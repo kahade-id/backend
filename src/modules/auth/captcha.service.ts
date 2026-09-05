@@ -7,6 +7,9 @@ const CAPTCHA_PREFIX = 'captcha:';
 const CAPTCHA_TTL = 120;
 const CAPTCHA_MIN_SOLVE_MS = 800;
 const CAPTCHA_MAX_SOLVE_MS = 120_000;
+const LOGIN_CAPTCHA_FAILURE_PREFIX = 'login:captcha-failures:';
+const LOGIN_CAPTCHA_FAILURE_TTL = 15 * 60;
+const LOGIN_CAPTCHA_THRESHOLD = 3;
 // B-04 (audit-fix): tighten the slider tolerance from 8 percentage-points to 4.
 // targetX is expressed in *percent* (the mobile/admin clients render it as
 // `${targetX}%`), so the 60-pp target range previously gave an attacker a
@@ -28,6 +31,21 @@ export interface CaptchaChallenge {
 @Injectable()
 export class CaptchaService {
   constructor(private readonly redis: RedisService) {}
+
+  async shouldRequireLoginCaptcha(ipAddress: string): Promise<boolean> {
+    const raw = await this.redis.get(`${LOGIN_CAPTCHA_FAILURE_PREFIX}${ipAddress}`);
+    return Number(raw ?? 0) >= LOGIN_CAPTCHA_THRESHOLD;
+  }
+
+  async recordLoginFailure(ipAddress: string): Promise<void> {
+    const key = `${LOGIN_CAPTCHA_FAILURE_PREFIX}${ipAddress}`;
+    const count = await this.redis.incr(key);
+    if (count === 1) await this.redis.expire(key, LOGIN_CAPTCHA_FAILURE_TTL);
+  }
+
+  async clearLoginFailures(ipAddress: string): Promise<void> {
+    await this.redis.del(`${LOGIN_CAPTCHA_FAILURE_PREFIX}${ipAddress}`);
+  }
 
   async generateChallenge(): Promise<{ challengeId: string; targetX: number }> {
     const challengeId = crypto.randomUUID();

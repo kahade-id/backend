@@ -51,12 +51,28 @@ const CAPTCHA_PREFIX = 'captcha:';
 const CAPTCHA_TTL = 120;
 const CAPTCHA_MIN_SOLVE_MS = 800;
 const CAPTCHA_MAX_SOLVE_MS = 120_000;
+const LOGIN_CAPTCHA_FAILURE_PREFIX = 'login:captcha-failures:';
+const LOGIN_CAPTCHA_FAILURE_TTL = 15 * 60;
+const LOGIN_CAPTCHA_THRESHOLD = 3;
 const POSITION_TOLERANCE = 4;
 const TARGET_X_MIN = 20;
 const TARGET_X_RANGE = 60;
 let CaptchaService = class CaptchaService {
     constructor(redis) {
         this.redis = redis;
+    }
+    async shouldRequireLoginCaptcha(ipAddress) {
+        const raw = await this.redis.get(`${LOGIN_CAPTCHA_FAILURE_PREFIX}${ipAddress}`);
+        return Number(raw ?? 0) >= LOGIN_CAPTCHA_THRESHOLD;
+    }
+    async recordLoginFailure(ipAddress) {
+        const key = `${LOGIN_CAPTCHA_FAILURE_PREFIX}${ipAddress}`;
+        const count = await this.redis.incr(key);
+        if (count === 1)
+            await this.redis.expire(key, LOGIN_CAPTCHA_FAILURE_TTL);
+    }
+    async clearLoginFailures(ipAddress) {
+        await this.redis.del(`${LOGIN_CAPTCHA_FAILURE_PREFIX}${ipAddress}`);
     }
     async generateChallenge() {
         const challengeId = crypto.randomUUID();

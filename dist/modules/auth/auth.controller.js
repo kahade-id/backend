@@ -217,12 +217,29 @@ let AuthController = class AuthController {
         if (!emailAuthEnabled) {
             throw new common_1.UnauthorizedException({ code: 'EMAIL_AUTH_DISABLED', message: 'Email/password login is not available. Please use phone number login.' });
         }
-        if (!dto.captchaId || dto.captchaAnswer === undefined) {
-            throw new common_1.UnauthorizedException({ code: ErrorCodes.CAPTCHA_REQUIRED, message: 'Captcha verification is required' });
-        }
-        await this.captchaService.verifyChallenge(dto.captchaId, dto.captchaAnswer);
         const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
-        const result = await this.authService.login(dto, ipAddress);
+        const captchaRequired = await this.captchaService.shouldRequireLoginCaptcha(ipAddress);
+        if (captchaRequired) {
+            if (!dto.captchaId || dto.captchaAnswer === undefined) {
+                throw new common_1.UnauthorizedException({ code: ErrorCodes.CAPTCHA_REQUIRED, message: 'Captcha verification is required after repeated failed login attempts' });
+            }
+            await this.captchaService.verifyChallenge(dto.captchaId, dto.captchaAnswer);
+        }
+        let result;
+        try {
+            result = await this.authService.login(dto, ipAddress);
+        }
+        catch (error) {
+            const response = error instanceof common_1.UnauthorizedException ? error.getResponse() : null;
+            const code = typeof response === 'object' && response !== null && 'code' in response
+                ? response.code
+                : undefined;
+            if (code === ErrorCodes.INVALID_CREDENTIALS) {
+                await this.captchaService.recordLoginFailure(ipAddress);
+            }
+            throw error;
+        }
+        await this.captchaService.clearLoginFailures(ipAddress);
         if ('refreshToken' in result) {
             this.setRefreshTokenCookie(res, result.refreshToken);
             if ('accessToken' in result) {

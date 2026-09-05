@@ -1,0 +1,2527 @@
+generator client {
+  provider = "prisma-client-js"
+  // fullTextSearch:
+  //   karena mendaftarkan GA feature di sini menyebabkan warning/error di Prisma 5+.
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// ENUMS
+// ============================================================
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+  PREFER_NOT_TO_SAY
+}
+
+enum UserAccountType {
+  PERSONAL
+  BUSINESS
+}
+
+enum KycStatus {
+  UNVERIFIED
+  PENDING
+  APPROVED
+  REJECTED
+  REVOKED
+}
+
+enum OrderStatus {
+  WAITING_CONFIRMATION
+  WAITING_PAYMENT
+  PROCESSING
+  IN_DELIVERY
+  COMPLETED
+  DISPUTED
+  CANCELLED
+}
+
+enum OrderType {
+  PHYSICAL_GOODS
+  DIGITAL_GOODS
+  SERVICE
+  OTHER
+}
+
+enum OrderCancelReason {
+  TIMEOUT_CONFIRMATION
+  TIMEOUT_PAYMENT
+  TIMEOUT_PROCESSING
+  TIMEOUT_DELIVERY
+  REJECTED_BY_COUNTERPART
+  ADMIN_FORCE_CANCEL
+  USER_MUTUAL_CANCEL
+  CHANGED_MIND
+  WRONG_DETAILS
+  DUPLICATE_ORDER
+  MUTUAL_AGREEMENT
+  COUNTERPART_UNRESPONSIVE
+  OTHER
+}
+
+enum FeeResponsibility {
+  BUYER
+  SELLER
+  SPLIT
+}
+
+enum WalletTransactionType {
+  TOP_UP
+  WITHDRAW
+  ORDER_LOCK
+  ORDER_RELEASE
+  ORDER_REFUND
+  FEE_DEDUCT
+  REFERRAL_REWARD
+  // VOUCHER_DISCOUNT dihapus — bukan pergerakan saldo nyata.
+  // Efek diskon sudah tercatat via Order.voucherDiscount + pengurangan FEE_DEDUCT.
+  SUBSCRIPTION_PAYMENT
+  ADMIN_CREDIT
+  ADMIN_DEBIT
+  DISPUTE_RELEASE
+  TRANSFER_SENT
+  TRANSFER_RECEIVED
+}
+
+enum WalletTransactionStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  CANCELLED
+  REVERSED
+}
+
+enum PaymentProvider {
+  MIDTRANS
+}
+
+enum PaymentPurpose {
+  TOPUP
+  ORDER_ESCROW
+}
+
+enum PaymentMethod {
+  VIRTUAL_ACCOUNT_BCA
+  VIRTUAL_ACCOUNT_BNI
+  VIRTUAL_ACCOUNT_BRI
+  VIRTUAL_ACCOUNT_MANDIRI
+  VIRTUAL_ACCOUNT_CIMB
+  VIRTUAL_ACCOUNT_PERMATA
+  VIRTUAL_ACCOUNT_OTHER
+  QRIS
+  GOPAY
+  SHOPEEPAY
+  OVO
+  DANA
+  LINKAJA
+  CREDIT_CARD
+  ALFAMART
+  INDOMARET
+  AKULAKU
+  KREDIVO
+  KAHADE_WALLET
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  EXPIRED
+  CANCELLED
+  REFUNDED
+}
+
+enum WithdrawStatus {
+  PENDING_OTP
+  PENDING_PROCESS
+  PROCESSING
+  SUCCESS
+  FAILED
+}
+
+enum DisputeStatus {
+  OPEN
+  ASSIGNED
+  UNDER_REVIEW
+  WAITING_RESPONSE
+  RESOLVED
+  ESCALATED
+}
+
+enum DisputeInitiator {
+  BUYER
+  SELLER
+  BOTH
+}
+
+enum DisputeDecisionType {
+  FULL_BUYER
+  FULL_SELLER
+  SPLIT
+}
+
+enum MembershipRank {
+  BRONZE
+  SILVER
+  GOLD
+  PLATINUM
+  DIAMOND
+}
+
+enum OtpType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+  WITHDRAW_CONFIRMATION
+  TWO_FA_DISABLE
+  ACCOUNT_DELETION
+  LOGIN_NEW_DEVICE
+  SENSITIVE_ACTION
+  PHONE_LOGIN
+}
+
+enum OtpMethod {
+  SMS
+  WHATSAPP
+}
+
+enum NotificationCategory {
+  INFORMASI
+  PROMOSI
+  TRANSAKSI
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  WHATSAPP
+  SMS
+  PUSH_NOTIFICATION
+}
+
+enum NotificationType {
+  ORDER_NEW
+  ORDER_ACCEPTED
+  ORDER_REJECTED
+  ORDER_CANCELLED_TIMEOUT
+  ORDER_CANCELLED
+  ORDER_PAYMENT_RECEIVED
+  ORDER_SHIPPED
+  ORDER_DEADLINE_REMINDER
+  ORDER_EXTENSION_REQUESTED
+  ORDER_EXTENSION_APPROVED
+  ORDER_EXTENSION_REJECTED
+  ORDER_COMPLETED
+  ORDER_AUTOCOMPLETED
+  DISPUTE_SUBMITTED
+  DISPUTE_ADMIN_JOINED
+  DISPUTE_DECISION
+  CHAT_NEW_MESSAGE
+  WALLET_TOPUP_SUCCESS
+  WALLET_TOPUP_FAILED
+  WALLET_WITHDRAW_SUCCESS
+  WALLET_WITHDRAW_FAILED
+  WALLET_FUNDS_RELEASED
+  WALLET_TRANSFER_SENT
+  WALLET_TRANSFER_RECEIVED
+  KYC_APPROVED
+  KYC_REJECTED
+  KYC_REVOKED
+  KYC_RESUBMIT_REMINDER
+  SECURITY_NEW_LOGIN
+  SECURITY_PASSWORD_CHANGED
+  SECURITY_ACCOUNT_LOCKED
+  SECURITY_2FA_ENABLED
+  SECURITY_2FA_DISABLED
+  SECURITY_BACKUP_CODE_USED
+  SUBSCRIPTION_ACTIVATED
+  SUBSCRIPTION_EXPIRY_REMINDER
+  SUBSCRIPTION_EXPIRED
+  SUBSCRIPTION_RENEWED
+  REFERRAL_REWARD_RECEIVED
+  RATING_NEW
+  BADGE_AWARDED
+  RANK_UPGRADED
+  ORDER_DELIVERED
+  DATA_EXPORT_READY
+  SYSTEM_MAINTENANCE
+  SYSTEM_ANNOUNCEMENT
+}
+
+enum SubscriptionPlan {
+  MONTHLY
+  ANNUAL
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELLED
+  EXPIRED
+  PENDING
+  SUSPENDED
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  DISPUTE_ADMIN
+  KYC_ADMIN
+  FINANCE_ADMIN
+  CUSTOMER_SUPPORT
+}
+
+enum SupportTicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+enum SupportTicketCategory {
+  GENERAL
+  ORDER
+  PAYMENT
+  ACCOUNT
+  KYC
+  TECHNICAL
+  OTHER
+}
+
+enum SupportTicketSenderType {
+  USER
+  ADMIN
+  SYSTEM
+}
+
+enum ReportCategory {
+  FRAUD
+  FAKE_IDENTITY
+  INAPPROPRIATE_CONTENT
+  TNC_VIOLATION
+  MONEY_LAUNDERING
+  SPAM
+  OTHER
+}
+
+enum ReportStatus {
+  PENDING
+  UNDER_REVIEW
+  RESOLVED_ACTION_TAKEN
+  RESOLVED_NO_ACTION
+  DISMISSED
+}
+
+enum BankCode {
+  BCA
+  BNI
+  BRI
+  MANDIRI
+  CIMB
+  PERMATA
+  DANAMON
+  OCBC
+  PANIN
+  MEGA
+  BTN
+  BSI
+  MAYBANK
+  OTHER
+}
+
+enum ChatMessageType {
+  TEXT
+  IMAGE
+  FILE
+  SYSTEM
+}
+
+enum DeadlineExtensionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+enum VoucherType {
+  FEE_DISCOUNT_FLAT
+  FEE_DISCOUNT_PERCENT
+}
+
+enum AuditAction {
+  USER_CREATED
+  USER_UPDATED
+  USER_SUSPENDED
+  USER_ACTIVATED
+  USER_BANNED
+  USER_RESTORED
+  KYC_APPROVED
+  KYC_REJECTED
+  KYC_REVOKED
+  ORDER_CREATED
+  ORDER_STATUS_CHANGED
+  ORDER_FORCE_CANCEL
+  ORDER_FORCE_COMPLETE
+  WALLET_CREDIT
+  WALLET_DEBIT
+  DISPUTE_ASSIGNED
+  DISPUTE_DECIDED
+  DISPUTE_ESCALATED
+  ADMIN_LOGIN
+  ADMIN_LOGOUT
+  ADMIN_ACTION
+  SYSTEM_CONFIG_CHANGED
+  VOUCHER_CREATED
+  VOUCHER_DEACTIVATED
+  KYC_DOCUMENTS_ACCESSED
+  BADGE_ASSIGNED
+  BADGE_REVOKED
+  BROADCAST_SENT
+  USER_PASSWORD_RESET
+  REPORT_RESOLVED
+}
+
+// Menggantikan AuditLog.action String — mencegah typo dan memastikan konsistensi
+// dengan AdminAuditLog yang sudah menggunakan AuditAction enum.
+enum OrderLinkStatus {
+  ACTIVE
+  ACCEPTED
+  EXPIRED
+  CANCELLED
+}
+
+enum DeliveryProofStatus {
+  SUBMITTED
+  ACCEPTED
+  REJECTED
+  AUTO_RELEASED
+}
+
+enum CampaignType {
+  FEE_PROMO
+  SUBSCRIPTION_DISCOUNT
+  CASHBACK
+}
+
+enum CampaignStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  ENDED
+}
+
+enum UserAuditAction {
+  // Auth
+  REGISTER
+  LOGIN
+  LOGOUT
+  LOGOUT_ALL
+  PASSWORD_CHANGED
+  PASSWORD_RESET
+  TWO_FA_ENABLED
+  TWO_FA_DISABLED
+  EMAIL_VERIFIED
+  // Profile
+  PROFILE_UPDATED
+  AVATAR_UPDATED
+  USERNAME_SET
+  ACCOUNT_DELETION_REQUESTED
+  // KYC
+  KYC_SUBMITTED
+  // Order
+  ORDER_CREATED
+  ORDER_CONFIRMED
+  ORDER_REJECTED
+  ORDER_PAID
+  ORDER_PROCESSED
+  ORDER_SHIPPING_UPDATED
+  ORDER_COMPLETED
+  ORDER_CANCELLED
+  ORDER_DISPUTE_SUBMITTED
+  ORDER_EXTENSION_REQUESTED
+  ORDER_EXTENSION_RESPONDED
+  ORDER_DELIVERED
+  ORDER_DELIVERY_CONFIRMED
+  // Wallet
+  TOPUP_INITIATED
+  TOPUP_CANCELLED
+  WITHDRAW_REQUESTED
+  WITHDRAW_CONFIRMED
+  WITHDRAW_CANCELLED
+  TRANSFER_SENT
+  TRANSFER_RECEIVED
+  // Bank
+  BANK_ACCOUNT_ADDED
+  BANK_ACCOUNT_DELETED
+  BANK_ACCOUNT_PRIMARY_SET
+  // Settings
+  USER_BLOCKED
+  USER_UNBLOCKED
+  USER_REPORTED
+  NOTIFICATION_PREF_UPDATED
+  // Subscription
+  SUBSCRIPTION_STARTED
+  SUBSCRIPTION_CANCELLED
+  SUBSCRIPTION_AUTO_RENEW_TOGGLED
+  // Referral
+  REFERRAL_CODE_APPLIED
+  // Rating
+  RATING_SUBMITTED
+  // Evidence
+  DISPUTE_EVIDENCE_ADDED
+  // Order Link
+  ORDER_LINK_CREATED
+  ORDER_LINK_ACCEPTED
+  // Device Trust
+  DEVICE_TRUSTED
+  DEVICE_UNTRUSTED
+}
+
+// ============================================================
+// ============================================================
+
+// dan DisputeEvidence.submittedByRole
+enum ActorType {
+  BUYER
+  SELLER
+  ADMIN
+  SYSTEM
+}
+
+// dan Rating.giverRole
+enum UserRole {
+  BUYER
+  SELLER
+}
+
+enum VoucherApplicability {
+  ALL
+  BUYER_ONLY
+  SELLER_ONLY
+  NEW_USER
+}
+
+enum SystemConfigDataType {
+  STRING
+  NUMBER
+  BOOLEAN
+  JSON
+}
+
+// ============================================================
+// USERS
+// ============================================================
+
+model User {
+  id          String          @id @default(cuid())
+  userId      String          @unique // Format: USR-XXXXXXXX
+  username    String?         @unique
+  email       String?         @unique
+  password    String?
+
+  // Profile
+  fullName    String
+  bio         String?         @db.VarChar(500)
+  avatarUrl   String?
+  headerUrl   String?
+  accountType UserAccountType @default(PERSONAL)
+  usernameChangedAt DateTime?
+
+  // Extended profile (collected at registration)
+  phoneNumber     String    @unique
+  phoneNumberHash String?   @unique
+  phoneVerified   Boolean   @default(false)
+  dateOfBirth     DateTime? @db.Date
+  gender          Gender?
+  address         String?   @db.VarChar(500)
+
+  // Verification
+  emailVerified   Boolean   @default(false)
+  emailVerifiedAt DateTime?
+
+  // kycStatus denormalized — query cepat tanpa JOIN ke kyc_requests
+  // Di-sync oleh KycService saat approve/reject/revoke
+  kycStatus     KycStatus @default(UNVERIFIED)
+  kycApprovedAt DateTime?
+
+  // Kahade Plus flag denormalized — di-sync oleh SubscriptionService
+  isKahadePlus          Boolean   @default(false)
+  subscriptionExpiresAt DateTime?
+
+  // Security
+  failedLoginAttempts   Int       @default(0)
+  lockedUntil           DateTime? // Account lockout
+  lastLoginAt           DateTime?
+  lastLoginIp           String?
+  passwordChangedAt     DateTime?
+  isActive              Boolean   @default(true)
+  isBanned              Boolean   @default(false)
+  banReason             String?
+  bannedAt              DateTime?
+  bannedBy              String?   // Admin user ID (soft FK ke admin_users.id)
+
+  // Contact options
+  contactEmail          String?
+  contactPhone          String?
+  showContactEmail      Boolean   @default(false)
+  showContactPhone      Boolean   @default(false)
+
+  // Privacy and localization settings persisted in DB (Redis used as read-through cache)
+  profileVisible        Boolean   @default(true)
+  showOnlineStatus      Boolean   @default(true)
+  language              String    @default("id")
+
+  // Flags
+  isVip                 Boolean   @default(false)  // Badge VIP dari admin
+  vipGrantedAt          DateTime?
+  vipGrantedBy          String?   // Admin user ID (soft FK ke admin_users.id)
+
+  // Membership
+  membershipRank        MembershipRank @default(BRONZE)
+  rankUpdatedAt         DateTime       @default(now())
+
+  // Stats (denormalized for performance)
+  // ALTER TABLE users ADD CONSTRAINT user_stats_non_negative
+  //   CHECK (
+  //     total_orders_completed >= 0 AND
+  //     total_transaction_value >= 0 AND
+  //     average_rating BETWEEN 0 AND 5 AND
+  //     total_rating_count >= 0
+  //   );
+  totalOrdersCompleted  Int     @default(0)
+  totalOrdersAsBuyer    Int     @default(0) // Denormalized counter — updated by OrderStateService
+  totalOrdersAsSeller   Int     @default(0) // Denormalized counter — updated by OrderStateService
+  totalOrdersCancelled  Int     @default(0) // Check constraint via migration (>= 0)
+  totalOrdersDisputed   Int     @default(0) // Check constraint via migration (>= 0)
+  totalTransactionValue BigInt  @default(0) // dalam satuan SEN (IDR x 100) — konsisten dengan wallet
+  averageRating         Decimal @default(0) @db.Decimal(3, 2)
+  totalRatingCount      Int     @default(0)
+  memberSince           DateTime @default(now())
+
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime? // Soft delete
+
+  // Relations
+  sessions                UserSession[]
+  devices                 UserDevice[]
+  twoFactorAuth           TwoFactorAuth?
+  otpCodes                OtpCode[]
+  kycRequests             KycRequest[]
+  bankAccounts            BankAccount[]
+  wallet                  Wallet?
+  ordersAsBuyer           Order[]               @relation("BuyerOrders")
+  ordersAsSeller          Order[]               @relation("SellerOrders")
+  chatMessages            ChatMessage[]
+  ratingsGiven            Rating[]              @relation("RatingGiver")
+  ratingsReceived         Rating[]              @relation("RatingReceiver")
+  notifications           Notification[]
+  notificationPreference  NotificationPreference?
+  voucherUsages           VoucherUsage[]
+  referralCode            ReferralCode?
+  referralUsed            ReferralRelation?     @relation("RefereeUser")    // fix typo: ReferreeUser → RefereeUser
+  referralsGiven          ReferralRelation[]    @relation("ReferrerUser")
+  referralRewards         ReferralReward[]
+  subscriptions           Subscription[]
+  membershipRankHistories MembershipRankHistory[]
+  blockedUsers            BlockList[]           @relation("BlockerUser")
+  blockedByUsers          BlockList[]           @relation("BlockedUser")
+  reportsSubmitted        UserReport[]          @relation("ReportSubmitter")
+  reportsReceived         UserReport[]          @relation("ReportTarget")
+  auditLogs               AuditLog[]
+  paymentTransactions     PaymentTransaction[]
+  initiatedDisputes       Dispute[]             @relation("DisputeInitiatorUser")
+  requestedDisputeCalls   DisputeCall[]         @relation("DisputeCallRequester")
+  disputeMessages         DisputeMessage[]      @relation("DisputeMessageSender")
+ 
+  disputeEvidences        DisputeEvidence[]     @relation("DisputeEvidenceSubmitter")
+  mutualResolutionProposals MutualResolutionProposal[] @relation("MutualResolutionProposer")
+ 
+  extensionRequests       OrderExtensionRequest[] @relation("ExtensionRequester")
+  extensionResponses      OrderExtensionRequest[] @relation("ExtensionResponder")
+  // Badge system — reverse relations untuk UserBadge
+  badges                  UserBadge[]
+  // Password history — untuk cegah password cycling
+  passwordHistories       PasswordHistory[]
+  // Social links
+  links                   UserLink[]
+  // Follow system
+  followers               Follow[]              @relation("FollowingUser")
+  following               Follow[]              @relation("FollowerUser")
+  // Favorites system
+  favoritesGiven          UserFavorite[]        @relation("FavoriteOwner")
+  favoritesReceived       UserFavorite[]        @relation("FavoriteTarget")
+  // Saved-profile system, intentionally separate from favorites
+  savedProfilesGiven      UserSavedProfile[]    @relation("SavedProfileOwner")
+  savedProfilesReceived   UserSavedProfile[]    @relation("SavedProfileTarget")
+  // Order links
+  orderLinksCreated       OrderLink[]           @relation("OrderLinkCreator")
+  // Profile Q&A
+  questionsAsked          ProfileQuestion[]     @relation("QuestionAsker")
+  questionsReceived       ProfileQuestion[]     @relation("QuestionReceiver")
+  questionComments        ProfileQuestionComment[] @relation("CommentAuthor")
+  supportTickets          SupportTicket[]          @relation("UserSupportTickets")
+  showcaseItems           UserShowcase[]
+  scheduledWithdrawals    ScheduledWithdrawal[]  @relation("UserScheduledWithdrawals")
+  deliveryProofsSubmitted DeliveryProof[]        @relation("DeliveryProofSubmitter")
+  ratingReplies           RatingReply[]          @relation("RatingReplies")
+  orderLinksAccepted      OrderLink[]            @relation("OrderLinkAcceptor")
+  transactionTemplates    TransactionTemplate[]  @relation("UserTransactionTemplates")
+  idempotencyRecords       IdempotencyRecord[]
+
+  //         — ketiga field ini sudah @unique, index dibuat otomatis. Redundan.
+  @@index([kycStatus])
+  @@index([membershipRank])
+  @@index([createdAt])
+  @@index([isActive, isBanned])
+  @@index([deletedAt]) // WHERE deletedAt IS NULL query optimization
+  @@map("users")
+}
+
+// ============================================================
+// AUTH & SESSION
+// ============================================================
+
+model UserSession {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  jti           String   @unique // JWT ID — untuk blacklist token
+  refreshToken  String   @unique // Hashed refresh token
+  deviceId      String?  // Stable app-generated device identifier
+  deviceInfo    String?  // User-Agent
+  ipAddress     String
+  isRevoked     Boolean  @default(false)
+  revokedAt     DateTime?
+  revokedReason String?  // logout, password_change, admin_revoke, etc.
+
+  lastActiveAt  DateTime @default(now())
+  expiresAt     DateTime
+  createdAt     DateTime @default(now())
+
+  @@index([userId])
+  @@index([userId, deviceId])
+  @@index([userId, isRevoked]) // query "sesi aktif user X" (WHERE isRevoked=false)
+  @@index([expiresAt])
+  @@map("user_sessions")
+}
+
+model UserDevice {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  deviceId       String   // Fingerprint
+  deviceName     String?  // "Chrome on MacOS"
+  deviceType     String?  // "desktop", "mobile", "tablet"
+  os             String?
+  browser        String?
+  // Separate pushToken field from deviceId to avoid conflating
+  // push notification tokens with browser/device fingerprints
+  pushToken      String?
+  ipAddress      String
+  isTrusted      Boolean  @default(false)
+  trustedAt      DateTime?
+  lastLoginAt    DateTime @default(now())
+  loginCount     Int      @default(1)
+  createdAt      DateTime @default(now())
+
+  @@unique([userId, deviceId])
+  @@index([userId])
+  @@index([deviceId])          // cross-user device detection lookup
+  @@index([pushToken])        
+  @@map("user_devices")
+}
+
+model TwoFactorAuth {
+  id            String    @id @default(cuid())
+  userId        String    @unique
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  secret        String?   // TOTP secret (encrypted AES-256), null saat 2FA dinonaktifkan
+  isEnabled     Boolean   @default(false)
+  enabledAt     DateTime?
+  disabledAt    DateTime?
+  backupCodes   String[]  // Hashed backup codes (10 kode)
+  usedBackupCodes String[] @default([])
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@map("two_factor_auth")
+}
+
+model OtpCode {
+  id          String   @id @default(cuid())
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  email       String?
+  phone       String?
+  code        String
+  type        OtpType
+  method      OtpMethod?
+  metadata    Json?
+
+  isUsed      Boolean  @default(false)
+  usedAt      DateTime?
+  attempts    Int      @default(0)
+  ipAddress   String?
+
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  @@index([email, type])
+  @@index([phone, type])
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([userId, type, isUsed])
+  @@map("otp_codes")
+}
+
+// ============================================================
+// NOTIFICATION PREFERENCES
+// ============================================================
+
+model NotificationPreference {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Per kategori: true = notif aktif
+  orderInApp     Boolean @default(true)
+  orderPush      Boolean @default(true)
+  orderEmail     Boolean @default(true)
+  walletInApp    Boolean @default(true)
+  walletPush     Boolean @default(true)
+  walletEmail    Boolean @default(true)
+  securityInApp  Boolean @default(true)
+  securityPush   Boolean @default(true)
+  securityEmail  Boolean @default(true)   // TIDAK bisa dimatikan (keamanan — enforce di application layer)
+  chatInApp      Boolean @default(true)
+  chatPush       Boolean @default(true)
+  disputeInApp   Boolean @default(true)
+  disputePush    Boolean @default(true)
+  disputeEmail   Boolean @default(true)
+  rankingInApp   Boolean @default(true)
+  rankingPush    Boolean @default(true)
+  marketingEmail Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("notification_preferences")
+}
+
+// ============================================================
+// KYC
+// ============================================================
+
+model KycRequest {
+  id          String    @id @default(cuid())
+  kycId       String    @unique // Format: KYC-YYYYMMDD-SERIAL
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  status      KycStatus @default(PENDING)
+
+  // Documents (URL signed, encrypted AES-256)
+  ktpPhotoUrl    String  // URL encrypted ke S3 private
+  selfiePhotoUrl String  // URL encrypted ke S3 private
+  ktpNumber      String  // NIK, encrypted AES-256
+  // HMAC-SHA256 deterministik dari NIK — untuk cek duplikat lintas akun
+  // AES non-deterministik (IV random) tidak bisa di-unique.
+  // Hash ini TIDAK bisa di-decrypt ke NIK asli (one-way).
+  ktpNumberHash  String // HMAC-SHA256(NIK, HMAC_SECRET_KEY); active-state uniqueness is enforced by migration
+
+  // Review — FK ke AdminUser
+  reviewedBy     String?    // Admin user ID (FK ke admin_users.id)
+  reviewer       AdminUser? @relation("KycReviewer", fields: [reviewedBy], references: [id], onDelete: SetNull)
+  reviewedAt     DateTime?
+  rejectionReason String?
+  adminNotes     String?   @db.Text
+
+  // Metadata
+  submittedIp    String?
+  attemptNumber  Int       @default(1)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // CREATE UNIQUE INDEX kyc_one_pending_per_user ON kyc_requests(user_id)
+  // WHERE status = 'PENDING';
+
+  @@index([userId])
+  @@index([status])
+  @@index([ktpNumberHash])
+  @@index([status, createdAt]) // compound untuk admin KYC queue: status-filter + sort by date
+  @@index([reviewedBy]) // index untuk admin performance analytics
+  @@map("kyc_requests")
+}
+
+// ============================================================
+// BANK ACCOUNTS
+// ============================================================
+
+model BankAccount {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  bankCode      BankCode
+  bankName      String
+  accountNumber String   // Encrypted AES-256
+  accountName   String
+  // Deterministik untuk duplicate detection lintas user.
+  // NULL untuk data lama yang belum di-backfill.
+  accountNumberHash String? @unique
+  isPrimary     Boolean  @default(false)
+  // CREATE UNIQUE INDEX bank_one_primary_per_user
+  //   ON bank_accounts(user_id)
+  //   WHERE is_primary = true AND deleted_at IS NULL;
+  isVerified    Boolean  @default(false) // Verified via penny-drop atau manual
+
+  // Midtrans Iris
+  irisAccountId String?  // Iris beneficiary account ID
+  // CREATE UNIQUE INDEX bank_iris_account_unique
+  //   ON bank_accounts(iris_account_id)
+  //   WHERE iris_account_id IS NOT NULL;
+  // Mencegah pendaftaran rekening yang sama dua kali ke Iris.
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  deletedAt     DateTime? // Soft delete
+
+  withdrawTransactions    WalletTransaction[]
+  scheduledWithdrawals    ScheduledWithdrawal[]  @relation("BankAccountScheduledWithdrawals")
+
+  @@index([userId])
+  @@index([irisAccountId])     // Iris webhook lookup "find bank account by Iris ID"
+  @@index([userId, deletedAt]) // WHERE userId=? AND deletedAt IS NULL
+  @@index([deletedAt])         // soft-delete query optimization
+  @@map("bank_accounts")
+}
+
+// ============================================================
+// WALLET
+// ============================================================
+
+model Wallet {
+  id              String  @id @default(cuid())
+  userId          String  @unique
+  user            User    @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  // Saldo dalam satuan sen (IDR x 100)
+  availableBalance BigInt @default(0) // Saldo Tersedia
+  escrowBalance    BigInt @default(0) // Saldo dalam Escrow
+  // WAJIB update ketiganya atomik dalam 1 Prisma $transaction.
+  // Invariant enforced in production: totalBalance = availableBalance + escrowBalance.
+  // Withdrawal reservations decrement availableBalance and totalBalance together,
+  // including the PENDING_OTP window; cancellation/failure refunds both together.
+  totalBalance     BigInt @default(0)
+  // Production migration enforces non-negative balances and
+  // total_balance = available_balance + escrow_balance.
+
+  // Daily limits tracking (stored in SEN — IDR x 100)
+  todayTopupAmount    BigInt   @default(0)
+  todayWithdrawAmount BigInt   @default(0)
+  lastLimitResetAt    DateTime @default(now()) // Di-reset setiap midnight WIB oleh cron job
+  lastTopupAt         DateTime? // Timestamp top-up terakhir berhasil (diset oleh handleTopupSuccess)
+
+  walletPinHash String?
+
+  // Security
+  isLocked      Boolean  @default(false)
+  lockedAt      DateTime?
+  lockReason    String?
+  lockedBy      String?  // Admin ID (soft FK ke admin_users.id)
+
+  version       Int      @default(0) // Optimistic locking
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  deletedAt     DateTime?
+
+  transactions  WalletTransaction[]
+
+  @@map("wallets")
+}
+
+model WalletTransaction {
+  id              String                 @id @default(cuid())
+  txId            String                 @unique // Format: WLT-YYYYMMDD-SERIAL
+  walletId        String
+  wallet          Wallet                 @relation(fields: [walletId], references: [id], onDelete: Restrict)
+
+  type            WalletTransactionType
+  status          WalletTransactionStatus @default(PENDING)
+
+  // Amounts in sen (IDR x 100)
+  amount          BigInt                 // Selalu positif
+  balanceBefore   BigInt                 // Snapshot sebelum transaksi
+  balanceAfter    BigInt                 // Snapshot setelah transaksi
+  // ALTER TABLE wallet_transactions ADD CONSTRAINT wallet_tx_amounts_valid
+  //   CHECK (
+  //     amount > 0 AND
+  //     balance_before >= 0 AND
+  //     balance_after >= 0
+  //   );
+  // ALTER TABLE wallet_transactions ADD CONSTRAINT wallet_tx_no_self_reversal
+  //   CHECK (reversal_tx_id IS NULL OR reversal_tx_id != id);
+
+  // References
+  orderId         String?
+  order           Order?                 @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  paymentTxId     String?
+  paymentTx       PaymentTransaction?    @relation(fields: [paymentTxId], references: [id], onDelete: SetNull)
+  bankAccountId   String?
+  bankAccount     BankAccount?           @relation(fields: [bankAccountId], references: [id], onDelete: SetNull)
+
+  // Metadata
+  description     String
+  metadata        Json?
+  failureReason   String?
+
+  reversalTxId    String?
+  reversalTx      WalletTransaction?     @relation("ReversalTransaction", fields: [reversalTxId], references: [id], onDelete: SetNull)
+  reversals       WalletTransaction[]    @relation("ReversalTransaction")
+
+  // Withdraw specific
+  withdrawStatus  WithdrawStatus?
+  irisPayoutId    String?                // Midtrans Iris payout ID
+  // CREATE UNIQUE INDEX wallet_tx_iris_payout_unique
+  //   ON wallet_transactions(iris_payout_id)
+  //   WHERE iris_payout_id IS NOT NULL;
+  irisRef         String?                // Iris reference number
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  completedAt     DateTime?
+
+  @@index([walletId])
+  @@index([orderId])
+  @@index([type, status])
+  @@index([createdAt])
+  @@index([type, status, createdAt])
+  @@index([walletId, createdAt])    // paginated transaction history
+  @@index([walletId, type, status]) // "semua TOP_UP PENDING untuk wallet ini"
+  @@index([withdrawStatus])         // withdrawal pipeline queries
+  @@index([bankAccountId])         
+  @@index([paymentTxId])           
+  @@index([reversalTxId])          
+  @@index([irisPayoutId]) // performance index untuk webhook lookup
+  @@map("wallet_transactions")
+}
+
+// ============================================================
+// PAYMENTS (Midtrans)
+// ============================================================
+
+model PaymentTransaction {
+  id                String        @id @default(cuid())
+  midtransOrderId   String        @unique // Order ID di Midtrans
+  userId            String
+  user              User          @relation(fields: [userId], references: [id], onDelete: Restrict)
+  orderId           String?
+  order             Order?        @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  provider          PaymentProvider @default(MIDTRANS)
+  purpose           PaymentPurpose  @default(TOPUP)
+  method            PaymentMethod
+  status            PaymentStatus   @default(PENDING)
+
+  // Amounts in IDR sen
+  amount            BigInt
+  paymentFee        BigInt        @default(0)
+  grossAmount       BigInt        @default(0)
+  refundedAmount    BigInt        @default(0)
+  currency          String        @default("IDR")
+
+  // Midtrans response
+  midtransToken     String?
+  midtransRedirectUrl String?
+  vaNumber          String?
+  vaBank            String?
+  qrCodeUrl         String?
+  deepLinkUrl       String?
+  providerInstructions Json?
+
+  // Webhook data
+  webhookReceivedAt DateTime?
+  webhookPayload    Json?
+  fraudStatus       String?
+
+  // Timestamps
+  expiredAt         DateTime?
+  paidAt            DateTime?
+  settledAt         DateTime? // Diset saat Midtrans SETTLEMENT webhook diterima (handleTopupSuccess)
+  failedAt          DateTime? // Diset saat Midtrans DENY/EXPIRE/CANCEL webhook diterima (handleTopupFailure)
+  refundRequestedAt DateTime?
+  refundReference   String?
+  refundReason      String?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  walletTransactions WalletTransaction[]
+  subscriptions      Subscription[]
+
+  @@index([userId])
+  @@index([orderId])
+  @@index([purpose, status])
+  @@index([status])
+  @@index([createdAt])
+  @@map("payment_transactions")
+}
+
+// ============================================================
+// ORDERS
+// ============================================================
+
+model Order {
+  id          String      @id @default(cuid())
+  orderId     String      @unique // Format: ORD-YYYYMMDD-SERIAL
+  buyerId     String
+  buyer       User        @relation("BuyerOrders", fields: [buyerId], references: [id], onDelete: Restrict)
+  sellerId    String
+  seller      User        @relation("SellerOrders", fields: [sellerId], references: [id], onDelete: Restrict)
+
+  // Order Details
+  title       String      @db.VarChar(100)
+  description String      @db.VarChar(500)
+  orderType   OrderType
+
+  // Financial (in sen / IDR x 100)
+  orderValue        BigInt
+  feeAmount         BigInt
+  feeResponsibility FeeResponsibility
+  buyerFeeAmount    BigInt
+  sellerFeeAmount   BigInt
+  buyerPayAmount    BigInt           // Total yang buyer bayar (orderValue + buyerFeeAmount)
+  sellerReceiveAmount BigInt         // Total yang seller terima (orderValue - sellerFeeAmount)
+  // ALTER TABLE orders ADD CONSTRAINT order_fee_sum
+  //   CHECK (buyer_fee_amount + seller_fee_amount = fee_amount);
+  // ALTER TABLE orders ADD CONSTRAINT order_buyer_pay
+  //   CHECK (buyer_pay_amount = order_value + buyer_fee_amount);
+  // ALTER TABLE orders ADD CONSTRAINT order_seller_receive
+  //   CHECK (seller_receive_amount = order_value - seller_fee_amount);
+
+  // Voucher
+  voucherId         String?
+  voucher           Voucher?        @relation(fields: [voucherId], references: [id], onDelete: SetNull)
+  // NULL vs 0 ambigu di application layer — gunakan 0 untuk "tidak ada diskon".
+  voucherDiscount   BigInt          @default(0)
+
+  // Kahade Plus flag
+  isKahadePlus      Boolean         @default(false)
+  feeRate           Decimal         @db.Decimal(5, 4)
+
+  // Status
+  status            OrderStatus     @default(WAITING_CONFIRMATION)
+  cancelReason      OrderCancelReason?
+  cancelNote        String?
+
+  // Deadlines
+  deliveryDeadlineDays    Int              @default(3)
+  // ALTER TABLE orders ADD CONSTRAINT delivery_deadline_range
+  //   CHECK (delivery_deadline_days BETWEEN 1 AND 14);
+  deliveryDeadlineAt      DateTime?  // Nullable — diset saat paidAt
+  paymentDeadlineAt       DateTime?
+  confirmationDeadlineAt  DateTime?
+  processingDeadlineAt    DateTime?
+
+  // Shipping
+  trackingNumber    String?
+  courierName       String?
+  trackingNotes     String?
+
+  // Timestamps per state
+  createdAt               DateTime  @default(now())
+  confirmedAt             DateTime?
+  paidAt                  DateTime?
+  processedAt             DateTime?
+  shippedAt               DateTime?
+  completedAt             DateTime?
+  cancelledAt             DateTime?
+  disputedAt              DateTime?
+  updatedAt               DateTime  @updatedAt
+  deletedAt               DateTime?
+
+  // Creator
+  createdByBuyer    Boolean          @default(false) // true jika order dibuat oleh buyer; false jika oleh seller. Selalu di-set eksplisit saat INSERT.
+
+  // Order Link reference
+  orderLinkId       String?
+  orderLink         OrderLink? @relation(fields: [orderLinkId], references: [id], onDelete: SetNull)
+
+  // Relations
+  statusHistories    OrderStatusHistory[]
+  chatRoom           ChatRoom?
+  dispute            Dispute?
+  ratings            Rating[]
+  walletTransactions WalletTransaction[]
+  extensionRequests  OrderExtensionRequest[]
+  voucherUsages      VoucherUsage[]
+  referralRewards    ReferralReward[]
+  paymentTransactions PaymentTransaction[]
+  deliveryProofs     DeliveryProof[]
+
+  @@index([buyerId])
+  @@index([sellerId])
+  @@index([status])
+  @@index([status, createdAt])  // admin order queue: status-filter + sort by date
+  @@index([createdAt])
+  @@index([buyerId, status])
+  @@index([sellerId, status])
+  @@index([buyerId, createdAt])
+  @@index([sellerId, createdAt])
+  @@index([voucherId])          // FK tanpa index = full table scan
+  @@index([trackingNumber])     // admin lookup order via tracking number kurir
+  @@index([status, deliveryDeadlineAt])       // auto-complete scheduler: WHERE status=IN_DELIVERY AND deliveryDeadlineAt < NOW()
+  @@index([status, paymentDeadlineAt])        // payment cleanup scheduler
+  @@index([status, confirmationDeadlineAt])   // confirmation timeout scheduler
+  @@index([status, processingDeadlineAt])     // processing timeout scheduler
+  @@index([orderLinkId])
+  @@map("orders")
+}
+
+model OrderStatusHistory {
+  id          String      @id @default(cuid())
+  orderId     String
+  order       Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  fromStatus  OrderStatus?
+  toStatus    OrderStatus
+  changedBy   String?      // User ID atau 'SYSTEM'
+  changedByType ActorType? // Menggantikan String? — BUYER, SELLER, ADMIN, SYSTEM
+  reason      String?
+  metadata    Json?
+
+  ipAddress   String?
+  createdAt   DateTime    @default(now())
+
+  @@index([orderId])
+  @@index([createdAt])
+  @@map("order_status_histories")
+}
+
+model OrderExtensionRequest {
+  id          String                  @id @default(cuid())
+  orderId     String
+  order       Order                   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  requestedBy   String                // User ID yang request
+ 
+  // Tanpa FK, user yang dihapus tidak trigger cascade dan data menjadi orphan.
+  requester     User                  @relation("ExtensionRequester", fields: [requestedBy], references: [id], onDelete: Restrict)
+  requestedByRole UserRole            // Menggantikan String — BUYER atau SELLER
+  extensionDays Int
+  // ALTER TABLE order_extension_requests ADD CONSTRAINT extension_days_range
+  //   CHECK (extension_days BETWEEN 1 AND 14);
+  reason        String
+
+  status        DeadlineExtensionStatus @default(PENDING)
+  respondedBy   String?
+ 
+  responder     User?                 @relation("ExtensionResponder", fields: [respondedBy], references: [id], onDelete: SetNull)
+  respondedAt   DateTime?
+  rejectionNote String?
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt // Tambah updatedAt — status bisa berubah
+
+  @@index([orderId])
+  @@index([orderId, status]) // Compound index untuk query "ada pending extension?"
+  @@index([requestedBy])    
+  @@index([respondedBy])    
+  @@map("order_extension_requests")
+}
+
+// ============================================================
+// CHAT
+// ============================================================
+
+model ChatRoom {
+  id        String    @id @default(cuid())
+  orderId   String    @unique
+  order     Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  isArchived Boolean  @default(false)
+  archivedAt DateTime?
+  archivedReason String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  messages  ChatMessage[]
+
+  @@map("chat_rooms")
+}
+
+model ChatMessage {
+  id          String          @id @default(cuid())
+  roomId      String
+  room        ChatRoom        @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  senderId    String?         // Null untuk sistem message
+  sender      User?           @relation(fields: [senderId], references: [id], onDelete: SetNull)
+
+  messageType ChatMessageType @default(TEXT)
+  content     String?         @db.Text
+  isEdited    Boolean         @default(false)
+  isDeleted   Boolean         @default(false)
+  deletedAt   DateTime?
+
+  readAt      Json?
+
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  replyToId   String?
+  replyTo     ChatMessage?    @relation("ChatMessageReply", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies     ChatMessage[]   @relation("ChatMessageReply")
+
+  attachments ChatAttachment[]
+
+  @@index([roomId])
+  @@index([roomId, createdAt]) // cursor-based pagination (ORDER BY createdAt DESC)
+  @@index([senderId])
+  @@index([createdAt])
+  @@map("chat_messages")
+}
+
+model ChatAttachment {
+  id          String   @id @default(cuid())
+  messageId   String
+  message     ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  fileName    String
+  fileSize    Int      // bytes
+  mimeType    String
+  fileUrl     String   // CDN URL
+  thumbnailUrl String?
+
+  createdAt   DateTime @default(now())
+
+  @@index([messageId])
+  @@index([createdAt]) // sort attachments by date for attachment history queries
+  @@map("chat_attachments")
+}
+
+// ============================================================
+// DISPUTES
+// ============================================================
+
+model Dispute {
+  id          String        @id @default(cuid())
+  disputeId   String        @unique // Format: DSP-YYYYMMDD-SERIAL
+  orderId     String        @unique
+  order       Order         @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  initiatedBy    DisputeInitiator
+  initiatorUserId String
+  initiator       User          @relation("DisputeInitiatorUser", fields: [initiatorUserId], references: [id], onDelete: Restrict)
+
+  buyerClaim     String?    @db.Text
+  sellerClaim    String?    @db.Text
+  buyerClaimedAt DateTime?
+  sellerClaimedAt DateTime?
+
+  status         DisputeStatus @default(OPEN)
+  assignedAdminId String?
+  assignedAdmin   AdminUser?    @relation("DisputeAssignedAdmin", fields: [assignedAdminId], references: [id], onDelete: SetNull)
+  assignedAt      DateTime?
+  resolvedAt      DateTime?
+
+  // SLA tracking
+  slaHours        Int?
+  // ALTER TABLE disputes ADD CONSTRAINT dispute_sla_hours_positive
+  //   CHECK (sla_hours IS NULL OR sla_hours > 0);
+  slaDeadlineAt   DateTime?
+  isSlaBreached   Boolean       @default(false)
+
+  adminNotes      String?       @db.Text
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  deletedAt       DateTime?
+
+  evidences       DisputeEvidence[]
+  decision        DisputeDecision?
+  calls           DisputeCall[]
+  messages        DisputeMessage[]
+  mutualProposals MutualResolutionProposal[]
+
+  @@index([status])
+  @@index([status, createdAt])
+  @@index([assignedAdminId])
+  @@index([createdAt])
+  @@index([initiatorUserId])
+  @@map("disputes")
+}
+
+model MutualResolutionProposal {
+  id          String   @id @default(cuid())
+  disputeId   String
+  dispute     Dispute  @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+
+  proposedBy      String
+  proposer        User     @relation("MutualResolutionProposer", fields: [proposedBy], references: [id], onDelete: Restrict)
+  proposerRole    ActorType
+
+  buyerPercent    Int
+  sellerPercent   Int
+  reason          String   @db.Text
+
+  status          String   @default("PENDING") // PENDING | ACCEPTED | REJECTED | EXPIRED
+  respondedAt     DateTime?
+  responseNote    String?  @db.Text
+
+  createdAt       DateTime @default(now())
+
+  @@index([disputeId])
+  @@index([disputeId, status])
+  @@map("mutual_resolution_proposals")
+}
+
+model DisputeEvidence {
+  id          String   @id @default(cuid())
+  disputeId   String
+  dispute     Dispute  @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+
+ 
+  // User? FK. Ini menyebabkan FK VIOLATION di PostgreSQL saat admin submit evidence,
+  // karena AdminUser.id bukan User.id. Fix: pisah menjadi dua FK nullable yang terpisah.
+  //
+  // Aturan:
+  //   - submittedByRole IN (BUYER, SELLER) → submittedByUserId wajib diisi, submittedByAdminId NULL
+  //   - submittedByRole = ADMIN            → submittedByAdminId wajib diisi, submittedByUserId NULL
+  //   - submittedByRole = SYSTEM           → keduanya NULL (pesan sistem otomatis)
+  //
+  // Check constraint via raw migration:
+  // ALTER TABLE dispute_evidences ADD CONSTRAINT evidence_submitter_xor
+  //   CHECK (
+  //     (submitted_by_role IN ('BUYER', 'SELLER') AND submitted_by_user_id IS NOT NULL AND submitted_by_admin_id IS NULL) OR
+  //     (submitted_by_role = 'ADMIN'              AND submitted_by_admin_id IS NOT NULL AND submitted_by_user_id IS NULL) OR
+  //     (submitted_by_role = 'SYSTEM'             AND submitted_by_user_id IS NULL AND submitted_by_admin_id IS NULL)
+  //   );
+
+  submittedByRole    ActorType // BUYER | SELLER | ADMIN | SYSTEM
+
+  submittedByUserId  String?
+  submittedByUser    User?      @relation("DisputeEvidenceSubmitter", fields: [submittedByUserId], references: [id], onDelete: SetNull)
+
+  submittedByAdminId String?
+  submittedByAdmin   AdminUser? @relation("DisputeEvidenceAdmin", fields: [submittedByAdminId], references: [id], onDelete: SetNull)
+
+  description     String    @db.Text
+  fileUrls        String[]  // Array URL bukti (parallel array dengan fileTypes — harus sama panjang)
+  fileTypes       String[]  // Valid values per elemen: "image" | "document" | "screenshot"
+                            // Validated in application layer; enforced via DB constraint below
+  // ALTER TABLE dispute_evidences ADD CONSTRAINT evidence_files_length
+  //   CHECK (array_length(file_urls, 1) = array_length(file_types, 1));
+  // Atau pertimbangkan migrasi ke model DisputeEvidenceFile tersendiri
+  // jika query per-file menjadi kebutuhan.
+
+  createdAt   DateTime @default(now())
+
+  @@index([disputeId])
+  @@index([createdAt])               // evidence list sorted by submission date
+  @@index([submittedByUserId])  
+  @@index([submittedByAdminId]) 
+  @@map("dispute_evidences")
+}
+
+model DisputeDecision {
+  id          String              @id @default(cuid())
+  disputeId   String              @unique
+  dispute     Dispute             @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+
+  decidedBy       String
+  decider         AdminUser       @relation("DisputeDecider", fields: [decidedBy], references: [id], onDelete: Restrict)
+
+  decisionType    DisputeDecisionType
+
+  // Split amounts (in sen)
+  buyerAmount     BigInt
+  sellerAmount    BigInt
+  // Tidak bisa dilakukan murni di DB tanpa join ke orders.escrow_balance,
+  // sehingga WAJIB divalidasi di application layer (DisputeService.executeDecision):
+  // assert buyerAmount + sellerAmount == order.orderValue
+  // Partial DB constraint untuk minimal non-negative:
+  // ALTER TABLE dispute_decisions ADD CONSTRAINT decision_amounts_non_negative
+  //   CHECK (buyer_amount >= 0 AND seller_amount >= 0);
+
+  // Percentages for SPLIT type
+  // ALTER TABLE dispute_decisions ADD CONSTRAINT split_percent_sum
+  //   CHECK (
+  //     (buyer_percent IS NULL AND seller_percent IS NULL) OR
+  //     (buyer_percent + seller_percent = 100)
+  //   );
+  // Tambah range check INDIVIDUAL untuk masing-masing kolom:
+  // ALTER TABLE dispute_decisions ADD CONSTRAINT split_buyer_percent_range
+  //   CHECK (buyer_percent IS NULL OR (buyer_percent BETWEEN 0 AND 100));
+  // ALTER TABLE dispute_decisions ADD CONSTRAINT split_seller_percent_range
+  //   CHECK (seller_percent IS NULL OR (seller_percent BETWEEN 0 AND 100));
+  buyerPercent    Decimal?        @db.Decimal(5, 2)
+  sellerPercent   Decimal?        @db.Decimal(5, 2)
+
+  decisionNotes   String          @db.Text // Min 100 karakter — enforce di application layer
+  isExecuted      Boolean         @default(false)
+  executedAt      DateTime?
+
+  timeToFirstResponseMs  BigInt?
+  totalResolutionTimeMs  BigInt?
+
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([decidedBy]) // index untuk admin decision lookup
+  @@index([createdAt]) // reporting queries sorted by decision date
+  @@map("dispute_decisions")
+}
+
+// ============================================================
+// RATINGS
+// ============================================================
+
+model Rating {
+  id          String   @id @default(cuid())
+  orderId     String
+  order       Order    @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  giverId     String
+  giver       User     @relation("RatingGiver", fields: [giverId], references: [id], onDelete: Restrict)
+  receiverId  String
+  receiver    User     @relation("RatingReceiver", fields: [receiverId], references: [id], onDelete: Restrict)
+
+  stars       Int      // 1-5
+  // Check constraint via raw migration:
+  // ALTER TABLE ratings ADD CONSTRAINT rating_stars_range
+  //   CHECK (stars BETWEEN 1 AND 5);
+  comment     String?  @db.VarChar(500)
+  giverRole   UserRole // Menggantikan String — BUYER atau SELLER
+
+  isHidden    Boolean  @default(false)
+  hiddenAt    DateTime?
+  hiddenBy    String?  // Admin ID (soft FK ke admin_users.id)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  reply       RatingReply?
+
+  @@unique([orderId, giverId])
+  @@index([receiverId])
+  @@index([receiverId, isHidden, createdAt]) // query "rating visible user X" (WHERE isHidden=false ORDER BY createdAt DESC)
+  @@index([giverId])
+  @@index([orderId])
+  @@index([createdAt]) // query GET /users/:username/ratings sorted by date
+  @@map("ratings")
+}
+
+// ============================================================
+// NOTIFICATIONS
+// ============================================================
+
+model Notification {
+  id          String              @id @default(cuid())
+  // Format lama mengekspos userId ke client (notifId dikirim via API pada setiap notifikasi),
+  // memungkinkan enumerasi userId dari notifId. Gunakan random segment (cuid/nanoid).
+  notifId     String              @unique // Format: NTF-{timestamp}-{randomId}
+  userId      String
+  user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type        NotificationType
+  category    NotificationCategory @default(INFORMASI)
+  channel     NotificationChannel @default(IN_APP)
+  title       String
+  body        String              @db.Text
+  actionUrl   String?
+
+  isRead      Boolean             @default(false)
+  readAt      DateTime?
+  isSent      Boolean             @default(false)
+  sentAt      DateTime?
+  failedAt    DateTime?
+  failReason  String?
+
+  refType     String?
+  refId       String?
+  metadata    Json?
+
+  createdAt   DateTime @default(now())
+  expiresAt   DateTime?
+  deletedAt   DateTime?
+
+  @@index([userId, isRead])
+  @@index([userId, createdAt])
+  @@index([userId, isRead, createdAt])
+  @@index([userId, category, isRead])
+  @@index([refId, refType])
+  @@index([expiresAt]) 
+  @@index([sentAt])
+  @@index([deletedAt])
+  @@map("notifications")
+}
+
+// ============================================================
+// VOUCHERS
+// ============================================================
+
+model Voucher {
+  id          String      @id @default(cuid())
+  voucherId   String      @unique // Format: VCH-KODE
+  code        String      @unique
+  name        String
+  description String?
+
+  voucherType   VoucherType
+  discountAmount BigInt?
+  discountPercent Decimal?  @db.Decimal(5, 2)
+  // ALTER TABLE vouchers ADD CONSTRAINT voucher_discount_percent_range
+  //   CHECK (discount_percent IS NULL OR (discount_percent > 0 AND discount_percent <= 100));
+  // ALTER TABLE vouchers ADD CONSTRAINT voucher_discount_xor
+  //   CHECK (
+  //     (voucher_type = 'FEE_DISCOUNT_FLAT'    AND discount_amount IS NOT NULL AND discount_percent IS NULL) OR
+  //     (voucher_type = 'FEE_DISCOUNT_PERCENT' AND discount_percent IS NOT NULL AND discount_amount IS NULL)
+  //   );
+
+  maxDiscountAmount BigInt?
+  maxUsageTotal   Int?
+  maxUsagePerUser Int       @default(1)
+  // ALTER TABLE vouchers ADD CONSTRAINT voucher_usage_per_user_valid
+  //   CHECK (max_usage_per_user >= 1);
+  currentUsage    Int       @default(0)
+
+  // Validity
+  isActive      Boolean   @default(true)
+  validFrom     DateTime
+  validUntil    DateTime
+  // ALTER TABLE vouchers ADD CONSTRAINT voucher_validity_range
+  //   CHECK (valid_until > valid_from);
+
+  // Conditions
+  minOrderValue BigInt?
+  // NULL sebelumnya bisa diinterpretasi sebagai "tidak ada kondisi" (= ALL).
+  // Lebih eksplisit menggunakan @default(ALL).
+  applicableTo  VoucherApplicability @default(ALL)
+
+  // Tracking
+  createdBy     String    // Admin ID (soft FK ke admin_users.id)
+  deactivatedBy String?   // Admin ID (soft FK ke admin_users.id)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deactivatedAt DateTime?
+
+  usages        VoucherUsage[]
+  orders        Order[]
+
+  @@index([isActive, validUntil])
+  @@index([isActive, validFrom, validUntil]) // Compound untuk "valid sekarang?"
+  @@index([isActive])                        // standalone index untuk voucher aktif
+  @@index([createdBy])                       // index untuk admin voucher lookup
+  @@map("vouchers")
+}
+
+model VoucherUsage {
+  id          String   @id @default(cuid())
+  voucherId   String
+  voucher     Voucher  @relation(fields: [voucherId], references: [id], onDelete: Restrict)
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Restrict)
+  orderId     String
+  order       Order    @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  discountApplied BigInt
+  usedAt          DateTime @default(now())
+
+  @@unique([voucherId, userId, orderId])
+  @@index([voucherId])
+  @@index([userId])
+  @@index([orderId])
+  @@index([voucherId, userId])
+  @@map("voucher_usages")
+}
+
+// ============================================================
+// REFERRAL
+// ============================================================
+
+model ReferralCode {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  code      String   @unique
+  isActive  Boolean  @default(true)
+  totalReferrals Int @default(0)       // Denormalized counter — sync via ReferralService
+  totalRewardEarned BigInt @default(0) // Denormalized counter — sync via ReferralService
+  // ALTER TABLE referral_codes ADD CONSTRAINT referral_code_counters_non_negative
+  //   CHECK (total_referrals >= 0 AND total_reward_earned >= 0);
+  // TIDAK disimpan di DB — harus di-compute di service layer:
+  //   COUNT(*) FROM referral_rewards WHERE referrer_id = ? AND is_credited = false
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  relations ReferralRelation[] @relation("ReferralCodeRelation")
+
+  @@map("referral_codes")
+}
+
+model ReferralRelation {
+  id            String       @id @default(cuid())
+  referralCodeId String
+  referralCode   ReferralCode @relation("ReferralCodeRelation", fields: [referralCodeId], references: [id], onDelete: Restrict)
+
+  referrerId    String
+  referrer      User         @relation("ReferrerUser", fields: [referrerId], references: [id], onDelete: Restrict)
+  refereeId     String       @unique  // Satu user hanya bisa direferral sekali
+  referee       User         @relation("RefereeUser", fields: [refereeId], references: [id], onDelete: Restrict)
+  // ALTER TABLE referral_relations ADD CONSTRAINT referral_no_self
+  //   CHECK (referrer_id != referee_id);
+
+  isReferrerKyc  Boolean     @default(false)
+  isRefereeKyc   Boolean     @default(false)
+  isRewardActive Boolean     @default(false)
+
+  appliedAt     DateTime     @default(now())
+  rewardActivatedAt DateTime?
+
+  rewards       ReferralReward[]
+
+  @@index([referralCodeId])
+  @@index([referrerId])
+  @@map("referral_relations")
+}
+
+model ReferralReward {
+  id              String           @id @default(cuid())
+  relationId      String
+  relation        ReferralRelation @relation(fields: [relationId], references: [id], onDelete: Cascade)
+  referrerId      String
+  referrer        User             @relation(fields: [referrerId], references: [id], onDelete: Restrict)
+  triggeredByOrderId String
+  triggeredByOrder   Order         @relation(fields: [triggeredByOrderId], references: [id], onDelete: Restrict)
+
+  feeAmount       BigInt
+  rewardAmount    BigInt
+  isCredited      Boolean          @default(false)
+  creditedAt      DateTime?
+
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@index([relationId])      
+  @@index([referrerId])
+  @@index([referrerId, isCredited])
+  @@unique([triggeredByOrderId, referrerId])
+  @@map("referral_rewards")
+}
+
+// ============================================================
+// SUBSCRIPTIONS (Kahade Plus)
+// ============================================================
+
+model Subscription {
+  id          String             @id @default(cuid())
+  userId      String
+  user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  plan        SubscriptionPlan
+  status      SubscriptionStatus @default(PENDING)
+
+  price       BigInt             // 49000 atau 499000 (dalam sen)
+
+  // Di-set atomis saat subscription berhasil diaktifkan oleh SubscriptionService.
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  // ALTER TABLE subscriptions ADD CONSTRAINT subscription_period_valid
+  //   CHECK (
+  //     (current_period_start IS NULL AND current_period_end IS NULL) OR
+  //     (current_period_end > current_period_start)
+  //   );
+
+  isAutoRenew Boolean            @default(false)
+  cancelledAt DateTime?
+  cancelReason String?
+
+  paymentMethod  PaymentMethod?
+  paymentTxId    String?
+  paymentTx      PaymentTransaction? @relation(fields: [paymentTxId], references: [id], onDelete: SetNull)
+  // API GET /subscriptions/history (14.5) harus menggunakan field ini (lastPaymentAt),
+  // bukan "paymentAt" yang tidak ada di schema. Sudah difix di API v2.4.
+  lastPaymentAt  DateTime?
+  nextPaymentAt  DateTime?
+  paymentFailedAt DateTime?
+
+  feeSavingsUsed     BigInt      @default(0)
+  feeSavingsLimit    BigInt      @default(500000000) // Rp 5.000.000 dalam sen
+  // ALTER TABLE subscriptions ADD CONSTRAINT subscription_savings_valid
+  //   CHECK (fee_savings_used >= 0 AND fee_savings_limit >= 0
+  //     AND fee_savings_used <= fee_savings_limit);
+  // feeSavingsRemaining TIDAK disimpan di DB — computed di service layer:
+  // feeSavingsRemaining = feeSavingsLimit - feeSavingsUsed
+  // Dikembalikan di API GET /subscriptions/status sebagai convenience field.
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Hanya 1 ACTIVE subscription per user — enforce via raw migration:
+  // CREATE UNIQUE INDEX sub_one_active_per_user ON subscriptions(user_id)
+  // WHERE status = 'ACTIVE';
+
+  @@index([userId])
+  @@index([status])
+  @@index([userId, status]) // compound untuk query "apakah user X punya active subscription?"
+  @@index([paymentTxId])    // webhook lookup "find subscription by payment"
+  @@index([nextPaymentAt])  // [M-02] auto-renewal cron: base index untuk nextPaymentAt filter
+  @@index([status, isAutoRenew, nextPaymentAt])
+                            // WHERE status='ACTIVE' AND is_auto_renew=true AND next_payment_at<=now()
+  @@map("subscriptions")
+}
+
+// ============================================================
+// MEMBERSHIP
+// ============================================================
+
+model MembershipRankHistory {
+  id        String         @id @default(cuid())
+  userId    String
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  fromRank  MembershipRank?
+  toRank    MembershipRank
+  reason    String?
+
+  // Snapshot saat naik rank
+  totalOrders     Int
+  totalValue      BigInt
+  // ALTER TABLE membership_rank_histories ADD CONSTRAINT avg_rating_range
+  //   CHECK (average_rating BETWEEN 0 AND 5);
+  averageRating   Decimal  @db.Decimal(3, 2)
+  memberDays      Int
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt]) // query "riwayat rank terbaru user X" ORDER BY createdAt DESC
+  @@map("membership_rank_histories")
+}
+
+// ============================================================
+// SOCIAL: BLOCK & REPORT
+// ============================================================
+
+model Follow {
+  id          String   @id @default(cuid())
+  followerId  String
+  follower    User     @relation("FollowerUser", fields: [followerId], references: [id], onDelete: Cascade)
+  followingId String
+  following   User     @relation("FollowingUser", fields: [followingId], references: [id], onDelete: Cascade)
+
+  createdAt   DateTime @default(now())
+
+  @@unique([followerId, followingId])
+  @@index([followerId])
+  @@index([followingId])
+  @@map("follows")
+}
+
+model UserLink {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  platform     String   @db.VarChar(30)
+  url          String   @db.VarChar(500)
+  label        String?  @db.VarChar(50)
+  displayOrder Int      @default(0)
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([userId])
+  @@map("user_links")
+}
+
+model BlockList {
+  id          String   @id @default(cuid())
+  blockerId   String
+  blocker     User     @relation("BlockerUser", fields: [blockerId], references: [id], onDelete: Cascade)
+  blockedId   String
+  blocked     User     @relation("BlockedUser", fields: [blockedId], references: [id], onDelete: Cascade)
+
+  createdAt   DateTime @default(now())
+
+  @@unique([blockerId, blockedId])
+ 
+  // ALTER TABLE block_lists ADD CONSTRAINT block_no_self
+  //   CHECK (blocker_id != blocked_id);
+  @@index([blockerId])
+  @@index([blockedId])
+  @@map("block_lists")
+}
+
+model UserFavorite {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation("FavoriteOwner", fields: [userId], references: [id], onDelete: Cascade)
+  favoriteUserId  String
+  favoriteUser    User     @relation("FavoriteTarget", fields: [favoriteUserId], references: [id], onDelete: Cascade)
+
+  createdAt       DateTime @default(now())
+
+  @@unique([userId, favoriteUserId])
+  @@index([userId])
+  @@index([favoriteUserId])
+  @@map("user_favorites")
+}
+
+model UserSavedProfile {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation("SavedProfileOwner", fields: [userId], references: [id], onDelete: Cascade)
+  savedUserId   String
+  savedUser     User     @relation("SavedProfileTarget", fields: [savedUserId], references: [id], onDelete: Cascade)
+
+  createdAt     DateTime @default(now())
+
+  @@unique([userId, savedUserId])
+  @@index([userId, createdAt])
+  @@index([savedUserId])
+  @@map("user_saved_profiles")
+}
+
+model UserReport {
+  id          String         @id @default(cuid())
+  reporterId  String
+  reporter    User           @relation("ReportSubmitter", fields: [reporterId], references: [id], onDelete: Restrict)
+  targetId    String
+  target      User           @relation("ReportTarget", fields: [targetId], references: [id], onDelete: Restrict)
+
+  category    ReportCategory
+  description String         @db.VarChar(500)
+  evidenceUrls String[]
+
+  relatedOrderId String?
+  relatedMessageId String?  // Soft FK ke chat_messages.id — tidak ada FK constraint karena pesan bisa dihapus
+
+  status      ReportStatus   @default(PENDING)
+  reviewedBy  String?        // Admin ID (soft FK ke admin_users.id)
+  reviewedAt  DateTime?
+  resolution  String?        @db.Text
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([reporterId])
+  @@index([targetId])
+  @@index([status])
+  @@index([status, createdAt]) // admin report queue: status-filter + sort by date
+  @@index([createdAt])         // admin queue sorted by date
+  @@index([relatedOrderId])
+  @@index([reviewedBy]) // index untuk admin review lookup
+  @@map("user_reports")
+}
+
+// ============================================================
+// BADGES (Achievement system)
+// ============================================================
+
+model Badge {
+  id          String      @id @default(cuid())
+  name        String      @unique
+  iconUrl     String
+  description String?
+  createdAt   DateTime    @default(now())
+
+  userBadges  UserBadge[]
+
+  @@map("badges")
+}
+
+model UserBadge {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  badgeId   String
+  badge     Badge    @relation(fields: [badgeId], references: [id], onDelete: Cascade)
+  earnedAt  DateTime @default(now())
+
+  @@unique([userId, badgeId])
+  @@index([userId])
+  @@map("user_badges")
+}
+
+// ============================================================
+// PASSWORD HISTORY
+// ============================================================
+
+model PasswordHistory {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  passwordHash String   // bcrypt hash dari password lama — digunakan untuk cek password cycling
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+  @@map("password_histories")
+}
+
+// ============================================================
+// ADMIN
+// ============================================================
+
+model AdminUser {
+  id          String     @id @default(cuid())
+  adminId     String     @unique // Format: ADMIN-XXXXX
+  fullName    String
+  email       String     @unique
+  password    String     // bcrypt cost 14
+  role        AdminRole
+
+  isActive    Boolean    @default(true)
+  lastLoginAt DateTime?
+  lastLoginIp String?
+  mfaSecret   String?    // TOTP wajib untuk admin (encrypted AES-256)
+  isMfaEnabled Boolean   @default(false)
+
+  failedLoginAttempts Int      @default(0)
+  lockedUntil         DateTime?
+
+  createdBy   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  deletedAt   DateTime?
+
+  // Relations
+  auditLogs        AdminAuditLog[]
+  kycReviews       KycRequest[]        @relation("KycReviewer")
+  assignedDisputes Dispute[]           @relation("DisputeAssignedAdmin")
+  disputeDecisions DisputeDecision[]   @relation("DisputeDecider")
+ 
+  disputeEvidences DisputeEvidence[]   @relation("DisputeEvidenceAdmin")
+  disputeMessages  DisputeMessage[]    @relation("DisputeMessageAdmin")
+
+  @@index([isActive])    // query "semua admin aktif"
+  @@index([deletedAt])   // soft-delete query optimization
+  @@index([createdBy])   // query "semua admin yang dibuat oleh super admin X"
+  @@map("admin_users")
+}
+
+model AdminAuditLog {
+  id          String      @id @default(cuid())
+  adminId     String
+  admin       AdminUser   @relation(fields: [adminId], references: [id], onDelete: Restrict)
+
+  action      AuditAction
+  targetType  String?
+  targetId    String?
+
+  description String      @db.Text
+  before      Json?
+  after       Json?
+
+  ipAddress   String
+  userAgent   String?
+  createdAt   DateTime    @default(now())
+
+  @@index([adminId])
+  @@index([targetId, targetType])
+  @@index([createdAt])
+  @@index([action])   // filter audit logs by action type
+  @@map("admin_audit_logs")
+}
+
+// ============================================================
+// SYSTEM
+// ============================================================
+
+model SystemConfig {
+  id          String              @id @default(cuid())
+  key         String              @unique
+  value       String              @db.Text
+  description String?
+  dataType    SystemConfigDataType @default(STRING)
+  isPublic    Boolean             @default(false)
+
+  updatedBy   String?             // Admin ID (soft FK ke admin_users.id)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("system_configs")
+}
+
+model WebhookLog {
+  id            String   @id @default(cuid())
+  source        String   // 'MIDTRANS', 'MIDTRANS_IRIS'
+  event         String
+  payload       Json
+  headers       Json?
+  transactionId String?
+  // Stable key: provider + transaction id + status. Nullable for legacy rows.
+  eventKey      String?  @unique
+
+  isProcessed Boolean  @default(false)
+  processedAt DateTime?
+  errorMessage String?
+  retryCount       Int      @default(0)
+  lastAttemptAt   DateTime?
+  nextRetryAt     DateTime?
+  deadLetteredAt  DateTime?
+
+  ipAddress   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([source, isProcessed])
+  @@index([source, event])
+  @@index([createdAt])
+  @@index([transactionId])
+  @@index([source, isProcessed, nextRetryAt])
+  @@index([deadLetteredAt])
+  @@map("webhook_logs")
+}
+
+model AuditLog {
+  id          String          @id @default(cuid())
+  userId      String?
+  user        User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  // dengan AdminAuditLog.action yang sudah menggunakan AuditAction enum.
+  action      UserAuditAction
+  entityType  String
+  entityId    String
+  description String      @db.Text
+  before      Json?
+  after       Json?
+
+  ipAddress   String?
+  userAgent   String?
+  requestId   String?     // X-Request-ID header
+
+  createdAt   DateTime    @default(now())
+
+  @@index([userId])
+  @@index([entityId, entityType])
+  @@index([createdAt])
+  @@index([action])   // filter by action type
+  @@index([requestId]) // request tracing dan debugging via X-Request-ID
+  @@map("audit_logs")
+}
+
+// ============================================================
+// ORDER LINKS (Transaksi via Link)
+// ============================================================
+
+model OrderLink {
+  id              String          @id @default(cuid())
+  linkId          String          @unique
+  token           String          @unique
+  creatorId       String
+  creator         User            @relation("OrderLinkCreator", fields: [creatorId], references: [id], onDelete: Restrict)
+  creatorRole     UserRole
+
+  title           String          @db.VarChar(100)
+  description     String          @db.VarChar(500)
+  orderType       OrderType
+  orderValue      BigInt
+  feeResponsibility FeeResponsibility
+  deliveryDeadlineDays Int
+  counterpartUsername String?
+
+  status          OrderLinkStatus @default(ACTIVE)
+  expiresAt       DateTime
+  acceptedAt      DateTime?
+  acceptedById    String?
+  acceptedBy      User?           @relation("OrderLinkAcceptor", fields: [acceptedById], references: [id], onDelete: SetNull)
+
+  orders          Order[]
+
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([creatorId])
+  @@index([status])
+  @@index([status, expiresAt])
+  @@map("order_links")
+}
+
+// ============================================================
+// DELIVERY PROOF
+// ============================================================
+
+model DeliveryProof {
+  id              String              @id @default(cuid())
+  orderId         String
+  order           Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  submittedBy     String
+  submitter       User                @relation("DeliveryProofSubmitter", fields: [submittedBy], references: [id], onDelete: Restrict)
+  description     String              @db.Text
+  fileUrls        String[]
+  linkUrls        String[]
+
+  status          DeliveryProofStatus @default(SUBMITTED)
+  reviewWindowEnd DateTime?
+  reviewedAt      DateTime?
+  rejectionNote   String?
+
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  @@index([orderId])
+  @@index([status])
+  @@index([status, reviewWindowEnd])
+  @@map("delivery_proofs")
+}
+
+// ============================================================
+// RATING REPLY
+// ============================================================
+
+model RatingReply {
+  id          String   @id @default(cuid())
+  ratingId    String   @unique
+  rating      Rating   @relation(fields: [ratingId], references: [id], onDelete: Cascade)
+
+  replierId   String
+  replier     User     @relation("RatingReplies", fields: [replierId], references: [id], onDelete: Restrict)
+  content     String   @db.VarChar(500)
+
+  isHidden    Boolean  @default(false)
+  hiddenAt    DateTime?
+  hiddenBy    String?
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([ratingId])
+  @@index([replierId])
+  @@map("rating_replies")
+}
+
+// ============================================================
+// PROFILE Q&A
+// ============================================================
+
+model ProfileQuestion {
+  id          String   @id @default(cuid())
+  askerId     String
+  asker       User     @relation("QuestionAsker", fields: [askerId], references: [id], onDelete: Cascade)
+  receiverId  String
+  receiver    User     @relation("QuestionReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  question    String   @db.VarChar(500)
+  answer      String?  @db.VarChar(1000)
+  answeredAt  DateTime?
+
+  isPublic    Boolean  @default(true)
+  isHidden    Boolean  @default(false)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([receiverId])
+  @@index([askerId])
+  @@index([receiverId, isPublic, isHidden])
+  @@map("profile_questions")
+
+  comments    ProfileQuestionComment[]
+}
+
+model ProfileQuestionComment {
+  id          String   @id @default(cuid())
+  questionId  String
+  question    ProfileQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  authorId    String
+  author      User     @relation("CommentAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  parentId    String?
+  parent      ProfileQuestionComment? @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies     ProfileQuestionComment[] @relation("CommentReplies")
+
+  content     String   @db.VarChar(1000)
+  isHidden    Boolean  @default(false)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([questionId])
+  @@index([authorId])
+  @@index([parentId])
+  @@map("profile_question_comments")
+}
+
+// ============================================================
+// CAMPAIGNS (Promo & Marketing)
+// ============================================================
+
+model Campaign {
+  id              String         @id @default(cuid())
+  campaignId      String         @unique
+  name            String
+  description     String?        @db.Text
+  type            CampaignType
+  status          CampaignStatus @default(DRAFT)
+
+  discountValue   BigInt?
+  discountPercent Decimal?       @db.Decimal(5, 2)
+  maxDiscount     BigInt?
+  freeTransactions Int?
+
+  targetAudience  String?
+  maxRedemptions  Int?
+  currentRedemptions Int         @default(0)
+  rolloutPercent  Int?
+
+  startsAt        DateTime
+  endsAt          DateTime
+  createdBy       String
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([status])
+  @@index([status, startsAt, endsAt])
+  @@index([type])
+  @@map("campaigns")
+}
+
+// ============================================================
+// SCHEDULED WITHDRAWALS
+// ============================================================
+
+model ScheduledWithdrawal {
+  id              String      @id @default(cuid())
+  userId          String
+  user            User        @relation("UserScheduledWithdrawals", fields: [userId], references: [id], onDelete: Cascade)
+  bankAccountId   String
+  bankAccount     BankAccount @relation("BankAccountScheduledWithdrawals", fields: [bankAccountId], references: [id], onDelete: Restrict)
+  dayOfWeek       Int
+  minAmount       BigInt      @default(0)
+  isActive        Boolean     @default(true)
+  lastExecutedAt  DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  @@unique([userId, dayOfWeek])
+  @@index([userId])
+  @@index([isActive, dayOfWeek])
+  @@map("scheduled_withdrawals")
+}
+
+// ============================================================
+// FAQ / HELP CENTER
+// ============================================================
+
+model FaqCategory {
+  id          String    @id @default(cuid())
+  slug        String    @unique
+  name        String
+  nameEn      String?
+  description String?
+  descriptionEn String?
+  icon        String?
+  sortOrder   Int       @default(0)
+  isActive    Boolean   @default(true)
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  items       FaqItem[]
+
+  @@index([isActive, sortOrder])
+  @@map("faq_categories")
+}
+
+model FaqItem {
+  id          String      @id @default(cuid())
+  categoryId  String
+  category    FaqCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  question    String      @db.Text
+  questionEn  String?     @db.Text
+  answer      String      @db.Text
+  answerEn    String?     @db.Text
+  sortOrder   Int         @default(0)
+  isActive    Boolean     @default(true)
+  viewCount   Int         @default(0)
+
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@index([categoryId])
+  @@index([isActive, sortOrder])
+  @@index([viewCount])
+  @@map("faq_items")
+}
+
+// ============================================================
+// TRANSACTION TEMPLATES
+// ============================================================
+
+model TransactionTemplate {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation("UserTransactionTemplates", fields: [userId], references: [id], onDelete: Cascade)
+  name            String
+  title           String
+  description     String?   @db.Text
+  orderType       OrderType
+  orderValue      BigInt
+  feeResponsibility FeeResponsibility @default(BUYER)
+  deliveryDeadlineDays Int  @default(3)
+  isDefault       Boolean   @default(false)
+  usageCount      Int       @default(0)
+  lastUsedAt      DateTime?
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([userId, isDefault])
+  @@map("transaction_templates")
+}
+
+model SupportTicket {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation("UserSupportTickets", fields: [userId], references: [id], onDelete: Cascade)
+  subject     String   @db.VarChar(200)
+  message     String   @db.Text
+  category    SupportTicketCategory @default(GENERAL)
+  orderId     String?
+  status      SupportTicketStatus   @default(OPEN)
+  attachments Json                  @default("[]")
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  replies     SupportTicketReply[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("support_tickets")
+}
+
+model SupportTicketReply {
+  id          String   @id @default(cuid())
+  ticketId    String
+  ticket      SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  senderId    String
+  senderType  SupportTicketSenderType @default(USER)
+  message     String   @db.Text
+
+  createdAt   DateTime @default(now())
+
+  @@index([ticketId])
+  @@map("support_ticket_replies")
+}
+
+model DisputeMessage {
+  id          String   @id @default(cuid())
+  disputeId   String
+  dispute     Dispute  @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+  senderId    String?
+  sender      User?    @relation("DisputeMessageSender", fields: [senderId], references: [id], onDelete: Restrict)
+  adminId     String?
+  admin       AdminUser? @relation("DisputeMessageAdmin", fields: [adminId], references: [id], onDelete: SetNull)
+  message     String   @db.Text
+  attachments Json     @default("[]")
+
+  createdAt   DateTime @default(now())
+
+  @@index([disputeId])
+  @@index([disputeId, createdAt])
+  @@index([adminId])
+  @@map("dispute_messages")
+}
+
+model UserShowcase {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title       String   @db.VarChar(100)
+  description String?  @db.VarChar(500)
+  imageUrl    String?
+  priceMin    BigInt?
+  priceMax    BigInt?
+  isActive    Boolean  @default(true)
+  sortOrder   Int      @default(0)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId, isActive, sortOrder])
+  @@map("user_showcases")
+}
+
+enum DisputeCallStatus {
+  REQUESTED
+  ACCEPTED
+  IN_PROGRESS
+  ENDED
+  REJECTED
+  EXPIRED
+}
+
+model DisputeCall {
+  id              String            @id @default(cuid())
+  disputeId       String
+  dispute         Dispute           @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+
+  requestedById   String
+  requestedBy     User              @relation("DisputeCallRequester", fields: [requestedById], references: [id], onDelete: Restrict)
+
+  status          DisputeCallStatus @default(REQUESTED)
+
+  requestedAt     DateTime          @default(now())
+  acceptedAt      DateTime?
+  startedAt       DateTime?
+  endedAt         DateTime?
+  durationSeconds Int?
+
+  maxDurationSeconds Int            @default(900)
+
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  @@index([disputeId])
+  @@index([disputeId, status])
+  @@index([requestedById])
+  @@map("dispute_calls")
+}
+
+
+enum IdempotencyRecordStatus {
+  IN_FLIGHT
+  COMPLETED
+}
+
+model IdempotencyRecord {
+  id            String                 @id @default(cuid())
+  userId        String?
+  user          User?                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  key           String
+  // SHA-256 of the canonical request body; reusing a key with a different payload is rejected.
+  requestHash   String?
+  // Includes HTTP method + route + user scope + key to prevent cross-endpoint replay.
+  scopeKey      String                 @unique
+  status        IdempotencyRecordStatus @default(IN_FLIGHT)
+  responseBody  Json?
+  statusCode    Int                    @default(200)
+  errorMessage  String?                @db.Text
+  createdAt     DateTime               @default(now())
+  updatedAt     DateTime               @updatedAt
+  completedAt   DateTime?
+  expiresAt     DateTime
+
+  @@index([userId, key])
+  @@index([expiresAt])
+  @@index([status, expiresAt])
+  @@map("idempotency_records")
+}

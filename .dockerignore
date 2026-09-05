@@ -1,0 +1,54 @@
+# DEP-06 FIX: Exclude files that should never enter the Docker build context.
+# Without this file, secrets, test artifacts and dev tooling bloat the image.
+
+# Environment / secrets — NEVER include in image
+.env
+.env.*
+!.env.example
+
+# Node dependencies — rebuilt in Docker
+node_modules/
+
+# TypeScript build output (builder stage starts fresh)
+dist/
+
+# Test artifacts
+coverage/
+*.spec.ts
+test/
+jest*.config.*
+
+# Git
+.git/
+.gitignore
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker itself
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# CI
+.github/
+
+# Dev scripts (but keep scripts/ — entrypoint.sh needs run-constraints.sh)
+
+# Documentation
+*.md
+AUDIT_FIXES*.md
+PROJECT_SUMMARY.md
+README.md
+
+# Deploy configs (mounted separately in production)
+deploy/

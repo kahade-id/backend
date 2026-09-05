@@ -1,0 +1,3 @@
+# Kahade operational monitoring and retention
+*/5 * * * * root flock -n /run/lock/kahade-ops-health.lock /usr/local/sbin/kahade-ops-health-check >> /var/log/kahade/ops-health-cron.log 2>&1
+15 3 * * * root flock -n /run/lock/kahade-backup-retention.lock /usr/local/sbin/kahade-backup-retention >> /var/log/kahade/backup-retention.log 2>&1

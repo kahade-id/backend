@@ -1,0 +1,3 @@
+-- AlterEnum
+ALTER TYPE "UserAuditAction" ADD VALUE 'DEVICE_TRUSTED';
+ALTER TYPE "UserAuditAction" ADD VALUE 'DEVICE_UNTRUSTED';

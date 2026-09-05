@@ -1,0 +1,23 @@
+export declare function initializeCrypto(config: {
+    aesSecretKey: string;
+    aesKdfSalt?: string;
+    hmacSecretKey: string;
+    previousAesSecretKey?: string;
+    kycNikEncryptionKey?: string;
+    kycKtpEncryptionKey?: string;
+    kycSelfieEncryptionKey?: string;
+    bcryptRounds?: number;
+}): void;
+export declare function isCryptoInitialized(): boolean;
+export declare function getBcryptRounds(): number;
+export declare function encryptAES(plaintext: string): Promise<string>;
+export declare function encryptKycNik(plaintext: string): Promise<string>;
+export declare function encryptKycKtp(plaintext: string): Promise<string>;
+export declare function encryptKycSelfie(plaintext: string): Promise<string>;
+export declare function decryptAES(ciphertext: string): Promise<string>;
+export declare function hmacSHA256(value: string): string;
+export declare function hmacPinDigest(pepper: string, pin: string): string;
+export declare function bcryptHash(value: string, rounds?: number): Promise<string>;
+export declare function bcryptCompare(value: string, hash: string): Promise<boolean>;
+export declare function sha256(value: string): string;
+export declare function argon2HashNik(value: string): Promise<string>;

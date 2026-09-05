@@ -1,0 +1,12 @@
+export declare function generateUserId(): string;
+export declare function generateOrderId(serial: number): string;
+export declare function generateKycId(serial: number): string;
+export declare function generateDisputeId(serial: number): string;
+export declare function generateWalletTxId(serial: number): string;
+export declare function generatePaymentTxId(serial: number): string;
+export declare function generateNotifId(): string;
+export declare function generateAdminId(): string;
+export declare function generateReferralCode(): string;
+export declare function generateOrderLinkId(serial: number): string;
+export declare function generateOrderLinkToken(): string;
+export declare function generateCampaignId(serial: number): string;

@@ -1,0 +1,18 @@
+import type { Dayjs } from 'dayjs';
+export declare function toWIB(date?: Date): Dayjs;
+export declare function startOfDayWIB(date?: Date): Date;
+export declare function endOfDayWIB(date?: Date): Date;
+export declare function formatWIBDate(date?: Date): string;
+export declare function parseWIBCalendarDate(value: string): Date | undefined;
+export declare function parseDateBoundaryWIB(value: string, boundary: 'start' | 'end'): Date | undefined;
+export declare function addMinutes(date: Date, minutes: number): Date;
+export declare function addHours(date: Date, hours: number): Date;
+export declare function addDays(date: Date, days: number): Date;
+export declare function isExpired(date: Date): boolean;
+export declare function isFuture(date: Date): boolean;
+export declare function startOfDay(date?: Date): Date;
+export declare function endOfDay(date?: Date): Date;
+export declare function toISOString(date: Date): string;
+export declare function diffInDays(date1: Date, date2: Date): number;
+export declare function diffInHours(date1: Date, date2: Date): number;
+export declare function diffInMinutes(date1: Date, date2: Date): number;

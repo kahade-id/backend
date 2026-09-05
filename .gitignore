@@ -1,0 +1,21 @@
+# Runtime secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Runtime/build noise
+*.log
+coverage/
+.nyc_output/
+.DS_Store
+
+# Local IDE files
+.vscode/
+.idea/
+
+# Local uploads and backups
+uploads/
+backups/

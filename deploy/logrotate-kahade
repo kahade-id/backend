@@ -1,0 +1,11 @@
+/var/log/kahade/pm2-out.log /var/log/kahade/pm2-error.log /var/log/kahade/ops-health.log {
+    daily
+    rotate 14
+    size 50M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su kahade kahade
+}

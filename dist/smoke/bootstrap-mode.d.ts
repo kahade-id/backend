@@ -1,0 +1,10 @@
+import { Type } from '@nestjs/common';
+export declare const SMOKE_MODE_ENV = "SMOKE_MODE";
+export declare const SMOKE_ENV_FILE_ENV = "SMOKE_ENV_FILE";
+export type BootstrapMode = 'normal' | 'read-only-smoke';
+type RuntimeEnvironment = NodeJS.ProcessEnv;
+export declare function getBootstrapMode(env?: RuntimeEnvironment): BootstrapMode;
+export declare function selectRootModule(mode: BootstrapMode, normalModule: Type<unknown>, smokeModule: Type<unknown>): Type<unknown>;
+export declare function getSmokeLoopbackHost(env?: RuntimeEnvironment): string;
+export declare function getSmokeEnvFile(env?: RuntimeEnvironment): string;
+export {};

@@ -1,0 +1,198 @@
+# Docker Compose for local development and staging environments.
+# Usage:
+#   Local dev:  docker compose up -d
+#   Staging:    docker compose -f docker-compose.yml -f docker-compose.staging.yml up -d
+
+version: '3.9'
+
+services:
+  # ─── Nginx Reverse Proxy ────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: kahade-nginx
+    restart: unless-stopped
+    mem_limit: 128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/log/nginx
+      - /var/run
+    ports:
+      - "127.0.0.1:${NGINX_PORT:-80}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - kahade-network
+
+  # ─── Application ──────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ../..
+      dockerfile: apps/backend/Dockerfile
+      target: runtime
+    container_name: kahade-api
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1.0
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/.cache
+    ports:
+      - "127.0.0.1:${PORT:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-kahade}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-kahade_db}?connection_limit=20&pool_timeout=10
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      BULL_REDIS_URL: redis://:${REDIS_PASSWORD}@bull-redis:6380
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      bull-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - kahade-network
+
+  # ─── PostgreSQL ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: kahade-postgres
+    restart: unless-stopped
+    mem_limit: 512m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kahade}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-kahade_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kahade} -d ${POSTGRES_DB:-kahade_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kahade-network
+
+  # ─── Redis (Main) ──────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: kahade-redis
+    restart: unless-stopped
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+      --save 60 1
+      --appendonly yes
+      --appendfsync everysec
+      --requirepass ${REDIS_PASSWORD}
+    environment:
+      - REDISCLI_AUTH=${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - kahade-network
+
+  # ─── Redis (Bull Queues) ────────────────────────────────────────────────
+  bull-redis:
+    image: redis:7-alpine
+    container_name: kahade-bull-redis
+    restart: unless-stopped
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    command: >
+      redis-server
+      --port 6380
+      --maxmemory 256mb
+      --maxmemory-policy noeviction
+      --save 60 1
+      --appendonly yes
+      --appendfsync everysec
+      --requirepass ${REDIS_PASSWORD}
+    environment:
+      - REDISCLI_AUTH=${REDIS_PASSWORD}
+    volumes:
+      - bull_redis_data:/data
+    ports:
+      - "127.0.0.1:6380:6380"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6380", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - kahade-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  bull_redis_data:
+    driver: local
+
+networks:
+  kahade-network:
+    driver: bridge

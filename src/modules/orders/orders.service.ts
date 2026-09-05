@@ -1072,7 +1072,7 @@ export class OrdersService {
       all_transitions AS (
         SELECT
           h."orderId",
-          h."toStatus",
+          h."toStatus"::text AS "toStatus",
           h."createdAt",
           LEAD(h."createdAt") OVER (PARTITION BY h."orderId" ORDER BY h."createdAt" ASC) AS next_ts
         FROM "order_status_histories" h
@@ -1081,7 +1081,7 @@ export class OrdersService {
       creation_durations AS (
         SELECT
           co.id AS "orderId",
-          'WAITING_CONFIRMATION' AS "toStatus",
+          'WAITING_CONFIRMATION'::text AS "toStatus",
           co.order_created_at AS "createdAt",
           MIN(h."createdAt") AS next_ts
         FROM completed_orders co

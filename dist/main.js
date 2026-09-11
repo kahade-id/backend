@@ -227,7 +227,7 @@ async function bootstrap() {
         },
         credentials: true,
         methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-        allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID', 'Idempotency-Key', 'X-2FA-Code', 'X-CSRF-Token'],
+        allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID', 'Idempotency-Key', 'X-2FA-Code', 'X-CSRF-Token', 'X-Device-Id', 'X-Device-Info', 'X-App-Version', 'X-Platform'],
     });
     if (!isReadOnlySmoke) {
         app.useWebSocketAdapter(new ws_adapter_1.CorsIoAdapter(app, rawCorsOrigins));

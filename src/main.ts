@@ -237,7 +237,7 @@ async function bootstrap(): Promise<void> {
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID', 'Idempotency-Key', 'X-2FA-Code', 'X-CSRF-Token'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID', 'Idempotency-Key', 'X-2FA-Code', 'X-CSRF-Token', 'X-Device-Id', 'X-Device-Info', 'X-App-Version', 'X-Platform'],
   });
 
   if (!isReadOnlySmoke) {

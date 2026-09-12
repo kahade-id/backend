@@ -28,6 +28,7 @@ import {
   DeadlineReminderService,
   ProofExpiryService,
   WebhookRetryService,
+  QuestionReminderService,
 } from './services';
 import { AdminFinanceModule } from '../admin/finance/admin-finance.module';
 import { WithdrawalsModule } from '../withdrawals/withdrawals.module';
@@ -73,6 +74,7 @@ import { safeErrorMessage } from '../../common/utils/background-reliability.util
     DeadlineReminderService,
     ProofExpiryService,
     WebhookRetryService,
+    QuestionReminderService,
     WalletTxSerialService,
     MidtransService,
   ],

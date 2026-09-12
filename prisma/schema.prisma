@@ -266,6 +266,8 @@ enum NotificationType {
   BADGE_AWARDED
   RANK_UPGRADED
   ORDER_DELIVERED
+  // Section 4: pengingat pertanyaan profil yang belum dijawab setelah 48 jam.
+  QUESTION_UNANSWERED_REMINDER
   DATA_EXPORT_READY
   SYSTEM_MAINTENANCE
   SYSTEM_ANNOUNCEMENT
@@ -702,6 +704,8 @@ model User {
   questionsAsked          ProfileQuestion[]     @relation("QuestionAsker")
   questionsReceived       ProfileQuestion[]     @relation("QuestionReceiver")
   questionComments        ProfileQuestionComment[] @relation("CommentAuthor")
+  // Section 4: upvote pertanyaan profil
+  questionUpvotes         ProfileQuestionUpvote[]
   supportTickets          SupportTicket[]          @relation("UserSupportTickets")
   showcaseItems           UserShowcase[]
   // Section 3: interaksi sosial pada showcase (like & komentar)
@@ -2337,6 +2341,21 @@ model ProfileQuestion {
 
   isPublic    Boolean  @default(true)
   isHidden    Boolean  @default(false)
+  /// Section 4: `isHidden` polos digantikan alasan kategoris. Menyembunyikan
+  /// pertanyaan tanpa mengisi alasan ditolak di level service dan di level DB
+  /// (constraint profile_question_hidden_fields_consistent).
+  hiddenReason ContentHiddenReason?
+  hiddenAt     DateTime?
+  hiddenBy     String?  @db.VarChar(100)
+
+  /// Section 4: jumlah upvote. Denormalisasi + atomic increment (pola
+  /// TransactionTemplatesService.recordUsage) supaya urutan "terpopuler" tidak
+  /// perlu COUNT(*) per baris.
+  upvoteCount  Int      @default(0)
+  /// Section 4: penanda pengingat 48 jam sudah dikirim. Sekali per pertanyaan —
+  /// job reminder mengklaim baris ini dengan updateMany bersyarat sehingga dua
+  /// instance yang balapan tidak mengirim dua notifikasi.
+  reminderSentAt DateTime?
 
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -2344,9 +2363,32 @@ model ProfileQuestion {
   @@index([receiverId])
   @@index([askerId])
   @@index([receiverId, isPublic, isHidden])
+  // Job reminder 48 jam: scan pertanyaan belum dijawab yang belum diingatkan.
+  @@index([answeredAt, reminderSentAt, createdAt])
+  // Urutan "terpopuler" di Q&A publik.
+  @@index([receiverId, isPublic, isHidden, upvoteCount])
   @@map("profile_questions")
 
   comments    ProfileQuestionComment[]
+  upvotes     ProfileQuestionUpvote[]
+}
+
+/// Section 4 — upvote pertanyaan profil. Unique (userId, questionId) ditegakkan
+/// di DB agar dua request balapan tidak menghasilkan upvote ganda / counter
+/// melenceng.
+model ProfileQuestionUpvote {
+  id         String          @id @default(cuid())
+  questionId String
+  question   ProfileQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt  DateTime        @default(now())
+
+  @@unique([userId, questionId])
+  @@index([questionId, createdAt, id])
+  @@index([userId])
+  @@map("profile_question_upvotes")
 }
 
 model ProfileQuestionComment {
@@ -2361,6 +2403,11 @@ model ProfileQuestionComment {
 
   content     String   @db.VarChar(1000)
   isHidden    Boolean  @default(false)
+  /// Section 4: alasan moderasi kategoris, sama seperti ProfileQuestion dan
+  /// ShowcaseComment (ContentHiddenReason).
+  hiddenReason ContentHiddenReason?
+  hiddenAt     DateTime?
+  hiddenBy     String?  @db.VarChar(100)
 
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt

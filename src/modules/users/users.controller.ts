@@ -38,6 +38,8 @@ import { UploadAvatarDto } from './dto/upload-avatar.dto';
 import { ConfirmHeaderDto } from './dto/confirm-header.dto';
 import { RequestAccountDeletionDto } from './dto/request-account-deletion.dto';
 import { AskQuestionDto, AnswerQuestionDto, AddCommentDto } from './dto/profile-question.dto';
+import { HideContentDto } from './dto/moderate-content.dto';
+import { QuestionSort } from './profile-qa.service';
 // Section 3: showcase dipindah ke module sendiri; DTO lama users/dto/showcase.dto.ts dihapus.
 import { CreateShowcaseItemDto, UpdateShowcaseItemDto } from '../showcase/dto/showcase-item.dto';
 import { AttachShowcaseImagesDto, ReorderShowcaseImagesDto } from '../showcase/dto/showcase-image.dto';
@@ -482,14 +484,22 @@ export class UsersController {
   }
 
   @Get('me/questions')
-  @ApiOperation({ summary: 'Get my received or asked questions' })
+  @ApiOperation({
+    summary: 'Get my received or asked questions',
+    description:
+      'Section 4: `sort=top` mengurutkan berdasarkan jumlah upvote (terpopuler lebih ' +
+      'dulu), berguna untuk memilih pertanyaan mana yang paling ditunggu jawabannya. ' +
+      'Default `recent` (terbaru lebih dulu). Tiap pertanyaan menyertakan `upvoteCount` ' +
+      'dan `isUpvotedByViewer`.',
+  })
   async getMyQuestions(
     @CurrentUser('sub') userId: string,
     @Query('type', new DefaultValuePipe('received')) type: 'received' | 'asked',
     @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
     @Query('limit', new DefaultValuePipe(20), ParseIntPipe, new ClampLimitPipe()) limit: number,
+    @Query('sort', new DefaultValuePipe('recent')) sort: QuestionSort,
   ): Promise<object> {
-    return this.profileQAService.getMyQuestions(userId, type, page, limit);
+    return this.profileQAService.getMyQuestions(userId, type, page, limit, sort);
   }
 
   @UseGuards(UserThrottleGuard)
@@ -729,13 +739,49 @@ export class UsersController {
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Get(':username/questions')
-  @ApiOperation({ summary: 'Get public Q&A for a profile' })
+  @ApiOperation({
+    summary: 'Get public Q&A for a profile',
+    description:
+      'Hanya pertanyaan publik yang sudah dijawab dan tidak disembunyikan. Section 4 menambah ' +
+      '`sort=recent|top` (top = upvote terbanyak) serta `upvoteCount` dan `isUpvotedByViewer` ' +
+      'per pertanyaan. Viewer yang terlibat relasi block dengan pemilik profil mendapat ' +
+      '403 USER_BLOCKED, sama seperti GET /users/:username.',
+  })
   async getProfileQuestions(
     @Param('username', ParseUsernamePipe) username: string,
+    @CurrentUser('sub') viewerId: string | null,
     @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
     @Query('limit', new DefaultValuePipe(20), ParseIntPipe, new ClampLimitPipe()) limit: number,
+    @Query('sort', new DefaultValuePipe('recent')) sort: QuestionSort,
   ): Promise<object> {
-    return this.profileQAService.getProfileQuestions(username, page, limit);
+    return this.profileQAService.getProfileQuestions(username, page, limit, sort, viewerId);
+  }
+
+  // Section 4: upvote pertanyaan profil. Satu upvote per (user, pertanyaan) —
+  // ditegakkan unique constraint di DB, dan counternya bergerak dalam transaksi
+  // yang sama dengan barisnya.
+  @Post('questions/:questionId/upvote')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Idempotency()
+  @ApiOperation({ summary: 'Upvote a profile question' })
+  async upvoteQuestion(
+    @CurrentUser('sub') userId: string,
+    @Param('questionId', ParseIdPipe) questionId: string,
+  ): Promise<object> {
+    return this.profileQAService.upvoteQuestion(userId, questionId);
+  }
+
+  @Delete('questions/:questionId/upvote')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Idempotency()
+  @ApiOperation({ summary: 'Remove your upvote from a profile question' })
+  async removeQuestionUpvote(
+    @CurrentUser('sub') userId: string,
+    @Param('questionId', ParseIdPipe) questionId: string,
+  ): Promise<object> {
+    return this.profileQAService.removeUpvote(userId, questionId);
   }
 
   @Put('questions/:questionId/answer')
@@ -757,6 +803,37 @@ export class UsersController {
     @Param('questionId', ParseIdPipe) questionId: string,
   ): Promise<{ message: string }> {
     return this.profileQAService.deleteQuestion(userId, questionId);
+  }
+
+  // Section 4: moderasi dengan alasan kategoris (menggantikan isHidden polos).
+  @Post('questions/:questionId/hide')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @Idempotency()
+  @ApiOperation({
+    summary: 'Hide a question on your profile',
+    description:
+      'Hanya pemilik profil. `reason` wajib diisi: SPAM, INAPPROPRIATE, HARASSMENT, atau OTHER. ' +
+      'Pertanyaan tersembunyi hilang dari Q&A publik seketika (tidak ada cache).',
+  })
+  async hideQuestion(
+    @CurrentUser('sub') userId: string,
+    @Param('questionId', ParseIdPipe) questionId: string,
+    @Body() dto: HideContentDto,
+  ): Promise<object> {
+    return this.profileQAService.hideQuestion(userId, questionId, dto.reason);
+  }
+
+  @Post('questions/:questionId/unhide')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @Idempotency()
+  @ApiOperation({ summary: 'Unhide a question on your profile' })
+  async unhideQuestion(
+    @CurrentUser('sub') userId: string,
+    @Param('questionId', ParseIdPipe) questionId: string,
+  ): Promise<object> {
+    return this.profileQAService.unhideQuestion(userId, questionId);
   }
 
   @Post('questions/:questionId/comments')
@@ -791,6 +868,31 @@ export class UsersController {
     @Param('commentId', ParseIdPipe) commentId: string,
   ): Promise<{ message: string }> {
     return this.profileQAService.deleteComment(userId, commentId);
+  }
+
+  @Post('comments/:commentId/hide')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @Idempotency()
+  @ApiOperation({ summary: 'Hide a Q&A comment on your profile (reason required)' })
+  async hideComment(
+    @CurrentUser('sub') userId: string,
+    @Param('commentId', ParseIdPipe) commentId: string,
+    @Body() dto: HideContentDto,
+  ): Promise<object> {
+    return this.profileQAService.hideComment(userId, commentId, dto.reason);
+  }
+
+  @Post('comments/:commentId/unhide')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @Idempotency()
+  @ApiOperation({ summary: 'Unhide a Q&A comment on your profile' })
+  async unhideComment(
+    @CurrentUser('sub') userId: string,
+    @Param('commentId', ParseIdPipe) commentId: string,
+  ): Promise<object> {
+    return this.profileQAService.unhideComment(userId, commentId);
   }
 
   @Public()

@@ -6,8 +6,14 @@ import { PrismaService } from '../../../prisma/prisma.service';
 const mockPrisma: any = {
   user: { findUnique: jest.fn() },
   blockList: { findFirst: jest.fn() },
-  profileQuestion: { create: jest.fn(), findUnique: jest.fn(), update: jest.fn(), findMany: jest.fn(), count: jest.fn(), delete: jest.fn() },
-  profileQuestionComment: { findUnique: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn(), delete: jest.fn() },
+  profileQuestion: {
+    create: jest.fn(), findUnique: jest.fn(), findFirst: jest.fn(), update: jest.fn(), updateMany: jest.fn(),
+    findMany: jest.fn(), count: jest.fn(), delete: jest.fn(),
+  },
+  profileQuestionComment: { findUnique: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn(), delete: jest.fn(), update: jest.fn() },
+  // Section 4: upvote pertanyaan.
+  profileQuestionUpvote: { findMany: jest.fn(), create: jest.fn(), deleteMany: jest.fn() },
+  $transaction: jest.fn(),
 };
 
 describe('ProfileQAService', () => {
@@ -16,6 +22,7 @@ describe('ProfileQAService', () => {
   beforeEach(async () => {
     jest.resetAllMocks();
     mockPrisma.blockList.findFirst.mockResolvedValue(null);
+    mockPrisma.profileQuestionUpvote.findMany.mockResolvedValue([]);
     const module: TestingModule = await Test.createTestingModule({
       providers: [ProfileQAService, { provide: PrismaService, useValue: mockPrisma }],
     }).compile();

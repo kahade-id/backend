@@ -29,6 +29,7 @@ import { PendingTopupCleanupService } from '../services/pending-topup-cleanup.se
 import { PendingWithdrawCleanupService } from '../services/pending-withdraw-cleanup.service';
 import { ProcessScheduledWithdrawalsService } from '../services/process-scheduled-withdrawals.service';
 import { ProofExpiryService } from '../services/proof-expiry.service';
+import { QuestionReminderService } from '../services/question-reminder.service';
 import { RedisHashCleanupService } from '../services/redis-hash-cleanup.service';
 import { SubscriptionExpiryService } from '../services/subscription-expiry.service';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
@@ -213,6 +214,14 @@ describe('Scheduler services smoke', () => {
     const svc = await build<ProofExpiryService>(ProofExpiryService);
     expect(svc).toBeDefined();
     await expect(svc.expireUnreviewedProofs()).resolves.toBeUndefined();
+  });
+
+  it('QuestionReminderService — defined + skip', async () => {
+    const svc = await build<QuestionReminderService>(QuestionReminderService, [
+      { provide: NotificationQueueService, useValue: { enqueue: jest.fn(async () => undefined) } },
+    ]);
+    expect(svc).toBeDefined();
+    await expect(svc.sendUnansweredQuestionReminders()).resolves.toBeUndefined();
   });
 
   it('RedisHashCleanupService — defined + skip', async () => {

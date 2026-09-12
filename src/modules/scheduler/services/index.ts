@@ -20,3 +20,4 @@ export { FraudChallengeEscalationService } from './fraud-challenge-escalation.se
 export { DeadlineReminderService } from './deadline-reminder.service';
 export { ProofExpiryService } from './proof-expiry.service';
 export { WebhookRetryService } from './webhook-retry.service';
+export { QuestionReminderService } from './question-reminder.service';

@@ -83,6 +83,26 @@ export const DEFAULT_LIMIT = 20;
 export const MAX_LIMIT = 100;
 export const SEARCH_MAX_RESULTS = MAX_LIMIT;
 
+// ============================================================
+// SHOWCASE (Section 3 — konten sosial + feed discover)
+// ============================================================
+/** Batas item showcase per user (dipindah dari UsersService.MAX_SHOWCASE_ITEMS). */
+export const SHOWCASE_MAX_ITEMS = 20;
+/** Batas gambar per item showcase. */
+export const SHOWCASE_MAX_IMAGES = 8;
+export const SHOWCASE_TITLE_MAX_LENGTH = 100;
+export const SHOWCASE_DESCRIPTION_MAX_LENGTH = 500;
+export const SHOWCASE_CATEGORY_MAX_LENGTH = 60;
+export const SHOWCASE_COMMENT_MAX_LENGTH = 1000;
+/** Feed discover: cursor-based, jadi limitnya lebih kecil dari MAX_LIMIT (100)
+ *  supaya satu halaman tetap ringan (tiap item ikut memuat author + gambar). */
+export const SHOWCASE_FEED_DEFAULT_LIMIT = 20;
+export const SHOWCASE_FEED_MAX_LIMIT = 50;
+/** Satu view dihitung sekali per (viewer, showcase) dalam window ini. */
+export const SHOWCASE_VIEW_DEDUPE_TTL_SECONDS = 3600;
+export const SHOWCASE_SEARCH_MIN_LENGTH = 2;
+export const SHOWCASE_SEARCH_MAX_LENGTH = 100;
+
 export const ORDER_LINK_EXPIRY_HOURS = 48;
 export const ORDER_LINK_TOKEN_LENGTH = 32;
 

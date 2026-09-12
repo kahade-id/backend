@@ -26,6 +26,7 @@ import { UserAnalyticsService } from './user-analytics.service';
 import { ProfileQAService } from './profile-qa.service';
 import { OgMetadataService } from './og-metadata.service';
 import { VerificationBadgeService } from './verification-badge.service';
+import { ShowcaseService } from '../showcase/showcase.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
 import { Public } from '../../common/decorators/public.decorator';
@@ -37,7 +38,9 @@ import { UploadAvatarDto } from './dto/upload-avatar.dto';
 import { ConfirmHeaderDto } from './dto/confirm-header.dto';
 import { RequestAccountDeletionDto } from './dto/request-account-deletion.dto';
 import { AskQuestionDto, AnswerQuestionDto, AddCommentDto } from './dto/profile-question.dto';
-import { CreateShowcaseDto, UpdateShowcaseDto } from './dto/showcase.dto';
+// Section 3: showcase dipindah ke module sendiri; DTO lama users/dto/showcase.dto.ts dihapus.
+import { CreateShowcaseItemDto, UpdateShowcaseItemDto } from '../showcase/dto/showcase-item.dto';
+import { AttachShowcaseImagesDto, ReorderShowcaseImagesDto } from '../showcase/dto/showcase-image.dto';
 import { TrustDeviceDto } from './dto/trust-device.dto';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 
@@ -53,6 +56,7 @@ export class UsersController {
     private profileQAService: ProfileQAService,
     private ogMetadataService: OgMetadataService,
     private verificationBadgeService: VerificationBadgeService,
+    private showcaseService: ShowcaseService,
   ) {}
 
   @Get('me')
@@ -365,26 +369,38 @@ export class UsersController {
     return this.userStatsService.getDashboardStats(userId);
   }
 
+  // ------------------------------------------------------------------
+  // SHOWCASE (Section 3) — route owner tidak berubah, logikanya sekarang
+  // di ShowcaseService. Lihat juga ShowcaseController untuk permukaan
+  // sosial/discover (feed, like, komentar, share).
+  // ------------------------------------------------------------------
+
   @Post('me/showcase/upload')
   @UseGuards(UserThrottleGuard)
-  @ApiOperation({ summary: 'Upload showcase item image directly' })
+  @ApiOperation({
+    summary: 'Upload showcase item image directly',
+    description:
+      'Jalur multipart langsung (kompatibilitas client lama). Jalur yang dianjurkan: ' +
+      'POST /upload/presigned-url dengan purpose SHOWCASE_IMAGE, PUT ke URL hasilnya, ' +
+      'POST /upload/confirm, lalu lampirkan fileKey lewat POST /users/me/showcase/:id/images.',
+  })
   @ApiConsumes('multipart/form-data')
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 5 * 1024 * 1024 } }))
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   async uploadShowcaseImage(
     @CurrentUser('sub') userId: string,
     @UploadedFile() file: MulterFile,
-  ): Promise<{ imageUrl: string }> {
+  ): Promise<{ imageUrl: string; fileKey: string }> {
     if (!file) {
       throw new BadRequestException({ code: 'FILE_REQUIRED', message: 'File is required' });
     }
-    return this.usersService.uploadShowcaseImage(userId, file.originalname, file.mimetype, file.buffer);
+    return this.showcaseService.uploadShowcaseImageDirect(userId, file.originalname, file.mimetype, file.buffer);
   }
 
   @Get('me/showcase')
-  @ApiOperation({ summary: 'Get my showcase items (including inactive)' })
+  @ApiOperation({ summary: 'Get my showcase items (including inactive and private)' })
   async getMyShowcase(@CurrentUser('sub') userId: string): Promise<object> {
-    return this.usersService.getMyShowcase(userId);
+    return this.showcaseService.getMyShowcase(userId);
   }
 
   @Post('me/showcase')
@@ -393,9 +409,9 @@ export class UsersController {
   @ApiOperation({ summary: 'Add a showcase item' })
   async createShowcaseItem(
     @CurrentUser('sub') userId: string,
-    @Body() dto: CreateShowcaseDto,
+    @Body() dto: CreateShowcaseItemDto,
   ): Promise<object> {
-    return this.usersService.createShowcaseItem(userId, dto);
+    return this.showcaseService.createShowcaseItem(userId, dto);
   }
 
   @Put('me/showcase/:id')
@@ -404,9 +420,55 @@ export class UsersController {
   async updateShowcaseItem(
     @CurrentUser('sub') userId: string,
     @Param('id', ParseIdPipe) itemId: string,
-    @Body() dto: UpdateShowcaseDto,
+    @Body() dto: UpdateShowcaseItemDto,
   ): Promise<object> {
-    return this.usersService.updateShowcaseItem(userId, itemId, dto);
+    return this.showcaseService.updateShowcaseItem(userId, itemId, dto);
+  }
+
+  @Post('me/showcase/:id/images')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @ApiOperation({
+    summary: 'Attach uploaded images to a showcase item',
+    description:
+      'Menerima object key hasil upload presigned (purpose SHOWCASE_IMAGE) yang sudah ' +
+      'dikonfirmasi lewat POST /upload/confirm. Gambar ditambahkan di urutan terakhir; ' +
+      'total gambar per item dibatasi SHOWCASE_MAX_IMAGES.',
+  })
+  async attachShowcaseImages(
+    @CurrentUser('sub') userId: string,
+    @Param('id', ParseIdPipe) itemId: string,
+    @Body() dto: AttachShowcaseImagesDto,
+  ): Promise<object> {
+    return this.showcaseService.attachImages(userId, itemId, dto.fileKeys);
+  }
+
+  @Put('me/showcase/:id/images/order')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @ApiOperation({
+    summary: 'Reorder the images of a showcase item',
+    description: 'Kirim seluruh ID gambar milik item ini dalam urutan yang diinginkan.',
+  })
+  async reorderShowcaseImages(
+    @CurrentUser('sub') userId: string,
+    @Param('id', ParseIdPipe) itemId: string,
+    @Body() dto: ReorderShowcaseImagesDto,
+  ): Promise<object> {
+    return this.showcaseService.reorderImages(userId, itemId, dto.imageIds);
+  }
+
+  // Dideklarasikan SEBELUM 'me/showcase/:id' supaya segmen "images" tidak
+  // ditangkap sebagai :id.
+  @Delete('me/showcase/images/:imageId')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @ApiOperation({ summary: 'Delete one image of a showcase item' })
+  async deleteShowcaseImage(
+    @CurrentUser('sub') userId: string,
+    @Param('imageId', ParseIdPipe) imageId: string,
+  ): Promise<{ message: string }> {
+    return this.showcaseService.removeImage(userId, imageId);
   }
 
   @Delete('me/showcase/:id')
@@ -416,7 +478,7 @@ export class UsersController {
     @CurrentUser('sub') userId: string,
     @Param('id', ParseIdPipe) itemId: string,
   ): Promise<{ message: string }> {
-    return this.usersService.deleteShowcaseItem(userId, itemId);
+    return this.showcaseService.deleteShowcaseItem(userId, itemId);
   }
 
   @Get('me/questions')
@@ -587,7 +649,7 @@ export class UsersController {
     @Param('username', ParseUsernamePipe) username: string,
     @CurrentUser('sub') viewerId: string | null,
   ): Promise<object> {
-    return this.usersService.getShowcaseByUsername(username, viewerId ?? undefined);
+    return this.showcaseService.getShowcaseByUsername(username, viewerId ?? undefined);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 10 } })

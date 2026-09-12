@@ -8,11 +8,12 @@ import { UserAnalyticsService } from "./user-analytics.service";
 import { ProfileQAService } from "./profile-qa.service";
 import { OgMetadataService } from "./og-metadata.service";
 import { VerificationBadgeModule } from "./verification-badge.module";
+import { ShowcaseModule } from "../showcase/showcase.module";
 import { KycRequiredGuard } from "../../common/guards/kyc-required.guard";
 import { AuditLogModule } from "../../common/services/audit-log.module";
 
 @Module({
-  imports: [ConfigModule, AuditLogModule, VerificationBadgeModule],
+  imports: [ConfigModule, AuditLogModule, VerificationBadgeModule, ShowcaseModule],
   controllers: [UsersController],
   providers: [UsersService, UserSearchService, UserStatsService, UserAnalyticsService, ProfileQAService, OgMetadataService, KycRequiredGuard],
   exports: [UsersService, UserSearchService, UserStatsService, UserAnalyticsService, ProfileQAService, OgMetadataService],

@@ -4,6 +4,7 @@ import type { Response } from 'express';
 import { Public } from '../../common/decorators/public.decorator';
 import { UsersService } from '../users/users.service';
 import { OrderLinksService } from '../orders/order-links.service';
+import { ShowcaseService } from '../showcase/showcase.service';
 
 function escapeHtml(value: unknown): string {
   return String(value ?? '')
@@ -51,6 +52,7 @@ export class DeepLinksController {
   constructor(
     private readonly usersService: UsersService,
     private readonly orderLinksService: OrderLinksService,
+    private readonly showcaseService: ShowcaseService,
   ) {}
 
   @Public()
@@ -112,6 +114,34 @@ export class DeepLinksController {
       detail = 'Tautan ini mungkin sudah kedaluwarsa, dibatalkan, atau sudah digunakan. Buka aplikasi untuk mendapatkan status terbaru.';
     }
     response.status(200).send(page({ title, description: 'Tautan transaksi escrow Kahade.', appUrl: appSchemeUrl(`o-l/${encodeURIComponent(safeToken)}`), detail }));
+  }
+
+  // Section 3: halaman share untuk item showcase (konten sosial).
+  // getSharePayload menolak item PRIVATE, item milik akun nonaktif/banned/
+  // terhapus/profil privat, dan item yang pemiliknya saling blokir dengan
+  // viewer — semuanya dirender sebagai satu pesan netral supaya keberadaan
+  // konten privat tidak bocor lewat halaman share.
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @Get('showcase/:showcaseId')
+  @Header('Content-Type', 'text/html; charset=utf-8')
+  async showcase(@Param('showcaseId') showcaseId: string, @Res() response: Response): Promise<void> {
+    const safeId = String(showcaseId ?? '').trim();
+    if (!PUBLIC_ID_RE.test(safeId)) {
+      response.status(404).send(page({ title: 'Showcase tidak ditemukan', description: 'Konten showcase Kahade tidak tersedia.', appUrl: appSchemeUrl('showcase/invalid'), detail: 'ID showcase pada tautan tidak valid.' }));
+      return;
+    }
+    let title = 'Showcase Kahade';
+    let detail = 'Lihat item showcase ini di aplikasi Kahade.';
+    try {
+      const payload = await this.showcaseService.getSharePayload(safeId);
+      const record = payload as Record<string, unknown>;
+      title = String(record.title ?? title);
+      detail = `${String(record.description ?? 'Item showcase Kahade')}\nHarga: ${String(record.priceLabel ?? '—')}\nOleh: @${String(record.authorUsername ?? 'pengguna Kahade')}`;
+    } catch {
+      detail = 'Konten ini privat, sudah dihapus, atau tidak tersedia. Buka aplikasi untuk melihat status terbaru.';
+    }
+    response.status(200).send(page({ title, description: 'Item showcase publik Kahade.', appUrl: appSchemeUrl(`showcase/${encodeURIComponent(safeId)}`), detail }));
   }
 
   @Public()

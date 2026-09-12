@@ -24,6 +24,7 @@ import { UsersModule } from './modules/users/users.module';
 import { SessionsModule } from './modules/sessions/sessions.module';
 import { KycModule } from './modules/kyc/kyc.module';
 import { BusinessVerificationModule } from './modules/business-verification/business-verification.module';
+import { ShowcaseModule } from './modules/showcase/showcase.module';
 import { BankAccountsModule } from './modules/bank-accounts/bank-accounts.module';
 import { WalletModule } from './modules/wallet/wallet.module';
 import { OrdersModule } from './modules/orders/orders.module';
@@ -130,6 +131,8 @@ const runtimeEnvFile = getRuntimeEnvFile();
     // Feature modules
     AuthModule,
     UsersModule,
+    // Section 3: showcase sebagai konten sosial + feed discover
+    ShowcaseModule,
     SessionsModule,
     KycModule,
     BusinessVerificationModule,

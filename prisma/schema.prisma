@@ -704,6 +704,9 @@ model User {
   questionComments        ProfileQuestionComment[] @relation("CommentAuthor")
   supportTickets          SupportTicket[]          @relation("UserSupportTickets")
   showcaseItems           UserShowcase[]
+  // Section 3: interaksi sosial pada showcase (like & komentar)
+  showcaseLikes           ShowcaseLike[]
+  showcaseComments        ShowcaseComment[]
   scheduledWithdrawals    ScheduledWithdrawal[]  @relation("UserScheduledWithdrawals")
   deliveryProofsSubmitted DeliveryProof[]        @relation("DeliveryProofSubmitter")
   ratingReplies           RatingReply[]          @relation("RatingReplies")
@@ -2552,6 +2555,9 @@ model DisputeMessage {
   @@map("dispute_messages")
 }
 
+/// Section 3 — Showcase berubah dari "etalase statis" menjadi konten sosial:
+/// punya banyak gambar, kategori, visibilitas, dan counter like/komentar/view
+/// yang didenormalisasi agar feed discover tidak perlu COUNT(*) per baris.
 model UserShowcase {
   id          String   @id @default(cuid())
   userId      String
@@ -2559,17 +2565,121 @@ model UserShowcase {
 
   title       String   @db.VarChar(100)
   description String?  @db.VarChar(500)
-  imageUrl    String?
+  /// Kategori bebas-terkendali untuk filter feed discover (mis. "ilustrasi",
+  /// "jasa video"). Nullable: item lama tanpa kategori tetap muncul di feed.
+  category    String?  @db.VarChar(60)
+  /// PRIVATE menyembunyikan item dari feed discover DAN dari profil publik;
+  /// hanya pemilik (dan admin) yang bisa melihatnya.
+  visibility  ShowcaseVisibility @default(PUBLIC)
   priceMin    BigInt?
   priceMax    BigInt?
   isActive    Boolean  @default(true)
   sortOrder   Int      @default(0)
 
+  /// Counter denormalisasi. Selalu di-update lewat Prisma atomic increment
+  /// ({ increment } / { decrement }) di dalam transaksi yang sama dengan
+  /// mutasi barisnya — pola TransactionTemplatesService.recordUsage.
+  likeCount    Int     @default(0)
+  commentCount Int     @default(0)
+  viewCount    Int     @default(0)
+
+  images      ShowcaseImage[]
+  likes       ShowcaseLike[]
+  comments    ShowcaseComment[]
+
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   @@index([userId, isActive, sortOrder])
+  // Feed discover: sort "latest" (createdAt) dan "popular" (likeCount). Kolom id
+  // ikut di index karena dipakai sebagai tiebreak cursor pagination.
+  @@index([visibility, isActive, createdAt, id])
+  @@index([visibility, isActive, likeCount, id])
+  @@index([category])
   @@map("user_showcases")
+}
+
+/// Visibilitas item showcase di feed discover / profil publik.
+enum ShowcaseVisibility {
+  PUBLIC
+  PRIVATE
+}
+
+/// Kategori alasan konten disembunyikan oleh moderator. Dipakai bersama oleh
+/// ShowcaseComment (Section 3) dan ProfileQuestion (Section 4) supaya alasan
+/// moderasi konsisten di seluruh platform.
+enum ContentHiddenReason {
+  SPAM
+  INAPPROPRIATE
+  HARASSMENT
+  OTHER
+}
+
+/// Gambar showcase (one-to-many). Menggantikan kolom tunggal
+/// `user_showcases.imageUrl` yang sudah di-drop setelah data lama di-backfill
+/// ke tabel ini (lihat migration 20260912120000 + 20260912130000).
+model ShowcaseImage {
+  id         String       @id @default(cuid())
+  showcaseId String
+  showcase   UserShowcase @relation(fields: [showcaseId], references: [id], onDelete: Cascade)
+
+  /// URL publik yang siap dipakai client (R2 public bucket).
+  imageUrl   String       @db.VarChar(512)
+  /// Object key R2. Nullable karena baris hasil backfill dari `imageUrl` lama
+  /// bisa berupa URL eksternal yang tidak kita miliki object-nya.
+  fileKey    String?      @db.VarChar(512)
+  sortOrder  Int          @default(0)
+
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  @@index([showcaseId, sortOrder])
+  @@map("showcase_images")
+}
+
+/// Like pada showcase. Unique (userId, showcaseId) ditegakkan di DB supaya dua
+/// request balapan tidak menghasilkan like ganda / counter melenceng.
+model ShowcaseLike {
+  id         String       @id @default(cuid())
+  showcaseId String
+  showcase   UserShowcase @relation(fields: [showcaseId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt  DateTime     @default(now())
+
+  @@unique([userId, showcaseId])
+  @@index([showcaseId, createdAt, id])
+  @@index([userId])
+  @@map("showcase_likes")
+}
+
+/// Komentar showcase dengan balasan bersarang satu tingkat (parentId).
+/// `isHidden` + `hiddenReason` dipakai moderasi; komentar tersembunyi tetap
+/// dihitung di DB tapi disaring dari semua query publik.
+model ShowcaseComment {
+  id         String       @id @default(cuid())
+  showcaseId String
+  showcase   UserShowcase @relation(fields: [showcaseId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  parentId   String?
+  parent     ShowcaseComment?  @relation("ShowcaseCommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies    ShowcaseComment[] @relation("ShowcaseCommentReplies")
+
+  content    String       @db.Text
+  isHidden   Boolean      @default(false)
+  hiddenReason ContentHiddenReason?
+  hiddenAt   DateTime?
+  hiddenBy   String?      @db.VarChar(100)
+
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  @@index([showcaseId, parentId, createdAt, id])
+  @@index([userId])
+  @@map("showcase_comments")
 }
 
 enum DisputeCallStatus {

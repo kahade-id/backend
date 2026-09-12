@@ -662,11 +662,8 @@ describe('UsersService', () => {
       await expect(service.getPublicProfile('owner')).rejects.toThrow(NotFoundException);
     });
 
-    it('does not expose showcase for a banned user', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ id: 'owner', profileVisible: true, isActive: true, isBanned: true, deletedAt: null });
-      await expect(service.getShowcaseByUsername('owner')).rejects.toThrow(NotFoundException);
-      expect(mockPrisma.userShowcase.findMany).not.toHaveBeenCalled();
-    });
+    // Showcase dipindah ke ShowcaseService (Section 3); cakupan "banned owner"
+    // ikut pindah ke src/modules/showcase/tests/showcase.service.spec.ts.
   });
 
   describe('public relationship privacy', () => {
@@ -710,12 +707,9 @@ describe('UsersService', () => {
       expect(mockPrisma.rating.findMany).not.toHaveBeenCalled();
     });
 
-    it('does not expose showcase across a block relationship', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ id: 'target-id', profileVisible: true });
-      mockPrisma.blockList.findUnique.mockResolvedValue({ id: 'block-1' });
-      await expect(service.getShowcaseByUsername('target', 'viewer-id')).rejects.toThrow(NotFoundException);
-      expect(mockPrisma.userShowcase.findMany).not.toHaveBeenCalled();
-    });
+    // Showcase dipindah ke ShowcaseService (Section 3); cakupan block-list ikut
+    // pindah ke src/modules/showcase/tests/showcase.service.spec.ts (sekarang
+    // 403 USER_BLOCKED, mengikuti perilaku profil publik di Section 2).
   });
 
   describe('trusted-device factor preservation', () => {

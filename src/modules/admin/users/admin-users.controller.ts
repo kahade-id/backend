@@ -178,4 +178,28 @@ export class AdminUsersController {
   unbanUser(@Param('userId', ParseIdPipe) userId: string, @CurrentAdmin() admin: AdminJwtPayload, @Req() req: Request): Promise<object> {
     return this.service.unbanUser(userId, admin.sub, req.ip || 'unknown');
   }
+
+  // Section 6: menutup flag `flaggedForReview` setelah admin mereview laporan
+  // dan menyimpulkan tidak ada pelanggaran. Flag ini dipasang otomatis oleh
+  // ReportFlagService (>= 3 reporter berbeda dalam 24 jam) dan TIDAK pernah
+  // memicu sanksi otomatis — ban tetap lewat POST :userId/ban.
+  @Post(':userId/review-flag/clear')
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN', 'CUSTOMER_SUPPORT')
+  @ApiOperation({
+    summary: 'Clear the automatic moderation review flag',
+    description:
+      'Menghapus `flaggedForReview` setelah admin mereview agregasi laporan dan memutuskan tidak ada pelanggaran. ' +
+      'Flag dipasang otomatis saat >= 3 user berbeda melaporkan target dalam 24 jam; tidak ada auto-ban, ' +
+      'sehingga route ini adalah jalur "direview, tidak ada tindakan". Idempoten terhadap klik ganda ' +
+      '(409 bila state sudah berubah).',
+  })
+  @ApiResponse({ status: 200, description: 'Review flag cleared.' })
+  @ApiResponse({ status: 400, description: 'User is not flagged for review.' })
+  @ApiResponse({ status: 403, description: 'Insufficient admin role (SUPER_ADMIN or CUSTOMER_SUPPORT only).' })
+  @ApiResponse({ status: 404, description: 'User not found.' })
+  @ApiResponse({ status: 409, description: 'Flag state changed concurrently.' })
+  clearReviewFlag(@Param('userId', ParseIdPipe) userId: string, @CurrentAdmin() admin: AdminJwtPayload, @Req() req: Request): Promise<object> {
+    return this.service.clearReviewFlag(userId, admin.sub, req.ip || 'unknown');
+  }
 }

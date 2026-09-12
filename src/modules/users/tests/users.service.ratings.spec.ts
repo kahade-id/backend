@@ -7,6 +7,7 @@ import { RedisService } from '../../../redis/redis.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { OgMetadataService } from '../og-metadata.service';
 import { VerificationBadgeService } from '../verification-badge.service';
+import { ReportFlagService } from '../../../common/services/report-flag.service';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 
 jest.mock('../../../common/utils/pii.util', () => ({
@@ -62,6 +63,8 @@ describe('UsersService — daftar rating publik (Section 5)', () => {
         { provide: AuditLogService, useValue: mockAudit },
         { provide: OgMetadataService, useValue: mockOg },
         { provide: VerificationBadgeService, useValue: mockVerificationBadges },
+        // Section 6: agregasi laporan -> flag moderasi internal.
+        { provide: ReportFlagService, useValue: { evaluateTarget: jest.fn(async () => ({ flaggedForReview: false, distinctReporters: 0 })) } },
       ],
     }).compile();
     service = module.get<UsersService>(UsersService);

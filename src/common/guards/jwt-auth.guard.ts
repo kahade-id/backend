@@ -109,7 +109,13 @@ export class JwtAuthGuard implements CanActivate {
     const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
       context.getHandler(), context.getClass(),
     ]);
-    if (isPublic) return true;
+    if (isPublic) {
+      // Section 6: rute publik tetap "viewer-aware". Token opsional di-parse
+      // supaya request.user terisi; tanpa ini SEMUA gate yang bergantung pada
+      // viewer diam-diam turun jadi anonim (lihat attachOptionalUser).
+      await this.attachOptionalUser(context);
+      return true;
+    }
 
     const isAdminRoute = this.reflector.getAllAndOverride<boolean>(IS_ADMIN_ROUTE_KEY, [
       context.getHandler(), context.getClass(),
@@ -206,6 +212,53 @@ export class JwtAuthGuard implements CanActivate {
       if (error instanceof UnauthorizedException) throw error;
       if (error instanceof ServiceUnavailableException) throw error;
       throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Invalid or expired token' });
+    }
+  }
+
+  /**
+   * Section 6 — optional auth untuk rute `@Public()`.
+   *
+   * Sebelumnya `canActivate` langsung `return true` untuk rute publik, jadi
+   * `request.user` tidak pernah terisi dan setiap gate berbasis viewer mati
+   * tanpa suara: block-list di getPublicProfile / getUserRatings / Q&A /
+   * showcase feed / halaman deep-link share, plus isFollowing,
+   * isFavoritedByViewer, dan isUpvotedByViewer. User yang diblokir tetap bisa
+   * membaca profil yang memblokirnya.
+   *
+   * Kontraknya sengaja longgar — token TIDAK wajib:
+   *   - token sah + belum dicabut  -> request.user diisi;
+   *   - token absen / rusak / kedaluwarsa / di-blacklist / sesi dicabut /
+   *     akun nonaktif / Redis atau DB tidak tersedia -> request TETAP dilayani
+   *     sebagai anonim.
+   * Rute publik tidak boleh berubah menjadi 401/503 hanya karena klien
+   * mengirim token basi atau karena Redis sedang down; yang hilang cuma
+   * personalisasi viewer-nya. Ini fail-open untuk ANONIMITAS, bukan untuk
+   * otorisasi: token yang tidak lolos verifikasi penuh tidak pernah mendapat
+   * identitas, jadi tidak ada hak yang bocor.
+   */
+  private async attachOptionalUser(context: ExecutionContext): Promise<void> {
+    try {
+      const request = context.switchToHttp().getRequest();
+      const token = this.extractTokenFromHeader(request) || this.extractTokenFromCookie(request);
+      if (!token) return;
+
+      const secret = this.configService.get<string>('jwt.secret');
+      const payload = await this.jwtService.verifyAsync(token, {
+        secret,
+        audience: USER_TOKEN_AUDIENCE,
+        issuer: TOKEN_ISSUER,
+        algorithms: ['HS256'],
+      });
+      if (!payload?.jti || !payload?.sessionId) return;
+
+      // Verifikasi yang sama persis dengan rute terproteksi: token yang sudah
+      // di-logout/revoke tidak boleh dipakai menyamar sebagai viewer.
+      if ((await this.checkBlacklist(payload)) !== 'ok') return;
+      if ((await this.checkDatabaseAuthorization(payload)) !== 'ok') return;
+
+      request.user = payload;
+    } catch {
+      // Token tidak sah (atau dependensinya error) -> lanjut sebagai anonim.
     }
   }
 

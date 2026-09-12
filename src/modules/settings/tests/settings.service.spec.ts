@@ -7,6 +7,7 @@ import { AuditLogService } from '../../../common/services/audit-log.service';
 import { RedisService } from '../../../redis/redis.service';
 import { UploadService } from '../../upload/upload.service';
 import { NotificationQueueService } from '../../queue/notification-queue.service';
+import { ReportFlagService } from '../../../common/services/report-flag.service';
 
 const mockPrisma = {
   blockList: { findMany: jest.fn(), count: jest.fn(), findUnique: jest.fn(), create: jest.fn(), delete: jest.fn() },
@@ -30,12 +31,14 @@ const mockConfig = { get: jest.fn() };
 const mockUpload = { uploadPrivateAccountExport: jest.fn() };
 const mockNotification = { enqueue: jest.fn() };
 const mockEmailQueue = { add: jest.fn() };
+const mockReportFlag = { evaluateTarget: jest.fn() };
 
 describe('SettingsService', () => {
   let service: SettingsService;
 
   beforeEach(async () => {
     jest.resetAllMocks();
+    mockReportFlag.evaluateTarget.mockResolvedValue({ flaggedForReview: false, distinctReporters: 1 });
     mockRedis.setNx.mockResolvedValue(true);
     mockRedis.releaseLock.mockResolvedValue(true);
     mockPrisma.$transaction.mockImplementation(async (callback: (tx: typeof mockPrisma) => Promise<unknown>) => callback(mockPrisma));
@@ -49,6 +52,8 @@ describe('SettingsService', () => {
         { provide: UploadService, useValue: mockUpload },
         { provide: NotificationQueueService, useValue: mockNotification },
         { provide: 'BullQueue_email', useValue: mockEmailQueue },
+        // Section 6: agregasi laporan -> flag moderasi internal.
+        { provide: ReportFlagService, useValue: mockReportFlag },
       ],
     }).compile();
     service = module.get<SettingsService>(SettingsService);
@@ -174,6 +179,33 @@ describe('SettingsService', () => {
       mockPrisma.userReport.create.mockResolvedValue({ id: 'r1' });
       const res = await service.reportUser('u1', { targetId: 'u2', category: 'SPAM', description: 'x' } as any);
       expect(res.reportId).toBe('r1');
+    });
+
+    // Section 6: jalur laporan kedua (settings) juga harus memicu agregasi.
+    it('evaluates the report aggregation after the report is stored', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'u2' });
+      mockPrisma.userReport.findFirst.mockResolvedValue(null);
+      mockPrisma.userReport.create.mockResolvedValue({ id: 'r1' });
+      await service.reportUser('u1', { targetId: 'u2', category: 'SPAM', description: 'x' } as any);
+      expect(mockReportFlag.evaluateTarget).toHaveBeenCalledWith('u2');
+      expect(mockPrisma.userReport.create.mock.invocationCallOrder[0]).toBeLessThan(
+        mockReportFlag.evaluateTarget.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('does not evaluate the aggregation when storing the report fails', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'u2' });
+      mockPrisma.userReport.findFirst.mockResolvedValue(null);
+      mockPrisma.userReport.create.mockRejectedValue(new Error('database unavailable'));
+      await expect(service.reportUser('u1', { targetId: 'u2', category: 'SPAM', description: 'x' } as any)).rejects.toThrow('database unavailable');
+      expect(mockReportFlag.evaluateTarget).not.toHaveBeenCalled();
+    });
+
+    it('does not evaluate the aggregation when the cooldown rejects the report', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'u2' });
+      mockPrisma.userReport.findFirst.mockResolvedValue({ id: 'r0' });
+      await expect(service.reportUser('u1', { targetId: 'u2', category: 'SPAM', description: 'x' } as any)).rejects.toThrow(BadRequestException);
+      expect(mockReportFlag.evaluateTarget).not.toHaveBeenCalled();
     });
   });
 

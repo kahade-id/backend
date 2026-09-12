@@ -617,6 +617,15 @@ model User {
   vipGrantedAt          DateTime?
   vipGrantedBy          String?   // Admin user ID (soft FK ke admin_users.id)
 
+  // Section 6: sinyal moderasi hasil agregasi laporan user.
+  // Di-set otomatis oleh ReportFlagService bila >= REPORT_FLAG_THRESHOLD (3)
+  // laporan dari reporter BERBEDA masuk dalam REPORT_FLAG_WINDOW (24 jam).
+  // Ini murni penanda antrean untuk admin: TIDAK memicu auto-ban, tidak
+  // membatasi fitur apa pun, dan tidak pernah diekspos ke user lain.
+  // Keputusan (ban / teguran / abaikan) tetap di tangan admin.
+  flaggedForReview      Boolean   @default(false)
+  flaggedForReviewAt    DateTime? // kapan ambang laporan terakhir terlampaui
+
   // Membership
   membershipRank        MembershipRank @default(BRONZE)
   rankUpdatedAt         DateTime       @default(now())
@@ -724,6 +733,10 @@ model User {
   @@index([createdAt])
   @@index([isActive, isBanned])
   @@index([deletedAt]) // WHERE deletedAt IS NULL query optimization
+  // Section 6: antrean moderasi admin — WHERE flaggedForReview = true
+  // ORDER BY flaggedForReviewAt DESC. Selektivitasnya tinggi (hanya sedikit
+  // user yang pernah terflag) sehingga index boolean ini efektif.
+  @@index([flaggedForReview, flaggedForReviewAt])
   @@map("users")
 }
 

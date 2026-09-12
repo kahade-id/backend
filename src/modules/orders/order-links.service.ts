@@ -75,7 +75,7 @@ export class OrderLinksService {
     if (!Number.isSafeInteger(dto.orderValue) || dto.orderValue < ORDER_MIN_VALUE || dto.orderValue > ORDER_MAX_VALUE) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Order value must be an integer between Rp ${ORDER_MIN_VALUE.toLocaleString('id-ID')} and Rp ${ORDER_MAX_VALUE.toLocaleString('id-ID')}` });
     }
-    const creator = await this.prisma.user.findUnique({ where: { id: userId }, select: { isActive: true, isBanned: true } });
+    const creator = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true, isActive: true, isBanned: true } });
     if (!creator) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
     if (!creator.isActive || creator.isBanned) throw new ForbiddenException({ code: ErrorCodes.COUNTERPART_SUSPENDED, message: 'Your account is suspended' });
 
@@ -91,6 +91,38 @@ export class OrderLinksService {
     if (normalizedCounterpartUsername && (normalizedCounterpartUsername.length < 3 || normalizedCounterpartUsername.length > 50)) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Counterpart username must be between 3 and 50 characters' });
     }
+
+    // Section 6: bila counterpart disebut, selesaikan dan validasi SEKARANG.
+    // Sebelumnya username hanya dinormalisasi lalu disimpan mentah-mentah, jadi
+    // creator bisa menerbitkan link bernama untuk user yang tidak ada, sudah
+    // nonaktif/banned, atau yang saling blokir dengannya — kegagalan baru
+    // muncul di sisi penerima saat accept (baris ~196 dan ~301). Menolak di
+    // hulu memakai kode error yang sama dengan jalur accept.
+    if (normalizedCounterpartUsername) {
+      if (normalizedCounterpartUsername === creator.username?.toLowerCase()) {
+        throw new BadRequestException({ code: ErrorCodes.CANNOT_ORDER_SELF, message: 'Cannot create an order link for yourself' });
+      }
+      const counterpart = await this.prisma.user.findFirst({
+        where: { username: normalizedCounterpartUsername, deletedAt: null },
+        select: { id: true, isActive: true, isBanned: true },
+      });
+      if (!counterpart) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'Counterpart user not found' });
+      if (!counterpart.isActive || counterpart.isBanned) {
+        throw new ForbiddenException({ code: ErrorCodes.COUNTERPART_SUSPENDED, message: 'Counterpart account is suspended' });
+      }
+      // Relasi block dua arah, sama seperti acceptLink.
+      const blockedRelation = await this.prisma.blockList.findFirst({
+        where: {
+          OR: [
+            { blockerId: userId, blockedId: counterpart.id },
+            { blockerId: counterpart.id, blockedId: userId },
+          ],
+        },
+        select: { id: true },
+      });
+      if (blockedRelation) throw new ForbiddenException({ code: ErrorCodes.USER_BLOCKED, message: 'Cannot create an order link with a blocked user' });
+    }
+
     const serial = await this.getNextLinkSerial();
     const linkId = generateOrderLinkId(serial);
     const token = generateOrderLinkToken();

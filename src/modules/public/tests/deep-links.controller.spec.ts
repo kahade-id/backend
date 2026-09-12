@@ -21,7 +21,7 @@ describe('DeepLinksController', () => {
 
   it('renders public profile metadata and an app fallback button', async () => {
     usersService.getPublicProfile.mockResolvedValue({ username: 'alice', fullName: 'Alice', bio: 'Escrow seller' });
-    await controller.profile('alice', response as never);
+    await controller.profile('alice', null, response as never);
     const html = String(response.send.mock.calls[0][0]);
     expect(response.status).toHaveBeenCalledWith(200);
     expect(html).toContain('Alice');
@@ -39,7 +39,7 @@ describe('DeepLinksController', () => {
   });
 
   it('rejects malformed public identifiers before querying services', async () => {
-    await controller.profile('../alice', response as never);
+    await controller.profile('../alice', null, response as never);
     expect(response.status).toHaveBeenCalledWith(404);
     expect(usersService.getPublicProfile).not.toHaveBeenCalled();
     expect(String(response.send.mock.calls[0][0])).not.toContain('../alice');
@@ -64,22 +64,41 @@ describe('DeepLinksController', () => {
       identity: { nickname: 'Alice Wijaya', username: 'alice', bio: 'Menerima komisi ilustrasi' },
       fullName: 'ignored-flat-alias',
     });
-    await controller.profile('alice', response as never);
+    await controller.profile('alice', null, response as never);
     const html = String(response.send.mock.calls[0][0]);
     expect(html).toContain('Alice Wijaya');
     expect(html).toContain('Menerima komisi ilustrasi');
     expect(html).not.toContain('ignored-flat-alias');
   });
 
+  // Section 6: halaman share harus viewer-aware, bukan selalu anonim.
+  it('forwards the signed-in viewer so the block-list gate can run', async () => {
+    usersService.getPublicProfile.mockResolvedValue({ identity: { nickname: 'Alice', username: 'alice' } });
+    await controller.profile('alice', 'viewer-1', response as never);
+    expect(usersService.getPublicProfile).toHaveBeenCalledWith('alice', 'viewer-1');
+  });
+
+  it('passes undefined — not null — for an anonymous share link', async () => {
+    usersService.getPublicProfile.mockResolvedValue({ identity: { nickname: 'Alice', username: 'alice' } });
+    await controller.profile('alice', null, response as never);
+    expect(usersService.getPublicProfile).toHaveBeenCalledWith('alice', undefined);
+  });
+
+  it('keeps the alias route viewer-aware too', async () => {
+    usersService.getPublicProfile.mockResolvedValue({ identity: { nickname: 'Alice', username: 'alice' } });
+    await controller.profileAlias('alice', 'viewer-2', response as never);
+    expect(usersService.getPublicProfile).toHaveBeenCalledWith('alice', 'viewer-2');
+  });
+
   // Section 6: 404 (profil privat) dan 403 (block-list) tidak boleh bocor.
   it('renders the same neutral page for a private profile and a blocked viewer', async () => {
     usersService.getPublicProfile.mockRejectedValue({ response: { code: 'USER_NOT_FOUND' } });
-    await controller.profile('alice', response as never);
+    await controller.profile('alice', null, response as never);
     const privateHtml = String(response.send.mock.calls[0][0]);
 
     jest.clearAllMocks();
     usersService.getPublicProfile.mockRejectedValue({ response: { code: 'USER_BLOCKED' } });
-    await controller.profile('alice', response as never);
+    await controller.profile('alice', null, response as never);
     const blockedHtml = String(response.send.mock.calls[0][0]);
 
     expect(privateHtml).toContain('belum dapat dimuat');

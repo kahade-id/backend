@@ -17,6 +17,7 @@ import { NotificationType, Prisma, UserAuditAction, ReportCategory } from '@pris
 import { ReportUserSettingsDto } from './dto/report-user.dto';
 import { UploadService } from '../upload/upload.service';
 import { NotificationQueueService } from '../queue/notification-queue.service';
+import { ReportFlagService } from '../../common/services/report-flag.service';
 import { EMAIL_QUEUE, EmailJobData } from '../queue/processors/email.processor';
 import { decryptAES } from '../../common/utils/crypto.util';
 import { decryptPiiSafe } from '../../common/utils/pii.util';
@@ -31,6 +32,8 @@ export class SettingsService {
     private uploadService: UploadService,
     private notificationQueue: NotificationQueueService,
     @InjectQueue(EMAIL_QUEUE) private readonly emailQueue: Queue<EmailJobData>,
+    // Section 6: agregasi laporan -> flag moderasi internal.
+    private readonly reportFlagService: ReportFlagService,
   ) {}
 
   async listBlockedUsers(userId: string, page: number, limit: number): Promise<PaginatedResponse<Record<string, unknown>>> {
@@ -282,6 +285,10 @@ export class SettingsService {
       if (reportLockAcquired) await this.redis.releaseLock(reportCooldownKey, reportLockValue).catch(() => undefined);
       throw error;
     }
+
+    // Section 6: hitung agregasi setelah laporan tersimpan; tidak pernah
+    // melempar dan tidak pernah memicu tindakan otomatis terhadap target.
+    await this.reportFlagService.evaluateTarget(dto.targetId);
 
     this.auditLog.logUserAction({
       userId: reporterId,

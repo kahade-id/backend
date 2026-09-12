@@ -2,6 +2,7 @@ import { Controller, Get, Header, Param, Res } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import type { Response } from 'express';
 import { Public } from '../../common/decorators/public.decorator';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { UsersService } from '../users/users.service';
 import { OrderLinksService } from '../orders/order-links.service';
 import { ShowcaseService } from '../showcase/showcase.service';
@@ -59,7 +60,14 @@ export class DeepLinksController {
   @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Get('user/:username')
   @Header('Content-Type', 'text/html; charset=utf-8')
-  async profile(@Param('username') username: string, @Res() response: Response): Promise<void> {
+  async profile(
+    @Param('username') username: string,
+    // Section 6: halaman share ikut menghormati relasi block. Route ini
+    // @Public(), jadi viewerId terisi hanya bila klien mengirim token yang sah
+    // (lihat JwtAuthGuard.attachOptionalUser); tanpa token -> null -> anonim.
+    @CurrentUser('sub') viewerId: string | null,
+    @Res() response: Response,
+  ): Promise<void> {
     const safeUsername = String(username ?? '').trim().toLowerCase();
     if (!USERNAME_RE.test(safeUsername)) {
       response.status(404).send(page({ title: 'Profil tidak ditemukan', description: 'Profil publik Kahade tidak tersedia.', appUrl: appSchemeUrl('u/invalid'), detail: 'Username pada tautan tidak valid.' }));
@@ -68,7 +76,7 @@ export class DeepLinksController {
     let detail = `Profil publik @${safeUsername}`;
     let title = `Profil @${safeUsername}`;
     try {
-      const profile = await this.usersService.getPublicProfile(safeUsername);
+      const profile = await this.usersService.getPublicProfile(safeUsername, viewerId ?? undefined);
       const record = profile as Record<string, unknown>;
       // Section 2: profil publik sekarang mengembalikan bagian `identity`
       // secara eksplisit. Field datar lama masih ada sebagai alias deprecated,
@@ -79,8 +87,11 @@ export class DeepLinksController {
       detail = `@${resolvedUsername}\n${String(identity.bio ?? record.bio ?? 'Profil publik Kahade')}`;
     } catch {
       // Section 6: getPublicProfile menolak profil yang profileVisible-nya mati
-      // (404) dan viewer yang terlibat relasi block (403). Keduanya memang
-      // tidak boleh dibocorkan lewat halaman share, jadi satu pesan netral.
+      // (404), akun nonaktif/banned/terhapus (404), dan viewer yang terlibat
+      // relasi block dua arah (403 USER_BLOCKED). Ketiganya memang tidak boleh
+      // dibocorkan lewat halaman share — halaman ini tetap 200 dengan satu
+      // pesan netral yang identik, supaya penyerang tidak bisa membedakan
+      // "profil private", "akun dihapus", dan "kamu diblokir" dari responsnya.
       detail = `Profil @${safeUsername} belum dapat dimuat. Buka aplikasi untuk melihat status terbaru.`;
     }
     response.status(200).send(page({ title, description: 'Profil publik Kahade.', appUrl: appSchemeUrl(`u/${encodeURIComponent(safeUsername)}`), detail }));
@@ -89,8 +100,12 @@ export class DeepLinksController {
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Get('profile/:username')
-  async profileAlias(@Param('username') username: string, @Res() response: Response): Promise<void> {
-    return this.profile(username, response);
+  async profileAlias(
+    @Param('username') username: string,
+    @CurrentUser('sub') viewerId: string | null,
+    @Res() response: Response,
+  ): Promise<void> {
+    return this.profile(username, viewerId, response);
   }
 
   @Public()

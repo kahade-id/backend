@@ -34,6 +34,14 @@ const mockWallet = {
 };
 
 const mockPrisma = {
+  // Section 6: transfer sekarang menegakkan block-list dua arah. Default null
+  // (tidak ada relasi block) dipasang sebagai implementasi, bukan
+  // mockResolvedValue di beforeEach, supaya bertahan dari jest.clearAllMocks().
+  blockList: {
+    // Tipe return ditulis eksplisit: tanpa itu jest menyimpulkan Promise<null>
+    // dan mockResolvedValue({ id }) ditolak compiler.
+    findFirst: jest.fn(async (): Promise<{ id: string } | null> => null),
+  },
   wallet: {
     findUnique: jest.fn(),
     update: jest.fn(),
@@ -1490,6 +1498,85 @@ describe('WalletService', () => {
         },
         data: { updatedAt: expect.any(Date) },
       });
+    });
+  });
+
+  // ============================================================
+  // Section 6 — block-list enforcement pada transfer antar user
+  // ============================================================
+  // Sebelumnya transfer hanya memeriksa isActive/isBanned/deletedAt, jadi dua
+  // user yang saling blokir tetap bisa bertransaksi — tidak konsisten dengan
+  // createOrder dan acceptLink yang sudah menutup jalur itu.
+  describe('transfer block-list enforcement (Section 6)', () => {
+    const sender = {
+      id: 'user-1', userId: 'USR-1', fullName: 'Sender', email: 'sender@example.com',
+      username: 'sender', kycStatus: 'APPROVED', isActive: true, isBanned: false, deletedAt: null,
+    };
+    const recipient = {
+      id: 'user-2', userId: 'USR-2', fullName: 'Recipient', email: 'recipient@example.com',
+      username: 'recipient', kycStatus: 'APPROVED', isActive: true, isBanned: false,
+    };
+
+    beforeEach(() => {
+      mockPrisma.user.findUnique.mockResolvedValue(sender);
+      mockPrisma.user.findFirst.mockResolvedValue(recipient);
+    });
+
+    it('rejects a transfer when a block relation exists in either direction', async () => {
+      mockPrisma.blockList.findFirst.mockResolvedValue({ id: 'block-1' });
+      await expect(service.transfer('user-1', 'user-2', 10000, '481723')).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'USER_BLOCKED' }),
+      });
+      expect(mockPrisma.blockList.findFirst).toHaveBeenCalledWith({
+        where: {
+          OR: [
+            { blockerId: 'user-1', blockedId: 'user-2' },
+            { blockerId: 'user-2', blockedId: 'user-1' },
+          ],
+        },
+        select: { id: true },
+      });
+    });
+
+    it('rejects before any wallet is read or any lock is taken', async () => {
+      mockPrisma.blockList.findFirst.mockResolvedValue({ id: 'block-1' });
+      await expect(service.transfer('user-1', 'user-2', 10000, '481723')).rejects.toBeDefined();
+      // Tidak boleh ada state yang perlu dikompensasi setelah penolakan.
+      expect(mockPrisma.wallet.findUnique).not.toHaveBeenCalled();
+      expect(mockPrisma.walletTransaction.create).not.toHaveBeenCalled();
+      expect(mockRedis.setNx).not.toHaveBeenCalled();
+    });
+
+    it('checks the resolved recipient id, not the raw username argument', async () => {
+      mockPrisma.blockList.findFirst.mockResolvedValue({ id: 'block-1' });
+      await expect(service.transfer('user-1', 'recipient', 10000, '481723')).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'USER_BLOCKED' }),
+      });
+      expect(mockPrisma.blockList.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            OR: expect.arrayContaining([{ blockerId: 'user-1', blockedId: 'user-2' }]),
+          }),
+        }),
+      );
+    });
+
+    it('lets an unblocked pair continue past the gate', async () => {
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      // Sender tanpa KYC: kegagalan berikutnya adalah SENDER_KYC_REQUIRED,
+      // bukti bahwa gate block sudah dilewati tanpa perlu setup PIN penuh.
+      mockPrisma.user.findUnique.mockResolvedValue({ ...sender, kycStatus: 'PENDING' });
+      await expect(service.transfer('user-1', 'user-2', 10000, '481723')).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'SENDER_KYC_REQUIRED' }),
+      });
+    });
+
+    it('still rejects a missing recipient before the block check', async () => {
+      mockPrisma.user.findFirst.mockResolvedValue(null);
+      await expect(service.transfer('user-1', 'ghost', 10000, '481723')).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'RECIPIENT_NOT_FOUND' }),
+      });
+      expect(mockPrisma.blockList.findFirst).not.toHaveBeenCalled();
     });
   });
 });

@@ -14,6 +14,7 @@ import { randomBytes, randomInt, randomUUID } from 'crypto';
 import * as path from 'path';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { MAX_LIMIT, RESERVED_USERNAMES } from '../../common/constants/app.constants';
+import { ReportFlagService } from '../../common/services/report-flag.service';
 import { TOKEN_BLACKLIST, SESSION_REVOKED_KEY, TOTP_USED_CODE } from '../../common/constants/redis-keys';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { ReportUserDto } from './dto/report-user.dto';
@@ -45,6 +46,8 @@ export class UsersService {
     private auditLog: AuditLogService,
     private ogMetadataService: OgMetadataService,
     private verificationBadgeService: VerificationBadgeService,
+    // Section 6: agregasi laporan -> flag moderasi internal.
+    private reportFlagService: ReportFlagService,
   ) {}
 
   async getMyProfile(userId: string): Promise<object> {
@@ -1838,6 +1841,12 @@ export class UsersService {
       if (reportLockAcquired) await this.redis.releaseLock(reportCooldownKey, reportLockValue).catch(() => undefined);
       throw error;
     }
+
+    // Section 6: laporan sudah tersimpan, baru agregasi dihitung. evaluateTarget
+    // tidak pernah melempar, jadi kegagalan agregasi tidak membatalkan laporan.
+    // Tidak ada auto-ban di sini — hanya flag antrean review untuk admin.
+    await this.reportFlagService.evaluateTarget(target.id);
+
     return { message: 'Report submitted successfully' };
   }
 

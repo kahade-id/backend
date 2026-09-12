@@ -22,7 +22,8 @@ import { NotificationQueueService } from '../../queue/notification-queue.service
 
 const mockPrisma = {
   orderLink: { findUnique: jest.fn(), create: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
-  user: { findUnique: jest.fn() },
+  // Section 6: createLink sekarang menyelesaikan counterpartUsername.
+  user: { findUnique: jest.fn(), findFirst: jest.fn() },
   subscription: { findFirst: jest.fn() },
   blockList: { findFirst: jest.fn() },
   order: { create: jest.fn() },
@@ -93,6 +94,7 @@ describe('OrderLinksService — acceptLink', () => {
     mockPrisma.orderLink.update.mockResolvedValue({});
     mockPrisma.orderLink.updateMany.mockResolvedValue({ count: 1 });
     mockPrisma.blockList.findFirst.mockResolvedValue(null);
+    mockPrisma.user.findFirst.mockResolvedValue({ id: 'counterpart-1', isActive: true, isBanned: false });
     mockPrisma.user.findUnique.mockResolvedValue({
       kycStatus: 'APPROVED', isKahadePlus: false, isActive: true, isBanned: false, username: 'acceptor',
     });
@@ -291,6 +293,66 @@ describe('OrderLinksService — acceptLink', () => {
       mockPrisma.orderLink.create.mockResolvedValue({ linkId: 'LNK-1', token: 'tok-new', expiresAt: LINK.expiresAt });
       await service.createLink('creator', { role: 'SELLER', title: '<b>Logo</b>', description: '<i>Deskripsi layanan yang cukup panjang</i>', orderType: 'SERVICE' as any, orderValue: 100000, deliveryDeadlineDays: 3, feeResponsibility: 'BUYER' as any, counterpartUsername: '  buyer01  ' });
       expect(mockPrisma.orderLink.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ title: 'bLogo/b', description: 'iDeskripsi layanan yang cukup panjang/i', counterpartUsername: 'buyer01' }) }));
+    });
+
+    // ---------------- Section 6: counterpart gate saat create ----------------
+    it('resolves the named counterpart before issuing a serial or creating the link', async () => {
+      mockPrisma.orderLink.create.mockResolvedValue({ linkId: 'LNK-1', token: 'tok-new', expiresAt: LINK.expiresAt });
+      await service.createLink('creator', { role: 'SELLER', title: 'Logo brand', description: 'Deskripsi layanan yang cukup panjang', orderType: 'SERVICE' as any, orderValue: 100000, deliveryDeadlineDays: 3, feeResponsibility: 'BUYER' as any, counterpartUsername: '  Buyer01  ' });
+      expect(mockPrisma.user.findFirst).toHaveBeenCalledWith({
+        where: { username: 'buyer01', deletedAt: null },
+        select: { id: true, isActive: true, isBanned: true },
+      });
+      expect(mockPrisma.orderLink.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ counterpartUsername: 'buyer01' }),
+      }));
+    });
+
+    it('rejects a counterpart username that does not resolve to a live account', async () => {
+      mockPrisma.user.findFirst.mockResolvedValue(null);
+      const createsBefore = mockPrisma.orderLink.create.mock.calls.length;
+      await expect(service.createLink('creator', { role: 'SELLER', title: 'Logo brand', description: 'Deskripsi layanan yang cukup panjang', orderType: 'SERVICE' as any, orderValue: 100000, deliveryDeadlineDays: 3, feeResponsibility: 'BUYER' as any, counterpartUsername: 'ghostuser' })).rejects.toMatchObject({ response: { code: 'USER_NOT_FOUND' } });
+      expect(mockPrisma.orderLink.create.mock.calls.length).toBe(createsBefore);
+    });
+
+    it('rejects a suspended or banned counterpart at creation, not at accept', async () => {
+      mockPrisma.user.findFirst.mockResolvedValue({ id: 'counterpart-1', isActive: false, isBanned: false });
+      const createsBefore = mockPrisma.orderLink.create.mock.calls.length;
+      await expect(service.createLink('creator', { role: 'SELLER', title: 'Logo brand', description: 'Deskripsi layanan yang cukup panjang', orderType: 'SERVICE' as any, orderValue: 100000, deliveryDeadlineDays: 3, feeResponsibility: 'BUYER' as any, counterpartUsername: 'buyer01' })).rejects.toMatchObject({ response: { code: 'COUNTERPART_SUSPENDED' } });
+      expect(mockPrisma.orderLink.create.mock.calls.length).toBe(createsBefore);
+    });
+
+    it('rejects a link addressed to a blocked counterpart in either direction', async () => {
+      mockPrisma.blockList.findFirst.mockResolvedValue({ id: 'block-1' });
+      const createsBefore = mockPrisma.orderLink.create.mock.calls.length;
+      await expect(service.createLink('creator', { role: 'SELLER', title: 'Logo brand', description: 'Deskripsi layanan yang cukup panjang', orderType: 'SERVICE' as any, orderValue: 100000, deliveryDeadlineDays: 3, feeResponsibility: 'BUYER' as any, counterpartUsername: 'buyer01' })).rejects.toMatchObject({ response: { code: 'USER_BLOCKED' } });
+      expect(mockPrisma.blockList.findFirst).toHaveBeenCalledWith({
+        where: { OR: [{ blockerId: 'creator', blockedId: 'counterpart-1' }, { blockerId: 'counterpart-1', blockedId: 'creator' }] },
+        select: { id: true },
+      });
+      expect(mockPrisma.orderLink.create.mock.calls.length).toBe(createsBefore);
+    });
+
+    it('rejects addressing a link to yourself', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ isActive: true, isBanned: false, username: 'creatorname' });
+      mockPrisma.user.findFirst.mockResolvedValue({ id: 'creator', isActive: true, isBanned: false });
+      const createsBefore = mockPrisma.orderLink.create.mock.calls.length;
+      await expect(service.createLink('creator', { role: 'SELLER', title: 'Logo brand', description: 'Deskripsi layanan yang cukup panjang', orderType: 'SERVICE' as any, orderValue: 100000, deliveryDeadlineDays: 3, feeResponsibility: 'BUYER' as any, counterpartUsername: 'CreatorName' })).rejects.toMatchObject({ response: { code: 'CANNOT_ORDER_SELF' } });
+      expect(mockPrisma.orderLink.create.mock.calls.length).toBe(createsBefore);
+    });
+
+    it('skips the counterpart gate entirely for an open link', async () => {
+      mockPrisma.orderLink.create.mockResolvedValue({ linkId: 'LNK-1', token: 'tok-new', expiresAt: LINK.expiresAt });
+      const lookupsBefore = mockPrisma.user.findFirst.mock.calls.length;
+      const blockChecksBefore = mockPrisma.blockList.findFirst.mock.calls.length;
+      await service.createLink('creator', { role: 'SELLER', title: 'Logo brand', description: 'Deskripsi layanan yang cukup panjang', orderType: 'SERVICE' as any, orderValue: 100000, deliveryDeadlineDays: 3, feeResponsibility: 'BUYER' as any });
+      expect(mockPrisma.user.findFirst.mock.calls.length).toBe(lookupsBefore);
+      expect(mockPrisma.blockList.findFirst.mock.calls.length).toBe(blockChecksBefore);
+      // Link terbuka: tidak ada counterpart yang dituju. dto.counterpartUsername
+      // undefined dinormalisasi jadi undefined (Prisma memperlakukannya sebagai
+      // "tidak diset" -> kolom default null), jadi keduanya diterima di sini.
+      const lastCreate = mockPrisma.orderLink.create.mock.calls.at(-1)?.[0] as { data: { counterpartUsername?: string | null } };
+      expect(lastCreate.data.counterpartUsername ?? null).toBeNull();
     });
 
     it('does not mutate an already accepted link even when its expiry is in the past', async () => {

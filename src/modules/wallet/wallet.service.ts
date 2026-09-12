@@ -1575,6 +1575,31 @@ export class WalletService implements OnModuleInit {
       });
     }
 
+    // Section 6: block-list enforcement untuk transfer antar user.
+    // Sebelumnya jalur ini hanya memeriksa isActive/isBanned/deletedAt, jadi
+    // dua user yang saling blokir tetap bisa bertransaksi — bertentangan dengan
+    // createOrder (orders.service) dan acceptLink (order-links.service) yang
+    // sudah menutup jalur itu dengan kode yang sama. Relasi block diperiksa dua
+    // arah karena transfer adalah interaksi bersama.
+    //
+    // Sengaja ditaruh SEBELUM KYC/wallet disentuh: penolakan harus terjadi
+    // sebelum ada state yang perlu dikompensasi.
+    const blockedRelation = await this.prisma.blockList.findFirst({
+      where: {
+        OR: [
+          { blockerId: sender.id, blockedId: recipient.id },
+          { blockerId: recipient.id, blockedId: sender.id },
+        ],
+      },
+      select: { id: true },
+    });
+    if (blockedRelation) {
+      throw new ForbiddenException({
+        code: ErrorCodes.USER_BLOCKED,
+        message: 'Cannot transfer to a blocked user',
+      });
+    }
+
     if (sender.kycStatus !== KycStatus.APPROVED) {
       throw new ForbiddenException({
         code: ErrorCodes.SENDER_KYC_REQUIRED,

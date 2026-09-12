@@ -295,6 +295,22 @@ describe('UsersService.getPublicProfile (Section 2 — Profile Core)', () => {
       expect(select.ratingsReceived.where.isHidden).toBe(false);
       expect(select.ratingsReceived.orderBy).toEqual([{ createdAt: 'desc' }, { id: 'desc' }]);
     });
+
+    it('uses the same giver visibility rule as GET /users/:username/ratings', async () => {
+      // Preview dan list harus sepakat soal siapa yang boleh tampil; pemberi
+      // rating yang menyembunyikan profilnya tidak muncul di keduanya.
+      await service.getPublicProfile('seller');
+      const select = mockPrisma.user.findUnique.mock.calls[0][0].select;
+      expect(select.ratingsReceived.where.giver).toEqual({
+        isActive: true, isBanned: false, deletedAt: null, profileVisible: true,
+      });
+    });
+
+    it('caps the preview so the profile payload stays small', async () => {
+      await service.getPublicProfile('seller');
+      const select = mockPrisma.user.findUnique.mock.calls[0][0].select;
+      expect(select.ratingsReceived.take).toBe(5);
+    });
   });
 
   describe('deprecated flat aliases', () => {

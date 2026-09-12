@@ -714,6 +714,19 @@ export class UsersController {
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 20 } })
   @Get(':username/ratings')
+  @ApiOperation({
+    summary: 'Get public ratings for a user profile',
+    description:
+      'Section 5: mengembalikan daftar rating publik (isHidden=false, pemberi rating sehat dan ' +
+      'profilnya tidak private) beserta agregat profil. Urutan `createdAt desc, id desc` — ' +
+      'tiebreak `{ id }` wajib supaya offset pagination tidak menduplikasi/melewatkan baris, ' +
+      'dan sengaja disamakan dengan preview `ratings.recent` di GET /users/:username. ' +
+      'Respons memuat `averageRating` + `totalRatingCount` (counter denormalisasi profil) ' +
+      'selain `total` (jumlah baris yang lolos filter halaman ini, mis. `filter=positive`) ' +
+      'karena keduanya memang bisa berbeda. Profil private / nonaktif / banned / terhapus ' +
+      'mengembalikan 404 USER_NOT_FOUND; viewer yang terlibat relasi block juga 404, bukan 403, ' +
+      'agar keberadaan rating tidak bocor.',
+  })
   async getUserRatings(
     @Param('username', ParseUsernamePipe) username: string,
     @CurrentUser('sub') viewerId: string | null,

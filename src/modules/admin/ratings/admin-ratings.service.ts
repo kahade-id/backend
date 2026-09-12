@@ -42,7 +42,9 @@ export class AdminRatingsService {
         where,
         skip,
         take: safeLimit,
-        orderBy: { createdAt: 'desc' },
+        // Section 5: tiebreak { id } — daftar admin juga offset pagination,
+        // createdAt tidak unik sehingga halaman bisa duplikat/loncat tanpanya.
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         include: {
           giver: {
             select: {

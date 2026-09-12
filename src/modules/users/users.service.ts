@@ -296,7 +296,12 @@ export class UsersService {
         // Achievement badge (model Badge/UserBadge) — berbeda dari badge verifikasi.
         badges: { select: { badge: { select: { name: true, iconUrl: true, description: true } }, earnedAt: true } },
         ratingsReceived: {
-          where: { isHidden: false, giver: { isActive: true, isBanned: false, deletedAt: null } },
+          // Section 5: `profileVisible: true` ditambahkan supaya preview rating
+          // di profil memakai aturan visibilitas yang sama persis dengan
+          // GET /users/:username/ratings — pemberi rating yang menyembunyikan
+          // profilnya tidak boleh muncul di satu tempat tapi hilang di tempat
+          // lain (dan memang tidak seharusnya ditampilkan sama sekali).
+          where: { isHidden: false, giver: { isActive: true, isBanned: false, deletedAt: null, profileVisible: true } },
           orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // tiebreak { id } — halaman stabil
           take: PROFILE_RECENT_RATINGS_LIMIT,
           select: { stars: true, comment: true, createdAt: true, giver: { select: { username: true, avatarUrl: true } } },
@@ -1439,7 +1444,7 @@ export class UsersService {
   }
 
   async getUserRatings(username: string, page: number, limit: number, filter?: string, viewerId?: string | null): Promise<object> {
-    const user = await this.prisma.user.findUnique({ where: { username: username.toLowerCase() }, select: { id: true, averageRating: true, profileVisible: true, isActive: true, isBanned: true, deletedAt: true } });
+    const user = await this.prisma.user.findUnique({ where: { username: username.toLowerCase() }, select: { id: true, averageRating: true, totalRatingCount: true, profileVisible: true, isActive: true, isBanned: true, deletedAt: true } });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
     if (user.profileVisible === false && viewerId !== user.id) {
       throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
@@ -1472,7 +1477,12 @@ export class UsersService {
         where,
         skip,
         take: safeLimit,
-        orderBy: { createdAt: 'desc' },
+        // Section 5: tiebreak { id } wajib untuk offset pagination — createdAt
+        // tidak unik, jadi tanpa tiebreak dua rating yang lahir pada detik yang
+        // sama bisa muncul dua kali atau terlewat saat halaman bergeser. Arah
+        // `id: desc` disamakan dengan preview `ratingsReceived` di
+        // getPublicProfile supaya halaman pertama list == preview profil.
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         select: {
           id: true,
           stars: true,
@@ -1484,7 +1494,19 @@ export class UsersService {
       this.prisma.rating.count({ where }),
     ]);
 
-    return { ratings, total, averageRating: Number(user.averageRating ?? 0), page: safePage, limit: safeLimit };
+    return {
+      ratings,
+      // `total` = jumlah rating yang lolos filter visibilitas halaman ini;
+      // `totalRatingCount` = counter denormalisasi di profil. Keduanya bisa
+      // berbeda (mis. filter=positive, atau pemberi rating yang menonaktifkan
+      // profil), jadi keduanya dikembalikan agar klien tidak menebak.
+      total,
+      averageRating: Number(user.averageRating ?? 0),
+      totalRatingCount: user.totalRatingCount,
+      filter: filter || null,
+      page: safePage,
+      limit: safeLimit,
+    };
   }
 
   // ========== FOLLOW ==========

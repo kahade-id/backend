@@ -1,0 +1,21 @@
+-- ============================================================
+-- Section 3 (lanjutan): drop kolom legacy user_showcases.imageUrl
+-- ============================================================
+-- Migration TERPISAH sesuai prisma/MIGRATION_SAFETY.md rule 2 ("rename via copy
+-- — add the new column, backfill data, update code, then drop old column in a
+-- separate migration").
+--
+-- Prasyarat sebelum migration ini dijalankan di production:
+--   1. Migration 20260912120000_showcase_social_content sudah applied dan
+--      backfill showcase_images sudah terverifikasi (lihat query cek di bawah).
+--   2. Semua instance backend sudah menjalankan kode Section 3 (tidak ada lagi
+--      kode yang membaca/menulis user_showcases.imageUrl).
+--   3. Rollback script tersedia: prisma/migrations/ROLLBACK_showcase_imageUrl.sql
+--
+-- Query verifikasi backfill (harus mengembalikan 0 baris):
+--   SELECT s."id" FROM "user_showcases" s
+--   WHERE s."imageUrl" IS NOT NULL AND btrim(s."imageUrl") <> ''
+--     AND NOT EXISTS (SELECT 1 FROM "showcase_images" i WHERE i."showcaseId" = s."id");
+-- ============================================================
+
+ALTER TABLE "user_showcases" DROP COLUMN IF EXISTS "imageUrl";

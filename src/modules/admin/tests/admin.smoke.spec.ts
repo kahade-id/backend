@@ -36,6 +36,8 @@ import { AdminSupportService } from '../support/admin-support.service';
 import { AdminSystemService } from '../system/admin-system.service';
 import { AdminUsersService } from '../users/admin-users.service';
 import { AdminVouchersService } from '../vouchers/admin-vouchers.service';
+import { AdminBusinessVerificationService } from '../business-verification/admin-business-verification.service';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 
 const mkPrisma = (): any => new Proxy({}, {
   get: (_t, p) => {
@@ -82,6 +84,10 @@ async function build<T>(target: any, extras: any[] = []): Promise<T> {
       { provide: ConfigService, useValue: mkConfig() },
       { provide: AuditLogService, useValue: { log: jest.fn(), logUserAction: jest.fn(), logAdminAction: jest.fn() } },
       { provide: NotificationQueueService, useValue: { enqueue: jest.fn(), enqueueMany: jest.fn() } },
+      // Section 1: beberapa admin service sekarang meng-invalidasi cache badge
+      // verifikasi post-commit (AdminKycService, AdminSubscriptionsService,
+      // AdminBusinessVerificationService).
+      { provide: VerificationBadgeService, useValue: { invalidate: jest.fn(), getBadges: jest.fn(), loadBadges: jest.fn(), computeBadges: jest.fn(), getCatalog: jest.fn(), getPublicBadgesByUsername: jest.fn() } },
       ...extras,
     ],
   }).compile();
@@ -194,6 +200,15 @@ describe('Admin services smoke', () => {
     ]);
     expect(s).toBeDefined();
     const res: any = await s.listSubscriptions(1, 10);
+    expect(res).toBeDefined();
+  });
+
+  it('AdminBusinessVerificationService defined + getQueue', async () => {
+    const s = await build<AdminBusinessVerificationService>(AdminBusinessVerificationService, [
+      { provide: UploadService, useValue: {} },
+    ]);
+    expect(s).toBeDefined();
+    const res: any = await s.getQueue(1, 10);
     expect(res).toBeDefined();
   });
 

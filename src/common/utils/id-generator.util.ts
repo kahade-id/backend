@@ -47,6 +47,12 @@ export function generateKycId(serial: number): string {
   return `KYC-${jakartaDateStr()}-${serial.toString().padStart(6, '0')}-${cryptoSuffix()}`;
 }
 
+// Business verification (badge "Business Verified") — prefix BIZ supaya mudah
+// dibedakan dari KYC-... di admin console dan log.
+export function generateBusinessVerificationId(serial: number): string {
+  return `BIZ-${jakartaDateStr()}-${serial.toString().padStart(6, '0')}-${cryptoSuffix()}`;
+}
+
 export function generateDisputeId(serial: number): string {
   return `DSP-${jakartaDateStr()}-${serial.toString().padStart(6, '0')}-${cryptoSuffix()}`;
 }

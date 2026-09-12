@@ -6,6 +6,8 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { OgMetadataService } from '../og-metadata.service';
+import { VerificationBadgeService } from '../verification-badge.service';
+import { ReportFlagService } from '../../../common/services/report-flag.service';
 import { Prisma } from '@prisma/client';
 import { bcryptHash } from '../../../common/utils/crypto.util';
 import * as cryptoUtils from '../../../common/utils/crypto.util';
@@ -43,6 +45,10 @@ const mockRedis = { get: jest.fn(), set: jest.fn(), del: jest.fn(), setex: jest.
 const mockAudit = { logUserAction: jest.fn() };
 const mockConfig = { get: jest.fn() };
 const mockOg = { invalidateUserOgCache: jest.fn() };
+// Section 1/2: getPublicProfile sekarang menyertakan badge verifikasi.
+const mockVerificationBadges = { getBadges: jest.fn(), invalidate: jest.fn(), loadBadges: jest.fn(), computeBadges: jest.fn(), getCatalog: jest.fn(), getPublicBadgesByUsername: jest.fn() };
+// Section 6: agregasi laporan -> flag moderasi internal.
+const mockReportFlag = { evaluateTarget: jest.fn() };
 
 describe('UsersService', () => {
   let service: UsersService;
@@ -54,6 +60,8 @@ describe('UsersService', () => {
     mockRedis.releaseLock.mockResolvedValue(true);
     mockPrisma.notification.create.mockResolvedValue({});
     mockOg.invalidateUserOgCache.mockResolvedValue(undefined);
+    mockVerificationBadges.getBadges.mockResolvedValue([]);
+    mockReportFlag.evaluateTarget.mockResolvedValue({ flaggedForReview: false, distinctReporters: 1 });
     mockPrisma.$transaction.mockImplementation(async (fn: any) => fn(mockPrisma));
     mockPrisma.rating.aggregate.mockResolvedValue({ _avg: { stars: null } });
     const module: TestingModule = await Test.createTestingModule({
@@ -64,6 +72,9 @@ describe('UsersService', () => {
         { provide: ConfigService, useValue: mockConfig },
         { provide: AuditLogService, useValue: mockAudit },
         { provide: OgMetadataService, useValue: mockOg },
+        { provide: VerificationBadgeService, useValue: mockVerificationBadges },
+        // Section 6: agregasi laporan -> flag moderasi internal.
+        { provide: ReportFlagService, useValue: mockReportFlag },
       ],
     }).compile();
     service = module.get<UsersService>(UsersService);
@@ -501,6 +512,49 @@ describe('UsersService', () => {
     });
   });
 
+  // Section 6: laporan yang tersimpan harus memicu agregasi flag moderasi.
+  describe('report aggregation into the moderation flag', () => {
+    beforeEach(() => {
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'target-id' });
+      mockPrisma.userReport.findFirst.mockResolvedValue(null);
+      mockPrisma.userReport.count.mockResolvedValue(0);
+      mockPrisma.userReport.create.mockResolvedValue({ id: 'report-1' });
+      mockRedis.setNx.mockResolvedValue(true);
+      mockRedis.releaseLock.mockResolvedValue(true);
+    });
+
+    it('evaluates the target after the report row is stored', async () => {
+      await service.reportUser('me', 'target', { category: 'SPAM', description: 'spam' } as any);
+      expect(mockReportFlag.evaluateTarget).toHaveBeenCalledWith('target-id');
+      // Urutan penting: agregasi dihitung SESUDAH laporan tersimpan, bukan
+      // sebelumnya, supaya laporan yang gagal tidak pernah ikut terhitung.
+      expect(mockPrisma.userReport.create.mock.invocationCallOrder[0]).toBeLessThan(
+        mockReportFlag.evaluateTarget.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('does not evaluate when the report itself fails to store', async () => {
+      mockPrisma.userReport.create.mockRejectedValue(new Error('db down'));
+      await expect(service.reportUser('me', 'target', { category: 'SPAM', description: 'spam' } as any)).rejects.toThrow('db down');
+      expect(mockReportFlag.evaluateTarget).not.toHaveBeenCalled();
+    });
+
+    it('does not evaluate when the report is rejected by the cooldown', async () => {
+      mockPrisma.userReport.findFirst.mockResolvedValue({ id: 'existing-report' });
+      await expect(service.reportUser('me', 'target', { category: 'SPAM', description: 'spam' } as any)).rejects.toMatchObject({
+        response: { code: 'DUPLICATE_REPORT' },
+      });
+      expect(mockReportFlag.evaluateTarget).not.toHaveBeenCalled();
+    });
+
+    it('never bans or restricts the target as part of reporting', async () => {
+      await service.reportUser('me', 'target', { category: 'SPAM', description: 'spam' } as any);
+      // Satu-satunya tulisan ke tabel users ada di dalam ReportFlagService,
+      // yang di-mock di sini: jalur laporan sendiri tidak menyentuh akun target.
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    });
+  });
+
   describe('updateLinks', () => {
     it('rejects duplicate platforms case-insensitively before replacing links', async () => {
       await expect(service.updateLinks('me', {
@@ -657,11 +711,8 @@ describe('UsersService', () => {
       await expect(service.getPublicProfile('owner')).rejects.toThrow(NotFoundException);
     });
 
-    it('does not expose showcase for a banned user', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ id: 'owner', profileVisible: true, isActive: true, isBanned: true, deletedAt: null });
-      await expect(service.getShowcaseByUsername('owner')).rejects.toThrow(NotFoundException);
-      expect(mockPrisma.userShowcase.findMany).not.toHaveBeenCalled();
-    });
+    // Showcase dipindah ke ShowcaseService (Section 3); cakupan "banned owner"
+    // ikut pindah ke src/modules/showcase/tests/showcase.service.spec.ts.
   });
 
   describe('public relationship privacy', () => {
@@ -705,12 +756,9 @@ describe('UsersService', () => {
       expect(mockPrisma.rating.findMany).not.toHaveBeenCalled();
     });
 
-    it('does not expose showcase across a block relationship', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ id: 'target-id', profileVisible: true });
-      mockPrisma.blockList.findUnique.mockResolvedValue({ id: 'block-1' });
-      await expect(service.getShowcaseByUsername('target', 'viewer-id')).rejects.toThrow(NotFoundException);
-      expect(mockPrisma.userShowcase.findMany).not.toHaveBeenCalled();
-    });
+    // Showcase dipindah ke ShowcaseService (Section 3); cakupan block-list ikut
+    // pindah ke src/modules/showcase/tests/showcase.service.spec.ts (sekarang
+    // 403 USER_BLOCKED, mengikuti perilaku profil publik di Section 2).
   });
 
   describe('trusted-device factor preservation', () => {

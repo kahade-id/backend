@@ -78,3 +78,11 @@ export const LOGIN_IP_RATE = (ip: string): string => `login_ip_rate:${ip}`;
 export const TRANSFER_LOCK = (userId: string): string => `transfer_lock:${userId}`;
 export const DAILY_TRANSFER_AMOUNT = (userId: string, date: string): string =>
   `daily_transfer:${userId}:${date}`;
+
+// Section 1 (Verified Badge System): cache read-through untuk array badge
+// verifikasi publik. TTL-nya sengaja SANGAT pendek (lihat
+// VERIFICATION_BADGE_CACHE_TTL_SECONDS) plus invalidation eksplisit post-commit di
+// setiap titik revoke, sehingga KYC revoked / subscription expired / business
+// verification revoked langsung menghilangkan badge tanpa delay berarti.
+export const PROFILE_VERIFICATION_BADGES = (userId: string): string =>
+  `profile:badges:${userId}`;

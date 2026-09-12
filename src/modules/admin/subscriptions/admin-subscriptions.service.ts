@@ -7,6 +7,7 @@ import { AuditAction, Prisma } from '@prisma/client';
 import { toIdr } from '../../../common/utils/currency.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { RedisService } from '../../../redis/redis.service';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 
 @Injectable()
 export class AdminSubscriptionsService {
@@ -17,6 +18,7 @@ export class AdminSubscriptionsService {
     private auditLog: AuditLogService,
     private midtransService: MidtransService,
     private redis: RedisService,
+    private verificationBadgeService: VerificationBadgeService,
   ) {}
 
   async listSubscriptions(
@@ -191,6 +193,10 @@ export class AdminSubscriptionsService {
     await this.redis.del(`subscription_status:${subscription.userId}`).catch((err: unknown) =>
       this.logger.warn(`Failed to invalidate subscription status cache for ${subscription.userId}: ${err instanceof Error ? err.message : String(err)}`),
     );
+
+    // Section 1: force-cancel bisa langsung mencabut badge "Kahade+" — invalidasi
+    // cache badge post-commit supaya tidak ada jeda tampil.
+    await this.verificationBadgeService.invalidate(subscription.userId);
 
     let paymentProviderSynced = false;
     let midtransOrderId: string | null = null;

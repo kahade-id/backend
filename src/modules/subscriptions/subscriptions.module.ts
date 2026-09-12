@@ -4,9 +4,10 @@ import { SubscriptionsController } from './subscriptions.controller';
 import { SubscriptionsService } from './subscriptions.service';
 import { WalletModule } from '../wallet/wallet.module';
 import { AuditLogModule } from '../../common/services/audit-log.module';
+import { VerificationBadgeModule } from '../users/verification-badge.module';
 
 @Module({
-  imports: [PrismaModule, WalletModule, AuditLogModule],
+  imports: [PrismaModule, WalletModule, AuditLogModule, VerificationBadgeModule],
   controllers: [SubscriptionsController],
   providers: [SubscriptionsService],
   exports: [SubscriptionsService],

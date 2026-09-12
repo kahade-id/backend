@@ -4,6 +4,7 @@ import { DashboardModule } from './dashboard/dashboard.module';
 import { AdminUsersModule } from './users/admin-users.module';
 import { AdminOrdersModule } from './orders/admin-orders.module';
 import { AdminKycModule } from './kyc/admin-kyc.module';
+import { AdminBusinessVerificationModule } from './business-verification/admin-business-verification.module';
 import { AdminDisputesModule } from './disputes/admin-disputes.module';
 import { AdminFinanceModule } from './finance/admin-finance.module';
 import { AdminVouchersModule } from './vouchers/admin-vouchers.module';
@@ -25,6 +26,7 @@ import { AdminSupportModule } from './support/admin-support.module';
     AdminUsersModule,
     AdminOrdersModule,
     AdminKycModule,
+    AdminBusinessVerificationModule,
     AdminDisputesModule,
     AdminFinanceModule,
     AdminVouchersModule,

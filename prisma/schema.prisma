@@ -33,6 +33,18 @@ enum KycStatus {
   REVOKED
 }
 
+// Status verifikasi BADAN USAHA (BusinessVerification). Sengaja terpisah dari
+// KycStatus: KYC memverifikasi identitas personal (NIK/KTP), sedangkan ini
+// memverifikasi legalitas usaha (NPWP/akta/SIUP). Sebuah akun BUSINESS bisa
+// punya KYC APPROVED sekaligus business verification PENDING, dan badge
+// "Business Verified" hanya menyala dari enum ini — bukan dari kycStatus.
+enum BusinessVerificationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  REVOKED
+}
+
 enum OrderStatus {
   WAITING_CONFIRMATION
   WAITING_PAYMENT
@@ -234,6 +246,11 @@ enum NotificationType {
   KYC_REJECTED
   KYC_REVOKED
   KYC_RESUBMIT_REMINDER
+  // Hasil review verifikasi badan usaha — dikabari ke user lewat notification
+  // queue yang sama seperti KYC_APPROVED dkk.
+  BUSINESS_VERIFICATION_APPROVED
+  BUSINESS_VERIFICATION_REJECTED
+  BUSINESS_VERIFICATION_REVOKED
   SECURITY_NEW_LOGIN
   SECURITY_PASSWORD_CHANGED
   SECURITY_ACCOUNT_LOCKED
@@ -249,6 +266,8 @@ enum NotificationType {
   BADGE_AWARDED
   RANK_UPGRADED
   ORDER_DELIVERED
+  // Section 4: pengingat pertanyaan profil yang belum dijawab setelah 48 jam.
+  QUESTION_UNANSWERED_REMINDER
   DATA_EXPORT_READY
   SYSTEM_MAINTENANCE
   SYSTEM_ANNOUNCEMENT
@@ -362,6 +381,12 @@ enum AuditAction {
   KYC_APPROVED
   KYC_REJECTED
   KYC_REVOKED
+  // Verifikasi badan usaha (BusinessVerification) — jejak audit admin, terpisah
+  // dari KYC_* supaya admin console bisa memfilter kedua domain secara independen.
+  BUSINESS_VERIFICATION_APPROVED
+  BUSINESS_VERIFICATION_REJECTED
+  BUSINESS_VERIFICATION_REVOKED
+  BUSINESS_DOCUMENTS_ACCESSED
   ORDER_CREATED
   ORDER_STATUS_CHANGED
   ORDER_FORCE_CANCEL
@@ -432,6 +457,8 @@ enum UserAuditAction {
   ACCOUNT_DELETION_REQUESTED
   // KYC
   KYC_SUBMITTED
+  // Business verification (badan usaha) — jejak audit sisi user
+  BUSINESS_VERIFICATION_SUBMITTED
   // Order
   ORDER_CREATED
   ORDER_CONFIRMED
@@ -535,6 +562,11 @@ model User {
   phoneNumber     String    @unique
   phoneNumberHash String?   @unique
   phoneVerified   Boolean   @default(false)
+  // phoneVerifiedAt dibuat simetris dengan emailVerifiedAt: badge "Email & Phone
+  // Verified" adalah kombinasi keduanya, jadi UI "Tentang" perlu tanggal kapan
+  // masing-masing diverifikasi. Legacy rows (phoneVerified=true sebelum kolom ini
+  // ada) tetap NULL — badge tetap tampil, earnedAt-nya fallback ke memberSince.
+  phoneVerifiedAt DateTime?
   dateOfBirth     DateTime? @db.Date
   gender          Gender?
   address         String?   @db.VarChar(500)
@@ -551,6 +583,11 @@ model User {
   // Kahade Plus flag denormalized — di-sync oleh SubscriptionService
   isKahadePlus          Boolean   @default(false)
   subscriptionExpiresAt DateTime?
+  // kahadePlusSince = tanggal PERTAMA kali user subscribe Kahade Plus. Tidak pernah
+  // di-reset saat langganan expire/renew — dipakai badge "Kahade+" dan bagian
+  // "Tentang" di profil publik ("Plus member sejak ..."). Di-sync oleh
+  // SubscriptionService (subscribe pertama) dan admin grant.
+  kahadePlusSince       DateTime?
 
   // Security
   failedLoginAttempts   Int       @default(0)
@@ -579,6 +616,15 @@ model User {
   isVip                 Boolean   @default(false)  // Badge VIP dari admin
   vipGrantedAt          DateTime?
   vipGrantedBy          String?   // Admin user ID (soft FK ke admin_users.id)
+
+  // Section 6: sinyal moderasi hasil agregasi laporan user.
+  // Di-set otomatis oleh ReportFlagService bila >= REPORT_FLAG_THRESHOLD (3)
+  // laporan dari reporter BERBEDA masuk dalam REPORT_FLAG_WINDOW (24 jam).
+  // Ini murni penanda antrean untuk admin: TIDAK memicu auto-ban, tidak
+  // membatasi fitur apa pun, dan tidak pernah diekspos ke user lain.
+  // Keputusan (ban / teguran / abaikan) tetap di tangan admin.
+  flaggedForReview      Boolean   @default(false)
+  flaggedForReviewAt    DateTime? // kapan ambang laporan terakhir terlampaui
 
   // Membership
   membershipRank        MembershipRank @default(BRONZE)
@@ -613,6 +659,8 @@ model User {
   twoFactorAuth           TwoFactorAuth?
   otpCodes                OtpCode[]
   kycRequests             KycRequest[]
+  // Verifikasi badan usaha (badge "Business Verified") — domain terpisah dari KYC
+  businessVerifications   BusinessVerification[]
   bankAccounts            BankAccount[]
   wallet                  Wallet?
   ordersAsBuyer           Order[]               @relation("BuyerOrders")
@@ -665,8 +713,13 @@ model User {
   questionsAsked          ProfileQuestion[]     @relation("QuestionAsker")
   questionsReceived       ProfileQuestion[]     @relation("QuestionReceiver")
   questionComments        ProfileQuestionComment[] @relation("CommentAuthor")
+  // Section 4: upvote pertanyaan profil
+  questionUpvotes         ProfileQuestionUpvote[]
   supportTickets          SupportTicket[]          @relation("UserSupportTickets")
   showcaseItems           UserShowcase[]
+  // Section 3: interaksi sosial pada showcase (like & komentar)
+  showcaseLikes           ShowcaseLike[]
+  showcaseComments        ShowcaseComment[]
   scheduledWithdrawals    ScheduledWithdrawal[]  @relation("UserScheduledWithdrawals")
   deliveryProofsSubmitted DeliveryProof[]        @relation("DeliveryProofSubmitter")
   ratingReplies           RatingReply[]          @relation("RatingReplies")
@@ -680,6 +733,10 @@ model User {
   @@index([createdAt])
   @@index([isActive, isBanned])
   @@index([deletedAt]) // WHERE deletedAt IS NULL query optimization
+  // Section 6: antrean moderasi admin — WHERE flaggedForReview = true
+  // ORDER BY flaggedForReviewAt DESC. Selektivitasnya tinggi (hanya sedikit
+  // user yang pernah terflag) sehingga index boolean ini efektif.
+  @@index([flaggedForReview, flaggedForReviewAt])
   @@map("users")
 }
 
@@ -862,6 +919,78 @@ model KycRequest {
   @@index([status, createdAt]) // compound untuk admin KYC queue: status-filter + sort by date
   @@index([reviewedBy]) // index untuk admin performance analytics
   @@map("kyc_requests")
+}
+
+// ============================================================
+// BUSINESS VERIFICATION (badge "Business Verified")
+// ============================================================
+//
+// Verifikasi badan usaha — BEDA domain dari KycRequest (personal/KTP). Hanya
+// boleh diajukan oleh akun dengan accountType == BUSINESS; enforcement di
+// BusinessVerificationService, bukan di DB (accountType bisa berubah).
+//
+// Review lewat admin console dengan pola yang sama persis seperti admin-kyc.service.ts:
+// queue FIFO per status, approve/reject/revoke dengan guard `status = 'PENDING'`
+// di dalam transaction Serializable supaya dua admin tidak double-process.
+model BusinessVerification {
+  id             String                     @id @default(cuid())
+  verificationId String                     @unique // Format: BIZ-YYYYMMDD-SERIAL-SUFFIX
+  userId         String
+  user           User                       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  status         BusinessVerificationStatus @default(PENDING)
+
+  // Identitas badan usaha
+  businessName   String                     @db.VarChar(150)
+  // NPWP disimpan terenkripsi AES-256 (pola sama seperti BankAccount.accountNumber).
+  npwpNumber     String
+  // HMAC-SHA256 deterministik dari NPWP untuk deteksi duplikat lintas akun.
+  // AES non-deterministik (IV random) tidak bisa di-unique, jadi uniqueness
+  // pakai hash satu arah ini — sama seperti KycRequest.ktpNumberHash.
+  // Partial-unique (hanya PENDING/APPROVED) ditegakkan lewat migration, bukan
+  // @unique di sini, supaya submission yang REJECTED/REVOKED tidak memblokir
+  // pengajuan ulang dengan NPWP yang sama.
+  npwpNumberHash String
+  // Nomor akta pendirian / SIUP — minimal salah satu wajib diisi (divalidasi di DTO).
+  deedNumber     String?                    @db.VarChar(100)
+  siupNumber     String?                    @db.VarChar(100)
+
+  // Dokumen pendukung: fileKey R2 private-bucket yang sudah dikonfirmasi lewat
+  // POST /upload/confirm (pola sama seperti KYC ktpFileKey/selfieFileKey).
+  // Tiap entri disimpan TERENKRIPSI AES-256 (pola KycRequest.ktpPhotoUrl) supaya
+  // DB dump tidak membocorkan nama file dokumen legalitas. Admin me-mint signed
+  // URL short-lived saat review (lihat AdminBusinessVerificationService.getDocumentUrls).
+  documentFileKeys String[]
+
+  // Review — FK ke AdminUser (SetNull agar riwayat tetap ada saat admin dihapus)
+  reviewedBy      String?
+  reviewer        AdminUser?                @relation("BusinessVerificationReviewer", fields: [reviewedBy], references: [id], onDelete: SetNull)
+  reviewedAt      DateTime?
+  // approvedAt dipertahankan setelah REVOKED (untuk audit) — badge "Business
+  // Verified" memakai status, bukan approvedAt.
+  approvedAt      DateTime?
+  revokedAt       DateTime?
+  rejectionReason String?
+  adminNotes      String?                   @db.Text
+
+  // Metadata
+  submittedIp     String?
+  attemptNumber   Int                       @default(1)
+
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+
+  // CREATE UNIQUE INDEX business_verification_one_pending_per_user
+  //   ON business_verifications(user_id) WHERE status = 'PENDING';
+  // CREATE UNIQUE INDEX business_verification_active_npwp_unique
+  //   ON business_verifications(npwp_number_hash) WHERE status IN ('PENDING','APPROVED');
+
+  @@index([userId])
+  @@index([status])
+  @@index([npwpNumberHash])
+  @@index([status, createdAt]) // admin review queue: status-filter + sort by date
+  @@index([reviewedBy])
+  @@map("business_verifications")
 }
 
 // ============================================================
@@ -2001,6 +2130,9 @@ model AdminUser {
   // Relations
   auditLogs        AdminAuditLog[]
   kycReviews       KycRequest[]        @relation("KycReviewer")
+  // Review verifikasi badan usaha — relasi terpisah dari kycReviews karena
+  // BusinessVerification adalah domain verifikasi yang berbeda.
+  businessVerificationReviews BusinessVerification[] @relation("BusinessVerificationReviewer")
   assignedDisputes Dispute[]           @relation("DisputeAssignedAdmin")
   disputeDecisions DisputeDecision[]   @relation("DisputeDecider")
  
@@ -2222,6 +2354,21 @@ model ProfileQuestion {
 
   isPublic    Boolean  @default(true)
   isHidden    Boolean  @default(false)
+  /// Section 4: `isHidden` polos digantikan alasan kategoris. Menyembunyikan
+  /// pertanyaan tanpa mengisi alasan ditolak di level service dan di level DB
+  /// (constraint profile_question_hidden_fields_consistent).
+  hiddenReason ContentHiddenReason?
+  hiddenAt     DateTime?
+  hiddenBy     String?  @db.VarChar(100)
+
+  /// Section 4: jumlah upvote. Denormalisasi + atomic increment (pola
+  /// TransactionTemplatesService.recordUsage) supaya urutan "terpopuler" tidak
+  /// perlu COUNT(*) per baris.
+  upvoteCount  Int      @default(0)
+  /// Section 4: penanda pengingat 48 jam sudah dikirim. Sekali per pertanyaan —
+  /// job reminder mengklaim baris ini dengan updateMany bersyarat sehingga dua
+  /// instance yang balapan tidak mengirim dua notifikasi.
+  reminderSentAt DateTime?
 
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -2229,9 +2376,32 @@ model ProfileQuestion {
   @@index([receiverId])
   @@index([askerId])
   @@index([receiverId, isPublic, isHidden])
+  // Job reminder 48 jam: scan pertanyaan belum dijawab yang belum diingatkan.
+  @@index([answeredAt, reminderSentAt, createdAt])
+  // Urutan "terpopuler" di Q&A publik.
+  @@index([receiverId, isPublic, isHidden, upvoteCount])
   @@map("profile_questions")
 
   comments    ProfileQuestionComment[]
+  upvotes     ProfileQuestionUpvote[]
+}
+
+/// Section 4 — upvote pertanyaan profil. Unique (userId, questionId) ditegakkan
+/// di DB agar dua request balapan tidak menghasilkan upvote ganda / counter
+/// melenceng.
+model ProfileQuestionUpvote {
+  id         String          @id @default(cuid())
+  questionId String
+  question   ProfileQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt  DateTime        @default(now())
+
+  @@unique([userId, questionId])
+  @@index([questionId, createdAt, id])
+  @@index([userId])
+  @@map("profile_question_upvotes")
 }
 
 model ProfileQuestionComment {
@@ -2246,6 +2416,11 @@ model ProfileQuestionComment {
 
   content     String   @db.VarChar(1000)
   isHidden    Boolean  @default(false)
+  /// Section 4: alasan moderasi kategoris, sama seperti ProfileQuestion dan
+  /// ShowcaseComment (ContentHiddenReason).
+  hiddenReason ContentHiddenReason?
+  hiddenAt     DateTime?
+  hiddenBy     String?  @db.VarChar(100)
 
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -2440,6 +2615,9 @@ model DisputeMessage {
   @@map("dispute_messages")
 }
 
+/// Section 3 — Showcase berubah dari "etalase statis" menjadi konten sosial:
+/// punya banyak gambar, kategori, visibilitas, dan counter like/komentar/view
+/// yang didenormalisasi agar feed discover tidak perlu COUNT(*) per baris.
 model UserShowcase {
   id          String   @id @default(cuid())
   userId      String
@@ -2447,17 +2625,121 @@ model UserShowcase {
 
   title       String   @db.VarChar(100)
   description String?  @db.VarChar(500)
-  imageUrl    String?
+  /// Kategori bebas-terkendali untuk filter feed discover (mis. "ilustrasi",
+  /// "jasa video"). Nullable: item lama tanpa kategori tetap muncul di feed.
+  category    String?  @db.VarChar(60)
+  /// PRIVATE menyembunyikan item dari feed discover DAN dari profil publik;
+  /// hanya pemilik (dan admin) yang bisa melihatnya.
+  visibility  ShowcaseVisibility @default(PUBLIC)
   priceMin    BigInt?
   priceMax    BigInt?
   isActive    Boolean  @default(true)
   sortOrder   Int      @default(0)
 
+  /// Counter denormalisasi. Selalu di-update lewat Prisma atomic increment
+  /// ({ increment } / { decrement }) di dalam transaksi yang sama dengan
+  /// mutasi barisnya — pola TransactionTemplatesService.recordUsage.
+  likeCount    Int     @default(0)
+  commentCount Int     @default(0)
+  viewCount    Int     @default(0)
+
+  images      ShowcaseImage[]
+  likes       ShowcaseLike[]
+  comments    ShowcaseComment[]
+
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   @@index([userId, isActive, sortOrder])
+  // Feed discover: sort "latest" (createdAt) dan "popular" (likeCount). Kolom id
+  // ikut di index karena dipakai sebagai tiebreak cursor pagination.
+  @@index([visibility, isActive, createdAt, id])
+  @@index([visibility, isActive, likeCount, id])
+  @@index([category])
   @@map("user_showcases")
+}
+
+/// Visibilitas item showcase di feed discover / profil publik.
+enum ShowcaseVisibility {
+  PUBLIC
+  PRIVATE
+}
+
+/// Kategori alasan konten disembunyikan oleh moderator. Dipakai bersama oleh
+/// ShowcaseComment (Section 3) dan ProfileQuestion (Section 4) supaya alasan
+/// moderasi konsisten di seluruh platform.
+enum ContentHiddenReason {
+  SPAM
+  INAPPROPRIATE
+  HARASSMENT
+  OTHER
+}
+
+/// Gambar showcase (one-to-many). Menggantikan kolom tunggal
+/// `user_showcases.imageUrl` yang sudah di-drop setelah data lama di-backfill
+/// ke tabel ini (lihat migration 20260912120000 + 20260912130000).
+model ShowcaseImage {
+  id         String       @id @default(cuid())
+  showcaseId String
+  showcase   UserShowcase @relation(fields: [showcaseId], references: [id], onDelete: Cascade)
+
+  /// URL publik yang siap dipakai client (R2 public bucket).
+  imageUrl   String       @db.VarChar(512)
+  /// Object key R2. Nullable karena baris hasil backfill dari `imageUrl` lama
+  /// bisa berupa URL eksternal yang tidak kita miliki object-nya.
+  fileKey    String?      @db.VarChar(512)
+  sortOrder  Int          @default(0)
+
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  @@index([showcaseId, sortOrder])
+  @@map("showcase_images")
+}
+
+/// Like pada showcase. Unique (userId, showcaseId) ditegakkan di DB supaya dua
+/// request balapan tidak menghasilkan like ganda / counter melenceng.
+model ShowcaseLike {
+  id         String       @id @default(cuid())
+  showcaseId String
+  showcase   UserShowcase @relation(fields: [showcaseId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt  DateTime     @default(now())
+
+  @@unique([userId, showcaseId])
+  @@index([showcaseId, createdAt, id])
+  @@index([userId])
+  @@map("showcase_likes")
+}
+
+/// Komentar showcase dengan balasan bersarang satu tingkat (parentId).
+/// `isHidden` + `hiddenReason` dipakai moderasi; komentar tersembunyi tetap
+/// dihitung di DB tapi disaring dari semua query publik.
+model ShowcaseComment {
+  id         String       @id @default(cuid())
+  showcaseId String
+  showcase   UserShowcase @relation(fields: [showcaseId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  parentId   String?
+  parent     ShowcaseComment?  @relation("ShowcaseCommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies    ShowcaseComment[] @relation("ShowcaseCommentReplies")
+
+  content    String       @db.Text
+  isHidden   Boolean      @default(false)
+  hiddenReason ContentHiddenReason?
+  hiddenAt   DateTime?
+  hiddenBy   String?      @db.VarChar(100)
+
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  @@index([showcaseId, parentId, createdAt, id])
+  @@index([userId])
+  @@map("showcase_comments")
 }
 
 enum DisputeCallStatus {

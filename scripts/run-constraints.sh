@@ -741,6 +741,59 @@ BEGIN
   END IF;
 END $$;
 
+
+-- ============================================================
+-- BUSINESS VERIFICATION (Section 1: Verified Badge System)
+-- Partial unique indexes declared as comments in schema.prisma
+-- (model BusinessVerification).
+-- ============================================================
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes WHERE indexname = 'business_verification_one_pending_per_user'
+  ) THEN
+    CREATE UNIQUE INDEX business_verification_one_pending_per_user
+      ON business_verifications("userId")
+      WHERE status = 'PENDING';
+    RAISE NOTICE 'Added: business_verification_one_pending_per_user';
+  ELSE
+    RAISE NOTICE 'Exists: business_verification_one_pending_per_user';
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes WHERE indexname = 'business_verification_active_npwp_unique'
+  ) THEN
+    CREATE UNIQUE INDEX business_verification_active_npwp_unique
+      ON business_verifications("npwpNumberHash")
+      WHERE status IN ('PENDING', 'APPROVED');
+    RAISE NOTICE 'Added: business_verification_active_npwp_unique';
+  ELSE
+    RAISE NOTICE 'Exists: business_verification_active_npwp_unique';
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints
+    WHERE constraint_name = 'business_verification_timestamps_consistent'
+  ) THEN
+    ALTER TABLE business_verifications ADD CONSTRAINT business_verification_timestamps_consistent
+      CHECK (
+        ("revokedAt" IS NULL OR status = 'REVOKED')
+        AND ("reviewedAt" IS NULL OR status <> 'PENDING')
+        AND ("attemptNumber" >= 1)
+      );
+    RAISE NOTICE 'Added: business_verification_timestamps_consistent';
+  ELSE
+    RAISE NOTICE 'Exists: business_verification_timestamps_consistent';
+  END IF;
+END $$;
+
 SQL
 
 echo "All constraints applied successfully. ($(date))"

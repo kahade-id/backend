@@ -68,6 +68,9 @@ export class AdminUsersService {
     if (status === 'active') where.isBanned = false;
     if (status === 'kyc_approved') where.kycStatus = 'APPROVED';
     if (status === 'kyc_pending') where.kycStatus = 'PENDING';
+    // Section 6: antrean moderasi — user yang terflag agregasi laporan
+    // (>= 3 reporter berbeda dalam 24 jam). Flag ini sinyal saja, bukan sanksi.
+    if (status === 'flagged') where.flaggedForReview = true;
 
     const allowedSortFields = ['createdAt', 'lastLoginAt', 'email', 'fullName'];
     const orderField = sortBy && allowedSortFields.includes(sortBy) ? sortBy : 'createdAt';
@@ -86,6 +89,8 @@ export class AdminUsersService {
           membershipRank: true, averageRating: true,
           totalOrdersAsBuyer: true, totalOrdersAsSeller: true, totalOrdersCompleted: true,
           createdAt: true, lastLoginAt: true,
+          // Section 6: penanda antrean moderasi (internal admin saja).
+          flaggedForReview: true, flaggedForReviewAt: true,
           wallet: { select: { totalBalance: true, availableBalance: true } },
         },
       }),
@@ -116,6 +121,8 @@ export class AdminUsersService {
         totalOrdersCompleted: true, totalOrdersDisputed: true,
         createdAt: true, updatedAt: true, lastLoginAt: true, lastLoginIp: true,
         bio: true, headerUrl: true, usernameChangedAt: true,
+        // Section 6: penanda antrean moderasi + kapan ambang laporan terlampaui.
+        flaggedForReview: true, flaggedForReviewAt: true,
         contactEmail: true, contactPhone: true,
         showContactEmail: true, showContactPhone: true,
         wallet: { select: { totalBalance: true, availableBalance: true, escrowBalance: true } },
@@ -184,8 +191,12 @@ export class AdminUsersService {
         banReason: reason,
         bannedAt: now,
         bannedBy: adminId,
+        // Section 6: ban adalah kesimpulan dari review, jadi flag antrean
+        // dibersihkan agar user tidak terus muncul di daftar flagged.
+        flaggedForReview: false,
+        flaggedForReviewAt: null,
       },
-      select: { userId: true, isBanned: true, banReason: true, bannedAt: true, bannedBy: true },
+      select: { userId: true, isBanned: true, banReason: true, bannedAt: true, bannedBy: true, flaggedForReview: true },
     });
 
     const activeSessions = await this.prisma.userSession.findMany({
@@ -229,8 +240,13 @@ export class AdminUsersService {
 
     const result = await this.prisma.user.update({
       where: { id: user.id },
-      data: { isBanned: false, banReason: null, bannedAt: null, bannedBy: null },
-      select: { userId: true, isBanned: true },
+      data: {
+        isBanned: false, banReason: null, bannedAt: null, bannedBy: null,
+        // Section 6: setelah banding diterima, user tidak boleh langsung
+        // muncul lagi di antrean moderasi karena flag lama.
+        flaggedForReview: false, flaggedForReviewAt: null,
+      },
+      select: { userId: true, isBanned: true, flaggedForReview: true },
     });
 
     this.auditLog.logAdminAction({
@@ -245,6 +261,48 @@ export class AdminUsersService {
     });
 
     return result;
+  }
+
+  /**
+   * Section 6 — menutup antrean moderasi tanpa sanksi.
+   *
+   * `flaggedForReview` hanya sinyal bahwa >= 3 reporter berbeda melaporkan user
+   * ini dalam 24 jam. Dua dari tiga kemungkinan kesimpulan sudah punya jalur
+   * sendiri (ban -> banUser, banding -> unbanUser); method ini untuk kesimpulan
+   * ketiga: "sudah direview, tidak ada pelanggaran". Tidak ada tindakan
+   * otomatis lain terhadap user — flag dihapus, audit dicatat, selesai.
+   */
+  async clearReviewFlag(userId: string, adminId: string, ipAddress: string = 'internal'): Promise<object> {
+    const user = await this.prisma.user.findFirst({
+      where: { OR: [{ id: userId }, { userId }], deletedAt: null },
+      select: { id: true, userId: true, flaggedForReview: true, flaggedForReviewAt: true },
+    });
+    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    if (!user.flaggedForReview) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'User is not flagged for review' });
+    }
+
+    // Bersyarat flaggedForReview: true -> idempoten terhadap klik ganda admin.
+    const cleared = await this.prisma.user.updateMany({
+      where: { id: user.id, flaggedForReview: true },
+      data: { flaggedForReview: false, flaggedForReviewAt: null },
+    });
+    if (cleared.count === 0) {
+      throw new ConflictException({ code: ErrorCodes.INVALID_STATUS, message: 'Review flag state changed; reload and retry' });
+    }
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'User',
+      targetId: user.id,
+      description: `Admin cleared review flag for user ${user.id} (no sanction)`,
+      before: { flaggedForReview: true, flaggedForReviewAt: user.flaggedForReviewAt },
+      after: { flaggedForReview: false, flaggedForReviewAt: null },
+      ipAddress,
+    });
+
+    return { message: 'Review flag cleared', userId: user.userId, flaggedForReview: false };
   }
 
   private async resolveUserId(userId: string): Promise<string> {

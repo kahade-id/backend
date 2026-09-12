@@ -7,6 +7,7 @@ import { RedisService } from '../../../redis/redis.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { WalletService } from '../../wallet/wallet.service';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { SubscriptionPlan, SubscriptionStatus } from '@prisma/client';
 
 const mockPrisma = {
@@ -26,6 +27,9 @@ const mockPrisma = {
   },
   user: {
     update: jest.fn(),
+    // Section 1: subscribe/renew membaca kahadePlusSince sebelum memutuskan
+    // apakah perlu mengisinya (hanya pertama kali subscribe).
+    findUnique: jest.fn().mockResolvedValue({ kahadePlusSince: null }),
   },
   $queryRaw: jest.fn().mockResolvedValue([]),
   $transaction: jest.fn(),
@@ -88,6 +92,7 @@ describe('SubscriptionsService', () => {
         { provide: ConfigService, useValue: mockConfigService },
         { provide: AuditLogService, useValue: { logUserAction: jest.fn() } },
         { provide: WalletService, useValue: { verifyPin: jest.fn().mockResolvedValue(undefined) } },
+        { provide: VerificationBadgeService, useValue: { invalidate: jest.fn().mockResolvedValue(undefined) } },
       ],
     }).compile();
 

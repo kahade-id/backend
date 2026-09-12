@@ -21,6 +21,11 @@ const nanoid = customAlphabet('1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLM
 const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
   [UploadPurpose.KYC_KTP]: ['image/jpeg', 'image/png', 'image/webp'],
   [UploadPurpose.KYC_SELFIE]: ['image/jpeg', 'image/png', 'image/webp'],
+  // Dokumen badan usaha boleh PDF (NPWP/akta/SIUP umumnya dipindai sebagai PDF).
+  [UploadPurpose.BUSINESS_DOCUMENT]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
+  // Section 3: gambar showcase tampil publik di feed, jadi hanya image raster.
+  // PDF/SVG ditolak — tidak bisa dirender sebagai thumbnail kartu feed.
+  [UploadPurpose.SHOWCASE_IMAGE]: ['image/jpeg', 'image/png', 'image/webp'],
   [UploadPurpose.AVATAR]: ['image/jpeg', 'image/png', 'image/webp'],
   [UploadPurpose.CHAT_ATTACHMENT]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
   [UploadPurpose.DISPUTE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
@@ -33,6 +38,8 @@ const MIN_FILE_SIZE = 1024;
 const MAX_FILE_SIZE: Record<UploadPurpose, number> = {
   [UploadPurpose.KYC_KTP]: 5 * 1024 * 1024,
   [UploadPurpose.KYC_SELFIE]: 5 * 1024 * 1024,
+  [UploadPurpose.BUSINESS_DOCUMENT]: 10 * 1024 * 1024,
+  [UploadPurpose.SHOWCASE_IMAGE]: 5 * 1024 * 1024,
   [UploadPurpose.AVATAR]: 2 * 1024 * 1024,
   [UploadPurpose.CHAT_ATTACHMENT]: 10 * 1024 * 1024,
   [UploadPurpose.DISPUTE_EVIDENCE]: 10 * 1024 * 1024,
@@ -128,6 +135,8 @@ function isSafeFileKey(fileKey: unknown): fileKey is string {
 const PURPOSE_VISIBILITY: Record<UploadPurpose, 'private' | 'public'> = {
   [UploadPurpose.KYC_KTP]: 'private',
   [UploadPurpose.KYC_SELFIE]: 'private',
+  [UploadPurpose.BUSINESS_DOCUMENT]: 'private',
+  [UploadPurpose.SHOWCASE_IMAGE]: 'public',
   [UploadPurpose.AVATAR]: 'public',
   [UploadPurpose.CHAT_ATTACHMENT]: 'private',
   [UploadPurpose.DISPUTE_EVIDENCE]: 'private',
@@ -138,6 +147,8 @@ const PURPOSE_VISIBILITY: Record<UploadPurpose, 'private' | 'public'> = {
 const PURPOSE_FOLDER_MAP_INTERNAL: Record<UploadPurpose, string> = {
   [UploadPurpose.KYC_KTP]: 'kyc-ktp',
   [UploadPurpose.KYC_SELFIE]: 'kyc-selfie',
+  [UploadPurpose.BUSINESS_DOCUMENT]: 'business-documents',
+  [UploadPurpose.SHOWCASE_IMAGE]: 'showcase-images',
   [UploadPurpose.AVATAR]: 'avatars',
   [UploadPurpose.CHAT_ATTACHMENT]: 'chat-attachments',
   [UploadPurpose.DISPUTE_EVIDENCE]: 'dispute-evidence',
@@ -250,6 +261,11 @@ export class UploadService {
     const EXPIRY_BY_PURPOSE: Record<UploadPurpose, number> = {
       [UploadPurpose.KYC_KTP]: 600,
       [UploadPurpose.KYC_SELFIE]: 600,
+      // Dokumen badan usaha bisa beberapa file dan diupload bergantian, jadi
+      // window-nya disamakan dengan evidence (1800 s), bukan avatar (300 s).
+      [UploadPurpose.BUSINESS_DOCUMENT]: 1800,
+      // Satu item showcase boleh beberapa gambar yang diupload bergantian.
+      [UploadPurpose.SHOWCASE_IMAGE]: 1800,
       [UploadPurpose.AVATAR]: 300,
       [UploadPurpose.CHAT_ATTACHMENT]: 900,
       [UploadPurpose.DISPUTE_EVIDENCE]: 1800,
@@ -597,46 +613,79 @@ export class UploadService {
     return results;
   }
 
-  async verifyUserFileKeys(userId: string, fileKeys: string[], purpose: UploadPurpose): Promise<void> {
+  /**
+   * Validasi file key hasil upload presigned milik user: bentuk key, kepemilikan,
+   * konfirmasi /upload/confirm, ukuran tersimpan, dan content type tersimpan.
+   *
+   * `opts.maxFiles`  — batas jumlah file (default 5, perilaku lama).
+   * `opts.consume`   — konsumsi konfirmasi upload (default true). Set false bila
+   *                    pemanggil masih bisa gagal SETELAH validasi ini dan file
+   *                    harus tetap bisa dipakai ulang (pola business-verification).
+   * `opts.label`     — kata benda untuk pesan error (default "Attachment").
+   *
+   * Bucket diturunkan dari `purpose` (PURPOSE_VISIBILITY), bukan hardcoded private,
+   * supaya purpose public seperti SHOWCASE_IMAGE/AVATAR bisa lewat jalur yang sama.
+   */
+  async verifyUserFileKeys(
+    userId: string,
+    fileKeys: string[],
+    purpose: UploadPurpose,
+    opts?: { maxFiles?: number; consume?: boolean; label?: string },
+  ): Promise<void> {
     const folder = UploadService.PURPOSE_FOLDER_MAP[purpose];
     const prefix = `uploads/${folder}/${userId}/`;
     const allowedTypes = ALLOWED_CONTENT_TYPES[purpose];
     const maxSize = MAX_FILE_SIZE[purpose];
-    if (!Array.isArray(fileKeys) || fileKeys.length > 5) {
-      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Too many attachment files' });
+    const maxFiles = opts?.maxFiles ?? 5;
+    const shouldConsume = opts?.consume ?? true;
+    const label = opts?.label ?? 'Attachment';
+    if (!Array.isArray(fileKeys) || fileKeys.length > maxFiles) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Too many ${label.toLowerCase()} files (max ${maxFiles})` });
     }
     if (new Set(fileKeys).size !== fileKeys.length) {
-      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Duplicate attachment file keys are not allowed' });
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Duplicate ${label.toLowerCase()} file keys are not allowed` });
     }
 
+    const bucket = this.getBucket(purpose);
     for (const fileKey of fileKeys) {
       if (!isSafeFileKey(fileKey) || !fileKey.startsWith(prefix) || fileKey.split('/').length !== 4) {
-        throw new BadRequestException({ code: ErrorCodes.FILE_ACCESS_DENIED, message: 'Attachment file key is not owned by this user or has the wrong purpose' });
+        throw new BadRequestException({ code: ErrorCodes.FILE_ACCESS_DENIED, message: `${label} file key is not owned by this user or has the wrong purpose` });
       }
       if (!(await this.isConfirmedUploadKey(userId, fileKey))) {
-        throw new BadRequestException({ code: ErrorCodes.UPLOAD_NOT_CONFIRMED, message: 'Attachment must be confirmed before it can be attached' });
+        throw new BadRequestException({ code: ErrorCodes.UPLOAD_NOT_CONFIRMED, message: `${label} must be confirmed before it can be attached` });
       }
 
       let head: HeadObjectCommandOutput;
       try {
-        head = await this.getS3Client().send(new HeadObjectCommand({ Bucket: this.getPrivateBucket(), Key: fileKey })) as HeadObjectCommandOutput;
+        head = await this.getS3Client().send(new HeadObjectCommand({ Bucket: bucket, Key: fileKey })) as HeadObjectCommandOutput;
       } catch {
-        throw new NotFoundException({ code: ErrorCodes.FILE_NOT_FOUND_OR_EXPIRED, message: 'Attachment file was not found in storage' });
+        throw new NotFoundException({ code: ErrorCodes.FILE_NOT_FOUND_OR_EXPIRED, message: `${label} file was not found in storage` });
       }
       if (head.ContentLength === undefined || head.ContentLength < MIN_FILE_SIZE || head.ContentLength > maxSize) {
-        throw new BadRequestException({ code: ErrorCodes.FILE_TOO_LARGE, message: 'Attachment file size is outside the allowed range' });
+        throw new BadRequestException({ code: ErrorCodes.FILE_TOO_LARGE, message: `${label} file size is outside the allowed range` });
       }
       if (!head.ContentType || !allowedTypes.includes(head.ContentType)) {
-        throw new BadRequestException({ code: ErrorCodes.MIME_TYPE_MISMATCH, message: 'Attachment content type is not allowed' });
+        throw new BadRequestException({ code: ErrorCodes.MIME_TYPE_MISMATCH, message: `${label} content type is not allowed` });
       }
     }
 
+    if (!shouldConsume) return;
     for (const fileKey of fileKeys) {
       const consumed = await this.redis.consumeOnce(`confirmed_upload:${userId}:${fileKey}`, { throwOnError: true });
       if (!consumed) {
-        throw new ConflictException({ code: ErrorCodes.UPLOAD_NOT_CONFIRMED, message: 'Attachment confirmation has already been consumed' });
+        throw new ConflictException({ code: ErrorCodes.UPLOAD_NOT_CONFIRMED, message: `${label} confirmation has already been consumed` });
       }
     }
+  }
+
+  /**
+   * URL publik untuk object key di bucket public (AVATAR / SHOWCASE_IMAGE).
+   * Mengikuti konvensi `uploadDirect`: bila R2_PUBLIC_URL tidak diset, kembalikan
+   * key apa adanya supaya client tetap punya penanda yang stabil.
+   */
+  buildPublicUrl(fileKey: string): string {
+    const publicUrl = this.configService.get<string>('r2.publicUrl');
+    return publicUrl ? `${publicUrl.replace(/\/+$/, '')}/${fileKey}` : fileKey;
   }
 
   async getFileSize(fileKey: string): Promise<number> {

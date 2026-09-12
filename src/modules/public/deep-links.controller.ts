@@ -2,8 +2,10 @@ import { Controller, Get, Header, Param, Res } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import type { Response } from 'express';
 import { Public } from '../../common/decorators/public.decorator';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { UsersService } from '../users/users.service';
 import { OrderLinksService } from '../orders/order-links.service';
+import { ShowcaseService } from '../showcase/showcase.service';
 
 function escapeHtml(value: unknown): string {
   return String(value ?? '')
@@ -51,13 +53,21 @@ export class DeepLinksController {
   constructor(
     private readonly usersService: UsersService,
     private readonly orderLinksService: OrderLinksService,
+    private readonly showcaseService: ShowcaseService,
   ) {}
 
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Get('user/:username')
   @Header('Content-Type', 'text/html; charset=utf-8')
-  async profile(@Param('username') username: string, @Res() response: Response): Promise<void> {
+  async profile(
+    @Param('username') username: string,
+    // Section 6: halaman share ikut menghormati relasi block. Route ini
+    // @Public(), jadi viewerId terisi hanya bila klien mengirim token yang sah
+    // (lihat JwtAuthGuard.attachOptionalUser); tanpa token -> null -> anonim.
+    @CurrentUser('sub') viewerId: string | null,
+    @Res() response: Response,
+  ): Promise<void> {
     const safeUsername = String(username ?? '').trim().toLowerCase();
     if (!USERNAME_RE.test(safeUsername)) {
       response.status(404).send(page({ title: 'Profil tidak ditemukan', description: 'Profil publik Kahade tidak tersedia.', appUrl: appSchemeUrl('u/invalid'), detail: 'Username pada tautan tidak valid.' }));
@@ -66,11 +76,22 @@ export class DeepLinksController {
     let detail = `Profil publik @${safeUsername}`;
     let title = `Profil @${safeUsername}`;
     try {
-      const profile = await this.usersService.getPublicProfile(safeUsername);
+      const profile = await this.usersService.getPublicProfile(safeUsername, viewerId ?? undefined);
       const record = profile as Record<string, unknown>;
-      title = String(record.fullName ?? record.username ?? title);
-      detail = `@${String(record.username ?? safeUsername)}\n${String(record.bio ?? 'Profil publik Kahade')}`;
+      // Section 2: profil publik sekarang mengembalikan bagian `identity`
+      // secara eksplisit. Field datar lama masih ada sebagai alias deprecated,
+      // jadi fallback ini menjaga kompatibilitas selama masa transisi.
+      const identity = (record.identity ?? {}) as Record<string, unknown>;
+      const resolvedUsername = String(identity.username ?? record.username ?? safeUsername);
+      title = String(identity.nickname ?? record.fullName ?? resolvedUsername);
+      detail = `@${resolvedUsername}\n${String(identity.bio ?? record.bio ?? 'Profil publik Kahade')}`;
     } catch {
+      // Section 6: getPublicProfile menolak profil yang profileVisible-nya mati
+      // (404), akun nonaktif/banned/terhapus (404), dan viewer yang terlibat
+      // relasi block dua arah (403 USER_BLOCKED). Ketiganya memang tidak boleh
+      // dibocorkan lewat halaman share — halaman ini tetap 200 dengan satu
+      // pesan netral yang identik, supaya penyerang tidak bisa membedakan
+      // "profil private", "akun dihapus", dan "kamu diblokir" dari responsnya.
       detail = `Profil @${safeUsername} belum dapat dimuat. Buka aplikasi untuk melihat status terbaru.`;
     }
     response.status(200).send(page({ title, description: 'Profil publik Kahade.', appUrl: appSchemeUrl(`u/${encodeURIComponent(safeUsername)}`), detail }));
@@ -79,8 +100,12 @@ export class DeepLinksController {
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Get('profile/:username')
-  async profileAlias(@Param('username') username: string, @Res() response: Response): Promise<void> {
-    return this.profile(username, response);
+  async profileAlias(
+    @Param('username') username: string,
+    @CurrentUser('sub') viewerId: string | null,
+    @Res() response: Response,
+  ): Promise<void> {
+    return this.profile(username, viewerId, response);
   }
 
   @Public()
@@ -104,6 +129,34 @@ export class DeepLinksController {
       detail = 'Tautan ini mungkin sudah kedaluwarsa, dibatalkan, atau sudah digunakan. Buka aplikasi untuk mendapatkan status terbaru.';
     }
     response.status(200).send(page({ title, description: 'Tautan transaksi escrow Kahade.', appUrl: appSchemeUrl(`o-l/${encodeURIComponent(safeToken)}`), detail }));
+  }
+
+  // Section 3: halaman share untuk item showcase (konten sosial).
+  // getSharePayload menolak item PRIVATE, item milik akun nonaktif/banned/
+  // terhapus/profil privat, dan item yang pemiliknya saling blokir dengan
+  // viewer — semuanya dirender sebagai satu pesan netral supaya keberadaan
+  // konten privat tidak bocor lewat halaman share.
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @Get('showcase/:showcaseId')
+  @Header('Content-Type', 'text/html; charset=utf-8')
+  async showcase(@Param('showcaseId') showcaseId: string, @Res() response: Response): Promise<void> {
+    const safeId = String(showcaseId ?? '').trim();
+    if (!PUBLIC_ID_RE.test(safeId)) {
+      response.status(404).send(page({ title: 'Showcase tidak ditemukan', description: 'Konten showcase Kahade tidak tersedia.', appUrl: appSchemeUrl('showcase/invalid'), detail: 'ID showcase pada tautan tidak valid.' }));
+      return;
+    }
+    let title = 'Showcase Kahade';
+    let detail = 'Lihat item showcase ini di aplikasi Kahade.';
+    try {
+      const payload = await this.showcaseService.getSharePayload(safeId);
+      const record = payload as Record<string, unknown>;
+      title = String(record.title ?? title);
+      detail = `${String(record.description ?? 'Item showcase Kahade')}\nHarga: ${String(record.priceLabel ?? '—')}\nOleh: @${String(record.authorUsername ?? 'pengguna Kahade')}`;
+    } catch {
+      detail = 'Konten ini privat, sudah dihapus, atau tidak tersedia. Buka aplikasi untuk melihat status terbaru.';
+    }
+    response.status(200).send(page({ title, description: 'Item showcase publik Kahade.', appUrl: appSchemeUrl(`showcase/${encodeURIComponent(safeId)}`), detail }));
   }
 
   @Public()

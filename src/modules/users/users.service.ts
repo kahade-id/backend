@@ -14,16 +14,23 @@ import { randomBytes, randomInt, randomUUID } from 'crypto';
 import * as path from 'path';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { MAX_LIMIT, RESERVED_USERNAMES } from '../../common/constants/app.constants';
+import { ReportFlagService } from '../../common/services/report-flag.service';
 import { TOKEN_BLACKLIST, SESSION_REVOKED_KEY, TOTP_USED_CODE } from '../../common/constants/redis-keys';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { ReportUserDto } from './dto/report-user.dto';
 import { UpdateLinksDto } from './dto/update-links.dto';
-import { CreateShowcaseDto, UpdateShowcaseDto } from './dto/showcase.dto';
 import { OgMetadataService } from './og-metadata.service';
+import { VerificationBadgeService } from './verification-badge.service';
 import { generateNotifId } from '../../common/utils/id-generator.util';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import { verifyOtp } from '../../common/utils/otp.util';
 import { escapeLikePattern } from '../../common/utils/search.util';
+
+/** Jumlah baris preview yang ikut di payload profil publik. List lengkap tetap
+ * lewat endpoint paginasi masing-masing (followers/following/favorites). */
+const PROFILE_SOCIAL_PREVIEW_LIMIT = 6;
+const PROFILE_FAVORITES_PREVIEW_LIMIT = 12;
+const PROFILE_RECENT_RATINGS_LIMIT = 5;
 
 @Injectable()
 export class UsersService {
@@ -38,6 +45,9 @@ export class UsersService {
     private configService: ConfigService,
     private auditLog: AuditLogService,
     private ogMetadataService: OgMetadataService,
+    private verificationBadgeService: VerificationBadgeService,
+    // Section 6: agregasi laporan -> flag moderasi internal.
+    private reportFlagService: ReportFlagService,
   ) {}
 
   async getMyProfile(userId: string): Promise<object> {
@@ -255,6 +265,28 @@ export class UsersService {
     return { ...user, phoneNumber: decryptedPhone, isMfaEnabled: tfa?.isEnabled ?? false };
   }
 
+  /**
+   * Section 2 — Profile Core.
+   *
+   * Endpoint publik `GET /users/:username`. Payload dikelompokkan per bagian
+   * secara EKSPLISIT (identity / contact / links / social / favorites / badges /
+   * about / ratings) supaya UI tidak perlu merakit sendiri dari field datar.
+   *
+   * Penegakan privasi:
+   *  - `profileVisible` false, nonaktif, banned, atau soft-deleted -> 404
+   *    (identik dengan sebelumnya; tidak membocorkan keberadaan akun)
+   *  - ADA relasi block antara viewer dan owner (dua arah) -> 403 USER_BLOCKED.
+   *    Sebelumnya endpoint ini hanya menyembunyikan field; sekarang seluruh
+   *    endpoint ditolak, mengikuti pola block-list enforcement di
+   *    user-search.service.ts dan orders.service.ts.
+   *  - `contact.email` / `contact.phone` hanya terisi bila toggle
+   *    showContactEmail/showContactPhone aktif, dan dipaksa null bila ada relasi
+   *    block (defensive — jalur normalnya sudah 403 lebih dulu).
+   *
+   * Field datar lama (username, fullName, isKycVerified, isVip, stats, ...)
+   * DIPERTAHANKAN sebagai alias deprecated agar client lama tidak putus selama
+   * migrasi ke bentuk bersarang.
+   */
   async getPublicProfile(username: string, viewerId?: string): Promise<object> {
     const user = await this.prisma.user.findUnique({
       where: { username: username.toLowerCase() },
@@ -264,15 +296,21 @@ export class UsersService {
         totalOrdersCompleted: true, averageRating: true, totalRatingCount: true, memberSince: true,
         profileVisible: true, showContactEmail: true, contactEmail: true, showContactPhone: true, contactPhone: true,
         isActive: true, isBanned: true, deletedAt: true,
+        // Achievement badge (model Badge/UserBadge) — berbeda dari badge verifikasi.
         badges: { select: { badge: { select: { name: true, iconUrl: true, description: true } }, earnedAt: true } },
         ratingsReceived: {
-          where: { isHidden: false, giver: { isActive: true, isBanned: false, deletedAt: null } },
-          orderBy: { createdAt: 'desc' },
-          take: 5,
+          // Section 5: `profileVisible: true` ditambahkan supaya preview rating
+          // di profil memakai aturan visibilitas yang sama persis dengan
+          // GET /users/:username/ratings — pemberi rating yang menyembunyikan
+          // profilnya tidak boleh muncul di satu tempat tapi hilang di tempat
+          // lain (dan memang tidak seharusnya ditampilkan sama sekali).
+          where: { isHidden: false, giver: { isActive: true, isBanned: false, deletedAt: null, profileVisible: true } },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // tiebreak { id } — halaman stabil
+          take: PROFILE_RECENT_RATINGS_LIMIT,
           select: { stars: true, comment: true, createdAt: true, giver: { select: { username: true, avatarUrl: true } } },
         },
         links: {
-          orderBy: { displayOrder: 'asc' },
+          orderBy: [{ displayOrder: 'asc' }, { id: 'asc' }],
           select: { id: true, platform: true, url: true, label: true, displayOrder: true },
         },
         _count: {
@@ -289,37 +327,197 @@ export class UsersService {
       throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
     }
 
-    let isFollowing = false;
-    let isBlocked = false;
-    if (viewerId && viewerId !== user.id) {
-      const [followRow, blockRow, reverseBlockRow] = await Promise.all([
-        this.prisma.follow.findUnique({ where: { followerId_followingId: { followerId: viewerId, followingId: user.id } } }),
-        this.prisma.blockList.findUnique({ where: { blockerId_blockedId: { blockerId: viewerId, blockedId: user.id } } }),
-        this.prisma.blockList.findUnique({ where: { blockerId_blockedId: { blockerId: user.id, blockedId: viewerId } } }),
-      ]);
-      isFollowing = !!followRow;
-      isBlocked = !!blockRow;
-      if (reverseBlockRow) {
-        throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    const isOwnProfile = Boolean(viewerId && viewerId === user.id);
+
+    // Block-list enforcement: relasi block dua arah menutup seluruh endpoint.
+    if (viewerId && !isOwnProfile) {
+      const block = await this.prisma.blockList.findFirst({
+        where: {
+          OR: [
+            { blockerId: user.id, blockedId: viewerId },
+            { blockerId: viewerId, blockedId: user.id },
+          ],
+        },
+        select: { id: true, blockerId: true },
+      });
+      if (block) {
+        throw new ForbiddenException({
+          code: ErrorCodes.USER_BLOCKED,
+          message: 'This profile is not accessible',
+        });
       }
     }
 
+    // Setelah gate block lolos, semua query turunan bisa jalan paralel.
+    const excludedIds = await this.getViewerExcludedIds(viewerId ?? undefined);
+    const visibleUserFilter: Prisma.UserWhereInput = {
+      isActive: true,
+      isBanned: false,
+      deletedAt: null,
+      profileVisible: true,
+      ...(excludedIds.length > 0 ? { id: { notIn: excludedIds } } : {}),
+    };
+
+    const [followRow, followedByRow, favoriteRow, followerPreview, followingPreview, favorites, verificationBadges] =
+      await Promise.all([
+        viewerId && !isOwnProfile
+          ? this.prisma.follow.findUnique({
+              where: { followerId_followingId: { followerId: viewerId, followingId: user.id } },
+              select: { id: true },
+            })
+          : Promise.resolve(null),
+        viewerId && !isOwnProfile
+          ? this.prisma.follow.findUnique({
+              where: { followerId_followingId: { followerId: user.id, followingId: viewerId } },
+              select: { id: true },
+            })
+          : Promise.resolve(null),
+        viewerId && !isOwnProfile
+          ? this.prisma.userFavorite.findUnique({
+              where: { userId_favoriteUserId: { userId: viewerId, favoriteUserId: user.id } },
+              select: { id: true },
+            })
+          : Promise.resolve(null),
+        this.prisma.follow.findMany({
+          where: { followingId: user.id, follower: visibleUserFilter },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          take: PROFILE_SOCIAL_PREVIEW_LIMIT,
+          select: { follower: { select: { username: true, fullName: true, avatarUrl: true } } },
+        }),
+        this.prisma.follow.findMany({
+          where: { followerId: user.id, following: visibleUserFilter },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          take: PROFILE_SOCIAL_PREVIEW_LIMIT,
+          select: { following: { select: { username: true, fullName: true, avatarUrl: true } } },
+        }),
+        this.prisma.userFavorite.findMany({
+          where: { userId: user.id, favoriteUser: visibleUserFilter },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          take: PROFILE_FAVORITES_PREVIEW_LIMIT,
+          select: {
+            createdAt: true,
+            favoriteUser: { select: { userId: true, username: true, fullName: true, avatarUrl: true } },
+          },
+        }),
+        this.verificationBadgeService.getBadges(user.id),
+      ]);
+
+    const favoritesTotal = await this.prisma.userFavorite.count({
+      where: { userId: user.id, favoriteUser: visibleUserFilter },
+    });
+
+    // Kontak publik: hormati toggle, dan paksa null bila ada relasi block.
+    // (Gate di atas sudah 403 untuk block, guard ini menjaga bila kelak ada
+    // jalur lain yang memanggil method ini dengan viewer terblokir.)
+    const contactAllowed = !viewerId || isOwnProfile;
+    const publicContact = {
+      email: contactAllowed && user.showContactEmail ? user.contactEmail : null,
+      phone: contactAllowed && user.showContactPhone ? user.contactPhone : null,
+    };
+
+    // "Tentang": tanggal akun dibuat + tanggal tiap badge didapat.
+    const badgeEarnedDates: Record<string, string | null> = {};
+    for (const badge of verificationBadges) {
+      badgeEarnedDates[badge.type] = badge.earnedAt ? badge.earnedAt.toISOString() : null;
+    }
+
     return {
-      userId: user.userId, username: user.username, fullName: user.fullName, avatarUrl: user.avatarUrl, headerUrl: user.headerUrl,
-      accountType: user.accountType, bio: user.bio, isKycVerified: user.kycStatus === KycStatus.APPROVED,
-      isVip: user.isVip, membershipRank: user.membershipRank,
-      badges: user.badges.map((ub: { badge: { name: string; iconUrl: string | null; description: string | null }; earnedAt: Date }) => ({ ...ub.badge, earnedAt: ub.earnedAt })),
-      stats: { totalOrders: user.totalOrdersCompleted, avgRating: Number(user.averageRating ?? 0), ratingCount: user.totalRatingCount, memberSince: user.memberSince },
-      recentRatings: user.ratingsReceived,
+      // ================= Identity =================
+      identity: {
+        userId: user.userId,
+        nickname: user.fullName,
+        username: user.username,
+        bio: user.bio,
+        avatarUrl: user.avatarUrl,
+        headerUrl: user.headerUrl,
+        accountType: user.accountType,
+        membershipRank: user.membershipRank,
+      },
+
+      // ================= Kontak publik =================
+      contact: publicContact,
+
+      // ================= Sosial media / link =================
       links: user.links,
+
+      // ================= Follower / following =================
+      social: {
+        followersCount: user._count.followers,
+        followingCount: user._count.following,
+        isFollowing: Boolean(followRow),
+        isFollowedBy: Boolean(followedByRow),
+        // Preview saja — list lengkap lewat GET /users/:username/followers|following
+        followers: followerPreview.map((f) => f.follower),
+        following: followingPreview.map((f) => f.following),
+      },
+
+      // ================= Favorit =================
+      favorites: {
+        total: favoritesTotal,
+        isFavoritedByViewer: Boolean(favoriteRow),
+        items: favorites.map((f) => ({ ...f.favoriteUser, favoritedAt: f.createdAt })),
+      },
+
+      // ================= Badge verifikasi (Section 1) =================
+      badges: verificationBadges,
+
+      // ================= Tentang =================
+      about: {
+        memberSince: user.memberSince,
+        badgeEarnedDates,
+        contact: publicContact,
+      },
+
+      // ================= Rating (Section 5) =================
+      ratings: {
+        averageRating: Number(user.averageRating ?? 0),
+        totalRatingCount: user.totalRatingCount,
+        recent: user.ratingsReceived,
+      },
+
+      stats: {
+        totalOrders: user.totalOrdersCompleted,
+        avgRating: Number(user.averageRating ?? 0),
+        ratingCount: user.totalRatingCount,
+        memberSince: user.memberSince,
+      },
+
+      // Achievement badge (katalog Badge/UserBadge) — sengaja dipisah dari badge
+      // verifikasi agar UI bisa menampilkan keduanya di tempat berbeda.
+      achievementBadges: user.badges.map(
+        (ub: { badge: { name: string; iconUrl: string | null; description: string | null }; earnedAt: Date }) => ({
+          ...ub.badge,
+          earnedAt: ub.earnedAt,
+        }),
+      ),
+
+      viewer: {
+        isOwnProfile,
+        isAuthenticated: Boolean(viewerId),
+      },
+
+      // ------------------------------------------------------------------
+      // DEPRECATED flat aliases — dipertahankan agar client lama tidak putus.
+      // Gunakan bagian bersarang di atas untuk kode baru.
+      // ------------------------------------------------------------------
+      userId: user.userId,
+      username: user.username,
+      fullName: user.fullName,
+      avatarUrl: user.avatarUrl,
+      headerUrl: user.headerUrl,
+      accountType: user.accountType,
+      bio: user.bio,
+      isKycVerified: user.kycStatus === KycStatus.APPROVED,
+      isVip: user.isVip,
+      membershipRank: user.membershipRank,
+      recentRatings: user.ratingsReceived,
       followersCount: user._count.followers,
       followingCount: user._count.following,
-      isFollowing,
-      isBlocked,
-      contact: {
-        email: user.showContactEmail ? user.contactEmail : null,
-        phone: user.showContactPhone ? user.contactPhone : null,
-      },
+      isFollowing: Boolean(followRow),
+      // Viewer yang memblokir owner: sebelumnya field ini satu-satunya sinyal,
+      // sekarang relasi block apa pun sudah ditolak 403 di atas. Dipertahankan
+      // sebagai alias yang selalu false supaya bentuk response tidak berubah.
+      isBlocked: false,
     };
   }
 
@@ -1249,7 +1447,7 @@ export class UsersService {
   }
 
   async getUserRatings(username: string, page: number, limit: number, filter?: string, viewerId?: string | null): Promise<object> {
-    const user = await this.prisma.user.findUnique({ where: { username: username.toLowerCase() }, select: { id: true, averageRating: true, profileVisible: true, isActive: true, isBanned: true, deletedAt: true } });
+    const user = await this.prisma.user.findUnique({ where: { username: username.toLowerCase() }, select: { id: true, averageRating: true, totalRatingCount: true, profileVisible: true, isActive: true, isBanned: true, deletedAt: true } });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
     if (user.profileVisible === false && viewerId !== user.id) {
       throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
@@ -1282,7 +1480,12 @@ export class UsersService {
         where,
         skip,
         take: safeLimit,
-        orderBy: { createdAt: 'desc' },
+        // Section 5: tiebreak { id } wajib untuk offset pagination — createdAt
+        // tidak unik, jadi tanpa tiebreak dua rating yang lahir pada detik yang
+        // sama bisa muncul dua kali atau terlewat saat halaman bergeser. Arah
+        // `id: desc` disamakan dengan preview `ratingsReceived` di
+        // getPublicProfile supaya halaman pertama list == preview profil.
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         select: {
           id: true,
           stars: true,
@@ -1294,7 +1497,19 @@ export class UsersService {
       this.prisma.rating.count({ where }),
     ]);
 
-    return { ratings, total, averageRating: Number(user.averageRating ?? 0), page: safePage, limit: safeLimit };
+    return {
+      ratings,
+      // `total` = jumlah rating yang lolos filter visibilitas halaman ini;
+      // `totalRatingCount` = counter denormalisasi di profil. Keduanya bisa
+      // berbeda (mis. filter=positive, atau pemberi rating yang menonaktifkan
+      // profil), jadi keduanya dikembalikan agar klien tidak menebak.
+      total,
+      averageRating: Number(user.averageRating ?? 0),
+      totalRatingCount: user.totalRatingCount,
+      filter: filter || null,
+      page: safePage,
+      limit: safeLimit,
+    };
   }
 
   // ========== FOLLOW ==========
@@ -1626,6 +1841,12 @@ export class UsersService {
       if (reportLockAcquired) await this.redis.releaseLock(reportCooldownKey, reportLockValue).catch(() => undefined);
       throw error;
     }
+
+    // Section 6: laporan sudah tersimpan, baru agregasi dihitung. evaluateTarget
+    // tidak pernah melempar, jadi kegagalan agregasi tidak membatalkan laporan.
+    // Tidak ada auto-ban di sini — hanya flag antrean review untuk admin.
+    await this.reportFlagService.evaluateTarget(target.id);
+
     return { message: 'Report submitted successfully' };
   }
 
@@ -2132,236 +2353,11 @@ export class UsersService {
     return { message: 'Header image deleted successfully' };
   }
 
-  async uploadShowcaseImage(userId: string, fileName: string, contentType: string, fileBuffer: Buffer): Promise<{ imageUrl: string }> {
-    const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
-    if (!ALLOWED_TYPES.includes(contentType)) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: 'contentType must be image/jpeg, image/png, or image/webp',
-      });
-    }
-
-    const MAX_SIZE = 5 * 1024 * 1024;
-    if (fileBuffer.length > MAX_SIZE) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: 'File exceeds maximum allowed size of 5 MB',
-      });
-    }
-
-    const detectedType = this.detectImageMimeType(fileBuffer);
-    if (!detectedType || detectedType !== contentType) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: 'File content does not match the declared content type',
-      });
-    }
-
-    const ext = contentType === 'image/png' ? 'png' : contentType === 'image/webp' ? 'webp' : 'jpg';
-    const imageKey = `showcase/${userId}/${nanoid(16)}.${ext}`;
-
-    const bucket = this.configService.get<string>('r2.bucketPublic');
-    if (!bucket) {
-      throw new BadRequestException({
-        code: ErrorCodes.UPLOAD_FAILED,
-        message: 'R2_BUCKET_PUBLIC is not configured',
-      });
-    }
-
-    try {
-      const { s3, modules } = await this.getS3Client();
-      const PutObjectCommand = modules['PutObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-      const command = new PutObjectCommand({
-        Bucket: bucket,
-        Key: imageKey,
-        ContentType: contentType,
-        Body: fileBuffer,
-      });
-      const send = (s3 as { send: (cmd: unknown) => Promise<unknown> }).send.bind(s3);
-      await send(command);
-    } catch (err) {
-      this.logger.error('R2 direct showcase image upload failed', err);
-      throw new BadRequestException({
-        code: ErrorCodes.UPLOAD_FAILED,
-        message: 'Failed to upload showcase image. Please try again.',
-      });
-    }
-
-    const publicUrl = this.configService.get<string>('r2.publicUrl');
-    const imageUrl = publicUrl ? `${publicUrl}/${imageKey}` : `/uploads/${imageKey}`;
-
-    return { imageUrl };
-  }
-
-  private readonly MAX_SHOWCASE_ITEMS = 20;
-
-  async getShowcaseByUsername(username: string, viewerId?: string): Promise<object> {
-    const user = await this.prisma.user.findUnique({
-      where: { username: username.toLowerCase() },
-      select: { id: true, profileVisible: true, isActive: true, isBanned: true, deletedAt: true },
-    });
-    if (!user || !user.profileVisible || user.isActive === false || user.isBanned === true || user.deletedAt != null) {
-      throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
-    }
-
-    if (viewerId && viewerId !== user.id) {
-      const [viewerBlockedUser, userBlockedViewer] = await Promise.all([
-        this.prisma.blockList.findUnique({ where: { blockerId_blockedId: { blockerId: viewerId, blockedId: user.id } } }),
-        this.prisma.blockList.findUnique({ where: { blockerId_blockedId: { blockerId: user.id, blockedId: viewerId } } }),
-      ]);
-      if (viewerBlockedUser || userBlockedViewer) {
-        throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
-      }
-    }
-
-    const items = await this.prisma.userShowcase.findMany({
-      where: { userId: user.id, isActive: true },
-      orderBy: { sortOrder: 'asc' },
-      select: {
-        id: true, title: true, description: true, imageUrl: true,
-        priceMin: true, priceMax: true, sortOrder: true, createdAt: true,
-      },
-    });
-
-    return {
-      items: items.map(item => ({
-        ...item,
-        priceMin: item.priceMin !== null ? Number(item.priceMin) : null,
-        priceMax: item.priceMax !== null ? Number(item.priceMax) : null,
-      })),
-      total: items.length,
-    };
-  }
-
-  async getMyShowcase(userId: string): Promise<object> {
-    const items = await this.prisma.userShowcase.findMany({
-      where: { userId },
-      orderBy: { sortOrder: 'asc' },
-      select: {
-        id: true, title: true, description: true, imageUrl: true,
-        priceMin: true, priceMax: true, isActive: true, sortOrder: true, createdAt: true,
-      },
-    });
-
-    return {
-      items: items.map(item => ({
-        ...item,
-        priceMin: item.priceMin !== null ? Number(item.priceMin) : null,
-        priceMax: item.priceMax !== null ? Number(item.priceMax) : null,
-      })),
-      total: items.length,
-    };
-  }
-
-  async createShowcaseItem(userId: string, dto: CreateShowcaseDto): Promise<object> {
-    const count = await this.prisma.userShowcase.count({ where: { userId } });
-    if (count >= this.MAX_SHOWCASE_ITEMS) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: `Maximum ${this.MAX_SHOWCASE_ITEMS} showcase items allowed`,
-      });
-    }
-
-    const trimmedTitle = dto.title.trim();
-    if (!trimmedTitle) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: 'Title is required',
-      });
-    }
-
-    if (dto.priceMin !== undefined && dto.priceMax !== undefined && dto.priceMin > dto.priceMax) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: 'priceMin must not exceed priceMax',
-      });
-    }
-
-    const item = await this.prisma.userShowcase.create({
-      data: {
-        userId,
-        title: trimmedTitle,
-        description: dto.description?.trim() || null,
-        imageUrl: dto.imageUrl || null,
-        priceMin: dto.priceMin !== undefined ? BigInt(dto.priceMin) : null,
-        priceMax: dto.priceMax !== undefined ? BigInt(dto.priceMax) : null,
-        sortOrder: dto.sortOrder ?? count,
-      },
-      select: {
-        id: true, title: true, description: true, imageUrl: true,
-        priceMin: true, priceMax: true, isActive: true, sortOrder: true, createdAt: true,
-      },
-    });
-
-    return {
-      ...item,
-      priceMin: item.priceMin !== null ? Number(item.priceMin) : null,
-      priceMax: item.priceMax !== null ? Number(item.priceMax) : null,
-    };
-  }
-
-  async updateShowcaseItem(userId: string, itemId: string, dto: UpdateShowcaseDto): Promise<object> {
-    const existing = await this.prisma.userShowcase.findFirst({
-      where: { id: itemId, userId },
-    });
-    if (!existing) {
-      throw new NotFoundException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Showcase item not found' });
-    }
-
-    if (dto.title !== undefined) {
-      const trimmedTitle = dto.title.trim();
-      if (!trimmedTitle) {
-        throw new BadRequestException({
-          code: ErrorCodes.VALIDATION_ERROR,
-          message: 'Title is required',
-        });
-      }
-    }
-
-    const priceMin = dto.priceMin !== undefined ? dto.priceMin : (existing.priceMin !== null ? Number(existing.priceMin) : undefined);
-    const priceMax = dto.priceMax !== undefined ? dto.priceMax : (existing.priceMax !== null ? Number(existing.priceMax) : undefined);
-    if (priceMin !== undefined && priceMax !== undefined && priceMin > priceMax) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: 'priceMin must not exceed priceMax',
-      });
-    }
-
-    const data: Record<string, unknown> = {};
-    if (dto.title !== undefined) data.title = dto.title.trim();
-    if (dto.description !== undefined) data.description = dto.description?.trim() || null;
-    if (dto.imageUrl !== undefined) data.imageUrl = dto.imageUrl || null;
-    if (dto.priceMin !== undefined) data.priceMin = BigInt(dto.priceMin);
-    if (dto.priceMax !== undefined) data.priceMax = BigInt(dto.priceMax);
-    if (dto.isActive !== undefined) data.isActive = dto.isActive;
-    if (dto.sortOrder !== undefined) data.sortOrder = dto.sortOrder;
-
-    const item = await this.prisma.userShowcase.update({
-      where: { id: itemId },
-      data,
-      select: {
-        id: true, title: true, description: true, imageUrl: true,
-        priceMin: true, priceMax: true, isActive: true, sortOrder: true, createdAt: true,
-      },
-    });
-
-    return {
-      ...item,
-      priceMin: item.priceMin !== null ? Number(item.priceMin) : null,
-      priceMax: item.priceMax !== null ? Number(item.priceMax) : null,
-    };
-  }
-
-  async deleteShowcaseItem(userId: string, itemId: string): Promise<{ message: string }> {
-    const existing = await this.prisma.userShowcase.findFirst({
-      where: { id: itemId, userId },
-    });
-    if (!existing) {
-      throw new NotFoundException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Showcase item not found' });
-    }
-
-    await this.prisma.userShowcase.delete({ where: { id: itemId } });
-    return { message: 'Showcase item deleted successfully' };
-  }
-
+  // ============================================================
+  // SHOWCASE
+  // ============================================================
+  // Section 3: seluruh logika showcase (etalase, gambar, like, komentar, feed
+  // discover) dipindah ke ShowcaseService di src/modules/showcase/.
+  // Route owner lama (/users/me/showcase*) tetap ada di UsersController dan
+  // sekarang mendelegasikan ke service tersebut, jadi tidak ada URL yang berubah.
 }

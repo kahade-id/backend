@@ -25,6 +25,8 @@ import { UserStatsService } from './user-stats.service';
 import { UserAnalyticsService } from './user-analytics.service';
 import { ProfileQAService } from './profile-qa.service';
 import { OgMetadataService } from './og-metadata.service';
+import { VerificationBadgeService } from './verification-badge.service';
+import { ShowcaseService } from '../showcase/showcase.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
 import { Public } from '../../common/decorators/public.decorator';
@@ -36,7 +38,11 @@ import { UploadAvatarDto } from './dto/upload-avatar.dto';
 import { ConfirmHeaderDto } from './dto/confirm-header.dto';
 import { RequestAccountDeletionDto } from './dto/request-account-deletion.dto';
 import { AskQuestionDto, AnswerQuestionDto, AddCommentDto } from './dto/profile-question.dto';
-import { CreateShowcaseDto, UpdateShowcaseDto } from './dto/showcase.dto';
+import { HideContentDto } from './dto/moderate-content.dto';
+import { QuestionSort } from './profile-qa.service';
+// Section 3: showcase dipindah ke module sendiri; DTO lama users/dto/showcase.dto.ts dihapus.
+import { CreateShowcaseItemDto, UpdateShowcaseItemDto } from '../showcase/dto/showcase-item.dto';
+import { AttachShowcaseImagesDto, ReorderShowcaseImagesDto } from '../showcase/dto/showcase-image.dto';
 import { TrustDeviceDto } from './dto/trust-device.dto';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 
@@ -51,6 +57,8 @@ export class UsersController {
     private userAnalyticsService: UserAnalyticsService,
     private profileQAService: ProfileQAService,
     private ogMetadataService: OgMetadataService,
+    private verificationBadgeService: VerificationBadgeService,
+    private showcaseService: ShowcaseService,
   ) {}
 
   @Get('me')
@@ -363,26 +371,38 @@ export class UsersController {
     return this.userStatsService.getDashboardStats(userId);
   }
 
+  // ------------------------------------------------------------------
+  // SHOWCASE (Section 3) — route owner tidak berubah, logikanya sekarang
+  // di ShowcaseService. Lihat juga ShowcaseController untuk permukaan
+  // sosial/discover (feed, like, komentar, share).
+  // ------------------------------------------------------------------
+
   @Post('me/showcase/upload')
   @UseGuards(UserThrottleGuard)
-  @ApiOperation({ summary: 'Upload showcase item image directly' })
+  @ApiOperation({
+    summary: 'Upload showcase item image directly',
+    description:
+      'Jalur multipart langsung (kompatibilitas client lama). Jalur yang dianjurkan: ' +
+      'POST /upload/presigned-url dengan purpose SHOWCASE_IMAGE, PUT ke URL hasilnya, ' +
+      'POST /upload/confirm, lalu lampirkan fileKey lewat POST /users/me/showcase/:id/images.',
+  })
   @ApiConsumes('multipart/form-data')
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 5 * 1024 * 1024 } }))
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   async uploadShowcaseImage(
     @CurrentUser('sub') userId: string,
     @UploadedFile() file: MulterFile,
-  ): Promise<{ imageUrl: string }> {
+  ): Promise<{ imageUrl: string; fileKey: string }> {
     if (!file) {
       throw new BadRequestException({ code: 'FILE_REQUIRED', message: 'File is required' });
     }
-    return this.usersService.uploadShowcaseImage(userId, file.originalname, file.mimetype, file.buffer);
+    return this.showcaseService.uploadShowcaseImageDirect(userId, file.originalname, file.mimetype, file.buffer);
   }
 
   @Get('me/showcase')
-  @ApiOperation({ summary: 'Get my showcase items (including inactive)' })
+  @ApiOperation({ summary: 'Get my showcase items (including inactive and private)' })
   async getMyShowcase(@CurrentUser('sub') userId: string): Promise<object> {
-    return this.usersService.getMyShowcase(userId);
+    return this.showcaseService.getMyShowcase(userId);
   }
 
   @Post('me/showcase')
@@ -391,9 +411,9 @@ export class UsersController {
   @ApiOperation({ summary: 'Add a showcase item' })
   async createShowcaseItem(
     @CurrentUser('sub') userId: string,
-    @Body() dto: CreateShowcaseDto,
+    @Body() dto: CreateShowcaseItemDto,
   ): Promise<object> {
-    return this.usersService.createShowcaseItem(userId, dto);
+    return this.showcaseService.createShowcaseItem(userId, dto);
   }
 
   @Put('me/showcase/:id')
@@ -402,9 +422,55 @@ export class UsersController {
   async updateShowcaseItem(
     @CurrentUser('sub') userId: string,
     @Param('id', ParseIdPipe) itemId: string,
-    @Body() dto: UpdateShowcaseDto,
+    @Body() dto: UpdateShowcaseItemDto,
   ): Promise<object> {
-    return this.usersService.updateShowcaseItem(userId, itemId, dto);
+    return this.showcaseService.updateShowcaseItem(userId, itemId, dto);
+  }
+
+  @Post('me/showcase/:id/images')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @ApiOperation({
+    summary: 'Attach uploaded images to a showcase item',
+    description:
+      'Menerima object key hasil upload presigned (purpose SHOWCASE_IMAGE) yang sudah ' +
+      'dikonfirmasi lewat POST /upload/confirm. Gambar ditambahkan di urutan terakhir; ' +
+      'total gambar per item dibatasi SHOWCASE_MAX_IMAGES.',
+  })
+  async attachShowcaseImages(
+    @CurrentUser('sub') userId: string,
+    @Param('id', ParseIdPipe) itemId: string,
+    @Body() dto: AttachShowcaseImagesDto,
+  ): Promise<object> {
+    return this.showcaseService.attachImages(userId, itemId, dto.fileKeys);
+  }
+
+  @Put('me/showcase/:id/images/order')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @ApiOperation({
+    summary: 'Reorder the images of a showcase item',
+    description: 'Kirim seluruh ID gambar milik item ini dalam urutan yang diinginkan.',
+  })
+  async reorderShowcaseImages(
+    @CurrentUser('sub') userId: string,
+    @Param('id', ParseIdPipe) itemId: string,
+    @Body() dto: ReorderShowcaseImagesDto,
+  ): Promise<object> {
+    return this.showcaseService.reorderImages(userId, itemId, dto.imageIds);
+  }
+
+  // Dideklarasikan SEBELUM 'me/showcase/:id' supaya segmen "images" tidak
+  // ditangkap sebagai :id.
+  @Delete('me/showcase/images/:imageId')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @ApiOperation({ summary: 'Delete one image of a showcase item' })
+  async deleteShowcaseImage(
+    @CurrentUser('sub') userId: string,
+    @Param('imageId', ParseIdPipe) imageId: string,
+  ): Promise<{ message: string }> {
+    return this.showcaseService.removeImage(userId, imageId);
   }
 
   @Delete('me/showcase/:id')
@@ -414,18 +480,26 @@ export class UsersController {
     @CurrentUser('sub') userId: string,
     @Param('id', ParseIdPipe) itemId: string,
   ): Promise<{ message: string }> {
-    return this.usersService.deleteShowcaseItem(userId, itemId);
+    return this.showcaseService.deleteShowcaseItem(userId, itemId);
   }
 
   @Get('me/questions')
-  @ApiOperation({ summary: 'Get my received or asked questions' })
+  @ApiOperation({
+    summary: 'Get my received or asked questions',
+    description:
+      'Section 4: `sort=top` mengurutkan berdasarkan jumlah upvote (terpopuler lebih ' +
+      'dulu), berguna untuk memilih pertanyaan mana yang paling ditunggu jawabannya. ' +
+      'Default `recent` (terbaru lebih dulu). Tiap pertanyaan menyertakan `upvoteCount` ' +
+      'dan `isUpvotedByViewer`.',
+  })
   async getMyQuestions(
     @CurrentUser('sub') userId: string,
     @Query('type', new DefaultValuePipe('received')) type: 'received' | 'asked',
     @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
     @Query('limit', new DefaultValuePipe(20), ParseIntPipe, new ClampLimitPipe()) limit: number,
+    @Query('sort', new DefaultValuePipe('recent')) sort: QuestionSort,
   ): Promise<object> {
-    return this.profileQAService.getMyQuestions(userId, type, page, limit);
+    return this.profileQAService.getMyQuestions(userId, type, page, limit, sort);
   }
 
   @UseGuards(UserThrottleGuard)
@@ -528,9 +602,45 @@ export class UsersController {
     return this.usersService.reportUser(userId, targetUserId, dto);
   }
 
+  // Section 1: endpoint publik badge verifikasi. Mengembalikan ARRAY badge aktif
+  // (bukan single flag) yang sudah terurut sesuai prioritas tampil:
+  // KYC > Business > Kahade+ > Trusted Admin > Email/Phone.
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Get(':username/badges')
+  @ApiOperation({
+    summary: 'Get active verification badges for a public profile',
+    description:
+      'Mengembalikan array badge verifikasi aktif, terurut berdasarkan prioritas tampil untuk UI ruang terbatas: ' +
+      'KYC_VERIFIED > BUSINESS_VERIFIED > KAHADE_PLUS > TRUSTED_BY_KAHADE > CONTACT_VERIFIED. ' +
+      'Badge yang di-revoke hilang dalam beberapa detik (cache TTL pendek + invalidation post-commit).',
+  })
+  async getVerificationBadges(
+    @Param('username', ParseUsernamePipe) username: string,
+    @CurrentUser('sub') viewerId: string | null,
+  ): Promise<object> {
+    return this.verificationBadgeService.getPublicBadgesByUsername(username, viewerId ?? undefined);
+  }
+
+  // Section 2: profil publik dirombak menjadi bagian-bagian eksplisit
+  // (identity / contact / links / social / favorites / badges / about / ratings
+  // / stats) + alias datar lama yang deprecated. Block-list sekarang menutup
+  // seluruh endpoint dengan 403 USER_BLOCKED, bukan menyembunyikan field.
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Get(':username')
+  @ApiOperation({
+    summary: 'Get a public profile',
+    description:
+      'Mengembalikan profil publik per bagian: `identity` (fullName/nickname, username, bio, avatarUrl, headerUrl, ' +
+      'accountType, membershipRank), `contact` (email/phone, hanya bila toggle showContact* aktif — selain itu null), ' +
+      '`links` (tautan sosial media), `social` (followersCount, followingCount, isFollowing, isFollowedBy + preview 6 item), ' +
+      '`favorites` (total, isFavoritedByViewer + preview 12 item), `badges` (array badge verifikasi aktif), ' +
+      '`about` (memberSince, badgeEarnedDates, contact publik), `ratings` (averageRating, totalRatingCount, 5 rating terbaru), ' +
+      '`stats`, `achievementBadges`, dan `viewer`. ' +
+      'Menghormati profileVisible: profil privat/nonaktif/banned/terhapus menghasilkan 404. ' +
+      'Bila ada relasi block dua arah antara viewer dan pemilik profil, hasilnya 403 USER_BLOCKED.',
+  })
   async getPublicProfile(
     @Param('username', ParseUsernamePipe) username: string,
     @CurrentUser('sub') viewerId: string | null,
@@ -549,7 +659,7 @@ export class UsersController {
     @Param('username', ParseUsernamePipe) username: string,
     @CurrentUser('sub') viewerId: string | null,
   ): Promise<object> {
-    return this.usersService.getShowcaseByUsername(username, viewerId ?? undefined);
+    return this.showcaseService.getShowcaseByUsername(username, viewerId ?? undefined);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 10 } })
@@ -604,6 +714,19 @@ export class UsersController {
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 20 } })
   @Get(':username/ratings')
+  @ApiOperation({
+    summary: 'Get public ratings for a user profile',
+    description:
+      'Section 5: mengembalikan daftar rating publik (isHidden=false, pemberi rating sehat dan ' +
+      'profilnya tidak private) beserta agregat profil. Urutan `createdAt desc, id desc` — ' +
+      'tiebreak `{ id }` wajib supaya offset pagination tidak menduplikasi/melewatkan baris, ' +
+      'dan sengaja disamakan dengan preview `ratings.recent` di GET /users/:username. ' +
+      'Respons memuat `averageRating` + `totalRatingCount` (counter denormalisasi profil) ' +
+      'selain `total` (jumlah baris yang lolos filter halaman ini, mis. `filter=positive`) ' +
+      'karena keduanya memang bisa berbeda. Profil private / nonaktif / banned / terhapus ' +
+      'mengembalikan 404 USER_NOT_FOUND; viewer yang terlibat relasi block juga 404, bukan 403, ' +
+      'agar keberadaan rating tidak bocor.',
+  })
   async getUserRatings(
     @Param('username', ParseUsernamePipe) username: string,
     @CurrentUser('sub') viewerId: string | null,
@@ -629,13 +752,49 @@ export class UsersController {
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Get(':username/questions')
-  @ApiOperation({ summary: 'Get public Q&A for a profile' })
+  @ApiOperation({
+    summary: 'Get public Q&A for a profile',
+    description:
+      'Hanya pertanyaan publik yang sudah dijawab dan tidak disembunyikan. Section 4 menambah ' +
+      '`sort=recent|top` (top = upvote terbanyak) serta `upvoteCount` dan `isUpvotedByViewer` ' +
+      'per pertanyaan. Viewer yang terlibat relasi block dengan pemilik profil mendapat ' +
+      '403 USER_BLOCKED, sama seperti GET /users/:username.',
+  })
   async getProfileQuestions(
     @Param('username', ParseUsernamePipe) username: string,
+    @CurrentUser('sub') viewerId: string | null,
     @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
     @Query('limit', new DefaultValuePipe(20), ParseIntPipe, new ClampLimitPipe()) limit: number,
+    @Query('sort', new DefaultValuePipe('recent')) sort: QuestionSort,
   ): Promise<object> {
-    return this.profileQAService.getProfileQuestions(username, page, limit);
+    return this.profileQAService.getProfileQuestions(username, page, limit, sort, viewerId);
+  }
+
+  // Section 4: upvote pertanyaan profil. Satu upvote per (user, pertanyaan) —
+  // ditegakkan unique constraint di DB, dan counternya bergerak dalam transaksi
+  // yang sama dengan barisnya.
+  @Post('questions/:questionId/upvote')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Idempotency()
+  @ApiOperation({ summary: 'Upvote a profile question' })
+  async upvoteQuestion(
+    @CurrentUser('sub') userId: string,
+    @Param('questionId', ParseIdPipe) questionId: string,
+  ): Promise<object> {
+    return this.profileQAService.upvoteQuestion(userId, questionId);
+  }
+
+  @Delete('questions/:questionId/upvote')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Idempotency()
+  @ApiOperation({ summary: 'Remove your upvote from a profile question' })
+  async removeQuestionUpvote(
+    @CurrentUser('sub') userId: string,
+    @Param('questionId', ParseIdPipe) questionId: string,
+  ): Promise<object> {
+    return this.profileQAService.removeUpvote(userId, questionId);
   }
 
   @Put('questions/:questionId/answer')
@@ -657,6 +816,37 @@ export class UsersController {
     @Param('questionId', ParseIdPipe) questionId: string,
   ): Promise<{ message: string }> {
     return this.profileQAService.deleteQuestion(userId, questionId);
+  }
+
+  // Section 4: moderasi dengan alasan kategoris (menggantikan isHidden polos).
+  @Post('questions/:questionId/hide')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @Idempotency()
+  @ApiOperation({
+    summary: 'Hide a question on your profile',
+    description:
+      'Hanya pemilik profil. `reason` wajib diisi: SPAM, INAPPROPRIATE, HARASSMENT, atau OTHER. ' +
+      'Pertanyaan tersembunyi hilang dari Q&A publik seketika (tidak ada cache).',
+  })
+  async hideQuestion(
+    @CurrentUser('sub') userId: string,
+    @Param('questionId', ParseIdPipe) questionId: string,
+    @Body() dto: HideContentDto,
+  ): Promise<object> {
+    return this.profileQAService.hideQuestion(userId, questionId, dto.reason);
+  }
+
+  @Post('questions/:questionId/unhide')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @Idempotency()
+  @ApiOperation({ summary: 'Unhide a question on your profile' })
+  async unhideQuestion(
+    @CurrentUser('sub') userId: string,
+    @Param('questionId', ParseIdPipe) questionId: string,
+  ): Promise<object> {
+    return this.profileQAService.unhideQuestion(userId, questionId);
   }
 
   @Post('questions/:questionId/comments')
@@ -691,6 +881,31 @@ export class UsersController {
     @Param('commentId', ParseIdPipe) commentId: string,
   ): Promise<{ message: string }> {
     return this.profileQAService.deleteComment(userId, commentId);
+  }
+
+  @Post('comments/:commentId/hide')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @Idempotency()
+  @ApiOperation({ summary: 'Hide a Q&A comment on your profile (reason required)' })
+  async hideComment(
+    @CurrentUser('sub') userId: string,
+    @Param('commentId', ParseIdPipe) commentId: string,
+    @Body() dto: HideContentDto,
+  ): Promise<object> {
+    return this.profileQAService.hideComment(userId, commentId, dto.reason);
+  }
+
+  @Post('comments/:commentId/unhide')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @Idempotency()
+  @ApiOperation({ summary: 'Unhide a Q&A comment on your profile' })
+  async unhideComment(
+    @CurrentUser('sub') userId: string,
+    @Param('commentId', ParseIdPipe) commentId: string,
+  ): Promise<object> {
+    return this.profileQAService.unhideComment(userId, commentId);
   }
 
   @Public()

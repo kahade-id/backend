@@ -6,12 +6,15 @@ describe('SubscriptionExpiryService auto-renewal', () => {
     wallet: { findUnique: jest.fn(), updateMany: jest.fn() },
     walletTransaction: { create: jest.fn() },
     subscription: { updateMany: jest.fn() },
-    user: { update: jest.fn() },
+    user: { update: jest.fn(), findUnique: jest.fn(async () => ({ kahadePlusSince: null })) },
     notification: { create: jest.fn() },
     emitNotificationCreated: jest.fn(),
   };
   const redis = {};
   const serial = { getNext: jest.fn() };
+  // Section 1: SubscriptionExpiryService sekarang meng-invalidasi cache badge
+  // "Kahade+" post-commit, jadi butuh stub VerificationBadgeService.
+  const verificationBadges = { invalidate: jest.fn(async () => undefined) };
   const config = {
     get: jest.fn((key: string) => {
       if (key === 'app.subscriptionMonthlyPriceSen') return 10000;
@@ -40,7 +43,7 @@ describe('SubscriptionExpiryService auto-renewal', () => {
   });
 
   it('renews from the present when an active subscription period is already long expired', async () => {
-    const service = new SubscriptionExpiryService(prisma as never, redis as never, serial as never, config as never);
+    const service = new SubscriptionExpiryService(prisma as never, redis as never, serial as never, config as never, verificationBadges as never);
 
     const result = await (service as unknown as { tryAutoRenew: (subscription: unknown) => Promise<string> }).tryAutoRenew({
       id: 'sub-1',

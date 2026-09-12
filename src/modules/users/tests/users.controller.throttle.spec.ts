@@ -41,6 +41,8 @@ describe('UsersController device security throttling', () => {
       'uploadHeader', 'confirmHeader', 'uploadHeaderDirect', 'deleteHeader', 'updateLinks',
       'requestAccountDeletion', 'getMyDevices', 'getSecurityLog', 'removeDevice', 'trustDevice', 'untrustDevice',
       'uploadShowcaseImage', 'createShowcaseItem', 'updateShowcaseItem', 'deleteShowcaseItem',
+      // Section 3: rute gambar showcase (one-to-many) ikut wajib di-throttle per user.
+      'attachShowcaseImages', 'reorderShowcaseImages', 'deleteShowcaseImage',
       'addFavorite', 'removeFavorite', 'blockUser', 'unblockUser', 'reportUser',
       'followUser', 'unfollowUser', 'askQuestion', 'answerQuestion', 'deleteQuestion',
       'addComment', 'deleteComment',

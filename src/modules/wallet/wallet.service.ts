@@ -118,6 +118,10 @@ export class WalletService implements OnModuleInit {
   private readonly topupExpiryHours: number;
   private readonly walletPinPepper: string;
   private dummyPinHash: string | null = null;
+  // AUDIT-12 (SEC-019): WITHDRAW_CONFIRMATION OTP length, 6–10 digits via
+  // app.withdrawOtpDigits (WITHDRAW_OTP_DIGITS). Default 6 keeps existing clients
+  // compatible; deployment can raise it after the mobile form accepts more digits.
+  private readonly withdrawOtpDigits: number = 6;
   private readonly paymentFees: {
     bca: number;
     bni: number;
@@ -159,6 +163,10 @@ export class WalletService implements OnModuleInit {
       this.configService.get<number>('app.walletMaxWithdrawPerTx') ?? WALLET_MAX_WITHDRAW_PER_TX;
     const rawExpiry = this.configService.get<number>('app.topupExpiryHours') ?? 24;
     this.topupExpiryHours = Math.max(1, rawExpiry);
+    const rawOtpDigits = this.configService.get<number>('app.withdrawOtpDigits');
+    if (rawOtpDigits !== undefined && Number.isFinite(rawOtpDigits)) {
+      this.withdrawOtpDigits = Math.min(10, Math.max(6, Math.floor(rawOtpDigits)));
+    }
 
     const pepper =
       this.configService.get<string>('app.walletPinPepper') ??
@@ -329,7 +337,7 @@ export class WalletService implements OnModuleInit {
     const [transactions, total] = await Promise.all([
       this.prisma.walletTransaction.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
         skip,
         take: safeLimit,
         include: { order: { select: { orderId: true, title: true } } },
@@ -911,8 +919,7 @@ export class WalletService implements OnModuleInit {
   private async incrementPinIpAttempts(ip?: string): Promise<void> {
     if (!ip) return;
     const ipAttemptKey = WALLET_PIN_IP_ATTEMPTS(ip);
-    const newCount = await this.redis.incr(ipAttemptKey, { throwOnError: true });
-    if (newCount === 1) await this.redis.expire(ipAttemptKey, 3600, { throwOnError: true });
+    await this.redis.incrWithTtl(ipAttemptKey, 3600, { throwOnError: true });
   }
 
   private getDummyPinHash(): string {
@@ -933,21 +940,6 @@ export class WalletService implements OnModuleInit {
     await this.checkPinIpRateLimit(ip);
 
     const pinAttemptKey = WALLET_PIN_ATTEMPTS(userId);
-    const rawAttempts = await this.redis.get(pinAttemptKey, { throwOnError: true });
-    const currentAttempts = rawAttempts == null ? 0 : Number(rawAttempts);
-    if (!Number.isSafeInteger(currentAttempts) || currentAttempts < 0) {
-      throw new ServiceUnavailableException({
-        code: 'PIN_RATE_LIMIT_UNAVAILABLE',
-        message: 'PIN security controls are temporarily unavailable. Please try again later.',
-      });
-    }
-    if (currentAttempts >= 5) {
-      throw new ForbiddenException({
-        code: ErrorCodes.PIN_RATE_LIMITED,
-        message: 'Too many failed PIN attempts. Please try again in 15 minutes.',
-      });
-    }
-
     const hasPin = wallet.walletPinHash !== null && wallet.walletPinHash !== '';
     const hashToCompare = hasPin ? wallet.walletPinHash! : this.getDummyPinHash();
     const pinDigest = hmacPinDigest(this.walletPinPepper, pin);
@@ -973,9 +965,27 @@ export class WalletService implements OnModuleInit {
       });
     }
 
+    // R2-H (audit): the attempt guard used to be read-then-increment, so N parallel
+    // requests all observed the same low counter and each got a free guess before any
+    // increment landed — a burst repeated every round-trip defeated the lockout.
+    // Reserve the attempt atomically up front; a successful PIN releases it. (The
+    // reservation runs after the no-PIN branch so a missing PIN cannot lock a user
+    // out of their own wallet settings.)
+    const attemptNo = await this.redis.incrWithTtl(pinAttemptKey, 900, { throwOnError: true });
+    if (!Number.isSafeInteger(attemptNo) || attemptNo < 0) {
+      throw new ServiceUnavailableException({
+        code: 'PIN_RATE_LIMIT_UNAVAILABLE',
+        message: 'PIN security controls are temporarily unavailable. Please try again later.',
+      });
+    }
+    if (attemptNo > 5) {
+      throw new ForbiddenException({
+        code: ErrorCodes.PIN_RATE_LIMITED,
+        message: 'Too many failed PIN attempts. Please try again in 15 minutes.',
+      });
+    }
+
     if (!pinValid) {
-      const newCount = await this.redis.incr(pinAttemptKey, { throwOnError: true });
-      if (newCount === 1) await this.redis.expire(pinAttemptKey, 900, { throwOnError: true });
       await this.incrementPinIpAttempts(ip);
       throw new UnauthorizedException({
         code: ErrorCodes.UNAUTHORIZED,
@@ -1273,6 +1283,7 @@ export class WalletService implements OnModuleInit {
         userId,
         { walletTxId, amountSen: amountInSen.toString(), bankAccountId, timestamp: Date.now() },
         ip,
+        this.withdrawOtpDigits,
       );
       await this.emailQueue.add(
         'send',
@@ -1819,7 +1830,9 @@ export class WalletService implements OnModuleInit {
                     recipientId: recipient.id,
                     recipientUserId: recipient.userId,
                     recipientName: recipient.fullName,
-                    note: note || null,
+                    // AUDIT-15: persist the sanitised note (same contract as `description`);
+                    // the raw client string could contain control characters beyond the DTO cap.
+                    note: safeNote || null,
                     linkedTxId: receivedTxId,
                   },
                 },
@@ -1839,7 +1852,7 @@ export class WalletService implements OnModuleInit {
                     senderId: sender.id,
                     senderUserId: sender.userId,
                     senderName: sender.fullName,
-                    note: note || null,
+                    note: safeNote || null, // AUDIT-15
                     linkedTxId: sentTxId,
                   },
                 },
@@ -1973,7 +1986,9 @@ export class WalletService implements OnModuleInit {
               amount: `Rp ${amount.toLocaleString('id-ID')}`,
               recipientName: sanitizeName(recipient.fullName),
               txId: sentTxId,
-              date: new Date().toLocaleDateString('id-ID'),
+              // AUDIT-18: pin to WIB — the pod clock is UTC, so between 17:00–23:59 WIB
+              // the unqualified toLocaleDateString printed the previous day.
+              date: new Date().toLocaleDateString('id-ID', { timeZone: 'Asia/Jakarta' }),
             },
           }),
         )
@@ -1994,7 +2009,7 @@ export class WalletService implements OnModuleInit {
               amount: `Rp ${amount.toLocaleString('id-ID')}`,
               senderName: sanitizeName(sender.fullName),
               txId: receivedTxId,
-              date: new Date().toLocaleDateString('id-ID'),
+              date: new Date().toLocaleDateString('id-ID', { timeZone: 'Asia/Jakarta' }), // AUDIT-18
             },
           }),
         )
@@ -3291,6 +3306,7 @@ export class WalletService implements OnModuleInit {
             timestamp: Date.now(),
           },
           ipAddress,
+          this.withdrawOtpDigits,
         );
 
         await this.emailQueue.add(

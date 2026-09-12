@@ -202,7 +202,10 @@ export class OrderStateService {
 
   async confirmOrder(orderId: string, userId: string): Promise<void> {
     await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      const order = await tx.order.findUnique({ where: { orderId } });
+      // AUDIT-16: exclude soft-deleted orders — every other surface (list views, WS
+      // rooms, scheduler crons) filters `deletedAt: null`; without it a deleted order
+      // could keep advancing while the crons no longer see it, stranding escrow.
+      const order = await tx.order.findFirst({ where: { orderId, deletedAt: null } });
 
       if (!order) {
         throw new BadRequestException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
@@ -222,7 +225,7 @@ export class OrderStateService {
       this.validateTransition(order.status, OrderStatus.WAITING_PAYMENT);
 
       const updated = await tx.order.updateMany({
-        where: { id: order.id, status: OrderStatus.WAITING_CONFIRMATION, OR: [{ confirmationDeadlineAt: null }, { confirmationDeadlineAt: { gt: new Date() } }] },
+        where: { id: order.id, status: OrderStatus.WAITING_CONFIRMATION, deletedAt: null, OR: [{ confirmationDeadlineAt: null }, { confirmationDeadlineAt: { gt: new Date() } }] },
         data: {
           status: OrderStatus.WAITING_PAYMENT,
           confirmedAt: new Date(),
@@ -249,7 +252,7 @@ export class OrderStateService {
 
   async rejectOrder(orderId: string, userId: string, reason?: string): Promise<void> {
     await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      const order = await tx.order.findUnique({ where: { orderId } });
+      const order = await tx.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
 
       if (!order) {
         throw new BadRequestException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
@@ -266,7 +269,7 @@ export class OrderStateService {
       this.validateTransition(order.status, OrderStatus.CANCELLED);
 
       const updated = await tx.order.updateMany({
-        where: { id: order.id, status: OrderStatus.WAITING_CONFIRMATION },
+        where: { id: order.id, status: OrderStatus.WAITING_CONFIRMATION, deletedAt: null },
         data: {
           status: OrderStatus.CANCELLED,
           cancelledAt: new Date(),
@@ -307,8 +310,8 @@ export class OrderStateService {
   }
 
   async payOrder(orderId: string, buyerId: string): Promise<{ walletTxId: string }> {
-    const order = await this.prisma.order.findUnique({
-      where: { orderId },
+    const order = await this.prisma.order.findFirst({
+      where: { orderId, deletedAt: null }, // AUDIT-16
       include: { buyer: { select: { wallet: { select: { id: true } } } } },
     });
 
@@ -337,7 +340,7 @@ export class OrderStateService {
     const walletTxSerial = await this.getNextWalletTxSerial();
 
     await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      const freshOrder = await tx.order.findUnique({ where: { id: order.id }, select: { status: true, paymentDeadlineAt: true, buyerId: true, buyerPayAmount: true } });
+      const freshOrder = await tx.order.findFirst({ where: { id: order.id, deletedAt: null }, select: { status: true, paymentDeadlineAt: true, buyerId: true, buyerPayAmount: true } }); // AUDIT-16
       if (!freshOrder || freshOrder.status !== OrderStatus.WAITING_PAYMENT) {
         throw new BadRequestException({ code: ErrorCodes.INVALID_ORDER_STATUS, message: 'Order is no longer waiting for payment' });
       }
@@ -382,7 +385,7 @@ export class OrderStateService {
         },
       });
       const orderUpdated = await tx.order.updateMany({
-        where: { id: order.id, status: OrderStatus.WAITING_PAYMENT },
+        where: { id: order.id, status: OrderStatus.WAITING_PAYMENT, deletedAt: null }, // AUDIT-16
         data: {
           status: OrderStatus.PROCESSING,
           paidAt: new Date(),
@@ -436,7 +439,7 @@ export class OrderStateService {
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
     await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      const order = await tx.order.findUnique({ where: { orderId } });
+      const order = await tx.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
 
       if (!order) {
         throw new BadRequestException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
@@ -460,7 +463,7 @@ export class OrderStateService {
       }
 
       const orderUpdated = await tx.order.updateMany({
-        where: { id: order.id, status: OrderStatus.IN_DELIVERY },
+        where: { id: order.id, status: OrderStatus.IN_DELIVERY, deletedAt: null }, // AUDIT-16
         data: { status: OrderStatus.COMPLETED, completedAt: new Date() },
       });
       if (orderUpdated.count === 0) {
@@ -672,6 +675,14 @@ export class OrderStateService {
       }
     }
     if (lastError) throw lastError;
+
+    // R2-B (audit): completeOrder consumes the Plus fee-savings quota (feeSavingsUsed)
+    // inside the tx above. orders.service caches `subscription_status:<userId>` (which
+    // carries the remaining quota) for 300 s, so without this delete the buyer kept
+    // seeing — and being charged under — a stale quota for up to five minutes.
+    await this.redis.del(`subscription_status:${buyerId}`).catch((err: unknown) =>
+      this.logger.warn(`Failed to invalidate subscription status cache for ${buyerId}: ${err instanceof Error ? err.message : String(err)}`),
+    );
   }
 
   private isRetryableDbError(err: unknown): boolean {
@@ -689,7 +700,7 @@ export class OrderStateService {
       ? normalizedText as OrderCancelReason
       : OrderCancelReason.USER_MUTUAL_CANCEL;
     await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      const order = await tx.order.findUnique({ where: { orderId } });
+      const order = await tx.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
 
       if (!order) {
         throw new BadRequestException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
@@ -722,7 +733,7 @@ export class OrderStateService {
         ? `${normalizedReason}: ${note}`
         : `${normalizedReason} — Cancelled by ${isBuyer ? 'buyer' : 'seller'}`;
       const cancelUpdated = await tx.order.updateMany({
-        where: { id: order.id, status: { in: cancellableStatuses } },
+        where: { id: order.id, status: { in: cancellableStatuses }, deletedAt: null }, // AUDIT-16
         data: {
           status: OrderStatus.CANCELLED,
           cancelledAt: new Date(),
@@ -810,7 +821,7 @@ export class OrderStateService {
     let walletTxId!: string;
 
     await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      const order = await tx.order.findUnique({ where: { orderId } });
+      const order = await tx.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
 
       if (!order) {
         throw new BadRequestException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
@@ -831,7 +842,7 @@ export class OrderStateService {
       }
 
       const adminCancelUpdated = await tx.order.updateMany({
-        where: { id: order.id, status: { in: adminCancellableStatuses } },
+        where: { id: order.id, status: { in: adminCancellableStatuses }, deletedAt: null }, // AUDIT-16
         data: {
           status: OrderStatus.CANCELLED,
           cancelledAt: new Date(),

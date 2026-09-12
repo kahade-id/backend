@@ -112,9 +112,15 @@ const mockPrisma = {
 const mockRedis = {
   get: jest.fn(),
   setex: jest.fn(),
-  del: jest.fn(),
+  del: jest.fn().mockResolvedValue(undefined),
   incr: jest.fn(),
+  // AUDIT-B: incrWithTtl is the fixed atomic INCR+EXPIRE primitive; alias it to the same
+  // jest.fn so existing counter setups/assertions keep working.
+  // (assigned after literal — see below)
 };
+// AUDIT-B: alias the atomic counter primitive to the shared mock fn
+(mockRedis as any).incrWithTtl = (mockRedis as any).incr;
+
 
 const mockWalletService = {
   releaseEscrow: jest.fn(),
@@ -171,6 +177,12 @@ describe('OrderStateService', () => {
 
     service = module.get<OrderStateService>(OrderStateService);
     jest.clearAllMocks();
+
+    // AUDIT-B: the service now reads orders through findFirst({ orderId, deletedAt: null })
+    // (soft-delete guard); tests keep seeding data via findUnique.
+    mockPrisma.order.findFirst.mockImplementation((args: unknown) =>
+      mockPrisma.order.findUnique(args as never),
+    );
 
     mockWalletTxSerial.getNext.mockResolvedValue(1);
     mockPrisma.wallet.updateMany.mockResolvedValue({ count: 1 });

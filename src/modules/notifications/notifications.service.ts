@@ -116,7 +116,7 @@ export class NotificationsService {
     const [data, total] = await Promise.all([
       this.prisma.notification.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
         skip: (safePage - 1) * safeLimit,
         take: safeLimit,
         select: PUBLIC_NOTIFICATION_SELECT,

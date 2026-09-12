@@ -328,6 +328,12 @@ export class SubscriptionExpiryService {
             },
           });
 
+          // AUDIT-24: the fee-discount decision in createOrder caches
+          // `subscription_status:<userId>` for 300 s; without this delete, orders created
+          // right after expiry keep the stale Plus rate (and `completeOrder` would charge
+          // feeSavingsUsed against an expired subscription).
+          await this.redis.del(`subscription_status:${sub.userId}`).catch(() => undefined);
+
           await tx.notification.create({
             data: {
               notifId: generateNotifId(),

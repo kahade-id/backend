@@ -108,7 +108,7 @@ export class DeliveryProofService {
     reviewWindowEnd.setDate(reviewWindowEnd.getDate() + DELIVERY_REVIEW_WINDOW_DAYS);
 
     const result = await this.withSerializableRetry(() => this.prisma.$transaction(async (tx) => {
-      const order = await tx.order.findFirst({ where: { orderId } });
+      const order = await tx.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
       if (!order) throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
       // Serialize proof submissions for the same order. Serializable isolation alone does not
       // prevent two concurrent reads from both seeing no SUBMITTED proof before inserting rows.
@@ -171,7 +171,7 @@ export class DeliveryProofService {
   }
 
   async getProofs(orderId: string, userId: string): Promise<object[]> {
-    const order = await this.prisma.order.findFirst({ where: { orderId } });
+    const order = await this.prisma.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
     if (!order) throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
     if (order.buyerId !== userId && order.sellerId !== userId) {
       throw new ForbiddenException({ code: ErrorCodes.NOT_ORDER_PARTICIPANT, message: 'Not a participant' });
@@ -225,7 +225,7 @@ export class DeliveryProofService {
   }
 
   async confirmDelivery(orderId: string, userId: string, proofId?: string): Promise<{ message: string }> {
-    const order = await this.prisma.order.findFirst({ where: { orderId } });
+    const order = await this.prisma.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
     if (!order) throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
     if (order.buyerId !== userId) throw new ForbiddenException({ code: ErrorCodes.NOT_ORDER_PARTICIPANT, message: 'Only buyer can confirm delivery' });
     if (order.status !== OrderStatus.IN_DELIVERY) {
@@ -274,7 +274,7 @@ export class DeliveryProofService {
     if (normalizedNote.length < 10 || normalizedNote.length > 1000) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Rejection note must be between 10 and 1000 characters' });
     }
-    const order = await this.prisma.order.findFirst({ where: { orderId } });
+    const order = await this.prisma.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
     if (!order) throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
     if (order.buyerId !== userId) throw new ForbiddenException({ code: ErrorCodes.NOT_ORDER_PARTICIPANT, message: 'Only buyer can reject delivery' });
     if (order.status !== OrderStatus.IN_DELIVERY) {

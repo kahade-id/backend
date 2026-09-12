@@ -76,6 +76,9 @@ const mockRedis = {
   setex: jest.fn().mockResolvedValue('OK'),
   del: jest.fn().mockResolvedValue(1),
   incr: jest.fn().mockResolvedValue(1),
+  // AUDIT-B: incrWithTtl is the fixed atomic INCR+EXPIRE primitive; alias it to the same
+  // jest.fn so existing counter setups/assertions keep working.
+  // (assigned after literal — see below)
   decr: jest.fn().mockResolvedValue(0),
   incrBy: jest.fn().mockResolvedValue(1),
   decrBy: jest.fn().mockResolvedValue(0),
@@ -85,6 +88,9 @@ const mockRedis = {
   setNx: jest.fn().mockResolvedValue(true),
   releaseLock: jest.fn().mockResolvedValue(true),
 };
+// AUDIT-B: alias the atomic counter primitive to the shared mock fn
+(mockRedis as any).incrWithTtl = (mockRedis as any).incr;
+
 
 const mockConfig = {
   get: jest.fn((key: string) => {
@@ -674,7 +680,8 @@ describe('WalletService', () => {
         ...mockWallet,
         walletPinHash: 'hashed-pin',
       });
-      mockRedis.get.mockResolvedValueOnce('5'); // currentAttempts >= 5 → lockout before PIN check
+      // R2-H: the guard is now an atomic reserve-then-check — the 6th reservation locks out.
+      mockRedis.incr.mockResolvedValueOnce(6); // attemptNo 6 > 5 → lockout before PIN check
 
       await expect(service.verifyPin('user-1', 'wrongpin')).rejects.toThrow(ForbiddenException);
     });

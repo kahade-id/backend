@@ -113,7 +113,7 @@ export class DisputesService {
         where,
         skip,
         take: safeLimit,
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
         include: {
           order: {
             select: {
@@ -158,7 +158,7 @@ export class DisputesService {
     const [data, total] = await Promise.all([
       this.prisma.disputeEvidence.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
         skip: (safePage - 1) * safeLimit,
         take: safeLimit,
       }),
@@ -642,7 +642,7 @@ export class DisputesService {
     let validatedFileUrls: string[] | undefined;
     let validatedFileTypes: string[] | undefined;
     this.logger.log(`Dispute submission started: orderId=${orderId}, userId=${userId}`);
-    const order = await this.prisma.order.findUnique({ where: { orderId } });
+    const order = await this.prisma.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
     if (!order) throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
     if (order.buyerId !== userId && order.sellerId !== userId) throw new ForbiddenException({ code: ErrorCodes.NOT_ORDER_PARTICIPANT, message: 'Not authorized' });
     const isPostCompletionDispute = order.status === OrderStatus.COMPLETED
@@ -783,7 +783,7 @@ export class DisputesService {
         });
       }
 
-      const freshOrder = await tx.order.findUnique({ where: { id: order.id } });
+      const freshOrder = await tx.order.findFirst({ where: { id: order.id, deletedAt: null } }); // AUDIT-16
       if (!freshOrder) {
         throw new BadRequestException({ code: ErrorCodes.INVALID_ORDER_STATUS, message: 'Cannot submit dispute at this stage' });
       }

@@ -12,6 +12,7 @@ import { createHash } from 'crypto';
 import { Prisma, IdempotencyRecordStatus } from '@prisma/client';
 import { Observable, of, switchMap, catchError, throwError } from 'rxjs';
 import { Reflector } from '@nestjs/core';
+import { HTTP_CODE_METADATA } from '@nestjs/common/constants';
 import { RedisService } from '../../redis/redis.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { IDEMPOTENCY_KEY } from '../decorators/idempotency.decorator';
@@ -80,6 +81,27 @@ export class IdempotencyInterceptor implements NestInterceptor {
     return this.configService.get<number>('app.idempotencyTtlSeconds') ?? IDEMPOTENCY_TTL;
   }
 
+  /**
+   * AUDIT-11: replayed responses bypass the route handler, which is where Nest applies
+   * the @HttpCode decorator. Re-assert the handler's declared status (200 vs the POST
+   * default 201) on the response before short-circuiting with the cached body.
+   */
+  private applyReplayStatusCode(context: ExecutionContext): void {
+    try {
+      const code = this.reflector.getAllAndOverride<number>(HTTP_CODE_METADATA, [
+        context.getHandler(),
+        context.getClass(),
+      ]);
+      if (typeof code === 'number') {
+        const response = context.switchToHttp().getResponse<{ status?: (code: number) => unknown }>();
+        response?.status?.(code);
+      }
+    } catch {
+      // Best effort only: if the execution context is not HTTP (SSE/ws), leave the
+      // transport default in place rather than failing an otherwise valid replay.
+    }
+  }
+
   async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<unknown>> {
     const isIdempotencyRequired = this.reflector.getAllAndOverride<boolean>(IDEMPOTENCY_KEY, [
       context.getHandler(),
@@ -143,6 +165,12 @@ export class IdempotencyInterceptor implements NestInterceptor {
 
     if (!claim.acquired) {
       if ('responseBody' in claim) {
+        // AUDIT-11 (fix): a short-circuited replay never reaches the route handler, so
+        // the route's @HttpCode decorator is not applied and POST replays would be
+        // served with Express' default 201 while the original response was e.g. 200
+        // (withdraw/cancel, logout, 2fa endpoints). Re-assert the handler's declared
+        // status before returning the cached body.
+        this.applyReplayStatusCode(context);
         return of(claim.responseBody);
       }
       throw new BadRequestException({

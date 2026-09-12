@@ -123,7 +123,7 @@ export class RedisService implements OnModuleDestroy {
     }
   }
 
-  async delPattern(pattern: string): Promise<void> {
+  async delPattern(pattern: string, opts?: { throwOnError?: boolean }): Promise<void> {
     try {
       // A partial SCAN result is not safe for destructive invalidation: if Redis
       // disconnects halfway through, fail instead of deleting an incomplete set
@@ -139,7 +139,11 @@ export class RedisService implements OnModuleDestroy {
         await pipeline.exec();
       }
     } catch (error) {
+      // AUDIT-25: cache-invalidation callers (admin mutations followed by delPattern)
+      // must be able to distinguish "nothing to delete" from "delete failed"; without
+      // the strict option they would report success while stale entries survive.
       this.logger.error(`Redis DEL pattern failed for pattern ${pattern}:`, error);
+      if (opts?.throwOnError) throw error;
     }
   }
 
@@ -148,6 +152,34 @@ export class RedisService implements OnModuleDestroy {
       return await this.client.incr(this.getKey(key));
     } catch (error) {
       this.logger.error(`Redis INCR failed for key ${key}:`, error);
+      if (opts?.throwOnError !== false) throw error;
+      return 0;
+    }
+  }
+
+  /**
+   * AUDIT-14: Atomic INCR + EXPIRE for fixed-window counters.
+   *
+   * The historical `incr(...)` followed by a separate `if (count === 1) expire(...)`
+   * call is not crash-safe: if the connection drops (or the EXPIRE itself fails)
+   * between the two commands the counter keeps NO TTL and never resets, permanently
+   * locking the affected bucket (429 for an IP, PIN cooldown forever, ...). The Lua
+   * script below sets the TTL whenever it is missing (first increment *or* an
+   * orphaned key left behind by a previous failure), self-healing existing damage.
+   */
+  async incrWithTtl(key: string, ttlSeconds: number, opts?: { throwOnError?: boolean }): Promise<number> {
+    assertPositiveTtl(ttlSeconds, 'INCR+EXPIRE');
+    const script = `
+      local current = redis.call('INCR', KEYS[1])
+      if redis.call('TTL', KEYS[1]) < 0 then
+        redis.call('EXPIRE', KEYS[1], ARGV[1])
+      end
+      return current
+    `;
+    try {
+      return (await this.client.eval(script, 1, this.getKey(key), String(ttlSeconds))) as number;
+    } catch (error) {
+      this.logger.error(`Redis INCR+EXPIRE failed for key ${key}:`, error);
       if (opts?.throwOnError !== false) throw error;
       return 0;
     }

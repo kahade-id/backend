@@ -334,14 +334,28 @@ export class ScheduledWithdrawalService {
       });
     }
 
-    const schedule = await this.prisma.scheduledWithdrawal.create({
-      data: {
-        userId,
-        bankAccountId: dto.bankAccountId,
-        dayOfWeek: dto.dayOfWeek,
-        minAmount: dto.minAmount === undefined ? 0n : toSen(dto.minAmount),
-      },
-    });
+    let schedule: Awaited<ReturnType<typeof this.prisma.scheduledWithdrawal.create>>;
+    try {
+      schedule = await this.prisma.scheduledWithdrawal.create({
+        data: {
+          userId,
+          bankAccountId: dto.bankAccountId,
+          dayOfWeek: dto.dayOfWeek,
+          minAmount: dto.minAmount === undefined ? 0n : toSen(dto.minAmount),
+        },
+      });
+    } catch (err) {
+      // R2-G (audit): the "already exists" pre-check races with concurrent requests;
+      // the userId+dayOfWeek unique constraint then surfaced as an unhandled P2002
+      // (500). Map it back to the documented conflict response.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        throw new BadRequestException({
+          code: ErrorCodes.SCHEDULE_ALREADY_EXISTS,
+          message: 'Schedule already exists for this day',
+        });
+      }
+      throw err;
+    }
 
     return this.formatSchedule(schedule);
   }
@@ -427,10 +441,26 @@ export class ScheduledWithdrawalService {
       data.bankAccountId = dto.bankAccountId;
     }
 
-    const updated = await this.prisma.scheduledWithdrawal.update({
-      where: { id: scheduleId },
-      data,
-    });
+    let updated: Awaited<ReturnType<typeof this.prisma.scheduledWithdrawal.update>>;
+    try {
+      updated = await this.prisma.scheduledWithdrawal.update({
+        where: { id: scheduleId },
+        data,
+      });
+    } catch (err) {
+      // R2-G (audit): day-of-week moves race against another create/update the same
+      // way; the unique-violation must not surface as a 500.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        throw new BadRequestException({
+          code: ErrorCodes.SCHEDULE_ALREADY_EXISTS,
+          message: 'Schedule already exists for this day',
+        });
+      }
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
+        throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Schedule not found' });
+      }
+      throw err;
+    }
     return this.formatSchedule(updated);
   }
 

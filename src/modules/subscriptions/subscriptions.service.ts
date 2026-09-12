@@ -265,6 +265,14 @@ export class SubscriptionsService {
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
 
+    // AUDIT-24: orders.service caches `subscription_status:<userId>` for 300 s to decide
+    // fee discounts at order creation; without invalidation here (and in cancel/renew and
+    // the expiry cron) a just-purchased or just-expired Plus state kept applying stale
+    // rates inside that window.
+    await this.redis.del(`subscription_status:${userId}`).catch((err: unknown) =>
+      this.logger.warn(`Failed to invalidate subscription status cache for ${userId}: ${err instanceof Error ? err.message : String(err)}`),
+    );
+
     this.logger.log(`User ${userId} subscribed to ${plan}, charged ${planInfo.price} sen`);
 
     this.auditLogService.logUserAction({
@@ -319,6 +327,9 @@ export class SubscriptionsService {
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
+
+    // AUDIT-24: drop the 300 s order-creation cache as soon as entitlement changes.
+    await this.redis.del(`subscription_status:${userId}`).catch(() => undefined);
 
     this.auditLogService.logUserAction({
       userId,
@@ -576,6 +587,8 @@ export class SubscriptionsService {
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
 
+    // AUDIT-24: see subscribe() — keep order-fee decisions honest after renewal.
+    await this.redis.del(`subscription_status:${userId}`).catch(() => undefined);
     this.logger.log(`User ${userId} renewed ${subscription.plan}, charged ${planInfo.price} sen`);
     this.auditLogService.logUserAction({
       userId,

@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { MembershipRank, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { SEARCH_MAX_RESULTS } from '../../common/constants/app.constants';
+import { escapeLikePattern } from '../../common/utils/search.util';
 
 @Injectable()
 export class UserSearchService {
@@ -51,8 +52,8 @@ export class UserSearchService {
 
         if (tsQuery.length > 0) {
           where.OR = [
-            { username: { contains: tsQuery, mode: 'insensitive' } },
-            { fullName: { contains: tsQuery, mode: 'insensitive' } },
+            { username: { contains: escapeLikePattern(tsQuery), mode: 'insensitive' } },
+            { fullName: { contains: escapeLikePattern(tsQuery), mode: 'insensitive' } },
           ];
         } else {
           where.OR = [
@@ -79,7 +80,7 @@ export class UserSearchService {
     const [users, total] = await Promise.all([
       this.prisma.user.findMany({
         where,
-        orderBy: [{ totalOrdersCompleted: 'desc' }, { averageRating: 'desc' }],
+        orderBy: [{ totalOrdersCompleted: 'desc' }, { averageRating: 'desc' }, { id: 'asc' }], // R2-L: id tiebreak for equal-rank users
         skip,
         take: safeLimit,
         select: {

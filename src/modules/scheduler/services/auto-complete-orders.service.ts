@@ -74,6 +74,7 @@ export class AutoCompleteDeliveredOrdersService {
         where: {
           status: OrderStatus.IN_DELIVERY,
           deliveryDeadlineAt: { lt: now },
+          deletedAt: null,
           dispute: { is: null },
           deliveryProofs: {
             none: {
@@ -117,9 +118,9 @@ export class AutoCompleteDeliveredOrdersService {
             // while this order waited in the batch.
             const freshOrder = await tx.order.findUnique({
               where: { id: order.id },
-              select: { status: true, deliveryDeadlineAt: true, dispute: { select: { id: true } } },
+              select: { status: true, deliveryDeadlineAt: true, deletedAt: true, dispute: { select: { id: true } } },
             });
-            if (!freshOrder || freshOrder.status !== OrderStatus.IN_DELIVERY || !freshOrder.deliveryDeadlineAt || freshOrder.deliveryDeadlineAt >= now || freshOrder.dispute) {
+            if (!freshOrder || freshOrder.status !== OrderStatus.IN_DELIVERY || !freshOrder.deliveryDeadlineAt || freshOrder.deliveryDeadlineAt >= now || freshOrder.dispute || freshOrder.deletedAt) {
               return;
             }
 
@@ -158,7 +159,7 @@ export class AutoCompleteDeliveredOrdersService {
               } else {
                 const graceEnd = new Date(now.getTime() + AUTO_COMPLETE_GRACE_PERIOD_HOURS * 60 * 60 * 1000);
                 const extensionGranted = await tx.order.updateMany({
-                  where: { id: order.id, status: OrderStatus.IN_DELIVERY },
+                  where: { id: order.id, status: OrderStatus.IN_DELIVERY, deletedAt: null },
                   data: { deliveryDeadlineAt: graceEnd },
                 });
                 if (extensionGranted.count === 0) return;
@@ -181,7 +182,7 @@ export class AutoCompleteDeliveredOrdersService {
             }
 
             const updated = await tx.order.updateMany({
-              where: { id: order.id, status: OrderStatus.IN_DELIVERY },
+              where: { id: order.id, status: OrderStatus.IN_DELIVERY, deletedAt: null },
               data: { status: OrderStatus.COMPLETED, completedAt: new Date() },
             });
             if (updated.count === 0) return;
@@ -429,6 +430,12 @@ export class AutoCompleteDeliveredOrdersService {
           this.runRealtimeBestEffort(() => this.prisma.emitNotificationCreated({ userId: order.sellerId, title: 'Funds Received', body: `Order "${order.title}" completed. Rp ${postAmountIdr} has been credited to your wallet.`, data: { type: 'WALLET_FUNDS_RELEASED', orderId: order.orderId } }), `AUTO_COMPLETE_SELLER_NOTIFICATION orderId=${order.orderId}`);
           // Success: clear any previous failure counter
           await this.redis.del(`auto_complete_failures:${order.id}`).catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
+          // R2-B (audit): the completion above can consume the buyer's Plus fee-savings
+          // quota; drop the cached `subscription_status:<userId>` snapshot (300 s TTL,
+          // read by orders.service when quoting fees) like the interactive completeOrder does.
+          if (order.isKahadePlus) {
+            await this.redis.del(`subscription_status:${order.buyerId}`).catch((err) => this.logger.warn(`silent-catch: subscription status cache invalidation failed: ${err instanceof Error ? err.message : String(err)}`));
+          }
         } catch (err: unknown) {
           const errMsg = err instanceof Error ? err.message : String(err);
 
@@ -444,11 +451,9 @@ export class AutoCompleteDeliveredOrdersService {
           this.logger.error(`Failed to auto-complete order ${order.orderId}: ${errMsg}`);
 
           const failureKey = `auto_complete_failures:${order.id}`;
-          const failCount = await this.redis.incr(failureKey).catch(() => 0);
-          if (failCount === 1) {
-            // Expire tracking key after 7 days to avoid unbounded Redis growth
-            await this.redis.expire(failureKey, 7 * 24 * 3600).catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
-          }
+          // AUDIT-14: atomic INCR+EXPIRE — the separate expire could be lost, leaving
+          // a TTL-less failure counter that grows unbounded and mis-alerts forever.
+          const failCount = await this.redis.incrWithTtl(failureKey, 7 * 24 * 3600, { throwOnError: false });
 
           // After 3 consecutive failures, emit a CRITICAL-level alert so ops are notified
           const FAILURE_ALERT_THRESHOLD = 3;

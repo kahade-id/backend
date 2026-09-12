@@ -103,7 +103,7 @@ export class CampaignService {
     const [campaigns, total] = await Promise.all([
       this.prisma.campaign.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: id tiebreak keeps offset pages stable when timestamps collide
         skip,
         take: safeLimit,
       }),

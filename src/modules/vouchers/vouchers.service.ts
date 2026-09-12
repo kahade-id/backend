@@ -102,8 +102,16 @@ export class VouchersService {
     }
 
     const where = this.buildActiveVoucherWhere(applicableTo);
+    // AUDIT-17: a completed-order user requesting BUYER_ONLY/SELLER_ONLY must keep that
+    // filter AND drop NEW_USER-only vouchers. Assigning `where.applicableTo` outright
+    // used to clobber the requested audience filter and return the other role's vouchers.
     if (user.totalOrdersCompleted > 0) {
-      where.applicableTo = { not: VoucherApplicability.NEW_USER };
+      if (applicableTo === VoucherApplicability.NEW_USER) {
+        return createPaginatedResponse([], 0, safePage, safeLimit);
+      }
+      if (applicableTo === undefined) {
+        where.applicableTo = { not: VoucherApplicability.NEW_USER };
+      }
     }
 
     if (safePage === 1) {
@@ -139,11 +147,7 @@ export class VouchersService {
     return this.fetchVoucherPage(where, safePage, safeLimit);
   }
 
-  async invalidateAvailableVouchersCache(): Promise<void> {
-    await this.redis.delPattern('public:vouchers:active:*');
-  }
-
-  async validateVoucher(
+    async validateVoucher(
     userId: string,
     code: string,
     orderValue?: number,

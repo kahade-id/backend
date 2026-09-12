@@ -3,7 +3,7 @@ import { Writable } from 'stream';
 import { PrismaService } from '../../prisma/prisma.service';
 import * as ExcelJS from 'exceljs';
 import { toIdr } from '../../common/utils/currency.util';
-import { formatWIBDate, parseDateBoundaryWIB } from '../../common/utils/date.util';
+import { formatWIBDate, parseDateBoundaryWIB, toWIB } from '../../common/utils/date.util';
 
 function escapeHtml(str: string | null | undefined): string {
   if (!str) return '';
@@ -91,11 +91,13 @@ export class WalletExportService {
   }
 
   private formatCsvRow(tx: {
-    id: string; createdAt: Date; type: string; status: string;
+    id: string; txId: string; createdAt: Date; type: string; status: string;
     amount: bigint; balanceAfter: bigint; description: string | null;
     order: { orderId: string; title: string } | null;
   }): string {
-    const date = tx.createdAt.toISOString().replace('T', ' ').substring(0, 19);
+    // AUDIT: the export label is a local (WIB) date/time for users; emitting raw UTC
+    // silently shifted every statement row up to 7h backwards at the app's boundary.
+    const date = toWIB(tx.createdAt).format('YYYY-MM-DD HH:mm:ss');
     const amount = toIdr(tx.amount);
     const balanceAfter = toIdr(tx.balanceAfter);
     const type = TYPE_LABELS[tx.type] || tx.type;
@@ -105,7 +107,10 @@ export class WalletExportService {
     const desc = sanitizeCell(rawDesc);
 
     return [
-      date, tx.id, sanitizeCell(type), `"${desc}"`,
+      // AUDIT: "Transaction ID" must be the human ledger id (WLT-…) shown everywhere
+      // in the app/API; the internal cuid was exported instead, so statements could
+      // not be matched against support cases.
+      date, tx.txId, sanitizeCell(type), `"${desc}"`,
       amount.toString(), balanceAfter.toString(), status, sanitizeCell(orderId),
     ].join(',');
   }
@@ -171,8 +176,8 @@ export class WalletExportService {
         const amount = toIdr(tx.amount);
         const balanceAfter = toIdr(tx.balanceAfter);
         sheet.addRow({
-          date: tx.createdAt.toISOString().replace('T', ' ').substring(0, 19),
-          txId: sanitizeCell(tx.id),
+          date: toWIB(tx.createdAt).format('YYYY-MM-DD HH:mm:ss'), // AUDIT: WIB-consistent
+          txId: sanitizeCell(tx.txId), // AUDIT: user-facing ledger id, not internal cuid
           type: sanitizeCell(TYPE_LABELS[tx.type] || tx.type),
           description: sanitizeCell(tx.description || tx.order?.title || ''),
           amount,

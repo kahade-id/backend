@@ -8,6 +8,7 @@ import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
+import { RedisService } from '../../../redis/redis.service';
 
 function buildPrisma() {
   const buyerWallet = { id: 'wallet-buyer', availableBalance: 0n, escrowBalance: 0n, totalBalance: 0n, version: 1, isLocked: false };
@@ -44,6 +45,7 @@ describe('AdminOrdersService — forceComplete terminal cleanup', () => {
         AdminOrdersService,
         { provide: PrismaService, useValue: prisma },
         { provide: AuditLogService, useValue: { logAdminAction: jest.fn() } },
+        { provide: RedisService, useValue: { del: jest.fn().mockResolvedValue(undefined) } },
         { provide: OrderStateService, useValue: {} },
         { provide: FeeCalculatorService, useValue: { getFeeConfig: jest.fn(), getPlusSavingsSen: jest.fn() } },
         { provide: WalletTxSerialService, useValue: { getNext: jest.fn().mockResolvedValue(1) } },

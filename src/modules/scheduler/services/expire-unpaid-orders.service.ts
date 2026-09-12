@@ -57,6 +57,7 @@ export class ExpireUnpaidOrdersService {
           where: {
             status: OrderStatus.WAITING_PAYMENT,
             paymentDeadlineAt: { lt: now },
+            deletedAt: null, // R2-J (audit): never auto-cancel (or notify about) soft-deleted orders
           },
           select: { id: true, orderId: true, title: true, buyerId: true, sellerId: true, voucherId: true },
           take: 500,
@@ -71,7 +72,7 @@ export class ExpireUnpaidOrdersService {
           try {
             const didExpire = await this.prisma.$transaction(async (tx) => {
               const updated = await tx.order.updateMany({
-                where: { id: order.id, status: OrderStatus.WAITING_PAYMENT, paymentDeadlineAt: { lt: now } },
+                where: { id: order.id, status: OrderStatus.WAITING_PAYMENT, paymentDeadlineAt: { lt: now }, deletedAt: null },
                 data: {
                   status: OrderStatus.CANCELLED,
                   cancelledAt: new Date(),

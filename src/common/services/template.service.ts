@@ -46,6 +46,13 @@ export class TemplateService implements OnModuleInit {
     'backup-code-used', 'data-export',
     'transfer-sent',
     'transfer-received',
+    // AUDIT (missing templates): security notifications referenced by AuthService /
+    // AdminKycService had no template file AND no allowlist entry, so every render in
+    // the email worker threw and the alert never reached the user.
+    'password-changed-notification', 'phone-changed-notification',
+    'two-fa-enabled-notification', 'two-fa-disabled-notification',
+    'backup-codes-regenerated-notification', 'refresh-token-reuse-detected',
+    'kyc-revoked',
   ]);
 
   private getOrCompile(templateName: string): Handlebars.TemplateDelegate {

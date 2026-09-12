@@ -42,9 +42,12 @@ services:
 
   # ─── Application ──────────────────────────────────────────────────────────
   api:
+    # AUDIT-4: the repo is flat and uses npm — the previous ../.. /
+    # apps/backend/ paths referenced a monorepo layout that does not exist
+    # here, so `docker compose build` could never succeed.
     build:
-      context: ../..
-      dockerfile: apps/backend/Dockerfile
+      context: .
+      dockerfile: Dockerfile
       target: runtime
     container_name: kahade-api
     restart: unless-stopped

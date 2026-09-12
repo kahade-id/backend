@@ -42,7 +42,7 @@ import { EMAIL_QUEUE, EmailJobData } from '../queue/processors/email.processor';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { OtpGatewayService } from './otp-gateway.service';
-import { randomBytes as _cryptoRandomBytes, randomInt as _cryptoRandomInt } from 'crypto';
+import { randomBytes as _cryptoRandomBytes, randomInt as _cryptoRandomInt, timingSafeEqual as _timingSafeEqual } from 'crypto';
 const TWO_FA_ATTEMPT_KEY = (userId: string): string => `2fa_attempts:${userId}`;
 
 let _dummyHash: string | undefined;
@@ -1009,15 +1009,18 @@ export class AuthService {
     type VerifyResult = { ok: true } | { ok: false; reason: 'otp_invalid' | 'user_not_found' | 'account_inactive' };
 
     const result: VerifyResult = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      // AUDIT-7: this endpoint is public; distinct 404/403 responses would turn it into an
+      // account-enumeration and status oracle even though register/forgot-password/GET-link
+      // all collapse to one message. Inactive/banned accounts simply cannot verify via OTP.
       const user = await tx.user.findUnique({
         where: { email: normalizedEmail },
         select: { id: true, isActive: true, isBanned: true },
       });
       if (!user) {
-        throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+        return { ok: false, reason: 'otp_invalid' } as const;
       }
       if (!user.isActive || user.isBanned) {
-        throw new ForbiddenException({ code: ErrorCodes.ACCOUNT_INACTIVE, message: 'Account is inactive or banned' });
+        return { ok: false, reason: 'otp_invalid' } as const;
       }
       const record = await tx.otpCode.findFirst({
         where: { email: normalizedEmail, type: OtpType.EMAIL_VERIFICATION, isUsed: false, expiresAt: { gt: now }, attempts: { lt: OTP_MAX_ATTEMPTS } },
@@ -1049,7 +1052,7 @@ export class AuthService {
       });
 
       if (userUpdate.count === 0) {
-        throw new ForbiddenException({ code: ErrorCodes.ACCOUNT_INACTIVE, message: 'Account is inactive or banned' });
+        return { ok: false, reason: 'otp_invalid' } as const;
       }
 
       return { ok: true } as const;
@@ -1174,16 +1177,14 @@ export class AuthService {
 
     if (ipAddress) {
       const ipRateLimitKey = `forgot_password_ip_rate:${ipAddress}`;
-      const ipRequestCount = await this.redis.incr(ipRateLimitKey);
-      if (ipRequestCount === 1) await this.redis.expire(ipRateLimitKey, 3600);
+      const ipRequestCount = await this.redis.incrWithTtl(ipRateLimitKey, 3600);
       if (ipRequestCount > 5) {
         return { message: 'If this email exists, a password reset code has been sent.' };
       }
     }
 
     const rateLimitKey = `forgot_password_rate:${normalizedEmail}`;
-    const requestCount = await this.redis.incr(rateLimitKey);
-    if (requestCount === 1) await this.redis.expire(rateLimitKey, 3600);
+    const requestCount = await this.redis.incrWithTtl(rateLimitKey, 3600);
     if (requestCount > 3) {
       return { message: 'If this email exists, a password reset code has been sent.' };
     }
@@ -1217,16 +1218,19 @@ export class AuthService {
     validatePasswordComplexity(newPassword);
 
     const normalizedEmail = email.toLowerCase();
+    // AUDIT-8: public endpoint — distinct USER_NOT_FOUND / ACCOUNT_INACTIVE / ACCOUNT_BANNED
+    // responses before OTP verification are an enumeration oracle. Callers that never received
+    // a PASSWORD_RESET OTP get the same generic OTP error either way.
     const user = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
     if (!user) {
-      throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+      throw new BadRequestException({ code: ErrorCodes.OTP_INVALID, message: 'Invalid or expired reset code' });
     }
 
     if (!user.isActive) {
-      throw new ForbiddenException({ code: ErrorCodes.ACCOUNT_INACTIVE, message: 'Account is inactive' });
+      throw new BadRequestException({ code: ErrorCodes.OTP_INVALID, message: 'Invalid or expired reset code' });
     }
     if (user.isBanned) {
-      throw new ForbiddenException({ code: ErrorCodes.ACCOUNT_BANNED, message: 'Account has been banned' });
+      throw new BadRequestException({ code: ErrorCodes.OTP_INVALID, message: 'Invalid or expired reset code' });
     }
 
     const isSamePassword = user.password ? await bcryptCompare(newPassword, user.password) : false;
@@ -1340,8 +1344,7 @@ export class AuthService {
     ipAddress: string,
   ): Promise<LoginResult> {
     const LOGIN_IP_KEY = `login_ip_rate:${ipAddress}`;
-    const ipAttempts = await this.redis.incr(LOGIN_IP_KEY);
-    if (ipAttempts === 1) await this.redis.expire(LOGIN_IP_KEY, 900);
+    const ipAttempts = await this.redis.incrWithTtl(LOGIN_IP_KEY, 900);
     if (ipAttempts > 20) {
       throw new HttpException(
         { code: ErrorCodes.TOO_MANY_REQUESTS, message: 'Too many login attempts. Please try again later.' },
@@ -1391,10 +1394,7 @@ export class AuthService {
         let cycleCount = 1;
         try {
           const lockoutCycleKey = `lockout_cycles:${user.id}`;
-          cycleCount = await this.redis.incr(lockoutCycleKey);
-          if (cycleCount === 1) {
-            await this.redis.expire(lockoutCycleKey, 7 * 24 * 3600);
-          }
+          cycleCount = await this.redis.incrWithTtl(lockoutCycleKey, 7 * 24 * 3600);
         } catch (redisErr) {
           this.logger.warn(`[AUTH] Redis unavailable for lockout cycle tracking (user: ${user.id}), falling back to base lockout`, redisErr);
           cycleCount = 1;
@@ -1437,6 +1437,17 @@ export class AuthService {
       throw new UnauthorizedException({ code: ErrorCodes.INVALID_CREDENTIALS, message: 'Invalid credentials' });
     }
 
+    // AUDIT-6: a successful password check refunds *this* attempt to the shared per-IP
+    // budget — legitimate users on carrier-grade NAT IPs (several households per address)
+    // must not exhaust the 20/15min allowance with successes alone. Failure counts from
+    // other actors on the same IP are untouched because we decrement by one.
+    if (isPasswordValid) {
+      const remaining = await this.redis.decr(LOGIN_IP_KEY).catch(() => undefined);
+      if (typeof remaining === 'number' && remaining < 0) {
+        await this.redis.del(LOGIN_IP_KEY).catch(() => undefined);
+      }
+    }
+
     // Do not reset lockout counters here; verify2faLogin() re-checks and clears them
     // after the second factor succeeds so a tempToken cannot bypass a concurrent lockout.
     const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({ where: { userId: user.id } });
@@ -1473,8 +1484,11 @@ export class AuthService {
 
     const storedRounds = user.password ? this.extractBcryptRounds(user.password) : 0;
     if (storedRounds > 0 && storedRounds < getBcryptRounds()) {
+      // AUDIT-9: do NOT stamp passwordChangedAt here. The field means "the user rotated
+      // their password" (surfaced by GET /users/me and usable for iat-based session
+      // invalidation); a transparent server-side cost-factor upgrade is not a password
+      // change and previously rewrote that security signal on login.
       updateData.password = await bcryptHash(dto.password, getBcryptRounds());
-      updateData.passwordChangedAt = new Date();
       this.logger.log(`[CRY-020] Upgraded password hash rounds from ${storedRounds} to ${getBcryptRounds()} for user ${user.id}`);
     }
 
@@ -1570,10 +1584,7 @@ export class AuthService {
     const userId = payload.sub;
 
     const attemptKey = TWO_FA_ATTEMPT_KEY(userId);
-    const attempts = await this.redis.incr(attemptKey);
-    if (attempts === 1) {
-      await this.redis.expire(attemptKey, 5 * 60);
-    }
+    const attempts = await this.redis.incrWithTtl(attemptKey, 5 * 60);
     if (attempts > TWO_FA_MAX_ATTEMPTS) {
       throw new ForbiddenException({ code: ErrorCodes.TOO_MANY_REQUESTS, message: 'Too many 2FA attempts. Please log in again.' });
     }
@@ -1712,6 +1723,22 @@ export class AuthService {
   // ─────────────────────────────────────────────────────────────────
   // REFRESH TOKEN
   // ─────────────────────────────────────────────────────────────────
+  /**
+   * AUDIT-10: constant-time comparison for sha256-hashed session tokens; legacy rows
+   * stored before the fix keep bcrypt("$2…" prefix) verification until they are rotated.
+   */
+  private async verifyStoredRefreshToken(incomingTokenHash: string, session: { refreshToken: string | null }): Promise<boolean> {
+    const stored = session.refreshToken;
+    if (!stored) return false;
+    if (stored.startsWith('$2')) {
+      return bcryptCompare(incomingTokenHash, stored);
+    }
+    const a = Buffer.from(stored, 'utf8');
+    const b = Buffer.from(incomingTokenHash, 'utf8');
+    if (a.length !== b.length) return false;
+    return _timingSafeEqual(a, b);
+  }
+
   async refreshToken(refreshToken: string): Promise<{ accessToken: string; refreshToken: string }> {
     let payload: RefreshTokenPayload;
     try {
@@ -1733,7 +1760,7 @@ export class AuthService {
     }
 
     const incomingTokenHash = sha256(refreshToken);
-    const isTokenValid = await bcryptCompare(incomingTokenHash, session.refreshToken);
+    const isTokenValid = await this.verifyStoredRefreshToken(incomingTokenHash, session);
     if (!isTokenValid) {
       const reuseSessionIds = await this.prisma.$transaction(async (tx) => {
         const sessions = await tx.userSession.findMany({
@@ -1772,8 +1799,9 @@ export class AuthService {
       });
     }
 
-    const tokenHash = sha256(newRefreshToken);
-    const hashedRefreshToken = await bcryptHash(tokenHash, getBcryptRounds());
+    // AUDIT-10: see saveSession — sha256 is the correct primitive for high-entropy
+    // opaque-equivalent tokens; removes ~2x bcrypt cost from the hottest auth call.
+    const hashedRefreshToken = sha256(newRefreshToken);
 
     const refreshTtlSeconds = this.getRefreshTokenTtlSeconds();
     await this.redis.setex(TOKEN_BLACKLIST(oldJti), refreshTtlSeconds, '1', { throwOnError: true });
@@ -1864,8 +1892,7 @@ export class AuthService {
   // ─────────────────────────────────────────────────────────────────
   async verifyPassword(userId: string, password: string): Promise<{ verified: boolean }> {
     const VERIFY_PW_KEY = `verify_pw_rate:${userId}`;
-    const attempts = await this.redis.incr(VERIFY_PW_KEY);
-    if (attempts === 1) await this.redis.expire(VERIFY_PW_KEY, 900);
+    const attempts = await this.redis.incrWithTtl(VERIFY_PW_KEY, 900);
     if (attempts > 10) {
       throw new HttpException(
         { code: ErrorCodes.TOO_MANY_REQUESTS, message: 'Too many password verification attempts. Please wait before trying again.' },
@@ -2143,8 +2170,7 @@ export class AuthService {
   // ─────────────────────────────────────────────────────────────────
   async disable2fa(userId: string, password: string, code: string, emailOtpCode: string): Promise<{ message: string }> {
     const disable2faRateKey = `disable_2fa_rate:${userId}`;
-    const disable2faAttempts = await this.redis.incr(disable2faRateKey);
-    if (disable2faAttempts === 1) await this.redis.expire(disable2faRateKey, 900);
+    const disable2faAttempts = await this.redis.incrWithTtl(disable2faRateKey, 900);
     if (disable2faAttempts > 5) {
       throw new HttpException(
         { code: ErrorCodes.TOO_MANY_REQUESTS, message: 'Too many attempts. Please wait before trying again.' },
@@ -2275,8 +2301,7 @@ export class AuthService {
   // ─────────────────────────────────────────────────────────────────
   async regenerateBackupCodes(userId: string, password: string, code: string): Promise<{ backupCodes: string[] }> {
     const regenRateKey = `regen_backup_rate:${userId}`;
-    const regenAttempts = await this.redis.incr(regenRateKey);
-    if (regenAttempts === 1) await this.redis.expire(regenRateKey, 900);
+    const regenAttempts = await this.redis.incrWithTtl(regenRateKey, 900);
     if (regenAttempts > 5) {
       throw new HttpException(
         { code: ErrorCodes.TOO_MANY_REQUESTS, message: 'Too many attempts. Please wait before trying again.' },
@@ -2358,8 +2383,7 @@ export class AuthService {
   // ─────────────────────────────────────────────────────────────────
   async requestDisable2faOtp(userId: string, ipAddress?: string): Promise<{ message: string }> {
     const rateLimitKey = `disable_2fa_otp_rate:${userId}`;
-    const requestCount = await this.redis.incr(rateLimitKey);
-    if (requestCount === 1) await this.redis.expire(rateLimitKey, 300);
+    const requestCount = await this.redis.incrWithTtl(rateLimitKey, 300);
     if (requestCount > 3) {
       throw new BadRequestException({ code: 'RATE_LIMIT_EXCEEDED', message: 'Too many OTP requests. Please wait 5 minutes before trying again.' });
     }
@@ -2516,10 +2540,7 @@ export class AuthService {
     }
 
     const backupRateKey = `backup_code_rate:${twoFactorAuth.id}`;
-    const backupAttempts = await this.redis.incr(backupRateKey);
-    if (backupAttempts === 1) {
-      await this.redis.expire(backupRateKey, 15 * 60);
-    }
+    const backupAttempts = await this.redis.incrWithTtl(backupRateKey, 15 * 60);
     if (backupAttempts > 5) {
       throw new HttpException(
         { code: ErrorCodes.TOO_MANY_REQUESTS, message: 'Too many backup code attempts. Please wait before trying again.' },
@@ -2725,8 +2746,13 @@ export class AuthService {
     }
     const jti = payload.jti;
 
-    const tokenHash = sha256(refreshToken);
-    const hashedRefreshToken = await bcryptHash(tokenHash, getBcryptRounds());
+    // AUDIT-10: store a plain SHA-256 of the refresh token instead of bcrypt-hashing it.
+    // The refresh token is a signed HS256 JWT with full entropy, so bcrypt's anti-GPU
+    // properties are not needed (OWASP: strong hashing is for low-entropy secrets), while
+    // the cost-12 hash put ~250 ms of CPU on every login AND every refresh (`refreshToken`
+    // compares with bcryptCompare and rotation re-hashed). Legacy bcrypt rows still verify
+    // via `verifyStoredRefreshToken` and are upgraded to sha256 on the next rotation.
+    const hashedRefreshToken = sha256(refreshToken);
 
     const MAX_SESSIONS_PER_USER = this.configService.get<number>('app.maxSessionsPerUser') ?? 5;
     const now = new Date();

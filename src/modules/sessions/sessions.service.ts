@@ -10,8 +10,10 @@ import { parseJwtTtl } from '../../common/utils/jwt.util';
 @Injectable()
 export class SessionsService {
   private readonly logger = new Logger(SessionsService.name);
-  // at 900s — if JWT_EXPIRES_IN was changed to e.g. '30m', the revocation key would
-  // expire after 15m and allow revoked tokens to become valid again.
+  // R2-L: TTL for `session_revoked:*` markers. It must cover the FULL access-token
+  // lifetime, not the hard-coded 900s default — if JWT_EXPIRES_IN is '30m' but the
+  // revocation key expired after 15m, revoked tokens would become valid again while
+  // still accepted. parseJwtTtl() (now format-complete) derives it from config.
   private readonly accessTokenTtlSeconds: number;
 
   constructor(

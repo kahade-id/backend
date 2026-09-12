@@ -4,7 +4,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { generateKycId } from '../../common/utils/id-generator.util';
-import { encryptKycNik, encryptKycKtp, encryptKycSelfie, decryptAES, hmacSHA256, argon2HashNik } from '../../common/utils/crypto.util';
+import { encryptKycNik, encryptKycKtp, encryptKycSelfie, hmacSHA256, argon2HashNik } from '../../common/utils/crypto.util';
 import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { UserAuditAction } from '@prisma/client';
@@ -276,7 +276,7 @@ export class KycService {
     const [data, total] = await Promise.all([
       this.prisma.kycRequest.findMany({
         where: { userId },
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
         skip,
         take: safeLimit,
         select: {

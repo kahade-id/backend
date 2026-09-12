@@ -113,8 +113,8 @@ export class OrderQrisPaymentService {
   }
 
   async initiate(orderId: string, buyerId: string): Promise<OrderQrisPaymentResult> {
-    const order = await this.prisma.order.findUnique({
-      where: { orderId },
+    const order = await this.prisma.order.findFirst({
+      where: { orderId, deletedAt: null }, // AUDIT-16
       include: { buyer: { select: { id: true, email: true, fullName: true } } },
     });
     if (!order)
@@ -400,7 +400,7 @@ export class OrderQrisPaymentService {
         });
 
         const orderUpdated = await tx.order.updateMany({
-          where: { id: order.id, status: OrderStatus.WAITING_PAYMENT },
+          where: { id: order.id, status: OrderStatus.WAITING_PAYMENT, deletedAt: null }, // AUDIT-16
           data: {
             status: OrderStatus.PROCESSING,
             paidAt: new Date(),

@@ -52,7 +52,7 @@ export class ReceiptService {
 
     const timeline = order.statusHistories.map((h) => ({
       status: statusLabel[h.toStatus] || h.toStatus,
-      date: h.createdAt.toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
+      date: h.createdAt.toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Jakarta' }),
     }));
 
     return `<!DOCTYPE html>
@@ -97,7 +97,7 @@ body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;color:#1a1a2e;backg
 <div class="receipt">
 <div class="header">
 <h1>Transaction Receipt</h1>
-<div class="id">${order.orderId}</div>
+<div class="id">${escapeHtml(order.orderId)}</div>
 <div class="status">${statusLabel[order.status] || order.status}</div>
 </div>
 <div class="body">
@@ -105,8 +105,8 @@ body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;color:#1a1a2e;backg
 <div class="section-title">Transaction Details</div>
 <div class="row"><span class="label">Title</span><span class="value">${escapeHtml(order.title)}</span></div>
 <div class="row"><span class="label">Type</span><span class="value">${order.orderType.replace('_', ' ')}</span></div>
-<div class="row"><span class="label">Date</span><span class="value">${order.createdAt.toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric' })}</span></div>
-${order.completedAt ? `<div class="row"><span class="label">Completed</span><span class="value">${order.completedAt.toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric' })}</span></div>` : ''}
+<div class="row"><span class="label">Date</span><span class="value">${order.createdAt.toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Jakarta' })}</span></div>
+${order.completedAt ? `<div class="row"><span class="label">Completed</span><span class="value">${order.completedAt.toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Jakarta' })}</span></div>` : ''}
 </div>
 <div class="section">
 <div class="section-title">Parties Involved</div>
@@ -135,7 +135,7 @@ ${timeline.map((t) => `<div class="timeline-item"><div class="time">${t.date}</d
 <p><strong>Kahade — P2P Escrow Platform</strong></p>
 <p>PT Kawal Hak Dengan Aman</p>
 <p>This document is automatically generated and valid without a signature.</p>
-<p>Printed: ${new Date().toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' })}</p>
+<p>Printed: ${new Date().toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Jakarta' })}</p>
 </div>
 </div>
 </body>

@@ -10,12 +10,19 @@ import { AuditLogService } from '../../../common/services/audit-log.service';
 const mockPrisma = {
   dispute: { findMany: jest.fn(), findUnique: jest.fn(), findFirst: jest.fn(), count: jest.fn(), update: jest.fn(), groupBy: jest.fn() },
   disputeEvidence: { findMany: jest.fn(), findUnique: jest.fn(), count: jest.fn(), create: jest.fn(), delete: jest.fn(), deleteMany: jest.fn() },
-  order: { findUnique: jest.fn() },
+  order: {
+    findUnique: jest.fn(),
+    findFirst: jest.fn(),
+  },
   notification: { create: jest.fn() },
   emitNotificationCreated: jest.fn(),
   $transaction: jest.fn(),
   $queryRaw: jest.fn(),
 };
+// AUDIT-B: the service now reads orders via findFirst({ deletedAt: null }); delegate it to
+// the findUnique mock so existing fixtures keep working.
+(mockPrisma.order as any).findFirst = (args: any) => (mockPrisma.order as any).findUnique(args);
+
 const mockSerial = { getNextForPrefix: jest.fn().mockResolvedValue(1) };
 const mockUpload = {
   verifyFileMagicBytes: jest.fn().mockResolvedValue(true),
@@ -482,7 +489,7 @@ describe('DisputesService', () => {
       mockPrisma.order.findUnique.mockResolvedValue(activeOrder);
       mockPrisma.$transaction.mockImplementation(async (fn: (tx: any) => Promise<unknown>) => fn({
         dispute: { findUnique: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue(createdDispute) },
-        order: { findUnique: jest.fn().mockResolvedValue(activeOrder), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        order: { findUnique: jest.fn().mockResolvedValue(activeOrder), findFirst: jest.fn().mockResolvedValue(activeOrder), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
         disputeEvidence: { create: jest.fn() },
         orderStatusHistory: { create: jest.fn() },
         walletTransaction: { findFirst: jest.fn().mockResolvedValue(null) },
@@ -500,7 +507,7 @@ describe('DisputesService', () => {
       mockPrisma.order.findUnique.mockResolvedValue(completedOrder);
       mockPrisma.$transaction.mockImplementation(async (fn: (tx: any) => Promise<unknown>) => fn({
         dispute: { findUnique: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue(createdDispute) },
-        order: { findUnique: jest.fn().mockResolvedValue(completedOrder), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        order: { findUnique: jest.fn().mockResolvedValue(completedOrder), findFirst: jest.fn().mockResolvedValue(completedOrder), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
         disputeEvidence: { create: jest.fn() },
         orderStatusHistory: { create: jest.fn() },
         wallet: { findUnique: jest.fn()

@@ -29,11 +29,17 @@ const mockPrisma = {
 };
 const mockRedis = {
   incr: jest.fn().mockResolvedValue(1),
+  // AUDIT-B: incrWithTtl is the fixed atomic INCR+EXPIRE primitive; alias it to the same
+  // jest.fn so existing counter setups/assertions keep working.
+  // (assigned after literal — see below)
   expire: jest.fn().mockResolvedValue(undefined),
   decr: jest.fn().mockResolvedValue(0),
   del: jest.fn().mockResolvedValue(undefined),
   get: jest.fn().mockResolvedValue(null),
 };
+// AUDIT-B: alias the atomic counter primitive to the shared mock fn
+(mockRedis as any).incrWithTtl = (mockRedis as any).incr;
+
 const mockRealtimeService = {
   setServer: jest.fn(),
   refreshUserPresence: jest.fn().mockResolvedValue(undefined),

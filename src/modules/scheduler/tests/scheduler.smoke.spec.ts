@@ -177,6 +177,7 @@ describe('Scheduler services smoke', () => {
         OrphanedUploadCleanupService,
         { provide: RedisService, useValue: mkRedis(false) },
         { provide: ConfigService, useValue: mkConfig() },
+        { provide: PrismaService, useValue: { user: { findMany: jest.fn().mockResolvedValue([]) } } },
       ],
     }).compile();
     const svc = mod.get(OrphanedUploadCleanupService);

@@ -9,6 +9,7 @@ import { AuditAction } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { bcryptHash } from '../../../common/utils/crypto.util';
 import { BCRYPT_ROUNDS_ADMIN } from '../../../common/constants/app.constants';
+import { escapeLikePattern } from '../../../common/utils/search.util';
 // jwt.config clamps admin access tokens to at most two hours.
 // Keep revocation markers alive for that full bound so a revoked token cannot
 // become usable merely because the marker expired before the token.
@@ -31,9 +32,9 @@ export class AdminManagementService {
       ...(search
         ? {
             OR: [
-              { fullName: { contains: search, mode: 'insensitive' as const } },
-              { email: { contains: search, mode: 'insensitive' as const } },
-              { adminId: { contains: search, mode: 'insensitive' as const } },
+              { fullName: { contains: escapeLikePattern(search), mode: 'insensitive' as const } },
+              { email: { contains: escapeLikePattern(search), mode: 'insensitive' as const } },
+              { adminId: { contains: escapeLikePattern(search), mode: 'insensitive' as const } },
             ],
           }
         : {}),

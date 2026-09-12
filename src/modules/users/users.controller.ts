@@ -58,6 +58,9 @@ export class UsersController {
     return this.usersService.getMyProfile(userId);
   }
 
+  // AUDIT-23: profile updates confirm sensitive changes with the account password
+  // (bcryptCompare) and previously inherited only the 100/min global limit.
+  @Throttle({ default: { ttl: 900000, limit: 10 } })
   @Put('me')
   @UseGuards(UserThrottleGuard)
   async updateProfile(@CurrentUser('sub') userId: string, @Body() dto: UpdateProfileDto): Promise<object> {

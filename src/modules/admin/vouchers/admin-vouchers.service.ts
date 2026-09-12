@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { ConflictException } from '@nestjs/common';
@@ -14,6 +14,8 @@ const VOUCHER_LIST_TTL = 300;
 
 @Injectable()
 export class AdminVouchersService {
+  private readonly logger = new Logger(AdminVouchersService.name);
+
   constructor(
     private prisma: PrismaService,
     private redis: RedisService,
@@ -309,9 +311,19 @@ export class AdminVouchersService {
   }
 
   private async invalidateVoucherListCache(): Promise<void> {
-    await Promise.all([
-      this.redis.delPattern('admin:vouchers:list:*'),
-      this.redis.delPattern('public:vouchers:active:*'),
-    ]);
+    // AUDIT-25: delPattern() used to swallow SCAN/DEL failures, so a voucher could stay
+    // "revoked but still advertised" for the full cache TTL while every log claimed
+    // success. Run strict, then surface a loud operator signal on failure (the admin
+    // write itself already committed; stale entries expire on their own within 300 s).
+    try {
+      await Promise.all([
+        this.redis.delPattern('admin:vouchers:list:*', { throwOnError: true }),
+        this.redis.delPattern('public:vouchers:active:*', { throwOnError: true }),
+      ]);
+    } catch (error: unknown) {
+      this.logger.error(
+        `CRITICAL: voucher cache invalidation failed — stale voucher lists can persist up to 300s: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 }

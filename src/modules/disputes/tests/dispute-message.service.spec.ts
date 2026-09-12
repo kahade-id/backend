@@ -53,9 +53,11 @@ describe('DisputeMessageService', () => {
     mockUpload.cleanupFileKeys.mockResolvedValue({ deleted: 1, errors: [] });
     mockPrisma.disputeMessage.create.mockResolvedValue({ id: 'msg-created', message: 'hello' });
     mockPrisma.disputeMessage.findMany.mockImplementation(
-      (args: { orderBy: { createdAt: 'asc' | 'desc' }; skip: number; take: number }) => {
+      (args: { orderBy: { createdAt: 'asc' | 'desc' } | Array<{ createdAt: 'asc' | 'desc' }>; skip: number; take: number }) => {
         const ordered =
-          args.orderBy.createdAt === 'desc' ? [...ALL_MESSAGES].reverse() : [...ALL_MESSAGES];
+          (Array.isArray(args.orderBy) ? args.orderBy[0]?.createdAt : args.orderBy.createdAt) === 'desc'
+            ? [...ALL_MESSAGES].reverse()
+            : [...ALL_MESSAGES];
         return Promise.resolve(ordered.slice(args.skip, args.skip + args.take));
       },
     );

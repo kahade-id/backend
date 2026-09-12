@@ -119,6 +119,8 @@ export const appConfig = registerAs('app', () => ({
 
   // OTP settings
   otpExpiresMinutes: parseInt(process.env.OTP_EXPIRES_MINUTES || '5', 10),
+  // AUDIT-12 (SEC-019): digit count for WITHDRAW_CONFIRMATION OTPs (6–10; clamped in WalletService).
+  withdrawOtpDigits: parseInt(process.env.WITHDRAW_OTP_DIGITS || '6', 10),
   otpMaxAttempts: parseInt(process.env.OTP_MAX_ATTEMPTS || '5', 10),
   otpLength: parseInt(process.env.OTP_LENGTH || '6', 10),
 

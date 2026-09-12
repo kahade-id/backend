@@ -140,13 +140,18 @@ describe('TransactionTemplatesService', () => {
   });
 
   describe('recordUsage', () => {
-    it('increments usage count and sets lastUsedAt', async () => {
-      mockPrisma.transactionTemplate.update.mockResolvedValue({});
-      await service.recordUsage('t1');
-      expect(mockPrisma.transactionTemplate.update).toHaveBeenCalledWith(expect.objectContaining({
-        where: { id: 't1' },
-        data: expect.objectContaining({ usageCount: { increment: 1 } }),
+    it('increments usage count and sets lastUsedAt, scoped to the owner', async () => {
+      mockPrisma.transactionTemplate.updateMany.mockResolvedValue({ count: 1 });
+      await service.recordUsage('u1', 't1');
+      expect(mockPrisma.transactionTemplate.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: { id: 't1', userId: 'u1' },
+        data: expect.objectContaining({ usageCount: { increment: 1 }, lastUsedAt: expect.any(Date) }),
       }));
+    });
+
+    it('throws NotFound when the template is not owned by the caller', async () => {
+      mockPrisma.transactionTemplate.updateMany.mockResolvedValue({ count: 0 });
+      await expect(service.recordUsage('u1', 'other')).rejects.toThrow(NotFoundException);
     });
   });
 });

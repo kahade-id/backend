@@ -6,6 +6,7 @@ import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditAction, Prisma } from '@prisma/client';
 import { toIdr } from '../../../common/utils/currency.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
+import { RedisService } from '../../../redis/redis.service';
 
 @Injectable()
 export class AdminSubscriptionsService {
@@ -15,6 +16,7 @@ export class AdminSubscriptionsService {
     private prisma: PrismaService,
     private auditLog: AuditLogService,
     private midtransService: MidtransService,
+    private redis: RedisService,
   ) {}
 
   async listSubscriptions(
@@ -180,6 +182,14 @@ export class AdminSubscriptionsService {
         return sub;
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
+
+    // R2-B (audit): force-cancel flips the user's Plus entitlement immediately, but
+    // orders.service keeps a 300 s `subscription_status:<userId>` cache. Without this
+    // delete the user (or a refund-requesting buyer) could keep ordering at Plus rates
+    // — or be charged Plus rates after losing them — for up to five minutes.
+    await this.redis.del(`subscription_status:${subscription.userId}`).catch((err: unknown) =>
+      this.logger.warn(`Failed to invalidate subscription status cache for ${subscription.userId}: ${err instanceof Error ? err.message : String(err)}`),
     );
 
     let paymentProviderSynced = false;

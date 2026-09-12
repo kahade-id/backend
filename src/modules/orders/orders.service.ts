@@ -13,10 +13,7 @@ import { ORDER_SERIAL, ORDER_AVG_DURATIONS_CACHE } from '../../common/constants/
 import { NotificationQueueService } from '../queue/notification-queue.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { CONFIRMATION_DEADLINE_DAYS, KYC_THRESHOLD, CONFIRMATION_DEADLINE_DAYS_MAP, ORDER_MIN_VALUE, ORDER_MAX_VALUE, DELIVERY_DEADLINE_DAYS_MIN, DELIVERY_DEADLINE_DAYS_MAX, POST_COMPLETION_DISPUTE_WINDOW_HOURS } from '../../common/constants/app.constants';
-
-function escapeLikePattern(pattern: string): string {
-  return pattern.replace(/[%_\\]/g, '\\$&');
-}
+import { escapeLikePattern } from '../../common/utils/search.util';
 
 const ORDER_COUNTERPART_COOLDOWN_SECONDS = 60;
 

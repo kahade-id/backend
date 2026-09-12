@@ -165,7 +165,7 @@ export class RatingsService {
     const [given, givenCount] = await Promise.all([
       this.prisma.rating.findMany({
         where: { giverId: userId, isHidden: false },
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
         skip,
         take: safeLimit,
         include: {
@@ -180,7 +180,7 @@ export class RatingsService {
     const [received, receivedCount, receivedAggregate] = await Promise.all([
       this.prisma.rating.findMany({
         where: { receiverId: userId, isHidden: false },
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
         skip,
         take: safeLimit,
         include: {

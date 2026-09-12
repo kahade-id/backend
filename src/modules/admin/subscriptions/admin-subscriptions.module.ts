@@ -2,10 +2,11 @@ import { Module } from '@nestjs/common';
 import { AdminSubscriptionsController } from './admin-subscriptions.controller';
 import { AdminSubscriptionsService } from './admin-subscriptions.service';
 import { AuditLogModule } from '../../../common/services/audit-log.module';
+import { RedisModule } from '../../../redis/redis.module';
 import { PaymentModule } from '../../payment/payment.module';
 
 @Module({
-  imports: [AuditLogModule, PaymentModule],
+  imports: [AuditLogModule, RedisModule, PaymentModule],
   controllers: [AdminSubscriptionsController],
   providers: [AdminSubscriptionsService],
 })

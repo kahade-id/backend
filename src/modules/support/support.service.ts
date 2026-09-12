@@ -20,13 +20,32 @@ export class SupportService {
   async createTicket(userId: string, dto: CreateTicketDto): Promise<object> {
     const attachments = dto.attachments ?? [];
     await this.uploadService.verifyUserFileKeys(userId, attachments, UploadPurpose.CHAT_ATTACHMENT);
+
+    // R2-C (audit): `orderId` on a ticket is shown to staff as the order context.
+    // Accepting any order id let users attach other people's orders to their ticket
+    // (no FK guarantees it); require the referenced order to be one the ticket
+    // creator participates in before linking it.
+    const linkedOrderId = dto.orderId?.trim();
+    if (linkedOrderId) {
+      const order = await this.prisma.order.findFirst({
+        where: { OR: [{ orderId: linkedOrderId }, { id: linkedOrderId }], deletedAt: null },
+        select: { buyerId: true, sellerId: true },
+      });
+      if (!order || (order.buyerId !== userId && order.sellerId !== userId)) {
+        throw new BadRequestException({
+          code: ErrorCodes.NOT_FOUND,
+          message: 'orderId does not refer to an order owned by this user',
+        });
+      }
+    }
+
     return this.prisma.supportTicket.create({
       data: {
         userId,
         subject: dto.subject.trim(),
         message: dto.message.trim(),
         category: dto.category || 'GENERAL',
-        orderId: dto.orderId || null,
+        orderId: linkedOrderId ?? null,
         attachments,
         status: 'OPEN',
       },

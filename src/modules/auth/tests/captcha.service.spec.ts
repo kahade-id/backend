@@ -4,6 +4,7 @@ describe('CaptchaService login threshold', () => {
   const redis = {
     get: jest.fn(),
     incr: jest.fn(),
+    incrWithTtl: jest.fn(),
     expire: jest.fn(),
     del: jest.fn(),
     set: jest.fn(),
@@ -25,11 +26,12 @@ describe('CaptchaService login threshold', () => {
     await expect(service.shouldRequireLoginCaptcha('1.2.3.4')).resolves.toBe(true);
   });
 
-  it('records the first failure with a fifteen-minute TTL', async () => {
-    redis.incr.mockResolvedValueOnce(1);
+  it('records the first failure with a fifteen-minute TTL atomically', async () => {
+    redis.incrWithTtl.mockResolvedValueOnce(1);
     await service.recordLoginFailure('1.2.3.4');
-    expect(redis.incr).toHaveBeenCalledWith('login:captcha-failures:1.2.3.4');
-    expect(redis.expire).toHaveBeenCalledWith('login:captcha-failures:1.2.3.4', 900);
+    // AUDIT-B: INCR + EXPIRE must be one atomic operation (a lost EXPIRE used to pin
+    // the counter forever); the service now uses incrWithTtl(key, ttl).
+    expect(redis.incrWithTtl).toHaveBeenCalledWith('login:captcha-failures:1.2.3.4', 900);
   });
 
   it('clears failures after successful login', async () => {

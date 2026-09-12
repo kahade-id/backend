@@ -7,6 +7,8 @@ import { AuditLogService } from '../../../../common/services/audit-log.service';
 const mockPrisma = {
   supportTicket: { findMany: jest.fn(), count: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
   supportTicketReply: { create: jest.fn() },
+  notification: { create: jest.fn().mockResolvedValue({}) },
+  emitNotificationCreated: jest.fn(),
   $transaction: jest.fn(),
 };
 const mockAuditLog = { logAdminAction: jest.fn() };
@@ -51,7 +53,7 @@ describe('AdminSupportService', () => {
   });
 
   it('uses one transaction for reply and status side effect', async () => {
-    mockPrisma.supportTicket.findUnique.mockResolvedValue({ id: 't1', status: 'OPEN' });
+    mockPrisma.supportTicket.findUnique.mockResolvedValue({ id: 't1', userId: 'u1', status: 'OPEN' });
     mockPrisma.supportTicketReply.create.mockResolvedValue({ id: 'r1' });
     mockPrisma.supportTicket.update.mockResolvedValue({});
     await service.replyToTicket('t1', 'admin-1', 'reply', '127.0.0.1');
@@ -68,5 +70,17 @@ describe('AdminSupportService', () => {
   it('rejects a no-op status update', async () => {
     mockPrisma.supportTicket.findUnique.mockResolvedValue({ id: 't1', status: 'OPEN' });
     await expect(service.updateStatus('t1', 'OPEN', 'admin-1', '127.0.0.1')).rejects.toThrow('already in this status');
+  });
+
+  it('notifies the requester when staff replies', async () => {
+    mockPrisma.supportTicket.findUnique.mockResolvedValue({ id: 't1', userId: 'u1', status: 'OPEN' });
+    mockPrisma.supportTicketReply.create.mockResolvedValue({ id: 'r1', ticketId: 't1' });
+    mockPrisma.supportTicket.update.mockResolvedValue({});
+    await service.replyToTicket('t1', 'admin-1', 'we are on it', '127.0.0.1');
+    await new Promise(setImmediate);
+    expect(mockPrisma.notification.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ userId: 'u1', body: expect.stringContaining('we are on it') }),
+    }));
+    expect(mockPrisma.emitNotificationCreated).toHaveBeenCalledWith(expect.objectContaining({ userId: 'u1' }));
   });
 });

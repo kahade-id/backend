@@ -8,6 +8,7 @@ import { AuditLogService } from '../../../common/services/audit-log.service';
 const mockPrisma = {
   supportTicket: { create: jest.fn(), findMany: jest.fn(), count: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
   supportTicketReply: { create: jest.fn() },
+  order: { findFirst: jest.fn() },
   $transaction: jest.fn(),
 };
 
@@ -20,6 +21,8 @@ describe('SupportService', () => {
   beforeEach(async () => {
     jest.resetAllMocks();
     mockUpload.verifyUserFileKeys.mockResolvedValue(undefined);
+    // R2-C: createTicket validates the linked order belongs to the requester.
+    mockPrisma.order.findFirst.mockResolvedValue({ buyerId: 'u1', sellerId: 'u2' });
     mockPrisma.$transaction.mockImplementation(async (callback: (tx: typeof mockPrisma) => unknown) => callback(mockPrisma));
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -59,6 +62,22 @@ describe('SupportService', () => {
       expect(mockPrisma.supportTicket.create).toHaveBeenCalledWith(expect.objectContaining({
         data: expect.objectContaining({ category: 'PAYMENT', orderId: 'ORD-1' }),
       }));
+    });
+
+    it('rejects linking another user\'s order to the ticket', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue({ buyerId: 'someone-else', sellerId: 'u9' });
+      await expect(
+        service.createTicket('u1', { subject: 'S', message: 'M', orderId: 'ORD-OTHER' } as any),
+      ).rejects.toThrow(BadRequestException);
+      expect(mockPrisma.supportTicket.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects linking an order id that does not exist', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+      await expect(
+        service.createTicket('u1', { subject: 'S', message: 'M', orderId: 'ORD-MISSING' } as any),
+      ).rejects.toThrow(BadRequestException);
+      expect(mockPrisma.supportTicket.create).not.toHaveBeenCalled();
     });
 
     /*

@@ -35,8 +35,8 @@ const mockRedis = {
   get: jest.fn(),
   set: jest.fn(),
   setex: jest.fn(),
-  del: jest.fn(),
-  delPattern: jest.fn(),
+  del: jest.fn().mockResolvedValue(undefined),
+  delPattern: jest.fn().mockResolvedValue(undefined),
 };
 
 const mockWalletTxSerialService = {

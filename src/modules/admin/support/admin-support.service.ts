@@ -2,8 +2,11 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
-import { AuditAction, Prisma, SupportTicketStatus, SupportTicketCategory, SupportTicketSenderType } from '@prisma/client';
+import { AuditAction, Prisma, SupportTicketStatus, SupportTicketCategory, SupportTicketSenderType, NotificationType } from '@prisma/client';
+import { generateNotifId } from '../../../common/utils/id-generator.util';
+import { getCategoryForType } from '../../notifications/notification-category.map';
 import * as ErrorCodes from '../../../common/constants/error-codes';
+import { escapeLikePattern } from '../../../common/utils/search.util';
 
 const TERMINAL_TICKET_STATUSES = [SupportTicketStatus.RESOLVED, SupportTicketStatus.CLOSED] as const;
 
@@ -24,11 +27,11 @@ export class AdminSupportService {
     const normalizedSearch = search?.trim();
     if (normalizedSearch) {
       where.OR = [
-        { subject: { contains: normalizedSearch, mode: 'insensitive' } },
-        { message: { contains: normalizedSearch, mode: 'insensitive' } },
-        { user: { is: { email: { contains: normalizedSearch, mode: 'insensitive' } } } },
-        { user: { is: { username: { contains: normalizedSearch, mode: 'insensitive' } } } },
-        { user: { is: { fullName: { contains: normalizedSearch, mode: 'insensitive' } } } },
+        { subject: { contains: escapeLikePattern(normalizedSearch), mode: 'insensitive' } },
+        { message: { contains: escapeLikePattern(normalizedSearch), mode: 'insensitive' } },
+        { user: { is: { email: { contains: escapeLikePattern(normalizedSearch), mode: 'insensitive' } } } },
+        { user: { is: { username: { contains: escapeLikePattern(normalizedSearch), mode: 'insensitive' } } } },
+        { user: { is: { fullName: { contains: escapeLikePattern(normalizedSearch), mode: 'insensitive' } } } },
       ];
     }
 
@@ -86,6 +89,11 @@ export class AdminSupportService {
       return created;
     });
 
+    // R2-C (audit): admin replies used to be invisible until the user happened to
+    // poll the ticket list — there was no in-app signal at all. Notify the ticket
+    // owner (and push via realtime) whenever staff answers.
+    await this.notifyTicketOwner(reply.ticketId ?? ticketId, 'Kahade Support replied to your ticket', `Reply: ${this.snippet(message)}`);
+
     this.auditLog.logAdminAction({
       adminId,
       action: AuditAction.ADMIN_ACTION,
@@ -111,6 +119,11 @@ export class AdminSupportService {
       return { previousStatus: ticket.status, updated };
     });
 
+    // R2-C (audit): terminal transitions were also silent for the requester.
+    if (status === SupportTicketStatus.RESOLVED || status === SupportTicketStatus.CLOSED) {
+      await this.notifyTicketOwner(ticketId, 'Kahade Support updated your ticket', `Your ticket is now ${status}.`);
+    }
+
     this.auditLog.logAdminAction({
       adminId,
       action: AuditAction.ADMIN_ACTION,
@@ -120,5 +133,34 @@ export class AdminSupportService {
       ipAddress,
     });
     return { message: 'Ticket status updated', ticketId: result.updated.id, status: result.updated.status };
+  }
+
+  private snippet(text: string): string {
+    const flat = text.replace(/\s+/g, ' ').trim();
+    return flat.length > 140 ? `${flat.slice(0, 140)}…` : flat;
+  }
+
+  private async notifyTicketOwner(ticketId: string, title: string, body: string): Promise<void> {
+    const ticket = await this.prisma.supportTicket.findUnique({
+      where: { id: ticketId },
+      select: { userId: true },
+    });
+    if (!ticket) return;
+    void Promise.resolve()
+      .then(() =>
+        this.prisma.notification.create({
+          data: {
+            notifId: generateNotifId(),
+            userId: ticket.userId,
+            type: NotificationType.SYSTEM_ANNOUNCEMENT,
+            category: getCategoryForType(NotificationType.SYSTEM_ANNOUNCEMENT),
+            title,
+            body,
+            isRead: false,
+          },
+        }),
+      )
+      .catch(() => undefined);
+    this.prisma.emitNotificationCreated({ userId: ticket.userId, title, body, data: { type: 'SUPPORT_TICKET_UPDATE', ticketId } });
   }
 }

@@ -56,7 +56,7 @@ export class DisputeMessageService {
         // silently froze for both parties even though POST and the socket event both succeeded.
         // Paginate newest-first, then flip the page back to ascending for display. Keeps `page` /
         // `limit` / `total` / `totalPages` intact, so no client change is needed.
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
         skip,
         take: safeLimit,
       }),

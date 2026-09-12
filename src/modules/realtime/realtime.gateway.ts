@@ -23,6 +23,7 @@ import { TYPING_SERVER_AUTO_STOP_MS } from '../../common/constants/app.constants
 interface AuthenticatedSocket extends Socket {
   userId?: string;
   _connectionLeaseRegistered?: boolean;
+  _connectionLeaseKey?: string;
   _presenceRegistered?: boolean;
   _tokenExp?: number;
   _jti?: string;
@@ -61,10 +62,8 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     const identity = client.userId || client.id;
     const key = `ws:msg_rate:${identity}`;
     try {
-      const count = await this.redisService.incr(key);
-      if (count === 1) {
-        await this.redisService.expire(key, WS_MSG_RATE_WINDOW_SECONDS);
-      }
+      // AUDIT-14: atomic INCR+EXPIRE (a TTL-less key would mute this socket forever).
+      const count = await this.redisService.incrWithTtl(key, WS_MSG_RATE_WINDOW_SECONDS);
       if (count > WS_MSG_RATE_LIMIT) {
         client.emit('error', { message: 'Rate limit exceeded' });
         return false;
@@ -81,10 +80,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     const identity = client.userId || client.id;
     const key = `ws:typing_rate:${identity}`;
     try {
-      const count = await this.redisService.incr(key);
-      if (count === 1) {
-        await this.redisService.expire(key, WS_TYPING_RATE_WINDOW_SECONDS);
-      }
+      const count = await this.redisService.incrWithTtl(key, WS_TYPING_RATE_WINDOW_SECONDS); // AUDIT-14
       if (count > WS_TYPING_RATE_LIMIT) {
         return false;
       }
@@ -275,6 +271,9 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
       const connKey = `${this.WS_CONN_PREFIX}${payload.sub}`;
       const currentCount = await this.redisService.incr(connKey);
       client._connectionLeaseRegistered = true;
+      // AUDIT-19: remember the lease key so the outer catch below can release it even
+      // when client.userId has not been assigned yet (handleDisconnect keys off userId).
+      client._connectionLeaseKey = connKey;
       try {
         await this.redisService.expire(connKey, this.WS_CONN_TTL, { throwOnError: true });
       } catch {
@@ -323,6 +322,15 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
 
       this.logger.debug(`Client connected: ${client.id} (user: ${payload.sub})`);
     } catch {
+      // AUDIT-19: release a lease that was registered before the failure; otherwise the
+      // slot stays counted for the whole TTL and repeated failures permanently exhaust
+      // WS_MAX_CONNECTIONS_PER_USER for a healthy client.
+      if (client._connectionLeaseRegistered && client._connectionLeaseKey) {
+        client._connectionLeaseRegistered = false;
+        await this.redisService
+          .decr(client._connectionLeaseKey)
+          .catch(() => undefined);
+      }
       client.emit('error', { message: 'Authentication failed' });
       client.disconnect(true);
     }

@@ -24,10 +24,9 @@ export class GlobalThrottleGuard implements CanActivate {
     const key = `global_throttle:${resolvedIp}`;
 
     try {
-      const count = await this.redis.incr(key);
-      if (count === 1) {
-        await this.redis.expire(key, GLOBAL_IP_WINDOW_SECONDS);
-      }
+      // AUDIT-14: single atomic INCR+EXPIRE — a crash between the two commands used to
+      // leave a TTL-less counter, permanently blocking this IP with 429s.
+      const count = await this.redis.incrWithTtl(key, GLOBAL_IP_WINDOW_SECONDS);
       if (count > GLOBAL_IP_LIMIT) {
         throw new HttpException(
           { statusCode: HttpStatus.TOO_MANY_REQUESTS, message: 'Too many requests. Please try again later.' },

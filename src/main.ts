@@ -14,7 +14,7 @@ import { ValidationPipe, Logger } from '@nestjs/common';
 import helmet from 'helmet';
 import compression from 'compression';
 import cookieParser from 'cookie-parser';
-import { json, urlencoded } from 'express';
+import { json, urlencoded, Request as ExpressRequest, Response as ExpressResponse, NextFunction } from 'express';
 import { getBootstrapMode, getSmokeLoopbackHost } from './smoke/bootstrap-mode';
 import { createWinstonLogger } from './common/logger/winston.logger';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
@@ -44,7 +44,8 @@ const REQUIRED_SECRETS: Array<{ env: string; name: string; pattern?: string }> =
   { env: 'WALLET_PIN_PEPPER', name: 'WALLET_PIN_PEPPER' },
 ];
 
-// JWT and symmetric key secrets must be at least 32 characters to resist brute-force.
+// JWT and symmetric key secrets must be at least MIN_SECRET_LENGTH (64) chars.
+// AUDIT-21: this comment used to claim 32 while the enforced value was 64.
 // 256-bit entropy minimum for HS256/HS512 signing keys.
 const MIN_SECRET_LENGTH = 64;
 const HIGH_ENTROPY_SECRETS: string[] = [
@@ -180,7 +181,13 @@ async function bootstrap(): Promise<void> {
     : ["'self'", "wss://*.kahade.id", "https://*.kahade.id"];
 
   // Security middleware
-  app.use(helmet({
+  //
+  // AUDIT-20 (fix): the API CSP is deliberately hostile (`default-src 'none'`,
+  // `script-src 'none'`), which also applies to the Swagger UI — swagger-ui-express
+  // serves an inline bootstrap script and fetches /docs-json, so `GET /docs` was a
+  // permanently dead page wherever Swagger is enabled. Exempt only the docs paths
+  // (already IP-allowlisted below); every API route keeps the strict policy.
+  const helmetCsp = helmet({
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'none'"],
@@ -194,7 +201,16 @@ async function bootstrap(): Promise<void> {
     },
     hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
     referrerPolicy: { policy: 'no-referrer' },
-  }));
+  });
+  const swaggerDocsActive = !isReadOnlySmoke && (
+    process.env.NODE_ENV === 'development' ||
+    (process.env.NODE_ENV !== 'production' && !!process.env.SWAGGER_ALLOWLIST)
+  ); // mirrors the swaggerEnabled decision made below (line with const swaggerEnabled)
+  app.use((req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+    const isDocs = swaggerDocsActive && (req.path === '/docs' || req.path.startsWith('/docs/'));
+    if (isDocs) return next();
+    return helmetCsp(req, res, next);
+  });
   app.use(compression({ threshold: 5120 }));
   app.use(cookieParser());
 

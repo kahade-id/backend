@@ -69,7 +69,7 @@ export class OrderExtensionsService {
     if (normalizedReason.length < 10 || normalizedReason.length > 1000) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Extension reason must be between 10 and 1000 characters' });
     }
-    const order = await this.prisma.order.findUnique({ where: { orderId } });
+    const order = await this.prisma.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
     if (!order) throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
 
     if (order.sellerId !== requesterId) throw new ForbiddenException({ code: ErrorCodes.FORBIDDEN, message: 'Only the seller can request a delivery extension' });
@@ -317,7 +317,7 @@ export class OrderExtensionsService {
     const safeLimit = Math.min(100, Math.max(1, Math.trunc(Number.isFinite(limit) ? limit : 20)));
     const skip = (safePage - 1) * safeLimit;
 
-    const order = await this.prisma.order.findUnique({ where: { orderId } });
+    const order = await this.prisma.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
     if (!order) throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
     if (order.buyerId !== userId && order.sellerId !== userId) throw new ForbiddenException({ code: ErrorCodes.NOT_ORDER_PARTICIPANT, message: 'Not authorized' });
 

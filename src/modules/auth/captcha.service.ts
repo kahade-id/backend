@@ -39,8 +39,17 @@ export class CaptchaService {
 
   async recordLoginFailure(ipAddress: string): Promise<void> {
     const key = `${LOGIN_CAPTCHA_FAILURE_PREFIX}${ipAddress}`;
-    const count = await this.redis.incr(key);
-    if (count === 1) await this.redis.expire(key, LOGIN_CAPTCHA_FAILURE_TTL);
+    // AUDIT-14: a GET→SET here raced (two concurrent failures could lose one increment)
+    // and left a key without a TTL when Redis was briefly degraded. The counter is also
+    // capped so a hostile IP cannot make it grow without bound.
+    const count = await this.redis.incrWithTtl(key, LOGIN_CAPTCHA_FAILURE_TTL);
+    if (count !== null && count > 4000) {
+      await this.redis.decr(key);
+      throw new BadRequestException({
+        code: 'LOGIN_FAILED',
+        message: 'Terlalu banyak percobaan login gagal. Coba lagi nanti.',
+      });
+    }
   }
 
   async clearLoginFailures(ipAddress: string): Promise<void> {

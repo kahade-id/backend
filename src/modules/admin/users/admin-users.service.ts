@@ -19,6 +19,7 @@ import { EMAIL_QUEUE, EmailJobData } from '../../queue/processors/email.processo
 import { generateNotifId, generateWalletTxId } from '../../../common/utils/id-generator.util';
 import { parseJwtTtl } from '../../../common/utils/jwt.util';
 import { decryptPiiSafe, hashPhoneNumber, normalizePhoneNumber } from '../../../common/utils/pii.util';
+import { escapeLikePattern } from '../../../common/utils/search.util';
 
 @Injectable()
 export class AdminUsersService {
@@ -47,10 +48,10 @@ export class AdminUsersService {
 
     if (search) {
       const orClauses: Prisma.UserWhereInput[] = [
-        { email: { contains: search, mode: 'insensitive' } },
-        { fullName: { contains: search, mode: 'insensitive' } },
-        { userId: { contains: search, mode: 'insensitive' } },
-        { username: { contains: search, mode: 'insensitive' } },
+        { email: { contains: escapeLikePattern(search), mode: 'insensitive' } },
+        { fullName: { contains: escapeLikePattern(search), mode: 'insensitive' } },
+        { userId: { contains: escapeLikePattern(search), mode: 'insensitive' } },
+        { username: { contains: escapeLikePattern(search), mode: 'insensitive' } },
       ];
       const digitsOnly = search.replace(/\D/g, '');
       if (digitsOnly.length >= 8) {

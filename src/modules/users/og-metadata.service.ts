@@ -84,7 +84,9 @@ export class OgMetadataService {
     }
 
     const order = await this.prisma.order.findFirst({
-      where: { orderId },
+      // AUDIT: public OG must not surface soft-deleted orders — every user-facing
+      // order query (list/detail/realtime rooms) already filters `deletedAt: null`.
+      where: { orderId, deletedAt: null },
       select: {
         orderId: true,
         title: true,

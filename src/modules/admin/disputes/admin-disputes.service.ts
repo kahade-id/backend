@@ -14,6 +14,7 @@ import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { escapeHtml } from '../../../common/utils/sanitize.util';
 import { UploadService } from '../../upload/upload.service';
 import { RealtimeService } from '../../realtime/realtime.service';
+import { escapeLikePattern } from '../../../common/utils/search.util';
 
 @Injectable()
 export class AdminDisputesService {
@@ -54,8 +55,8 @@ export class AdminDisputesService {
     const normalizedSearch = search?.trim();
     if (normalizedSearch) {
       where.OR = [
-        { disputeId: { contains: normalizedSearch, mode: 'insensitive' } },
-        { order: { orderId: { contains: normalizedSearch, mode: 'insensitive' } } },
+        { disputeId: { contains: escapeLikePattern(normalizedSearch), mode: 'insensitive' } },
+        { order: { orderId: { contains: escapeLikePattern(normalizedSearch), mode: 'insensitive' } } },
       ];
     }
 
@@ -64,7 +65,7 @@ export class AdminDisputesService {
         where,
         skip,
         take: safeLimit,
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
         include: {
           order: { select: { orderId: true, title: true, orderValue: true } },
           initiator: { select: { userId: true, fullName: true } },

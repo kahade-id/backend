@@ -559,6 +559,9 @@ export class PaymentService {
   private expandIPv6(ip: string): string | null {
     try {
       let groups: string[];
+      // AUDIT-12: 'a::b::c' must be rejected, not truncated into a valid-looking
+      // address — a silently mangled value could match an allowlist prefix.
+      if ((ip.match(/::/g)?.length ?? 0) > 1) return null;
       if (ip.includes('::')) {
         const [left, right] = ip.split('::');
         const leftGroups = left ? left.split(':') : [];

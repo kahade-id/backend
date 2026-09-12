@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CreateFaqCategoryDto, UpdateFaqCategoryDto, CreateFaqItemDto, UpdateFaqItemDto } from './dto';
+import { escapeLikePattern } from '../../common/utils/search.util';
 
 @Injectable()
 export class HelpCenterService {
@@ -78,10 +79,10 @@ export class HelpCenterService {
         isActive: true,
         category: { isActive: true },
         OR: [
-          { question: { contains: normalizedQuery, mode: 'insensitive' } },
-          { questionEn: { contains: normalizedQuery, mode: 'insensitive' } },
-          { answer: { contains: normalizedQuery, mode: 'insensitive' } },
-          { answerEn: { contains: normalizedQuery, mode: 'insensitive' } },
+          { question: { contains: escapeLikePattern(normalizedQuery), mode: 'insensitive' } },
+          { questionEn: { contains: escapeLikePattern(normalizedQuery), mode: 'insensitive' } },
+          { answer: { contains: escapeLikePattern(normalizedQuery), mode: 'insensitive' } },
+          { answerEn: { contains: escapeLikePattern(normalizedQuery), mode: 'insensitive' } },
         ],
       },
       include: {

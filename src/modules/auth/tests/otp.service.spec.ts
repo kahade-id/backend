@@ -21,9 +21,15 @@ const mockRedis = {
   setex: jest.fn(),
   del: jest.fn().mockResolvedValue(undefined),
   incr: jest.fn(),
+  // AUDIT-B: incrWithTtl is the fixed atomic INCR+EXPIRE primitive; alias it to the same
+  // jest.fn so existing counter setups/assertions keep working.
+  // (assigned after literal — see below)
   expire: jest.fn(),
   setNx: jest.fn(),
 };
+// AUDIT-B: alias the atomic counter primitive to the shared mock fn
+(mockRedis as any).incrWithTtl = (mockRedis as any).incr;
+
 
 describe('OtpService', () => {
   let service: OtpService;

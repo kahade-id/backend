@@ -2,41 +2,42 @@
 # ============================================================================
 # Kahade Backend — production Docker image
 #
-# Build from the repository root:
-#   docker build -f apps/backend/Dockerfile -t kahade-api:latest .
+# Flat repository layout: this Dockerfile is built with the repository root as
+# the context and npm as the package manager:
+#   docker build -t kahade-api:latest .
 #
-# The repository is a pnpm workspace. The Docker build context must therefore
-# include pnpm-lock.yaml and pnpm-workspace.yaml; docker-compose.yml sets the
-# corresponding root context.
+# (AUDIT-4: this file previously described a pnpm workspace with an
+# `apps/backend/` sub-package — paths that do not exist in this repository —
+# so every `docker build`/`docker compose --build` failed immediately. There is
+# no pnpm-lock.yaml here either, which makes `pnpm install --frozen-lockfile`
+# unresolvable.)
 # ============================================================================
 ARG NODE_VERSION=20-alpine
-ARG PNPM_VERSION=10.26.1
 
 FROM node:${NODE_VERSION} AS base
-ENV PNPM_HOME=/pnpm
-ENV PATH=${PNPM_HOME}:${PATH}
+ENV NODE_ENV=production
 WORKDIR /app
-RUN apk add --no-cache python3 make g++ openssl \
-    && corepack enable \
-    && corepack prepare pnpm@${PNPM_VERSION} --activate
+# python3/make/g++ are needed to build the native bcrypt/argon2 addons from
+# source (no prebuilt binaries are vendored for the alpine musl target).
+RUN apk add --no-cache python3 make g++ openssl
 
+# ─── deps: install the full dependency tree once, shared by later stages ─────
 FROM base AS deps
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY apps/backend/package.json apps/backend/package.json
-RUN --mount=type=cache,id=kahade-pnpm-store,target=/pnpm/store \
-    pnpm install --frozen-lockfile --filter kahade-backend...
+COPY package.json package-lock.json ./
+COPY prisma ./prisma
+RUN npm ci --no-audit --no-fund
 
+# ─── builder: prisma generate + tsc build (devDependencies available) ────────
 FROM deps AS builder
-COPY apps/backend apps/backend
-RUN pnpm --filter kahade-backend exec prisma generate \
-    && pnpm --filter kahade-backend run build
+COPY . .
+RUN npx prisma generate \
+    && npm run build
 
-# The workspace is not configured for injected packages, so legacy deploy is
-# explicit here. It produces a self-contained production dependency tree.
-RUN pnpm deploy --legacy --filter kahade-backend --prod /prod/backend \
-    && cd /prod/backend \
-    && ./node_modules/.bin/prisma generate
+# ─── prod-deps: prune to production-only dependencies ───────────────────────
+FROM deps AS prod-deps
+RUN npm prune --omit=dev
 
+# ─── runtime ─────────────────────────────────────────────────────────────────
 FROM node:${NODE_VERSION} AS runtime
 WORKDIR /app
 RUN apk add --no-cache openssl postgresql-client bash tini wget \
@@ -45,12 +46,22 @@ RUN apk add --no-cache openssl postgresql-client bash tini wget \
 ENV NODE_ENV=production \
     PORT=3000
 
-COPY --from=builder --chown=app:app /prod/backend ./
-COPY --from=builder --chown=app:app /app/apps/backend/dist ./dist
-COPY --from=builder --chown=app:app /app/apps/backend/scripts ./scripts
-COPY --from=builder --chown=app:app /app/apps/backend/entrypoint.sh ./entrypoint.sh
-RUN chmod +x entrypoint.sh scripts/*.sh 2>/dev/null || true
+COPY --from=prod-deps --chown=app:app /app/node_modules ./node_modules
+# Prisma client + engine artifacts produced by `prisma generate` in builder —
+# node_modules/.prisma and @prisma/client resolve the query engine from here.
+COPY --from=builder --chown=app:app /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=builder --chown=app:app /app/node_modules/@prisma ./node_modules/@prisma
+COPY --from=builder --chown=app:app /app/package.json ./package.json
+COPY --from=builder --chown=app:app /app/prisma ./prisma
+COPY --from=builder --chown=app:app /app/dist ./dist
+COPY --from=builder --chown=app:app /app/scripts ./scripts
+COPY --from=builder --chown=app:app /app/entrypoint.sh ./entrypoint.sh
+RUN chmod +x entrypoint.sh && (chmod +x scripts/*.sh 2>/dev/null || true)
 
 USER app
 EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/v1/health || exit 1
+
 ENTRYPOINT ["/sbin/tini", "--", "./entrypoint.sh"]

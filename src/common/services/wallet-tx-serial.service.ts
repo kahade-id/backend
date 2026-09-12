@@ -6,6 +6,7 @@ import { formatWIBDate } from '../utils/date.util';
 @Injectable()
 export class WalletTxSerialService {
   private static readonly TTL_2_DAYS = 86400 * 2;
+  private static readonly SYNC_WAIT_BUDGET_MS = 3_000;
   private readonly logger = new Logger(WalletTxSerialService.name);
 
   private static readonly LUA_ATOMIC_INCR = `
@@ -55,8 +56,37 @@ export class WalletTxSerialService {
     const today = formatWIBDate().replace(/-/g, '');
     const key = `${prefix}:${today}`;
     const lockKey = `${key}:sync_lock`;
+    const markerKey = `${key}:synced`;
     const serial = await this.atomicIncr(key);
-    if (serial === 1) {
+
+    // R2-D (audit): the day-start sync must gate EVERY early caller, not just the one
+    // that received `1` from INCR. Before the fix, callers who raced in while the key
+    // sat at 1..N drew raw counter values that could still be <= the highest serial
+    // already persisted in PostgreSQL for that day (Redis surviving across midnight,
+    // or a Redis restart mid-day). The loser branch then returned a stale number and
+    // financial rows were recorded with duplicate day-serials — precisely what this
+    // recovery sync exists to prevent. Protocol now:
+    //   - once the day's key is marked synced, INCR values are trusted directly;
+    //   - before that, every caller funnels through the DB re-sync (lock winner),
+    //     waits for it (bumpers), or takes it over when the syncer died;
+    //   - a value is only returned after it is strictly above the synced floor.
+    const synced = await this.redis.get(markerKey, { throwOnError: false });
+    if (synced) {
+      return serial;
+    }
+
+    return this.performDayStartSync(prefix, today, key, lockKey, markerKey);
+  }
+
+  private async performDayStartSync(
+    prefix: string,
+    today: string,
+    key: string,
+    lockKey: string,
+    markerKey: string,
+  ): Promise<number> {
+    const deadline = Date.now() + WalletTxSerialService.SYNC_WAIT_BUDGET_MS;
+    for (;;) {
       const acquired = await this.redis.setNx(lockKey, '1', 30);
       if (acquired) {
         try {
@@ -72,23 +102,38 @@ export class WalletTxSerialService {
               String(newSerial),
               WalletTxSerialService.TTL_2_DAYS,
             ) as number;
+            await this.markSynced(markerKey);
             return result;
           }
+          await this.markSynced(markerKey);
+          return await this.atomicIncr(key);
         } finally {
           await this.redis.del(lockKey);
         }
-      } else {
-        await new Promise(resolve => setTimeout(resolve, 100));
-        const current = await this.redis.get(key);
-        if (current) {
-          const val = parseInt(current, 10);
-          if (!isNaN(val) && val > serial) {
-            return await this.atomicIncr(key);
-          }
-        }
+      }
+
+      if (Date.now() >= deadline) {
+        // The syncer seems gone and the lock is still held (e.g. process killed
+        // mid-sync). Take a fresh number anyway: it is strictly greater than
+        // anything served so far, and a rare collision is surfaced by the UNIQUE
+        // constraint on txId — far better than serving a known-stale serial.
+        this.logger.warn(`Serial sync for ${prefix} timed out; serving an unconfirmed fresh counter value`);
+        return this.atomicIncr(key);
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+      if (await this.redis.get(markerKey, { throwOnError: false })) {
+        return this.atomicIncr(key);
       }
     }
-    return serial;
+  }
+
+  private async markSynced(markerKey: string): Promise<void> {
+    try {
+      await this.redis.set(markerKey, '1', WalletTxSerialService.TTL_2_DAYS);
+    } catch (err: unknown) {
+      this.logger.warn(`Failed to mark serial counter synced (${markerKey}): ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private async syncFromDb(prefix: string, today: string): Promise<number> {

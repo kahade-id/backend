@@ -13,7 +13,7 @@ import { nanoid } from 'nanoid';
 import { randomBytes, randomInt, randomUUID } from 'crypto';
 import * as path from 'path';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { MAX_LIMIT } from '../../common/constants/app.constants';
+import { MAX_LIMIT, RESERVED_USERNAMES } from '../../common/constants/app.constants';
 import { TOKEN_BLACKLIST, SESSION_REVOKED_KEY, TOTP_USED_CODE } from '../../common/constants/redis-keys';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { ReportUserDto } from './dto/report-user.dto';
@@ -23,6 +23,7 @@ import { OgMetadataService } from './og-metadata.service';
 import { generateNotifId } from '../../common/utils/id-generator.util';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import { verifyOtp } from '../../common/utils/otp.util';
+import { escapeLikePattern } from '../../common/utils/search.util';
 
 @Injectable()
 export class UsersService {
@@ -159,6 +160,31 @@ export class UsersService {
 
       const normalizedUsername = dto.username.toLowerCase();
       if (normalizedUsername !== (currentUser.username ?? '')) {
+        // AUDIT-22: mirror auth.setUsername's reserved-name and shape rules; without them,
+        // register/setUsername blocklist could be bypassed by renaming to `admin`/`support`
+        // via profile update (impersonation).
+        if (RESERVED_USERNAMES.includes(normalizedUsername)) {
+          throw new BadRequestException({
+            code: ErrorCodes.USERNAME_RESERVED,
+            message: 'Username is reserved and cannot be used',
+          });
+        }
+        if (
+          !/^[a-z0-9][a-z0-9._-]*[a-z0-9]$/.test(normalizedUsername) &&
+          normalizedUsername.length > 2
+        ) {
+          throw new BadRequestException({
+            code: ErrorCodes.VALIDATION_ERROR,
+            message:
+              'Username must start and end with a letter or number, and can only contain letters, numbers, dots, underscores, and hyphens',
+          });
+        }
+        if (/[._-]{2,}/.test(normalizedUsername)) {
+          throw new BadRequestException({
+            code: ErrorCodes.VALIDATION_ERROR,
+            message: 'Username cannot contain consecutive special characters',
+          });
+        }
         if (currentUser.usernameChangedAt) {
           const daysSinceChange = (Date.now() - currentUser.usernameChangedAt.getTime()) / (1000 * 60 * 60 * 24);
           if (daysSinceChange < 30) {
@@ -512,6 +538,61 @@ export class UsersService {
     return { s3: this.s3Client, modules: this.s3Modules as Record<string, unknown> };
   }
 
+  // R2-F (audit): presigned PUTs cannot be size-capped by the browser, so the
+  // interceptor limits only cover the direct-upload routes. The confirm endpoints
+  // therefore reject oversized stored objects via HeadObject before publishing the
+  // key, matching the direct-path caps (avatar 2 MB, header 5 MB).
+  private static readonly MAX_AVATAR_BYTES = 2 * 1024 * 1024;
+  private static readonly MAX_HEADER_BYTES = 5 * 1024 * 1024;
+
+  private async deleteR2ObjectQuietly(bucket: string, key: string): Promise<void> {
+    try {
+      const { s3, modules } = await this.getS3Client();
+      const DeleteObjectCommand = modules['DeleteObjectCommand'] as new (input: Record<string, unknown>) => unknown;
+      const send = (s3 as { send: (cmd: unknown) => Promise<unknown> }).send.bind(s3);
+      await send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+    } catch (err) {
+      this.logger.warn(`Failed to delete R2 object ${key}`, err);
+    }
+  }
+
+  private async verifyStoredImage(bucket: string, key: string, maxBytes: number, label: string): Promise<void> {
+    const { s3, modules } = await this.getS3Client();
+    const send = (s3 as { send: (cmd: unknown) => Promise<Record<string, unknown>> }).send.bind(s3);
+
+    const HeadObjectCommand = modules['HeadObjectCommand'] as new (input: Record<string, unknown>) => unknown;
+    const head = await send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+    const contentLength = typeof head?.ContentLength === 'number' ? head.ContentLength : undefined;
+    if (contentLength !== undefined && contentLength > maxBytes) {
+      await this.deleteR2ObjectQuietly(bucket, key);
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: `${label} exceeds the maximum allowed size of ${Math.floor(maxBytes / (1024 * 1024))} MB`,
+      });
+    }
+
+    const GetObjectCommand = modules['GetObjectCommand'] as new (input: Record<string, unknown>) => unknown;
+    const response = await send(new GetObjectCommand({ Bucket: bucket, Key: key, Range: 'bytes=0-15' }));
+    const body = response?.Body as { transformToByteArray?: () => Promise<Uint8Array> } | undefined;
+    if (body?.transformToByteArray) {
+      const headerBytes = Buffer.from(await body.transformToByteArray());
+      if (!this.detectImageMimeType(headerBytes)) {
+        await this.deleteR2ObjectQuietly(bucket, key);
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'Uploaded file is not a valid image. Please upload a JPEG, PNG, or WebP image.',
+        });
+      }
+    }
+  }
+
+  private async replaceStoredMedia(bucket: string | undefined, previousUrl: string | null | undefined, newKey: string): Promise<void> {
+    if (!bucket || !previousUrl) return;
+    const oldKey = this.extractKeyFromUrl(previousUrl);
+    if (!oldKey || oldKey === newKey) return;
+    await this.deleteR2ObjectQuietly(bucket, oldKey);
+  }
+
   async uploadAvatar(userId: string, contentType?: string): Promise<{ uploadUrl: string; avatarKey: string; expiresIn: number }> {
     const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
@@ -631,7 +712,7 @@ export class UsersService {
   }
 
   async confirmAvatar(userId: string, avatarKey: string): Promise<{ avatarUrl: string }> {
-    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true } });
+    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true, avatarUrl: true } });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
 
     const normalizedKey = avatarKey.replace(/\.\.\//g, '').replace(/\/+/g, '/');
@@ -646,24 +727,7 @@ export class UsersService {
 
     if (bucket) {
       try {
-        const { s3, modules } = await this.getS3Client();
-        const GetObjectCommand = modules['GetObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-        const command = new GetObjectCommand({ Bucket: bucket, Key: avatarKey, Range: 'bytes=0-15' });
-        const send = (s3 as { send: (cmd: unknown) => Promise<{ Body?: { transformToByteArray?: () => Promise<Uint8Array> }; ContentType?: string }> }).send.bind(s3);
-        const response = await send(command);
-        if (response.Body?.transformToByteArray) {
-          const headerBytes = Buffer.from(await response.Body.transformToByteArray());
-          const detectedType = this.detectImageMimeType(headerBytes);
-          if (!detectedType) {
-            const DeleteObjectCommand = modules['DeleteObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-            const delCmd = new DeleteObjectCommand({ Bucket: bucket, Key: avatarKey });
-            await send(delCmd as unknown as Record<string, unknown>);
-            throw new BadRequestException({
-              code: ErrorCodes.VALIDATION_ERROR,
-              message: 'Uploaded file is not a valid image. Please upload a JPEG, PNG, or WebP image.',
-            });
-          }
-        }
+        await this.verifyStoredImage(bucket, avatarKey, UsersService.MAX_AVATAR_BYTES, 'Avatar');
       } catch (err) {
         if (err instanceof BadRequestException) throw err;
         throw new BadRequestException({
@@ -683,6 +747,10 @@ export class UsersService {
       where: { id: userId },
       data: { avatarUrl },
     });
+    // R2-F (audit): the presigned confirm path never removed the previous avatar
+    // object (the direct path does), and the orphan-cleanup job only scans the
+    // `uploads/` prefix — replaced avatars leaked in the bucket indefinitely.
+    await this.replaceStoredMedia(bucket, user.avatarUrl, avatarKey);
     this.invalidateUserOgCaches(user.username);
 
     return { avatarUrl };
@@ -1326,8 +1394,8 @@ export class UsersService {
           follower: {
             ...visibleFollower,
             OR: [
-              { fullName: { contains: search.trim(), mode: 'insensitive' as const } },
-              { username: { contains: search.trim(), mode: 'insensitive' as const } },
+              { fullName: { contains: escapeLikePattern(search.trim()), mode: 'insensitive' as const } },
+              { username: { contains: escapeLikePattern(search.trim()), mode: 'insensitive' as const } },
             ],
           },
         }
@@ -1338,7 +1406,7 @@ export class UsersService {
     const [followers, total] = await Promise.all([
       this.prisma.follow.findMany({
         where,
-        skip, take: safeLimit, orderBy: { createdAt: 'desc' },
+        skip, take: safeLimit, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
         select: { createdAt: true, follower: { select: { username: true, fullName: true, avatarUrl: true, membershipRank: true } } },
       }),
       this.prisma.follow.count({ where }),
@@ -1379,7 +1447,7 @@ export class UsersService {
     const [following, total] = await Promise.all([
       this.prisma.follow.findMany({
         where: followingWhere,
-        skip, take: safeLimit, orderBy: { createdAt: 'desc' },
+        skip, take: safeLimit, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
         select: { createdAt: true, following: { select: { username: true, fullName: true, avatarUrl: true, membershipRank: true } } },
       }),
       this.prisma.follow.count({ where: followingWhere }),
@@ -1433,7 +1501,7 @@ export class UsersService {
     const [blocks, total] = await Promise.all([
       this.prisma.blockList.findMany({
         where: { blockerId: userId },
-        skip, take: safeLimit, orderBy: { createdAt: 'desc' },
+        skip, take: safeLimit, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
         select: { id: true, createdAt: true, blocked: { select: { userId: true, username: true, fullName: true, avatarUrl: true } } },
       }),
       this.prisma.blockList.count({ where: { blockerId: userId } }),
@@ -1677,7 +1745,7 @@ export class UsersService {
   }
 
   async confirmHeader(userId: string, headerKey: string): Promise<{ headerUrl: string }> {
-    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true } });
+    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true, headerUrl: true } });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
 
     const baseName = path.basename(headerKey);
@@ -1691,24 +1759,7 @@ export class UsersService {
 
     if (bucket) {
       try {
-        const { s3, modules } = await this.getS3Client();
-        const GetObjectCommand = modules['GetObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-        const command = new GetObjectCommand({ Bucket: bucket, Key: headerKey, Range: 'bytes=0-15' });
-        const send = (s3 as { send: (cmd: unknown) => Promise<{ Body?: { transformToByteArray?: () => Promise<Uint8Array> }; ContentType?: string }> }).send.bind(s3);
-        const response = await send(command);
-        if (response.Body?.transformToByteArray) {
-          const headerBytes = Buffer.from(await response.Body.transformToByteArray());
-          const detectedType = this.detectImageMimeType(headerBytes);
-          if (!detectedType) {
-            const DeleteObjectCommand = modules['DeleteObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-            const delCmd = new DeleteObjectCommand({ Bucket: bucket, Key: headerKey });
-            await send(delCmd as unknown as Record<string, unknown>);
-            throw new BadRequestException({
-              code: ErrorCodes.VALIDATION_ERROR,
-              message: 'Uploaded file is not a valid image. Please upload a JPEG, PNG, or WebP image.',
-            });
-          }
-        }
+        await this.verifyStoredImage(bucket, headerKey, UsersService.MAX_HEADER_BYTES, 'Header');
       } catch (err) {
         if (err instanceof BadRequestException) throw err;
         throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Header file not found in storage. Please upload the file first.' });
@@ -1721,6 +1772,8 @@ export class UsersService {
       : `/uploads/${headerKey}`;
 
     await this.prisma.user.update({ where: { id: userId }, data: { headerUrl } });
+    // R2-F (audit): same replaced-object leak as the avatar confirm path.
+    await this.replaceStoredMedia(bucket, user.headerUrl, headerKey);
     this.invalidateUserOgCaches(user.username);
     return { headerUrl };
   }

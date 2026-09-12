@@ -43,6 +43,13 @@ export class TransactionTemplatesController {
   }
 
   @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Post(':id/use')
+  async recordTemplateUse(@CurrentUser('sub') userId: string, @Param('id', ParseIdPipe) id: string) {
+    return this.templatesService.recordUsage(userId, id);
+  }
+
+  @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 60000, limit: 5 } })
   @Delete(':id')
   async deleteTemplate(@CurrentUser('sub') userId: string, @Param('id', ParseIdPipe) id: string) {

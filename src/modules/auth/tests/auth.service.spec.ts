@@ -100,12 +100,19 @@ const mockRedis = {
   setex: jest.fn().mockResolvedValue('OK'),
   del: jest.fn().mockResolvedValue(1),
   incr: jest.fn().mockResolvedValue(1),
+  decr: jest.fn().mockResolvedValue(0), // AUDIT-B: successful logins now refund one per-IP attempt
+  // AUDIT-B: incrWithTtl is the fixed atomic INCR+EXPIRE primitive; alias it to the same
+  // jest.fn so existing counter setups/assertions keep working.
+  // (assigned after literal — see below)
   expire: jest.fn().mockResolvedValue(1),
   setNx: jest.fn(),
   releaseLock: jest.fn().mockResolvedValue(true),
   getPrefix: jest.fn().mockReturnValue('test:'),
   getClient: jest.fn(),
 };
+// AUDIT-B: alias the atomic counter primitive to the shared mock fn
+(mockRedis as any).incrWithTtl = (mockRedis as any).incr;
+
 
 const mockTokenService = {
   signAccessToken: jest.fn().mockReturnValue('access-token-123'),
@@ -1101,15 +1108,33 @@ describe('AuthService', () => {
       ).rejects.toThrow(BadRequestException);
     });
 
-    it('does not inspect or consume an email OTP for an inactive account', async () => {
+    // AUDIT-E (verifyEmail enumeration fix): inactive/banned (and unknown-email) accounts
+    // must all collapse into the SAME generic bad-code error, and no OTP row may be
+    // inspected or consumed for them.
+    it('does not inspect or consume an email OTP for an inactive account (generic error)', async () => {
       mockPrisma.$transaction.mockImplementation(
         async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => fn(mockPrisma),
       );
       mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', isActive: false, isBanned: false });
 
-      await expect(service.verifyEmail('user@example.com', '123456')).rejects.toThrow(ForbiddenException);
+      await expect(service.verifyEmail('user@example.com', '123456')).rejects.toThrow(BadRequestException);
+      await expect(service.verifyEmail('user@example.com', '123456')).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'OTP_INVALID' }),
+      });
       expect(mockPrisma.otpCode.findFirst).not.toHaveBeenCalled();
       expect(mockPrisma.otpCode.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('answers with the identical generic error for an unregistered email', async () => {
+      mockPrisma.$transaction.mockImplementation(
+        async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => fn(mockPrisma),
+      );
+      mockPrisma.user.findUnique.mockResolvedValue(null);
+
+      await expect(service.verifyEmail('ghost@example.com', '123456')).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'OTP_INVALID' }),
+      });
+      expect(mockPrisma.otpCode.findFirst).not.toHaveBeenCalled();
     });
   });
 

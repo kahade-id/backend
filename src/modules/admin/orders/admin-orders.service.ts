@@ -6,6 +6,7 @@ import { getCategoryForType } from '../../notifications/notification-category.ma
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
+import { RedisService } from '../../../redis/redis.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
 import { OrderStateService } from '../../orders/order-state.service';
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
@@ -15,10 +16,7 @@ import { AdminOrderQueryDto, ForceActionDto } from './dto/admin-order-query.dto'
 import { toIdr } from '../../../common/utils/currency.util';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
-
-function escapeLikePattern(pattern: string): string {
-  return pattern.replace(/[%_\\]/g, '\\$&');
-}
+import { escapeLikePattern } from '../../../common/utils/search.util';
 
 function serializeOrder(order: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -40,6 +38,7 @@ export class AdminOrdersService {
   constructor(
     private prisma: PrismaService,
     private auditLog: AuditLogService,
+    private redis: RedisService,
     private orderStateService: OrderStateService,
     private feeCalculator: FeeCalculatorService,
     private walletTxSerialService: WalletTxSerialService,
@@ -145,7 +144,7 @@ export class AdminOrdersService {
 
   async forceCancel(orderId: string, adminId: string, dto: ForceActionDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: OrderStatus }> {
     const order = await this.prisma.order.findFirst({
-      where: { OR: [{ id: orderId }, { orderId }] },
+      where: { OR: [{ id: orderId }, { orderId }], deletedAt: null },
     });
 
     if (!order) {
@@ -175,7 +174,7 @@ export class AdminOrdersService {
 
   async forceComplete(orderId: string, adminId: string, dto: ForceActionDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: OrderStatus }> {
     const order = await this.prisma.order.findFirst({
-      where: { OR: [{ id: orderId }, { orderId }] },
+      where: { OR: [{ id: orderId }, { orderId }], deletedAt: null },
       include: {
         buyer: { select: { wallet: { select: { id: true, availableBalance: true, escrowBalance: true, totalBalance: true, version: true } } } },
         seller: { select: { wallet: { select: { id: true, availableBalance: true, totalBalance: true, version: true } } } },
@@ -224,7 +223,7 @@ export class AdminOrdersService {
 
     await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const orderUpdated = await tx.order.updateMany({
-        where: { id: order.id, status: { in: completableStatuses } },
+        where: { id: order.id, status: { in: completableStatuses }, deletedAt: null },
         data: { status: OrderStatus.COMPLETED, completedAt: new Date() },
       });
       if (orderUpdated.count === 0) {
@@ -404,6 +403,13 @@ export class AdminOrdersService {
       await this.membershipRankService.checkAndUpdateMembershipRank(tx, order.buyerId);
       await this.membershipRankService.checkAndUpdateMembershipRank(tx, order.sellerId);
     }), 'ADMIN_FORCE_COMPLETE_TX');
+
+    // R2-B (audit): forceComplete consumes the buyer's Plus fee-savings quota; the
+    // `subscription_status:<userId>` cache (300 s, read by orders.service when quoting
+    // fees) must be dropped like every other quota-consuming path does.
+    await this.redis.del(`subscription_status:${order.buyerId}`).catch((err: unknown) =>
+      this.logger.warn(`Failed to invalidate subscription status cache for ${order.buyerId}: ${err instanceof Error ? err.message : String(err)}`),
+    );
 
     this.auditLog.logAdminAction({
       adminId,

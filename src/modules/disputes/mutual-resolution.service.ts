@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, BadRequestException, ForbiddenException,
 import { randomInt } from 'crypto';
 import { Prisma, DisputeStatus, OrderStatus, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType, SubscriptionStatus } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { RedisService } from '../../redis/redis.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { FeeCalculatorService } from '../orders/fee-calculator.service';
 import { generateWalletTxId, generateNotifId } from '../../common/utils/id-generator.util';
@@ -18,6 +19,7 @@ export class MutualResolutionService {
     private prisma: PrismaService,
     private walletTxSerialService: WalletTxSerialService,
     private feeCalculator: FeeCalculatorService,
+    private redis: RedisService,
   ) {}
 
   async propose(
@@ -553,6 +555,15 @@ export class MutualResolutionService {
         data: { type: 'DISPUTE_RESOLVED', disputeId: dispute.id },
       }), 'ACCEPT_MUTUAL_RESOLUTION_REALTIME');
     }
+
+    // R2-B (audit): the resolution above can consume the buyer's Plus fee-savings
+    // quota (feeSavingsUsed). orders.service caches `subscription_status:<userId>`
+    // for 300 s, so without this delete the buyer kept being quoted a stale
+    // remaining quota for up to five minutes after the resolution committed.
+    this.runPostCommitBestEffort(
+      () => this.redis.del(`subscription_status:${dispute.order.buyerId}`),
+      'ACCEPT_MUTUAL_SUBSCRIPTION_CACHE_INVALIDATION',
+    );
 
     return { proposalId, status: 'ACCEPTED', buyerPercent: proposal.buyerPercent, sellerPercent: proposal.sellerPercent };
   }

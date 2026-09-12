@@ -1,5 +1,11 @@
-import { IsOptional, IsDateString, IsIn, IsString, ArrayMaxSize, Validate, ValidatorConstraint, ValidatorConstraintInterface, ValidationArguments } from 'class-validator';
+import { IsOptional, IsDateString, IsIn, ArrayMaxSize, Validate, ValidatorConstraint, ValidatorConstraintInterface, ValidationArguments } from 'class-validator';
+import { WalletTransactionType } from '@prisma/client';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
+
+// R2-K (audit): an unknown type string used to flow straight into the Prisma
+// `type: { in: [...] }` filter and blew up with a P2023 500; validate against the
+// enum here instead.
+const WALLET_TX_TYPES = Object.keys(WalletTransactionType) as string[];
 
 @ValidatorConstraint({ name: 'dateRangeLimit', async: false })
 class DateRangeLimitConstraint implements ValidatorConstraintInterface {
@@ -34,7 +40,7 @@ export class ExportCsvDto {
   format?: string;
 
   @IsOptional()
-  @IsString({ each: true })
+  @IsIn(WALLET_TX_TYPES, { each: true })
   @ArrayMaxSize(10)
   types?: string[];
 }

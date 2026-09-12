@@ -145,10 +145,17 @@ export class TransactionTemplatesService {
     return { message: 'Template deleted successfully' };
   }
 
-  async recordUsage(templateId: string) {
-    await this.prisma.transactionTemplate.update({
-      where: { id: templateId },
+  // R2-E (audit): `usageCount`/`lastUsedAt` feed the getMyTemplates ordering but were
+  // never written by anything — recordUsage existed with zero callers and no ownership
+  // scope. The route below applies both: an atomic, owner-scoped usage bump.
+  async recordUsage(userId: string, templateId: string) {
+    const updated = await this.prisma.transactionTemplate.updateMany({
+      where: { id: templateId, userId },
       data: { usageCount: { increment: 1 }, lastUsedAt: new Date() },
     });
+    if (updated.count === 0) {
+      throw new NotFoundException({ code: 'TEMPLATE_NOT_FOUND', message: 'Template not found' });
+    }
+    return { usageCounted: true };
   }
 }

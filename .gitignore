@@ -8,6 +8,9 @@ node_modules/
 
 # Runtime/build noise
 *.log
+dist/
+tsconfig.build.tsbuildinfo
+*.tsbuildinfo
 coverage/
 .nyc_output/
 .DS_Store

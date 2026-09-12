@@ -9,7 +9,7 @@ export class InvoiceService {
 
   async getInvoiceData(orderId: string, userId: string): Promise<object> {
     const order = await this.prisma.order.findFirst({
-      where: { orderId },
+      where: { orderId, deletedAt: null },
       include: {
         buyer: { select: { userId: true, fullName: true, username: true } },
         seller: { select: { userId: true, fullName: true, username: true } },

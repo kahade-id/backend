@@ -12,10 +12,13 @@ function readSchemas(filePath: string): SchemaMap {
 }
 
 describe('Escrow order lifecycle OpenAPI artifacts', () => {
-  it.each([
-    resolve(__dirname, '../../../../openapi.json'),
-    resolve(__dirname, '../../../../../admin/lib/openapi.json'),
-  ])('keeps order DTO schemas aligned in %s', (filePath) => {
+  // AUDIT-2: this spec previously also read `../../../../../admin/lib/openapi.json` —
+  // a file that lives in a *different repository* (the admin web app). In a standalone
+  // backend checkout (and therefore in CI) the path never exists, so the suite failed
+  // with ENOENT even though the backend contract itself was fine. The backend repo can
+  // only guarantee its own artifact; the admin copy is checked in that repo.
+  it('keeps order DTO schemas aligned in the backend openapi.json', () => {
+    const filePath = resolve(__dirname, '../../../../openapi.json');
     const schemas = readSchemas(filePath);
     expect(schemas.CreateOrderDto.properties?.title?.maxLength).toBe(100);
     expect(schemas.CreateOrderDto.properties?.description?.maxLength).toBe(500);

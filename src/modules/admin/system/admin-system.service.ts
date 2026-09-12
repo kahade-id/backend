@@ -14,6 +14,7 @@ import * as ErrorCodes from '../../../common/constants/error-codes';
 import { ADMIN_SYSTEM_CONFIGS, FEE_CONFIG_CACHE, SUBSCRIPTION_PLANS_CACHE } from '../../../common/constants/redis-keys';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
+import { escapeLikePattern } from '../../../common/utils/search.util';
 
 const SYSTEM_CONFIG_TTL = 300;
 const SYSTEM_CONFIG_LOCK_TTL = 10;
@@ -210,6 +211,7 @@ export class AdminSystemService {
       this.redis.del(SUBSCRIPTION_PLANS_CACHE),
       this.redis.del(`${SUBSCRIPTION_PLANS_CACHE}:plans`),
       this.redis.del('public:system:configs'),
+      this.redis.del('public:exchange:rates'),
     ]);
 
     this.auditLogService.logAdminAction({
@@ -312,6 +314,7 @@ export class AdminSystemService {
       this.redis.del(SUBSCRIPTION_PLANS_CACHE),
       this.redis.del(`${SUBSCRIPTION_PLANS_CACHE}:plans`),
       this.redis.del('public:system:configs'),
+      this.redis.del('public:exchange:rates'),
       this.redis.del(pendingKey),
     ]);
 
@@ -436,9 +439,9 @@ export class AdminSystemService {
 
     if (search) {
       where.OR = [
-        { source: { contains: search, mode: 'insensitive' } },
-        { event: { contains: search, mode: 'insensitive' } },
-        { errorMessage: { contains: search, mode: 'insensitive' } },
+        { source: { contains: escapeLikePattern(search), mode: 'insensitive' } },
+        { event: { contains: escapeLikePattern(search), mode: 'insensitive' } },
+        { errorMessage: { contains: escapeLikePattern(search), mode: 'insensitive' } },
       ];
     }
 
@@ -451,7 +454,7 @@ export class AdminSystemService {
     const [data, total] = await Promise.all([
       this.prisma.webhookLog.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
         skip,
         take: safeLimit,
       }),

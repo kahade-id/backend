@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
+import { escapeLikePattern } from '../../common/utils/search.util';
 
 @Injectable()
 export class SearchService {
@@ -132,8 +133,8 @@ export class SearchService {
           where: {
             ...activeFilters,
             OR: [
-              { username: { contains: query, mode: 'insensitive' } },
-              { fullName: { contains: query, mode: 'insensitive' } },
+              { username: { contains: escapeLikePattern(query), mode: 'insensitive' } },
+              { fullName: { contains: escapeLikePattern(query), mode: 'insensitive' } },
             ],
           },
           select: { id: true, username: true, fullName: true, avatarUrl: true },
@@ -143,8 +144,8 @@ export class SearchService {
           where: {
             ...activeFilters,
             OR: [
-              { username: { contains: query, mode: 'insensitive' } },
-              { fullName: { contains: query, mode: 'insensitive' } },
+              { username: { contains: escapeLikePattern(query), mode: 'insensitive' } },
+              { fullName: { contains: escapeLikePattern(query), mode: 'insensitive' } },
             ],
           },
         }),
@@ -190,7 +191,7 @@ export class SearchService {
 
     const where = {
       AND: [{ OR: [{ buyerId: userId }, { sellerId: userId }] }, { deletedAt: null }],
-      title: { contains: query, mode: 'insensitive' as const },
+      title: { contains: escapeLikePattern(query), mode: 'insensitive' as const },
     };
 
     const [rows, total] = await Promise.all([
@@ -214,8 +215,8 @@ export class SearchService {
     const where = {
       walletId: wallet.id,
       OR: [
-        { description: { contains: query, mode: 'insensitive' as const } },
-        { txId: { contains: query, mode: 'insensitive' as const } },
+        { description: { contains: escapeLikePattern(query), mode: 'insensitive' as const } },
+        { txId: { contains: escapeLikePattern(query), mode: 'insensitive' as const } },
       ],
     };
 

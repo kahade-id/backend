@@ -2,19 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../../redis/redis.service';
 import * as crypto from 'crypto';
-
-function parseJwtExpiresIn(value: string): number {
-  const match = value.match(/^(\d+)(s|m|h|d)$/);
-  if (!match) return 900;
-  const num = parseInt(match[1], 10);
-  switch (match[2]) {
-    case 's': return num;
-    case 'm': return num * 60;
-    case 'h': return num * 3600;
-    case 'd': return num * 86400;
-    default: return 900;
-  }
-}
+import { parseJwtTtl } from '../utils/jwt.util';
 
 @Injectable()
 export class CsrfService {
@@ -25,7 +13,10 @@ export class CsrfService {
     private configService: ConfigService,
   ) {
     const jwtExpiresIn = this.configService.get<string>('jwt.expiresIn') ?? '15m';
-    this.ttlSeconds = parseJwtExpiresIn(jwtExpiresIn);
+    // R2-I (audit): previously a local copy of the TTL parser that also lacked 'w';
+    // one shared parser (jwt.util.parseJwtTtl) keeps CSRF tokens, session-revoked
+    // markers and token blacklistings on the same clock as the access token itself.
+    this.ttlSeconds = parseJwtTtl(jwtExpiresIn);
   }
 
   private getTokenKey(userId: string, jti: string, token: string): string {

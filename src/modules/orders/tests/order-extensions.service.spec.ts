@@ -19,11 +19,19 @@ const ORIGINAL_DEADLINE = new Date('2099-01-10T00:00:00Z');
 const GRACE_DEADLINE = new Date('2099-01-12T00:00:00Z'); // cron granted +48h after the deadline lapsed
 
 const mockPrisma = {
-  order: { findUnique: jest.fn(), update: jest.fn() },
+  order: {
+    findUnique: jest.fn(),
+    findFirst: jest.fn(),
+    update: jest.fn(),
+  },
   orderExtensionRequest: { findUnique: jest.fn(), updateMany: jest.fn(), findFirst: jest.fn(), count: jest.fn(), create: jest.fn(), findMany: jest.fn() },
   $transaction: jest.fn(),
   $queryRaw: jest.fn(),
 };
+// AUDIT-B: the service now reads orders via findFirst({ deletedAt: null }); delegate it to
+// the findUnique mock so existing fixtures keep working.
+(mockPrisma.order as any).findFirst = (args: any) => (mockPrisma.order as any).findUnique(args);
+
 const mockRedis = { get: jest.fn(), set: jest.fn(), setNx: jest.fn(), releaseLock: jest.fn() };
 const mockQueue = { enqueue: jest.fn() };
 

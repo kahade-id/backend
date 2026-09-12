@@ -109,10 +109,7 @@ export class AdminAuthService {
       }
 
       const inlineAttemptKey = ADMIN_2FA_ATTEMPT_KEY(`admin:${admin.id}:inline`);
-      const inlineAttempts = await this.redis.incr(inlineAttemptKey);
-      if (inlineAttempts === 1) {
-        await this.redis.expire(inlineAttemptKey, 15 * 60);
-      }
+      const inlineAttempts = await this.redis.incrWithTtl(inlineAttemptKey, 15 * 60); // AUDIT-14
       if (inlineAttempts > ADMIN_2FA_MAX_ATTEMPTS) {
         throw new UnauthorizedException({
           code: ErrorCodes.TOO_MANY_REQUESTS,
@@ -217,10 +214,7 @@ export class AdminAuthService {
     }
 
     const attemptKey = ADMIN_2FA_ATTEMPT_KEY(`admin:${payload.sub}:${payload.jti ?? 'no-jti'}`);
-    const attempts = await this.redis.incr(attemptKey);
-    if (attempts === 1) {
-      await this.redis.expire(attemptKey, 15 * 60);
-    }
+    const attempts = await this.redis.incrWithTtl(attemptKey, 15 * 60); // AUDIT-14
     if (attempts > ADMIN_2FA_MAX_ATTEMPTS) {
       // B-18 (audit-fix): when attempts exhaust, immediately blacklist the
       // temp-token JTI for the rest of its expiry window. Without this, a

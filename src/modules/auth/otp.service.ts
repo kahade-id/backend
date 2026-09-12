@@ -37,6 +37,9 @@ export class OtpService {
     userId?: string,
     metadata?: Prisma.InputJsonValue,
     ipAddress?: string,
+    // AUDIT-12 (SEC-019): callers handling financial confirmations may request a longer
+    // code; verification compares bcrypt hashes so length is transport-only.
+    length?: number,
   ): Promise<string> {
     const cooldownKey = OTP_COOLDOWN(email, type);
 
@@ -48,25 +51,19 @@ export class OtpService {
     try {
       if (ipAddress) {
         const ipRateKey = OTP_IP_RATE(ipAddress);
-        const ipCount = await this.redis.incr(ipRateKey);
-        if (ipCount === 1) {
-          await this.redis.expire(ipRateKey, OTP_IP_RATE_WINDOW_SECONDS);
-        }
+        const ipCount = await this.redis.incrWithTtl(ipRateKey, OTP_IP_RATE_WINDOW_SECONDS);
         if (ipCount > OTP_IP_RATE_LIMIT) {
           throw new TooManyRequestsException('Too many OTP requests from this IP. Please try again later.');
         }
       }
 
       const emailRateKey = OTP_EMAIL_RATE(email, type);
-      const emailCount = await this.redis.incr(emailRateKey);
-      if (emailCount === 1) {
-        await this.redis.expire(emailRateKey, OTP_RATE_WINDOW_SECONDS);
-      }
+      const emailCount = await this.redis.incrWithTtl(emailRateKey, OTP_RATE_WINDOW_SECONDS);
       if (emailCount > OTP_EMAIL_RATE_LIMIT) {
         throw new TooManyRequestsException('Too many OTP requests for this email. Please try again later.');
       }
 
-      const otp = generateOtp(6);
+      const otp = generateOtp(length && length >= 6 && length <= 10 ? length : 6);
       const hashedOtp = await hashOtp(otp);
       const otpMinutes = this.configService.get<number>('app.otpExpiresMinutes') ?? OTP_EXPIRES_MINUTES;
       const expiresAt = addMinutes(new Date(), otpMinutes);
@@ -106,20 +103,14 @@ export class OtpService {
     try {
       if (ipAddress) {
         const ipRateKey = OTP_IP_RATE(ipAddress);
-        const ipCount = await this.redis.incr(ipRateKey);
-        if (ipCount === 1) {
-          await this.redis.expire(ipRateKey, OTP_IP_RATE_WINDOW_SECONDS);
-        }
+        const ipCount = await this.redis.incrWithTtl(ipRateKey, OTP_IP_RATE_WINDOW_SECONDS);
         if (ipCount > OTP_IP_RATE_LIMIT) {
           throw new TooManyRequestsException('Too many OTP requests from this IP. Please try again later.');
         }
       }
 
       const phoneRateKey = OTP_PHONE_RATE(phone, type);
-      const phoneCount = await this.redis.incr(phoneRateKey);
-      if (phoneCount === 1) {
-        await this.redis.expire(phoneRateKey, OTP_RATE_WINDOW_SECONDS);
-      }
+      const phoneCount = await this.redis.incrWithTtl(phoneRateKey, OTP_RATE_WINDOW_SECONDS);
       if (phoneCount > OTP_PHONE_RATE_LIMIT) {
         throw new TooManyRequestsException('Too many OTP requests for this phone number. Please try again later.');
       }

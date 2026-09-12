@@ -5,6 +5,7 @@ import { MutualResolutionService } from '../mutual-resolution.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
+import { RedisService } from '../../../redis/redis.service';
 
 /*
  * C-04 regression: REJECT and withdraw used to write the proposal row blind
@@ -80,6 +81,7 @@ describe('MutualResolutionService', () => {
         { provide: PrismaService, useValue: mockPrisma },
         { provide: WalletTxSerialService, useValue: mockSerial },
         { provide: FeeCalculatorService, useValue: mockFeeCalculator },
+        { provide: RedisService, useValue: { del: jest.fn().mockResolvedValue(undefined) } },
       ],
     }).compile();
     service = module.get<MutualResolutionService>(MutualResolutionService);

@@ -4,6 +4,7 @@ import { randomUUID } from 'crypto';
 import { ConfigService } from '@nestjs/config';
 import { S3Client, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { RedisService } from '../../../redis/redis.service';
+import { PrismaService } from '../../../prisma/prisma.service';
 import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { formatWIBDate } from '../../../common/utils/date.util';
 import { safeErrorMessage, startLockRenewal } from '../../../common/utils/background-reliability.util';
@@ -16,6 +17,7 @@ export class OrphanedUploadCleanupService {
   constructor(
     private redis: RedisService,
     private configService: ConfigService,
+    private prisma: PrismaService,
   ) {}
 
   private getS3Client(): S3Client {
@@ -75,9 +77,17 @@ export class OrphanedUploadCleanupService {
         this.logger.warn('Orphan upload cleanup running in DRY-RUN mode — set ORPHAN_CLEANUP_ENABLED=true ONLY after a DB reference check is implemented in cleanupBucket().');
       }
 
+      // R2-F (audit): profile media (avatars/, headers/) bypass the UploadRecord
+      // system entirely, so `uploads/`-prefix scanning never saw their orphans —
+      // abandoned presigned PUTs and (before the confirm-path delete fix) replaced
+      // objects leaked forever. These prefixes are swept with a direct DB reference
+      // check (user.avatarUrl / user.headerUrl), so the Redis-confirmed-key caveat
+      // of the uploads/ pass does not apply; deletions still respect the same
+      // destructive gate.
       for (const bucket of buckets) {
         if (lease.lost()) throw new Error('Orphaned upload cleanup lease lost');
         totalDeleted += await this.cleanupBucket(bucket, cutoffMs, destructiveDeleteEnabled);
+        totalDeleted += await this.cleanupProfileMedia(bucket, cutoffMs, destructiveDeleteEnabled, lease);
       }
 
       this.logger.log(`Orphaned upload cleanup completed: ${totalDeleted} files ${destructiveDeleteEnabled ? 'deleted' : 'WOULD-be-deleted (dry-run)'}`);
@@ -91,6 +101,68 @@ export class OrphanedUploadCleanupService {
       lease.stop();
       await this.redis.releaseLock(lockKey, lockToken).catch((err) => this.logger.warn(`silent-catch: ${safeErrorMessage(err)}`));
     }
+  }
+
+  private async cleanupProfileMedia(bucket: string, cutoffMs: number, destructiveDeleteEnabled: boolean, lease: { lost(): boolean }): Promise<number> {
+    const users = await this.prisma.user.findMany({
+      where: { OR: [{ avatarUrl: { not: null } }, { headerUrl: { not: null } }] },
+      select: { avatarUrl: true, headerUrl: true },
+    });
+    const referenced = new Set<string>();
+    for (const u of users) {
+      for (const url of [u.avatarUrl, u.headerUrl]) {
+        if (!url) continue;
+        const idx = url.search(/\/(avatars|headers)\//);
+        if (idx >= 0) referenced.add(url.slice(idx + 1));
+      }
+    }
+
+    let deleted = 0;
+    const s3 = this.getS3Client();
+    for (const prefix of ['avatars/', 'headers/']) {
+      let continuationToken: string | undefined;
+      do {
+        if (lease.lost()) throw new Error('Orphaned upload cleanup lease lost');
+        const listResult = await s3.send(new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: prefix,
+          MaxKeys: 1000,
+          ContinuationToken: continuationToken,
+        }));
+        continuationToken = listResult.NextContinuationToken;
+        if (!listResult.Contents || listResult.Contents.length === 0) break;
+
+        const orphanedKeys: string[] = [];
+        for (const obj of listResult.Contents) {
+          if (!obj.Key || !obj.LastModified) continue;
+          if (obj.LastModified.getTime() > cutoffMs) continue;
+          if (referenced.has(obj.Key)) continue;
+          orphanedKeys.push(obj.Key);
+        }
+
+        if (orphanedKeys.length === 0) continue;
+        if (!destructiveDeleteEnabled) {
+          const sample = orphanedKeys.slice(0, 5);
+          this.logger.warn(`DRY-RUN (profile media): ${orphanedKeys.length} orphan candidate(s) in bucket ${bucket} prefix ${prefix}; sample: ${sample.join(', ')}`);
+          deleted += orphanedKeys.length;
+        } else {
+          const BATCH = 1000;
+          for (let i = 0; i < orphanedKeys.length; i += BATCH) {
+            const batch = orphanedKeys.slice(i, i + BATCH);
+            const deleteResult = await s3.send(new DeleteObjectsCommand({
+              Bucket: bucket,
+              Delete: { Objects: batch.map(Key => ({ Key })) },
+            }));
+            if (deleteResult.Errors && deleteResult.Errors.length > 0) {
+              throw new Error(`R2 returned ${deleteResult.Errors.length} deletion errors for bucket ${bucket} (${prefix})`);
+            }
+            deleted += deleteResult.Deleted?.length ?? batch.length;
+          }
+          this.logger.log(`Deleted ${orphanedKeys.length} orphaned profile-media files from bucket ${bucket}`);
+        }
+      } while (continuationToken);
+    }
+    return deleted;
   }
 
   private async cleanupBucket(bucket: string, cutoffMs: number, destructiveDeleteEnabled: boolean): Promise<number> {

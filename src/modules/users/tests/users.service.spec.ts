@@ -6,6 +6,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { OgMetadataService } from '../og-metadata.service';
+import { VerificationBadgeService } from '../verification-badge.service';
 import { Prisma } from '@prisma/client';
 import { bcryptHash } from '../../../common/utils/crypto.util';
 import * as cryptoUtils from '../../../common/utils/crypto.util';
@@ -43,6 +44,8 @@ const mockRedis = { get: jest.fn(), set: jest.fn(), del: jest.fn(), setex: jest.
 const mockAudit = { logUserAction: jest.fn() };
 const mockConfig = { get: jest.fn() };
 const mockOg = { invalidateUserOgCache: jest.fn() };
+// Section 1/2: getPublicProfile sekarang menyertakan badge verifikasi.
+const mockVerificationBadges = { getBadges: jest.fn(), invalidate: jest.fn(), loadBadges: jest.fn(), computeBadges: jest.fn(), getCatalog: jest.fn(), getPublicBadgesByUsername: jest.fn() };
 
 describe('UsersService', () => {
   let service: UsersService;
@@ -54,6 +57,7 @@ describe('UsersService', () => {
     mockRedis.releaseLock.mockResolvedValue(true);
     mockPrisma.notification.create.mockResolvedValue({});
     mockOg.invalidateUserOgCache.mockResolvedValue(undefined);
+    mockVerificationBadges.getBadges.mockResolvedValue([]);
     mockPrisma.$transaction.mockImplementation(async (fn: any) => fn(mockPrisma));
     mockPrisma.rating.aggregate.mockResolvedValue({ _avg: { stars: null } });
     const module: TestingModule = await Test.createTestingModule({
@@ -64,6 +68,7 @@ describe('UsersService', () => {
         { provide: ConfigService, useValue: mockConfig },
         { provide: AuditLogService, useValue: mockAudit },
         { provide: OgMetadataService, useValue: mockOg },
+        { provide: VerificationBadgeService, useValue: mockVerificationBadges },
       ],
     }).compile();
     service = module.get<UsersService>(UsersService);

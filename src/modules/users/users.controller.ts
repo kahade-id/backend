@@ -550,9 +550,25 @@ export class UsersController {
     return this.verificationBadgeService.getPublicBadgesByUsername(username, viewerId ?? undefined);
   }
 
+  // Section 2: profil publik dirombak menjadi bagian-bagian eksplisit
+  // (identity / contact / links / social / favorites / badges / about / ratings
+  // / stats) + alias datar lama yang deprecated. Block-list sekarang menutup
+  // seluruh endpoint dengan 403 USER_BLOCKED, bukan menyembunyikan field.
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Get(':username')
+  @ApiOperation({
+    summary: 'Get a public profile',
+    description:
+      'Mengembalikan profil publik per bagian: `identity` (fullName/nickname, username, bio, avatarUrl, headerUrl, ' +
+      'accountType, membershipRank), `contact` (email/phone, hanya bila toggle showContact* aktif — selain itu null), ' +
+      '`links` (tautan sosial media), `social` (followersCount, followingCount, isFollowing, isFollowedBy + preview 6 item), ' +
+      '`favorites` (total, isFavoritedByViewer + preview 12 item), `badges` (array badge verifikasi aktif), ' +
+      '`about` (memberSince, badgeEarnedDates, contact publik), `ratings` (averageRating, totalRatingCount, 5 rating terbaru), ' +
+      '`stats`, `achievementBadges`, dan `viewer`. ' +
+      'Menghormati profileVisible: profil privat/nonaktif/banned/terhapus menghasilkan 404. ' +
+      'Bila ada relasi block dua arah antara viewer dan pemilik profil, hasilnya 403 USER_BLOCKED.',
+  })
   async getPublicProfile(
     @Param('username', ParseUsernamePipe) username: string,
     @CurrentUser('sub') viewerId: string | null,

@@ -68,9 +68,17 @@ export class DeepLinksController {
     try {
       const profile = await this.usersService.getPublicProfile(safeUsername);
       const record = profile as Record<string, unknown>;
-      title = String(record.fullName ?? record.username ?? title);
-      detail = `@${String(record.username ?? safeUsername)}\n${String(record.bio ?? 'Profil publik Kahade')}`;
+      // Section 2: profil publik sekarang mengembalikan bagian `identity`
+      // secara eksplisit. Field datar lama masih ada sebagai alias deprecated,
+      // jadi fallback ini menjaga kompatibilitas selama masa transisi.
+      const identity = (record.identity ?? {}) as Record<string, unknown>;
+      const resolvedUsername = String(identity.username ?? record.username ?? safeUsername);
+      title = String(identity.nickname ?? record.fullName ?? resolvedUsername);
+      detail = `@${resolvedUsername}\n${String(identity.bio ?? record.bio ?? 'Profil publik Kahade')}`;
     } catch {
+      // Section 6: getPublicProfile menolak profil yang profileVisible-nya mati
+      // (404) dan viewer yang terlibat relasi block (403). Keduanya memang
+      // tidak boleh dibocorkan lewat halaman share, jadi satu pesan netral.
       detail = `Profil @${safeUsername} belum dapat dimuat. Buka aplikasi untuk melihat status terbaru.`;
     }
     response.status(200).send(page({ title, description: 'Profil publik Kahade.', appUrl: appSchemeUrl(`u/${encodeURIComponent(safeUsername)}`), detail }));

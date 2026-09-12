@@ -21,6 +21,8 @@ const nanoid = customAlphabet('1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLM
 const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
   [UploadPurpose.KYC_KTP]: ['image/jpeg', 'image/png', 'image/webp'],
   [UploadPurpose.KYC_SELFIE]: ['image/jpeg', 'image/png', 'image/webp'],
+  // Dokumen badan usaha boleh PDF (NPWP/akta/SIUP umumnya dipindai sebagai PDF).
+  [UploadPurpose.BUSINESS_DOCUMENT]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
   [UploadPurpose.AVATAR]: ['image/jpeg', 'image/png', 'image/webp'],
   [UploadPurpose.CHAT_ATTACHMENT]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
   [UploadPurpose.DISPUTE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
@@ -33,6 +35,7 @@ const MIN_FILE_SIZE = 1024;
 const MAX_FILE_SIZE: Record<UploadPurpose, number> = {
   [UploadPurpose.KYC_KTP]: 5 * 1024 * 1024,
   [UploadPurpose.KYC_SELFIE]: 5 * 1024 * 1024,
+  [UploadPurpose.BUSINESS_DOCUMENT]: 10 * 1024 * 1024,
   [UploadPurpose.AVATAR]: 2 * 1024 * 1024,
   [UploadPurpose.CHAT_ATTACHMENT]: 10 * 1024 * 1024,
   [UploadPurpose.DISPUTE_EVIDENCE]: 10 * 1024 * 1024,
@@ -128,6 +131,7 @@ function isSafeFileKey(fileKey: unknown): fileKey is string {
 const PURPOSE_VISIBILITY: Record<UploadPurpose, 'private' | 'public'> = {
   [UploadPurpose.KYC_KTP]: 'private',
   [UploadPurpose.KYC_SELFIE]: 'private',
+  [UploadPurpose.BUSINESS_DOCUMENT]: 'private',
   [UploadPurpose.AVATAR]: 'public',
   [UploadPurpose.CHAT_ATTACHMENT]: 'private',
   [UploadPurpose.DISPUTE_EVIDENCE]: 'private',
@@ -138,6 +142,7 @@ const PURPOSE_VISIBILITY: Record<UploadPurpose, 'private' | 'public'> = {
 const PURPOSE_FOLDER_MAP_INTERNAL: Record<UploadPurpose, string> = {
   [UploadPurpose.KYC_KTP]: 'kyc-ktp',
   [UploadPurpose.KYC_SELFIE]: 'kyc-selfie',
+  [UploadPurpose.BUSINESS_DOCUMENT]: 'business-documents',
   [UploadPurpose.AVATAR]: 'avatars',
   [UploadPurpose.CHAT_ATTACHMENT]: 'chat-attachments',
   [UploadPurpose.DISPUTE_EVIDENCE]: 'dispute-evidence',
@@ -250,6 +255,9 @@ export class UploadService {
     const EXPIRY_BY_PURPOSE: Record<UploadPurpose, number> = {
       [UploadPurpose.KYC_KTP]: 600,
       [UploadPurpose.KYC_SELFIE]: 600,
+      // Dokumen badan usaha bisa beberapa file dan diupload bergantian, jadi
+      // window-nya disamakan dengan evidence (1800 s), bukan avatar (300 s).
+      [UploadPurpose.BUSINESS_DOCUMENT]: 1800,
       [UploadPurpose.AVATAR]: 300,
       [UploadPurpose.CHAT_ATTACHMENT]: 900,
       [UploadPurpose.DISPUTE_EVIDENCE]: 1800,

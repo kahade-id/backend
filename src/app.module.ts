@@ -23,6 +23,7 @@ import { AuthModule } from './modules/auth/auth.module';
 import { UsersModule } from './modules/users/users.module';
 import { SessionsModule } from './modules/sessions/sessions.module';
 import { KycModule } from './modules/kyc/kyc.module';
+import { BusinessVerificationModule } from './modules/business-verification/business-verification.module';
 import { BankAccountsModule } from './modules/bank-accounts/bank-accounts.module';
 import { WalletModule } from './modules/wallet/wallet.module';
 import { OrdersModule } from './modules/orders/orders.module';
@@ -131,6 +132,7 @@ const runtimeEnvFile = getRuntimeEnvFile();
     UsersModule,
     SessionsModule,
     KycModule,
+    BusinessVerificationModule,
     BankAccountsModule,
     WalletModule,
     OrdersModule,

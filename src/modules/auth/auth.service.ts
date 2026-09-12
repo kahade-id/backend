@@ -455,7 +455,9 @@ export class AuthService {
 
     await this.prisma.user.update({
       where: { id: existingUser.id },
-      data: { phoneVerified: true },
+      // Section 1: phoneVerifiedAt dibuat simetris dengan emailVerifiedAt supaya
+      // badge CONTACT_VERIFIED (kombinasi email+phone) punya tanggal "didapat".
+      data: { phoneVerified: true, phoneVerifiedAt: existingUser.phoneVerifiedAt ?? new Date() },
     });
     await this.redis.del(PHONE_VERIFIED_GUARD(existingUser.id)).catch((err) =>
       this.logger.warn(`Failed to invalidate phone verification cache for ${existingUser.id}: ${err instanceof Error ? err.message : String(err)}`),
@@ -647,7 +649,9 @@ export class AuthService {
         const sessions = await tx.userSession.findMany({ where: { userId, isRevoked: false }, select: { id: true } });
         await tx.user.update({
           where: { id: userId },
-          data: { phoneNumber: await encryptPii(normalizedPhone), phoneNumberHash: phoneHash, phoneVerified: true },
+          // Nomor baru baru sah setelah OTP-nya benar, jadi timestamp verifikasinya
+          // ikut di-reset ke sekarang (bukan mempertahankan tanggal nomor lama).
+          data: { phoneNumber: await encryptPii(normalizedPhone), phoneNumberHash: phoneHash, phoneVerified: true, phoneVerifiedAt: new Date() },
         });
         await tx.userSession.updateMany({
           where: { userId, isRevoked: false },
@@ -821,6 +825,8 @@ export class AuthService {
             phoneNumber: encryptedPhone,
             phoneNumberHash: phoneHash,
             phoneVerified: true,
+            // OTP registration memverifikasi nomor HP di titik ini — catat waktunya.
+            phoneVerifiedAt: new Date(),
             email: normalizedEmail,
             emailVerified: false,
             password: hashedPassword,

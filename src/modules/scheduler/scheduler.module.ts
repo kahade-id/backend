@@ -34,6 +34,7 @@ import { WithdrawalsModule } from '../withdrawals/withdrawals.module';
 import { MidtransService } from '../payment/midtrans.service';
 import { PaymentModule } from '../payment/payment.module';
 import { WalletModule } from '../wallet/wallet.module';
+import { VerificationBadgeModule } from '../users/verification-badge.module';
 import { OnApplicationBootstrap } from '@nestjs/common';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import {
@@ -48,7 +49,7 @@ import { RedisService } from '../../redis/redis.service';
 import { safeErrorMessage } from '../../common/utils/background-reliability.util';
 
 @Module({
-  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, QueueModule, PaymentModule, WalletModule],
+  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule],
   providers: [
     WalletDailyResetService,
     DataCleanupService,

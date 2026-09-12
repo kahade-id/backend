@@ -25,6 +25,7 @@ import { UserStatsService } from './user-stats.service';
 import { UserAnalyticsService } from './user-analytics.service';
 import { ProfileQAService } from './profile-qa.service';
 import { OgMetadataService } from './og-metadata.service';
+import { VerificationBadgeService } from './verification-badge.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
 import { Public } from '../../common/decorators/public.decorator';
@@ -51,6 +52,7 @@ export class UsersController {
     private userAnalyticsService: UserAnalyticsService,
     private profileQAService: ProfileQAService,
     private ogMetadataService: OgMetadataService,
+    private verificationBadgeService: VerificationBadgeService,
   ) {}
 
   @Get('me')
@@ -526,6 +528,26 @@ export class UsersController {
     @Body() dto: ReportUserDto,
   ): Promise<{ message: string }> {
     return this.usersService.reportUser(userId, targetUserId, dto);
+  }
+
+  // Section 1: endpoint publik badge verifikasi. Mengembalikan ARRAY badge aktif
+  // (bukan single flag) yang sudah terurut sesuai prioritas tampil:
+  // KYC > Business > Kahade+ > Trusted Admin > Email/Phone.
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Get(':username/badges')
+  @ApiOperation({
+    summary: 'Get active verification badges for a public profile',
+    description:
+      'Mengembalikan array badge verifikasi aktif, terurut berdasarkan prioritas tampil untuk UI ruang terbatas: ' +
+      'KYC_VERIFIED > BUSINESS_VERIFIED > KAHADE_PLUS > TRUSTED_BY_KAHADE > CONTACT_VERIFIED. ' +
+      'Badge yang di-revoke hilang dalam beberapa detik (cache TTL pendek + invalidation post-commit).',
+  })
+  async getVerificationBadges(
+    @Param('username', ParseUsernamePipe) username: string,
+    @CurrentUser('sub') viewerId: string | null,
+  ): Promise<object> {
+    return this.verificationBadgeService.getPublicBadgesByUsername(username, viewerId ?? undefined);
   }
 
   @Public()

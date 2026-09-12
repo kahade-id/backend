@@ -31,6 +31,7 @@ import { ProcessScheduledWithdrawalsService } from '../services/process-schedule
 import { ProofExpiryService } from '../services/proof-expiry.service';
 import { RedisHashCleanupService } from '../services/redis-hash-cleanup.service';
 import { SubscriptionExpiryService } from '../services/subscription-expiry.service';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { TopupCounterCorrectionService } from '../services/topup-counter-correction.service';
 import { WalletDailyResetService } from '../services/wallet-daily-reset.service';
 import { WeeklyReconciliationService } from '../services/weekly-reconciliation.service';
@@ -44,7 +45,7 @@ const mkPrisma = (): any => ({
   $queryRaw: jest.fn(async () => []),
   $executeRaw: jest.fn(async () => 0),
   $transaction: jest.fn(async (fn: any) => (typeof fn === 'function' ? fn(mkPrisma()) : Promise.all(fn))),
-  user: { findMany: jest.fn(async () => []), updateMany: jest.fn(async () => ({ count: 0 })), update: jest.fn() },
+  user: { findMany: jest.fn(async () => []), updateMany: jest.fn(async () => ({ count: 0 })), update: jest.fn(), findUnique: jest.fn(async () => ({ kahadePlusSince: null })) },
   order: { findMany: jest.fn(async () => []), updateMany: jest.fn(async () => ({ count: 0 })), update: jest.fn() },
   dispute: { findMany: jest.fn(async () => []), updateMany: jest.fn(async () => ({ count: 0 })) },
   disputeCall: { updateMany: jest.fn(async () => ({ count: 0 })) },
@@ -226,6 +227,7 @@ describe('Scheduler services smoke', () => {
   it('SubscriptionExpiryService — defined + skip', async () => {
     const svc = await build<SubscriptionExpiryService>(SubscriptionExpiryService, [
       { provide: WalletTxSerialService, useValue: {} },
+      { provide: VerificationBadgeService, useValue: { invalidate: jest.fn(async () => undefined) } },
     ]);
     expect(svc).toBeDefined();
     await expect(svc.handleExpiredSubscriptions()).resolves.toBeUndefined();

@@ -7,6 +7,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { UploadService } from '../../upload/upload.service';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { decryptAES, bcryptCompare } from '../../../common/utils/crypto.util';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
@@ -22,6 +23,7 @@ export class AdminKycService {
     private redis: RedisService,
     private auditLog: AuditLogService,
     private uploadService: UploadService,
+    private verificationBadgeService: VerificationBadgeService,
     @InjectQueue(EMAIL_QUEUE) private readonly emailQueue: Queue<EmailJobData>,
   ) {}
 
@@ -31,6 +33,10 @@ export class AdminKycService {
     } catch (err) {
       this.logger.warn(`Failed to invalidate KYC cache for user ${userId}`, err);
     }
+    // Section 1: badge KYC_VERIFIED dihitung dari kycStatus dan ikut di-cache
+    // (TTL pendek). Keputusan approve/reject/revoke harus langsung terlihat di
+    // profil publik, jadi cache badge di-drop di sini juga — post-commit.
+    await this.verificationBadgeService.invalidate(userId);
   }
 
   private normalizeOptionalText(value?: string): string | null {

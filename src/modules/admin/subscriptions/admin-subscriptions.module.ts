@@ -4,9 +4,10 @@ import { AdminSubscriptionsService } from './admin-subscriptions.service';
 import { AuditLogModule } from '../../../common/services/audit-log.module';
 import { RedisModule } from '../../../redis/redis.module';
 import { PaymentModule } from '../../payment/payment.module';
+import { VerificationBadgeModule } from '../../users/verification-badge.module';
 
 @Module({
-  imports: [AuditLogModule, RedisModule, PaymentModule],
+  imports: [AuditLogModule, RedisModule, PaymentModule, VerificationBadgeModule],
   controllers: [AdminSubscriptionsController],
   providers: [AdminSubscriptionsService],
 })

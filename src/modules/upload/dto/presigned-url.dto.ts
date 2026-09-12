@@ -4,6 +4,9 @@ import { ApiProperty } from '@nestjs/swagger';
 export enum UploadPurpose {
   KYC_KTP = 'KYC_KTP',
   KYC_SELFIE = 'KYC_SELFIE',
+  // Section 1 (Verified Badge System): dokumen legalitas badan usaha
+  // (NPWP / akta pendirian / SIUP). Private bucket, sama seperti dokumen KYC.
+  BUSINESS_DOCUMENT = 'BUSINESS_DOCUMENT',
   AVATAR = 'AVATAR',
   CHAT_ATTACHMENT = 'CHAT_ATTACHMENT',
   DISPUTE_EVIDENCE = 'DISPUTE_EVIDENCE',

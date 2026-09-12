@@ -12,6 +12,7 @@ import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-ge
 import { toSen } from '../../../common/utils/currency.util';
 import { SUBSCRIPTION_MONTHLY_PRICE, SUBSCRIPTION_ANNUAL_PRICE } from '../../../common/constants/app.constants';
 import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 
 const PLAN_METADATA: Record<SubscriptionPlan, { durationDays: number; label: string }> = {
   MONTHLY: { durationDays: 30, label: 'Kahade Plus Monthly' },
@@ -30,6 +31,7 @@ export class SubscriptionExpiryService {
     private redis: RedisService,
     private walletTxSerialService: WalletTxSerialService,
     private configService: ConfigService,
+    private verificationBadgeService: VerificationBadgeService,
   ) {
     const monthlyPriceSen = this.configService.get<number>('app.subscriptionMonthlyPriceSen')
       ?? SUBSCRIPTION_MONTHLY_PRICE * 100;
@@ -39,6 +41,19 @@ export class SubscriptionExpiryService {
       MONTHLY: { price: BigInt(monthlyPriceSen), ...PLAN_METADATA.MONTHLY },
       ANNUAL: { price: BigInt(annualPriceSen), ...PLAN_METADATA.ANNUAL },
     };
+  }
+
+  /**
+   * Section 1(c): patch `kahadePlusSince` hanya untuk akun yang belum punya
+   * nilainya. Dikembalikan sebagai object supaya bisa di-spread ke tx.user.update.
+   */
+  private async buildKahadePlusSinceData(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    since: Date,
+  ): Promise<{ kahadePlusSince?: Date }> {
+    const user = await tx.user.findUnique({ where: { id: userId }, select: { kahadePlusSince: true } });
+    return user?.kahadePlusSince ? {} : { kahadePlusSince: since };
   }
 
   // SCH-017: Runs every 15 minutes for subscription expiry + auto-renewal
@@ -146,9 +161,15 @@ export class SubscriptionExpiryService {
             data: {
               isKahadePlus: true,
               subscriptionExpiresAt: newPeriodEnd,
+              // Section 1(c): renewal tidak mengubah tanggal pertama subscribe,
+              // tapi akun legacy (subscribe sebelum kolom ini ada) tetap perlu
+              // di-backfill supaya badge "Kahade+" punya earnedAt.
+              ...(await this.buildKahadePlusSinceData(tx, sub.user.id, now)),
             },
           });
         }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+
+        await this.verificationBadgeService.invalidate(sub.userId);
 
         try {
           await this.prisma.notification.create({
@@ -264,6 +285,7 @@ export class SubscriptionExpiryService {
         });
 
         if (suspended) {
+          await this.verificationBadgeService.invalidate(sub.userId);
           this.logger.log(`Subscription ${sub.id} entered ${GRACE_PERIOD_DAYS}-day grace period (SUSPENDED) for user ${sub.userId}`);
           this.prisma.emitNotificationCreated({ userId: sub.userId, title: 'Kahade Plus Grace Period', body: `You have ${GRACE_PERIOD_DAYS} days to renew your subscription.`, data: { type: 'SUBSCRIPTION_EXPIRY_REMINDER' } });
         } else {
@@ -333,6 +355,10 @@ export class SubscriptionExpiryService {
           // right after expiry keep the stale Plus rate (and `completeOrder` would charge
           // feeSavingsUsed against an expired subscription).
           await this.redis.del(`subscription_status:${sub.userId}`).catch(() => undefined);
+          // Section 1: isKahadePlus=false di atas harus langsung menjatuhkan badge
+          // "Kahade+" dari profil publik — invalidasi cache badge di titik commit
+          // yang sama, jangan menunggu TTL.
+          await this.verificationBadgeService.invalidate(sub.userId);
 
           await tx.notification.create({
             data: {

@@ -21,6 +21,7 @@ import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pag
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { WalletService } from '../wallet/wallet.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
+import { VerificationBadgeService } from '../users/verification-badge.service';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { toIdr, toSen } from '../../common/utils/currency.util';
@@ -52,6 +53,7 @@ export class SubscriptionsService {
     private configService: ConfigService,
     private redis: RedisService,
     private auditLogService: AuditLogService,
+    private verificationBadgeService: VerificationBadgeService,
   ) {
     const monthlyPriceSen =
       this.configService.get<number>('app.subscriptionMonthlyPriceSen') ??
@@ -63,6 +65,20 @@ export class SubscriptionsService {
       MONTHLY: { price: BigInt(monthlyPriceSen), ...PLAN_METADATA.MONTHLY },
       ANNUAL: { price: BigInt(annualPriceSen), ...PLAN_METADATA.ANNUAL },
     };
+  }
+
+  /**
+   * Section 1(c): `kahadePlusSince` = tanggal PERTAMA kali user jadi Plus.
+   * Dikembalikan sebagai patch object supaya bisa di-spread ke `tx.user.update`.
+   * Kalau sudah terisi, tidak diubah sama sekali.
+   */
+  private async buildKahadePlusSinceData(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    since: Date,
+  ): Promise<{ kahadePlusSince?: Date }> {
+    const user = await tx.user.findUnique({ where: { id: userId }, select: { kahadePlusSince: true } });
+    return user?.kahadePlusSince ? {} : { kahadePlusSince: since };
   }
 
   async getStatus(userId: string): Promise<Record<string, unknown>> {
@@ -252,11 +268,14 @@ export class SubscriptionsService {
           },
         });
 
+        // kahadePlusSince hanya diisi saat PERTAMA kali subscribe dan tidak pernah
+        // di-reset — dipakai badge "Kahade+" dan bagian "Tentang" di profil publik.
         await tx.user.update({
           where: { id: userId },
           data: {
             isKahadePlus: true,
             subscriptionExpiresAt: periodEnd,
+            ...(await this.buildKahadePlusSinceData(tx, userId, now)),
           },
         });
 
@@ -272,6 +291,10 @@ export class SubscriptionsService {
     await this.redis.del(`subscription_status:${userId}`).catch((err: unknown) =>
       this.logger.warn(`Failed to invalidate subscription status cache for ${userId}: ${err instanceof Error ? err.message : String(err)}`),
     );
+
+    // Section 1: badge "Kahade+" juga read-through cache — invalidasi post-commit
+    // supaya badge langsung muncul tanpa menunggu TTL.
+    await this.verificationBadgeService.invalidate(userId);
 
     this.logger.log(`User ${userId} subscribed to ${plan}, charged ${planInfo.price} sen`);
 
@@ -330,6 +353,10 @@ export class SubscriptionsService {
 
     // AUDIT-24: drop the 300 s order-creation cache as soon as entitlement changes.
     await this.redis.del(`subscription_status:${userId}`).catch(() => undefined);
+    // Cancellation TIDAK langsung mencabut Plus (benefit bertahan sampai
+    // currentPeriodEnd), tapi badge cache tetap di-refresh supaya state terbaru
+    // terbaca tanpa menunggu TTL.
+    await this.verificationBadgeService.invalidate(userId);
 
     this.auditLogService.logUserAction({
       userId,
@@ -579,6 +606,9 @@ export class SubscriptionsService {
           data: {
             isKahadePlus: true,
             subscriptionExpiresAt: newPeriodEnd,
+            // Renewal tidak mengubah kahadePlusSince, kecuali akun legacy yang
+            // belum punya nilainya (kolom ini baru ada sejak Section 1).
+            ...(await this.buildKahadePlusSinceData(tx, userId, new Date())),
           },
         });
 
@@ -589,6 +619,7 @@ export class SubscriptionsService {
 
     // AUDIT-24: see subscribe() — keep order-fee decisions honest after renewal.
     await this.redis.del(`subscription_status:${userId}`).catch(() => undefined);
+    await this.verificationBadgeService.invalidate(userId);
     this.logger.log(`User ${userId} renewed ${subscription.plan}, charged ${planInfo.price} sen`);
     this.auditLogService.logUserAction({
       userId,

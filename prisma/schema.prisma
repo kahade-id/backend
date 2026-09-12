@@ -33,6 +33,18 @@ enum KycStatus {
   REVOKED
 }
 
+// Status verifikasi BADAN USAHA (BusinessVerification). Sengaja terpisah dari
+// KycStatus: KYC memverifikasi identitas personal (NIK/KTP), sedangkan ini
+// memverifikasi legalitas usaha (NPWP/akta/SIUP). Sebuah akun BUSINESS bisa
+// punya KYC APPROVED sekaligus business verification PENDING, dan badge
+// "Business Verified" hanya menyala dari enum ini — bukan dari kycStatus.
+enum BusinessVerificationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  REVOKED
+}
+
 enum OrderStatus {
   WAITING_CONFIRMATION
   WAITING_PAYMENT
@@ -234,6 +246,11 @@ enum NotificationType {
   KYC_REJECTED
   KYC_REVOKED
   KYC_RESUBMIT_REMINDER
+  // Hasil review verifikasi badan usaha — dikabari ke user lewat notification
+  // queue yang sama seperti KYC_APPROVED dkk.
+  BUSINESS_VERIFICATION_APPROVED
+  BUSINESS_VERIFICATION_REJECTED
+  BUSINESS_VERIFICATION_REVOKED
   SECURITY_NEW_LOGIN
   SECURITY_PASSWORD_CHANGED
   SECURITY_ACCOUNT_LOCKED
@@ -362,6 +379,12 @@ enum AuditAction {
   KYC_APPROVED
   KYC_REJECTED
   KYC_REVOKED
+  // Verifikasi badan usaha (BusinessVerification) — jejak audit admin, terpisah
+  // dari KYC_* supaya admin console bisa memfilter kedua domain secara independen.
+  BUSINESS_VERIFICATION_APPROVED
+  BUSINESS_VERIFICATION_REJECTED
+  BUSINESS_VERIFICATION_REVOKED
+  BUSINESS_DOCUMENTS_ACCESSED
   ORDER_CREATED
   ORDER_STATUS_CHANGED
   ORDER_FORCE_CANCEL
@@ -432,6 +455,8 @@ enum UserAuditAction {
   ACCOUNT_DELETION_REQUESTED
   // KYC
   KYC_SUBMITTED
+  // Business verification (badan usaha) — jejak audit sisi user
+  BUSINESS_VERIFICATION_SUBMITTED
   // Order
   ORDER_CREATED
   ORDER_CONFIRMED
@@ -535,6 +560,11 @@ model User {
   phoneNumber     String    @unique
   phoneNumberHash String?   @unique
   phoneVerified   Boolean   @default(false)
+  // phoneVerifiedAt dibuat simetris dengan emailVerifiedAt: badge "Email & Phone
+  // Verified" adalah kombinasi keduanya, jadi UI "Tentang" perlu tanggal kapan
+  // masing-masing diverifikasi. Legacy rows (phoneVerified=true sebelum kolom ini
+  // ada) tetap NULL — badge tetap tampil, earnedAt-nya fallback ke memberSince.
+  phoneVerifiedAt DateTime?
   dateOfBirth     DateTime? @db.Date
   gender          Gender?
   address         String?   @db.VarChar(500)
@@ -551,6 +581,11 @@ model User {
   // Kahade Plus flag denormalized — di-sync oleh SubscriptionService
   isKahadePlus          Boolean   @default(false)
   subscriptionExpiresAt DateTime?
+  // kahadePlusSince = tanggal PERTAMA kali user subscribe Kahade Plus. Tidak pernah
+  // di-reset saat langganan expire/renew — dipakai badge "Kahade+" dan bagian
+  // "Tentang" di profil publik ("Plus member sejak ..."). Di-sync oleh
+  // SubscriptionService (subscribe pertama) dan admin grant.
+  kahadePlusSince       DateTime?
 
   // Security
   failedLoginAttempts   Int       @default(0)
@@ -613,6 +648,8 @@ model User {
   twoFactorAuth           TwoFactorAuth?
   otpCodes                OtpCode[]
   kycRequests             KycRequest[]
+  // Verifikasi badan usaha (badge "Business Verified") — domain terpisah dari KYC
+  businessVerifications   BusinessVerification[]
   bankAccounts            BankAccount[]
   wallet                  Wallet?
   ordersAsBuyer           Order[]               @relation("BuyerOrders")
@@ -862,6 +899,78 @@ model KycRequest {
   @@index([status, createdAt]) // compound untuk admin KYC queue: status-filter + sort by date
   @@index([reviewedBy]) // index untuk admin performance analytics
   @@map("kyc_requests")
+}
+
+// ============================================================
+// BUSINESS VERIFICATION (badge "Business Verified")
+// ============================================================
+//
+// Verifikasi badan usaha — BEDA domain dari KycRequest (personal/KTP). Hanya
+// boleh diajukan oleh akun dengan accountType == BUSINESS; enforcement di
+// BusinessVerificationService, bukan di DB (accountType bisa berubah).
+//
+// Review lewat admin console dengan pola yang sama persis seperti admin-kyc.service.ts:
+// queue FIFO per status, approve/reject/revoke dengan guard `status = 'PENDING'`
+// di dalam transaction Serializable supaya dua admin tidak double-process.
+model BusinessVerification {
+  id             String                     @id @default(cuid())
+  verificationId String                     @unique // Format: BIZ-YYYYMMDD-SERIAL-SUFFIX
+  userId         String
+  user           User                       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  status         BusinessVerificationStatus @default(PENDING)
+
+  // Identitas badan usaha
+  businessName   String                     @db.VarChar(150)
+  // NPWP disimpan terenkripsi AES-256 (pola sama seperti BankAccount.accountNumber).
+  npwpNumber     String
+  // HMAC-SHA256 deterministik dari NPWP untuk deteksi duplikat lintas akun.
+  // AES non-deterministik (IV random) tidak bisa di-unique, jadi uniqueness
+  // pakai hash satu arah ini — sama seperti KycRequest.ktpNumberHash.
+  // Partial-unique (hanya PENDING/APPROVED) ditegakkan lewat migration, bukan
+  // @unique di sini, supaya submission yang REJECTED/REVOKED tidak memblokir
+  // pengajuan ulang dengan NPWP yang sama.
+  npwpNumberHash String
+  // Nomor akta pendirian / SIUP — minimal salah satu wajib diisi (divalidasi di DTO).
+  deedNumber     String?                    @db.VarChar(100)
+  siupNumber     String?                    @db.VarChar(100)
+
+  // Dokumen pendukung: fileKey R2 private-bucket yang sudah dikonfirmasi lewat
+  // POST /upload/confirm (pola sama seperti KYC ktpFileKey/selfieFileKey).
+  // Tiap entri disimpan TERENKRIPSI AES-256 (pola KycRequest.ktpPhotoUrl) supaya
+  // DB dump tidak membocorkan nama file dokumen legalitas. Admin me-mint signed
+  // URL short-lived saat review (lihat AdminBusinessVerificationService.getDocumentUrls).
+  documentFileKeys String[]
+
+  // Review — FK ke AdminUser (SetNull agar riwayat tetap ada saat admin dihapus)
+  reviewedBy      String?
+  reviewer        AdminUser?                @relation("BusinessVerificationReviewer", fields: [reviewedBy], references: [id], onDelete: SetNull)
+  reviewedAt      DateTime?
+  // approvedAt dipertahankan setelah REVOKED (untuk audit) — badge "Business
+  // Verified" memakai status, bukan approvedAt.
+  approvedAt      DateTime?
+  revokedAt       DateTime?
+  rejectionReason String?
+  adminNotes      String?                   @db.Text
+
+  // Metadata
+  submittedIp     String?
+  attemptNumber   Int                       @default(1)
+
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+
+  // CREATE UNIQUE INDEX business_verification_one_pending_per_user
+  //   ON business_verifications(user_id) WHERE status = 'PENDING';
+  // CREATE UNIQUE INDEX business_verification_active_npwp_unique
+  //   ON business_verifications(npwp_number_hash) WHERE status IN ('PENDING','APPROVED');
+
+  @@index([userId])
+  @@index([status])
+  @@index([npwpNumberHash])
+  @@index([status, createdAt]) // admin review queue: status-filter + sort by date
+  @@index([reviewedBy])
+  @@map("business_verifications")
 }
 
 // ============================================================
@@ -2001,6 +2110,9 @@ model AdminUser {
   // Relations
   auditLogs        AdminAuditLog[]
   kycReviews       KycRequest[]        @relation("KycReviewer")
+  // Review verifikasi badan usaha — relasi terpisah dari kycReviews karena
+  // BusinessVerification adalah domain verifikasi yang berbeda.
+  businessVerificationReviews BusinessVerification[] @relation("BusinessVerificationReviewer")
   assignedDisputes Dispute[]           @relation("DisputeAssignedAdmin")
   disputeDecisions DisputeDecision[]   @relation("DisputeDecider")
  

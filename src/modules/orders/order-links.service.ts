@@ -381,7 +381,20 @@ export class OrderLinksService {
           },
         });
 
-        await tx.chatRoom.create({ data: { orderId: order.id } });
+        await tx.chatRoom.create({
+          data: {
+            orderId: order.id,
+            type: 'ORDER',
+            initiatorId: order.buyerId,
+            counterpartId: order.sellerId,
+            members: {
+              create: [
+                { userId: order.buyerId, role: 'BUYER' },
+                { userId: order.sellerId, role: 'SELLER' },
+              ],
+            },
+          },
+        });
 
         await tx.orderStatusHistory.create({
           data: {

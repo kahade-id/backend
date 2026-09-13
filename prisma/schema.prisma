@@ -357,6 +357,59 @@ enum ChatMessageType {
   IMAGE
   FILE
   SYSTEM
+  VOICE
+}
+
+// ORDER  : percakapan yang melekat pada satu order (1 room per order).
+// INQUIRY: percakapan pra-transaksi (nego sebelum buyer membuat order & dana dikunci).
+enum ChatRoomType {
+  ORDER
+  INQUIRY
+}
+
+enum ChatRoomStatus {
+  ACTIVE
+  CLOSED
+}
+
+// Arsip & mute bersifat PER USER (satu room punya dua peserta dengan preferensi
+// yang bisa berbeda), keduanya disimpan di ChatRoomMember. Kolom
+// ChatRoom.isArchived yang lama tetap dipakai sebagai mirror "kedua peserta
+// mengarsipkan" agar tidak menjadi kolom mati.
+enum ChatRoomMemberRole {
+  BUYER
+  SELLER
+  INITIATOR
+  COUNTERPART
+}
+
+enum ChatModerationKind {
+  CIRCUMVENTION
+  CONTACT_SHARING
+  PROFANITY
+  SPAM
+}
+
+enum ChatModerationSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+// Aksi yang diambil detektor pada SATU kecocokan. Pesan yang diblokir tidak
+// pernah tersimpan, jadi BLOCKED hanya tercatat sebagai event, bukan pada pesan.
+enum ChatModerationAction {
+  BLOCKED
+  REDACTED
+  FLAGGED
+}
+
+enum ChatModerationStatus {
+  PENDING
+  REVIEWED
+  DISMISSED
+  ACTIONED
 }
 
 enum DeadlineExtensionStatus {
@@ -666,6 +719,13 @@ model User {
   ordersAsBuyer           Order[]               @relation("BuyerOrders")
   ordersAsSeller          Order[]               @relation("SellerOrders")
   chatMessages            ChatMessage[]
+  chatRoomsAsInitiator    ChatRoom[]             @relation("ChatRoomInitiator")
+  chatRoomsAsCounterpart  ChatRoom[]             @relation("ChatRoomCounterpart")
+  chatRoomMemberships     ChatRoomMember[]
+  chatReactions           ChatMessageReaction[]
+  chatMessageEdits        ChatMessageEdit[]
+  chatPinnedMessages      ChatMessage[]          @relation("ChatMessagePinnedBy")
+  chatModerationEvents    ChatModerationEvent[]
   ratingsGiven            Rating[]              @relation("RatingGiver")
   ratingsReceived         Rating[]              @relation("RatingReceiver")
   notifications           Notification[]
@@ -1375,8 +1435,26 @@ model OrderExtensionRequest {
 
 model ChatRoom {
   id        String    @id @default(cuid())
-  orderId   String    @unique
-  order     Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  // ORDER room: selalu punya order. INQUIRY room (pra-transaksi): orderId NULL.
+  // Dibuat nullable lewat migration 20260913_chat_trust_safety_and_features.
+  orderId   String?   @unique
+  order     Order?    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  type      ChatRoomType   @default(ORDER)
+  status    ChatRoomStatus @default(ACTIVE)
+
+  // Pasangan peserta. Untuk ORDER room nilainya disalin dari order saat room
+  // dibuat (dan di-backfill untuk room lama); untuk INQUIRY room diisi saat
+  // room dibuat. Menjadi sumber kebenaran untuk authorization supaya chat
+  // pra-transaksi tidak perlu punya order.
+  initiatorId   String?
+  initiator     User?   @relation("ChatRoomInitiator", fields: [initiatorId], references: [id], onDelete: SetNull)
+  counterpartId String?
+  counterpart   User?   @relation("ChatRoomCounterpart", fields: [counterpartId], references: [id], onDelete: SetNull)
+
+  // Konteks percakapan pra-transaksi (mis. judul barang yang dinegosiasikan).
+  subject   String?   @db.VarChar(200)
 
   isArchived Boolean  @default(false)
   archivedAt DateTime?
@@ -1387,7 +1465,12 @@ model ChatRoom {
   deletedAt DateTime?
 
   messages  ChatMessage[]
+  members   ChatRoomMember[]
+  moderationEvents ChatModerationEvent[]
 
+  @@index([type, initiatorId])
+  @@index([type, counterpartId])
+  @@index([type, status])
   @@map("chat_rooms")
 }
 
@@ -1401,8 +1484,34 @@ model ChatMessage {
   messageType ChatMessageType @default(TEXT)
   content     String?         @db.Text
   isEdited    Boolean         @default(false)
+  editedAt    DateTime?       // Diisi oleh editMessage(); sebelumnya isEdited tidak pernah di-set true.
   isDeleted   Boolean         @default(false)
   deletedAt   DateTime?
+
+  // Isi asli yang dipertahankan saat pesan dihapus. Pesan yang sudah masuk masa
+  // sengketa tidak boleh hilang begitu saja — resolver dispute dan admin harus
+  // tetap bisa membaca bukti percakapannya.
+  deletedContent String?      @db.Text
+  deletedById    String?
+
+  // Voice note.
+  durationSeconds Int?
+
+  // Pin message (alamat kirim, nomor resi, dsb).
+  isPinned    Boolean         @default(false)
+  pinnedAt    DateTime?
+  pinnedById  String?
+  pinnedBy    User?           @relation("ChatMessagePinnedBy", fields: [pinnedById], references: [id], onDelete: SetNull)
+
+  // Forward: pesan hasil forward menunjuk ke pesan aslinya.
+  forwardedFromId String?
+  forwardedFrom   ChatMessage? @relation("ChatMessageForward", fields: [forwardedFromId], references: [id], onDelete: SetNull)
+  forwards        ChatMessage[] @relation("ChatMessageForward")
+
+  // Hasil moderasi teks (ringkasan). Detail kecocokan ada di ChatModerationEvent.
+  moderationAction   ChatModerationAction?
+  moderationSeverity ChatModerationSeverity?
+  moderationKind     ChatModerationKind?
 
   readAt      Json?
 
@@ -1414,12 +1523,111 @@ model ChatMessage {
   replies     ChatMessage[]   @relation("ChatMessageReply")
 
   attachments ChatAttachment[]
+  reactions   ChatMessageReaction[]
+  editHistory ChatMessageEdit[]
 
   @@index([roomId])
   @@index([roomId, createdAt]) // cursor-based pagination (ORDER BY createdAt DESC)
+  @@index([roomId, isPinned])
   @@index([senderId])
   @@index([createdAt])
+  @@index([isDeleted])
   @@map("chat_messages")
+}
+
+// Satu emoji per (user, pesan, emoji). Seorang user boleh memberi beberapa emoji
+// berbeda pada pesan yang sama (model Slack), bukan satu reaksi saja.
+model ChatMessageReaction {
+  id        String   @id @default(cuid())
+  messageId String
+  message   ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  emoji     String   @db.VarChar(16)
+  createdAt DateTime @default(now())
+
+  @@unique([messageId, userId, emoji])
+  @@index([messageId])
+  @@index([userId])
+  @@map("chat_message_reactions")
+}
+
+// Riwayat revisi pesan. Tanpa ini, "edit pesan" = menghapus bukti secara diam-diam
+// — sama berbahayanya dengan delete saat order berstatus DISPUTED.
+model ChatMessageEdit {
+  id              String      @id @default(cuid())
+  messageId       String
+  message         ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  editorId        String
+  editor          User        @relation(fields: [editorId], references: [id], onDelete: Cascade)
+  previousContent String?     @db.Text
+  createdAt       DateTime    @default(now())
+
+  @@index([messageId, createdAt])
+  @@map("chat_message_edits")
+}
+
+// Status per peserta: arsip & mute. ChatRoom.isArchived bersifat global sehingga
+// tidak bisa dipakai untuk "saya arsipkan, lawan bicara tidak".
+model ChatRoomMember {
+  id        String   @id @default(cuid())
+  roomId    String
+  room      ChatRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      ChatRoomMemberRole @default(BUYER)
+
+  isArchived  Boolean   @default(false)
+  archivedAt  DateTime?
+  isMuted     Boolean   @default(false)
+  mutedUntil  DateTime?
+  lastReadAt  DateTime?
+
+  joinedAt  DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([roomId, userId])
+  @@index([userId, isArchived])
+  @@index([userId, isMuted])
+  @@map("chat_room_members")
+}
+
+// Jejak audit Trust & Safety. Pesan yang DIBLOKIR tidak tersimpan, sehingga ini
+// satu-satunya rekam jejaknya — sekaligus antrean moderasi untuk admin.
+model ChatModerationEvent {
+  id        String   @id @default(cuid())
+  eventId   String   @unique // Format: CME-YYYYMMDD-<random>
+
+  roomId    String?
+  room      ChatRoom? @relation(fields: [roomId], references: [id], onDelete: SetNull)
+  messageId String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  kind      ChatModerationKind
+  severity  ChatModerationSeverity
+  action    ChatModerationAction
+  // Id matcher + matcher yang ikut ter-absorb. Dipakai admin untuk memfilter
+  // antrean tanpa perlu membuka isi pesan.
+  matchers  Json?
+  // Potongan teks yang memicu deteksi. Untuk aksi BLOCKED ini satu-satunya jejak
+  // isi pesan, sehingga wajib ada dan dibatasi panjangnya.
+  snippet   String?  @db.VarChar(280)
+
+  status       ChatModerationStatus @default(PENDING)
+  reviewedById String?
+  reviewedAt   DateTime?
+  reviewNote   String?  @db.VarChar(500)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([severity, createdAt])
+  @@index([userId, createdAt])
+  @@index([roomId])
+  @@index([action])
+  @@map("chat_moderation_events")
 }
 
 model ChatAttachment {

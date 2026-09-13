@@ -6,6 +6,13 @@ import { RedisService } from '../../redis/redis.service';
 
 const PRESENCE_KEY = (userId: string) => `presence:${userId}`;
 const PRESENCE_TTL = 600;
+/**
+ * "Terakhir dilihat" disimpan terpisah dari counter presence karena counter
+ * dihapus begitu user offline. TTL 7 hari: cukup untuk ditampilkan di header
+ * chat, tidak cukup lama untuk menjadi jejak pelacakan jangka panjang.
+ */
+const LAST_SEEN_KEY = (userId: string) => `presence:last:${userId}`;
+const LAST_SEEN_TTL = 7 * 24 * 60 * 60;
 
 interface SocketWithHmac extends Socket {
   _hmacSessionKey?: string;
@@ -108,21 +115,59 @@ export class RealtimeService {
     void this.emitSignedToRoom(`order:${orderId}`, event, data);
   }
 
+  /**
+   * Room khusus chat (`chat:<roomId>`). Keberadaannya penting: room INQUIRY
+   * (pra-transaksi) tidak punya order, jadi `order:<orderId>` tidak bisa
+   * dipakai sebagai satu-satunya alamat pengiriman. Event chat juga dikirim
+   * ke `chat:<roomId>` untuk room bertipe ORDER, supaya klien yang sedang
+   * membuka percakapan selalu menerimanya terlepas dari room mana yang sudah
+   * di-join.
+   */
+  emitToChatRoom(roomId: string, event: string, data: unknown): void {
+    if (!this.server) return;
+    void this.emitSignedToRoom(`chat:${roomId}`, event, data);
+  }
+
   async setUserPresence(userId: string, online: boolean): Promise<void> {
     try {
       if (online) {
         await this.redis.incr(PRESENCE_KEY(userId));
         await this.redis.expire(PRESENCE_KEY(userId), PRESENCE_TTL);
+        await this.touchLastSeen(userId);
         return;
       }
       const newCount = await this.redis.decr(PRESENCE_KEY(userId));
       if (newCount <= 0) {
         await this.redis.del(PRESENCE_KEY(userId));
+        await this.touchLastSeen(userId);
       } else {
         await this.redis.expire(PRESENCE_KEY(userId), PRESENCE_TTL);
       }
     } catch (err) {
       this.logger.warn(`Presence update failed for user ${userId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Catat "terakhir dilihat" (ms epoch) dengan TTL 7 hari. */
+  async touchLastSeen(userId: string): Promise<void> {
+    try {
+      await this.redis.set(LAST_SEEN_KEY(userId), String(Date.now()), LAST_SEEN_TTL);
+    } catch (err) {
+      this.logger.warn(`Last-seen update failed for user ${userId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Waktu terakhir user terlihat online, atau null bila tidak ada catatan
+   * (user belum pernah online dalam 7 hari terakhir).
+   */
+  async getLastSeen(userId: string): Promise<Date | null> {
+    try {
+      const raw = await this.redis.get(LAST_SEEN_KEY(userId));
+      const ms = raw ? parseInt(raw, 10) : NaN;
+      return Number.isFinite(ms) && ms > 0 ? new Date(ms) : null;
+    } catch {
+      return null;
     }
   }
 

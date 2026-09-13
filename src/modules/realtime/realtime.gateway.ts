@@ -18,7 +18,7 @@ import { RealtimeService } from './realtime.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { TOKEN_ISSUER, USER_TOKEN_AUDIENCE } from '../auth/token.service';
 import { TOKEN_BLACKLIST, SESSION_REVOKED_KEY } from '../../common/constants/redis-keys';
-import { TYPING_SERVER_AUTO_STOP_MS } from '../../common/constants/app.constants';
+import { TYPING_HOLD_MS, TYPING_REBROADCAST_INTERVAL_MS } from '../../common/constants/app.constants';
 
 interface AuthenticatedSocket extends Socket {
   userId?: string;
@@ -31,11 +31,27 @@ interface AuthenticatedSocket extends Socket {
   _hmacSessionKey?: string;
 }
 
+/**
+ * Status mengetik per (user, room) yang sedang aktif di worker ini.
+ * `lastBroadcastAt` dipakai untuk men-throttle re-broadcast tanpa pernah
+ * membiarkan indikator macet menyala.
+ */
+interface TypingState {
+  timer: ReturnType<typeof setTimeout>;
+  lastBroadcastAt: number;
+  orderId: string | null;
+  fullName: string | null;
+}
+
 const WS_MSG_RATE_LIMIT = 30;
 const WS_MSG_RATE_WINDOW_SECONDS = 10;
 const WS_MAX_CONNECTIONS_PER_USER = 5;
-const WS_TYPING_RATE_LIMIT = 5;
-const WS_TYPING_RATE_WINDOW_SECONDS = 3;
+// Heartbeat mengetik bisa datang tiap ~1 detik dari beberapa klien sekaligus.
+// Batas lama (5 event / 3 detik) hampir selalu terlampaui, dan karena event
+// yang kelebihan kuota dibuang diam-diam, indikator jadi tidak pernah muncul.
+// Sekarang kuota dipakai hanya untuk menahan broadcast, bukan membatalkan status.
+const WS_TYPING_RATE_LIMIT = 30;
+const WS_TYPING_RATE_WINDOW_SECONDS = 10;
 const WS_TOKEN_RECHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 // B-39 (audit-fix): drop the long-polling transport. Long-polling transmits the
@@ -315,7 +331,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
         client.emit('session_hmac_token', { token: sessionKey });
       }
 
-      const userRooms = await this.getUserOrderRooms(payload.sub);
+      const userRooms = await this.getUserPresenceRooms(payload.sub);
       for (const room of userRooms) {
         await this.realtimeService.emitSignedToRoomExcept(room, client.id, 'user.online', { userId: payload.sub });
       }
@@ -338,22 +354,12 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
 
   async handleDisconnect(client: AuthenticatedSocket): Promise<void> {
     if (client.userId) {
-      for (const [key, timer] of this.typingTimers) {
-        if (key.startsWith(`${client.userId}:`)) {
-          clearTimeout(timer);
-          this.typingTimers.delete(key);
-          const roomId = key.split(':').slice(1).join(':');
-          if (roomId) {
-            this.isRoomParticipant(client.userId, roomId).then(async (room) => {
-              if (room.authorized && room.orderId) {
-                await this.realtimeService.emitSignedToRoomExcept(`order:${room.orderId}`, client.id, 'typing.stop', {
-                  userId: client.userId,
-                  roomId,
-                });
-              }
-            }).catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
-          }
-        }
+      // Putus koneksi tidak boleh meninggalkan indikator "sedang mengetik"
+      // yang menyala selamanya di layar lawan bicara.
+      const typingKeys = [...this.typingState.keys()].filter((key) => key.startsWith(`${client.userId}:`));
+      for (const key of typingKeys) {
+        const roomId = key.slice(`${client.userId}:`.length);
+        if (roomId) await this.clearTyping(client, roomId, key);
       }
 
       const connKey = `${this.WS_CONN_PREFIX}${client.userId}`;
@@ -370,7 +376,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
       }
       const remaining = await this.realtimeService.getConnectionCount(client.userId);
       if (remaining <= 0) {
-        const userRooms = await this.getUserOrderRooms(client.userId);
+        const userRooms = await this.getUserPresenceRooms(client.userId);
         for (const room of userRooms) {
           await this.realtimeService.emitSignedToRoomExcept(room, client.id, 'user.offline', { userId: client.userId });
         }
@@ -395,47 +401,112 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     }
   }
 
-  private async isRoomParticipant(userId: string, roomId: string): Promise<{ authorized: boolean; orderId?: string }> {
+  /**
+   * Room chat aktif user (ORDER maupun INQUIRY). Presence dikirim ke sini juga
+   * supaya indikator online/last-seen bekerja di chat pra-transaksi, yang tidak
+   * punya order sehingga tidak masuk `getUserOrderRooms`.
+   */
+  private async getUserChatRooms(userId: string): Promise<string[]> {
     try {
-      const chatRoom = await this.prisma.chatRoom.findUnique({
-        where: { id: roomId, deletedAt: null },
-        select: { orderId: true, order: { select: { orderId: true, buyerId: true, sellerId: true, deletedAt: true } } },
+      const rooms = await this.prisma.chatRoom.findMany({
+        where: {
+          deletedAt: null,
+          status: 'ACTIVE',
+          OR: [{ initiatorId: userId }, { counterpartId: userId }],
+        },
+        select: { id: true },
       });
-      if (!chatRoom?.order || chatRoom.order.deletedAt) return { authorized: false };
-      const authorized = chatRoom.order.buyerId === userId || chatRoom.order.sellerId === userId;
-      return { authorized, orderId: chatRoom.order.orderId };
+      return rooms.map(r => `chat:${r.id}`);
     } catch {
-      return { authorized: false };
+      return [];
     }
   }
 
-  private typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Semua room tempat presence user perlu diumumkan. */
+  private async getUserPresenceRooms(userId: string): Promise<string[]> {
+    const [orderRooms, chatRooms] = await Promise.all([
+      this.getUserOrderRooms(userId),
+      this.getUserChatRooms(userId),
+    ]);
+    return [...new Set([...orderRooms, ...chatRooms])];
+  }
+
+  /**
+   * Peserta room kini ditentukan oleh `ChatRoom.initiatorId` / `counterpartId`,
+   * bukan lagi lewat relasi order. Alasannya: room INQUIRY (chat pra-transaksi)
+   * tidak punya order sama sekali, dan memaksa semunya lewat `order` akan
+   * membuat room itu selalu gagal otorisasi.
+   *
+   * Fallback ke buyer/seller order tetap dipertahankan untuk baris lama yang
+   * belum ter-backfill (lihat migration 20260913_chat_trust_safety_and_features).
+   */
+  private async isRoomParticipant(
+    userId: string,
+    roomId: string,
+  ): Promise<{ authorized: boolean; orderId?: string | null; participantIds: string[] }> {
+    try {
+      const chatRoom = await this.prisma.chatRoom.findUnique({
+        where: { id: roomId, deletedAt: null },
+        select: {
+          orderId: true,
+          initiatorId: true,
+          counterpartId: true,
+          order: { select: { orderId: true, buyerId: true, sellerId: true, deletedAt: true } },
+        },
+      });
+      if (!chatRoom) return { authorized: false, participantIds: [] };
+      if (chatRoom.order?.deletedAt) return { authorized: false, participantIds: [] };
+
+      const participantIds = [chatRoom.initiatorId, chatRoom.counterpartId].filter(
+        (id): id is string => typeof id === 'string' && id.length > 0,
+      );
+      if (participantIds.length === 2) {
+        const participants = participantIds;
+        return {
+          authorized: participants.includes(userId),
+          orderId: chatRoom.order?.orderId ?? null,
+          participantIds,
+        };
+      }
+
+      // Fallback: baris lama yang belum ter-backfill.
+      if (!chatRoom.order) return { authorized: false, participantIds: [] };
+      const legacy = [chatRoom.order.buyerId, chatRoom.order.sellerId];
+      return {
+        authorized: legacy.includes(userId),
+        orderId: chatRoom.order.orderId,
+        participantIds: legacy,
+      };
+    } catch {
+      return { authorized: false, participantIds: [] };
+    }
+  }
+
+  /**
+   * Status "sedang mengetik" dikelola sebagai STATE, bukan sebagai aliran event.
+   *
+   * Implementasi lama mengirim ulang `typing.start` ke room tiap kali klien
+   * mengirim heartbeat, dengan rate limit 5 event / 3 detik. Klien mengetik
+   * mengirim heartbeat jauh lebih cepat dari itu, sehingga dua hal terjadi:
+   *   1. event ke-6 dan seterusnya DIBUANG secara diam-diam (return tanpa
+   *      apa pun), dan karena timer auto-stop hanya di-arm saat event lolos,
+   *      indikator bisa macet menyala di layar lawan bicara;
+   *   2. event hanya dikirim ke `order:<orderId>`. Klien chat bergabung lewat
+   *      `join-room`, dan bila room `chat:<roomId>` belum di-join (atau room
+   *      tidak punya order sama sekali — room INQUIRY), tidak ada yang sampai.
+   *
+   * Sekarang: heartbeat hanya memperpanjang timer, broadcast di-throttle, dan
+   * `typing.stop` selalu dikirim sekali saat state berakhir (klien berhenti
+   * menulis, timer habis, atau socket terputus).
+   */
+  private typingState = new Map<string, TypingState>();
 
   @SubscribeMessage('typing.start')
   async handleTypingStart(
     @ConnectedSocket() client: AuthenticatedSocket,
     @MessageBody() data: { roomId: string },
   ): Promise<void> {
-    if (!client.userId || !data?.roomId || typeof data.roomId !== 'string' || data.roomId.length > 100) return;
-    if (!(await this.checkWsRateLimit(client))) return;
-    if (!(await this.checkTypingRateLimit(client))) return;
-    const room = await this.isRoomParticipant(client.userId, data.roomId);
-    if (!room.authorized || !room.orderId) return;
-    await this.realtimeService.emitSignedToRoomExcept(`order:${room.orderId}`, client.id, 'typing.start', {
-      userId: client.userId,
-      roomId: data.roomId,
-    });
-
-    const timerKey = `${client.userId}:${data.roomId}`;
-    const existing = this.typingTimers.get(timerKey);
-    if (existing) clearTimeout(existing);
-    this.typingTimers.set(timerKey, setTimeout(async () => {
-      this.typingTimers.delete(timerKey);
-      await this.realtimeService.emitSignedToRoomExcept(`order:${room.orderId}`, client.id, 'typing.stop', {
-        userId: client.userId,
-        roomId: data.roomId,
-      });
-    }, TYPING_SERVER_AUTO_STOP_MS));
+    await this.applyTypingSignal(client, data?.roomId, true);
   }
 
   @SubscribeMessage('typing.stop')
@@ -443,20 +514,120 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     @ConnectedSocket() client: AuthenticatedSocket,
     @MessageBody() data: { roomId: string },
   ): Promise<void> {
-    if (!client.userId || !data?.roomId || typeof data.roomId !== 'string' || data.roomId.length > 100) return;
-    if (!(await this.checkWsRateLimit(client))) return;
-    if (!(await this.checkTypingRateLimit(client))) return;
-    const room = await this.isRoomParticipant(client.userId, data.roomId);
-    if (!room.authorized || !room.orderId) return;
+    await this.applyTypingSignal(client, data?.roomId, false);
+  }
 
-    const timerKey = `${client.userId}:${data.roomId}`;
-    const existing = this.typingTimers.get(timerKey);
-    if (existing) { clearTimeout(existing); this.typingTimers.delete(timerKey); }
+  /** Bentuk terpadu: satu event dengan flag, untuk klien yang lebih baru. */
+  @SubscribeMessage('chat.typing')
+  async handleChatTyping(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody() data: { roomId: string; isTyping?: boolean },
+  ): Promise<void> {
+    await this.applyTypingSignal(client, data?.roomId, data?.isTyping !== false);
+  }
 
-    await this.realtimeService.emitSignedToRoomExcept(`order:${room.orderId}`, client.id, 'typing.stop', {
-      userId: client.userId,
-      roomId: data.roomId,
+  private async applyTypingSignal(
+    client: AuthenticatedSocket,
+    roomId: string | undefined,
+    isTyping: boolean,
+  ): Promise<void> {
+    if (!client.userId || !roomId || typeof roomId !== 'string' || roomId.length > 100) return;
+    const room = await this.isRoomParticipant(client.userId, roomId);
+    if (!room.authorized) return;
+
+    // Catatan: heartbeat typing TIDAK memakai `checkWsRateLimit` (kuota pesan
+    // 30/10 detik). Mengetik bukan pesan; handler itu juga mengirim event
+    // `error` ke klien saat kuota habis, yang akan membanjiri klien dengan
+    // error hanya karena user sedang menulis panjang.
+
+    const stateKey = `${client.userId}:${roomId}`;
+
+    if (!isTyping) {
+      await this.clearTyping(client, roomId, stateKey);
+      return;
+    }
+
+    // Rate limit typing bersifat "silent": heartbeat yang kelebihan kuota tidak
+    // membatalkan status mengetik, hanya menahan broadcast berikutnya.
+    const withinRate = await this.checkTypingRateLimit(client);
+    const existing = this.typingState.get(stateKey);
+    const shouldBroadcast =
+      withinRate &&
+      (!existing || Date.now() - existing.lastBroadcastAt >= TYPING_REBROADCAST_INTERVAL_MS);
+
+    // Timer SELALU di-arm ulang — inilah yang menjamin indikator padam hanya
+    // setelah lawan bicara benar-benar berhenti, bukan setiap 4 detik.
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => {
+      void this.clearTyping(client, roomId, stateKey);
+    }, TYPING_HOLD_MS);
+
+    if (shouldBroadcast) {
+      const fullName = existing?.fullName ?? (await this.lookupDisplayName(client.userId));
+      await this.broadcastTyping(client, roomId, room.orderId ?? null, true, fullName);
+      this.typingState.set(stateKey, {
+        timer,
+        lastBroadcastAt: Date.now(),
+        orderId: room.orderId ?? null,
+        fullName,
+      });
+      return;
+    }
+
+    this.typingState.set(stateKey, {
+      timer,
+      lastBroadcastAt: existing?.lastBroadcastAt ?? 0,
+      orderId: room.orderId ?? null,
+      fullName: existing?.fullName ?? null,
     });
+  }
+
+  private async clearTyping(client: AuthenticatedSocket, roomId: string, stateKey: string): Promise<void> {
+    const state = this.typingState.get(stateKey);
+    if (!state) return; // tidak pernah di-broadcast → tidak ada status untuk dibatalkan
+    clearTimeout(state.timer);
+    this.typingState.delete(stateKey);
+    await this.broadcastTyping(client, roomId, state.orderId, false, state.fullName);
+  }
+
+  private async broadcastTyping(
+    client: AuthenticatedSocket,
+    roomId: string,
+    orderId: string | null,
+    isTyping: boolean,
+    fullName: string | null,
+  ): Promise<void> {
+    const payload = {
+      roomId,
+      userId: client.userId,
+      fullName,
+      isTyping,
+      // Klien bisa mematikan indikator sendiri tanpa menunggu event stop,
+      // yang penting bila paket `typing.stop` hilang karena koneksi putus.
+      expiresAt: new Date(Date.now() + (isTyping ? TYPING_HOLD_MS : 0)).toISOString(),
+    };
+    const rooms = [`chat:${roomId}`];
+    if (orderId) rooms.push(`order:${orderId}`);
+    // `typing.start`/`typing.stop` untuk klien lama, `chat.typing` untuk yang baru.
+    const events = isTyping ? ['typing.start', 'chat.typing'] : ['typing.stop', 'chat.typing'];
+    for (const room of rooms) {
+      for (const event of events) {
+        await this.realtimeService.emitSignedToRoomExcept(room, client.id, event, payload);
+      }
+    }
+  }
+
+  /** Nama tampilan di-cache per sesi mengetik agar tidak ada query per ketikan. */
+  private async lookupDisplayName(userId: string): Promise<string | null> {
+    try {
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { fullName: true, username: true },
+      });
+      return user?.fullName || user?.username || null;
+    } catch {
+      return null;
+    }
   }
 
   @SubscribeMessage('join_order')
@@ -525,25 +696,18 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
       return { success: false, message: 'roomId is required' };
     }
 
-    const chatRoom = await this.prisma.chatRoom.findUnique({
-      where: { id: data.roomId },
-      select: {
-        orderId: true,
-        order: { select: { orderId: true, buyerId: true, sellerId: true } },
-      },
-    });
-
-    if (!chatRoom || !chatRoom.order) {
-      return { success: false, message: 'Room not found' };
-    }
-
-    const { buyerId, sellerId } = chatRoom.order;
-    if (client.userId !== buyerId && client.userId !== sellerId) {
+    const room = await this.isRoomParticipant(client.userId, data.roomId);
+    if (!room.authorized) {
       return { success: false, message: 'Not a participant of this room' };
     }
 
-    await client.join(`order:${chatRoom.order.orderId}`);
-    this.logger.debug(`User ${client.userId} joined room order:${chatRoom.order.orderId} via chat room ${data.roomId}`);
+    // Dua alamat: `chat:<roomId>` untuk event percakapan (satu-satunya alamat
+    // yang ada untuk room INQUIRY) dan `order:<orderId>` untuk event order.
+    // Sebelumnya hanya `order:<orderId>` yang di-join, sehingga event typing
+    // tidak pernah sampai ke klien yang bergabung lewat jalur chat.
+    await client.join(`chat:${data.roomId}`);
+    if (room.orderId) await client.join(`order:${room.orderId}`);
+    this.logger.debug(`User ${client.userId} joined chat:${data.roomId}${room.orderId ? ` and order:${room.orderId}` : ''}`);
     return { success: true };
   }
 
@@ -556,30 +720,15 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     if (!data?.roomId) return { success: false };
     if (!(await this.checkWsRateLimit(client))) return { success: false, message: 'Rate limit exceeded' };
 
-    const chatRoom = await this.prisma.chatRoom.findUnique({
-      where: { id: data.roomId },
-      select: { order: { select: { orderId: true, buyerId: true, sellerId: true } } },
-    });
+    const room = await this.isRoomParticipant(client.userId, data.roomId);
+    if (!room.authorized) return { success: false, message: 'Not a participant' };
 
-    if (!chatRoom?.order) return { success: false, message: 'Room not found' };
+    if (room.orderId) await client.leave(`order:${room.orderId}`);
+    await client.leave(`chat:${data.roomId}`);
 
-    if (client.userId !== chatRoom.order.buyerId && client.userId !== chatRoom.order.sellerId) {
-      return { success: false, message: 'Not a participant' };
-    }
-
-    /*
-     * D-02: leave the room the client actually joined.
-     *
-     * `join-room` above joins `order:${chatRoom.order.orderId}` (:478), but this handler left
-     * `order:${chatRoom.orderId}` — the FK holding the internal cuid, never a real room name.
-     * `socket.leave` on an unjoined room is a silent no-op, so the client stayed subscribed to
-     * the order feed after closing the chat screen. Mobile emits `leave-room` on unmount
-     * (`lib/hooks/useChatSocket.ts:216`) and detaches its handlers, so nothing was misrendered,
-     * but the subscriptions accumulated for the life of the socket: every room the user had
-     * opened kept pushing `chat.new_message` payloads down a mobile connection that discarded
-     * them.
-     */
-    await client.leave(`order:${chatRoom.order.orderId}`);
+    // Keluar dari layar chat = berhenti mengetik. Tanpa ini, indikator lawan
+    // bicara menunggu timer habis walau pengirim sudah menutup percakapan.
+    await this.clearTyping(client, data.roomId, `${client.userId}:${data.roomId}`);
     return { success: true };
   }
 

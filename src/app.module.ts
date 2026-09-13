@@ -8,7 +8,7 @@ import { BullModule } from '@nestjs/bull';
 import { Logger as NestLogger } from '@nestjs/common';
 
 // Config
-import { appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, r2Config, smtpConfig, fcmConfig } from './config';
+import { appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, r2Config, smtpConfig, fcmConfig, chatConfig } from './config';
 import { validateEnv } from './config/env.validation';
 import { initializeCrypto } from './common/utils/crypto.util';
 import { getRuntimeEnvFile } from './config/runtime-env-file';
@@ -72,7 +72,7 @@ const runtimeEnvFile = getRuntimeEnvFile();
     ConfigModule.forRoot({
       isGlobal: true,
       ...(runtimeEnvFile ? { envFilePath: runtimeEnvFile } : {}),
-      load: [appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, r2Config, smtpConfig, fcmConfig],
+      load: [appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, r2Config, smtpConfig, fcmConfig, chatConfig],
       validate: validateEnv,
     }),
 

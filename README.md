@@ -65,16 +65,16 @@ src/
     ├── orders/             # P2P escrow lifecycle + state machine
     ├── wallet/             # balance, transfer, topup, withdraw, PIN
     ├── disputes/           # dispute resolution + admin handling
-    ├── chat/               # chat rooms, messages, reactions, attachments
+    ├── chat/               # chat rooms (ORDER + INQUIRY), messages, reactions, pins, moderation
     ├── kyc/                # NIK + KTP + selfie capture & verification
     ├── notifications/      # in-app + push (FCM)
     ├── payments/           # Midtrans integration + webhook handler
     ├── upload/             # presigned R2 uploads
-    ├── admin/              # operator console endpoints (treasury, KYC review)
+    ├── admin/              # operator console endpoints (treasury, KYC review, chat moderation)
     └── …                   # ~24 feature modules
 prisma/
-├── schema.prisma           # 58 models, 45 enums
-└── migrations/             # 37 migrations (kept in source control)
+├── schema.prisma           # 69 models, 57 enums
+└── migrations/             # 56 migrations (kept in source control)
 test/
 └── critical-flows.e2e-spec.ts
 ```

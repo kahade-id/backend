@@ -380,7 +380,23 @@ export class OrdersService {
             }
           }
 
-          await tx.chatRoom.create({ data: { orderId: newOrder.id } });
+          // Peserta disalin ke room agar otorisasi chat tidak perlu selalu
+          // membaca relasi order (dan supaya polanya sama dengan room INQUIRY
+          // yang tidak punya order sama sekali).
+          await tx.chatRoom.create({
+            data: {
+              orderId: newOrder.id,
+              type: 'ORDER',
+              initiatorId: buyerId,
+              counterpartId: sellerId,
+              members: {
+                create: [
+                  { userId: buyerId, role: 'BUYER' },
+                  { userId: sellerId, role: 'SELLER' },
+                ],
+              },
+            },
+          });
           await tx.orderStatusHistory.create({
             data: {
               orderId: newOrder.id,

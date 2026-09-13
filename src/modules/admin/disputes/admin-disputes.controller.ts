@@ -1,6 +1,6 @@
 import { AdminRoute } from '../../../common/decorators/public.decorator';
 import { Idempotency } from '../../../common/decorators/idempotency.decorator';
-import { Controller, Get, Post, Param, Body, Query, UseGuards, Req, DefaultValuePipe } from '@nestjs/common';
+import { Controller, Get, Post, Param, Body, Query, UseGuards, Req, DefaultValuePipe, ParseBoolPipe } from '@nestjs/common';
 import { ParseIdPipe } from '../../../common/pipes/parse-id.pipe';
 import { ParseQueryStringPipe } from '../../../common/pipes/parse-query-string.pipe';
 import { ClampLimitPipe } from '../../../common/pipes/clamp-limit.pipe';
@@ -55,6 +55,27 @@ export class AdminDisputesController {
     @Query('limit', new DefaultValuePipe(50), new ClampLimitPipe(100)) limit?: number,
   ): Promise<object> {
     return this.service.getDisputeMessages(disputeId, admin.sub, cursor, limit ?? 50);
+  }
+
+  @Get(':disputeId/chat')
+  @AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN')
+  @ApiOperation({
+    summary: 'Get order chat messages for a dispute, including deleted ones',
+    description:
+      'Returns the buyer-seller conversation attached to the disputed order. Soft-deleted messages are included with their original content in `deletedContent`, because that content is evidence. Only the assigned admin or SUPER_ADMIN can access.',
+  })
+  @ApiResponse({ status: 200, description: 'Chat messages returned.' })
+  @ApiResponse({ status: 403, description: 'Not the assigned admin.' })
+  @ApiResponse({ status: 404, description: 'Dispute not found.' })
+  getDisputeChat(
+    @Param('disputeId', ParseIdPipe) disputeId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Query('cursor', new ParseQueryStringPipe('cursor', 50)) cursor?: string,
+    @Query('limit', new DefaultValuePipe(50), new ClampLimitPipe(100)) limit?: number,
+    @Query('includeDeleted', new DefaultValuePipe(true), ParseBoolPipe) includeDeleted?: boolean,
+    @Req() req?: Request,
+  ): Promise<object> {
+    return this.service.getDisputeOrderChat(disputeId, admin.sub, cursor, limit ?? 50, includeDeleted !== false, req?.ip || 'unknown');
   }
 
   @Post(':disputeId/messages')

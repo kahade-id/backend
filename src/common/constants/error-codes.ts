@@ -262,6 +262,25 @@ export const EXTENSION_RATE_LIMITED = 'EXTENSION_RATE_LIMITED';
 export const DELIVERY_PROOF_REQUIRED = 'DELIVERY_PROOF_REQUIRED';
 
 export const CHAT_ROOM_CLOSED = 'CHAT_ROOM_CLOSED';
+
+// Chat — Trust & Safety (audit 2026-09-13).
+// CHAT_MESSAGE_BLOCKED: pesan ditolak detektor circumvention/moderation.
+//   `message` pada response berisi penjelasan Bahasa Indonesia yang aman
+//   ditampilkan langsung ke user.
+export const CHAT_MESSAGE_BLOCKED = 'CHAT_MESSAGE_BLOCKED';
+// CHAT_MESSAGE_LOCKED_DISPUTE: pesan terkunci karena order sedang DISPUTED.
+//   Dipakai untuk menolak delete DAN edit — keduanya akan merusak bukti
+//   percakapan yang dipakai resolver dispute.
+export const CHAT_MESSAGE_LOCKED_DISPUTE = 'CHAT_MESSAGE_LOCKED_DISPUTE';
+export const CHAT_MESSAGE_NOT_EDITABLE = 'CHAT_MESSAGE_NOT_EDITABLE';
+export const CHAT_PIN_LIMIT_REACHED = 'CHAT_PIN_LIMIT_REACHED';
+export const CHAT_INVALID_EMOJI = 'CHAT_INVALID_EMOJI';
+export const CHAT_FORWARD_NOT_ALLOWED = 'CHAT_FORWARD_NOT_ALLOWED';
+export const CHAT_INQUIRY_SELF = 'CHAT_INQUIRY_SELF';
+export const CHAT_INQUIRY_LIMIT_REACHED = 'CHAT_INQUIRY_LIMIT_REACHED';
+export const CHAT_COUNTERPART_NOT_FOUND = 'CHAT_COUNTERPART_NOT_FOUND';
+export const CHAT_COUNTERPART_BLOCKED = 'CHAT_COUNTERPART_BLOCKED';
+
 export const INVALID_IDEMPOTENCY_KEY = 'INVALID_IDEMPOTENCY_KEY';
 export const UPLOAD_ALREADY_CONFIRMED = 'UPLOAD_ALREADY_CONFIRMED';
 export const FILE_ACCESS_DENIED = 'FILE_ACCESS_DENIED';

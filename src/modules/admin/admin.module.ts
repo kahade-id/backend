@@ -18,6 +18,7 @@ import { AdminManagementModule } from './management/admin-management.module';
 import { AdminAnalyticsModule } from './analytics/admin-analytics.module';
 import { AdminCampaignsModule } from './campaigns/admin-campaigns.module';
 import { AdminSupportModule } from './support/admin-support.module';
+import { AdminChatModule } from './chat/admin-chat.module';
 
 @Module({
   imports: [
@@ -40,6 +41,7 @@ import { AdminSupportModule } from './support/admin-support.module';
     AdminAnalyticsModule,
     AdminCampaignsModule,
     AdminSupportModule,
+    AdminChatModule,
   ],
 })
 export class AdminModule {}

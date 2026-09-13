@@ -45,7 +45,44 @@ export const DISPUTE_SLA_HOURS = 72;
 
 export const CHAT_MESSAGE_MAX_LENGTH = 2000;
 
+/**
+ * Batas-batas chat yang ditambahkan bersama fitur Trust & Safety chat
+ * (audit 2026-09-13). Semua berbentuk hard limit supaya satu percakapan
+ * tidak bisa dipakai untuk menyanderakan performa lawan bicara.
+ */
+// Search: query di bawah panjang ini mengembalikan terlalu banyak noise.
+export const CHAT_SEARCH_MIN_QUERY_LENGTH = 2;
+export const CHAT_SEARCH_MAX_LIMIT = 50;
+export const CHAT_SEARCH_DEFAULT_LIMIT = 20;
+// Pin: alamat kirim & nomor resi, bukan tempat menyimpan seluruh percakapan.
+export const CHAT_MAX_PINNED_PER_ROOM = 20;
+// Forward: membatasi blast antar-room.
+export const CHAT_MAX_FORWARD_TARGETS = 5;
+// Reaction.
+export const CHAT_MAX_EMOJI_LENGTH = 16;
+// Voice note: 10 menit, sama dengan batas ukuran lampiran (10 MB).
+export const CHAT_VOICE_MAX_DURATION_SECONDS = 600;
+export const CHAT_VOICE_MIN_DURATION_SECONDS = 1;
+// Inquiry (chat pra-transaksi): mencegah satu user membuka puluhan room
+// untuk spam lawan bicaranya.
+export const CHAT_INQUIRY_MAX_ACTIVE_PER_USER = 30;
+export const CHAT_INQUIRY_SUBJECT_MAX_LENGTH = 200;
+export const CHAT_INQUIRY_FIRST_MESSAGE_MAX_LENGTH = 1000;
+
 export const TYPING_SERVER_AUTO_STOP_MS = 4000;
+/**
+ * Berapa lama server menahan status "sedang mengetik" sebelum mengirim
+ * typing.stop sendiri. Nilai lama (4 s) lebih pendek dari jeda mengetik
+ * normal, sehingga indikator berkedip padam walau lawan bicara masih
+ * menulis.
+ */
+export const TYPING_HOLD_MS = 8000;
+/**
+ * Interval minimum antar broadcast typing.start. Klien mengirim heartbeat
+ * tiap ketikan; tanpa ini, server membanjiri socket dengan event yang
+ * identik (lihat realtime.gateway.ts).
+ */
+export const TYPING_REBROADCAST_INTERVAL_MS = 2500;
 
 export const WALLET_DAILY_TOPUP_LIMIT = 50000000;
 export const WALLET_DAILY_WITHDRAW_LIMIT = 50000000;

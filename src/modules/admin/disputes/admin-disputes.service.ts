@@ -15,6 +15,7 @@ import { escapeHtml } from '../../../common/utils/sanitize.util';
 import { UploadService } from '../../upload/upload.service';
 import { RealtimeService } from '../../realtime/realtime.service';
 import { escapeLikePattern } from '../../../common/utils/search.util';
+import { ChatService } from '../../chat/chat.service';
 
 @Injectable()
 export class AdminDisputesService {
@@ -26,6 +27,7 @@ export class AdminDisputesService {
     private auditLog: AuditLogService,
     private uploadService: UploadService,
     private realtime: RealtimeService,
+    private chatService: ChatService,
   ) {}
 
   private async withSerializableRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
@@ -631,6 +633,63 @@ export class AdminDisputesService {
     const hasMore = messages.length === safeLimit;
     const nextCursor = hasMore ? messages[messages.length - 1].id : null;
     return { messages, nextCursor, hasMore };
+  }
+
+  /**
+   * Percakapan order untuk keperluan resolver dispute, TERMASUK isi asli pesan
+   * yang sudah dihapus lawan bicara.
+   *
+   * Mengapa endpoint ini ada: `deleteMessage()` dulu menghapus konten secara
+   * permanen, sehingga pesan yang paling menentukan justru hilang tepat saat
+   * dibutuhkan untuk memutus sengketa. Kini penghapusan dikunci selama
+   * DISPUTED dan isi aslinya tetap tersimpan — endpoint ini yang
+   * memperlihatkannya. Membuka percakapan user dicatat di audit log.
+   */
+  async getDisputeOrderChat(
+    disputeId: string,
+    adminId: string,
+    cursor: string | undefined,
+    limit: number = 50,
+    includeDeleted: boolean = true,
+    ipAddress: string = 'unknown',
+  ): Promise<object> {
+    const dispute = await this.prisma.dispute.findFirst({
+      where: { OR: [{ id: disputeId }, { disputeId }] },
+      include: { order: { select: { id: true, orderId: true } } },
+    });
+    if (!dispute) throw new NotFoundException({ code: ErrorCodes.DISPUTE_NOT_FOUND, message: 'Dispute not found' });
+
+    const admin = await this.prisma.adminUser.findUnique({ where: { id: adminId }, select: { role: true } });
+    if (admin?.role !== 'SUPER_ADMIN' && dispute.assignedAdminId !== adminId) {
+      throw new ForbiddenException({ code: ErrorCodes.NOT_ASSIGNED_ADMIN, message: 'Only the assigned admin or a SUPER_ADMIN can view dispute messages' });
+    }
+
+    const room = await this.prisma.chatRoom.findUnique({
+      where: { orderId: dispute.order.id },
+      select: { id: true },
+    });
+    if (!room) {
+      return { messages: [], nextCursor: null, hasMore: false };
+    }
+
+    const safeLimit = Number.isFinite(limit) ? Math.min(100, Math.max(1, Math.floor(limit))) : 50;
+    const result = await this.chatService.getRoomMessagesForAdmin(room.id, {
+      limit: safeLimit,
+      cursor,
+      includeDeleted,
+    });
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'Dispute',
+      targetId: dispute.disputeId,
+      description: `Admin read order chat for dispute ${dispute.disputeId}`,
+      after: { roomId: room.id, includeDeleted },
+      ipAddress,
+    });
+
+    return result;
   }
 
   async markUnderReview(disputeId: string, adminId: string, ipAddress: string = 'unknown'): Promise<object> {

@@ -1,4 +1,21 @@
-import { IsString, IsOptional, IsEnum, IsArray, IsIn, ValidateNested, MaxLength, IsInt, Min, Max, ArrayMaxSize, Matches } from 'class-validator';
+import {
+  IsString,
+  IsOptional,
+  IsEnum,
+  IsArray,
+  IsIn,
+  ValidateNested,
+  MaxLength,
+  IsInt,
+  Min,
+  Max,
+  ArrayMaxSize,
+  Matches,
+} from 'class-validator';
+import {
+  CHAT_VOICE_MAX_DURATION_SECONDS,
+  CHAT_VOICE_MIN_DURATION_SECONDS,
+} from '../../../common/constants/app.constants';
 import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -6,15 +23,30 @@ export enum UserChatMessageType {
   TEXT = 'TEXT',
   IMAGE = 'IMAGE',
   FILE = 'FILE',
+  /** Voice note — wajib lampiran audio + durationSeconds. */
+  VOICE = 'VOICE',
 }
 
 const ALLOWED_CHAT_MIME_TYPES = [
-  'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/heic',
-  'video/mp4', 'video/quicktime', 'video/webm',
-  'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/aac', 'audio/mp4', 'audio/m4a',
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+  'image/heic',
+  'video/mp4',
+  'video/quicktime',
+  'video/webm',
+  'audio/mpeg',
+  'audio/wav',
+  'audio/ogg',
+  'audio/aac',
+  'audio/mp4',
+  'audio/m4a',
   'application/pdf',
-  'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   'text/plain',
 ] as const;
 
@@ -24,7 +56,10 @@ export class ChatAttachmentDto {
   @MaxLength(255)
   fileName!: string;
 
-  @ApiProperty({ description: 'File URL (must be HTTPS; trusted storage domain enforced at service layer)', maxLength: 512 })
+  @ApiProperty({
+    description: 'File URL (must be HTTPS; trusted storage domain enforced at service layer)',
+    maxLength: 512,
+  })
   @IsString()
   @MaxLength(512)
   @Matches(/^https:\/\//, { message: 'fileUrl must be a valid HTTPS URL' })
@@ -34,7 +69,10 @@ export class ChatAttachmentDto {
   @IsIn([...ALLOWED_CHAT_MIME_TYPES], { message: 'Unsupported file type' })
   mimeType!: string;
 
-  @ApiPropertyOptional({ description: 'Thumbnail URL (must be HTTPS; trusted storage domain enforced at service layer)', maxLength: 512 })
+  @ApiPropertyOptional({
+    description: 'Thumbnail URL (must be HTTPS; trusted storage domain enforced at service layer)',
+    maxLength: 512,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(512)
@@ -49,7 +87,11 @@ export class ChatAttachmentDto {
 }
 
 export class SendMessageDto {
-  @ApiPropertyOptional({ enum: UserChatMessageType, description: 'Message type (TEXT, IMAGE, or FILE). SYSTEM is reserved for internal use.', default: 'TEXT' })
+  @ApiPropertyOptional({
+    enum: UserChatMessageType,
+    description: 'Message type (TEXT, IMAGE, FILE, or VOICE). SYSTEM is reserved for internal use.',
+    default: 'TEXT',
+  })
   @IsOptional()
   @IsEnum(UserChatMessageType)
   messageType?: UserChatMessageType = UserChatMessageType.TEXT;
@@ -74,4 +116,15 @@ export class SendMessageDto {
   @Matches(/^[a-z0-9]+$/, { message: 'replyToId must be a valid CUID' })
   @MaxLength(100)
   replyToId?: string;
+
+  @ApiPropertyOptional({
+    description: 'Voice note duration in seconds. Required for VOICE messages.',
+    minimum: CHAT_VOICE_MIN_DURATION_SECONDS,
+    maximum: CHAT_VOICE_MAX_DURATION_SECONDS,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(CHAT_VOICE_MIN_DURATION_SECONDS)
+  @Max(CHAT_VOICE_MAX_DURATION_SECONDS)
+  durationSeconds?: number;
 }

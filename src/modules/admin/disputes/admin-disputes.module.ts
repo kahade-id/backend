@@ -4,9 +4,10 @@ import { AdminDisputesService } from './admin-disputes.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { AuditLogModule } from '../../../common/services/audit-log.module';
 import { UploadModule } from '../../upload/upload.module';
+import { ChatModule } from '../../chat/chat.module';
 
 @Module({
-  imports: [AuditLogModule, UploadModule],
+  imports: [AuditLogModule, UploadModule, ChatModule],
   controllers: [AdminDisputesController],
   providers: [AdminDisputesService, WalletTxSerialService],
   exports: [AdminDisputesService],

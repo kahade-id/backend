@@ -1,5 +1,10 @@
 import { PrismaClient } from '@prisma/client';
-import { initializeCrypto, encryptAES, hmacSHA256, decryptAES } from '../src/common/utils/crypto.util';
+import {
+  initializeCrypto,
+  encryptAES,
+  hmacSHA256,
+  decryptAES,
+} from '../src/common/utils/crypto.util';
 
 const prisma = new PrismaClient();
 
@@ -15,15 +20,20 @@ function isEncrypted(value: string): boolean {
 }
 
 async function main() {
-  const aesKey = process.env.AES_ENCRYPTION_KEY;
+  // AUDIT: this script previously read `AES_ENCRYPTION_KEY` — a variable that
+  // nothing else in the codebase uses — and passed it as `aesKey`, which is not
+  // a property of InitializeCryptoConfig. The script could never run. Use the
+  // same variables the application itself validates (AES_SECRET_KEY), with the
+  // seed-style PII_ENCRYPTION_KEY override kept for parity with prisma/seed.ts.
+  const aesKey = process.env.PII_ENCRYPTION_KEY ?? process.env.AES_SECRET_KEY;
   const hmacKey = process.env.HMAC_SECRET_KEY;
 
   if (!aesKey || !hmacKey) {
-    console.error('ERROR: AES_ENCRYPTION_KEY and HMAC_SECRET_KEY must be set');
+    console.error('ERROR: AES_SECRET_KEY (or PII_ENCRYPTION_KEY) and HMAC_SECRET_KEY must be set');
     process.exit(1);
   }
 
-  initializeCrypto({ aesKey, hmacSecretKey: hmacKey });
+  initializeCrypto({ aesSecretKey: aesKey, hmacSecretKey: hmacKey });
 
   console.log('Starting PII encryption backfill...');
 
@@ -102,7 +112,7 @@ async function main() {
   await prisma.$disconnect();
 }
 
-main().catch((err) => {
+main().catch(err => {
   console.error('Fatal error:', err);
   process.exit(1);
 });

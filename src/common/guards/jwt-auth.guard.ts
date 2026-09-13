@@ -1,5 +1,12 @@
 import {
-  Injectable, CanActivate, ExecutionContext, UnauthorizedException, ServiceUnavailableException, Logger, Inject, Optional,
+  Injectable,
+  CanActivate,
+  ExecutionContext,
+  UnauthorizedException,
+  ServiceUnavailableException,
+  Logger,
+  Inject,
+  Optional,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { JwtService } from '@nestjs/jwt';
@@ -8,9 +15,17 @@ import { Request } from 'express';
 import { IS_PUBLIC_KEY, IS_ADMIN_ROUTE_KEY } from '../decorators/public.decorator';
 import { RedisService } from '../../redis/redis.service';
 import { PrismaService } from '../../prisma/prisma.service';
-import { TOKEN_BLACKLIST, ADMIN_TOKEN_BLACKLIST, SESSION_REVOKED_KEY } from '../constants/redis-keys';
+import {
+  TOKEN_BLACKLIST,
+  ADMIN_TOKEN_BLACKLIST,
+  SESSION_REVOKED_KEY,
+} from '../constants/redis-keys';
 import * as ErrorCodes from '../constants/error-codes';
-import { TOKEN_ISSUER, USER_TOKEN_AUDIENCE, ADMIN_TOKEN_AUDIENCE } from '../../modules/auth/token.service';
+import {
+  TOKEN_ISSUER,
+  USER_TOKEN_AUDIENCE,
+  ADMIN_TOKEN_AUDIENCE,
+} from '../../modules/auth/token.service';
 
 export const ADMIN_JWT_SERVICE = 'ADMIN_JWT_SERVICE';
 
@@ -18,7 +33,6 @@ const CIRCUIT_BREAKER_THRESHOLD = 5;
 const CIRCUIT_BREAKER_RESET_MS = 30_000;
 const CIRCUIT_BREAKER_KEY = 'jwt_guard:circuit:failures';
 const CIRCUIT_BREAKER_TS_KEY = 'jwt_guard:circuit:last_failure';
-
 
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
@@ -79,8 +93,14 @@ export class JwtAuthGuard implements CanActivate {
       const pipeline = client.pipeline();
       pipeline.incr(`${prefix}${CIRCUIT_BREAKER_KEY}`);
       pipeline.set(`${prefix}${CIRCUIT_BREAKER_TS_KEY}`, Date.now().toString());
-      pipeline.expire(`${prefix}${CIRCUIT_BREAKER_KEY}`, Math.ceil(CIRCUIT_BREAKER_RESET_MS / 1000) + 5);
-      pipeline.expire(`${prefix}${CIRCUIT_BREAKER_TS_KEY}`, Math.ceil(CIRCUIT_BREAKER_RESET_MS / 1000) + 5);
+      pipeline.expire(
+        `${prefix}${CIRCUIT_BREAKER_KEY}`,
+        Math.ceil(CIRCUIT_BREAKER_RESET_MS / 1000) + 5,
+      );
+      pipeline.expire(
+        `${prefix}${CIRCUIT_BREAKER_TS_KEY}`,
+        Math.ceil(CIRCUIT_BREAKER_RESET_MS / 1000) + 5,
+      );
       await pipeline.exec();
     } catch (err) {
       this.logger.warn(`Failed to record Redis circuit breaker failure: ${(err as Error).message}`);
@@ -88,7 +108,7 @@ export class JwtAuthGuard implements CanActivate {
     if (this.localCircuitFailureCount === CIRCUIT_BREAKER_THRESHOLD) {
       this.logger.error(
         `Redis circuit breaker OPEN after ${CIRCUIT_BREAKER_THRESHOLD} consecutive failures — ` +
-        `financial endpoints will reject requests for ${CIRCUIT_BREAKER_RESET_MS / 1000}s`,
+          `financial endpoints will reject requests for ${CIRCUIT_BREAKER_RESET_MS / 1000}s`,
       );
     }
   }
@@ -107,7 +127,8 @@ export class JwtAuthGuard implements CanActivate {
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
-      context.getHandler(), context.getClass(),
+      context.getHandler(),
+      context.getClass(),
     ]);
     if (isPublic) {
       // Section 6: rute publik tetap "viewer-aware". Token opsional di-parse
@@ -118,14 +139,18 @@ export class JwtAuthGuard implements CanActivate {
     }
 
     const isAdminRoute = this.reflector.getAllAndOverride<boolean>(IS_ADMIN_ROUTE_KEY, [
-      context.getHandler(), context.getClass(),
+      context.getHandler(),
+      context.getClass(),
     ]);
     if (isAdminRoute) {
       const request = context.switchToHttp().getRequest();
       const token = this.extractTokenFromHeader(request);
 
       if (!token) {
-        throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Admin access token required' });
+        throw new UnauthorizedException({
+          code: ErrorCodes.UNAUTHORIZED,
+          message: 'Admin access token required',
+        });
       }
 
       try {
@@ -136,18 +161,30 @@ export class JwtAuthGuard implements CanActivate {
         });
 
         if (!payload.jti) {
-          throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Admin token missing jti claim' });
+          throw new UnauthorizedException({
+            code: ErrorCodes.UNAUTHORIZED,
+            message: 'Admin token missing jti claim',
+          });
         }
 
         try {
-          const isBlacklisted = await this.redisService.get(ADMIN_TOKEN_BLACKLIST(payload.jti), { throwOnError: true });
+          const isBlacklisted = await this.redisService.get(ADMIN_TOKEN_BLACKLIST(payload.jti), {
+            throwOnError: true,
+          });
           if (isBlacklisted) {
-            throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Token has been revoked' });
+            throw new UnauthorizedException({
+              code: ErrorCodes.UNAUTHORIZED,
+              message: 'Token has been revoked',
+            });
           }
         } catch (redisErr) {
           if (redisErr instanceof UnauthorizedException) throw redisErr;
-          this.logger.warn('Redis unavailable during admin token blacklist check — rejecting request (fail-closed)');
-          throw new ServiceUnavailableException('Service temporarily unavailable. Please try again later.');
+          this.logger.warn(
+            'Redis unavailable during admin token blacklist check — rejecting request (fail-closed)',
+          );
+          throw new ServiceUnavailableException(
+            'Service temporarily unavailable. Please try again later.',
+          );
         }
 
         request.user = payload;
@@ -155,11 +192,21 @@ export class JwtAuthGuard implements CanActivate {
       } catch (error) {
         if (error instanceof UnauthorizedException) throw error;
         if (error instanceof ServiceUnavailableException) throw error;
-        if ((error as Error)?.name === 'JsonWebTokenError' || (error as Error)?.name === 'TokenExpiredError') {
-          throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Invalid or expired admin token' });
+        if (
+          (error as Error)?.name === 'JsonWebTokenError' ||
+          (error as Error)?.name === 'TokenExpiredError'
+        ) {
+          throw new UnauthorizedException({
+            code: ErrorCodes.UNAUTHORIZED,
+            message: 'Invalid or expired admin token',
+          });
         }
-        this.logger.warn('Unexpected error during admin token verification — rejecting request (fail-closed)');
-        throw new ServiceUnavailableException('Service temporarily unavailable. Please try again later.');
+        this.logger.warn(
+          'Unexpected error during admin token verification — rejecting request (fail-closed)',
+        );
+        throw new ServiceUnavailableException(
+          'Service temporarily unavailable. Please try again later.',
+        );
       }
     }
 
@@ -167,7 +214,10 @@ export class JwtAuthGuard implements CanActivate {
     const token = this.extractTokenFromHeader(request) || this.extractTokenFromCookie(request);
 
     if (!token) {
-      throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Access token required' });
+      throw new UnauthorizedException({
+        code: ErrorCodes.UNAUTHORIZED,
+        message: 'Access token required',
+      });
     }
 
     try {
@@ -181,29 +231,48 @@ export class JwtAuthGuard implements CanActivate {
       });
 
       if (!payload.jti || !payload.sessionId) {
-        throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Token missing required session claims' });
+        throw new UnauthorizedException({
+          code: ErrorCodes.UNAUTHORIZED,
+          message: 'Token missing required session claims',
+        });
       }
 
       const blacklistCheckResult = await this.checkBlacklist(payload);
       if (blacklistCheckResult === 'unavailable') {
-        throw new ServiceUnavailableException('Service temporarily unavailable. Please try again later.');
+        throw new ServiceUnavailableException(
+          'Service temporarily unavailable. Please try again later.',
+        );
       }
       if (blacklistCheckResult === 'revoked') {
-        throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Token has been revoked' });
+        throw new UnauthorizedException({
+          code: ErrorCodes.UNAUTHORIZED,
+          message: 'Token has been revoked',
+        });
       }
       if (blacklistCheckResult === 'session_revoked') {
-        throw new UnauthorizedException({ code: ErrorCodes.SESSION_REVOKED, message: 'Session has been revoked' });
+        throw new UnauthorizedException({
+          code: ErrorCodes.SESSION_REVOKED,
+          message: 'Session has been revoked',
+        });
       }
 
       const databaseAuthResult = await this.checkDatabaseAuthorization(payload);
       if (databaseAuthResult === 'unavailable') {
-        throw new ServiceUnavailableException('Service temporarily unavailable. Please try again later.');
+        throw new ServiceUnavailableException(
+          'Service temporarily unavailable. Please try again later.',
+        );
       }
       if (databaseAuthResult === 'revoked') {
-        throw new UnauthorizedException({ code: ErrorCodes.SESSION_REVOKED, message: 'Session has been revoked' });
+        throw new UnauthorizedException({
+          code: ErrorCodes.SESSION_REVOKED,
+          message: 'Session has been revoked',
+        });
       }
       if (databaseAuthResult === 'account_disabled') {
-        throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Invalid or expired token' });
+        throw new UnauthorizedException({
+          code: ErrorCodes.UNAUTHORIZED,
+          message: 'Invalid or expired token',
+        });
       }
 
       request.user = payload;
@@ -211,7 +280,10 @@ export class JwtAuthGuard implements CanActivate {
     } catch (error) {
       if (error instanceof UnauthorizedException) throw error;
       if (error instanceof ServiceUnavailableException) throw error;
-      throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Invalid or expired token' });
+      throw new UnauthorizedException({
+        code: ErrorCodes.UNAUTHORIZED,
+        message: 'Invalid or expired token',
+      });
     }
   }
 
@@ -266,12 +338,15 @@ export class JwtAuthGuard implements CanActivate {
     return this.configService.get<boolean>('app.redisAuthFailOpen') === true;
   }
 
-  private async checkBlacklist(
-    payload: { jti?: string; sessionId?: string },
-  ): Promise<'ok' | 'revoked' | 'session_revoked' | 'unavailable'> {
+  private async checkBlacklist(payload: {
+    jti?: string;
+    sessionId?: string;
+  }): Promise<'ok' | 'revoked' | 'session_revoked' | 'unavailable'> {
     if (await this.isCircuitOpen()) {
       if (this.isFailOpenEnabled()) {
-        this.logger.warn('Redis circuit open — allowing cryptographically valid token (fail-open mode)');
+        this.logger.warn(
+          'Redis circuit open — allowing cryptographically valid token (fail-open mode)',
+        );
         return 'ok';
       }
       this.logger.warn('Redis circuit open — rejecting request (fail-closed)');
@@ -280,7 +355,9 @@ export class JwtAuthGuard implements CanActivate {
 
     try {
       if (payload.jti) {
-        const isBlacklisted = await this.redisService.get(TOKEN_BLACKLIST(payload.jti), { throwOnError: true });
+        const isBlacklisted = await this.redisService.get(TOKEN_BLACKLIST(payload.jti), {
+          throwOnError: true,
+        });
         if (isBlacklisted) {
           await this.recordRedisSuccess();
           return 'revoked';
@@ -288,7 +365,9 @@ export class JwtAuthGuard implements CanActivate {
       }
 
       if (payload.sessionId) {
-        const sessionRevoked = await this.redisService.get(SESSION_REVOKED_KEY(payload.sessionId), { throwOnError: true });
+        const sessionRevoked = await this.redisService.get(SESSION_REVOKED_KEY(payload.sessionId), {
+          throwOnError: true,
+        });
         if (sessionRevoked) {
           await this.recordRedisSuccess();
           return 'session_revoked';
@@ -300,7 +379,9 @@ export class JwtAuthGuard implements CanActivate {
     } catch {
       await this.recordRedisFailure();
       if (this.isFailOpenEnabled()) {
-        this.logger.warn('Redis unavailable — allowing cryptographically valid token (fail-open mode)');
+        this.logger.warn(
+          'Redis unavailable — allowing cryptographically valid token (fail-open mode)',
+        );
         return 'ok';
       }
       this.logger.warn('Redis unavailable — rejecting request (fail-closed)');
@@ -308,9 +389,10 @@ export class JwtAuthGuard implements CanActivate {
     }
   }
 
-  private async checkDatabaseAuthorization(
-    payload: { sub?: string; sessionId?: string },
-  ): Promise<'ok' | 'revoked' | 'account_disabled' | 'unavailable'> {
+  private async checkDatabaseAuthorization(payload: {
+    sub?: string;
+    sessionId?: string;
+  }): Promise<'ok' | 'revoked' | 'account_disabled' | 'unavailable'> {
     if (!payload.sub) return 'revoked';
 
     try {
@@ -325,7 +407,12 @@ export class JwtAuthGuard implements CanActivate {
           },
         });
 
-        if (!session || session.userId !== payload.sub || session.isRevoked || session.expiresAt <= new Date()) {
+        if (
+          !session ||
+          session.userId !== payload.sub ||
+          session.isRevoked ||
+          session.expiresAt <= new Date()
+        ) {
           return 'revoked';
         }
         if (!session.user.isActive || session.user.isBanned || session.user.deletedAt) {

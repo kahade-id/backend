@@ -2,7 +2,12 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
-import { PaymentStatus, WalletTransactionStatus, WalletTransactionType, Prisma } from '@prisma/client';
+import {
+  PaymentStatus,
+  WalletTransactionStatus,
+  WalletTransactionType,
+  Prisma,
+} from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { cronJitter } from '../../../common/utils/cron-jitter.util';
@@ -23,7 +28,10 @@ export class PendingTopupCleanupService {
     private midtransService: MidtransService,
     private walletService: WalletService,
   ) {
-    this.topupExpiryHours = Math.max(1, this.configService.get<number>('app.topupExpiryHours') ?? 24);
+    this.topupExpiryHours = Math.max(
+      1,
+      this.configService.get<number>('app.topupExpiryHours') ?? 24,
+    );
   }
 
   // SCH-017: Runs every hour to cleanup stale PENDING topup transactions
@@ -39,22 +47,35 @@ export class PendingTopupCleanupService {
     if (!acquired) return;
 
     let lockLost = false;
-    const lockRenewal = setInterval(async () => {
-      const renewed = await this.redis.renewLock(lockKey, lockToken, lockTtl);
-      if (!renewed) {
-        lockLost = true;
-        clearInterval(lockRenewal);
-        this.logger.warn('Pending top-up cleanup lock ownership was lost; stopping after the current batch.');
-      }
-    }, Math.floor(lockTtl * 0.6) * 1000);
+    const lockRenewal = setInterval(
+      () => {
+        // AUDIT: keep the interval callback synchronous — an async callback
+        // risks overlapping ticks and unhandled rejections when renewLock throws.
+        void (async () => {
+          const renewed = await this.redis.renewLock(lockKey, lockToken, lockTtl);
+          if (!renewed) {
+            lockLost = true;
+            clearInterval(lockRenewal);
+            this.logger.warn(
+              'Pending top-up cleanup lock ownership was lost; stopping after the current batch.',
+            );
+          }
+        })().catch((err: unknown) => {
+          this.logger.error(`Lock renewal check failed: ${(err as Error).message}`);
+        });
+      },
+      Math.floor(lockTtl * 0.6) * 1000,
+    );
 
     const bufferHours = Math.max(1, Math.ceil(this.topupExpiryHours * 0.25));
     const expiryMs = (this.topupExpiryHours + bufferHours) * 60 * 60 * 1000;
     const expiryThreshold = new Date(Date.now() - expiryMs);
 
     try {
-      if (lockLost || await this.redis.get(lockKey) !== lockToken) {
-        this.logger.warn('Pending top-up cleanup lock ownership was lost; aborting before candidate fetch.');
+      if (lockLost || (await this.redis.get(lockKey)) !== lockToken) {
+        this.logger.warn(
+          'Pending top-up cleanup lock ownership was lost; aborting before candidate fetch.',
+        );
         return;
       }
 
@@ -72,13 +93,24 @@ export class PendingTopupCleanupService {
 
       if (staleTopups.length === 0) return;
 
-      this.logger.log(`Found ${staleTopups.length} stale PENDING topup transactions — reconciling before cleanup.`);
+      this.logger.log(
+        `Found ${staleTopups.length} stale PENDING topup transactions — reconciling before cleanup.`,
+      );
 
       // A stale local row is not proof that the provider charge failed. Re-check
       // Midtrans before releasing the daily limit: a missed settlement webhook or
       // a delayed provider response must not turn a paid top-up into FAILED.
       const providerConfirmedFailures: typeof staleTopups = [];
-      const terminalFailureStatuses = new Set(['deny', 'expire', 'cancel', 'failure', 'refund', 'partial_refund', 'chargeback', 'partial_chargeback']);
+      const terminalFailureStatuses = new Set([
+        'deny',
+        'expire',
+        'cancel',
+        'failure',
+        'refund',
+        'partial_refund',
+        'chargeback',
+        'partial_chargeback',
+      ]);
       for (const tx of staleTopups) {
         if (lockLost) break;
         if (!tx.paymentTx) {
@@ -89,37 +121,53 @@ export class PendingTopupCleanupService {
         }
 
         try {
-          const providerTx = await this.midtransService.getTransactionStatus(tx.paymentTx.midtransOrderId);
-          const providerStatus = typeof providerTx.transaction_status === 'string'
-            ? providerTx.transaction_status.toLowerCase()
-            : '';
+          const providerTx = await this.midtransService.getTransactionStatus(
+            tx.paymentTx.midtransOrderId,
+          );
+          const providerStatus =
+            typeof providerTx.transaction_status === 'string'
+              ? providerTx.transaction_status.toLowerCase()
+              : '';
 
           if (providerStatus === 'settlement') {
-            const grossAmount = typeof providerTx.gross_amount === 'string' ? providerTx.gross_amount : undefined;
+            const grossAmount =
+              typeof providerTx.gross_amount === 'string' ? providerTx.gross_amount : undefined;
             await this.walletService.handleTopupSuccess(tx.paymentTx.midtransOrderId, grossAmount);
-            this.logger.log(`Pending top-up ${tx.paymentTx.midtransOrderId} settled during provider reconciliation`);
+            this.logger.log(
+              `Pending top-up ${tx.paymentTx.midtransOrderId} settled during provider reconciliation`,
+            );
             continue;
           }
 
           if (providerStatus === 'capture') {
-            const fraudStatus = typeof providerTx.fraud_status === 'string'
-              ? providerTx.fraud_status.toLowerCase()
-              : '';
+            const fraudStatus =
+              typeof providerTx.fraud_status === 'string'
+                ? providerTx.fraud_status.toLowerCase()
+                : '';
             if (fraudStatus === 'accept') {
-              const grossAmount = typeof providerTx.gross_amount === 'string' ? providerTx.gross_amount : undefined;
-              await this.walletService.handleTopupSuccess(tx.paymentTx.midtransOrderId, grossAmount);
-              this.logger.log(`Pending top-up ${tx.paymentTx.midtransOrderId} capture+accept settled during provider reconciliation`);
+              const grossAmount =
+                typeof providerTx.gross_amount === 'string' ? providerTx.gross_amount : undefined;
+              await this.walletService.handleTopupSuccess(
+                tx.paymentTx.midtransOrderId,
+                grossAmount,
+              );
+              this.logger.log(
+                `Pending top-up ${tx.paymentTx.midtransOrderId} capture+accept settled during provider reconciliation`,
+              );
               continue;
             }
             if (fraudStatus === 'deny') {
               providerConfirmedFailures.push(tx);
-              this.logger.log(`Pending top-up ${tx.paymentTx.midtransOrderId} capture+deny failed during provider reconciliation`);
+              this.logger.log(
+                `Pending top-up ${tx.paymentTx.midtransOrderId} capture+deny failed during provider reconciliation`,
+              );
               continue;
             }
 
-            const reviewSignal = fraudStatus === 'challenge'
-              ? 'challenge'
-              : `unknown:${fraudStatus.slice(0, 32) || 'missing'}`;
+            const reviewSignal =
+              fraudStatus === 'challenge'
+                ? 'challenge'
+                : `unknown:${fraudStatus.slice(0, 32) || 'missing'}`;
             await this.prisma.paymentTransaction.updateMany({
               where: { id: tx.paymentTx.id, status: PaymentStatus.PENDING },
               data: { fraudStatus: reviewSignal, webhookReceivedAt: new Date() },
@@ -141,13 +189,15 @@ export class PendingTopupCleanupService {
         } catch (error) {
           this.logger.warn(
             `Pending top-up ${tx.paymentTx.midtransOrderId} retained because provider status is unavailable: ` +
-            `${error instanceof Error ? error.message : String(error)}`,
+              `${error instanceof Error ? error.message : String(error)}`,
           );
         }
       }
 
-      if (lockLost || await this.redis.get(lockKey) !== lockToken) {
-        this.logger.warn('Pending top-up cleanup lock ownership was lost; aborting before wallet updates.');
+      if (lockLost || (await this.redis.get(lockKey)) !== lockToken) {
+        this.logger.warn(
+          'Pending top-up cleanup lock ownership was lost; aborting before wallet updates.',
+        );
         return;
       }
       if (providerConfirmedFailures.length === 0) return;
@@ -163,62 +213,69 @@ export class PendingTopupCleanupService {
 
       const MAX_OCC_RETRIES = 3;
       for (const [walletId, txs] of walletGroups) {
-        if (lockLost || await this.redis.get(lockKey) !== lockToken) {
-          this.logger.warn('Pending top-up cleanup lock ownership was lost; aborting before the next wallet.');
+        if (lockLost || (await this.redis.get(lockKey)) !== lockToken) {
+          this.logger.warn(
+            'Pending top-up cleanup lock ownership was lost; aborting before the next wallet.',
+          );
           return;
         }
         let succeeded = false;
         for (let attempt = 1; attempt <= MAX_OCC_RETRIES && !succeeded; attempt++) {
           try {
-            await this.prisma.$transaction(async (client) => {
-              const wallet = await client.wallet.findUnique({ where: { id: walletId } });
-              if (!wallet) {
-                this.logger.warn(`PendingTopupCleanup: wallet ${walletId} not found, skipping`);
-                return;
-              }
+            await this.prisma.$transaction(
+              async client => {
+                const wallet = await client.wallet.findUnique({ where: { id: walletId } });
+                if (!wallet) {
+                  this.logger.warn(`PendingTopupCleanup: wallet ${walletId} not found, skipping`);
+                  return;
+                }
 
-              let todayTopupRollback = BigInt(0);
+                let todayTopupRollback = BigInt(0);
 
-              for (const tx of txs) {
-                const updated = await client.walletTransaction.updateMany({
-                  where: { id: tx.id, status: WalletTransactionStatus.PENDING },
-                  data: {
-                    status: WalletTransactionStatus.FAILED,
-                    description: 'Auto-failed: stale PENDING topup (no Midtrans charge completed)',
-                  },
-                });
+                for (const tx of txs) {
+                  const updated = await client.walletTransaction.updateMany({
+                    where: { id: tx.id, status: WalletTransactionStatus.PENDING },
+                    data: {
+                      status: WalletTransactionStatus.FAILED,
+                      description:
+                        'Auto-failed: stale PENDING topup (no Midtrans charge completed)',
+                    },
+                  });
 
-                if (updated.count > 0) {
-                  if (tx.paymentTx && tx.paymentTx.status === PaymentStatus.PENDING) {
-                    await client.paymentTransaction.updateMany({
-                      where: { id: tx.paymentTx.id, status: PaymentStatus.PENDING },
-                      data: { status: PaymentStatus.FAILED, failedAt: new Date() },
-                    });
-                  }
+                  if (updated.count > 0) {
+                    if (tx.paymentTx && tx.paymentTx.status === PaymentStatus.PENDING) {
+                      await client.paymentTransaction.updateMany({
+                        where: { id: tx.paymentTx.id, status: PaymentStatus.PENDING },
+                        data: { status: PaymentStatus.FAILED, failedAt: new Date() },
+                      });
+                    }
 
-                  if (tx.createdAt >= todayStart) {
-                    todayTopupRollback += tx.amount;
+                    if (tx.createdAt >= todayStart) {
+                      todayTopupRollback += tx.amount;
+                    }
                   }
                 }
-              }
 
-              if (todayTopupRollback > BigInt(0)) {
-                const rollbackData = wallet.todayTopupAmount >= todayTopupRollback
-                  ? { todayTopupAmount: { decrement: todayTopupRollback } }
-                  : { todayTopupAmount: { set: BigInt(0) } };
+                if (todayTopupRollback > BigInt(0)) {
+                  const rollbackData =
+                    wallet.todayTopupAmount >= todayTopupRollback
+                      ? { todayTopupAmount: { decrement: todayTopupRollback } }
+                      : { todayTopupAmount: { set: BigInt(0) } };
 
-                const walletUpdated = await client.wallet.updateMany({
-                  where: { id: walletId, version: wallet.version },
-                  data: {
-                    ...rollbackData,
-                    version: { increment: 1 },
-                  },
-                });
-                if (walletUpdated.count === 0) {
-                  throw new Error(`PendingTopupCleanup OCC conflict for wallet ${walletId}`);
+                  const walletUpdated = await client.wallet.updateMany({
+                    where: { id: walletId, version: wallet.version },
+                    data: {
+                      ...rollbackData,
+                      version: { increment: 1 },
+                    },
+                  });
+                  if (walletUpdated.count === 0) {
+                    throw new Error(`PendingTopupCleanup OCC conflict for wallet ${walletId}`);
+                  }
                 }
-              }
-            }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+              },
+              { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+            );
             succeeded = true;
           } catch (err) {
             if (attempt === MAX_OCC_RETRIES) {
@@ -226,7 +283,9 @@ export class PendingTopupCleanupService {
                 `PendingTopupCleanup: wallet ${walletId} cleanup failed after ${MAX_OCC_RETRIES} retries — will retry next tick: ${err instanceof Error ? err.message : String(err)}`,
               );
             } else {
-              this.logger.warn(`PendingTopupCleanup: wallet ${walletId} OCC conflict, retry ${attempt}/${MAX_OCC_RETRIES}`);
+              this.logger.warn(
+                `PendingTopupCleanup: wallet ${walletId} OCC conflict, retry ${attempt}/${MAX_OCC_RETRIES}`,
+              );
               await new Promise(r => setTimeout(r, 150 * attempt));
             }
           }
@@ -236,7 +295,11 @@ export class PendingTopupCleanupService {
       this.logger.error('PendingTopupCleanup FAILED', error);
     } finally {
       clearInterval(lockRenewal);
-      await this.redis.releaseLock(lockKey, lockToken).catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
+      await this.redis
+        .releaseLock(lockKey, lockToken)
+        .catch(err =>
+          this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`),
+        );
     }
   }
 }

@@ -9,10 +9,8 @@ for Kahade, a P2P escrow platform for Indonesia (PT Kawal Hak Dengan Aman).
 ## Quick start (local)
 
 ```bash
-# 1. Install deps (from the monorepo root)
-cd ../..
-pnpm install --frozen-lockfile
-cd apps/backend
+# 1. Install deps (this repo is standalone; Node 20+ required)
+npm install
 
 # 2. Configure env
 cp .env.example .env
@@ -74,7 +72,7 @@ src/
     └── …                   # ~24 feature modules
 prisma/
 ├── schema.prisma           # 69 models, 57 enums
-└── migrations/             # 56 migrations (kept in source control)
+└── migrations/             # 57 migrations (kept in source control)
 test/
 └── critical-flows.e2e-spec.ts
 ```
@@ -87,6 +85,8 @@ test/
 | `npm run build` | `nest build` → `dist/`. |
 | `npm run start` | `node dist/main` (production runtime). |
 | `npm run lint` | ESLint over `src/` and `test/`. |
+| `npm run typecheck` | `tsc --noEmit` over `src/` + `test/`. |
+| `npm run typecheck:all` | Type-check also covers `scripts/` and `prisma/` (seed, ops scripts). |
 | `npm run test` | Jest unit tests (`src/**/*.spec.ts`). |
 | `npm run test:cov` | Jest with coverage (threshold 70% on whitelisted files). |
 | `npm run test:e2e` | E2E tests in `test/`. |
@@ -136,9 +136,9 @@ Key invariants enforced:
 3. Open a PR — CI runs lint + build + test with coverage.
 4. The team uses **conventional commits** (`feat:`, `fix:`, `chore:`, …).
 
-> The `kahade-id/backend` GitHub repo is published from a private monorepo via
-> [`scripts/release.sh`](../mobile/scripts/release.sh) in the mobile repo. PRs
-> opened directly against this mirror are reviewed and back-ported.
+> The `kahade-id/backend` GitHub repo is published from a private upstream
+> repository. PRs opened directly against this mirror are reviewed and
+> back-ported.
 
 ## License
 

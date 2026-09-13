@@ -1,10 +1,4 @@
-import {
-  Injectable,
-  CanActivate,
-  ExecutionContext,
-  ForbiddenException,
-  Logger,
-} from '@nestjs/common';
+import { Injectable, CanActivate, ExecutionContext, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import * as ErrorCodes from '../constants/error-codes';
@@ -14,8 +8,6 @@ const PHONE_CACHE_TTL = 300;
 
 @Injectable()
 export class PhoneVerifiedGuard implements CanActivate {
-  private readonly logger = new Logger(PhoneVerifiedGuard.name);
-
   constructor(
     private prisma: PrismaService,
     private redis: RedisService,

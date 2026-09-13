@@ -7,13 +7,27 @@ import { requestContext } from '../../prisma/prisma.service';
  * entry, so any service-level `this.logger.log('...')` call automatically carries
  * the correlation id set by RequestIdInterceptor.
  */
-const requestIdInjector = winston.format((info) => {
+const requestIdInjector = winston.format(info => {
   const store = requestContext.getStore();
   if (store?.requestId && info.requestId === undefined) {
     (info as unknown as { requestId: string }).requestId = store.requestId;
   }
   return info;
 });
+
+/**
+ * Render a logger `context` without ever producing "[object Object]":
+ * strings pass through, anything else is JSON-serialised (circular-safe).
+ */
+function safeContext(context: unknown): string {
+  if (typeof context === 'string') return context;
+  if (context === null || context === undefined) return '';
+  try {
+    return JSON.stringify(context) ?? String(context);
+  } catch {
+    return String(context);
+  }
+}
 
 /**
  * NestJS built-in Logger writes plain text to stdout, which cannot be parsed by
@@ -37,17 +51,28 @@ export function createWinstonLogger(): ReturnType<typeof WinstonModule.createLog
           requestIdInjector(),
           winston.format.timestamp(),
           winston.format.errors({ stack: true }),
-          winston.format.printf((info) => {
+          winston.format.printf(info => {
             const redact = (text: unknown): unknown => {
               if (typeof text !== 'string') return text;
               return text
                 .replace(/\bNIK[:\s=]+\d{16}\b/gi, 'NIK:****************')
-                .replace(/\b(?:account|rekening|norek)[_\s]*(?:number|no)?[:\s=]+\d{10,16}\b/gi, (m) => m.replace(/\d+/, '**********'))
+                .replace(
+                  /\b(?:account|rekening|norek)[_\s]*(?:number|no)?[:\s=]+\d{10,16}\b/gi,
+                  m => m.replace(/\d+/, '**********'),
+                )
                 .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z]{2,}\b/gi, '[EMAIL_REDACTED]')
                 .replace(/(?:\+62|62|0)8\d{8,12}\b/g, '[PHONE_REDACTED]')
-                .replace(/\b(?:password|passwd|secret|token)[:\s=]+\S+/gi, (m) => m.replace(/[:\s=]+\S+/, '=[REDACTED]'))
-                .replace(/\b[A-Z]{2}\d{2}[\s]?[A-Z0-9]{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{0,2}\b/g, '[IBAN_REDACTED]')
-                .replace(/\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\b/g, '[CARD_REDACTED]');
+                .replace(/\b(?:password|passwd|secret|token)[:\s=]+\S+/gi, m =>
+                  m.replace(/[:\s=]+\S+/, '=[REDACTED]'),
+                )
+                .replace(
+                  /\b[A-Z]{2}\d{2}[\s]?[A-Z0-9]{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{0,2}\b/g,
+                  '[IBAN_REDACTED]',
+                )
+                .replace(
+                  /\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\b/g,
+                  '[CARD_REDACTED]',
+                );
             };
             if (info.message) info.message = redact(info.message);
             if (info.stack) info.stack = redact(info.stack);
@@ -64,16 +89,29 @@ export function createWinstonLogger(): ReturnType<typeof WinstonModule.createLog
               if (typeof text !== 'string') return text;
               return text
                 .replace(/\bNIK[:\s=]+\d{16}\b/gi, 'NIK:****************')
-                .replace(/\b(?:account|rekening|norek)[_\s]*(?:number|no)?[:\s=]+\d{10,16}\b/gi, (m) => m.replace(/\d+/, '**********'))
+                .replace(
+                  /\b(?:account|rekening|norek)[_\s]*(?:number|no)?[:\s=]+\d{10,16}\b/gi,
+                  m => m.replace(/\d+/, '**********'),
+                )
                 .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z]{2,}\b/gi, '[EMAIL_REDACTED]')
                 .replace(/(?:\+62|62|0)8\d{8,12}\b/g, '[PHONE_REDACTED]')
-                .replace(/\b(?:password|passwd|secret|token)[:\s=]+\S+/gi, (m) => m.replace(/[:\s=]+\S+/, '=[REDACTED]'))
-                .replace(/\b[A-Z]{2}\d{2}[\s]?[A-Z0-9]{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{0,2}\b/g, '[IBAN_REDACTED]')
-                .replace(/\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\b/g, '[CARD_REDACTED]');
+                .replace(/\b(?:password|passwd|secret|token)[:\s=]+\S+/gi, m =>
+                  m.replace(/[:\s=]+\S+/, '=[REDACTED]'),
+                )
+                .replace(
+                  /\b[A-Z]{2}\d{2}[\s]?[A-Z0-9]{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{0,2}\b/g,
+                  '[IBAN_REDACTED]',
+                )
+                .replace(
+                  /\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\b/g,
+                  '[CARD_REDACTED]',
+                );
             };
             const msg = redact(message as string);
             const trc = trace ? redact(trace as string) : '';
-            const ctx = context ? `[${context}]` : '';
+            // `context` is normally a logger name string, but call sites may
+            // pass an object; interpolating it directly would emit "[object Object]".
+            const ctx = context ? `[${safeContext(context)}]` : '';
             const rid = requestId ? ` (req=${String(requestId).slice(0, 8)})` : '';
             return `${timestamp} ${level} ${ctx} ${msg}${rid}${trc ? `\n${trc}` : ''}`;
           }),

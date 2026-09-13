@@ -17,11 +17,16 @@ export class ExpireUnpaidOrdersService {
     private redis: RedisService,
   ) {}
 
-  private emitRealtimeBestEffort(payload: { userId: string; title: string; body: string; data: Record<string, string> }, label: string): void {
+  private emitRealtimeBestEffort(
+    payload: { userId: string; title: string; body: string; data: Record<string, string> },
+    label: string,
+  ): void {
     try {
       this.prisma.emitNotificationCreated(payload);
     } catch (error: unknown) {
-      this.logger.warn(`${label} realtime notification failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.logger.warn(
+        `${label} realtime notification failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
@@ -36,21 +41,31 @@ export class ExpireUnpaidOrdersService {
     if (!acquired) return;
 
     let lockLost = false;
-    const lockRenewalInterval = setInterval(async () => {
-      const renewed = await this.redis.renewLock(lockKey, lockToken, 600);
-      if (!renewed) {
-        lockLost = true;
-        clearInterval(lockRenewalInterval);
-        this.logger.warn('Expire unpaid orders lock ownership was lost; stopping after the current batch.');
-      }
+    const lockRenewalInterval = setInterval(() => {
+      // AUDIT: keep the interval callback synchronous — an async callback
+      // risks overlapping ticks and unhandled rejections when renewLock throws.
+      void (async () => {
+        const renewed = await this.redis.renewLock(lockKey, lockToken, 600);
+        if (!renewed) {
+          lockLost = true;
+          clearInterval(lockRenewalInterval);
+          this.logger.warn(
+            'Expire unpaid orders lock ownership was lost; stopping after the current batch.',
+          );
+        }
+      })().catch((err: unknown) => {
+        this.logger.error(`Lock renewal check failed: ${(err as Error).message}`);
+      });
     }, 60_000);
 
     const now = new Date();
     try {
       let hasMore = true;
       while (hasMore) {
-        if (lockLost || await this.redis.get(lockKey) !== lockToken) {
-          this.logger.warn('Expire unpaid orders lock ownership was lost; aborting before the next batch.');
+        if (lockLost || (await this.redis.get(lockKey)) !== lockToken) {
+          this.logger.warn(
+            'Expire unpaid orders lock ownership was lost; aborting before the next batch.',
+          );
           return;
         }
         const expiredOrders = await this.prisma.order.findMany({
@@ -59,90 +74,126 @@ export class ExpireUnpaidOrdersService {
             paymentDeadlineAt: { lt: now },
             deletedAt: null, // R2-J (audit): never auto-cancel (or notify about) soft-deleted orders
           },
-          select: { id: true, orderId: true, title: true, buyerId: true, sellerId: true, voucherId: true },
+          select: {
+            id: true,
+            orderId: true,
+            title: true,
+            buyerId: true,
+            sellerId: true,
+            voucherId: true,
+          },
           take: 500,
         });
 
-        if (expiredOrders.length === 0) { hasMore = false; break; }
+        if (expiredOrders.length === 0) {
+          hasMore = false;
+          break;
+        }
         hasMore = expiredOrders.length === 500;
 
         this.logger.log(`Found ${expiredOrders.length} unpaid orders past deadline — expiring.`);
 
         for (const order of expiredOrders) {
           try {
-            const didExpire = await this.prisma.$transaction(async (tx) => {
-              const updated = await tx.order.updateMany({
-                where: { id: order.id, status: OrderStatus.WAITING_PAYMENT, paymentDeadlineAt: { lt: now }, deletedAt: null },
-                data: {
-                  status: OrderStatus.CANCELLED,
-                  cancelledAt: new Date(),
-                  cancelReason: 'TIMEOUT_PAYMENT',
-                },
-              });
-              if (updated.count === 0) return false;
-
-              await tx.orderStatusHistory.create({
-                data: {
-                  orderId: order.id,
-                  fromStatus: OrderStatus.WAITING_PAYMENT,
-                  toStatus: OrderStatus.CANCELLED,
-                  changedBy: 'SYSTEM',
-                  changedByType: ActorType.SYSTEM,
-                  reason: 'Auto-expired: payment deadline exceeded',
-                },
-              });
-
-              if (order.voucherId) {
-                const deletedVoucherUsage = await tx.voucherUsage.deleteMany({
-                  where: { orderId: order.id, voucherId: order.voucherId },
+            const didExpire = await this.prisma.$transaction(
+              async tx => {
+                const updated = await tx.order.updateMany({
+                  where: {
+                    id: order.id,
+                    status: OrderStatus.WAITING_PAYMENT,
+                    paymentDeadlineAt: { lt: now },
+                    deletedAt: null,
+                  },
+                  data: {
+                    status: OrderStatus.CANCELLED,
+                    cancelledAt: new Date(),
+                    cancelReason: 'TIMEOUT_PAYMENT',
+                  },
                 });
-                if (deletedVoucherUsage.count > 0) {
-                  await tx.voucher.updateMany({
-                    where: { id: order.voucherId, currentUsage: { gt: 0 } },
-                    data: { currentUsage: { decrement: 1 } },
-                  });
-                }
-              }
+                if (updated.count === 0) return false;
 
-              return true;
-            }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+                await tx.orderStatusHistory.create({
+                  data: {
+                    orderId: order.id,
+                    fromStatus: OrderStatus.WAITING_PAYMENT,
+                    toStatus: OrderStatus.CANCELLED,
+                    changedBy: 'SYSTEM',
+                    changedByType: ActorType.SYSTEM,
+                    reason: 'Auto-expired: payment deadline exceeded',
+                  },
+                });
+
+                if (order.voucherId) {
+                  const deletedVoucherUsage = await tx.voucherUsage.deleteMany({
+                    where: { orderId: order.id, voucherId: order.voucherId },
+                  });
+                  if (deletedVoucherUsage.count > 0) {
+                    await tx.voucher.updateMany({
+                      where: { id: order.voucherId, currentUsage: { gt: 0 } },
+                      data: { currentUsage: { decrement: 1 } },
+                    });
+                  }
+                }
+
+                return true;
+              },
+              { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+            );
 
             if (!didExpire) continue;
 
-            this.prisma.notification.create({
-              data: {
-                notifId: generateNotifId(),
+            this.prisma.notification
+              .create({
+                data: {
+                  notifId: generateNotifId(),
+                  userId: order.buyerId,
+                  type: NotificationType.ORDER_CANCELLED_TIMEOUT,
+                  category: getCategoryForType(NotificationType.ORDER_CANCELLED_TIMEOUT),
+                  title: 'Order Cancelled',
+                  body: `Order "${order.title}" has been cancelled because the payment deadline has passed.`,
+                  isRead: false,
+                },
+              })
+              .catch((notificationError: unknown) =>
+                this.logger.warn(
+                  `silent-catch: unpaid buyer notification failed: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`,
+                ),
+              );
+            this.prisma.notification
+              .create({
+                data: {
+                  notifId: generateNotifId(),
+                  userId: order.sellerId,
+                  type: NotificationType.ORDER_CANCELLED_TIMEOUT,
+                  category: getCategoryForType(NotificationType.ORDER_CANCELLED_TIMEOUT),
+                  title: 'Order Cancelled',
+                  body: `Order "${order.title}" has been cancelled because the buyer did not pay before the deadline.`,
+                  isRead: false,
+                },
+              })
+              .catch((notificationError: unknown) =>
+                this.logger.warn(
+                  `silent-catch: unpaid seller notification failed: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`,
+                ),
+              );
+            this.emitRealtimeBestEffort(
+              {
                 userId: order.buyerId,
-                type: NotificationType.ORDER_CANCELLED_TIMEOUT,
-                category: getCategoryForType(NotificationType.ORDER_CANCELLED_TIMEOUT),
                 title: 'Order Cancelled',
                 body: `Order "${order.title}" has been cancelled because the payment deadline has passed.`,
-                isRead: false,
+                data: { type: 'ORDER_CANCELLED', orderId: order.orderId },
               },
-            }).catch((notificationError: unknown) => this.logger.warn(`silent-catch: unpaid buyer notification failed: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`));
-            this.prisma.notification.create({
-              data: {
-                notifId: generateNotifId(),
+              'EXPIRE_UNPAID_BUYER',
+            );
+            this.emitRealtimeBestEffort(
+              {
                 userId: order.sellerId,
-                type: NotificationType.ORDER_CANCELLED_TIMEOUT,
-                category: getCategoryForType(NotificationType.ORDER_CANCELLED_TIMEOUT),
                 title: 'Order Cancelled',
                 body: `Order "${order.title}" has been cancelled because the buyer did not pay before the deadline.`,
-                isRead: false,
+                data: { type: 'ORDER_CANCELLED', orderId: order.orderId },
               },
-            }).catch((notificationError: unknown) => this.logger.warn(`silent-catch: unpaid seller notification failed: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`));
-            this.emitRealtimeBestEffort({
-              userId: order.buyerId,
-              title: 'Order Cancelled',
-              body: `Order "${order.title}" has been cancelled because the payment deadline has passed.`,
-              data: { type: 'ORDER_CANCELLED', orderId: order.orderId },
-            }, 'EXPIRE_UNPAID_BUYER');
-            this.emitRealtimeBestEffort({
-              userId: order.sellerId,
-              title: 'Order Cancelled',
-              body: `Order "${order.title}" has been cancelled because the buyer did not pay before the deadline.`,
-              data: { type: 'ORDER_CANCELLED', orderId: order.orderId },
-            }, 'EXPIRE_UNPAID_SELLER');
+              'EXPIRE_UNPAID_SELLER',
+            );
 
             this.logger.log(`Expired unpaid order ${order.orderId}`);
           } catch (err: unknown) {
@@ -155,7 +206,11 @@ export class ExpireUnpaidOrdersService {
       this.logger.error('ExpireUnpaidOrders FAILED', error);
     } finally {
       clearInterval(lockRenewalInterval);
-      await this.redis.releaseLock(lockKey, lockToken).catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
+      await this.redis
+        .releaseLock(lockKey, lockToken)
+        .catch(err =>
+          this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`),
+        );
     }
   }
 }

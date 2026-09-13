@@ -1,10 +1,21 @@
-import { Controller, Post, Get, Body, Query, Req, Res, HttpCode, HttpStatus, UnauthorizedException, UseGuards } from '@nestjs/common';
+import {
+  Controller,
+  Post,
+  Get,
+  Body,
+  Query,
+  Req,
+  Res,
+  HttpCode,
+  HttpStatus,
+  UnauthorizedException,
+  UseGuards,
+} from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { Throttle } from '@nestjs/throttler';
 import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
-import { TokenService } from './token.service';
 import { CaptchaService } from './captcha.service';
 import { OtpGatewayService, OtpDeliveryMethod } from './otp-gateway.service';
 import { CsrfService } from '../../common/services/csrf.service';
@@ -43,7 +54,6 @@ import {
 export class AuthController {
   constructor(
     private authService: AuthService,
-    private tokenService: TokenService,
     private configService: ConfigService,
     private csrfService: CsrfService,
     private captchaService: CaptchaService,
@@ -65,14 +75,16 @@ export class AuthController {
   }
 
   private useSecureAuthCookies(): boolean {
-    const nodeEnv = this.configService.get<string>('app.nodeEnv') ?? process.env.NODE_ENV ?? 'production';
+    const nodeEnv =
+      this.configService.get<string>('app.nodeEnv') ?? process.env.NODE_ENV ?? 'production';
     const appUrl = this.configService.get<string>('app.appUrl') ?? '';
     let isLocalHttpDevelopment = false;
     try {
       const parsedUrl = new URL(appUrl);
-      isLocalHttpDevelopment = ['development', 'test'].includes(nodeEnv)
-        && parsedUrl.protocol === 'http:'
-        && ['localhost', '127.0.0.1'].includes(parsedUrl.hostname.toLowerCase());
+      isLocalHttpDevelopment =
+        ['development', 'test'].includes(nodeEnv) &&
+        parsedUrl.protocol === 'http:' &&
+        ['localhost', '127.0.0.1'].includes(parsedUrl.hostname.toLowerCase());
     } catch {
       // Invalid app URLs are rejected by startup validation; keep cookies secure here.
     }
@@ -123,10 +135,17 @@ export class AuthController {
   async register(@Body() dto: RegisterDto, @Req() req: Request): Promise<{ message: string }> {
     const emailAuthEnabled = this.configService.get<boolean>('app.emailAuthEnabled') ?? false;
     if (!emailAuthEnabled) {
-      throw new UnauthorizedException({ code: 'EMAIL_AUTH_DISABLED', message: 'Email/password registration is not available. Please use phone number registration.' });
+      throw new UnauthorizedException({
+        code: 'EMAIL_AUTH_DISABLED',
+        message:
+          'Email/password registration is not available. Please use phone number registration.',
+      });
     }
     if (!dto.captchaId || dto.captchaAnswer === undefined) {
-      throw new UnauthorizedException({ code: ErrorCodes.CAPTCHA_REQUIRED, message: 'Captcha verification is required' });
+      throw new UnauthorizedException({
+        code: ErrorCodes.CAPTCHA_REQUIRED,
+        message: 'Captcha verification is required',
+      });
     }
     await this.captchaService.verifyChallenge(dto.captchaId, dto.captchaAnswer);
     return this.authService.register(dto, req.ip);
@@ -163,7 +182,13 @@ export class AuthController {
     @Res({ passthrough: true }) res: Response,
   ): Promise<Record<string, unknown>> {
     const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
-    const result = await this.authService.verifyPhoneOtp(dto.phoneNumber, dto.code, dto.deviceId, dto.deviceInfo, ipAddress);
+    const result = await this.authService.verifyPhoneOtp(
+      dto.phoneNumber,
+      dto.code,
+      dto.deviceId,
+      dto.deviceInfo,
+      ipAddress,
+    );
 
     if (result.status === 'existing_user' && 'refreshToken' in result && result.refreshToken) {
       this.setRefreshTokenCookie(res, result.refreshToken);
@@ -206,7 +231,14 @@ export class AuthController {
     @Req() req: Request,
   ): Promise<{ message: string }> {
     const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
-    return this.authService.requestPhoneChange(userId, dto.newPhoneNumber, dto.currentPassword, dto.method, dto.mfaCode, ipAddress);
+    return this.authService.requestPhoneChange(
+      userId,
+      dto.newPhoneNumber,
+      dto.currentPassword,
+      dto.method,
+      dto.mfaCode,
+      ipAddress,
+    );
   }
 
   @Throttle({ default: { ttl: 60000, limit: 5 } })
@@ -224,7 +256,10 @@ export class AuthController {
   @UseGuards(UserThrottleGuard)
   @Post('set-username')
   @HttpCode(HttpStatus.OK)
-  async setUsername(@CurrentUser('sub') userId: string, @Body() dto: SetUsernameDto): Promise<{ user: Record<string, unknown> }> {
+  async setUsername(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: SetUsernameDto,
+  ): Promise<{ user: Record<string, unknown> }> {
     return this.authService.setUsername(userId, dto.username);
   }
 
@@ -244,7 +279,12 @@ export class AuthController {
     @Query('token') token: string,
     @Res() res: Response,
   ): Promise<void> {
-    const htmlPage = (title: string, heading: string, message: string, success: boolean): string => `<!doctype html>
+    const htmlPage = (
+      title: string,
+      heading: string,
+      message: string,
+      success: boolean,
+    ): string => `<!doctype html>
 <html lang="id">
 <head>
 <meta charset="utf-8" />
@@ -270,21 +310,39 @@ export class AuthController {
 </html>`;
 
     if (!email || !token) {
-      res.status(HttpStatus.BAD_REQUEST).type('html').send(
-        htmlPage('Verifikasi Email', 'Tautan Tidak Valid', 'Parameter email atau token hilang. Silakan minta ulang tautan verifikasi di aplikasi.', false),
-      );
+      res
+        .status(HttpStatus.BAD_REQUEST)
+        .type('html')
+        .send(
+          htmlPage(
+            'Verifikasi Email',
+            'Tautan Tidak Valid',
+            'Parameter email atau token hilang. Silakan minta ulang tautan verifikasi di aplikasi.',
+            false,
+          ),
+        );
       return;
     }
     try {
       await this.authService.verifyEmail(email, token);
-      res.status(HttpStatus.OK).type('html').send(
-        htmlPage('Email Terverifikasi', 'Email Berhasil Diverifikasi', 'Terima kasih! Alamat email Anda sudah terverifikasi. Anda bisa melanjutkan menggunakan aplikasi Kahade.', true),
-      );
+      res
+        .status(HttpStatus.OK)
+        .type('html')
+        .send(
+          htmlPage(
+            'Email Terverifikasi',
+            'Email Berhasil Diverifikasi',
+            'Terima kasih! Alamat email Anda sudah terverifikasi. Anda bisa melanjutkan menggunakan aplikasi Kahade.',
+            true,
+          ),
+        );
     } catch {
-      const humanMessage = 'Tautan verifikasi tidak valid atau sudah kedaluwarsa. Silakan minta tautan baru dari aplikasi Kahade.';
-      res.status(HttpStatus.BAD_REQUEST).type('html').send(
-        htmlPage('Verifikasi Gagal', 'Verifikasi Gagal', humanMessage, false),
-      );
+      const humanMessage =
+        'Tautan verifikasi tidak valid atau sudah kedaluwarsa. Silakan minta tautan baru dari aplikasi Kahade.';
+      res
+        .status(HttpStatus.BAD_REQUEST)
+        .type('html')
+        .send(htmlPage('Verifikasi Gagal', 'Verifikasi Gagal', humanMessage, false));
     }
   }
 
@@ -292,7 +350,10 @@ export class AuthController {
   @Throttle({ default: { ttl: 60000, limit: 3 } })
   @Post('resend-verification')
   @HttpCode(HttpStatus.OK)
-  async resendVerification(@Body() dto: ResendVerificationDto, @Req() req: Request): Promise<{ message: string }> {
+  async resendVerification(
+    @Body() dto: ResendVerificationDto,
+    @Req() req: Request,
+  ): Promise<{ message: string }> {
     return this.authService.resendVerification(dto.email, req.ip);
   }
 
@@ -320,13 +381,19 @@ export class AuthController {
   ): Promise<Record<string, unknown>> {
     const emailAuthEnabled = this.configService.get<boolean>('app.emailAuthEnabled') ?? false;
     if (!emailAuthEnabled) {
-      throw new UnauthorizedException({ code: 'EMAIL_AUTH_DISABLED', message: 'Email/password login is not available. Please use phone number login.' });
+      throw new UnauthorizedException({
+        code: 'EMAIL_AUTH_DISABLED',
+        message: 'Email/password login is not available. Please use phone number login.',
+      });
     }
     const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
     const captchaRequired = await this.captchaService.shouldRequireLoginCaptcha(ipAddress);
     if (captchaRequired) {
       if (!dto.captchaId || dto.captchaAnswer === undefined) {
-        throw new UnauthorizedException({ code: ErrorCodes.CAPTCHA_REQUIRED, message: 'Captcha verification is required after repeated failed login attempts' });
+        throw new UnauthorizedException({
+          code: ErrorCodes.CAPTCHA_REQUIRED,
+          message: 'Captcha verification is required after repeated failed login attempts',
+        });
       }
       await this.captchaService.verifyChallenge(dto.captchaId, dto.captchaAnswer);
     }
@@ -336,9 +403,10 @@ export class AuthController {
       result = await this.authService.login(dto, ipAddress);
     } catch (error) {
       const response = error instanceof UnauthorizedException ? error.getResponse() : null;
-      const code = typeof response === 'object' && response !== null && 'code' in response
-        ? (response as { code?: unknown }).code
-        : undefined;
+      const code =
+        typeof response === 'object' && response !== null && 'code' in response
+          ? (response as { code?: unknown }).code
+          : undefined;
       if (code === ErrorCodes.INVALID_CREDENTIALS) {
         await this.captchaService.recordLoginFailure(ipAddress);
       }
@@ -369,7 +437,13 @@ export class AuthController {
   ): Promise<Record<string, unknown>> {
     const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
     const deviceInfo = dto.deviceInfo || req.headers['user-agent'] || 'unknown';
-    const result = await this.authService.verify2faLogin(dto.tempToken, dto.code, dto.deviceId, deviceInfo, ipAddress);
+    const result = await this.authService.verify2faLogin(
+      dto.tempToken,
+      dto.code,
+      dto.deviceId,
+      deviceInfo,
+      ipAddress,
+    );
 
     this.setRefreshTokenCookie(res, result.refreshToken);
     this.setAccessTokenCookie(res, result.accessToken);
@@ -389,7 +463,10 @@ export class AuthController {
     const refreshToken = req.cookies?.kahade_refresh_token || body?.refreshToken;
     if (!refreshToken) {
       this.clearAuthCookies(res);
-      throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Refresh token required' });
+      throw new UnauthorizedException({
+        code: ErrorCodes.UNAUTHORIZED,
+        message: 'Refresh token required',
+      });
     }
     let result: { accessToken: string; refreshToken?: string };
     try {
@@ -431,9 +508,15 @@ export class AuthController {
   @Throttle({ default: { ttl: 3600000, limit: 3 } })
   @Post('forgot-password')
   @HttpCode(HttpStatus.OK)
-  async forgotPassword(@Body() dto: ForgotPasswordDto, @Req() req: Request): Promise<{ message: string }> {
+  async forgotPassword(
+    @Body() dto: ForgotPasswordDto,
+    @Req() req: Request,
+  ): Promise<{ message: string }> {
     if (!dto.captchaId || dto.captchaAnswer === undefined) {
-      throw new UnauthorizedException({ code: ErrorCodes.CAPTCHA_REQUIRED, message: 'Captcha verification is required' });
+      throw new UnauthorizedException({
+        code: ErrorCodes.CAPTCHA_REQUIRED,
+        message: 'Captcha verification is required',
+      });
     }
     await this.captchaService.verifyChallenge(dto.captchaId, dto.captchaAnswer);
     const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
@@ -484,7 +567,10 @@ export class AuthController {
   @Post('2fa/setup')
   @HttpCode(HttpStatus.OK)
   @AllowResponseFields('secret', 'backupCodes')
-  async setup2fa(@CurrentUser('sub') userId: string, @Body() dto: Setup2faDto): Promise<{ secret: string; qrCodeUrl: string; otpauthUrl: string; backupCodes: string[] }> {
+  async setup2fa(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: Setup2faDto,
+  ): Promise<{ secret: string; qrCodeUrl: string; otpauthUrl: string; backupCodes: string[] }> {
     return this.authService.setup2fa(userId, dto.password);
   }
 
@@ -492,7 +578,10 @@ export class AuthController {
   @UseGuards(UserThrottleGuard)
   @Post('2fa/enable')
   @HttpCode(HttpStatus.OK)
-  async enable2fa(@CurrentUser('sub') userId: string, @Body() dto: Enable2faDto): Promise<{ message: string }> {
+  async enable2fa(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: Enable2faDto,
+  ): Promise<{ message: string }> {
     return this.authService.enable2fa(userId, dto.code);
   }
 
@@ -500,7 +589,10 @@ export class AuthController {
   @UseGuards(UserThrottleGuard)
   @Post('2fa/request-disable-otp')
   @HttpCode(HttpStatus.OK)
-  async requestDisable2faOtp(@CurrentUser('sub') userId: string, @Req() req: Request): Promise<{ message: string }> {
+  async requestDisable2faOtp(
+    @CurrentUser('sub') userId: string,
+    @Req() req: Request,
+  ): Promise<{ message: string }> {
     return this.authService.requestDisable2faOtp(userId, req.ip);
   }
 
@@ -508,7 +600,10 @@ export class AuthController {
   @UseGuards(UserThrottleGuard)
   @Post('2fa/disable')
   @HttpCode(HttpStatus.OK)
-  async disable2fa(@CurrentUser('sub') userId: string, @Body() dto: Disable2faDto): Promise<{ message: string }> {
+  async disable2fa(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: Disable2faDto,
+  ): Promise<{ message: string }> {
     return this.authService.disable2fa(userId, dto.password, dto.code, dto.emailOtpCode);
   }
 

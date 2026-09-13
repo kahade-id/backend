@@ -21,12 +21,16 @@ function handlerOf(controller: object, name: string): Handler {
 function mutationHandlerNames(controller: object): string[] {
   const proto = controller as object;
   return Object.getOwnPropertyNames(proto)
-    .filter((name) => name !== 'constructor')
-    .filter((name) => {
+    .filter(name => name !== 'constructor')
+    .filter(name => {
       const descriptor = Object.getOwnPropertyDescriptor(proto, name);
       const method = descriptor?.value;
       const requestMethod = method && Reflect.getMetadata(METHOD_METADATA, method);
-      return typeof method === 'function' && requestMethod !== undefined && requestMethod !== RequestMethod.GET;
+      return (
+        typeof method === 'function' &&
+        requestMethod !== undefined &&
+        requestMethod !== RequestMethod.GET
+      );
     });
 }
 
@@ -35,7 +39,9 @@ describe('UserThrottleGuard admin hardening', () => {
     const evalSlidingWindow = jest.fn().mockResolvedValue(true);
     const guard = new UserThrottleGuard(
       { evalSlidingWindow } as never,
-      { get: jest.fn((key: string) => key === 'app.throttleGlobalTtlMs' ? 60_000 : 100) } as never,
+      {
+        get: jest.fn((key: string) => (key === 'app.throttleGlobalTtlMs' ? 60_000 : 100)),
+      } as never,
     );
     const request = {
       admin: { sub: 'admin-1' },
@@ -59,7 +65,9 @@ describe('UserThrottleGuard admin hardening', () => {
     const evalSlidingWindow = jest.fn().mockResolvedValue(true);
     const guard = new UserThrottleGuard(
       { evalSlidingWindow } as never,
-      { get: jest.fn((key: string) => key === 'app.throttleGlobalTtlMs' ? 60_000 : 100) } as never,
+      {
+        get: jest.fn((key: string) => (key === 'app.throttleGlobalTtlMs' ? 60_000 : 100)),
+      } as never,
     );
     const request = {
       user: { sub: 'admin-1' },
@@ -82,14 +90,40 @@ describe('UserThrottleGuard admin hardening', () => {
 
   it('covers sensitive admin mutations outside order/dispute controllers', () => {
     const contracts: Array<[object, string[]]> = [
-      [AdminUsersController.prototype, ['adjustWallet', 'resetUserPassword', 'forceLogout', 'revokeUserSession', 'banUser', 'unbanUser']],
-      [AdminManagementController.prototype, ['createAdmin', 'updateAdmin', 'resetAdmin2fa', 'unlockAdmin', 'deleteAdmin']],
-      [AdminSystemController.prototype, ['updateConfig', 'approveConfigChange', 'rejectConfigChange', 'retryDeadLetterWebhook', 'resolveDeadLetterWebhook', 'sendBroadcast']],
+      [
+        AdminUsersController.prototype,
+        [
+          'adjustWallet',
+          'resetUserPassword',
+          'forceLogout',
+          'revokeUserSession',
+          'banUser',
+          'unbanUser',
+        ],
+      ],
+      [
+        AdminManagementController.prototype,
+        ['createAdmin', 'updateAdmin', 'resetAdmin2fa', 'unlockAdmin', 'deleteAdmin'],
+      ],
+      [
+        AdminSystemController.prototype,
+        [
+          'updateConfig',
+          'approveConfigChange',
+          'rejectConfigChange',
+          'retryDeadLetterWebhook',
+          'resolveDeadLetterWebhook',
+          'sendBroadcast',
+        ],
+      ],
       [AdminKycController.prototype, ['getDocumentUrls', 'approve', 'reject', 'revoke']],
       [AdminSubscriptionsController.prototype, ['forceCancelSubscription']],
       [AdminVouchersController.prototype, ['createVoucher', 'deactivateVoucher']],
       [AdminAuthController.prototype, ['logout']],
-      [AdminFinanceController.prototype, ['approveWithdrawal', 'rejectWithdrawal', 'reconcileUser', 'reconcileAll']],
+      [
+        AdminFinanceController.prototype,
+        ['approveWithdrawal', 'rejectWithdrawal', 'reconcileUser', 'reconcileAll'],
+      ],
     ];
 
     for (const [controller, names] of contracts) {

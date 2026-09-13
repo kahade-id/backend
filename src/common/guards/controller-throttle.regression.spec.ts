@@ -24,7 +24,10 @@ describe('non-order controller throttle regression', () => {
   it('protects user-owned chat, rating, referral, template, upload, and voucher mutations', () => {
     const routes: Array<[ControllerClass, string[]]> = [
       [ChatController, ['sendMessage', 'markAsRead', 'deleteMessage', 'uploadChatFile']],
-      [RatingsController, ['createRating', 'updateRating', 'replyToRating', 'updateReply', 'deleteReply']],
+      [
+        RatingsController,
+        ['createRating', 'updateRating', 'replyToRating', 'updateReply', 'deleteReply'],
+      ],
       [ReferralController, ['applyCode', 'regenerateCode']],
       [TransactionTemplatesController, ['createTemplate', 'updateTemplate', 'deleteTemplate']],
       [UploadController, ['getPresignedUrl', 'confirmUpload', 'uploadDirect', 'cleanupFiles']],
@@ -42,7 +45,10 @@ describe('non-order controller throttle regression', () => {
 
   it('protects non-order admin mutations with the admin identity tracker', () => {
     const routes: Array<[ControllerClass, string[]]> = [
-      [AdminBadgesController, ['createBadge', 'updateBadge', 'deleteBadge', 'awardBadge', 'revokeBadge']],
+      [
+        AdminBadgesController,
+        ['createBadge', 'updateBadge', 'deleteBadge', 'awardBadge', 'revokeBadge'],
+      ],
       [AdminCampaignsController, ['createCampaign', 'updateCampaign', 'deleteCampaign']],
       [AdminRatingsController, ['removeRating', 'unhideRating']],
       [AdminReportsController, ['resolveReport', 'dismissReport']],

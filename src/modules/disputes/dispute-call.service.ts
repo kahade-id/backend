@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { DisputeCallStatus, Prisma } from '@prisma/client';
 import * as ErrorCodes from '../../common/constants/error-codes';
@@ -9,7 +9,6 @@ import {
 
 @Injectable()
 export class DisputeCallService {
-  private readonly logger = new Logger(DisputeCallService.name);
 
   constructor(
     private prisma: PrismaService,

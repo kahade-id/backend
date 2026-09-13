@@ -1,4 +1,5 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Writable } from 'stream';
 import { PrismaService } from '../../prisma/prisma.service';
 import * as ExcelJS from 'exceljs';
@@ -7,7 +8,12 @@ import { formatWIBDate, parseDateBoundaryWIB, toWIB } from '../../common/utils/d
 
 function escapeHtml(str: string | null | undefined): string {
   if (!str) return '';
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
 }
 
 function sanitizeCell(val: string): string {
@@ -46,17 +52,79 @@ interface ExportFilters {
 }
 
 const CURSOR_BATCH_SIZE = 500;
+/**
+ * Hard cap on rows produced by the in-memory export variants (XLSX workbook
+ * buffer, CSV-as-JSON, HTML report). The streaming CSV path is unbounded by
+ * design; these three materialise the whole result, so a pathological ledger
+ * must fail fast with an actionable message instead of exhausting heap.
+ */
+const MAX_IN_MEMORY_EXPORT_ROWS = 20_000;
 
 @Injectable()
 export class WalletExportService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private configService: ConfigService,
+  ) {}
+
+  /**
+   * Enforce the operator-configured export window (EXPORT_MAX_DATE_RANGE_DAYS,
+   * default 90 days). Previously only the DTO checked the range, and only when
+   * BOTH `from` and `to` were present — `?from=2019-01-01` alone bypassed the
+   * limit entirely and the configured value was never read anywhere.
+   */
+  private clampExportRange(startDate?: string, endDate?: string): { start?: string; end?: string } {
+    const maxDays = this.configService.get<number>('app.exportMaxDateRangeDays') ?? 90;
+    const now = new Date();
+    const start = startDate ? parseDateBoundaryWIB(startDate, 'start') : undefined;
+    const end = endDate ? parseDateBoundaryWIB(endDate, 'end') : undefined;
+
+    if (start && end && start.getTime() > end.getTime()) {
+      throw new BadRequestException({
+        code: 'EXPORT_INVALID_DATE_RANGE',
+        message: '"from" must not be after "to"',
+      });
+    }
+
+    const effectiveEnd = end ?? now;
+    if (start && effectiveEnd.getTime() - start.getTime() > maxDays * 24 * 60 * 60 * 1000) {
+      throw new BadRequestException({
+        code: 'EXPORT_DATE_RANGE_TOO_LARGE',
+        message: `Export date range must not exceed ${maxDays} days. Narrow the range between "from" and "to".`,
+      });
+    }
+    if (end && end.getTime() - now.getTime() > 24 * 60 * 60 * 1000) {
+      throw new BadRequestException({
+        code: 'EXPORT_INVALID_DATE_RANGE',
+        message: '"to" must not be in the future',
+      });
+    }
+    return { start: startDate, end: endDate };
+  }
+
+  private assertInMemoryRowCap(rowCount: number): void {
+    if (rowCount > MAX_IN_MEMORY_EXPORT_ROWS) {
+      throw new BadRequestException({
+        code: 'EXPORT_TOO_MANY_ROWS',
+        message: `This export format supports at most ${MAX_IN_MEMORY_EXPORT_ROWS.toLocaleString('id-ID')} rows in the selected range. Narrow the date range, or use the streaming CSV export (/wallet/export).`,
+      });
+    }
+  }
 
   private buildWhere(walletId: string, filters: ExportFilters): Record<string, unknown> {
     const where: Record<string, unknown> = { walletId };
     if (filters.startDate || filters.endDate) {
       where.createdAt = {};
-      if (filters.startDate) (where.createdAt as Record<string, unknown>).gte = parseDateBoundaryWIB(filters.startDate, 'start');
-      if (filters.endDate) (where.createdAt as Record<string, unknown>).lte = parseDateBoundaryWIB(filters.endDate, 'end');
+      if (filters.startDate)
+        (where.createdAt as Record<string, unknown>).gte = parseDateBoundaryWIB(
+          filters.startDate,
+          'start',
+        );
+      if (filters.endDate)
+        (where.createdAt as Record<string, unknown>).lte = parseDateBoundaryWIB(
+          filters.endDate,
+          'end',
+        );
     }
     if (filters.types && filters.types.length > 0) {
       where.type = { in: filters.types };
@@ -91,8 +159,14 @@ export class WalletExportService {
   }
 
   private formatCsvRow(tx: {
-    id: string; txId: string; createdAt: Date; type: string; status: string;
-    amount: bigint; balanceAfter: bigint; description: string | null;
+    id: string;
+    txId: string;
+    createdAt: Date;
+    type: string;
+    status: string;
+    amount: bigint;
+    balanceAfter: bigint;
+    description: string | null;
     order: { orderId: string; title: string } | null;
   }): string {
     // AUDIT: the export label is a local (WIB) date/time for users; emitting raw UTC
@@ -110,43 +184,87 @@ export class WalletExportService {
       // AUDIT: "Transaction ID" must be the human ledger id (WLT-…) shown everywhere
       // in the app/API; the internal cuid was exported instead, so statements could
       // not be matched against support cases.
-      date, tx.txId, sanitizeCell(type), `"${desc}"`,
-      amount.toString(), balanceAfter.toString(), status, sanitizeCell(orderId),
+      date,
+      tx.txId,
+      sanitizeCell(type),
+      `"${desc}"`,
+      amount.toString(),
+      balanceAfter.toString(),
+      status,
+      sanitizeCell(orderId),
     ].join(',');
   }
 
-  async streamTransactionsCsv(userId: string, output: Writable, startDate?: string, endDate?: string, types?: string[]): Promise<boolean> {
+  async streamTransactionsCsv(
+    userId: string,
+    output: Writable,
+    startDate?: string,
+    endDate?: string,
+    types?: string[],
+  ): Promise<boolean> {
+    this.clampExportRange(startDate, endDate);
     const wallet = await this.prisma.wallet.findUnique({ where: { userId } });
     if (!wallet) return false;
 
-    const header = ['Date', 'Transaction ID', 'Type', 'Description', 'Amount (IDR)', 'Balance After (IDR)', 'Status', 'Order ID'].join(',');
+    const header = [
+      'Date',
+      'Transaction ID',
+      'Type',
+      'Description',
+      'Amount (IDR)',
+      'Balance After (IDR)',
+      'Status',
+      'Order ID',
+    ].join(',');
     output.write(header + '\n');
 
     for await (const tx of this.fetchTransactionsCursor(wallet.id, { startDate, endDate, types })) {
       const canContinue = output.write(this.formatCsvRow(tx) + '\n');
       if (!canContinue) {
-        await new Promise<void>((resolve) => output.once('drain', resolve));
+        await new Promise<void>(resolve => output.once('drain', resolve));
       }
     }
 
     return true;
   }
 
-  async exportTransactionsCsv(userId: string, startDate?: string, endDate?: string, types?: string[]): Promise<string> {
+  async exportTransactionsCsv(
+    userId: string,
+    startDate?: string,
+    endDate?: string,
+    types?: string[],
+  ): Promise<string> {
+    this.clampExportRange(startDate, endDate);
     const wallet = await this.prisma.wallet.findUnique({ where: { userId } });
     if (!wallet) return '';
 
-    const header = ['Date', 'Transaction ID', 'Type', 'Description', 'Amount (IDR)', 'Balance After (IDR)', 'Status', 'Order ID'].join(',');
+    const header = [
+      'Date',
+      'Transaction ID',
+      'Type',
+      'Description',
+      'Amount (IDR)',
+      'Balance After (IDR)',
+      'Status',
+      'Order ID',
+    ].join(',');
     const rows = [header];
 
     for await (const tx of this.fetchTransactionsCursor(wallet.id, { startDate, endDate, types })) {
+      this.assertInMemoryRowCap(rows.length);
       rows.push(this.formatCsvRow(tx));
     }
 
     return rows.join('\n');
   }
 
-  async exportTransactionsXlsx(userId: string, startDate?: string, endDate?: string, types?: string[]): Promise<Buffer> {
+  async exportTransactionsXlsx(
+    userId: string,
+    startDate?: string,
+    endDate?: string,
+    types?: string[],
+  ): Promise<Buffer> {
+    this.clampExportRange(startDate, endDate);
     const wallet = await this.prisma.wallet.findUnique({ where: { userId } });
 
     const workbook = new ExcelJS.Workbook();
@@ -171,8 +289,14 @@ export class WalletExportService {
     headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF6366F1' } };
     headerRow.alignment = { horizontal: 'center' };
 
+    let rowCount = 0;
     if (wallet) {
-      for await (const tx of this.fetchTransactionsCursor(wallet.id, { startDate, endDate, types })) {
+      for await (const tx of this.fetchTransactionsCursor(wallet.id, {
+        startDate,
+        endDate,
+        types,
+      })) {
+        this.assertInMemoryRowCap(++rowCount);
         const amount = toIdr(tx.amount);
         const balanceAfter = toIdr(tx.balanceAfter);
         sheet.addRow({
@@ -195,15 +319,26 @@ export class WalletExportService {
     return Buffer.from(buffer);
   }
 
-  async exportTransactionsHtml(userId: string, startDate?: string, endDate?: string): Promise<string> {
+  async exportTransactionsHtml(
+    userId: string,
+    startDate?: string,
+    endDate?: string,
+  ): Promise<string> {
+    this.clampExportRange(startDate, endDate);
     const wallet = await this.prisma.wallet.findUnique({ where: { userId } });
     if (!wallet) return '';
 
     const transactions: Array<{
-      createdAt: Date; type: string; status: string; amount: bigint; balanceAfter: bigint;
-      description: string | null; order: { orderId: string; title: string } | null;
+      createdAt: Date;
+      type: string;
+      status: string;
+      amount: bigint;
+      balanceAfter: bigint;
+      description: string | null;
+      order: { orderId: string; title: string } | null;
     }> = [];
     for await (const tx of this.fetchTransactionsCursor(wallet.id, { startDate, endDate })) {
+      this.assertInMemoryRowCap(transactions.length + 1);
       transactions.push(tx);
     }
 
@@ -213,30 +348,54 @@ export class WalletExportService {
     });
 
     const formatCurrency = (amount: number) =>
-      new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(amount);
+      new Intl.NumberFormat('id-ID', {
+        style: 'currency',
+        currency: 'IDR',
+        minimumFractionDigits: 0,
+      }).format(amount);
 
-    const INCOME_TYPES = ['TOP_UP', 'ORDER_RELEASE', 'ORDER_REFUND', 'REFERRAL_REWARD', 'ADMIN_CREDIT', 'DISPUTE_RELEASE', 'TRANSFER_RECEIVED'];
-    const EXPENSE_TYPES = ['WITHDRAW', 'ORDER_LOCK', 'FEE_DEDUCT', 'SUBSCRIPTION_PAYMENT', 'ADMIN_DEBIT', 'TRANSFER_SENT'];
+    const INCOME_TYPES = [
+      'TOP_UP',
+      'ORDER_RELEASE',
+      'ORDER_REFUND',
+      'REFERRAL_REWARD',
+      'ADMIN_CREDIT',
+      'DISPUTE_RELEASE',
+      'TRANSFER_RECEIVED',
+    ];
+    const EXPENSE_TYPES = [
+      'WITHDRAW',
+      'ORDER_LOCK',
+      'FEE_DEDUCT',
+      'SUBSCRIPTION_PAYMENT',
+      'ADMIN_DEBIT',
+      'TRANSFER_SENT',
+    ];
 
-    const totalIn = transactions.filter((t) => INCOME_TYPES.includes(t.type) && t.status === 'SUCCESS')
+    const totalIn = transactions
+      .filter(t => INCOME_TYPES.includes(t.type) && t.status === 'SUCCESS')
       .reduce((s, t) => s + toIdr(t.amount), 0);
-    const totalOut = transactions.filter((t) => EXPENSE_TYPES.includes(t.type) && t.status === 'SUCCESS')
+    const totalOut = transactions
+      .filter(t => EXPENSE_TYPES.includes(t.type) && t.status === 'SUCCESS')
       .reduce((s, t) => s + toIdr(t.amount), 0);
 
-    const rows = transactions.map((tx) => {
-      const isIncome = INCOME_TYPES.includes(tx.type);
-      return `<tr>
+    const rows = transactions
+      .map(tx => {
+        const isIncome = INCOME_TYPES.includes(tx.type);
+        return `<tr>
 <td>${formatWIBDate(tx.createdAt)}</td>
 <td>${escapeHtml(TYPE_LABELS[tx.type] || tx.type)}</td>
 <td style="color:${isIncome ? '#10b981' : '#ef4444'};font-weight:600">${isIncome ? '+' : '-'}${formatCurrency(toIdr(tx.amount))}</td>
 <td>${escapeHtml(tx.order?.orderId) || '-'}</td>
 <td>${escapeHtml(tx.description || tx.order?.title) || '-'}</td>
 </tr>`;
-    }).join('\n');
+      })
+      .join('\n');
 
-    const periodStr = startDate && endDate
-      ? `${formatWIBDate(new Date(startDate))} - ${formatWIBDate(new Date(endDate))}`
-      : 'All Time';
+    const periodStr =
+      startDate && endDate
+        ? `${formatWIBDate(new Date(startDate))} - ${formatWIBDate(new Date(endDate))}`
+        : 'All Time';
 
     return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Financial Report - ${user?.fullName || ''}</title>
 <style>

@@ -1,38 +1,23 @@
 import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { AsyncLocalStorage } from 'async_hooks';
+import { applyDbPoolParams, defaultDbPoolSize } from '../config/db-url.util';
 
 export const requestContext = new AsyncLocalStorage<{ requestId: string }>();
 
-type NotificationCreatedCallback = (data: { userId: string; title: string; body: string; data?: Record<string, string> }) => void | Promise<void>;
+type NotificationCreatedCallback = (data: {
+  userId: string;
+  title: string;
+  body: string;
+  data?: Record<string, string>;
+}) => void | Promise<void>;
 
 const isProduction = process.env.NODE_ENV === 'production';
-const connectionLimit = parseInt(process.env.DATABASE_CONNECTION_LIMIT || (isProduction ? '10' : '5'), 10);
+const connectionLimit = defaultDbPoolSize();
 const datasourceUrl = (() => {
   const raw = process.env.DATABASE_URL;
   if (!raw) return undefined;
-  try {
-    const url = new URL(raw);
-    if (!url.searchParams.has('connection_limit')) {
-      url.searchParams.set('connection_limit', String(connectionLimit));
-    }
-    if (!url.searchParams.has('pool_timeout')) {
-      url.searchParams.set('pool_timeout', process.env.DB_POOL_TIMEOUT || '10');
-    }
-    if (!url.searchParams.has('connect_timeout')) {
-      url.searchParams.set('connect_timeout', process.env.DB_CONNECT_TIMEOUT || '15');
-    }
-    if (!url.searchParams.has('statement_timeout')) {
-      url.searchParams.set('statement_timeout', process.env.DB_STATEMENT_TIMEOUT || '30000');
-    }
-    return url.toString();
-  } catch {
-    const sep = raw.includes('?') ? '&' : '?';
-    const poolTimeout = process.env.DB_POOL_TIMEOUT || '10';
-    const connectTimeout = process.env.DB_CONNECT_TIMEOUT || '15';
-    const stmtTimeout = process.env.DB_STATEMENT_TIMEOUT || '30000';
-    return `${raw}${sep}connection_limit=${connectionLimit}&pool_timeout=${poolTimeout}&connect_timeout=${connectTimeout}&statement_timeout=${stmtTimeout}`;
-  }
+  return applyDbPoolParams(raw);
 })();
 
 @Injectable()
@@ -57,7 +42,12 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
     }
   }
 
-  emitNotificationCreated(data: { userId: string; title: string; body: string; data?: Record<string, string> }): void {
+  emitNotificationCreated(data: {
+    userId: string;
+    title: string;
+    body: string;
+    data?: Record<string, string>;
+  }): void {
     for (const cb of this.notificationCreatedCallbacks) {
       try {
         const result = cb(data);
@@ -76,7 +66,9 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
     this.applyExtension();
     this.applyRequestIdMiddleware();
     if (process.env.OPENAPI_GENERATE === 'true') {
-      this.logger.warn('OPENAPI_GENERATE=true — skipping database connection for contract generation');
+      this.logger.warn(
+        'OPENAPI_GENERATE=true — skipping database connection for contract generation',
+      );
       return;
     }
     await this.$connect();
@@ -84,7 +76,9 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
       await (this as any).$executeRaw`SET statement_timeout = '30s'`;
       this.logger.log('Database statement_timeout set to 30s');
     } catch (err) {
-      this.logger.warn(`Failed to set statement_timeout: ${(err as Error).message}. Configure via DATABASE_URL: ?options=-c%20statement_timeout%3D30000`);
+      this.logger.warn(
+        `Failed to set statement_timeout: ${(err as Error).message}. Configure via DATABASE_URL: ?options=-c%20statement_timeout%3D30000`,
+      );
     }
     this.logPoolConfig();
     this.validateSoftDeleteModels();
@@ -96,9 +90,9 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
     const stmtTimeout = process.env.DB_STATEMENT_TIMEOUT || '30000';
     this.logger.log(
       `Database pool config: connection_limit=${connectionLimit}, ` +
-      `pool_timeout=${poolTimeout}s, connect_timeout=${connectTimeout}s, ` +
-      `statement_timeout=${stmtTimeout}ms, ` +
-      `env=${isProduction ? 'production' : 'development'}`,
+        `pool_timeout=${poolTimeout}s, connect_timeout=${connectTimeout}s, ` +
+        `statement_timeout=${stmtTimeout}ms, ` +
+        `env=${isProduction ? 'production' : 'development'}`,
     );
   }
 
@@ -113,7 +107,7 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
         if (duration > 1000) {
           this.logger.warn(
             `Slow query: ${params.model}.${params.action} took ${duration}ms` +
-            (reqId ? ` [reqId=${reqId}]` : ''),
+              (reqId ? ` [reqId=${reqId}]` : ''),
           );
         }
         return result;
@@ -121,8 +115,8 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
         const duration = Date.now() - start;
         this.logger.error(
           `Query failed: ${params.model}.${params.action} after ${duration}ms` +
-          (reqId ? ` [reqId=${reqId}]` : '') +
-          ` — ${(error as Error).message}`,
+            (reqId ? ` [reqId=${reqId}]` : '') +
+            ` — ${(error as Error).message}`,
         );
         throw error;
       }
@@ -143,7 +137,9 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
     const modelNames = new Set(dmmf.datamodel.models.map((m: { name: string }) => m.name));
     for (const name of SOFT_DELETE_MODELS) {
       if (!modelNames.has(name)) {
-        this.logger.error(`SOFT_DELETE_MODELS contains unknown model: "${name}". Soft-delete middleware will silently skip it.`);
+        this.logger.error(
+          `SOFT_DELETE_MODELS contains unknown model: "${name}". Soft-delete middleware will silently skip it.`,
+        );
       } else {
         const model = dmmf.datamodel.models.find((m: { name: string }) => m.name === name);
         const hasDeletedAt = model?.fields?.some((f: { name: string }) => f.name === 'deletedAt');
@@ -160,20 +156,43 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
   }
 
   private applyExtension(): void {
-    const SOFT_DELETE_MODELS: ReadonlyArray<string> = ['User', 'BankAccount', 'AdminUser', 'ChatMessage'];
+    const SOFT_DELETE_MODELS: ReadonlyArray<string> = [
+      'User',
+      'BankAccount',
+      'AdminUser',
+      'ChatMessage',
+    ];
 
     const READ_ACTIONS: ReadonlyArray<string> = [
-      'findMany', 'findFirst', 'findUnique', 'count', 'aggregate',
-      'groupBy', 'findUniqueOrThrow', 'findFirstOrThrow',
+      'findMany',
+      'findFirst',
+      'findUnique',
+      'count',
+      'aggregate',
+      'groupBy',
+      'findUniqueOrThrow',
+      'findFirstOrThrow',
     ];
     const WRITE_ACTIONS: ReadonlyArray<string> = ['update', 'updateMany'];
     const HARD_DELETE_ACTIONS: ReadonlyArray<string> = ['delete', 'deleteMany'];
     const logger = this.logger;
 
-    const extended = (this as unknown as { $extends: (arg: Record<string, unknown>) => unknown }).$extends({
+    const extended = (
+      this as unknown as { $extends: (arg: Record<string, unknown>) => unknown }
+    ).$extends({
       query: {
         $allModels: {
-          async $allOperations({ model, operation, args, query }: { model: string | undefined; operation: string; args: Record<string, Record<string, unknown>> | undefined; query: (args: unknown) => Promise<unknown> }) {
+          async $allOperations({
+            model,
+            operation,
+            args,
+            query,
+          }: {
+            model: string | undefined;
+            operation: string;
+            args: Record<string, Record<string, unknown>> | undefined;
+            query: (args: unknown) => Promise<unknown>;
+          }) {
             if (!model || !SOFT_DELETE_MODELS.includes(model)) {
               return query(args);
             }
@@ -191,7 +210,9 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
               if (!args.where) args.where = {};
               if (args.where.deletedAt === undefined) {
                 if (process.env.NODE_ENV === 'development') {
-                  logger.debug(`[SoftDeleteGuard] Auto-injecting deletedAt:null on ${model}.${operation}`);
+                  logger.debug(
+                    `[SoftDeleteGuard] Auto-injecting deletedAt:null on ${model}.${operation}`,
+                  );
                 }
                 args.where = { ...args.where, deletedAt: null };
               }
@@ -200,11 +221,11 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
             if (HARD_DELETE_ACTIONS.includes(operation)) {
               logger.error(
                 `[SoftDeleteGuard] BLOCKED hard ${operation} on soft-delete model ${model}. ` +
-                `Use update with { deletedAt: new Date() } instead.`,
+                  `Use update with { deletedAt: new Date() } instead.`,
               );
               throw new Error(
                 `Hard ${operation} is not allowed on soft-delete model "${model}". ` +
-                `Set deletedAt instead.`,
+                  `Set deletedAt instead.`,
               );
             }
 
@@ -220,8 +241,8 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
     if (typeof (this as Record<string, unknown>)['$transaction'] !== 'function') {
       throw new Error(
         'PrismaService: $extends() failed — soft-delete middleware is NOT active. ' +
-        'This likely means a Prisma version upgrade changed the internal structure. ' +
-        'Do NOT start the application without soft-delete protection.',
+          'This likely means a Prisma version upgrade changed the internal structure. ' +
+          'Do NOT start the application without soft-delete protection.',
       );
     }
   }

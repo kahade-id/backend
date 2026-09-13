@@ -113,8 +113,6 @@ export const UPLOAD_MAX_CHAT_MB = 10;
 export const UPLOAD_MAX_KYC_MB = 5;
 export const UPLOAD_MAX_EVIDENCE_MB = 10;
 
-export const EXPORT_MAX_DATE_RANGE_DAYS = 90;
-
 export const DEFAULT_PAGE = 1;
 export const DEFAULT_LIMIT = 20;
 export const MAX_LIMIT = 100;

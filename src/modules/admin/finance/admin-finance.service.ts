@@ -444,7 +444,7 @@ export class AdminFinanceService {
             : `Approved by admin ${adminId} — payout submission outcome pending reconciliation`,
         },
       });
-      await this.auditLog.logAdminAction({
+      this.auditLog.logAdminAction({
         adminId,
         action: AuditAction.ADMIN_ACTION,
         targetType: 'WalletTransaction',
@@ -461,7 +461,7 @@ export class AdminFinanceService {
 
     const updated = await this.prisma.walletTransaction.findUniqueOrThrow({ where: { id: tx.id } });
 
-    await this.auditLog.logAdminAction({
+    this.auditLog.logAdminAction({
       adminId,
       action: AuditAction.ADMIN_ACTION,
       targetType: 'WalletTransaction',
@@ -564,7 +564,7 @@ export class AdminFinanceService {
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
 
-    await this.auditLog.logAdminAction({
+    this.auditLog.logAdminAction({
       adminId,
       action: AuditAction.ADMIN_ACTION,
       targetType: 'WalletTransaction',

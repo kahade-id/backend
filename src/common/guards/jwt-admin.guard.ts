@@ -60,7 +60,9 @@ export class JwtAdminGuard implements CanActivate {
         });
       }
 
-      const isBlacklisted = await this.redisService.get(ADMIN_TOKEN_BLACKLIST(payload.jti), { throwOnError: true });
+      const isBlacklisted = await this.redisService.get(ADMIN_TOKEN_BLACKLIST(payload.jti), {
+        throwOnError: true,
+      });
       if (isBlacklisted) {
         throw new UnauthorizedException({
           code: ErrorCodes.UNAUTHORIZED,
@@ -68,7 +70,9 @@ export class JwtAdminGuard implements CanActivate {
         });
       }
 
-      const revokedAtRaw = await this.redisService.get(`admin_revoked:${payload.sub}`, { throwOnError: true });
+      const revokedAtRaw = await this.redisService.get(`admin_revoked:${payload.sub}`, {
+        throwOnError: true,
+      });
       if (revokedAtRaw) {
         const revokedAt = Number(revokedAtRaw);
         const issuedAt = typeof payload.iat === 'number' ? payload.iat : 0;
@@ -102,9 +106,13 @@ export class JwtAdminGuard implements CanActivate {
 
       if (payload.scope) {
         const allowedPaths = this.getAllowedPathsForScope(payload.scope);
-        const rawPath = (request.originalUrl || request.url || '').split('?')[0].replace(/\/+$/, '');
+        const rawPath = (request.originalUrl || request.url || '')
+          .split('?')[0]
+          .replace(/\/+$/, '');
         const apiPrefix = '/v1';
-        const normalizedPath = rawPath.startsWith(apiPrefix) ? rawPath.slice(apiPrefix.length) : rawPath;
+        const normalizedPath = rawPath.startsWith(apiPrefix)
+          ? rawPath.slice(apiPrefix.length)
+          : rawPath;
         const isAllowed = allowedPaths.some(path => normalizedPath === path);
         if (!isAllowed) {
           throw new ForbiddenException({
@@ -117,16 +125,24 @@ export class JwtAdminGuard implements CanActivate {
       request.admin = payload;
       return true;
     } catch (error) {
-      if (error instanceof ForbiddenException || error instanceof UnauthorizedException) throw error;
+      if (error instanceof ForbiddenException || error instanceof UnauthorizedException)
+        throw error;
       if (error instanceof ServiceUnavailableException) throw error;
-      if ((error as Error)?.name === 'JsonWebTokenError' || (error as Error)?.name === 'TokenExpiredError') {
+      if (
+        (error as Error)?.name === 'JsonWebTokenError' ||
+        (error as Error)?.name === 'TokenExpiredError'
+      ) {
         throw new UnauthorizedException({
           code: ErrorCodes.UNAUTHORIZED,
           message: 'Invalid or expired admin token',
         });
       }
-      this.logger.warn('Unexpected error during admin token verification — rejecting request (fail-closed)');
-      throw new ServiceUnavailableException('Service temporarily unavailable. Please try again later.');
+      this.logger.warn(
+        'Unexpected error during admin token verification — rejecting request (fail-closed)',
+      );
+      throw new ServiceUnavailableException(
+        'Service temporarily unavailable. Please try again later.',
+      );
     }
   }
 

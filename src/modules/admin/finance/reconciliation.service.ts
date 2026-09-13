@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { WalletTransactionStatus, WalletTransactionType, WithdrawStatus } from '@prisma/client';
 import { toIdr } from '../../../common/utils/currency.util';
@@ -46,7 +46,6 @@ export interface AuditTrailResult {
 
 @Injectable()
 export class ReconciliationService {
-  private readonly logger = new Logger(ReconciliationService.name);
 
   constructor(private readonly prisma: PrismaService) {}
 

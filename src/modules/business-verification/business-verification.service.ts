@@ -2,7 +2,6 @@ import {
   Injectable,
   BadRequestException,
   ForbiddenException,
-  Logger,
 } from '@nestjs/common';
 import { BusinessVerificationStatus, Prisma, UserAccountType, UserAuditAction } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -37,7 +36,6 @@ const BUSINESS_DOCUMENT_FOLDER = 'business-documents';
  */
 @Injectable()
 export class BusinessVerificationService {
-  private readonly logger = new Logger(BusinessVerificationService.name);
 
   constructor(
     private prisma: PrismaService,

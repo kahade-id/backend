@@ -29,7 +29,11 @@ describe('JwtAdminGuard account-state enforcement', () => {
   });
 
   it('allows an active, unlocked admin account', async () => {
-    prisma.adminUser.findUnique.mockResolvedValue({ isActive: true, deletedAt: null, lockedUntil: null });
+    prisma.adminUser.findUnique.mockResolvedValue({
+      isActive: true,
+      deletedAt: null,
+      lockedUntil: null,
+    });
 
     await expect(guard.canActivate(createContext(request))).resolves.toBe(true);
     expect(request.admin).toMatchObject({ sub: 'admin-1', jti: 'admin-jti-1' });
@@ -38,24 +42,40 @@ describe('JwtAdminGuard account-state enforcement', () => {
   it('rejects a verified admin token without a JTI claim', async () => {
     verifyAsync.mockResolvedValue({ sub: 'admin-1' });
 
-    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
     expect(redis.get).not.toHaveBeenCalled();
     expect(prisma.adminUser.findUnique).not.toHaveBeenCalled();
   });
 
   it('rejects a token issued before the admin revocation epoch', async () => {
     verifyAsync.mockResolvedValue({ sub: 'admin-1', jti: 'admin-jti-1', iat: 100 });
-    redis.get.mockImplementation(async (key: string) => key === 'admin_revoked:admin-1' ? '101' : null);
-    prisma.adminUser.findUnique.mockResolvedValue({ isActive: true, deletedAt: null, lockedUntil: null });
+    redis.get.mockImplementation(async (key: string) =>
+      key === 'admin_revoked:admin-1' ? '101' : null,
+    );
+    prisma.adminUser.findUnique.mockResolvedValue({
+      isActive: true,
+      deletedAt: null,
+      lockedUntil: null,
+    });
 
-    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
     expect(prisma.adminUser.findUnique).not.toHaveBeenCalled();
   });
 
   it('allows a token issued after the admin revocation epoch', async () => {
     verifyAsync.mockResolvedValue({ sub: 'admin-1', jti: 'admin-jti-1', iat: 102 });
-    redis.get.mockImplementation(async (key: string) => key === 'admin_revoked:admin-1' ? '101' : null);
-    prisma.adminUser.findUnique.mockResolvedValue({ isActive: true, deletedAt: null, lockedUntil: null });
+    redis.get.mockImplementation(async (key: string) =>
+      key === 'admin_revoked:admin-1' ? '101' : null,
+    );
+    prisma.adminUser.findUnique.mockResolvedValue({
+      isActive: true,
+      deletedAt: null,
+      lockedUntil: null,
+    });
 
     await expect(guard.canActivate(createContext(request))).resolves.toBe(true);
     expect(request.admin).toMatchObject({ sub: 'admin-1', jti: 'admin-jti-1', iat: 102 });
@@ -68,7 +88,9 @@ describe('JwtAdminGuard account-state enforcement', () => {
       lockedUntil: new Date(Date.now() + 60_000),
     });
 
-    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
     expect(request.admin).toBeUndefined();
   });
 });

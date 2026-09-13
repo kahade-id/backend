@@ -1,4 +1,12 @@
-import { Injectable, CanActivate, ExecutionContext, Logger, HttpException, HttpStatus, ServiceUnavailableException } from '@nestjs/common';
+import {
+  Injectable,
+  CanActivate,
+  ExecutionContext,
+  Logger,
+  HttpException,
+  HttpStatus,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../../redis/redis.service';
 
@@ -30,9 +38,10 @@ export class UserThrottleGuard implements CanActivate {
     } else {
       // Use express's req.ip which respects the `trust proxy` setting (configured in main.ts
       // via TRUSTED_PROXY_CIDR). Reading X-Forwarded-For directly would allow spoofing.
-      const resolvedIp = (req.ip as string | undefined)
-        || (req.socket as { remoteAddress?: string } | undefined)?.remoteAddress
-        || 'unknown';
+      const resolvedIp =
+        (req.ip as string | undefined) ||
+        (req.socket as { remoteAddress?: string } | undefined)?.remoteAddress ||
+        'unknown';
       tracker = `ip:${resolvedIp}`;
     }
 
@@ -44,14 +53,21 @@ export class UserThrottleGuard implements CanActivate {
       const allowed = await this.redis.evalSlidingWindow(key, windowMs, limit, Date.now());
       if (!allowed) {
         throw new HttpException(
-          { statusCode: HttpStatus.TOO_MANY_REQUESTS, message: 'Too many requests. Please try again later.' },
+          {
+            statusCode: HttpStatus.TOO_MANY_REQUESTS,
+            message: 'Too many requests. Please try again later.',
+          },
           HttpStatus.TOO_MANY_REQUESTS,
         );
       }
     } catch (error) {
       if (error instanceof HttpException) throw error;
-      this.logger.error(`Sliding window throttle check failed for ${tracker}: ${(error as Error).message} — failing closed`);
-      throw new ServiceUnavailableException('Service temporarily unavailable. Please try again later.');
+      this.logger.error(
+        `Sliding window throttle check failed for ${tracker}: ${(error as Error).message} — failing closed`,
+      );
+      throw new ServiceUnavailableException(
+        'Service temporarily unavailable. Please try again later.',
+      );
     }
 
     return true;

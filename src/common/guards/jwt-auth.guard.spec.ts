@@ -98,7 +98,9 @@ describe('JwtAuthGuard database authorization defense-in-depth', () => {
       user: { isActive: true, isBanned: false, deletedAt: null },
     });
 
-    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
   });
 
   it('rejects an active session owned by a banned account', async () => {
@@ -109,13 +111,17 @@ describe('JwtAuthGuard database authorization defense-in-depth', () => {
       user: { isActive: true, isBanned: true, deletedAt: null },
     });
 
-    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
   });
 
   it('fails closed when the database authorization check is unavailable', async () => {
     prisma.userSession.findUnique.mockRejectedValue(new Error('database unavailable'));
 
-    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(ServiceUnavailableException);
+    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(
+      ServiceUnavailableException,
+    );
   });
 });
 
@@ -146,11 +152,20 @@ describe('JwtAuthGuard optional auth on public routes (Section 6)', () => {
     request = { headers: {} };
     prisma = {
       userSession: { findUnique: jest.fn().mockResolvedValue(healthySession()) },
-      user: { findUnique: jest.fn().mockResolvedValue({ isActive: true, isBanned: false, deletedAt: null }) },
+      user: {
+        findUnique: jest
+          .fn()
+          .mockResolvedValue({ isActive: true, isBanned: false, deletedAt: null }),
+      },
     };
     redisGet = jest.fn().mockResolvedValue(null);
-    const redisClient = { get: jest.fn().mockResolvedValue(null), del: jest.fn().mockResolvedValue(1) };
-    verifyAsync = jest.fn().mockResolvedValue({ sub: 'user-1', sessionId: 'session-1', jti: 'jti-1' });
+    const redisClient = {
+      get: jest.fn().mockResolvedValue(null),
+      del: jest.fn().mockResolvedValue(1),
+    };
+    verifyAsync = jest
+      .fn()
+      .mockResolvedValue({ sub: 'user-1', sessionId: 'session-1', jti: 'jti-1' });
     // Reflector: rute ini @Public(), bukan rute admin.
     const reflector = { getAllAndOverride: jest.fn((key: string) => key === 'isPublic') };
 
@@ -209,15 +224,55 @@ describe('JwtAuthGuard optional auth on public routes (Section 6)', () => {
   });
 
   it.each([
-    ['the signature does not verify', () => verifyAsync.mockRejectedValue(new Error('JsonWebTokenError'))],
-    ['the token has expired', () => verifyAsync.mockRejectedValue(Object.assign(new Error('jwt expired'), { name: 'TokenExpiredError' }))],
-    ['the jti claim is missing', () => verifyAsync.mockResolvedValue({ sub: 'user-1', sessionId: 'session-1' })],
-    ['the sessionId claim is missing', () => verifyAsync.mockResolvedValue({ sub: 'user-1', jti: 'jti-1' })],
+    [
+      'the signature does not verify',
+      () => verifyAsync.mockRejectedValue(new Error('JsonWebTokenError')),
+    ],
+    [
+      'the token has expired',
+      () =>
+        verifyAsync.mockRejectedValue(
+          Object.assign(new Error('jwt expired'), { name: 'TokenExpiredError' }),
+        ),
+    ],
+    [
+      'the jti claim is missing',
+      () => verifyAsync.mockResolvedValue({ sub: 'user-1', sessionId: 'session-1' }),
+    ],
+    [
+      'the sessionId claim is missing',
+      () => verifyAsync.mockResolvedValue({ sub: 'user-1', jti: 'jti-1' }),
+    ],
     ['the token is blacklisted in Redis', () => redisGet.mockResolvedValue('revoked')],
-    ['the session is revoked in the database', () => prisma.userSession.findUnique.mockResolvedValue({ ...healthySession(), isRevoked: true })],
-    ['the account is banned', () => prisma.userSession.findUnique.mockResolvedValue({ ...healthySession(), user: { isActive: true, isBanned: true, deletedAt: null } })],
-    ['the account is soft-deleted', () => prisma.userSession.findUnique.mockResolvedValue({ ...healthySession(), user: { isActive: true, isBanned: false, deletedAt: new Date() } })],
-    ['the session belongs to another user', () => prisma.userSession.findUnique.mockResolvedValue({ ...healthySession(), userId: 'someone-else' })],
+    [
+      'the session is revoked in the database',
+      () =>
+        prisma.userSession.findUnique.mockResolvedValue({ ...healthySession(), isRevoked: true }),
+    ],
+    [
+      'the account is banned',
+      () =>
+        prisma.userSession.findUnique.mockResolvedValue({
+          ...healthySession(),
+          user: { isActive: true, isBanned: true, deletedAt: null },
+        }),
+    ],
+    [
+      'the account is soft-deleted',
+      () =>
+        prisma.userSession.findUnique.mockResolvedValue({
+          ...healthySession(),
+          user: { isActive: true, isBanned: false, deletedAt: new Date() },
+        }),
+    ],
+    [
+      'the session belongs to another user',
+      () =>
+        prisma.userSession.findUnique.mockResolvedValue({
+          ...healthySession(),
+          userId: 'someone-else',
+        }),
+    ],
   ])('serves the page anonymously when %s', async (_label, arrange) => {
     withBearer();
     arrange();
@@ -251,11 +306,19 @@ describe('JwtAuthGuard optional auth on public routes (Section 6)', () => {
       reflector as never,
       { verifyAsync } as never,
       null,
-      { get: redisGet, getClient: jest.fn(() => ({ get: jest.fn(), del: jest.fn() })), getPrefix: jest.fn(() => 'kahade:') } as never,
-      { get: jest.fn((key: string) => (key === 'jwt.secret' ? 'test-secret' : undefined)) } as never,
+      {
+        get: redisGet,
+        getClient: jest.fn(() => ({ get: jest.fn(), del: jest.fn() })),
+        getPrefix: jest.fn(() => 'kahade:'),
+      } as never,
+      {
+        get: jest.fn((key: string) => (key === 'jwt.secret' ? 'test-secret' : undefined)),
+      } as never,
       prisma as never,
     );
-    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
     expect(request.user).toBeUndefined();
   });
 });

@@ -22,7 +22,7 @@ export class AdminRolesGuard implements CanActivate {
     }
 
     const { admin } = context.switchToHttp().getRequest();
-    
+
     if (!admin) {
       throw new ForbiddenException({
         code: ErrorCodes.FORBIDDEN,
@@ -31,7 +31,7 @@ export class AdminRolesGuard implements CanActivate {
     }
 
     const hasRole = requiredRoles.includes(admin.role);
-    
+
     if (!hasRole) {
       throw new ForbiddenException({
         code: ErrorCodes.INSUFFICIENT_ADMIN_ROLE,

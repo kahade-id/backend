@@ -1,4 +1,4 @@
-import { Injectable, CanActivate, ExecutionContext, ForbiddenException, Logger } from '@nestjs/common';
+import { Injectable, CanActivate, ExecutionContext, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { KycStatus } from '@prisma/client';
@@ -9,8 +9,10 @@ const KYC_CACHE_KEY = (userId: string) => `guard:kyc:${userId}`;
 
 @Injectable()
 export class KycRequiredGuard implements CanActivate {
-  private readonly logger = new Logger(KycRequiredGuard.name);
-  constructor(private prisma: PrismaService, private redis: RedisService) {}
+  constructor(
+    private prisma: PrismaService,
+    private redis: RedisService,
+  ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest();

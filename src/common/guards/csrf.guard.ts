@@ -43,7 +43,8 @@ export class CsrfGuard implements CanActivate {
     if (!user?.sub) {
       throw new ForbiddenException({
         code: 'CSRF_NO_AUTH',
-        message: 'CSRF guard requires an authenticated user — ensure JwtAuthGuard runs before CsrfGuard',
+        message:
+          'CSRF guard requires an authenticated user — ensure JwtAuthGuard runs before CsrfGuard',
       });
     }
     if (!user.jti) {

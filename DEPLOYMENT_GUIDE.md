@@ -3,28 +3,28 @@
 **Target:** Ubuntu 24.04 LTS (fresh VPS / dedicated server)
 **Stack:** NestJS 11 + Prisma + PostgreSQL 16 + Redis 7 + Nginx + PM2 + Certbot
 **Entry Point:** `node dist/main` on port 3000
-**Package Manager:** pnpm 10.26.1 (monorepo workspace — `npm ci` tidak bekerja)
-**Last Updated:** August 2026 (rev 6 — prosedur kanonis tunggal)
+**Package Manager:** npm (repo standalone dengan `package-lock.json`; Node 20+)
+**Last Updated:** September 2026 (rev 7 — konversi monorepo/pnpm → repo backend standalone npm)
 
 > **Dokumen kanonis tunggal.** Gunakan panduan ini untuk instalasi, rilis,
 > smoke read-only, cutover, dan rollback. Jangan membuat runbook deployment
 > kedua atau file environment kedua.
 
 > **Pola produksi legacy yang dipertahankan.** Semua secret tetap berada pada
-> `/var/www/kahade/apps/backend/.env`; file tersebut tidak pernah disalin ke
-> checkout release atau Git. Source rilis bersifat immutable di
+> `/var/www/kahade/.env`; file tersebut tidak pernah disalin ke checkout
+> release atau Git. Source rilis bersifat immutable di
 > `/var/www/kahade-release-<SHA>`, sementara PM2 selalu menjalankan symlink
-> `/var/www/kahade-current/apps/backend` melalui satu konfigurasi
+> `/var/www/kahade-current` melalui satu konfigurasi
 > `/etc/kahade/kahade-api.config.cjs`.
 
-> **Rev 4 — apa yang berubah.** Guide ini diverifikasi ulang baris-per-baris
-> terhadap source code, bukan hanya dibaca. Perbaikan yang memblokir deploy:
-> perintah install `npm ci` → `pnpm` (repo ini workspace pnpm tanpa
-> `package-lock.json`), `WALLET_PIN_PEPPER` dan `OTP_PROVIDER` yang wajib tapi
-> tidak ada di template `.env`, `AES_KDF_SALT` yang di-generate terlalu pendek
-> (44 karakter, minimumnya 64), path aplikasi, jumlah cron scheduler (8 → 21),
-> dan script auto-restart yang akan me-restart API tiap 2 menit saat SMTP down.
-> Template `.env` di Section 6.3 sudah diuji lolos seluruh validasi startup.
+> **Rev 7 — apa yang berubah.** Repo `kahade-id/backend` kini adalah repo
+> standalone npm (bukan lagi workspace pnpm): seluruh perintah `pnpm` diganti
+> `npm`, path `apps/backend` dihapus, dan PM2 `cwd` menunjuk langsung ke root
+> checkout. Sebelumnya (rev 4-6): verifikasi baris-per-baris terhadap source
+> code, `WALLET_PIN_PEPPER`/`OTP_PROVIDER` wajib di template `.env`, panjang
+> `AES_KDF_SALT` minimal 64, jumlah cron scheduler 8 → 21, fix script
+> auto-restart saat SMTP down. Template `.env` di Section 6.3 sudah diuji
+> lolos seluruh validasi startup.
 
 ---
 
@@ -162,21 +162,12 @@ node -v   # v20.x.x
 npm -v    # v10.x.x
 ```
 
-### 3.2 pnpm (package manager repo ini)
+### 3.2 npm (package manager repo ini)
 
-Repo ini adalah **pnpm workspace** (`packageManager: pnpm@10.26.1`). `npm ci`
-tidak akan bekerja — tidak ada `package-lock.json`. Aktifkan pnpm lewat corepack
-yang sudah dibundel Node 20:
-
-```bash
-corepack enable
-corepack prepare pnpm@10.26.1 --activate
-
-pnpm -v   # 10.26.1
-```
-
-> Versi harus cocok dengan field `packageManager` di `package.json` root supaya
-> resolusi lockfile identik dengan mesin developer dan CI.
+Repo ini adalah repo **standalone npm** dengan `package-lock.json` yang
+committed. Tidak ada langkah ekstra — npm sudah terpasang bersama Node 20.
+Instalasi dependency memakai `npm ci` (clean install persis sesuai lockfile),
+sehingga resolusi dependency identik dengan mesin developer dan CI.
 
 ### 3.3 PM2
 
@@ -351,18 +342,17 @@ redis-cli -a PASSWORD_REDIS ping
 
 ### 6.1 Clone Repository
 
-> **Ini monorepo pnpm.** Backend tinggal di `apps/backend` di dalam repo
-> `kahade-id/kahade` — tidak ada repo `kahade-backend` terpisah. Dependency
-> di-hoist ke `node_modules` root lewat pnpm workspace, jadi **install harus
-> dijalankan dari root repo**, bukan dari `apps/backend`. Repo juga tidak punya
-> `package-lock.json`, jadi `npm ci` akan gagal.
+> **Repo standalone.** Backend tinggal di repo `kahade-id/backend` — root
+> checkout adalah aplikasi itu sendiri (`package.json`, `prisma/`, `src/`
+> berada di root). Install, build, dan PM2 semuanya dijalankan dari root
+> checkout.
 
 ```bash
 sudo mkdir -p /var/www/kahade
 sudo chown kahade:kahade /var/www/kahade
 
 sudo su - kahade
-git clone git@github.com:kahade-id/kahade.git /var/www/kahade
+git clone git@github.com:kahade-id/backend.git /var/www/kahade
 cd /var/www/kahade
 ```
 
@@ -370,37 +360,38 @@ Seluruh guide ini memakai dua path:
 
 | Variabel | Nilai | Keterangan |
 |:--|:--|:--|
-| Root repo | `/var/www/kahade` | tempat `pnpm install` dijalankan |
-| App backend | `/var/www/kahade/apps/backend` | tempat `.env`, build, dan PM2 dijalankan |
+| Root repo | `/var/www/kahade` | tempat `npm ci`, build, `.env`, dan PM2 dijalankan |
+| Symlink current | `/var/www/kahade-current` | target yang dijalankan PM2 (release aktif) |
 
 ### 6.2 Install Dependencies
 
 ```bash
-# pnpm sesuai packageManager di package.json root
-corepack enable
-corepack prepare pnpm@10.26.1 --activate
-
-# Dari ROOT repo — install workspace + build native deps (argon2, bcrypt)
+# Install persis sesuai package-lock.json (build native deps argon2, bcrypt ikut)
 cd /var/www/kahade
-pnpm install --frozen-lockfile --prod=false
+npm ci
 
 # Prisma client
-cd apps/backend
-pnpm exec prisma generate
+npx prisma generate
 ```
 
-> `--frozen-lockfile` memastikan deploy gagal-cepat kalau `pnpm-lock.yaml`
-> tertinggal dari `package.json`, bukan diam-diam menginstal versi lain.
+> `npm ci` memastikan deploy gagal-cepat kalau `package-lock.json` tertinggal
+> dari `package.json`, bukan diam-diam menginstal versi lain.
 >
-> `--prod=false` diperlukan karena build butuh devDependencies (`@nestjs/cli`,
-> `typescript`, `prisma`). Setelah `pnpm run build` selesai, kalau mau memangkas
-> image bisa jalankan `pnpm prune --prod` — tapi untuk deploy PM2 biasa,
-> biarkan saja; devDependencies tidak ikut ter-load saat runtime.
+> devDependencies (`@nestjs/cli`, `typescript`, `prisma`) diperlukan untuk
+> build. Setelah `npm run build` selesai, kalau mau memangkas image bisa
+> jalankan `npm prune --omit=dev` — tapi untuk deploy PM2 biasa, biarkan saja;
+> devDependencies tidak ikut ter-load saat runtime.
 
 ### 6.3 Create Production .env
 
+Template lengkap semua variabel (beserta default dan komentarnya) tersedia di
+[`.env.example`](./.env.example) di root repo. Untuk production, salin lalu
+ganti value development dengan value production — dan isi semua secret yang
+kosong dengan `openssl rand -hex 32`.
+
 ```bash
-nano /var/www/kahade/apps/backend/.env
+cp .env.example /var/www/kahade/.env
+nano /var/www/kahade/.env
 ```
 
 **PENTING:** Setiap secret harus unik. Jangan gunakan value yang sama untuk key berbeda.
@@ -638,29 +629,25 @@ echo "DB_PASSWORD=$(openssl rand -hex 24)"
 ### 6.5 Secure the .env File
 
 ```bash
-chmod 600 /var/www/kahade/apps/backend/.env
-ls -la /var/www/kahade/apps/backend/.env
+chmod 600 /var/www/kahade/.env
+ls -la /var/www/kahade/.env
 # -rw------- 1 kahade kahade
 ```
 
 ### 6.6 Build Application
 
 ```bash
-cd /var/www/kahade/apps/backend
-pnpm run build
+cd /var/www/kahade
+npm run build
 ```
 
 ### 6.7 Run Database Migrations
 
 ```bash
-cd /var/www/kahade/apps/backend
-pnpm exec prisma migrate deploy
+cd /var/www/kahade
+npx prisma migrate deploy
 bash scripts/run-constraints.sh
 ```
-
-> Pakai `pnpm exec`, bukan `npx`. Di workspace pnpm, `npx` bisa jatuh ke
-> mengunduh `prisma` versi lain dari registry kalau resolusi bin gagal —
-> `pnpm exec` selalu memakai binary yang sudah terinstal dari lockfile.
 
 Script `run-constraints.sh` menambahkan CHECK constraints PostgreSQL yang tidak bisa dikelola Prisma (non-negative balances, voucher exclusivity, order invariants, dll). Script ini idempotent — aman dijalankan berulang.
 
@@ -704,7 +691,7 @@ module.exports = {
   apps: [
     {
       name: 'kahade-api',
-      cwd: '/var/www/kahade-current/apps/backend',
+      cwd: '/var/www/kahade-current',
       script: 'dist/main.js',
       instances: 1,
       exec_mode: 'fork',
@@ -712,7 +699,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         PORT: 3000,
-        RUNTIME_ENV_FILE: '/var/www/kahade/apps/backend/.env',
+        RUNTIME_ENV_FILE: '/var/www/kahade/.env',
       },
       kill_timeout: 30000,
       autorestart: true,
@@ -1009,7 +996,7 @@ sudo ufw status verbose
 ### 10.2 Verify NODE_ENV
 
 ```bash
-grep NODE_ENV /var/www/kahade/apps/backend/.env
+grep NODE_ENV /var/www/kahade/.env
 # Harus: NODE_ENV=production
 ```
 
@@ -1272,22 +1259,20 @@ fi
 ### 13.1 Build Release Immutable
 
 Tentukan commit `main` yang telah divalidasi. Buat checkout baru dengan nama
-commit pendek, lalu install dari root monorepo dan build backend di dalam
-checkout tersebut.
+commit pendek, lalu install dan build di dalam checkout tersebut.
 
 ```bash
 export RELEASE_SHA="<commit-main-yang-disetujui>"
 export RELEASE_DIR="/var/www/kahade-release-${RELEASE_SHA}"
 
-git clone https://github.com/kahade-id/kahade.git "$RELEASE_DIR"
+git clone https://github.com/kahade-id/backend.git "$RELEASE_DIR"
 cd "$RELEASE_DIR"
 git checkout --detach "$RELEASE_SHA"
-pnpm install --frozen-lockfile
+npm ci
 
-cd apps/backend
 DATABASE_URL='postgresql://placeholder:placeholder@127.0.0.1:5432/placeholder' \
-  pnpm exec prisma generate
-pnpm exec nest build
+  npx prisma generate
+npm run build
 test -f dist/main.js
 ```
 
@@ -1299,7 +1284,7 @@ operator sebelum menjalankan `prisma migrate deploy`.
 
 Sebelum cutover, jalankan kandidat pada port loopback berbeda dengan
 `SMOKE_MODE=true`, `HOST=127.0.0.1`, dan `SMOKE_ENV_FILE` menunjuk ke satu file
-legacy `/var/www/kahade/apps/backend/.env`. Smoke mode tidak boleh memuat
+legacy `/var/www/kahade/.env`. Smoke mode tidak boleh memuat
 worker, scheduler, queue, WebSocket, atau route bisnis. Health harus `200`,
 route `/v1/orders` harus `404`, dan listener hanya boleh berada di loopback.
 
@@ -1400,29 +1385,23 @@ echo "[entrypoint] Starting Kahade Backend (NODE_ENV=$NODE_ENV)..."
 exec node dist/main
 ```
 
-### 14.2 Dockerfile monorepo dan build context
+### 14.2 Dockerfile dan build context
 
-`apps/backend/Dockerfile` memakai pnpm workspace dan committed lockfile. Build
-context **harus root repository**, bukan `apps/backend`, agar
-`pnpm-lock.yaml`, `pnpm-workspace.yaml`, dan root `package.json` tersedia.
-Dockerfile menjalankan filtered frozen install, build Prisma/Nest, lalu membuat
-isolated production dependency tree dengan `pnpm deploy --legacy --prod`.
-Prisma CLI berada di production dependencies karena entrypoint menjalankan
-migration saat startup.
+Repo ini standalone — `Dockerfile` berada di root checkout, bersama
+`package.json` dan `package-lock.json`. Build context adalah root repository:
 
 ```bash
 cd /var/www/kahade
-docker build -f apps/backend/Dockerfile -t kahade-api:latest .
+docker build -t kahade-api:latest .
 ```
 
 ### 14.3 Build & Run
 
 ```bash
-# Context HARUS root repo agar pnpm-lock.yaml & pnpm-workspace.yaml ikut terbawa
 cd /var/www/kahade
 
-# Build image (hanya setelah Dockerfile diperbaiki — lihat 14.2)
-docker build -f apps/backend/Dockerfile -t kahade-api:latest .
+# Build image
+docker build -t kahade-api:latest .
 
 # Atau gunakan docker-compose (PostgreSQL + Redis + API)
 docker compose up -d
@@ -1463,46 +1442,44 @@ Fakta aktual kedua app (dari `app.json`):
 
 ### 15.1 Prasyarat build client
 
-Dijalankan sekali di mesin developer (bukan di EC2 — EAS build jalan di cloud):
+Dijalankan sekali di mesin developer (bukan di EC2 — EAS build jalan di cloud).
+Client mobile/admin tinggal di repo terpisah (`kahade-id/mobile`,
+`kahade-id/admin`) — gunakan package manager yang dipakai repo masing-masing:
 
 ```bash
-# Node 20 LTS + pnpm (repo ini pnpm workspace, packageManager: pnpm@10.26.1)
-corepack enable
-corepack prepare pnpm@10.26.1 --activate
-
+# Node 20 LTS
 # EAS CLI
-pnpm add -g eas-cli
+npm install -g eas-cli
 eas login                      # akun yang punya akses ke owner "kahade"
 eas whoami                     # verifikasi
 ```
 
-Install dependency dari **root repo**, bukan per app — ini workspace:
+Install dependency di root repo client terkait (bukan di repo backend ini):
 
 ```bash
-cd /path/to/kahade          # root repo, bukan apps/mobile atau apps/admin
-pnpm install --frozen-lockfile
+cd /path/to/kahade-mobile     # atau /path/to/kahade-admin
+npm ci
 ```
 
-> `--frozen-lockfile` penting: EAS Build menjalankan install dengan `CI=true`,
-> yang membuat pnpm memakai frozen-lockfile secara default. Kalau
-> `pnpm-lock.yaml` tertinggal dari `package.json`, build **gagal di cloud**
-> dengan `ERR_PNPM_OUTDATED_LOCKFILE`. Pakai flag yang sama secara lokal supaya
+> Install yang reproducible penting: EAS Build menjalankan install dengan
+> `CI=true`, dan lockfile yang tertinggal dari `package.json` membuat build
+> **gagal di cloud**. Pakai clean install (`npm ci`) secara lokal supaya
 > ketidakcocokan ketahuan sebelum menghabiskan kuota build.
 
 ### 15.2 Sinkronkan SDK dari OpenAPI backend
 
-Kedua client generate tipe dari `apps/backend/openapi.json`. Jalankan ini
-**setiap kali API contract backend berubah**, sebelum build:
+Kedua client generate tipe dari `openapi.json` di repo backend ini. Jalankan
+ini **setiap kali API contract backend berubah**, sebelum build:
 
 ```bash
 # 1. Regenerate spec di backend (butuh Postgres + Redis hidup, karena
 #    script ini boot AppModule)
-cd apps/backend
-pnpm run openapi:generate
+cd /path/to/kahade-backend
+npm run openapi:generate
 
-# 2. Salin + generate tipe di kedua client
-cd ../mobile && pnpm run sdk:update
-cd ../admin  && pnpm run sdk:update
+# 2. Salin + generate tipe di kedua client (repo terpisah)
+cd /path/to/kahade-mobile && npm run sdk:update
+cd /path/to/kahade-admin  && npm run sdk:update
 ```
 
 `sdk:update` = `sdk:fetch` (copy `openapi.json`) + `sdk:generate`
@@ -1517,14 +1494,14 @@ EAS build memakan waktu dan kuota. Selalu lolos gate ini dulu secara lokal:
 
 ```bash
 # Mobile
-cd apps/mobile
-pnpm run typecheck        # tsc --noEmit
-pnpm run lint
-pnpm test
+cd /path/to/kahade-mobile
+npm run typecheck        # tsc --noEmit
+npm run lint
+npm test
 
 # Admin (tidak punya script lint/test)
-cd ../admin
-pnpm run typecheck
+cd /path/to/kahade-admin
+npm run typecheck
 ```
 
 Lalu pastikan JS bundle benar-benar bisa dibundel — ini yang menangkap error
@@ -1826,13 +1803,13 @@ Script `scripts/run-constraints.sh` menambahkan CHECK constraints PostgreSQL yan
 Script idempotent — aman dijalankan berulang.
 
 > **PENTING — hook `postprisma:migrate` TIDAK jalan di production.** Hook itu
-> hanya ter-trigger lewat `pnpm run prisma:migrate` (yang memanggil
+> hanya ter-trigger lewat `npm run prisma:migrate` (yang memanggil
 > `prisma migrate dev` — dev-only). Perintah production `prisma migrate deploy`
 > memanggil binary Prisma langsung, jadi tidak ada pre/post hook npm yang jalan.
 > **Panggil constraints secara eksplisit setelah setiap migrasi:**
 >
 > ```bash
-> pnpm run db:constraints
+> npm run db:constraints
 > ```
 >
 > Kalau ini dilewat, CHECK constraints tidak pernah terpasang di production.
@@ -1874,7 +1851,7 @@ Perubahan berikut mempengaruhi deployment setelah audit. Pastikan sudah diterapk
 | FEE_DEDUCT audit trail | Audit balanceBefore/After akurat | Tidak perlu aksi — otomatis |
 
 **Upgrade dari versi sebelum audit:** tambahkan `WALLET_PIN_PEPPER` melalui
-editor aman pada satu file legacy `/var/www/kahade/apps/backend/.env`, lalu
+editor aman pada satu file legacy `/var/www/kahade/.env`, lalu
 gunakan prosedur immutable di Section 13. Jangan menambah environment variable
 melalui `echo`, jangan melakukan `git pull` pada runtime, dan jangan melakukan
 `pm2 reload` untuk memindahkan source release.
@@ -2024,8 +2001,8 @@ Jika gagal:
 ### 19.6 Migration Gagal
 
 ```bash
-cd /var/www/kahade/apps/backend
-pnpm exec prisma migrate deploy
+cd /var/www/kahade
+npx prisma migrate deploy
 ```
 
 Jika error "migration not found":
@@ -2103,7 +2080,7 @@ Jika weekly reconciliation menemukan discrepancy (`clean: false`):
 ║                                                              ║
 ║  DEPLOY                                                      ║
 ║  ─────────────────────────────────────────────               ║
-║  cd /var/www/kahade/apps/backend && ./deploy.sh                    ║
+║  cd /var/www/kahade && ./deploy.sh                                ║
 ║                                                              ║
 ║  SSL                                                         ║
 ║  ─────────────────────────────────────────────               ║
@@ -2120,7 +2097,7 @@ Jika weekly reconciliation menemukan discrepancy (`clean: false`):
 ║  DATABASE                                                    ║
 ║  ─────────────────────────────────────────────               ║
 ║  psql -U kahade_prod -d kahade_prod -h 127.0.0.1             ║
-║  pnpm exec prisma migrate deploy  Run migrations             ║
+║  npx prisma migrate deploy       Run migrations             ║
 ║  bash scripts/run-constraints.sh  Apply constraints          ║
 ║                                                              ║
 ║  REDIS                                                       ║

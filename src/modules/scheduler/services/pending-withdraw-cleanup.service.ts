@@ -31,13 +31,24 @@ export class PendingWithdrawCleanupService {
     const acquired = await this.redis.setNx(lockKey, lockToken, lockTtl);
     if (!acquired) return;
 
-    const lockRenewal = setInterval(async () => {
-      const renewed = await this.redis.renewLock(lockKey, lockToken, lockTtl);
-      if (!renewed) {
-        clearInterval(lockRenewal);
-        this.logger.warn('Pending withdrawal cleanup lock ownership was lost; stopping after the current batch.');
-      }
-    }, Math.floor(lockTtl * 0.6) * 1000);
+    const lockRenewal = setInterval(
+      () => {
+        // AUDIT: keep the interval callback synchronous — an async callback
+        // risks overlapping ticks and unhandled rejections when renewLock throws.
+        void (async () => {
+          const renewed = await this.redis.renewLock(lockKey, lockToken, lockTtl);
+          if (!renewed) {
+            clearInterval(lockRenewal);
+            this.logger.warn(
+              'Pending withdrawal cleanup lock ownership was lost; stopping after the current batch.',
+            );
+          }
+        })().catch((err: unknown) => {
+          this.logger.error(`Lock renewal check failed: ${(err as Error).message}`);
+        });
+      },
+      Math.floor(lockTtl * 0.6) * 1000,
+    );
 
     // 10 minutes = 2× the OTP TTL (5 min); give users the full OTP window + buffer
     const otpExpiryThreshold = new Date(Date.now() - 10 * 60 * 1000);
@@ -87,70 +98,87 @@ export class PendingWithdrawCleanupService {
         let succeeded = false;
         for (let attempt = 1; attempt <= MAX_OCC_RETRIES && !succeeded; attempt++) {
           try {
-          await this.prisma.$transaction(async (client) => {
-            const wallet = await client.wallet.findUnique({ where: { id: walletId } });
-            if (!wallet) {
-              this.logger.warn(`PendingWithdrawCleanup: wallet ${walletId} not found, skipping refund`);
-              return;
-            }
-
-            let availableRefund = BigInt(0);
-            let totalRefund = BigInt(0);
-            let todayTotal = BigInt(0);
-
-            for (const tx of txs) {
-              const isProcess = processIdSet.has(tx.id);
-              const expectedStatus = isProcess ? WithdrawStatus.PENDING_PROCESS : WithdrawStatus.PENDING_OTP;
-              const description = isProcess ? 'Auto-failed: stuck in PENDING_PROCESS for over 24 hours' : undefined;
-
-              const updated = await client.walletTransaction.updateMany({
-                where: { id: tx.id, withdrawStatus: expectedStatus },
-                data: {
-                  withdrawStatus: WithdrawStatus.FAILED,
-                  status: WalletTransactionStatus.FAILED,
-                  ...(description ? { description } : {}),
-                },
-              });
-
-              if (updated.count > 0) {
-                availableRefund += tx.amount;
-                // Every withdrawal reservation now decrements both availableBalance
-                // and totalBalance, including PENDING_OTP. Refund both on expiry.
-                totalRefund += tx.amount;
-                if (tx.createdAt >= todayStart) {
-                  todayTotal += tx.amount;
+            await this.prisma.$transaction(
+              async client => {
+                const wallet = await client.wallet.findUnique({ where: { id: walletId } });
+                if (!wallet) {
+                  this.logger.warn(
+                    `PendingWithdrawCleanup: wallet ${walletId} not found, skipping refund`,
+                  );
+                  return;
                 }
 
-              }
-            }
+                let availableRefund = BigInt(0);
+                let totalRefund = BigInt(0);
+                let todayTotal = BigInt(0);
 
-            if (availableRefund === BigInt(0)) return;
+                for (const tx of txs) {
+                  const isProcess = processIdSet.has(tx.id);
+                  const expectedStatus = isProcess
+                    ? WithdrawStatus.PENDING_PROCESS
+                    : WithdrawStatus.PENDING_OTP;
+                  const description = isProcess
+                    ? 'Auto-failed: stuck in PENDING_PROCESS for over 24 hours'
+                    : undefined;
 
-            const withdrawRollback = todayTotal > BigInt(0)
-              ? (wallet.todayWithdrawAmount >= todayTotal
-                  ? { decrement: todayTotal }
-                  : { set: BigInt(0) })
-              : undefined;
+                  const updated = await client.walletTransaction.updateMany({
+                    where: { id: tx.id, withdrawStatus: expectedStatus },
+                    data: {
+                      withdrawStatus: WithdrawStatus.FAILED,
+                      status: WalletTransactionStatus.FAILED,
+                      ...(description ? { description } : {}),
+                    },
+                  });
 
-            const walletUpdated = await client.wallet.updateMany({
-              where: { id: walletId, version: wallet.version },
-              data: {
-                availableBalance: { increment: availableRefund },
-                ...(totalRefund > BigInt(0) ? { totalBalance: { increment: totalRefund } } : {}),
-                ...(withdrawRollback !== undefined ? { todayWithdrawAmount: withdrawRollback } : {}),
-                version: { increment: 1 },
+                  if (updated.count > 0) {
+                    availableRefund += tx.amount;
+                    // Every withdrawal reservation now decrements both availableBalance
+                    // and totalBalance, including PENDING_OTP. Refund both on expiry.
+                    totalRefund += tx.amount;
+                    if (tx.createdAt >= todayStart) {
+                      todayTotal += tx.amount;
+                    }
+                  }
+                }
+
+                if (availableRefund === BigInt(0)) return;
+
+                const withdrawRollback =
+                  todayTotal > BigInt(0)
+                    ? wallet.todayWithdrawAmount >= todayTotal
+                      ? { decrement: todayTotal }
+                      : { set: BigInt(0) }
+                    : undefined;
+
+                const walletUpdated = await client.wallet.updateMany({
+                  where: { id: walletId, version: wallet.version },
+                  data: {
+                    availableBalance: { increment: availableRefund },
+                    ...(totalRefund > BigInt(0)
+                      ? { totalBalance: { increment: totalRefund } }
+                      : {}),
+                    ...(withdrawRollback !== undefined
+                      ? { todayWithdrawAmount: withdrawRollback }
+                      : {}),
+                    version: { increment: 1 },
+                  },
+                });
+                if (walletUpdated.count === 0) {
+                  throw new Error(`PendingWithdrawCleanup OCC conflict for wallet ${walletId}`);
+                }
               },
-            });
-            if (walletUpdated.count === 0) {
-              throw new Error(`PendingWithdrawCleanup OCC conflict for wallet ${walletId}`);
-            }
-          }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
-          succeeded = true;
+              { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+            );
+            succeeded = true;
           } catch (walletErr) {
             if (attempt === MAX_OCC_RETRIES) {
-              this.logger.error(`PendingWithdrawCleanup: wallet ${walletId} refund failed after ${MAX_OCC_RETRIES} retries — will retry next tick: ${walletErr instanceof Error ? walletErr.message : String(walletErr)}`);
+              this.logger.error(
+                `PendingWithdrawCleanup: wallet ${walletId} refund failed after ${MAX_OCC_RETRIES} retries — will retry next tick: ${walletErr instanceof Error ? walletErr.message : String(walletErr)}`,
+              );
             } else {
-              this.logger.warn(`PendingWithdrawCleanup: wallet ${walletId} OCC conflict, retry ${attempt}/${MAX_OCC_RETRIES}`);
+              this.logger.warn(
+                `PendingWithdrawCleanup: wallet ${walletId} OCC conflict, retry ${attempt}/${MAX_OCC_RETRIES}`,
+              );
               await new Promise(r => setTimeout(r, 150 * attempt));
             }
           }
@@ -160,7 +188,11 @@ export class PendingWithdrawCleanupService {
       this.logger.error('PendingWithdrawCleanup FAILED', error);
     } finally {
       clearInterval(lockRenewal);
-      await this.redis.releaseLock(lockKey, lockToken).catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
+      await this.redis
+        .releaseLock(lockKey, lockToken)
+        .catch(err =>
+          this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`),
+        );
     }
   }
 }

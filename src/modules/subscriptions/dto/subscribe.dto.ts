@@ -1,4 +1,13 @@
-import { IsBoolean, IsEnum, IsOptional, IsString, Length, Matches, MaxLength, IsDateString } from 'class-validator';
+import {
+  IsBoolean,
+  IsEnum,
+  IsOptional,
+  IsString,
+  Length,
+  Matches,
+  MaxLength,
+  IsDateString,
+} from 'class-validator';
 import { Transform } from 'class-transformer';
 import { SubscriptionPlan, PaymentMethod } from '@prisma/client';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
@@ -14,10 +23,13 @@ export class SubscribeDto {
   @IsEnum(SubscriptionPlan)
   plan!: SubscriptionPlan;
 
-  @ApiPropertyOptional({ description: 'Wallet PIN for paid subscription verification. Optional only when useTrial=true.' })
+  @ApiPropertyOptional({
+    description: 'Wallet PIN for paid subscription verification. Optional only when useTrial=true.',
+  })
   @IsOptional()
   @IsString()
   @Length(6, 6)
+  @Matches(/^\d{6}$/, { message: 'Wallet PIN must consist of 6 numeric digits' })
   pin?: string;
 
   @ApiPropertyOptional({ enum: PaymentMethod, description: 'Payment method' })
@@ -25,14 +37,20 @@ export class SubscribeDto {
   @IsEnum(PaymentMethod)
   paymentMethod?: PaymentMethod;
 
-  @ApiPropertyOptional({ description: 'Active SUBSCRIPTION_DISCOUNT campaign promo code for the first paid period' })
+  @ApiPropertyOptional({
+    description: 'Active SUBSCRIPTION_DISCOUNT campaign promo code for the first paid period',
+  })
   @IsOptional()
   @IsString()
   @MaxLength(32)
-  @Matches(/^[A-Z0-9_-]+$/i, { message: 'promoCode may contain only A-Z, 0-9, underscore, or hyphen' })
+  @Matches(/^[A-Z0-9_-]+$/i, {
+    message: 'promoCode may contain only A-Z, 0-9, underscore, or hyphen',
+  })
   promoCode?: string;
 
-  @ApiPropertyOptional({ description: 'Start the one-lifetime free trial instead of charging wallet balance' })
+  @ApiPropertyOptional({
+    description: 'Start the one-lifetime free trial instead of charging wallet balance',
+  })
   @IsOptional()
   @IsBoolean()
   @Transform(toBoolean)
@@ -43,11 +61,15 @@ export class RenewDto {
   @ApiProperty({ description: 'Wallet PIN for payment verification' })
   @IsString()
   @Length(6, 6)
+  @Matches(/^\d{6}$/, { message: 'Wallet PIN must consist of 6 numeric digits' })
   pin!: string;
 }
 
 export class PauseSubscriptionDto {
-  @ApiPropertyOptional({ description: 'Auto-resume date (ISO 8601). If omitted, the subscription stays paused until manual resume.' })
+  @ApiPropertyOptional({
+    description:
+      'Auto-resume date (ISO 8601). If omitted, the subscription stays paused until manual resume.',
+  })
   @IsOptional()
   @IsDateString()
   resumeAt?: string;

@@ -13,7 +13,9 @@ const KNOWN_PREFIX_PATTERNS: Record<string, RegExp> = {
   PRD: /^PRD-[A-Za-z0-9_-]{8,40}$/,
   SUB: /^SUB-[A-Za-z0-9_-]{8,40}$/,
   TKT: /^TKT-[A-Za-z0-9_-]{8,40}$/,
-  ADM: /^ADM-[A-Za-z0-9_-]{8,40}$/,
+  // Admin IDs are generated as `ADMIN-XXXXX` (generateAdminId / prisma seed);
+  // the previous `ADM` entry could never match a real ID and was dead code.
+  ADMIN: /^ADMIN-[A-Za-z0-9_-]{3,40}$/,
 };
 
 @Injectable()

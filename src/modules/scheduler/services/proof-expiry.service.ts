@@ -22,7 +22,9 @@ export class ProofExpiryService {
     try {
       task();
     } catch (error: unknown) {
-      this.logger.warn(`${label} realtime side effect failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.logger.warn(
+        `${label} realtime side effect failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
@@ -37,13 +39,21 @@ export class ProofExpiryService {
     if (!acquired) return;
 
     let lockLost = false;
-    const lockRenewalInterval = setInterval(async () => {
-      const renewed = await this.redis.renewLock(lockKey, lockToken, 600);
-      if (!renewed) {
-        lockLost = true;
-        clearInterval(lockRenewalInterval);
-        this.logger.warn('Proof expiry lock ownership was lost; stopping after the current batch.');
-      }
+    const lockRenewalInterval = setInterval(() => {
+      // AUDIT: keep the interval callback synchronous — an async callback
+      // risks overlapping ticks and unhandled rejections when renewLock throws.
+      void (async () => {
+        const renewed = await this.redis.renewLock(lockKey, lockToken, 600);
+        if (!renewed) {
+          lockLost = true;
+          clearInterval(lockRenewalInterval);
+          this.logger.warn(
+            'Proof expiry lock ownership was lost; stopping after the current batch.',
+          );
+        }
+      })().catch((err: unknown) => {
+        this.logger.error(`Lock renewal check failed: ${(err as Error).message}`);
+      });
     }, 60_000);
 
     const now = new Date();
@@ -51,7 +61,7 @@ export class ProofExpiryService {
     try {
       let hasMore = true;
       while (hasMore) {
-        if (lockLost || await this.redis.get(lockKey) !== lockToken) {
+        if (lockLost || (await this.redis.get(lockKey)) !== lockToken) {
           this.logger.warn('Proof expiry lock ownership was lost; aborting before the next batch.');
           return;
         }
@@ -72,49 +82,72 @@ export class ProofExpiryService {
 
         if (expiredProofs.length === 0) break;
         hasMore = expiredProofs.length === 100;
-        this.logger.log(`Found ${expiredProofs.length} expired unreviewed delivery proofs — auto-rejecting`);
+        this.logger.log(
+          `Found ${expiredProofs.length} expired unreviewed delivery proofs — auto-rejecting`,
+        );
 
         for (const proof of expiredProofs) {
-        try {
-          const updated = await this.prisma.deliveryProof.updateMany({
-            where: { id: proof.id, status: 'SUBMITTED', reviewWindowEnd: { lt: now }, order: { status: 'IN_DELIVERY' } },
-            data: {
-              status: 'REJECTED',
-              reviewedAt: new Date(),
-              rejectionNote: 'Auto-expired: buyer did not review within the review window',
-            },
-          });
-          if (updated.count === 0) continue;
+          try {
+            const updated = await this.prisma.deliveryProof.updateMany({
+              where: {
+                id: proof.id,
+                status: 'SUBMITTED',
+                reviewWindowEnd: { lt: now },
+                order: { status: 'IN_DELIVERY' },
+              },
+              data: {
+                status: 'REJECTED',
+                reviewedAt: new Date(),
+                rejectionNote: 'Auto-expired: buyer did not review within the review window',
+              },
+            });
+            if (updated.count === 0) continue;
 
-          this.prisma.notification.create({
-            data: {
-              notifId: generateNotifId(),
-              userId: proof.order.sellerId,
-              type: NotificationType.ORDER_DELIVERED,
-              category: getCategoryForType(NotificationType.ORDER_DELIVERED),
-              title: 'Bukti Pengiriman Kedaluwarsa',
-              body: `Bukti pengiriman untuk order "${proof.order.title}" sudah melewati batas waktu review. Silakan kirim bukti pengiriman baru.`,
-              isRead: false,
-            },
-          }).catch((notificationError: unknown) => this.logger.warn(`silent-catch: proof expiry notification failed: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`));
-          this.runRealtimeBestEffort(() => this.prisma.emitNotificationCreated({
-            userId: proof.order.sellerId,
-            title: 'Bukti Pengiriman Kedaluwarsa',
-            body: `Bukti pengiriman untuk order "${proof.order.title}" kedaluwarsa. Kirim ulang bukti baru.`,
-            data: { type: 'ORDER_DELIVERED', orderId: proof.order.orderId },
-          }), `PROOF_EXPIRY_NOTIFICATION orderId=${proof.order.orderId}`);
+            this.prisma.notification
+              .create({
+                data: {
+                  notifId: generateNotifId(),
+                  userId: proof.order.sellerId,
+                  type: NotificationType.ORDER_DELIVERED,
+                  category: getCategoryForType(NotificationType.ORDER_DELIVERED),
+                  title: 'Bukti Pengiriman Kedaluwarsa',
+                  body: `Bukti pengiriman untuk order "${proof.order.title}" sudah melewati batas waktu review. Silakan kirim bukti pengiriman baru.`,
+                  isRead: false,
+                },
+              })
+              .catch((notificationError: unknown) =>
+                this.logger.warn(
+                  `silent-catch: proof expiry notification failed: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`,
+                ),
+              );
+            this.runRealtimeBestEffort(
+              () =>
+                this.prisma.emitNotificationCreated({
+                  userId: proof.order.sellerId,
+                  title: 'Bukti Pengiriman Kedaluwarsa',
+                  body: `Bukti pengiriman untuk order "${proof.order.title}" kedaluwarsa. Kirim ulang bukti baru.`,
+                  data: { type: 'ORDER_DELIVERED', orderId: proof.order.orderId },
+                }),
+              `PROOF_EXPIRY_NOTIFICATION orderId=${proof.order.orderId}`,
+            );
 
-          this.logger.log(`Auto-expired proof ${proof.id} for order ${proof.order.orderId}`);
-        } catch (err) {
-          this.logger.error(`Failed to expire proof ${proof.id}: ${err instanceof Error ? err.message : String(err)}`);
-        }
+            this.logger.log(`Auto-expired proof ${proof.id} for order ${proof.order.orderId}`);
+          } catch (err) {
+            this.logger.error(
+              `Failed to expire proof ${proof.id}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
         }
       }
     } catch (error) {
       this.logger.error('ProofExpiryService FAILED', error);
     } finally {
       clearInterval(lockRenewalInterval);
-      await this.redis.releaseLock(lockKey, lockToken).catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
+      await this.redis
+        .releaseLock(lockKey, lockToken)
+        .catch(err =>
+          this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`),
+        );
     }
   }
 }

@@ -122,7 +122,11 @@ services:
     image: redis:7-alpine
     container_name: kahade-redis
     restart: unless-stopped
-    mem_limit: 256m
+    # AUDIT: maxmemory must stay BELOW the container mem_limit. Redis needs
+    # headroom for the process itself, buffers and the fork during AOF
+    # rewrite/bgsave — maxmemory == mem_limit (or above it) leads to the
+    # container being OOM-killed before Redis ever applies its own limit.
+    mem_limit: 512m
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -132,7 +136,7 @@ services:
       - /tmp
     command: >
       redis-server
-      --maxmemory 512mb
+      --maxmemory 384mb
       --maxmemory-policy noeviction
       --save 60 1
       --appendonly yes
@@ -157,7 +161,9 @@ services:
     image: redis:7-alpine
     container_name: kahade-bull-redis
     restart: unless-stopped
-    mem_limit: 256m
+    # AUDIT: leave ~25% headroom under the container limit for Redis overhead
+    # (AOF rewrite fork, buffers, fragmentation) to avoid OOM-kills.
+    mem_limit: 512m
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -168,7 +174,7 @@ services:
     command: >
       redis-server
       --port 6380
-      --maxmemory 256mb
+      --maxmemory 384mb
       --maxmemory-policy noeviction
       --save 60 1
       --appendonly yes

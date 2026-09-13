@@ -1,15 +1,34 @@
-import { IsNumber, IsInt, Min, Max, IsString, IsNotEmpty, Matches, Length, IsOptional, MaxLength } from 'class-validator';
+import {
+  IsNumber,
+  IsInt,
+  Min,
+  Max,
+  IsString,
+  IsNotEmpty,
+  Matches,
+  Length,
+  IsOptional,
+  MaxLength,
+} from 'class-validator';
 import { Transform } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { WALLET_MIN_TRANSFER, WALLET_MAX_TRANSFER_PER_TX } from '../../../common/constants/app.constants';
+import {
+  WALLET_MIN_TRANSFER,
+  WALLET_MAX_TRANSFER_PER_TX,
+} from '../../../common/constants/app.constants';
 
 export class TransferDto {
   @ApiProperty({ description: 'Recipient user ID or username' })
   @IsString()
   @IsNotEmpty({ message: 'Recipient is required' })
+  @MaxLength(100, { message: 'Recipient identifier must be at most 100 characters' })
   recipientId!: string;
 
-  @ApiProperty({ description: 'Transfer amount in IDR', minimum: WALLET_MIN_TRANSFER, maximum: WALLET_MAX_TRANSFER_PER_TX })
+  @ApiProperty({
+    description: 'Transfer amount in IDR',
+    minimum: WALLET_MIN_TRANSFER,
+    maximum: WALLET_MAX_TRANSFER_PER_TX,
+  })
   @Transform(({ value }) => {
     if (typeof value === 'number') return value;
     if (typeof value === 'string') {
@@ -20,8 +39,12 @@ export class TransferDto {
   })
   @IsNumber()
   @IsInt({ message: 'amount must be a whole number (no decimals)' })
-  @Min(WALLET_MIN_TRANSFER, { message: `Minimum transfer is Rp ${WALLET_MIN_TRANSFER.toLocaleString()}` })
-  @Max(WALLET_MAX_TRANSFER_PER_TX, { message: `Maximum transfer is Rp ${WALLET_MAX_TRANSFER_PER_TX.toLocaleString()}` })
+  @Min(WALLET_MIN_TRANSFER, {
+    message: `Minimum transfer is Rp ${WALLET_MIN_TRANSFER.toLocaleString()}`,
+  })
+  @Max(WALLET_MAX_TRANSFER_PER_TX, {
+    message: `Maximum transfer is Rp ${WALLET_MAX_TRANSFER_PER_TX.toLocaleString()}`,
+  })
   amount!: number;
 
   @ApiProperty({ description: '6-digit wallet PIN for transfer authorization' })

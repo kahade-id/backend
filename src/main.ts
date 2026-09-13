@@ -156,6 +156,13 @@ async function bootstrap(): Promise<void> {
   }
   app.getHttpAdapter().getInstance().set('trust proxy', trustedProxyCidr ?? 1);
 
+  // Express 5 defaults the query parser to "simple", which drops qs-style
+  // bracket array syntax (`?types[]=A&types[]=B`) that Express 4 accepted via
+  // its "extended" default. Pin the parser so the major-version bump of the
+  // direct `express` dependency cannot silently change req.query semantics
+  // for array/object query params (e.g. wallet export `types`).
+  app.getHttpAdapter().getInstance().set('query parser', 'extended');
+
   // Prisma transactions, and Bull jobs before the process exits on SIGTERM/SIGINT.
   app.enableShutdownHooks();
 

@@ -1,12 +1,5 @@
 import * as Sentry from '@sentry/nestjs';
-import {
-  ExceptionFilter,
-  Catch,
-  ArgumentsHost,
-  HttpStatus,
-  Inject,
-  Logger,
-} from '@nestjs/common';
+import { ExceptionFilter, Catch, ArgumentsHost, HttpStatus, Inject, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Response, Request } from 'express';
 
@@ -29,7 +22,9 @@ export class AllExceptionsFilter implements ExceptionFilter {
       let message: string;
       if (expressType === 'entity.too.large') {
         code = 'PAYLOAD_TOO_LARGE';
-        message = 'Request body too large (max 100 KB)';
+        // Do not hardcode a size here: the enforced limit differs per route
+        // (1 MB global JSON limit in main.ts, 1 KB on PIN/auth routes).
+        message = 'Request body too large for this endpoint';
       } else if (expressType === 'entity.parse.failed') {
         code = 'BAD_REQUEST';
         message = 'Malformed request body';
@@ -55,7 +50,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
       return;
     }
 
-    Sentry.withScope((scope) => {
+    Sentry.withScope(scope => {
       const sanitizedUrl = request.url?.split('?')[0] ?? request.url;
       scope.setExtra('url', sanitizedUrl);
       scope.setExtra('method', request.method);

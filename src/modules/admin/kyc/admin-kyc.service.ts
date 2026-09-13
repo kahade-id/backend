@@ -1,6 +1,12 @@
 import { Prisma, NotificationType, AuditAction } from '@prisma/client';
 import { getCategoryForType } from '../../notifications/notification-category.map';
-import { Injectable, NotFoundException, BadRequestException, UnauthorizedException, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  UnauthorizedException,
+  Logger,
+} from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { PrismaService } from '../../../prisma/prisma.service';
@@ -47,12 +53,19 @@ export class AdminKycService {
   private normalizeRequiredText(value: string, field: string): string {
     const normalized = value.trim();
     if (!normalized) {
-      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `${field} must contain non-whitespace text` });
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: `${field} must contain non-whitespace text`,
+      });
     }
     return normalized;
   }
 
-  async getKycQueue(page = 1, limit = 20, status?: string): Promise<PaginatedResponse<Record<string, unknown>>> {
+  async getKycQueue(
+    page = 1,
+    limit = 20,
+    status?: string,
+  ): Promise<PaginatedResponse<Record<string, unknown>>> {
     const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
     const safeLimit = Number.isFinite(limit) ? Math.min(100, Math.max(1, Math.floor(limit))) : 20;
     const skip = (safePage - 1) * safeLimit;
@@ -93,42 +106,60 @@ export class AdminKycService {
     return createPaginatedResponse(requests, total, safePage, safeLimit);
   }
 
-  async approveKyc(kycId: string, adminId: string, notes?: string, ipAddress: string = 'internal'): Promise<Record<string, unknown>> {
+  async approveKyc(
+    kycId: string,
+    adminId: string,
+    notes?: string,
+    ipAddress: string = 'internal',
+  ): Promise<Record<string, unknown>> {
     const normalizedNotes = this.normalizeOptionalText(notes);
     const request = await this.prisma.kycRequest.findFirst({
       where: { OR: [{ id: kycId }, { kycId }] },
       include: { user: { select: { id: true, userId: true, email: true, fullName: true } } },
     });
-    if (!request) throw new NotFoundException({ code: ErrorCodes.KYC_NOT_FOUND, message: 'KYC request not found' });
+    if (!request)
+      throw new NotFoundException({
+        code: ErrorCodes.KYC_NOT_FOUND,
+        message: 'KYC request not found',
+      });
     if (request.status !== 'PENDING') {
-      throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: `KYC is already ${request.status}` });
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_STATUS,
+        message: `KYC is already ${request.status}`,
+      });
     }
 
-    const updated = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      const guard = await tx.kycRequest.updateMany({
-        where: { id: request.id, status: 'PENDING' },
-        data: {
-          status: 'APPROVED',
-          reviewedBy: adminId,
-          reviewedAt: new Date(),
-          adminNotes: normalizedNotes,
-        },
-      });
-      if (guard.count === 0) {
-        throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'KYC request was already processed by another admin' });
-      }
-      const result = await tx.kycRequest.findUniqueOrThrow({ where: { id: request.id } });
+    const updated = await this.prisma.$transaction(
+      async (tx: Prisma.TransactionClient) => {
+        const guard = await tx.kycRequest.updateMany({
+          where: { id: request.id, status: 'PENDING' },
+          data: {
+            status: 'APPROVED',
+            reviewedBy: adminId,
+            reviewedAt: new Date(),
+            adminNotes: normalizedNotes,
+          },
+        });
+        if (guard.count === 0) {
+          throw new BadRequestException({
+            code: ErrorCodes.INVALID_STATUS,
+            message: 'KYC request was already processed by another admin',
+          });
+        }
+        const result = await tx.kycRequest.findUniqueOrThrow({ where: { id: request.id } });
 
-      await tx.user.update({
-        where: { id: request.userId },
-        data: {
-          kycStatus: 'APPROVED',
-          kycApprovedAt: new Date(),
-        },
-      });
+        await tx.user.update({
+          where: { id: request.userId },
+          data: {
+            kycStatus: 'APPROVED',
+            kycApprovedAt: new Date(),
+          },
+        });
 
-      return result;
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+        return result;
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
 
     await this.invalidateKycCache(request.userId);
     this.auditLog.logAdminAction({
@@ -140,9 +171,23 @@ export class AdminKycService {
       ipAddress,
     });
 
-    void this.prisma.notification.create({
-      data: { notifId: generateNotifId(), userId: request.userId, type: NotificationType.KYC_APPROVED, category: getCategoryForType(NotificationType.KYC_APPROVED), title: 'KYC Verification Approved', body: 'Congratulations! Your identity has been successfully verified. You can now perform escrow transactions.', isRead: false },
-    }).catch((error: unknown) => this.logger.warn(`KYC approval notification failed after commit: ${error instanceof Error ? error.message : String(error)}`));
+    void this.prisma.notification
+      .create({
+        data: {
+          notifId: generateNotifId(),
+          userId: request.userId,
+          type: NotificationType.KYC_APPROVED,
+          category: getCategoryForType(NotificationType.KYC_APPROVED),
+          title: 'KYC Verification Approved',
+          body: 'Congratulations! Your identity has been successfully verified. You can now perform escrow transactions.',
+          isRead: false,
+        },
+      })
+      .catch((error: unknown) =>
+        this.logger.warn(
+          `KYC approval notification failed after commit: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
 
     this.prisma.emitNotificationCreated({
       userId: request.userId,
@@ -152,57 +197,82 @@ export class AdminKycService {
     });
 
     if (request.user?.email) {
-      this.emailQueue.add('send', {
-        to: request.user.email,
-        subject: 'Kahade — Your KYC Verification Has Been Approved',
-        templateName: 'kyc-approved',
-        templateContext: { name: request.user.fullName ?? 'User' },
-      }, { attempts: 3, backoff: { type: 'exponential', delay: 5000 } }).catch((err) => {
-        this.logger.error(`Failed to queue KYC approval email for ${request.user?.email}`, err);
-      });
+      this.emailQueue
+        .add(
+          'send',
+          {
+            to: request.user.email,
+            subject: 'Kahade — Your KYC Verification Has Been Approved',
+            templateName: 'kyc-approved',
+            templateContext: { name: request.user.fullName ?? 'User' },
+          },
+          { attempts: 3, backoff: { type: 'exponential', delay: 5000 } },
+        )
+        .catch(err => {
+          this.logger.error(`Failed to queue KYC approval email for ${request.user?.email}`, err);
+        });
     }
 
     return updated;
   }
 
-  async rejectKyc(kycId: string, adminId: string, reason: string, notes?: string, ipAddress: string = 'internal'): Promise<Record<string, unknown>> {
+  async rejectKyc(
+    kycId: string,
+    adminId: string,
+    reason: string,
+    notes?: string,
+    ipAddress: string = 'internal',
+  ): Promise<Record<string, unknown>> {
     const normalizedReason = this.normalizeRequiredText(reason, 'Rejection reason');
     const normalizedNotes = this.normalizeOptionalText(notes);
     const request = await this.prisma.kycRequest.findFirst({
       where: { OR: [{ id: kycId }, { kycId }] },
       include: { user: { select: { id: true, userId: true, email: true, fullName: true } } },
     });
-    if (!request) throw new NotFoundException({ code: ErrorCodes.KYC_NOT_FOUND, message: 'KYC request not found' });
+    if (!request)
+      throw new NotFoundException({
+        code: ErrorCodes.KYC_NOT_FOUND,
+        message: 'KYC request not found',
+      });
     if (request.status !== 'PENDING') {
-      throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: `KYC is already ${request.status}` });
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_STATUS,
+        message: `KYC is already ${request.status}`,
+      });
     }
 
-    const updated = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      const guard = await tx.kycRequest.updateMany({
-        where: { id: request.id, status: 'PENDING' },
-        data: {
-          status: 'REJECTED',
-          reviewedBy: adminId,
-          reviewedAt: new Date(),
-          rejectionReason: normalizedReason,
-          adminNotes: normalizedNotes,
-        },
-      });
-      if (guard.count === 0) {
-        throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'KYC request was already processed by another admin' });
-      }
-      const result = await tx.kycRequest.findUniqueOrThrow({ where: { id: request.id } });
+    const updated = await this.prisma.$transaction(
+      async (tx: Prisma.TransactionClient) => {
+        const guard = await tx.kycRequest.updateMany({
+          where: { id: request.id, status: 'PENDING' },
+          data: {
+            status: 'REJECTED',
+            reviewedBy: adminId,
+            reviewedAt: new Date(),
+            rejectionReason: normalizedReason,
+            adminNotes: normalizedNotes,
+          },
+        });
+        if (guard.count === 0) {
+          throw new BadRequestException({
+            code: ErrorCodes.INVALID_STATUS,
+            message: 'KYC request was already processed by another admin',
+          });
+        }
+        const result = await tx.kycRequest.findUniqueOrThrow({ where: { id: request.id } });
 
-      await tx.user.update({
-        where: { id: request.userId },
-        data: {
-          kycStatus: 'REJECTED',
-          kycApprovedAt: null,
-        },
-      });
+        await tx.user.update({
+          where: { id: request.userId },
+          data: {
+            kycStatus: 'REJECTED',
+            kycApprovedAt: null,
+          },
+        });
 
-      return result;
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+        return result;
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
 
     await this.invalidateKycCache(request.userId);
     this.auditLog.logAdminAction({
@@ -215,9 +285,23 @@ export class AdminKycService {
     });
 
     const safeReason = escapeHtml(normalizedReason);
-    void this.prisma.notification.create({
-      data: { notifId: generateNotifId(), userId: request.userId, type: NotificationType.KYC_REJECTED, category: getCategoryForType(NotificationType.KYC_REJECTED), title: 'KYC Verification Rejected', body: `Your KYC application could not be approved. Reason: ${safeReason}. Please resubmit with the correct documents.`, isRead: false },
-    }).catch((error: unknown) => this.logger.warn(`KYC rejection notification failed after commit: ${error instanceof Error ? error.message : String(error)}`));
+    void this.prisma.notification
+      .create({
+        data: {
+          notifId: generateNotifId(),
+          userId: request.userId,
+          type: NotificationType.KYC_REJECTED,
+          category: getCategoryForType(NotificationType.KYC_REJECTED),
+          title: 'KYC Verification Rejected',
+          body: `Your KYC application could not be approved. Reason: ${safeReason}. Please resubmit with the correct documents.`,
+          isRead: false,
+        },
+      })
+      .catch((error: unknown) =>
+        this.logger.warn(
+          `KYC rejection notification failed after commit: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
 
     const safeReasonForPush = escapeHtml(normalizedReason);
     this.prisma.emitNotificationCreated({
@@ -230,55 +314,83 @@ export class AdminKycService {
     if (request.user?.email) {
       const safeReasonForEmail = escapeHtml(normalizedReason);
       const safeNotesForEmail = normalizedNotes ? escapeHtml(normalizedNotes) : undefined;
-      this.emailQueue.add('send', {
-        to: request.user.email,
-        subject: 'Kahade — Your KYC Verification Was Not Approved',
-        templateName: 'kyc-rejected',
-        templateContext: { name: request.user.fullName ?? 'User', reason: safeReasonForEmail, notes: safeNotesForEmail },
-      }, { attempts: 3, backoff: { type: 'exponential', delay: 5000 } }).catch((err) => {
-        this.logger.error(`Failed to queue KYC rejection email for ${request.user?.email}`, err);
-      });
+      this.emailQueue
+        .add(
+          'send',
+          {
+            to: request.user.email,
+            subject: 'Kahade — Your KYC Verification Was Not Approved',
+            templateName: 'kyc-rejected',
+            templateContext: {
+              name: request.user.fullName ?? 'User',
+              reason: safeReasonForEmail,
+              notes: safeNotesForEmail,
+            },
+          },
+          { attempts: 3, backoff: { type: 'exponential', delay: 5000 } },
+        )
+        .catch(err => {
+          this.logger.error(`Failed to queue KYC rejection email for ${request.user?.email}`, err);
+        });
     }
 
     return updated;
   }
 
-  async revokeKyc(kycId: string, adminId: string, reason: string, ipAddress: string = 'internal'): Promise<Record<string, unknown>> {
+  async revokeKyc(
+    kycId: string,
+    adminId: string,
+    reason: string,
+    ipAddress: string = 'internal',
+  ): Promise<Record<string, unknown>> {
     const normalizedReason = this.normalizeRequiredText(reason, 'Revocation reason');
     const request = await this.prisma.kycRequest.findFirst({
       where: { OR: [{ id: kycId }, { kycId }] },
       include: { user: { select: { id: true, userId: true, email: true, fullName: true } } },
     });
-    if (!request) throw new NotFoundException({ code: ErrorCodes.KYC_NOT_FOUND, message: 'KYC request not found' });
+    if (!request)
+      throw new NotFoundException({
+        code: ErrorCodes.KYC_NOT_FOUND,
+        message: 'KYC request not found',
+      });
     if (request.status !== 'APPROVED') {
-      throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: `KYC can only be revoked from APPROVED status, current: ${request.status}` });
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_STATUS,
+        message: `KYC can only be revoked from APPROVED status, current: ${request.status}`,
+      });
     }
 
-    const updated = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      const guard = await tx.kycRequest.updateMany({
-        where: { id: request.id, status: 'APPROVED' },
-        data: {
-          status: 'REVOKED',
-          reviewedBy: adminId,
-          reviewedAt: new Date(),
-          rejectionReason: normalizedReason,
-        },
-      });
-      if (guard.count === 0) {
-        throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'KYC request was already processed by another admin' });
-      }
-      const result = await tx.kycRequest.findUniqueOrThrow({ where: { id: request.id } });
+    const updated = await this.prisma.$transaction(
+      async (tx: Prisma.TransactionClient) => {
+        const guard = await tx.kycRequest.updateMany({
+          where: { id: request.id, status: 'APPROVED' },
+          data: {
+            status: 'REVOKED',
+            reviewedBy: adminId,
+            reviewedAt: new Date(),
+            rejectionReason: normalizedReason,
+          },
+        });
+        if (guard.count === 0) {
+          throw new BadRequestException({
+            code: ErrorCodes.INVALID_STATUS,
+            message: 'KYC request was already processed by another admin',
+          });
+        }
+        const result = await tx.kycRequest.findUniqueOrThrow({ where: { id: request.id } });
 
-      await tx.user.update({
-        where: { id: request.userId },
-        data: {
-          kycStatus: 'REVOKED',
-          kycApprovedAt: null,
-        },
-      });
+        await tx.user.update({
+          where: { id: request.userId },
+          data: {
+            kycStatus: 'REVOKED',
+            kycApprovedAt: null,
+          },
+        });
 
-      return result;
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+        return result;
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
 
     await this.invalidateKycCache(request.userId);
     this.auditLog.logAdminAction({
@@ -291,9 +403,23 @@ export class AdminKycService {
     });
 
     const safeRevokeReason = escapeHtml(normalizedReason);
-    void this.prisma.notification.create({
-      data: { notifId: generateNotifId(), userId: request.userId, type: NotificationType.KYC_REVOKED, category: getCategoryForType(NotificationType.KYC_REVOKED), title: 'KYC Verification Revoked', body: `Your KYC verification has been revoked. Reason: ${safeRevokeReason}. Please contact customer support for more information.`, isRead: false },
-    }).catch((error: unknown) => this.logger.warn(`KYC revocation notification failed after commit: ${error instanceof Error ? error.message : String(error)}`));
+    void this.prisma.notification
+      .create({
+        data: {
+          notifId: generateNotifId(),
+          userId: request.userId,
+          type: NotificationType.KYC_REVOKED,
+          category: getCategoryForType(NotificationType.KYC_REVOKED),
+          title: 'KYC Verification Revoked',
+          body: `Your KYC verification has been revoked. Reason: ${safeRevokeReason}. Please contact customer support for more information.`,
+          isRead: false,
+        },
+      })
+      .catch((error: unknown) =>
+        this.logger.warn(
+          `KYC revocation notification failed after commit: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
 
     const safeRevokeReasonForPush = escapeHtml(normalizedReason);
     this.prisma.emitNotificationCreated({
@@ -305,20 +431,30 @@ export class AdminKycService {
 
     if (request.user?.email) {
       const safeReasonForEmail = escapeHtml(normalizedReason);
-      this.emailQueue.add('send', {
-        to: request.user.email,
-        subject: 'Kahade — Your KYC Verification Has Been Revoked',
-        templateName: 'kyc-revoked',
-        templateContext: { name: request.user.fullName ?? 'User', reason: safeReasonForEmail },
-      }, { attempts: 3, backoff: { type: 'exponential', delay: 5000 } }).catch((err) => {
-        this.logger.error(`Failed to queue KYC revocation email for ${request.user?.email}`, err);
-      });
+      this.emailQueue
+        .add(
+          'send',
+          {
+            to: request.user.email,
+            subject: 'Kahade — Your KYC Verification Has Been Revoked',
+            templateName: 'kyc-revoked',
+            templateContext: { name: request.user.fullName ?? 'User', reason: safeReasonForEmail },
+          },
+          { attempts: 3, backoff: { type: 'exponential', delay: 5000 } },
+        )
+        .catch(err => {
+          this.logger.error(`Failed to queue KYC revocation email for ${request.user?.email}`, err);
+        });
     }
 
     return updated;
   }
 
-  async getKycDetail(kycId: string, adminId?: string, ipAddress?: string): Promise<Record<string, unknown>> {
+  async getKycDetail(
+    kycId: string,
+    adminId?: string,
+    ipAddress?: string,
+  ): Promise<Record<string, unknown>> {
     const request = await this.prisma.kycRequest.findFirst({
       where: { OR: [{ id: kycId }, { kycId }] },
       select: {
@@ -337,10 +473,14 @@ export class AdminKycService {
         reviewer: { select: { adminId: true, fullName: true } },
       },
     });
-    if (!request) throw new NotFoundException({ code: ErrorCodes.KYC_NOT_FOUND, message: 'KYC request not found' });
+    if (!request)
+      throw new NotFoundException({
+        code: ErrorCodes.KYC_NOT_FOUND,
+        message: 'KYC request not found',
+      });
 
     if (adminId) {
-      await this.auditLog.logAdminAction({
+      this.auditLog.logAdminAction({
         adminId,
         action: AuditAction.ADMIN_ACTION,
         targetType: 'KYC_REQUEST',
@@ -353,7 +493,12 @@ export class AdminKycService {
     return request;
   }
 
-  async getDocumentUrls(kycId: string, adminId: string, ipAddress: string = 'unknown', adminPassword?: string): Promise<{ ktpUrl: string | null; selfieUrl: string | null; partialErrors?: string[] }> {
+  async getDocumentUrls(
+    kycId: string,
+    adminId: string,
+    ipAddress: string = 'unknown',
+    adminPassword?: string,
+  ): Promise<{ ktpUrl: string | null; selfieUrl: string | null; partialErrors?: string[] }> {
     if (!adminPassword) {
       throw new UnauthorizedException({
         code: ErrorCodes.UNAUTHORIZED,
@@ -363,12 +508,15 @@ export class AdminKycService {
 
     const admin = await this.prisma.adminUser.findUnique({ where: { id: adminId } });
     if (!admin) {
-      throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Admin not found' });
+      throw new UnauthorizedException({
+        code: ErrorCodes.UNAUTHORIZED,
+        message: 'Admin not found',
+      });
     }
 
     const isPasswordValid = await bcryptCompare(adminPassword, admin.password);
     if (!isPasswordValid) {
-      await this.auditLog.logAdminAction({
+      this.auditLog.logAdminAction({
         adminId,
         action: AuditAction.ADMIN_ACTION,
         targetType: 'KYC_REQUEST',
@@ -376,11 +524,20 @@ export class AdminKycService {
         description: `Failed re-authentication attempt for KYC document access (${kycId})`,
         ipAddress,
       });
-      throw new UnauthorizedException({ code: ErrorCodes.INVALID_CREDENTIALS, message: 'Invalid password for re-authentication' });
+      throw new UnauthorizedException({
+        code: ErrorCodes.INVALID_CREDENTIALS,
+        message: 'Invalid password for re-authentication',
+      });
     }
 
-    const request = await this.prisma.kycRequest.findFirst({ where: { OR: [{ id: kycId }, { kycId }] } });
-    if (!request) throw new NotFoundException({ code: ErrorCodes.KYC_NOT_FOUND, message: 'KYC request not found' });
+    const request = await this.prisma.kycRequest.findFirst({
+      where: { OR: [{ id: kycId }, { kycId }] },
+    });
+    if (!request)
+      throw new NotFoundException({
+        code: ErrorCodes.KYC_NOT_FOUND,
+        message: 'KYC request not found',
+      });
 
     // KYC-006 fix: decrypt each document independently so a single corrupted
     // ciphertext doesn't prevent the admin from accessing the other (valid) document.
@@ -402,7 +559,10 @@ export class AdminKycService {
     }
 
     if (!ktpFileKey && !selfieFileKey) {
-      throw new BadRequestException({ code: ErrorCodes.INTERNAL_SERVER_ERROR, message: 'Both document decryption failed. Data may be corrupted.' });
+      throw new BadRequestException({
+        code: ErrorCodes.INTERNAL_SERVER_ERROR,
+        message: 'Both document decryption failed. Data may be corrupted.',
+      });
     }
 
     let ktpUrl: string | null = null;
@@ -411,7 +571,10 @@ export class AdminKycService {
       try {
         ktpUrl = await this.uploadService.generateDownloadUrl(ktpFileKey, 300);
       } catch (err) {
-        this.logger.error(`[AdminKycService] KTP signed URL generation failed for kycId=${kycId}`, err);
+        this.logger.error(
+          `[AdminKycService] KTP signed URL generation failed for kycId=${kycId}`,
+          err,
+        );
         decryptErrors.push('KTP download URL is unavailable');
       }
     }
@@ -419,12 +582,15 @@ export class AdminKycService {
       try {
         selfieUrl = await this.uploadService.generateDownloadUrl(selfieFileKey, 300);
       } catch (err) {
-        this.logger.error(`[AdminKycService] Selfie signed URL generation failed for kycId=${kycId}`, err);
+        this.logger.error(
+          `[AdminKycService] Selfie signed URL generation failed for kycId=${kycId}`,
+          err,
+        );
         decryptErrors.push('Selfie download URL is unavailable');
       }
     }
 
-    await this.auditLog.logAdminAction({
+    this.auditLog.logAdminAction({
       adminId,
       action: AuditAction.KYC_DOCUMENTS_ACCESSED,
       targetType: 'KYC_REQUEST',
@@ -433,6 +599,10 @@ export class AdminKycService {
       ipAddress,
     });
 
-    return { ktpUrl, selfieUrl, ...(decryptErrors.length > 0 ? { partialErrors: decryptErrors } : {}) };
+    return {
+      ktpUrl,
+      selfieUrl,
+      ...(decryptErrors.length > 0 ? { partialErrors: decryptErrors } : {}),
+    };
   }
 }

@@ -29,13 +29,21 @@ export class ProcessScheduledWithdrawalsService {
     if (!acquired) return;
 
     let lockLost = false;
-    const lockRenewalInterval = setInterval(async () => {
-      const renewed = await this.redis.renewLock(lockKey, lockToken, 3600);
-      if (!renewed) {
-        lockLost = true;
-        clearInterval(lockRenewalInterval);
-        this.logger.warn('Scheduled withdrawal lock ownership was lost; stopping after the current schedule.');
-      }
+    const lockRenewalInterval = setInterval(() => {
+      // AUDIT: keep the interval callback synchronous — an async callback
+      // risks overlapping ticks and unhandled rejections when renewLock throws.
+      void (async () => {
+        const renewed = await this.redis.renewLock(lockKey, lockToken, 3600);
+        if (!renewed) {
+          lockLost = true;
+          clearInterval(lockRenewalInterval);
+          this.logger.warn(
+            'Scheduled withdrawal lock ownership was lost; stopping after the current schedule.',
+          );
+        }
+      })().catch((err: unknown) => {
+        this.logger.error(`Lock renewal check failed: ${(err as Error).message}`);
+      });
     }, 60_000);
 
     const startedAt = Date.now();
@@ -54,12 +62,16 @@ export class ProcessScheduledWithdrawalsService {
       let skipped = 0;
 
       for (const schedule of schedules) {
-        if (lockLost || await this.redis.get(lockKey) !== lockToken) {
-          this.logger.warn('Scheduled withdrawal lock ownership was lost; aborting before the next schedule.');
+        if (lockLost || (await this.redis.get(lockKey)) !== lockToken) {
+          this.logger.warn(
+            'Scheduled withdrawal lock ownership was lost; aborting before the next schedule.',
+          );
           return;
         }
         try {
-          const result = await this.scheduledWithdrawalService.processScheduledWithdrawal(schedule.id);
+          const result = await this.scheduledWithdrawalService.processScheduledWithdrawal(
+            schedule.id,
+          );
           if (result.skipped) {
             skipped++;
             this.logger.debug(`Skipped schedule ${schedule.id}: ${result.reason}`);
@@ -76,14 +88,24 @@ export class ProcessScheduledWithdrawalsService {
       }
 
       const durationMs = Date.now() - startedAt;
-      this.logger.log(`Scheduled withdrawals complete: ${processed} processed, ${skipped} skipped (${durationMs}ms)`);
+      this.logger.log(
+        `Scheduled withdrawals complete: ${processed} processed, ${skipped} skipped (${durationMs}ms)`,
+      );
 
-      await this.redis.setex(`cron_heartbeat:process_scheduled_withdrawals`, 86400, JSON.stringify({
-        ranAt: new Date().toISOString(),
-        processed,
-        skipped,
-        durationMs,
-      })).catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
+      await this.redis
+        .setex(
+          `cron_heartbeat:process_scheduled_withdrawals`,
+          86400,
+          JSON.stringify({
+            ranAt: new Date().toISOString(),
+            processed,
+            skipped,
+            durationMs,
+          }),
+        )
+        .catch(err =>
+          this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`),
+        );
     } catch (error) {
       this.logger.error(
         `Failed to run scheduled withdrawals cron: ${error instanceof Error ? error.message : error}`,
@@ -91,7 +113,11 @@ export class ProcessScheduledWithdrawalsService {
       );
     } finally {
       clearInterval(lockRenewalInterval);
-      await this.redis.releaseLock(lockKey, lockToken).catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
+      await this.redis
+        .releaseLock(lockKey, lockToken)
+        .catch(err =>
+          this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`),
+        );
     }
   }
 }

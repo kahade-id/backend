@@ -1,4 +1,4 @@
-import { Injectable, CanActivate, ExecutionContext, ForbiddenException, Logger } from '@nestjs/common';
+import { Injectable, CanActivate, ExecutionContext, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import * as ErrorCodes from '../constants/error-codes';
@@ -8,8 +8,10 @@ const EMAIL_CACHE_KEY = (userId: string) => `guard:email_verified:${userId}`;
 
 @Injectable()
 export class EmailVerifiedGuard implements CanActivate {
-  private readonly logger = new Logger(EmailVerifiedGuard.name);
-  constructor(private prisma: PrismaService, private redis: RedisService) {}
+  constructor(
+    private prisma: PrismaService,
+    private redis: RedisService,
+  ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest();

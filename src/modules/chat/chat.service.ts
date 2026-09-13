@@ -90,7 +90,7 @@ const MESSAGE_SELECT = {
     },
     orderBy: { createdAt: 'asc' },
   },
-};
+} satisfies Prisma.ChatMessageSelect;
 
 type RawReplyTo = {
   id: string;

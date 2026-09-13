@@ -6,6 +6,7 @@ import { WalletTxSerialService } from '../../../../common/services/wallet-tx-ser
 import { AuditLogService } from '../../../../common/services/audit-log.service';
 import { UploadService } from '../../../upload/upload.service';
 import { RealtimeService } from '../../../realtime/realtime.service';
+import { ChatService } from '../../../chat/chat.service';
 
 describe('AdminDisputesService round-two boundaries', () => {
   const prisma: any = {
@@ -25,6 +26,7 @@ describe('AdminDisputesService round-two boundaries', () => {
         { provide: AuditLogService, useValue: auditLog },
         { provide: UploadService, useValue: {} },
         { provide: RealtimeService, useValue: {} },
+        { provide: ChatService, useValue: {} },
       ],
     }).compile();
     service = module.get(AdminDisputesService);
@@ -45,6 +47,33 @@ describe('AdminDisputesService round-two boundaries', () => {
     prisma.adminUser.findFirst.mockResolvedValue(null);
     await expect(service.assignAdmin('disp-1', 'super-1', 'inactive-1')).rejects.toBeInstanceOf(NotFoundException);
     expect(prisma.dispute.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('issues an apology voucher to the non-fault winner chosen by the decision helper', async () => {
+    const recipients = (service as any).disputeApologyRecipients(
+      'FULL_BUYER',
+      { buyerId: 'buyer-1', sellerId: 'seller-1' },
+      BigInt(100_000),
+      BigInt(0),
+    );
+    expect(recipients).toEqual(['buyer-1']);
+
+    const tx = {
+      voucher: {
+        create: jest.fn().mockImplementation(async ({ data }) => ({ code: data.code })),
+      },
+    };
+    const issued = await (service as any).issueDisputeApologyVouchers(tx, recipients, 'DSP-20260913-001');
+
+    expect(issued).toHaveLength(1);
+    expect(tx.voucher.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        assignedToUserId: 'buyer-1',
+        createdBy: 'SYSTEM_DISPUTE_APOLOGY',
+        voucherType: 'FEE_DISCOUNT_FLAT',
+        discountAmount: BigInt(1_000_000),
+      }),
+    }));
   });
 
   it('requires an active dispute-capable role on the assignee lookup', async () => {

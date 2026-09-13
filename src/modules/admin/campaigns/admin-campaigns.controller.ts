@@ -64,6 +64,18 @@ export class AdminCampaignsController {
   }
 
   @UseGuards(UserThrottleGuard)
+  @Post(':campaignId/activate')
+  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  @ApiOperation({ summary: 'Manually activate a campaign and issue eligible personal vouchers' })
+  async activateCampaign(
+    @CurrentAdmin('sub') adminId: string,
+    @Param('campaignId', ParseIdPipe) campaignId: string,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.campaignService.activateCampaign(campaignId, adminId, req.ip || 'unknown');
+  }
+
+  @UseGuards(UserThrottleGuard)
   @Put(':campaignId')
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @ApiOperation({ summary: 'Update a campaign' })

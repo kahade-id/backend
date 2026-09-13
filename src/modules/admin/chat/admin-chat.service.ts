@@ -140,6 +140,7 @@ export class AdminChatService {
         reviewNote: true,
         createdAt: true,
         updatedAt: true,
+        messageId: true,
         user: {
           select: {
             id: true,
@@ -147,16 +148,6 @@ export class AdminChatService {
             fullName: true,
             username: true,
             flaggedForReview: true,
-          },
-        },
-        message: {
-          select: {
-            id: true,
-            content: true,
-            messageType: true,
-            isDeleted: true,
-            isEdited: true,
-            createdAt: true,
           },
         },
         room: {
@@ -177,7 +168,20 @@ export class AdminChatService {
         message: 'Moderation event not found',
       });
     }
-    return event;
+    const message = event.messageId
+      ? await this.prisma.chatMessage.findUnique({
+          where: { id: event.messageId },
+          select: {
+            id: true,
+            content: true,
+            messageType: true,
+            isDeleted: true,
+            isEdited: true,
+            createdAt: true,
+          },
+        })
+      : null;
+    return { ...event, message };
   }
 
   async reviewModerationEvent(

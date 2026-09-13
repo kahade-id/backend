@@ -89,6 +89,7 @@ const mockFeeCalculation = {
   buyerPayAmount: BigInt(10_150_000),
   sellerReceiveAmount: BigInt(10_000_000),
   voucherDiscount: BigInt(0),
+  membershipRankDiscount: BigInt(0),
 };
 
 const mockPrisma = {
@@ -112,6 +113,7 @@ const mockPrisma = {
   rating: { findUnique: jest.fn().mockResolvedValue(null) },
   notificationPreference: { findUnique: jest.fn().mockResolvedValue(null) },
   subscription: { findFirst: jest.fn().mockResolvedValue(null) },
+  campaign: { findUnique: jest.fn().mockResolvedValue({ status: 'ACTIVE' }), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
   $queryRaw: jest.fn().mockResolvedValue([]),
   $transaction: jest.fn(),
 };
@@ -194,6 +196,8 @@ describe('OrdersService', () => {
     mockPrisma.rating.findUnique.mockResolvedValue(null);
     mockPrisma.notificationPreference.findUnique.mockResolvedValue(null);
     mockPrisma.subscription.findFirst.mockResolvedValue(null);
+    mockPrisma.campaign.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    mockPrisma.campaign.updateMany.mockResolvedValue({ count: 1 });
     mockPrisma.voucher.updateMany.mockResolvedValue({ count: 1 });
     mockPrisma.$queryRaw.mockResolvedValue([]);
     mockPrisma.$transaction.mockImplementation(async (fn: unknown) => typeof fn === 'function' ? (fn as (tx: typeof mockPrisma) => Promise<unknown>)(mockPrisma) : undefined);
@@ -476,7 +480,7 @@ describe('OrdersService', () => {
       mockPrisma.$queryRaw
         .mockResolvedValueOnce([{
           id: 'voucher-1', code: 'ONCEONLY', isActive: true,
-          voucherType: 'FEE_DISCOUNT_AMOUNT', discountPercent: null, discountAmount: BigInt(1000),
+          voucherType: 'FEE_DISCOUNT_FLAT', discountPercent: null, discountAmount: BigInt(1000),
           maxUsageTotal: null, currentUsage: 0, maxUsagePerUser: 1,
           validFrom: new Date(0), validUntil: new Date(Date.now() + 86400000),
           applicableTo: 'ALL', minOrderValue: null, maxDiscountAmount: null,
@@ -734,6 +738,37 @@ describe('OrdersService', () => {
           'user-db-1',
         ),
       ).rejects.toThrow(BadRequestException);
+    });
+
+    it('should preview WALLET_CASHBACK from order value without reducing order fee', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(mockUser);
+      mockPrisma.voucher.findFirst.mockResolvedValue({
+        id: 'voucher-1',
+        isActive: true,
+        voucherType: 'WALLET_CASHBACK',
+        discountPercent: 10,
+        discountAmount: null,
+        maxUsageTotal: null,
+        currentUsage: 0,
+        maxUsagePerUser: null,
+        minOrderValue: null,
+        maxDiscountAmount: null,
+        applicableTo: 'ALL',
+        assignedToUserId: null,
+        campaignId: null,
+      });
+      mockPrisma.voucherUsage.count.mockResolvedValue(0);
+
+      const result = await service.calculateFee(
+        { orderValue: 100_000, feeResponsibility: FeeResponsibility.BUYER, voucherCode: 'CASH10', role: 'BUYER' },
+        'user-db-1',
+      );
+
+      expect(result.voucherCashback).toBe(10_000);
+      expect(mockFeeCalculator.calculateFee).toHaveBeenCalledWith(
+        expect.objectContaining({ voucherDiscountSen: BigInt(0) }),
+        expect.objectContaining({ kahadeFeeRateBps: expect.any(Number) }),
+      );
     });
 
     it('should return fee without voucher discount when voucher not found', async () => {

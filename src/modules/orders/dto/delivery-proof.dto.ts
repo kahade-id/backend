@@ -27,7 +27,7 @@ export class SubmitDeliveryProofDto {
 }
 
 export class ConfirmDeliveryDto {
-  @ApiPropertyOptional({ description: 'Specific submitted delivery proof to review' })
+  @ApiPropertyOptional({ description: 'Specific submitted delivery proof to review', pattern: '^c[a-z0-9]{24}$' })
   @IsOptional()
   @IsString()
   @Matches(/^c[a-z0-9]{24}$/, { message: 'proofId must be a valid delivery proof ID' })
@@ -41,7 +41,7 @@ export class RejectDeliveryDto {
   @MaxLength(1000)
   note!: string;
 
-  @ApiPropertyOptional({ description: 'Specific submitted delivery proof to reject' })
+  @ApiPropertyOptional({ description: 'Specific submitted delivery proof to reject', pattern: '^c[a-z0-9]{24}$' })
   @IsOptional()
   @IsString()
   @Matches(/^c[a-z0-9]{24}$/, { message: 'proofId must be a valid delivery proof ID' })

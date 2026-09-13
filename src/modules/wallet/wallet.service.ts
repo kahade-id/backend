@@ -22,6 +22,8 @@ import {
   WithdrawStatus,
   NotificationType,
   Prisma,
+  VoucherType,
+  CampaignStatus,
 } from '@prisma/client';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import { randomBytes, randomInt } from 'crypto';
@@ -414,6 +416,17 @@ export class WalletService implements OnModuleInit {
     return num % 10000 !== 0 ? base + 1 : base;
   }
 
+  private calculateTopupBonusSen(voucher: { discountAmount: bigint | null; discountPercent: Prisma.Decimal | null; maxDiscountAmount: bigint | null }, amountSen: bigint): bigint {
+    if (voucher.discountAmount !== null) return voucher.discountAmount;
+    if (voucher.discountPercent !== null) {
+      const percentBps = BigInt(Math.round(Number(voucher.discountPercent) * 100));
+      let bonus = (amountSen * percentBps) / BigInt(10_000);
+      if (voucher.maxDiscountAmount !== null && bonus > voucher.maxDiscountAmount) bonus = voucher.maxDiscountAmount;
+      return bonus;
+    }
+    return BigInt(0);
+  }
+
   private calculatePaymentFee(amount: number, method: PaymentMethod): number {
     const f = this.paymentFees;
 
@@ -484,6 +497,7 @@ export class WalletService implements OnModuleInit {
     amount: number,
     method: PaymentMethod,
     cardToken?: string,
+    voucherCode?: string,
   ): Promise<Record<string, unknown>> {
     if (
       !Number.isFinite(amount) ||
@@ -580,6 +594,10 @@ export class WalletService implements OnModuleInit {
 
       const amountInSen = toSen(amount);
       const dailyLimit = toSen(this.dailyTopupLimit);
+      const normalizedVoucherCode = voucherCode?.trim().toUpperCase();
+      if (normalizedVoucherCode && !/^[A-Z0-9_-]{1,50}$/.test(normalizedVoucherCode)) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Voucher code is invalid' });
+      }
 
       const result = await this.prisma.$transaction(
         async (tx: Prisma.TransactionClient) => {
@@ -618,6 +636,90 @@ export class WalletService implements OnModuleInit {
             });
           }
 
+          let topupBonusSen = BigInt(0);
+          let resolvedVoucher: {
+            id: string;
+            code: string;
+            voucherType: VoucherType;
+            discountAmount: bigint | null;
+            discountPercent: Prisma.Decimal | null;
+            maxDiscountAmount: bigint | null;
+            maxUsageTotal: number | null;
+            maxUsagePerUser: number;
+            currentUsage: number;
+            validFrom: Date;
+            validUntil: Date;
+            isActive: boolean;
+            minOrderValue: bigint | null;
+            assignedToUserId: string | null;
+            campaignId: string | null;
+          } | null = null;
+          if (normalizedVoucherCode) {
+            const [voucher] = await tx.$queryRaw<Array<{
+              id: string;
+              code: string;
+              voucherType: VoucherType;
+              discountAmount: bigint | null;
+              discountPercent: Prisma.Decimal | null;
+              maxDiscountAmount: bigint | null;
+              maxUsageTotal: number | null;
+              maxUsagePerUser: number;
+              currentUsage: number;
+              validFrom: Date;
+              validUntil: Date;
+              isActive: boolean;
+              minOrderValue: bigint | null;
+              assignedToUserId: string | null;
+              campaignId: string | null;
+            }>>`
+              SELECT * FROM "vouchers"
+              WHERE "code" = ${normalizedVoucherCode}
+              LIMIT 1
+              FOR UPDATE
+            `;
+            if (!voucher) {
+              throw new NotFoundException({ code: ErrorCodes.VOUCHER_NOT_FOUND, message: 'Voucher not found' });
+            }
+            const now = new Date();
+            if (!voucher.isActive || now < voucher.validFrom || now > voucher.validUntil) {
+              throw new BadRequestException({ code: ErrorCodes.VOUCHER_EXPIRED, message: 'Voucher is expired or inactive' });
+            }
+            if (voucher.campaignId) {
+              const campaign = await tx.campaign.findUnique({
+                where: { id: voucher.campaignId },
+                select: { status: true },
+              });
+              if (!campaign || campaign.status === CampaignStatus.ENDED) {
+                throw new BadRequestException({ code: ErrorCodes.VOUCHER_EXPIRED, message: 'Voucher campaign has ended' });
+              }
+            }
+            if (voucher.voucherType !== VoucherType.TOPUP_BONUS) {
+              throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher cannot be used for wallet top-ups' });
+            }
+            if (voucher.assignedToUserId && voucher.assignedToUserId !== userId) {
+              throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is assigned to a different user' });
+            }
+            if (voucher.minOrderValue !== null && amountInSen < voucher.minOrderValue) {
+              throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'Top-up amount does not meet the minimum requirement for this voucher' });
+            }
+            if (voucher.maxUsageTotal !== null && voucher.currentUsage >= voucher.maxUsageTotal) {
+              throw new BadRequestException({ code: ErrorCodes.VOUCHER_USAGE_LIMIT_REACHED, message: 'Voucher has reached its maximum usage limit' });
+            }
+            const userUsageRows = await tx.$queryRaw<Array<{ id: string }>>`
+              SELECT "id" FROM "voucher_usages"
+              WHERE "voucherId" = ${voucher.id} AND "userId" = ${userId}
+              FOR UPDATE
+            `;
+            if (voucher.maxUsagePerUser !== null && userUsageRows.length >= voucher.maxUsagePerUser) {
+              throw new BadRequestException({ code: ErrorCodes.VOUCHER_USAGE_LIMIT_REACHED, message: 'You have reached the per-user usage limit for this voucher' });
+            }
+            topupBonusSen = this.calculateTopupBonusSen(voucher, amountInSen);
+            if (topupBonusSen <= BigInt(0)) {
+              throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'Top-up bonus voucher has no bonus value' });
+            }
+            resolvedVoucher = voucher;
+          }
+
           const walletVersion = wallet.version;
 
           const paymentFee = this.calculatePaymentFee(amount, method);
@@ -636,6 +738,39 @@ export class WalletService implements OnModuleInit {
               status: PaymentStatus.PENDING,
             },
           });
+
+          if (resolvedVoucher) {
+            await tx.voucherUsage.create({
+              data: {
+                voucherId: resolvedVoucher.id,
+                userId,
+                paymentTxId: paymentTx.id,
+                discountApplied: topupBonusSen,
+              },
+            });
+            const updatedVoucher = await tx.voucher.updateMany({
+              where: {
+                id: resolvedVoucher.id,
+                OR: [
+                  { maxUsageTotal: null },
+                  { currentUsage: { lt: resolvedVoucher.maxUsageTotal as number } },
+                ],
+              },
+              data: { currentUsage: { increment: 1 } },
+            });
+            if (updatedVoucher.count === 0) {
+              throw new BadRequestException({ code: ErrorCodes.VOUCHER_USAGE_LIMIT_REACHED, message: 'Voucher has reached its maximum usage limit' });
+            }
+            if (resolvedVoucher.campaignId) {
+              const campaignUpdated = await tx.campaign.updateMany({
+                where: { id: resolvedVoucher.campaignId, status: { not: CampaignStatus.ENDED } },
+                data: { currentRedemptions: { increment: 1 } },
+              });
+              if (campaignUpdated.count === 0) {
+                throw new BadRequestException({ code: ErrorCodes.VOUCHER_EXPIRED, message: 'Voucher campaign has ended' });
+              }
+            }
+          }
 
           const walletTxId = generateWalletTxId(walletTxSerial);
           await tx.walletTransaction.create({
@@ -674,7 +809,7 @@ export class WalletService implements OnModuleInit {
             });
           }
 
-          return { paymentTxId, paymentDbId: paymentTx.id, paymentFee, grossAmount };
+          return { paymentTxId, paymentDbId: paymentTx.id, paymentFee, grossAmount, topupBonus: toIdr(topupBonusSen) };
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
       );
@@ -751,6 +886,23 @@ export class WalletService implements OnModuleInit {
                   },
                   data: { status: WalletTransactionStatus.FAILED },
                 });
+                const voucherUsage = await tx.voucherUsage.findFirst({
+                  where: { paymentTxId: result.paymentDbId },
+                  select: { id: true, voucherId: true, voucher: { select: { campaignId: true } } },
+                });
+                if (voucherUsage) {
+                  await tx.voucherUsage.delete({ where: { id: voucherUsage.id } });
+                  await tx.voucher.updateMany({
+                    where: { id: voucherUsage.voucherId, currentUsage: { gt: 0 } },
+                    data: { currentUsage: { decrement: 1 } },
+                  });
+                  if (voucherUsage.voucher.campaignId) {
+                    await tx.campaign.updateMany({
+                      where: { id: voucherUsage.voucher.campaignId, currentRedemptions: { gt: 0 } },
+                      data: { currentRedemptions: { decrement: 1 } },
+                    });
+                  }
+                }
                 const walletRows = await tx.$queryRaw<
                   Array<{ id: string; version: number; todayTopupAmount: bigint }>
                 >`
@@ -869,6 +1021,7 @@ export class WalletService implements OnModuleInit {
         amount,
         paymentFee: result.paymentFee,
         grossAmount: result.grossAmount,
+        topupBonus: result.topupBonus,
         paymentType: chargeResult.paymentType,
         transactionStatus: chargeResult.transactionStatus,
         vaNumber: chargeResult.vaNumber,
@@ -2485,6 +2638,8 @@ export class WalletService implements OnModuleInit {
     }
 
     let walletTxSerial: number | null = null;
+    let bonusTxSerial: number | null = null;
+    let topupBonusSen = BigInt(0);
 
     const topupSettled = await this.withWalletSerializableRetry(
       () =>
@@ -2508,12 +2663,21 @@ export class WalletService implements OnModuleInit {
             }
 
             const amount = paymentTx.amount;
+            const topupBonusUsage = await tx.voucherUsage.findFirst({
+              where: {
+                paymentTxId: paymentTx.id,
+                voucher: { voucherType: VoucherType.TOPUP_BONUS },
+              },
+              select: { id: true, discountApplied: true, voucher: { select: { code: true } } },
+            });
+            topupBonusSen = topupBonusUsage?.discountApplied ?? BigInt(0);
+            const creditAmount = amount + topupBonusSen;
 
             const walletUpdated = await tx.wallet.updateMany({
               where: { id: wallet.id, version: wallet.version },
               data: {
-                availableBalance: { increment: amount },
-                totalBalance: { increment: amount },
+                availableBalance: { increment: creditAmount },
+                totalBalance: { increment: creditAmount },
                 lastTopupAt: new Date(),
                 version: { increment: 1 },
               },
@@ -2530,8 +2694,8 @@ export class WalletService implements OnModuleInit {
               select: { availableBalance: true, totalBalance: true },
             });
             if (verifiedWallet) {
-              const expectedAvailable = wallet.availableBalance + amount;
-              const expectedTotal = wallet.totalBalance + amount;
+              const expectedAvailable = wallet.availableBalance + creditAmount;
+              const expectedTotal = wallet.totalBalance + creditAmount;
               if (
                 verifiedWallet.availableBalance !== expectedAvailable ||
                 verifiedWallet.totalBalance !== expectedTotal
@@ -2583,6 +2747,24 @@ export class WalletService implements OnModuleInit {
               });
             }
 
+            if (topupBonusUsage && topupBonusSen > BigInt(0)) {
+              if (bonusTxSerial === null) bonusTxSerial = await this.getNextWalletTxSerial();
+              const bonusTxId = generateWalletTxId(bonusTxSerial);
+              await tx.walletTransaction.create({
+                data: {
+                  txId: bonusTxId,
+                  walletId: wallet.id,
+                  type: WalletTransactionType.TOPUP_BONUS,
+                  status: WalletTransactionStatus.SUCCESS,
+                  amount: topupBonusSen,
+                  balanceBefore: wallet.totalBalance + amount,
+                  balanceAfter: wallet.totalBalance + amount + topupBonusSen,
+                  paymentTxId: paymentTx.id,
+                  description: `Top-up bonus voucher ${topupBonusUsage.voucher.code}`,
+                },
+              });
+            }
+
             return true;
           },
           { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
@@ -2622,6 +2804,29 @@ export class WalletService implements OnModuleInit {
       this.logger.warn(
         `Top-up success realtime notification failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+    }
+
+    if (topupBonusSen > BigInt(0)) {
+      const bonusTitle = 'Top-up Bonus Credited';
+      const bonusBody = `Bonus top-up Rp ${toIdr(topupBonusSen).toLocaleString('id-ID')} has been credited to your wallet.`;
+      this.prisma.notification
+        .create({
+          data: {
+            notifId: generateNotifId(),
+            userId: paymentTx.userId,
+            type: NotificationType.TOPUP_BONUS_CREDITED,
+            category: getCategoryForType(NotificationType.TOPUP_BONUS_CREDITED),
+            title: bonusTitle,
+            body: bonusBody,
+            isRead: false,
+          },
+        })
+        .catch((notificationError: unknown) =>
+          this.logger.warn(
+            `silent-catch: top-up bonus notification failed: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`,
+          ),
+        );
+      this.runRealtimeBestEffort(() => this.prisma.emitNotificationCreated({ userId: paymentTx.userId, title: bonusTitle, body: bonusBody, data: { type: 'TOPUP_BONUS_CREDITED' } }), 'TOPUP_BONUS_NOTIFICATION_PUSH');
     }
 
     this.runRealtimeBestEffort(
@@ -2747,6 +2952,24 @@ export class WalletService implements OnModuleInit {
                 },
                 data: { status: WalletTransactionStatus.FAILED },
               });
+
+              const voucherUsage = await tx.voucherUsage.findFirst({
+                where: { paymentTxId: paymentTx.id },
+                select: { id: true, voucherId: true, voucher: { select: { campaignId: true } } },
+              });
+              if (voucherUsage) {
+                await tx.voucherUsage.delete({ where: { id: voucherUsage.id } });
+                await tx.voucher.updateMany({
+                  where: { id: voucherUsage.voucherId, currentUsage: { gt: 0 } },
+                  data: { currentUsage: { decrement: 1 } },
+                });
+                if (voucherUsage.voucher.campaignId) {
+                  await tx.campaign.updateMany({
+                    where: { id: voucherUsage.voucher.campaignId, currentRedemptions: { gt: 0 } },
+                    data: { currentRedemptions: { decrement: 1 } },
+                  });
+                }
+              }
 
               const wallet = await tx.wallet.findUnique({ where: { userId: paymentTx.userId } });
               if (wallet && paymentTx.createdAt >= startOfDayWIB()) {

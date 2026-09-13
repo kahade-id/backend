@@ -42,7 +42,11 @@ export const ACTIVE_VOUCHERS_LIST = (
   applicableTo: string | undefined,
   limit: number,
   audience = 'all',
-): string => `public:vouchers:active:${applicableTo ?? 'all'}:${audience}:${limit}`;
+  userId = 'public',
+): string => `public:vouchers:active:${applicableTo ?? 'all'}:${audience}:${userId}:${limit}`;
+
+export const REFERRAL_LEADERBOARD_CACHE = (period: string, limit: number): string =>
+  `referral:leaderboard:${period}:${limit}`;
 
 export const WEBHOOK_PROCESSING = (transactionId: string, status: string): string =>
   `webhook_processing:${transactionId}:${status}`;

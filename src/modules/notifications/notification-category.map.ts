@@ -35,6 +35,9 @@ const PROMOSI_TYPES: ReadonlySet<NotificationType> = new Set([
   NotificationType.REFERRAL_REWARD_RECEIVED,
   NotificationType.BADGE_AWARDED,
   NotificationType.RANK_UPGRADED,
+  NotificationType.VOUCHER_ISSUED,
+  NotificationType.CAMPAIGN_CASHBACK_CREDITED,
+  NotificationType.TOPUP_BONUS_CREDITED,
 ]);
 
 export function getCategoryForType(type: NotificationType): NotificationCategory {

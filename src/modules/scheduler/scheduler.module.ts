@@ -13,6 +13,7 @@ import {
   AutoCompleteDeliveredOrdersService,
   AutoEscalateDisputesService,
   SubscriptionExpiryService,
+  SubscriptionAutoResumeService,
   RedisHashCleanupService,
   WeeklyReconciliationService,
   WithdrawalReconciliationService,
@@ -29,6 +30,9 @@ import {
   ProofExpiryService,
   WebhookRetryService,
   QuestionReminderService,
+  CampaignActivationService,
+  ReferralLeaderboardRefreshService,
+  DormantWinbackVoucherService,
 } from './services';
 import { AdminFinanceModule } from '../admin/finance/admin-finance.module';
 import { WithdrawalsModule } from '../withdrawals/withdrawals.module';
@@ -48,9 +52,11 @@ import {
 import { QueueModule } from '../queue/queue.module';
 import { RedisService } from '../../redis/redis.service';
 import { safeErrorMessage } from '../../common/utils/background-reliability.util';
+import { AuditLogModule } from '../../common/services/audit-log.module';
+import { CampaignService } from '../admin/campaign.service';
 
 @Module({
-  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule],
+  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, AuditLogModule],
   providers: [
     WalletDailyResetService,
     DataCleanupService,
@@ -59,6 +65,7 @@ import { safeErrorMessage } from '../../common/utils/background-reliability.util
     AutoCompleteDeliveredOrdersService,
     AutoEscalateDisputesService,
     SubscriptionExpiryService,
+    SubscriptionAutoResumeService,
     RedisHashCleanupService,
     WeeklyReconciliationService,
     WithdrawalReconciliationService,
@@ -75,6 +82,10 @@ import { safeErrorMessage } from '../../common/utils/background-reliability.util
     ProofExpiryService,
     WebhookRetryService,
     QuestionReminderService,
+    CampaignActivationService,
+    ReferralLeaderboardRefreshService,
+    DormantWinbackVoucherService,
+    CampaignService,
     WalletTxSerialService,
     MidtransService,
   ],

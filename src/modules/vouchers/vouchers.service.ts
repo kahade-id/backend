@@ -6,7 +6,7 @@ import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pag
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { toIdr, toSen } from '../../common/utils/currency.util';
 import { ACTIVE_VOUCHERS_LIST } from '../../common/constants/redis-keys';
-import { VoucherApplicability, Prisma } from '@prisma/client';
+import { OrderStatus, VoucherApplicability, VoucherType, Prisma, CampaignStatus } from '@prisma/client';
 
 const ACTIVE_VOUCHERS_TTL = 300;
 
@@ -35,6 +35,8 @@ export class VouchersService {
     validUntil: true,
     currentUsage: true,
     maxUsageTotal: true,
+    assignedToUserId: true,
+    campaignId: true,
   } as const;
 
   private serializeVouchers(
@@ -49,15 +51,38 @@ export class VouchersService {
     }));
   }
 
-  private buildActiveVoucherWhere(applicableTo?: VoucherApplicability): Prisma.VoucherWhereInput {
+  private buildActiveVoucherWhere(userId: string, applicableTo?: VoucherApplicability): Prisma.VoucherWhereInput {
     const now = new Date();
     const where: Prisma.VoucherWhereInput = {
       isActive: true,
       validFrom: { lte: now },
       validUntil: { gte: now },
+      OR: [{ assignedToUserId: null }, { assignedToUserId: userId }],
+      AND: [
+        {
+          OR: [
+            { campaignId: null },
+            { campaign: { is: { status: { not: CampaignStatus.ENDED } } } },
+          ],
+        },
+      ],
     };
     if (applicableTo) where.applicableTo = applicableTo;
     return where;
+  }
+
+  private async isDormantUser(userId: string, totalOrdersCompleted: number): Promise<boolean> {
+    if (totalOrdersCompleted <= 0) return false;
+    const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const recentCompleted = await this.prisma.order.count({
+      where: {
+        status: OrderStatus.COMPLETED,
+        deletedAt: null,
+        completedAt: { gte: cutoff },
+        OR: [{ buyerId: userId }, { sellerId: userId }],
+      },
+    });
+    return recentCompleted === 0;
   }
 
   private async fetchVoucherPage(
@@ -101,22 +126,28 @@ export class VouchersService {
       return createPaginatedResponse([], 0, safePage, safeLimit);
     }
 
-    const where = this.buildActiveVoucherWhere(applicableTo);
+    const isDormant = await this.isDormantUser(userId, user.totalOrdersCompleted);
+    const where = this.buildActiveVoucherWhere(userId, applicableTo);
     // AUDIT-17: a completed-order user requesting BUYER_ONLY/SELLER_ONLY must keep that
-    // filter AND drop NEW_USER-only vouchers. Assigning `where.applicableTo` outright
-    // used to clobber the requested audience filter and return the other role's vouchers.
-    if (user.totalOrdersCompleted > 0) {
-      if (applicableTo === VoucherApplicability.NEW_USER) {
-        return createPaginatedResponse([], 0, safePage, safeLimit);
-      }
-      if (applicableTo === undefined) {
-        where.applicableTo = { not: VoucherApplicability.NEW_USER };
-      }
+    // filter AND drop NEW_USER-only vouchers. DORMANT_USER is also computed from completed
+    // order history rather than trusting the display-only targetAudience field.
+    if (user.totalOrdersCompleted > 0 && applicableTo === VoucherApplicability.NEW_USER) {
+      return createPaginatedResponse([], 0, safePage, safeLimit);
+    }
+    if (!isDormant && applicableTo === VoucherApplicability.DORMANT_USER) {
+      return createPaginatedResponse([], 0, safePage, safeLimit);
+    }
+    if (applicableTo === undefined) {
+      const notIn: VoucherApplicability[] = [];
+      if (user.totalOrdersCompleted > 0) notIn.push(VoucherApplicability.NEW_USER);
+      if (!isDormant) notIn.push(VoucherApplicability.DORMANT_USER);
+      if (notIn.length === 1) where.applicableTo = { not: notIn[0] };
+      if (notIn.length > 1) where.applicableTo = { notIn };
     }
 
     if (safePage === 1) {
-      const audience = user.totalOrdersCompleted > 0 ? 'existing' : 'new';
-      const cacheKey = ACTIVE_VOUCHERS_LIST(applicableTo, safeLimit, audience);
+      const audience = isDormant ? 'dormant' : (user.totalOrdersCompleted > 0 ? 'existing' : 'new');
+      const cacheKey = ACTIVE_VOUCHERS_LIST(applicableTo, safeLimit, audience, userId);
       const cached = await this.redis.get(cacheKey);
       if (cached) {
         try {
@@ -181,6 +212,30 @@ export class VouchersService {
         message: 'Voucher is expired or inactive',
       });
     }
+    if (voucher.campaignId) {
+      const campaign = await this.prisma.campaign.findUnique({
+        where: { id: voucher.campaignId },
+        select: { status: true },
+      });
+      if (!campaign || campaign.status === CampaignStatus.ENDED) {
+        throw new BadRequestException({
+          code: ErrorCodes.VOUCHER_EXPIRED,
+          message: 'Voucher campaign has ended',
+        });
+      }
+    }
+    if (voucher.assignedToUserId && voucher.assignedToUserId !== userId) {
+      throw new BadRequestException({
+        code: ErrorCodes.VOUCHER_NOT_APPLICABLE,
+        message: 'This voucher is assigned to a different user',
+      });
+    }
+    if (orderValue != null && voucher.voucherType === VoucherType.TOPUP_BONUS) {
+      throw new BadRequestException({
+        code: ErrorCodes.VOUCHER_NOT_APPLICABLE,
+        message: 'Top-up bonus vouchers can only be used for wallet top-ups',
+      });
+    }
 
     if (voucher.maxUsageTotal !== null && voucher.currentUsage >= voucher.maxUsageTotal) {
       throw new BadRequestException({
@@ -219,6 +274,14 @@ export class VouchersService {
             message: 'This voucher is only available for new users',
           });
         }
+      } else if (voucher.applicableTo === VoucherApplicability.DORMANT_USER) {
+        const dormant = await this.isDormantUser(userId, user.totalOrdersCompleted);
+        if (!dormant) {
+          throw new BadRequestException({
+            code: ErrorCodes.VOUCHER_NOT_APPLICABLE,
+            message: 'This voucher is only available for dormant users',
+          });
+        }
       } else if (voucher.applicableTo === 'BUYER_ONLY' || voucher.applicableTo === 'SELLER_ONLY') {
         if (!userRole) {
           throw new BadRequestException({
@@ -238,31 +301,37 @@ export class VouchersService {
       }
     }
 
-    let discountAmount: bigint | null = null;
+    let benefitAmount: bigint | null = null;
 
-    if (voucher.voucherType === 'FEE_DISCOUNT_FLAT') {
-      discountAmount = voucher.discountAmount!;
-      if (orderValue != null) {
-        const standardFee = this.feeCalculator.getStandardFeeSen(toSen(orderValue));
-        if (discountAmount > standardFee) discountAmount = standardFee;
+    if (voucher.discountAmount !== null) {
+      benefitAmount = voucher.discountAmount;
+      if (orderValue != null && voucher.voucherType !== VoucherType.TOPUP_BONUS) {
+        const capBase = voucher.voucherType === VoucherType.WALLET_CASHBACK
+          ? toSen(orderValue)
+          : this.feeCalculator.getStandardFeeSen(toSen(orderValue));
+        if (benefitAmount > capBase) benefitAmount = capBase;
       }
-    } else if (
-      voucher.voucherType === 'FEE_DISCOUNT_PERCENT' &&
-      voucher.discountPercent != null &&
-      orderValue != null
-    ) {
+    } else if (voucher.discountPercent != null && orderValue != null) {
       const feeConfig = await this.feeCalculator.getFeeConfig();
       const orderValueSen = toSen(orderValue);
-      // Keep voucher preview identical to final order creation. The standard
-      // fee has configured floor/ceiling clamps, so raw order-value × rate
-      // underestimates small orders and overestimates large orders.
-      const baseFeeSen = this.feeCalculator.getStandardFeeSen(orderValueSen, feeConfig);
+      // Keep voucher preview identical to final order creation. Fee vouchers are
+      // computed from the clamped platform fee; cashback vouchers are computed
+      // from order value, then credited to wallet only after order completion.
+      const benefitBaseSen = voucher.voucherType === VoucherType.WALLET_CASHBACK
+        ? orderValueSen
+        : this.feeCalculator.getStandardFeeSen(orderValueSen, feeConfig);
       const percentBps = BigInt(Math.round(Number(voucher.discountPercent) * 100));
-      discountAmount = (baseFeeSen * percentBps) / BigInt(10_000);
-      if (voucher.maxDiscountAmount !== null && discountAmount > voucher.maxDiscountAmount) {
-        discountAmount = voucher.maxDiscountAmount;
+      benefitAmount = (benefitBaseSen * percentBps) / BigInt(10_000);
+      if (voucher.maxDiscountAmount !== null && benefitAmount > voucher.maxDiscountAmount) {
+        benefitAmount = voucher.maxDiscountAmount;
       }
+      if (benefitAmount > benefitBaseSen) benefitAmount = benefitBaseSen;
     }
+    const feeDiscountAmount = voucher.voucherType === VoucherType.FEE_DISCOUNT_FLAT || voucher.voucherType === VoucherType.FEE_DISCOUNT_PERCENT
+      ? benefitAmount
+      : null;
+    const cashbackAmount = voucher.voucherType === VoucherType.WALLET_CASHBACK ? benefitAmount : null;
+    const topupBonusAmount = voucher.voucherType === VoucherType.TOPUP_BONUS ? benefitAmount : null;
 
     return {
       valid: true,
@@ -270,7 +339,9 @@ export class VouchersService {
       code: voucher.code,
       name: voucher.name,
       voucherType: voucher.voucherType,
-      discountAmount: discountAmount != null ? toIdr(discountAmount) : null,
+      discountAmount: feeDiscountAmount != null ? toIdr(feeDiscountAmount) : null,
+      cashbackAmount: cashbackAmount != null ? toIdr(cashbackAmount) : null,
+      topupBonusAmount: topupBonusAmount != null ? toIdr(topupBonusAmount) : null,
       discountPercent: voucher.discountPercent ? Number(voucher.discountPercent) : null,
       minOrderValue: voucher.minOrderValue != null ? toIdr(voucher.minOrderValue) : null,
       maxDiscountAmount:
@@ -310,6 +381,7 @@ export class VouchersService {
     const serialized = usages.map(u => ({
       id: u.id,
       orderId: u.orderId,
+      paymentTxId: u.paymentTxId,
       discountAmount: toIdr(u.discountApplied),
       usedAt: u.usedAt,
       voucher: u.voucher,

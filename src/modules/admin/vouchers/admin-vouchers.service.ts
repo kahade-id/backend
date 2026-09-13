@@ -5,7 +5,7 @@ import { ConflictException } from '@nestjs/common';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { CreateVoucherDto } from './dto/create-voucher.dto';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
-import { AuditAction, Prisma } from '@prisma/client';
+import { AuditAction, Prisma, VoucherType } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { ADMIN_VOUCHERS_LIST } from '../../../common/constants/redis-keys';
 import { toSen, toIdr } from '../../../common/utils/currency.util';
@@ -181,20 +181,20 @@ export class AdminVouchersService {
         message: 'Set exactly one of discountAmount or discountPercent',
       });
     }
-    if (dto.voucherType === 'FEE_DISCOUNT_PERCENT' && !hasPercentDiscount) {
+    if (dto.voucherType === VoucherType.FEE_DISCOUNT_PERCENT && !hasPercentDiscount) {
       throw new BadRequestException({
         code: ErrorCodes.VALIDATION_ERROR,
         message: 'Percentage voucher must have a discountPercent value',
       });
     }
-    if (dto.voucherType === 'FEE_DISCOUNT_FLAT' && !hasFlatDiscount) {
+    if (dto.voucherType === VoucherType.FEE_DISCOUNT_FLAT && !hasFlatDiscount) {
       throw new BadRequestException({
         code: ErrorCodes.VALIDATION_ERROR,
         message: 'Fixed amount voucher must have a discountAmount value',
       });
     }
     if (
-      dto.voucherType === 'FEE_DISCOUNT_PERCENT' &&
+      (dto.voucherType === VoucherType.FEE_DISCOUNT_PERCENT || dto.voucherType === VoucherType.WALLET_CASHBACK || dto.voucherType === VoucherType.TOPUP_BONUS) &&
       hasPercentDiscount &&
       (dto.maxDiscountAmount === undefined || dto.maxDiscountAmount === null)
     ) {
@@ -224,6 +224,8 @@ export class AdminVouchersService {
           validUntil,
           minOrderValue: dto.minOrderValue ? toSen(dto.minOrderValue) : null,
           applicableTo: dto.applicableTo ?? 'ALL',
+          assignedToUserId: dto.assignedToUserId ?? null,
+          campaignId: dto.campaignId ?? null,
           createdBy: adminId,
         },
       });

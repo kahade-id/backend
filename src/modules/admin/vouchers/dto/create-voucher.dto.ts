@@ -108,8 +108,18 @@ export class CreateVoucherDto {
   @Max(1_000_000_000, { message: 'minOrderValue cannot exceed Rp 1.000.000.000' })
   minOrderValue?: number;
 
-  @ApiPropertyOptional({ enum: VoucherApplicability, description: 'Applicable to' })
+  @ApiPropertyOptional({ enum: VoucherApplicability, description: 'Applicable to. DORMANT_USER requires no completed order in the last 30 days when used on orders.' })
   @IsOptional()
   @IsEnum(VoucherApplicability)
   applicableTo?: VoucherApplicability;
+
+  @ApiPropertyOptional({ description: 'Internal user id when voucher is personal' })
+  @IsOptional()
+  @IsString()
+  assignedToUserId?: string;
+
+  @ApiPropertyOptional({ description: 'Internal campaign id when voucher belongs to a campaign' })
+  @IsOptional()
+  @IsString()
+  campaignId?: string;
 }

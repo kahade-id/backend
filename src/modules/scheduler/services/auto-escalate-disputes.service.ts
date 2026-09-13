@@ -3,8 +3,16 @@ import { Cron } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
-import { AuditAction, DisputeStatus } from '@prisma/client';
+import { AuditAction, DisputeStatus, MembershipRank } from '@prisma/client';
 import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
+
+const RANK_PRIORITY: Record<MembershipRank, number> = {
+  BRONZE: 0,
+  SILVER: 0,
+  GOLD: 1,
+  PLATINUM: 2,
+  DIAMOND: 3,
+};
 
 @Injectable()
 export class AutoEscalateDisputesService {
@@ -35,14 +43,30 @@ export class AutoEscalateDisputesService {
       ];
 
       while (true) {
-      const breached = await this.prisma.dispute.findMany({
+      const breached = (await this.prisma.dispute.findMany({
         where: {
           status: { in: escalatableStatuses },
           slaDeadlineAt: { lt: now },
           isSlaBreached: false,
+          deletedAt: null,
         },
-        select: { id: true, disputeId: true, status: true },
+        select: {
+          id: true,
+          disputeId: true,
+          status: true,
+          order: {
+            select: {
+              buyer: { select: { membershipRank: true } },
+              seller: { select: { membershipRank: true } },
+            },
+          },
+        },
+        orderBy: [{ slaDeadlineAt: 'asc' }, { id: 'asc' }],
         take: 500,
+      })).sort((a, b) => {
+        const aPriority = Math.max(RANK_PRIORITY[a.order.buyer.membershipRank], RANK_PRIORITY[a.order.seller.membershipRank]);
+        const bPriority = Math.max(RANK_PRIORITY[b.order.buyer.membershipRank], RANK_PRIORITY[b.order.seller.membershipRank]);
+        return bPriority - aPriority;
       });
 
       if (breached.length === 0) break;
@@ -58,6 +82,7 @@ export class AutoEscalateDisputesService {
               status: { in: escalatableStatuses },
               slaDeadlineAt: { lt: now },
               isSlaBreached: false,
+              deletedAt: null,
             },
             data: {
               status: DisputeStatus.ESCALATED,

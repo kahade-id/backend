@@ -1,5 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { MembershipRank, Prisma } from '@prisma/client';
+import { MembershipRank, NotificationType, Prisma, VoucherApplicability, VoucherType } from '@prisma/client';
+import { randomBytes } from 'crypto';
+import { generateNotifId } from '../../common/utils/id-generator.util';
 
 const RANK_THRESHOLDS: { rank: MembershipRank; minOrders: number }[] = [
   { rank: MembershipRank.DIAMOND, minOrders: 200 },
@@ -8,6 +10,9 @@ const RANK_THRESHOLDS: { rank: MembershipRank; minOrders: number }[] = [
   { rank: MembershipRank.SILVER, minOrders: 20 },
   { rank: MembershipRank.BRONZE, minOrders: 0 },
 ];
+
+const RANK_UP_VOUCHER_AMOUNT = BigInt(10_000 * 100);
+const RANK_UP_VOUCHER_VALID_DAYS = 30;
 
 const RANK_ORDER: Record<MembershipRank, number> = {
   BRONZE: 0,
@@ -20,6 +25,58 @@ const RANK_ORDER: Record<MembershipRank, number> = {
 @Injectable()
 export class MembershipRankService {
   private readonly logger = new Logger(MembershipRankService.name);
+
+  private rankUpVoucherCode(newRank: MembershipRank): string {
+    return `RANK-${newRank}-${randomBytes(4).toString('hex').toUpperCase()}`;
+  }
+
+  private async issueRankUpBenefits(tx: Prisma.TransactionClient, userId: string, newRank: MembershipRank): Promise<void> {
+    const validFrom = new Date();
+    const validUntil = new Date(validFrom.getTime() + RANK_UP_VOUCHER_VALID_DAYS * 24 * 60 * 60 * 1000);
+    let code = this.rankUpVoucherCode(newRank);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const voucher = await tx.voucher.create({
+          data: {
+            voucherId: `VCH-${code}`,
+            code,
+            name: `Rank Up ${newRank} Voucher`,
+            description: `Selamat naik ke ${newRank}! Gunakan voucher ini untuk potongan fee berikutnya.`,
+            voucherType: VoucherType.FEE_DISCOUNT_FLAT,
+            discountAmount: RANK_UP_VOUCHER_AMOUNT,
+            discountPercent: null,
+            maxDiscountAmount: null,
+            maxUsageTotal: 1,
+            maxUsagePerUser: 1,
+            currentUsage: 0,
+            applicableTo: VoucherApplicability.ALL,
+            isActive: true,
+            validFrom,
+            validUntil,
+            createdBy: 'SYSTEM_RANK_UP',
+            assignedToUserId: userId,
+          },
+        });
+        await tx.notification.create({
+          data: {
+            notifId: generateNotifId(),
+            userId,
+            type: NotificationType.RANK_UPGRADED,
+            title: `Naik Rank ke ${newRank}`,
+            body: `Selamat! Rank membership Anda naik ke ${newRank}. Voucher ${voucher.code} sudah ditambahkan ke akun Anda.`,
+            metadata: { rank: newRank, voucherCode: voucher.code },
+          },
+        });
+        return;
+      } catch (error: unknown) {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002' && attempt < 2) {
+          code = this.rankUpVoucherCode(newRank);
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
 
   async checkAndUpdateMembershipRank(tx: Prisma.TransactionClient, userId: string): Promise<void> {
     try {
@@ -61,6 +118,8 @@ export class MembershipRankService {
             memberDays,
           },
         });
+
+        await this.issueRankUpBenefits(tx, userId, newRank);
 
         this.logger.log(`User ${userId} ranked up: ${user.membershipRank} → ${newRank}`);
       }

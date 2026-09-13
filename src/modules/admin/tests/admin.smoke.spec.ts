@@ -38,6 +38,7 @@ import { AdminUsersService } from '../users/admin-users.service';
 import { AdminVouchersService } from '../vouchers/admin-vouchers.service';
 import { AdminBusinessVerificationService } from '../business-verification/admin-business-verification.service';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
+import { ChatService } from '../../chat/chat.service';
 
 const mkPrisma = (): any => new Proxy({}, {
   get: (_t, p) => {
@@ -84,6 +85,7 @@ async function build<T>(target: any, extras: any[] = []): Promise<T> {
       { provide: ConfigService, useValue: mkConfig() },
       { provide: AuditLogService, useValue: { log: jest.fn(), logUserAction: jest.fn(), logAdminAction: jest.fn() } },
       { provide: NotificationQueueService, useValue: { enqueue: jest.fn(), enqueueMany: jest.fn() } },
+      { provide: ChatService, useValue: {} },
       // Section 1: beberapa admin service sekarang meng-invalidasi cache badge
       // verifikasi post-commit (AdminKycService, AdminSubscriptionsService,
       // AdminBusinessVerificationService).

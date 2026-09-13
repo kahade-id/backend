@@ -53,11 +53,12 @@ export class WalletController {
   }
 
   @Post('topup')
+  @ApiOperation({ summary: 'Initiate wallet top-up, optionally reserving a TOPUP_BONUS voucher' })
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 900000, limit: 10 } })
   @Idempotency()
   async topup(@CurrentUser('sub') userId: string, @Body() dto: TopupDto): Promise<object> {
-    return this.walletService.topup(userId, dto.amount, dto.method, dto.cardToken);
+    return this.walletService.topup(userId, dto.amount, dto.method, dto.cardToken, dto.voucherCode);
   }
 
   @Post('withdraw')

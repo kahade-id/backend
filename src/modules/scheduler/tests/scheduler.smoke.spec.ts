@@ -37,6 +37,11 @@ import { TopupCounterCorrectionService } from '../services/topup-counter-correct
 import { WalletDailyResetService } from '../services/wallet-daily-reset.service';
 import { WeeklyReconciliationService } from '../services/weekly-reconciliation.service';
 import { WithdrawalReconciliationService } from '../services/withdrawal-reconciliation.service';
+import { CampaignActivationService } from '../services/campaign-activation.service';
+import { DormantWinbackVoucherService } from '../services/dormant-winback-voucher.service';
+import { ReferralLeaderboardRefreshService } from '../services/referral-leaderboard-refresh.service';
+import { SubscriptionAutoResumeService } from '../services/subscription-auto-resume.service';
+import { CampaignService } from '../../admin/campaign.service';
 
 jest.mock('../../../common/utils/cron-jitter.util', () => ({
   cronJitter: jest.fn(async () => undefined),
@@ -115,6 +120,38 @@ describe('Scheduler services smoke', () => {
     const svc = await build<AutoEscalateDisputesService>(AutoEscalateDisputesService);
     expect(svc).toBeDefined();
     await expect(svc.escalateBreachedDisputes()).resolves.toBeUndefined();
+  });
+
+  it('CampaignActivationService — defined + skip', async () => {
+    const svc = await build<CampaignActivationService>(CampaignActivationService, [
+      { provide: CampaignService, useValue: { activateDueCampaigns: jest.fn() } },
+    ]);
+    expect(svc).toBeDefined();
+    await expect(svc.handleCampaignActivation()).resolves.toBeUndefined();
+  });
+
+  it('DormantWinbackVoucherService — defined + skip', async () => {
+    const svc = await build<DormantWinbackVoucherService>(DormantWinbackVoucherService, [
+      { provide: NotificationQueueService, useValue: { enqueue: jest.fn(async () => undefined) } },
+    ]);
+    expect(svc).toBeDefined();
+    await expect(svc.issueMonthlyWinbackVouchers()).resolves.toBeUndefined();
+  });
+
+  it('ReferralLeaderboardRefreshService — defined + skip', async () => {
+    const svc = await build<ReferralLeaderboardRefreshService>(ReferralLeaderboardRefreshService, [
+      { provide: ReferralService, useValue: { refreshLeaderboard: jest.fn(async () => []) } },
+    ]);
+    expect(svc).toBeDefined();
+    await expect(svc.refresh()).resolves.toBeUndefined();
+  });
+
+  it('SubscriptionAutoResumeService — defined + skip', async () => {
+    const svc = await build<SubscriptionAutoResumeService>(SubscriptionAutoResumeService, [
+      { provide: VerificationBadgeService, useValue: { invalidate: jest.fn(async () => undefined) } },
+    ]);
+    expect(svc).toBeDefined();
+    await expect(svc.handleAutoResume()).resolves.toBeUndefined();
   });
 
   it('DataCleanupService — defined + skip', async () => {

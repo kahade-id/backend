@@ -1,7 +1,7 @@
 import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger } from '@nestjs/common';
 import { Decimal } from '@prisma/client/runtime/library';
-import { randomInt } from 'crypto';
-import { Prisma, DisputeDecisionType, DisputeStatus, OrderStatus, ActorType, WalletTransactionType, WalletTransactionStatus, AuditAction, NotificationType } from '@prisma/client';
+import { randomBytes, randomInt } from 'crypto';
+import { Prisma, DisputeDecisionType, DisputeStatus, OrderStatus, ActorType, WalletTransactionType, WalletTransactionStatus, AuditAction, NotificationType, VoucherApplicability, VoucherType } from '@prisma/client';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
@@ -17,6 +17,9 @@ import { RealtimeService } from '../../realtime/realtime.service';
 import { escapeLikePattern } from '../../../common/utils/search.util';
 import { ChatService } from '../../chat/chat.service';
 
+const DISPUTE_APOLOGY_VOUCHER_AMOUNT = BigInt(10_000 * 100);
+const DISPUTE_APOLOGY_VALID_DAYS = 30;
+
 @Injectable()
 export class AdminDisputesService {
   private readonly logger = new Logger(AdminDisputesService.name);
@@ -29,6 +32,62 @@ export class AdminDisputesService {
     private realtime: RealtimeService,
     private chatService: ChatService,
   ) {}
+
+  private apologyVoucherCode(disputeId: string): string {
+    const safeDispute = disputeId.replace(/[^A-Z0-9]/gi, '').slice(-8).toUpperCase();
+    return `APOLOGY-${safeDispute}-${randomBytes(3).toString('hex').toUpperCase()}`.slice(0, 50);
+  }
+
+  private disputeApologyRecipients(decision: DisputeDecisionDto['decision'], order: { buyerId: string; sellerId: string }, buyerAmount: bigint, sellerAmount: bigint): string[] {
+    if (decision === 'FULL_BUYER') return [order.buyerId];
+    if (decision === 'FULL_SELLER') return [order.sellerId];
+    if (buyerAmount > sellerAmount) return [order.buyerId];
+    if (sellerAmount > buyerAmount) return [order.sellerId];
+    return [order.buyerId, order.sellerId];
+  }
+
+  private async issueDisputeApologyVouchers(tx: Prisma.TransactionClient, recipients: string[], disputeId: string): Promise<Array<{ userId: string; code: string }>> {
+    const issued: Array<{ userId: string; code: string }> = [];
+    const validFrom = new Date();
+    const validUntil = new Date(validFrom.getTime() + DISPUTE_APOLOGY_VALID_DAYS * 24 * 60 * 60 * 1000);
+    for (const userId of recipients) {
+      let code = this.apologyVoucherCode(disputeId);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const voucher = await tx.voucher.create({
+            data: {
+              voucherId: `VCH-${code}`,
+              code,
+              name: 'Dispute Apology Voucher',
+              description: 'Voucher permintaan maaf Kahade setelah sengketa selesai.',
+              voucherType: VoucherType.FEE_DISCOUNT_FLAT,
+              discountAmount: DISPUTE_APOLOGY_VOUCHER_AMOUNT,
+              discountPercent: null,
+              maxDiscountAmount: null,
+              maxUsageTotal: 1,
+              maxUsagePerUser: 1,
+              currentUsage: 0,
+              applicableTo: VoucherApplicability.ALL,
+              isActive: true,
+              validFrom,
+              validUntil,
+              createdBy: 'SYSTEM_DISPUTE_APOLOGY',
+              assignedToUserId: userId,
+            },
+          });
+          issued.push({ userId, code: voucher.code });
+          break;
+        } catch (error: unknown) {
+          if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002' && attempt < 2) {
+            code = this.apologyVoucherCode(disputeId);
+            continue;
+          }
+          throw error;
+        }
+      }
+    }
+    return issued;
+  }
 
   private async withSerializableRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -481,6 +540,9 @@ export class AdminDisputesService {
         }
       }
 
+      const apologyVoucherRecipients = this.disputeApologyRecipients(dto.decision, order, buyerAmount, sellerAmount);
+      const apologyVouchers = await this.issueDisputeApologyVouchers(tx, apologyVoucherRecipients, dispute.disputeId);
+
       // Notify both parties of the dispute decision.
       const decisionLabel =
         dto.decision === 'FULL_BUYER' ? 'Full amount refunded to buyer'
@@ -500,6 +562,7 @@ export class AdminDisputesService {
         auditTargetId: dispute.disputeId,
         auditDescription: `Admin resolved dispute ${dispute.disputeId} with decision ${dto.decision}`,
         auditAfter: { decision: dto.decision, buyerPercent: dto.buyerPercent, sellerPercent: dto.sellerPercent },
+        apologyVouchers,
       };
     }), 'ADMIN_DISPUTE_RESOLVE_TX');
 
@@ -526,6 +589,20 @@ export class AdminDisputesService {
         },
       }).catch((err: unknown) => this.logger.warn(`silent-catch: dispute decision notification failed: ${err instanceof Error ? err.message : String(err)}`));
       this.prisma.emitNotificationCreated({ userId: uid, title: result.disputeNotifTitle, body: result.disputeNotifBody, data: { type: 'DISPUTE_RESOLVED', disputeId: result.resolvedDisputeId } });
+    }
+
+    for (const voucher of result.apologyVouchers) {
+      this.prisma.notification.create({
+        data: {
+          notifId: generateNotifId(),
+          userId: voucher.userId,
+          type: NotificationType.VOUCHER_ISSUED,
+          category: getCategoryForType(NotificationType.VOUCHER_ISSUED),
+          title: 'Voucher Apology dari Kahade',
+          body: `Voucher ${voucher.code} telah ditambahkan sebagai permintaan maaf setelah sengketa selesai.`,
+          metadata: { voucherCode: voucher.code, disputeId: result.resolvedDisputeId },
+        },
+      }).catch((err: unknown) => this.logger.warn(`silent-catch: dispute apology voucher notification failed: ${err instanceof Error ? err.message : String(err)}`));
     }
 
     return result.decision;

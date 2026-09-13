@@ -10,14 +10,25 @@ import {
   WalletTransactionStatus,
   KycStatus,
   OrderStatus,
+  MembershipRank,
 } from '@prisma/client';
 import { generateWalletTxId, generateReferralCode } from '../../common/utils/id-generator.util';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
 import { toIdr } from '../../common/utils/currency.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
+import { REFERRAL_LEADERBOARD_CACHE } from '../../common/constants/redis-keys';
 
-const REFERRAL_REWARD_AMOUNT = BigInt(500_000);
+const REFERRAL_REWARD_TIERS: Record<MembershipRank, bigint> = {
+  BRONZE: BigInt(500_000),
+  SILVER: BigInt(500_000),
+  GOLD: BigInt(1_000_000),
+  PLATINUM: BigInt(1_500_000),
+  DIAMOND: BigInt(1_500_000),
+};
+const REFERRAL_BURST_THRESHOLD = 5;
+const REFERRAL_BURST_WINDOW_SECONDS = 24 * 60 * 60;
+const REFERRAL_LEADERBOARD_TTL = 900;
 
 @Injectable()
 export class ReferralService {
@@ -29,6 +40,81 @@ export class ReferralService {
     private walletTxSerialService: WalletTxSerialService,
     private configService: ConfigService,
   ) {}
+
+  private getRewardAmountForRank(rank: MembershipRank): bigint {
+    return REFERRAL_REWARD_TIERS[rank] ?? REFERRAL_REWARD_TIERS.BRONZE;
+  }
+
+  private async flagReferralBurstIfNeeded(referrerId: string, relationId: string): Promise<void> {
+    const key = `referral:relations_24h:${referrerId}`;
+    const redisCount = await this.redis.incrWithTtl(key, REFERRAL_BURST_WINDOW_SECONDS).catch((error: unknown) => {
+      this.logger.warn(`Referral burst Redis counter failed for referrer=${referrerId}: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    });
+    const cutoff = new Date(Date.now() - REFERRAL_BURST_WINDOW_SECONDS * 1000);
+    const dbCount = await this.prisma.referralRelation.count({
+      where: { referrerId, appliedAt: { gte: cutoff } },
+    });
+    if ((redisCount ?? 0) < REFERRAL_BURST_THRESHOLD && dbCount < REFERRAL_BURST_THRESHOLD) return;
+    await this.prisma.referralRelation.updateMany({
+      where: { referrerId, appliedAt: { gte: cutoff }, flaggedForReview: false },
+      data: {
+        flaggedForReview: true,
+        flaggedForReviewAt: new Date(),
+        reviewReason: `Referrer received at least ${REFERRAL_BURST_THRESHOLD} new relations in 24 hours`,
+      },
+    });
+    await this.prisma.referralRelation.updateMany({
+      where: { id: relationId },
+      data: {
+        flaggedForReview: true,
+        flaggedForReviewAt: new Date(),
+        reviewReason: `Referrer received at least ${REFERRAL_BURST_THRESHOLD} new relations in 24 hours`,
+      },
+    });
+  }
+
+  async refreshLeaderboard(limit = 50): Promise<Array<Record<string, unknown>>> {
+    const safeLimit = Math.min(100, Math.max(1, Math.trunc(Number(limit) || 50)));
+    const leaders = await this.prisma.referralCode.findMany({
+      where: { user: { deletedAt: null, isActive: true, isBanned: false } },
+      orderBy: [{ totalRewardEarned: 'desc' }, { totalReferrals: 'desc' }, { id: 'asc' }],
+      take: safeLimit,
+      include: {
+        user: { select: { userId: true, username: true, fullName: true, avatarUrl: true, membershipRank: true } },
+      },
+    });
+    const relationCounts = await this.prisma.referralRelation.groupBy({
+      by: ['referrerId'],
+      where: { referrerId: { in: leaders.map(l => l.userId) }, isRewardActive: true },
+      _count: { _all: true },
+    });
+    const successfulByUser = new Map(relationCounts.map(row => [row.referrerId, row._count._all]));
+    const data = leaders.map((leader, index) => ({
+      rank: index + 1,
+      user: leader.user,
+      code: leader.code,
+      totalReferrals: leader.totalReferrals,
+      successfulReferrals: successfulByUser.get(leader.userId) ?? 0,
+      totalRewardEarned: toIdr(leader.totalRewardEarned),
+    }));
+    await this.redis.setex(REFERRAL_LEADERBOARD_CACHE('all_time', safeLimit), REFERRAL_LEADERBOARD_TTL, JSON.stringify(data));
+    return data;
+  }
+
+  async getLeaderboard(limit = 50): Promise<Array<Record<string, unknown>>> {
+    const safeLimit = Math.min(100, Math.max(1, Math.trunc(Number(limit) || 50)));
+    const cacheKey = REFERRAL_LEADERBOARD_CACHE('all_time', safeLimit);
+    const cached = await this.redis.get(cacheKey);
+    if (cached) {
+      try {
+        return JSON.parse(cached) as Array<Record<string, unknown>>;
+      } catch (_) {
+        await this.redis.del(cacheKey);
+      }
+    }
+    return this.refreshLeaderboard(safeLimit);
+  }
 
   async getOrCreateCode(userId: string): Promise<ReferralCode> {
     const existing = await this.prisma.referralCode.findUnique({ where: { userId } });
@@ -146,7 +232,8 @@ export class ReferralService {
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
       );
 
-      return relation;
+      await this.flagReferralBurstIfNeeded(relation.referrerId, relation.id);
+      return (await this.prisma.referralRelation.findUnique({ where: { id: relation.id } })) ?? relation;
     } catch (err: unknown) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
         throw new BadRequestException({
@@ -350,7 +437,7 @@ export class ReferralService {
     }
 
     const [referrer, referee] = await Promise.all([
-      tx.user.findUnique({ where: { id: relation.referrerId }, select: { kycStatus: true } }),
+      tx.user.findUnique({ where: { id: relation.referrerId }, select: { kycStatus: true, membershipRank: true } }),
       tx.user.findUnique({ where: { id: relation.refereeId }, select: { kycStatus: true } }),
     ]);
 
@@ -372,6 +459,7 @@ export class ReferralService {
       where: {
         OR: [{ buyerId: relation.referrerId }, { sellerId: relation.referrerId }],
         status: OrderStatus.COMPLETED,
+        deletedAt: null,
       },
     });
 
@@ -386,6 +474,7 @@ export class ReferralService {
       where: {
         OR: [{ buyerId: relation.refereeId }, { sellerId: relation.refereeId }],
         status: OrderStatus.COMPLETED,
+        deletedAt: null,
       },
     });
 
@@ -406,9 +495,11 @@ export class ReferralService {
       return;
     }
 
+    const rewardAmount = this.getRewardAmountForRank(referrer.membershipRank);
+
     const referrerCredited = await this.creditReward(
       relation.referrerId,
-      REFERRAL_REWARD_AMOUNT,
+      rewardAmount,
       feeAmount,
       orderId,
       relation.id,
@@ -417,7 +508,7 @@ export class ReferralService {
     );
     const refereeCredited = await this.creditReward(
       relation.refereeId,
-      REFERRAL_REWARD_AMOUNT,
+      rewardAmount,
       feeAmount,
       orderId,
       relation.id,
@@ -443,7 +534,7 @@ export class ReferralService {
     });
 
     this.logger.log(
-      `Referral rewards Rp5.000 each credited to referrer ${relation.referrerId} and referee ${relation.refereeId} for order ${orderId}`,
+      `Referral rewards Rp${toIdr(rewardAmount).toLocaleString('id-ID')} each credited to referrer ${relation.referrerId} and referee ${relation.refereeId} for order ${orderId}`,
     );
   }
 

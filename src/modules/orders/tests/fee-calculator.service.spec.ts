@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { FeeCalculatorService } from '../fee-calculator.service';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../../../redis/redis.service';
+import { MembershipRank } from '@prisma/client';
 
 const mockConfig = {
   get: jest.fn((key: string) => {
@@ -175,6 +176,32 @@ describe('FeeCalculatorService', () => {
       const orderSen = BigInt(orderValue) * BigInt(100);
       expect(result.buyerPayAmount).toBe(orderSen + result.buyerFeeAmount);
       expect(result.sellerReceiveAmount).toBe(orderSen - result.sellerFeeAmount);
+    });
+
+    it('should apply GOLD membership discount as a separate layer after standard fee', () => {
+      const result = service.calculateFee({
+        orderValue: 1_000_000,
+        feeResponsibility: 'BUYER',
+        isKahadePlus: false,
+        membershipRank: MembershipRank.GOLD,
+      });
+
+      expect(result.membershipRankDiscount).toBe(BigInt(125_000)); // 5% of Rp 25.000 fee, in sen
+      expect(result.feeAmount).toBe(BigInt(2_375_000));
+    });
+
+    it('should cap DIAMOND rank discount against the fee remaining after voucher discount', () => {
+      const result = service.calculateFee({
+        orderValue: 1_000_000,
+        feeResponsibility: 'BUYER',
+        isKahadePlus: false,
+        voucherDiscount: 20_000,
+        membershipRank: MembershipRank.DIAMOND,
+      });
+
+      expect(result.voucherDiscount).toBe(BigInt(2_000_000));
+      expect(result.membershipRankDiscount).toBe(BigInt(75_000)); // 15% of remaining Rp 5.000, in sen
+      expect(result.feeAmount).toBe(BigInt(425_000));
     });
   });
 

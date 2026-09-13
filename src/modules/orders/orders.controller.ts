@@ -87,6 +87,8 @@ export class OrdersController {
     buyerPayAmount: number;
     sellerReceiveAmount: number;
     voucherDiscount: number;
+    voucherCashback: number;
+    membershipRankDiscount: number;
     isKahadePlusApplied: boolean;
   }> {
     return this.ordersService.calculateFee(dto, userId);
@@ -134,6 +136,8 @@ export class OrdersController {
       buyerPayAmount: number;
       sellerReceiveAmount: number;
       voucherDiscount: number;
+      voucherCashback: number;
+      membershipRankDiscount: number;
     };
     confirmationDeadlineAt: Date | null;
   }> {

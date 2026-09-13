@@ -1,9 +1,14 @@
-import { IsDateString, IsEnum, IsInt, IsNumber, IsOptional, IsString, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { IsBoolean, IsDateString, IsEnum, IsInt, IsNumber, IsOptional, IsString, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
 import { Transform } from 'class-transformer';
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { CampaignStatus } from '@prisma/client';
+import { CampaignStatus, MembershipRank } from '@prisma/client';
 
 const trim = ({ value }: { value: unknown }) => typeof value === 'string' ? value.trim() : value;
+const toBoolean = ({ value }: { value: unknown }) => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') return value.toLowerCase() === 'true';
+  return value;
+};
 
 export class UpdateCampaignDto {
   @ApiPropertyOptional({ description: 'Campaign name', minLength: 3, maxLength: 100 })
@@ -22,11 +27,31 @@ export class UpdateCampaignDto {
   @IsOptional() @IsDateString()
   endsAt?: string;
 
+  @ApiPropertyOptional({ description: 'Unique public promo code for the campaign', example: 'SEPTCASHBACK' })
+  @IsOptional() @IsString() @MinLength(3) @MaxLength(32) @Matches(/^[A-Za-z0-9_-]+$/) @Transform(trim)
+  promoCode?: string;
+
+  @ApiPropertyOptional({ description: 'Legacy display-only audience label' })
+  @IsOptional() @IsString() @MaxLength(500) @Transform(trim)
+  targetAudience?: string;
+
+  @ApiPropertyOptional({ enum: MembershipRank, description: 'Minimum membership rank eligible for generated vouchers' })
+  @IsOptional() @IsEnum(MembershipRank)
+  targetMinRank?: MembershipRank;
+
+  @ApiPropertyOptional({ description: 'Dormant targeting: minimum days since last completed order', minimum: 1, maximum: 3650 })
+  @IsOptional() @IsInt() @Min(1) @Max(3650)
+  targetDormantDays?: number;
+
+  @ApiPropertyOptional({ description: 'Only target users with zero completed orders' })
+  @IsOptional() @IsBoolean() @Transform(toBoolean)
+  targetNewUserOnly?: boolean;
+
   @ApiPropertyOptional({ description: 'Max total redemptions', minimum: 1, maximum: 10_000_000 })
   @IsOptional() @IsInt() @Min(1) @Max(10_000_000)
   maxRedemptions?: number;
 
-  @ApiPropertyOptional({ enum: CampaignStatus, description: 'Campaign status' })
+  @ApiPropertyOptional({ enum: CampaignStatus, description: 'Campaign status. PAUSED stops new voucher issuance; ENDED is permanent.' })
   @IsOptional() @IsEnum(CampaignStatus)
   status?: CampaignStatus;
 

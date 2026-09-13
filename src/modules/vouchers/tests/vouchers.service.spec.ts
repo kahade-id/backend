@@ -43,8 +43,14 @@ const mockPrisma = {
   user: {
     findUnique: jest.fn(),
   },
+  order: {
+    count: jest.fn(),
+  },
   subscription: {
     findFirst: jest.fn(),
+  },
+  campaign: {
+    findUnique: jest.fn(),
   },
 };
 
@@ -77,6 +83,8 @@ describe('VouchersService', () => {
     service = module.get<VouchersService>(VouchersService);
     jest.clearAllMocks();
     mockPrisma.user.findUnique.mockResolvedValue({ totalOrdersCompleted: 0 });
+    mockPrisma.order.count.mockResolvedValue(0);
+    mockPrisma.campaign.findUnique.mockResolvedValue({ status: 'ACTIVE' });
   });
 
   it('should be defined', () => {
@@ -135,6 +143,44 @@ describe('VouchersService', () => {
       expect(result).toHaveProperty('code', 'SAVE10');
     });
 
+    it('previews WALLET_CASHBACK percentage from order value, not platform fee', async () => {
+      mockPrisma.voucher.findUnique.mockResolvedValueOnce(
+        makeVoucher({
+          voucherType: VoucherType.WALLET_CASHBACK,
+          discountPercent: 10,
+          discountAmount: null,
+          maxDiscountAmount: null,
+        }),
+      );
+      mockPrisma.voucherUsage.count.mockResolvedValueOnce(0);
+
+      await expect(service.validateVoucher('user-1', 'SAVE10', 100_000, 'BUYER')).resolves.toMatchObject({
+        discountAmount: null,
+        cashbackAmount: 10_000,
+      });
+    });
+
+    it('should reject a personal voucher assigned to another user', async () => {
+      mockPrisma.voucher.findUnique.mockResolvedValueOnce(
+        makeVoucher({ assignedToUserId: 'other-user' }),
+      );
+
+      await expect(service.validateVoucher('user-1', 'SAVE10', 100_000)).rejects.toThrow(BadRequestException);
+    });
+
+    it('should reject TOPUP_BONUS vouchers from the order voucher validation path', async () => {
+      mockPrisma.voucher.findUnique.mockResolvedValueOnce(
+        makeVoucher({
+          voucherType: VoucherType.TOPUP_BONUS,
+          discountAmount: BigInt(100_000),
+          discountPercent: null,
+          minOrderValue: null,
+        }),
+      );
+
+      await expect(service.validateVoucher('user-1', 'TOPUP10', 100_000)).rejects.toThrow(BadRequestException);
+    });
+
     it('should reject when concurrent requests push currentUsage to maxUsageTotal boundary', async () => {
       mockPrisma.voucher.findUnique.mockResolvedValueOnce(
         makeVoucher({ maxUsageTotal: 1, currentUsage: 1 }),
@@ -181,6 +227,29 @@ describe('VouchersService', () => {
       mockFeeCalculator.getFeeRate.mockReturnValueOnce(1.5);
 
       const result = await service.validateVoucher('user-1', 'SAVE10', 100_000);
+      expect(result).toHaveProperty('valid', true);
+    });
+
+    it('should reject DORMANT_USER voucher when the user has a recent completed order', async () => {
+      mockPrisma.voucher.findUnique.mockResolvedValueOnce(
+        makeVoucher({ applicableTo: VoucherApplicability.DORMANT_USER }),
+      );
+      mockPrisma.voucherUsage.count.mockResolvedValueOnce(0);
+      mockPrisma.user.findUnique.mockResolvedValueOnce({ totalOrdersCompleted: 3 });
+      mockPrisma.order.count.mockResolvedValueOnce(1);
+
+      await expect(service.validateVoucher('user-1', 'DORMANT10', 100_000)).rejects.toThrow(BadRequestException);
+    });
+
+    it('should allow DORMANT_USER voucher after thirty days without completed orders', async () => {
+      mockPrisma.voucher.findUnique.mockResolvedValueOnce(
+        makeVoucher({ applicableTo: VoucherApplicability.DORMANT_USER }),
+      );
+      mockPrisma.voucherUsage.count.mockResolvedValueOnce(0);
+      mockPrisma.user.findUnique.mockResolvedValueOnce({ totalOrdersCompleted: 3 });
+      mockPrisma.order.count.mockResolvedValueOnce(0);
+
+      const result = await service.validateVoucher('user-1', 'DORMANT10', 100_000);
       expect(result).toHaveProperty('valid', true);
     });
 
@@ -288,6 +357,7 @@ describe('VouchersService regression coverage', () => {
     service = module.get<VouchersService>(VouchersService);
     jest.clearAllMocks();
     mockPrisma.user.findUnique.mockResolvedValue({ totalOrdersCompleted: 0 });
+    mockPrisma.order.count.mockResolvedValue(0);
   });
 
   it('rejects validation for a missing authenticated user', async () => {
@@ -306,13 +376,14 @@ describe('VouchersService regression coverage', () => {
     expect(result.discountAmount).toBe(5_000);
   });
 
-  it('excludes NEW_USER vouchers from returning users and separates the cache audience', async () => {
+  it('excludes NEW_USER and DORMANT_USER vouchers from active returning users and separates the cache audience', async () => {
     mockPrisma.user.findUnique.mockResolvedValueOnce({ totalOrdersCompleted: 2 });
+    mockPrisma.order.count.mockResolvedValueOnce(1);
     mockPrisma.voucher.findMany.mockResolvedValueOnce([]);
     mockPrisma.voucher.count.mockResolvedValueOnce(0);
     await service.getAvailableVouchers('user-1', 1, 20);
     expect(mockPrisma.voucher.findMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({ applicableTo: { not: VoucherApplicability.NEW_USER } }),
+      where: expect.objectContaining({ applicableTo: { notIn: [VoucherApplicability.NEW_USER, VoucherApplicability.DORMANT_USER] } }),
     }));
     expect(mockRedis.setex).toHaveBeenCalledWith(expect.stringContaining(':existing:'), expect.any(Number), expect.any(String));
   });

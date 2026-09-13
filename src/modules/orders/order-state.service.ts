@@ -6,7 +6,7 @@ import { WalletService } from '../wallet/wallet.service';
 import { ReferralService } from '../referral/referral.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { MembershipRankService } from './membership-rank.service';
-import { OrderStatus, OrderCancelReason, ActorType, WalletTransactionType, WalletTransactionStatus, SubscriptionStatus, NotificationType, Prisma } from '@prisma/client';
+import { OrderStatus, OrderCancelReason, ActorType, WalletTransactionType, WalletTransactionStatus, SubscriptionStatus, NotificationType, Prisma, VoucherType } from '@prisma/client';
 import { addDays } from '../../common/utils/date.util';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
@@ -170,10 +170,23 @@ export class OrderStateService {
     this.runRealtimeBestEffort(() => this.realtime.emitToOrder(orderId, 'order.status_changed', { orderId, status: 'COMPLETED' }), 'COMPLETE_ORDER_STATUS');
 
     this.runPostCommitBestEffort(async () => {
-      const order = await this.prisma.order.findUnique({ where: { orderId }, select: { buyerId: true, sellerId: true, title: true } });
+      const order = await this.prisma.order.findUnique({ where: { orderId }, select: { id: true, buyerId: true, sellerId: true, title: true } });
       if (!order) return;
       await this.notificationQueue.enqueue({ userId: order.sellerId, type: NotificationType.ORDER_COMPLETED, title: 'Order Completed', body: `Order "${order.title}" has been completed! Funds have been credited to your wallet.`, pushData: { type: 'ORDER_COMPLETED', orderId } });
       await this.notificationQueue.enqueue({ userId: order.buyerId, type: NotificationType.WALLET_FUNDS_RELEASED, title: 'Escrow Released', body: `Escrow funds for order "${order.title}" have been released to the seller.`, pushData: { type: 'WALLET_FUNDS_RELEASED', orderId } });
+      const cashbackUsage = await this.prisma.voucherUsage.findFirst({
+        where: { orderId: order.id, discountApplied: { gt: BigInt(0) }, voucher: { voucherType: VoucherType.WALLET_CASHBACK } },
+        select: { userId: true, discountApplied: true },
+      });
+      if (cashbackUsage) {
+        await this.notificationQueue.enqueue({
+          userId: cashbackUsage.userId,
+          type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
+          title: 'Cashback Credited',
+          body: `Cashback Rp ${(cashbackUsage.discountApplied / BigInt(100)).toLocaleString('id-ID')} from order "${order.title}" has been credited to your wallet.`,
+          pushData: { type: 'CAMPAIGN_CASHBACK_CREDITED', orderId },
+        });
+      }
     }, 'COMPLETE_ORDER_NOTIFICATION');
 
     return { orderId, status: 'COMPLETED' };
@@ -435,6 +448,11 @@ export class OrderStateService {
       if (feeSerial === null) feeSerial = await this.getNextWalletTxSerial();
       return feeSerial;
     };
+    let cashbackSerial: number | null = null;
+    const nextCashbackTxSerial = async (): Promise<number> => {
+      if (cashbackSerial === null) cashbackSerial = await this.getNextWalletTxSerial();
+      return cashbackSerial;
+    };
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -524,6 +542,22 @@ export class OrderStateService {
         throw new ConflictException({ code: ErrorCodes.ESCROW_LOCK_MISSING, message: 'Escrow lock ledger is missing or does not match this order' });
       }
 
+      const cashbackUsage = await tx.voucherUsage.findFirst({
+        where: {
+          orderId: order.id,
+          voucher: { voucherType: VoucherType.WALLET_CASHBACK },
+        },
+        select: {
+          id: true,
+          userId: true,
+          discountApplied: true,
+          voucher: { select: { code: true } },
+        },
+      });
+      const cashbackAmount = cashbackUsage?.discountApplied ?? BigInt(0);
+      const cashbackRecipientIsBuyer = cashbackUsage?.userId === order.buyerId;
+      const cashbackRecipientIsSeller = cashbackUsage?.userId === order.sellerId;
+
       if (buyerWallet.isLocked) {
         throw new BadRequestException({ code: 'WALLET_LOCKED', message: 'Buyer wallet is locked. Cannot proceed with escrow release.' });
       }
@@ -535,14 +569,21 @@ export class OrderStateService {
       const buyerBalanceAfter = buyerWallet.escrowBalance - order.buyerPayAmount;
       const sellerBalanceBefore = sellerWallet.availableBalance;
       const sellerBalanceAfter = sellerWallet.availableBalance + order.sellerReceiveAmount;
+      const buyerCashbackAmount = cashbackRecipientIsBuyer ? cashbackAmount : BigInt(0);
+      const sellerCashbackAmount = cashbackRecipientIsSeller ? cashbackAmount : BigInt(0);
+
+      const buyerWalletData: Prisma.WalletUpdateManyMutationInput = {
+        escrowBalance: { decrement: order.buyerPayAmount },
+        totalBalance: { decrement: order.buyerPayAmount - buyerCashbackAmount },
+        version: { increment: 1 },
+      };
+      if (buyerCashbackAmount > BigInt(0)) {
+        buyerWalletData.availableBalance = { increment: buyerCashbackAmount };
+      }
 
       const buyerUpdated = await tx.wallet.updateMany({
         where: { id: buyerWallet.id, version: buyerWallet.version, escrowBalance: { gte: order.buyerPayAmount } },
-        data: {
-          escrowBalance: { decrement: order.buyerPayAmount },
-          totalBalance: { decrement: order.buyerPayAmount },
-          version: { increment: 1 },
-        },
+        data: buyerWalletData,
       });
       if (buyerUpdated.count === 0) {
         throw new ConflictException({ code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT, message: 'Concurrent escrow release detected, please retry' });
@@ -551,8 +592,8 @@ export class OrderStateService {
       const sellerUpdated = await tx.wallet.updateMany({
         where: { id: sellerWallet.id, version: sellerWallet.version },
         data: {
-          availableBalance: { increment: order.sellerReceiveAmount },
-          totalBalance: { increment: order.sellerReceiveAmount },
+          availableBalance: { increment: order.sellerReceiveAmount + sellerCashbackAmount },
+          totalBalance: { increment: order.sellerReceiveAmount + sellerCashbackAmount },
           version: { increment: 1 },
         },
       });
@@ -589,6 +630,27 @@ export class OrderStateService {
           description: `Payment received for completed order ${order.orderId}`,
         },
       });
+
+      if (cashbackUsage && cashbackAmount > BigInt(0) && (cashbackRecipientIsBuyer || cashbackRecipientIsSeller)) {
+        const cashbackWallet = cashbackRecipientIsBuyer ? buyerWallet : sellerWallet;
+        const cashbackBalanceBefore = cashbackRecipientIsBuyer
+          ? buyerWallet.availableBalance
+          : sellerWallet.availableBalance + order.sellerReceiveAmount;
+        const cashbackTxId = generateWalletTxId(await nextCashbackTxSerial());
+        await tx.walletTransaction.create({
+          data: {
+            txId: cashbackTxId,
+            walletId: cashbackWallet.id,
+            type: WalletTransactionType.CAMPAIGN_CASHBACK,
+            status: WalletTransactionStatus.SUCCESS,
+            amount: cashbackAmount,
+            balanceBefore: cashbackBalanceBefore,
+            balanceAfter: cashbackBalanceBefore + cashbackAmount,
+            orderId: order.id,
+            description: `Campaign cashback for order ${order.orderId} using voucher ${cashbackUsage.voucher.code}`,
+          },
+        });
+      }
 
       // feeAmount = buyerPayAmount − sellerReceiveAmount.
       // The fee amount is removed from the buyer's escrow (already done above via

@@ -1,17 +1,29 @@
-import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, InternalServerErrorException, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
 import { RedisService } from '../../redis/redis.service';
 import { FEE_CONFIG_CACHE } from '../../common/constants/redis-keys';
 import { toSen } from '../../common/utils/currency.util';
 import { FEE_MIN_SEN, FEE_MAX_SEN } from '../../common/constants/app.constants';
+import { PrismaService } from '../../prisma/prisma.service';
+import { MembershipRank } from '@prisma/client';
 
 const FEE_CONFIG_TTL = 300;
 const FEE_CONFIG_LOCK_TTL = 5;
+const MEMBERSHIP_RANK_FEE_DISCOUNT_CONFIG_KEY = 'membership_rank_fee_discount_bps';
+
+const DEFAULT_MEMBERSHIP_RANK_FEE_DISCOUNT_BPS: Record<MembershipRank, number> = {
+  [MembershipRank.BRONZE]: 0,
+  [MembershipRank.SILVER]: 0,
+  [MembershipRank.GOLD]: 500,
+  [MembershipRank.PLATINUM]: 1000,
+  [MembershipRank.DIAMOND]: 1500,
+};
 
 export interface FeeConfig {
   kahadeFeeRateBps: number;
   kahadePlusFeeRateBps: number;
+  membershipRankFeeDiscountBps: Record<MembershipRank, number>;
 }
 
 interface FeeCalculationParams {
@@ -20,6 +32,7 @@ interface FeeCalculationParams {
   isKahadePlus: boolean;
   voucherDiscount?: number;
   voucherDiscountSen?: bigint;
+  membershipRank?: MembershipRank;
 }
 
 interface FeeCalculationResult {
@@ -29,6 +42,7 @@ interface FeeCalculationResult {
   buyerPayAmount: bigint;
   sellerReceiveAmount: bigint;
   voucherDiscount: bigint;
+  membershipRankDiscount: bigint;
   feeRate: number;
 }
 
@@ -37,6 +51,7 @@ export class FeeCalculatorService {
   constructor(
     private configService: ConfigService,
     private redis: RedisService,
+    @Optional() private prisma?: PrismaService,
   ) {}
 
   /**
@@ -56,7 +71,7 @@ export class FeeCalculatorService {
     const cached = await this.redis.get(FEE_CONFIG_CACHE);
     if (cached) {
       try {
-        return JSON.parse(cached) as FeeConfig;
+        return this.normalizeFeeConfig(JSON.parse(cached) as Partial<FeeConfig>);
       } catch {
         await this.redis.del(FEE_CONFIG_CACHE);
       }
@@ -76,12 +91,13 @@ export class FeeCalculatorService {
         await new Promise<void>((r) => setTimeout(r, 100));
         const retry = await this.redis.get(FEE_CONFIG_CACHE);
         if (retry) {
-          try { return JSON.parse(retry) as FeeConfig; } catch { break; }
+          try { return this.normalizeFeeConfig(JSON.parse(retry) as Partial<FeeConfig>); } catch { break; }
         }
       }
       return {
         kahadeFeeRateBps: this.resolveRateBps(false),
         kahadePlusFeeRateBps: this.resolveRateBps(true),
+        membershipRankFeeDiscountBps: await this.resolveMembershipRankFeeDiscountBps(),
       };
     }
 
@@ -89,6 +105,7 @@ export class FeeCalculatorService {
       const config: FeeConfig = {
         kahadeFeeRateBps: this.resolveRateBps(false),
         kahadePlusFeeRateBps: this.resolveRateBps(true),
+        membershipRankFeeDiscountBps: await this.resolveMembershipRankFeeDiscountBps(),
       };
       await this.redis.setex(FEE_CONFIG_CACHE, FEE_CONFIG_TTL, JSON.stringify(config));
       return config;
@@ -103,6 +120,44 @@ export class FeeCalculatorService {
    */
   async invalidateFeeConfigCache(): Promise<void> {
     await this.redis.del(FEE_CONFIG_CACHE);
+  }
+
+  private normalizeFeeConfig(config: Partial<FeeConfig>): FeeConfig {
+    return {
+      kahadeFeeRateBps: Number.isFinite(config.kahadeFeeRateBps)
+        ? Number(config.kahadeFeeRateBps)
+        : this.resolveRateBps(false),
+      kahadePlusFeeRateBps: Number.isFinite(config.kahadePlusFeeRateBps)
+        ? Number(config.kahadePlusFeeRateBps)
+        : this.resolveRateBps(true),
+      membershipRankFeeDiscountBps: {
+        ...DEFAULT_MEMBERSHIP_RANK_FEE_DISCOUNT_BPS,
+        ...(config.membershipRankFeeDiscountBps ?? {}),
+      },
+    };
+  }
+
+  private async resolveMembershipRankFeeDiscountBps(): Promise<Record<MembershipRank, number>> {
+    if (!this.prisma) return { ...DEFAULT_MEMBERSHIP_RANK_FEE_DISCOUNT_BPS };
+
+    try {
+      const config = await this.prisma.systemConfig.findUnique({
+        where: { key: MEMBERSHIP_RANK_FEE_DISCOUNT_CONFIG_KEY },
+        select: { value: true },
+      });
+      if (!config) return { ...DEFAULT_MEMBERSHIP_RANK_FEE_DISCOUNT_BPS };
+
+      const parsed = JSON.parse(config.value) as Partial<Record<MembershipRank, unknown>>;
+      const normalized: Record<MembershipRank, number> = { ...DEFAULT_MEMBERSHIP_RANK_FEE_DISCOUNT_BPS };
+      for (const rank of Object.values(MembershipRank)) {
+        const value = parsed[rank];
+        if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+        normalized[rank] = Math.min(10_000, Math.max(0, Math.trunc(value)));
+      }
+      return normalized;
+    } catch {
+      return { ...DEFAULT_MEMBERSHIP_RANK_FEE_DISCOUNT_BPS };
+    }
   }
 
   /**
@@ -141,6 +196,13 @@ export class FeeCalculatorService {
       return BigInt(isKahadePlus ? feeConfig.kahadePlusFeeRateBps : feeConfig.kahadeFeeRateBps);
     }
     return BigInt(this.resolveRateBps(isKahadePlus));
+  }
+
+  private getMembershipRankDiscountBps(rank?: MembershipRank, feeConfig?: FeeConfig): bigint {
+    if (!rank) return BigInt(0);
+    const table = feeConfig?.membershipRankFeeDiscountBps ?? DEFAULT_MEMBERSHIP_RANK_FEE_DISCOUNT_BPS;
+    const bps = table[rank] ?? 0;
+    return BigInt(Math.min(10_000, Math.max(0, Math.trunc(bps))));
   }
 
   /**
@@ -196,7 +258,7 @@ export class FeeCalculatorService {
    * fee estimate) should always supply this parameter.
    */
   calculateFee(params: FeeCalculationParams, feeConfig?: FeeConfig): FeeCalculationResult {
-    const { orderValue, feeResponsibility, isKahadePlus, voucherDiscount = 0, voucherDiscountSen: directSen } = params;
+    const { orderValue, feeResponsibility, isKahadePlus, voucherDiscount = 0, voucherDiscountSen: directSen, membershipRank } = params;
 
     const orderValueSen = toSen(orderValue);
     const voucherDiscountSen = directSen ?? toSen(voucherDiscount);
@@ -228,6 +290,15 @@ export class FeeCalculatorService {
     const cappedVoucherDiscountSen = voucherDiscountSen > feeAmount ? feeAmount : voucherDiscountSen;
     if (cappedVoucherDiscountSen > BigInt(0)) {
       feeAmount = feeAmount - cappedVoucherDiscountSen;
+    }
+
+    // ── 4. Membership-rank reduction from SystemConfig (GOLD+ by default),
+    //       capped to the remaining fee after Kahade+ and voucher.
+    const rankDiscountBps = this.getMembershipRankDiscountBps(membershipRank, feeConfig);
+    let membershipRankDiscount = (feeAmount * rankDiscountBps) / BigInt(10_000);
+    if (membershipRankDiscount > feeAmount) membershipRankDiscount = feeAmount;
+    if (membershipRankDiscount > BigInt(0)) {
+      feeAmount = feeAmount - membershipRankDiscount;
     }
 
     // Split fee based on responsibility
@@ -265,6 +336,7 @@ export class FeeCalculatorService {
       buyerPayAmount,
       sellerReceiveAmount,
       voucherDiscount: cappedVoucherDiscountSen,
+      membershipRankDiscount,
       feeRate: this.getFeeRate(isKahadePlus, feeConfig),
     };
   }

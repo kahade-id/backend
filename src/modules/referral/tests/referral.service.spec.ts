@@ -1,7 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Prisma } from '@prisma/client';
+import { MembershipRank, Prisma } from '@prisma/client';
 import { ReferralService } from '../referral.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
@@ -38,6 +38,8 @@ const mockPrisma = {
     findUnique: jest.fn(),
     upsert: jest.fn(),
     update: jest.fn(),
+    updateMany: jest.fn(),
+    findMany: jest.fn(),
   },
   referralRelation: {
     findUnique: jest.fn(),
@@ -45,6 +47,8 @@ const mockPrisma = {
     findMany: jest.fn(),
     count: jest.fn(),
     update: jest.fn().mockResolvedValue({}),
+    updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+    groupBy: jest.fn(),
   },
   referralReward: {
     findMany: jest.fn(),
@@ -69,6 +73,7 @@ const mockRedis = {
   setex: jest.fn(),
   del: jest.fn(),
   hset: jest.fn(),
+  incrWithTtl: jest.fn(),
 };
 
 const mockWalletTxSerialService = {
@@ -156,6 +161,41 @@ describe('ReferralService', () => {
       await expect(service.applyCode('user-1', 'REFABC123')).rejects.toThrow(BadRequestException);
 
       expect(txCreate).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getLeaderboard', () => {
+    it('uses Redis cache when present', async () => {
+      mockRedis.get.mockResolvedValueOnce(JSON.stringify([{ rank: 1, code: 'KH-CACHED' }]));
+
+      await expect(service.getLeaderboard(10)).resolves.toEqual([{ rank: 1, code: 'KH-CACHED' }]);
+      expect(mockPrisma.referralCode.findMany).not.toHaveBeenCalled();
+    });
+
+    it('refreshes leaderboard with stable tiebreaker and caches serialized rewards', async () => {
+      mockRedis.get.mockResolvedValueOnce(null);
+      mockPrisma.referralCode.findMany.mockResolvedValueOnce([
+        {
+          id: 'rcode-1',
+          code: 'KHLEADER1',
+          userId: 'user-1',
+          totalReferrals: 7,
+          totalRewardEarned: BigInt(15_000_000),
+          user: { userId: 'USR-1', username: 'leader', fullName: 'Leader', avatarUrl: null, membershipRank: MembershipRank.PLATINUM },
+        },
+      ]);
+      mockPrisma.referralRelation.groupBy.mockResolvedValueOnce([
+        { referrerId: 'user-1', _count: { _all: 3 } },
+      ]);
+
+      const result = await service.getLeaderboard(10);
+
+      expect(mockPrisma.referralCode.findMany).toHaveBeenCalledWith(expect.objectContaining({
+        orderBy: [{ totalRewardEarned: 'desc' }, { totalReferrals: 'desc' }, { id: 'asc' }],
+        take: 10,
+      }));
+      expect(result[0]).toMatchObject({ code: 'KHLEADER1', totalRewardEarned: 150_000, successfulReferrals: 3 });
+      expect(mockRedis.setex).toHaveBeenCalledWith(expect.stringContaining('referral'), expect.any(Number), expect.any(String));
     });
   });
 
@@ -300,6 +340,36 @@ describe('ReferralService', () => {
     });
   });
 
+  describe('applyCode — referral burst review flag', () => {
+    it('flags recent relations when one referrer reaches five new relations in 24 hours', async () => {
+      const relation = { ...mockReferralRelation, flaggedForReview: false };
+      const updateMany = jest.fn().mockResolvedValue({ count: 1 });
+      mockPrisma.$transaction.mockImplementation(async (cb: (tx: unknown) => Promise<unknown>) =>
+        cb({
+          referralCode: { findUnique: jest.fn().mockResolvedValue(mockReferralCode), updateMany },
+          referralRelation: {
+            findUnique: jest.fn().mockResolvedValue(null),
+            findFirst: jest.fn().mockResolvedValue(null),
+            create: jest.fn().mockResolvedValue(relation),
+          },
+        }),
+      );
+      mockRedis.incrWithTtl.mockResolvedValueOnce(5);
+      mockPrisma.referralRelation.count.mockResolvedValueOnce(5);
+      mockPrisma.referralRelation.updateMany.mockResolvedValue({ count: 5 });
+      mockPrisma.referralRelation.findUnique.mockResolvedValueOnce({ ...relation, flaggedForReview: true });
+
+      const result = await service.applyCode('user-1', 'REFABC123');
+
+      expect(result.flaggedForReview).toBe(true);
+      expect(mockRedis.incrWithTtl).toHaveBeenCalledWith(expect.stringContaining('user-2'), 24 * 60 * 60);
+      expect(mockPrisma.referralRelation.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ referrerId: 'user-2', flaggedForReview: false }),
+        data: expect.objectContaining({ flaggedForReview: true }),
+      }));
+    });
+  });
+
   describe('applyCode — P2002 to friendly error mapping', () => {
     it('should convert P2002 unique constraint error to REFERRAL_ALREADY_APPLIED', async () => {
       const p2002Error = new Prisma.PrismaClientKnownRequestError('Unique constraint failed', { code: 'P2002', clientVersion: '5.0.0' });
@@ -419,6 +489,56 @@ describe('ReferralService', () => {
       };
       await service.createReferralRewardIfEligible('user-1', BigInt(50000), 'order-1', mockTx as unknown as Prisma.TransactionClient);
       expect(mockTx.referralReward!.create).not.toHaveBeenCalled();
+    });
+
+    it('credits Rp15.000 per side when the referrer is PLATINUM at reward time', async () => {
+      const mockTx: MockTransactionClient = {
+        referralRelation: {
+          findUnique: jest.fn().mockResolvedValue({ id: 'rel-1', referrerId: 'user-2', refereeId: 'user-1', isRewardActive: false }),
+          update: jest.fn(),
+        },
+        order: {
+          findUnique: jest.fn().mockResolvedValue({ status: 'COMPLETED' }),
+          count: jest.fn().mockResolvedValue(1),
+        },
+        user: {
+          findUnique: jest
+            .fn()
+            .mockResolvedValueOnce({ kycStatus: 'APPROVED', membershipRank: MembershipRank.PLATINUM })
+            .mockResolvedValueOnce({ kycStatus: 'APPROVED' }),
+        },
+        referralReward: {
+          findFirst: jest.fn().mockResolvedValue(null),
+          create: jest
+            .fn()
+            .mockResolvedValueOnce({ id: 'reward-referrer', triggeredByOrderId: 'order-1', isCredited: false })
+            .mockResolvedValueOnce({ id: 'reward-referee', triggeredByOrderId: 'order-1', isCredited: false }),
+          update: jest.fn(),
+        },
+        $queryRaw: jest
+          .fn()
+          .mockResolvedValueOnce([{ id: 'wallet-referrer', totalBalance: BigInt(100_000) }])
+          .mockResolvedValueOnce([{ id: 'wallet-referee', totalBalance: BigInt(200_000) }]),
+        wallet: {
+          count: jest.fn().mockResolvedValue(2),
+          update: jest.fn(),
+        },
+        walletTransaction: { create: jest.fn().mockResolvedValue({ id: 'tx-1' }) },
+        referralCode: { updateMany: jest.fn() },
+      };
+
+      await service.createReferralRewardIfEligible('user-1', BigInt(50_000), 'order-1', mockTx as unknown as Prisma.TransactionClient);
+
+      expect(mockTx.referralReward!.create).toHaveBeenCalledTimes(2);
+      for (const call of mockTx.referralReward!.create!.mock.calls) {
+        expect(call[0].data.rewardAmount).toBe(BigInt(1_500_000));
+      }
+      expect(mockTx.walletTransaction!.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ amount: BigInt(1_500_000) }),
+      }));
+      expect(mockTx.referralCode!.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        data: { totalRewardEarned: { increment: BigInt(1_500_000) } },
+      }));
     });
 
     it('should create reward on first call and skip on second call for the same order', async () => {

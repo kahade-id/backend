@@ -252,7 +252,7 @@ export class OrderLinksService {
     const [buyer, seller, acceptingUser] = await Promise.all([
       this.prisma.user.findUnique({ where: { id: buyerId }, select: { kycStatus: true, isKahadePlus: true, isActive: true, isBanned: true } }),
       this.prisma.user.findUnique({ where: { id: sellerId }, select: { kycStatus: true, isActive: true, isBanned: true } }),
-      this.prisma.user.findUnique({ where: { id: userId }, select: { isActive: true, isBanned: true } }),
+      this.prisma.user.findUnique({ where: { id: userId }, select: { isActive: true, isBanned: true, membershipRank: true } }),
     ]);
 
     if (!acceptingUser || !acceptingUser.isActive || acceptingUser.isBanned) {
@@ -290,6 +290,7 @@ export class OrderLinksService {
       orderValue: orderValueIdr,
       feeResponsibility: link.feeResponsibility as 'BUYER' | 'SELLER' | 'SPLIT',
       isKahadePlus: kahadePlusApplied,
+      membershipRank: acceptingUser.membershipRank,
     }, feeConfig);
 
     const orderSerial = await this.getNextOrderSerial();
@@ -371,6 +372,7 @@ export class OrderLinksService {
             buyerPayAmount: feeResult.buyerPayAmount,
             sellerReceiveAmount: feeResult.sellerReceiveAmount,
             voucherDiscount: feeResult.voucherDiscount,
+            membershipRankDiscount: feeResult.membershipRankDiscount,
             feeRate: feeResult.feeRate,
             isKahadePlus: kahadePlusApplied,
             deliveryDeadlineDays: link.deliveryDeadlineDays,

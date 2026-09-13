@@ -1,9 +1,10 @@
-import { Controller, Get, Post, Body, Query, HttpCode, UseGuards } from '@nestjs/common';
-import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
+import { Controller, Get, Post, Body, Query, HttpCode, UseGuards, DefaultValuePipe, ParseIntPipe } from '@nestjs/common';
+import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { ReferralCode, ReferralRelation } from '@prisma/client';
 import { ReferralService } from './referral.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { ClampLimitPipe } from '../../common/pipes/clamp-limit.pipe';
 import { AllowResponseFields } from '../../common/decorators/allow-response-fields.decorator';
 import { ApplyReferralDto } from './dto/apply-referral.dto';
 import { PaginationDto, PaginatedResponse } from '../../common/dto/pagination.dto';
@@ -55,6 +56,16 @@ export class ReferralController {
   @AllowResponseFields('code')
   async regenerateCode(@CurrentUser('sub') userId: string): Promise<ReferralCode> {
     return this.referralService.regenerateCode(userId);
+  }
+
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Get('leaderboard')
+  @ApiOperation({ summary: 'Get Redis-cached referral leaderboard' })
+  @AllowResponseFields('code')
+  async getLeaderboard(
+    @Query('limit', new DefaultValuePipe(50), ParseIntPipe, new ClampLimitPipe(100)) limit: number,
+  ): Promise<Array<Record<string, unknown>>> {
+    return this.referralService.getLeaderboard(limit);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 30 } })

@@ -4,7 +4,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { FeeCalculatorService } from './fee-calculator.service';
-import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, SubscriptionStatus, NotificationType, Prisma, Voucher } from '@prisma/client';
+import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, SubscriptionStatus, NotificationType, Prisma, Voucher, VoucherApplicability, VoucherType, CampaignStatus } from '@prisma/client';
 import { generateOrderId } from '../../common/utils/id-generator.util';
 import { toSen, toIdr } from '../../common/utils/currency.util';
 import { safeBigIntToNumber } from '../../common/utils/bigint.util';
@@ -74,6 +74,91 @@ export class OrdersService {
     });
   }
 
+  private async isDormantVoucherUser(
+    tx: Prisma.TransactionClient | PrismaService,
+    userId: string,
+    totalOrdersCompleted: number,
+  ): Promise<boolean> {
+    if (totalOrdersCompleted <= 0) return false;
+    const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const recentCompleted = await tx.order.count({
+      where: {
+        status: OrderStatus.COMPLETED,
+        deletedAt: null,
+        completedAt: { gte: cutoff },
+        OR: [{ buyerId: userId }, { sellerId: userId }],
+      },
+    });
+    return recentCompleted === 0;
+  }
+
+  private async validateOrderVoucherAudience(
+    tx: Prisma.TransactionClient | PrismaService,
+    voucher: Voucher,
+    user: { totalOrdersCompleted: number },
+    userId: string,
+    role: 'BUYER' | 'SELLER',
+  ): Promise<void> {
+    if (voucher.assignedToUserId && voucher.assignedToUserId !== userId) {
+      throw new BadRequestException({
+        code: ErrorCodes.VOUCHER_NOT_APPLICABLE,
+        message: 'This voucher is assigned to a different user',
+      });
+    }
+    if (voucher.voucherType === VoucherType.TOPUP_BONUS) {
+      throw new BadRequestException({
+        code: ErrorCodes.VOUCHER_NOT_APPLICABLE,
+        message: 'Top-up bonus vouchers can only be used for wallet top-ups',
+      });
+    }
+    if (voucher.campaignId) {
+      const campaign = await tx.campaign.findUnique({
+        where: { id: voucher.campaignId },
+        select: { status: true },
+      });
+      if (!campaign || campaign.status === CampaignStatus.ENDED) {
+        throw new BadRequestException({ code: ErrorCodes.VOUCHER_EXPIRED, message: 'Voucher campaign has ended' });
+      }
+    }
+
+    if (voucher.applicableTo && voucher.applicableTo !== VoucherApplicability.ALL) {
+      const isBuyer = role === 'BUYER';
+      if (voucher.applicableTo === VoucherApplicability.BUYER_ONLY && !isBuyer) {
+        throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is only available for buyers' });
+      }
+      if (voucher.applicableTo === VoucherApplicability.SELLER_ONLY && isBuyer) {
+        throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is only available for sellers' });
+      }
+      if (voucher.applicableTo === VoucherApplicability.NEW_USER && user.totalOrdersCompleted > 0) {
+        throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is only available for new users' });
+      }
+      if (voucher.applicableTo === VoucherApplicability.DORMANT_USER) {
+        const dormant = await this.isDormantVoucherUser(tx, userId, user.totalOrdersCompleted);
+        if (!dormant) {
+          throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is only available for dormant users' });
+        }
+      }
+    }
+  }
+
+  private calculateOrderVoucherBenefitSen(voucher: Voucher, orderValue: number, feeConfig: Parameters<FeeCalculatorService['calculateFee']>[1]): bigint {
+    const orderValueSen = toSen(orderValue);
+    const isCashback = voucher.voucherType === VoucherType.WALLET_CASHBACK;
+    const benefitBaseSen = isCashback
+      ? orderValueSen
+      : this.feeCalculator.getStandardFeeSen(orderValueSen, feeConfig);
+    if (voucher.discountPercent != null) {
+      const percentBps = BigInt(Math.round(Number(voucher.discountPercent) * 100));
+      let amount = (benefitBaseSen * percentBps) / BigInt(10_000);
+      if (voucher.maxDiscountAmount !== null && amount > voucher.maxDiscountAmount) {
+        amount = voucher.maxDiscountAmount;
+      }
+      return amount > benefitBaseSen ? benefitBaseSen : amount;
+    }
+    const amount = voucher.discountAmount ?? BigInt(0);
+    return amount > benefitBaseSen ? benefitBaseSen : amount;
+  }
+
   private runRealtimeBestEffort(task: () => void, context: string): void {
     try {
       task();
@@ -106,6 +191,8 @@ export class OrdersService {
       buyerPayAmount: number;
       sellerReceiveAmount: number;
       voucherDiscount: number;
+      voucherCashback: number;
+      membershipRankDiscount: number;
     };
     confirmationDeadlineAt: Date | null;
   }> {
@@ -134,7 +221,7 @@ export class OrdersService {
 
     const KYC_THRESHOLD_IDR = KYC_THRESHOLD;
 
-    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, isActive: true, isBanned: true, kycStatus: true, isKahadePlus: true, totalOrdersCompleted: true, fullName: true, username: true } });
+    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, isActive: true, isBanned: true, kycStatus: true, isKahadePlus: true, totalOrdersCompleted: true, membershipRank: true, fullName: true, username: true } });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
     if (!user.isActive || user.isBanned) {
       throw new ForbiddenException({ code: ErrorCodes.COUNTERPART_SUSPENDED, message: 'Your account is suspended' });
@@ -214,13 +301,14 @@ export class OrdersService {
 
     let order: Awaited<ReturnType<typeof this.prisma.order.create>> | undefined;
     let feeCalculation: ReturnType<typeof this.feeCalculator.calculateFee> | undefined;
+    let voucherCashbackSen = BigInt(0);
     try {
     for (let attempt = 0; attempt < ORDER_CREATE_MAX_RETRIES; attempt++) {
       const orderId = generateOrderId(await this.getNextOrderSerial());
       try {
         const txResult = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
           const [txUser, txCounterpart] = await Promise.all([
-            tx.user.findUnique({ where: { id: userId }, select: { id: true, isActive: true, isBanned: true, kycStatus: true } }),
+            tx.user.findUnique({ where: { id: userId }, select: { id: true, isActive: true, isBanned: true, kycStatus: true, totalOrdersCompleted: true, membershipRank: true } }),
             tx.user.findUnique({ where: { id: counterpart.id }, select: { id: true, isActive: true, isBanned: true, kycStatus: true } }),
           ]);
           if (!txUser || !txUser.isActive || txUser.isBanned) {
@@ -259,23 +347,21 @@ export class OrdersService {
             if (!voucher.isActive || now < voucher.validFrom || now > voucher.validUntil) {
               throw new BadRequestException({ code: ErrorCodes.VOUCHER_EXPIRED, message: 'Voucher is expired or inactive' });
             }
+            if (voucher.campaignId) {
+              const campaign = await tx.campaign.findUnique({
+                where: { id: voucher.campaignId },
+                select: { status: true },
+              });
+              if (!campaign || campaign.status === CampaignStatus.ENDED) {
+                throw new BadRequestException({ code: ErrorCodes.VOUCHER_EXPIRED, message: 'Voucher campaign has ended' });
+              }
+            }
             {
               if (voucher.maxUsageTotal != null && voucher.currentUsage >= voucher.maxUsageTotal) {
                 throw new BadRequestException({ code: ErrorCodes.VOUCHER_USAGE_LIMIT_REACHED, message: 'Voucher has reached its maximum usage limit' });
               }
 
-              if (voucher.applicableTo && voucher.applicableTo !== 'ALL') {
-                const isBuyer = dto.role === 'BUYER';
-                if (voucher.applicableTo === 'BUYER_ONLY' && !isBuyer) {
-                  throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is only available for buyers' });
-                }
-                if (voucher.applicableTo === 'SELLER_ONLY' && isBuyer) {
-                  throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is only available for sellers' });
-                }
-                if (voucher.applicableTo === 'NEW_USER' && user.totalOrdersCompleted > 0) {
-                  throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is only available for new users' });
-                }
-              }
+              await this.validateOrderVoucherAudience(tx, voucher, txUser, userId, dto.role);
 
               if (voucher.minOrderValue !== null && toSen(dto.orderValue) < voucher.minOrderValue) {
                 throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'Order value does not meet the minimum requirement for this voucher' });
@@ -299,22 +385,14 @@ export class OrdersService {
                 }
               }
 
-              if (voucher.voucherType === 'FEE_DISCOUNT_PERCENT' && voucher.discountPercent != null) {
-                // Voucher % is applied against the CLAMPED standard fee (the
-                // "fee before reductions" contract), not the raw orderValue ×
-                // rate.  Otherwise small orders get under-discounted (their
-                // standard fee is clamped UP to the Rp 5.000 floor) and large
-                // orders get over-discounted (clamped DOWN to the Rp 250.000
-                // ceiling).
-                const orderValueSen = toSen(dto.orderValue);
-                const baseFeeSen = this.feeCalculator.getStandardFeeSen(orderValueSen, feeConfig);
-                const percentBps = BigInt(Math.round(Number(voucher.discountPercent) * 100));
-                voucherDiscountSen = (baseFeeSen * percentBps) / BigInt(10_000);
-                if (voucher.maxDiscountAmount !== null && voucherDiscountSen > voucher.maxDiscountAmount) {
-                  voucherDiscountSen = voucher.maxDiscountAmount;
-                }
+              const voucherBenefitSen = this.calculateOrderVoucherBenefitSen(voucher, dto.orderValue, feeConfig);
+              if (voucher.voucherType === VoucherType.WALLET_CASHBACK) {
+                voucherCashbackSen = voucherBenefitSen;
+                voucherDiscountSen = BigInt(0);
+              } else if (voucher.voucherType === VoucherType.FEE_DISCOUNT_FLAT || voucher.voucherType === VoucherType.FEE_DISCOUNT_PERCENT) {
+                voucherDiscountSen = voucherBenefitSen;
               } else {
-                voucherDiscountSen = BigInt(Number(voucher.discountAmount ?? 0));
+                throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'Unsupported voucher type for order fee' });
               }
               resolvedVoucher = voucher;
             }
@@ -325,6 +403,7 @@ export class OrdersService {
             feeResponsibility: dto.feeResponsibility,
             isKahadePlus: effectiveKahadePlus,
             voucherDiscountSen,
+            membershipRank: txUser.membershipRank,
           }, feeConfig);
 
           const deadlineDays = getConfirmationDeadlineDays(dto.orderType);
@@ -346,6 +425,7 @@ export class OrdersService {
               deliveryDeadlineDays: dto.deliveryDeadlineDays,
               confirmationDeadlineAt,
               voucherDiscount: txFeeCalc.voucherDiscount,
+              membershipRankDiscount: txFeeCalc.membershipRankDiscount,
               voucherId: resolvedVoucher?.id ?? null,
               createdByBuyer: dto.role === 'BUYER',
             },
@@ -357,7 +437,7 @@ export class OrdersService {
                 voucherId: resolvedVoucher.id,
                 userId,
                 orderId: newOrder.id,
-                discountApplied: txFeeCalc.voucherDiscount,
+                discountApplied: resolvedVoucher.voucherType === VoucherType.WALLET_CASHBACK ? voucherCashbackSen : txFeeCalc.voucherDiscount,
               },
             });
 
@@ -377,6 +457,15 @@ export class OrdersService {
                 code: ErrorCodes.VOUCHER_USAGE_LIMIT_REACHED,
                 message: 'Voucher has reached its maximum usage limit',
               });
+            }
+            if (resolvedVoucher.campaignId) {
+              const campaignUpdated = await tx.campaign.updateMany({
+                where: { id: resolvedVoucher.campaignId, status: { not: CampaignStatus.ENDED } },
+                data: { currentRedemptions: { increment: 1 } },
+              });
+              if (campaignUpdated.count === 0) {
+                throw new BadRequestException({ code: ErrorCodes.VOUCHER_EXPIRED, message: 'Voucher campaign has ended' });
+              }
             }
           }
 
@@ -407,10 +496,11 @@ export class OrdersService {
               reason: 'Order created',
             },
           });
-          return { order: newOrder, feeCalc: txFeeCalc };
+          return { order: newOrder, feeCalc: txFeeCalc, voucherCashbackSen };
         }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
         order = txResult.order;
         feeCalculation = txResult.feeCalc;
+        voucherCashbackSen = txResult.voucherCashbackSen;
         break;
       } catch (err: unknown) {
         if (
@@ -475,6 +565,8 @@ export class OrdersService {
         buyerPayAmount: safeBigIntToNumber(feeCalculation.buyerPayAmount / 100n),
         sellerReceiveAmount: safeBigIntToNumber(feeCalculation.sellerReceiveAmount / 100n),
         voucherDiscount: safeBigIntToNumber(feeCalculation.voucherDiscount / 100n),
+        voucherCashback: safeBigIntToNumber(voucherCashbackSen / 100n),
+        membershipRankDiscount: safeBigIntToNumber((feeCalculation.membershipRankDiscount ?? BigInt(0)) / 100n),
       },
       confirmationDeadlineAt: order.confirmationDeadlineAt,
     };
@@ -698,6 +790,8 @@ export class OrdersService {
     buyerPayAmount: number;
     sellerReceiveAmount: number;
     voucherDiscount: number;
+    voucherCashback: number;
+    membershipRankDiscount: number;
     isKahadePlusApplied: boolean;
   }> {
     if (!Number.isSafeInteger(dto.orderValue) || dto.orderValue < this.configuredMinOrderValue || dto.orderValue > this.configuredMaxOrderValue) {
@@ -710,6 +804,7 @@ export class OrdersService {
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
 
     let voucherDiscountSen = BigInt(0);
+    let voucherCashbackSen = BigInt(0);
     const feeConfig = await this.feeCalculator.getFeeConfig();
 
     let effectiveKahadePlusEst = user.isKahadePlus;
@@ -761,36 +856,18 @@ export class OrdersService {
           throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'Order value does not meet the minimum requirement for this voucher' });
         }
 
-        if (voucher.applicableTo && voucher.applicableTo !== 'ALL') {
-          if (voucher.applicableTo === 'NEW_USER' && user.totalOrdersCompleted > 0) {
-            throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is only available for new users' });
-          }
-          if (voucher.applicableTo === 'BUYER_ONLY' || voucher.applicableTo === 'SELLER_ONLY') {
-            if (!dto.role) {
-              throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: `This voucher is only for ${voucher.applicableTo === 'BUYER_ONLY' ? 'buyers' : 'sellers'}. Please specify your role.` });
-            }
-            const isBuyer = dto.role === 'BUYER';
-            if (voucher.applicableTo === 'BUYER_ONLY' && !isBuyer) {
-              throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is only available for buyers' });
-            }
-            if (voucher.applicableTo === 'SELLER_ONLY' && isBuyer) {
-              throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is only available for sellers' });
-            }
-          }
+        if (!dto.role && (voucher.applicableTo === VoucherApplicability.BUYER_ONLY || voucher.applicableTo === VoucherApplicability.SELLER_ONLY)) {
+          throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: `This voucher is only for ${voucher.applicableTo === VoucherApplicability.BUYER_ONLY ? 'buyers' : 'sellers'}. Please specify your role.` });
         }
+        await this.validateOrderVoucherAudience(this.prisma, voucher, user, userId, dto.role ?? 'BUYER');
 
-        if (voucher.voucherType === 'FEE_DISCOUNT_PERCENT' && voucher.discountPercent != null) {
-          // See note in createOrder: voucher % is applied against the clamped
-          // standard fee, not raw orderValue × rate.
-          const orderValueSen = toSen(dto.orderValue);
-          const baseFeeSen = this.feeCalculator.getStandardFeeSen(orderValueSen, feeConfig);
-          const percentBps = BigInt(Math.round(Number(voucher.discountPercent) * 100));
-          voucherDiscountSen = (baseFeeSen * percentBps) / BigInt(10_000);
-          if (voucher.maxDiscountAmount !== null && voucherDiscountSen > voucher.maxDiscountAmount) {
-            voucherDiscountSen = voucher.maxDiscountAmount;
-          }
+        if (voucher.voucherType === VoucherType.WALLET_CASHBACK) {
+          voucherCashbackSen = this.calculateOrderVoucherBenefitSen(voucher, dto.orderValue, feeConfig);
+          voucherDiscountSen = BigInt(0);
+        } else if (voucher.voucherType === VoucherType.FEE_DISCOUNT_FLAT || voucher.voucherType === VoucherType.FEE_DISCOUNT_PERCENT) {
+          voucherDiscountSen = this.calculateOrderVoucherBenefitSen(voucher, dto.orderValue, feeConfig);
         } else {
-          voucherDiscountSen = BigInt(Number(voucher.discountAmount ?? 0));
+          throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'Unsupported voucher type for order fee' });
         }
       }
     }
@@ -800,6 +877,7 @@ export class OrdersService {
       feeResponsibility: dto.feeResponsibility,
       isKahadePlus: effectiveKahadePlusEst,
       voucherDiscountSen,
+      membershipRank: user.membershipRank,
     }, feeConfig);
 
     // BigInt-first division preserves precision; cast only at the end.
@@ -811,6 +889,8 @@ export class OrdersService {
       buyerPayAmount: safeBigIntToNumber(feeCalculation.buyerPayAmount / 100n),
       sellerReceiveAmount: safeBigIntToNumber(feeCalculation.sellerReceiveAmount / 100n),
       voucherDiscount: safeBigIntToNumber(feeCalculation.voucherDiscount / 100n),
+      voucherCashback: safeBigIntToNumber(voucherCashbackSen / 100n),
+      membershipRankDiscount: safeBigIntToNumber((feeCalculation.membershipRankDiscount ?? BigInt(0)) / 100n),
       isKahadePlusApplied: effectiveKahadePlusEst,
     };
   }

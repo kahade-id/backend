@@ -16,6 +16,10 @@ import {
   WalletTransactionStatus,
   UserAuditAction,
   Prisma,
+  Campaign,
+  CampaignStatus,
+  CampaignType,
+  MembershipRank,
 } from '@prisma/client';
 import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
@@ -32,6 +36,8 @@ import {
 } from '../../common/constants/app.constants';
 
 const SUBSCRIPTION_PLANS_TTL = 300;
+
+const RANK_ORDER: MembershipRank[] = [MembershipRank.BRONZE, MembershipRank.SILVER, MembershipRank.GOLD, MembershipRank.PLATINUM, MembershipRank.DIAMOND];
 
 const PLAN_METADATA: Record<SubscriptionPlan, { durationDays: number; label: string }> = {
   MONTHLY: { durationDays: 30, label: 'Kahade Plus Monthly' },
@@ -81,6 +87,84 @@ export class SubscriptionsService {
     return user?.kahadePlusSince ? {} : { kahadePlusSince: since };
   }
 
+  private getTrialDays(): number {
+    return Math.min(30, Math.max(1, Math.trunc(this.configService.get<number>('app.subscriptionTrialDays') ?? 7)));
+  }
+
+  private async isDormantUser(userId: string, totalOrdersCompleted: number, days: number): Promise<boolean> {
+    if (totalOrdersCompleted <= 0) return false;
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const recentCompleted = await this.prisma.order.count({
+      where: {
+        status: 'COMPLETED',
+        deletedAt: null,
+        completedAt: { gte: cutoff },
+        OR: [{ buyerId: userId }, { sellerId: userId }],
+      },
+    });
+    return recentCompleted === 0;
+  }
+
+  private isRankEligible(current: MembershipRank, minimum?: MembershipRank | null): boolean {
+    if (!minimum) return true;
+    return RANK_ORDER.indexOf(current) >= RANK_ORDER.indexOf(minimum);
+  }
+
+  private async resolveSubscriptionCampaign(
+    userId: string,
+    promoCode: string | undefined,
+    priceSen: bigint,
+  ): Promise<{ campaign: Campaign | null; discountSen: bigint }> {
+    const normalized = promoCode?.trim().toUpperCase();
+    if (!normalized) return { campaign: null, discountSen: BigInt(0) };
+    if (!/^[A-Z0-9_-]{3,32}$/.test(normalized)) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Promo code is invalid' });
+    }
+
+    const now = new Date();
+    const campaign = await this.prisma.campaign.findFirst({
+      where: {
+        promoCode: normalized,
+        type: CampaignType.SUBSCRIPTION_DISCOUNT,
+        status: CampaignStatus.ACTIVE,
+        startsAt: { lte: now },
+        endsAt: { gt: now },
+      },
+    });
+    if (!campaign) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Subscription promo code is not active' });
+    }
+    if (campaign.maxRedemptions !== null && campaign.currentRedemptions >= campaign.maxRedemptions) {
+      throw new BadRequestException({ code: ErrorCodes.VOUCHER_USAGE_LIMIT_REACHED, message: 'Promo code has reached its maximum redemptions' });
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { membershipRank: true, totalOrdersCompleted: true },
+    });
+    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    if (!this.isRankEligible(user.membershipRank, campaign.targetMinRank)) {
+      throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'Promo code is not available for your membership rank' });
+    }
+    if (campaign.targetNewUserOnly && user.totalOrdersCompleted > 0) {
+      throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'Promo code is only available for new users' });
+    }
+    if (campaign.targetDormantDays !== null && !(await this.isDormantUser(userId, user.totalOrdersCompleted, campaign.targetDormantDays))) {
+      throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'Promo code is only available for dormant users' });
+    }
+
+    let discountSen = BigInt(0);
+    if (campaign.discountValue !== null) {
+      discountSen = campaign.discountValue;
+    } else if (campaign.discountPercent !== null) {
+      const percentBps = BigInt(Math.round(Number(campaign.discountPercent) * 100));
+      discountSen = (priceSen * percentBps) / BigInt(10_000);
+      if (campaign.maxDiscount !== null && discountSen > campaign.maxDiscount) discountSen = campaign.maxDiscount;
+    }
+    if (discountSen > priceSen) discountSen = priceSen;
+    return { campaign, discountSen };
+  }
+
   async getStatus(userId: string): Promise<Record<string, unknown>> {
     const subscription = await this.prisma.subscription.findFirst({
       where: {
@@ -90,6 +174,7 @@ export class SubscriptionsService {
             SubscriptionStatus.ACTIVE,
             SubscriptionStatus.CANCELLED,
             SubscriptionStatus.SUSPENDED,
+            SubscriptionStatus.PAUSED,
           ],
         },
         currentPeriodEnd: { gt: new Date() },
@@ -115,15 +200,20 @@ export class SubscriptionsService {
         ? subscription.feeSavingsLimit - subscription.feeSavingsUsed
         : BigInt(0);
     const isInGracePeriod = subscription.status === SubscriptionStatus.SUSPENDED;
+    const isPaused = subscription.status === SubscriptionStatus.PAUSED;
 
     return {
-      isActive: !isInGracePeriod,
+      isActive: !isInGracePeriod && !isPaused,
       isInGracePeriod,
+      isPaused,
       plan: subscription.plan,
       status: subscription.status,
       cancelledAt: subscription.cancelledAt,
       currentPeriodStart: subscription.currentPeriodStart,
       currentPeriodEnd: subscription.currentPeriodEnd,
+      trialEndsAt: subscription.trialEndsAt,
+      pausedAt: subscription.pausedAt,
+      resumeAt: subscription.resumeAt,
       feeSavingsUsed: toIdr(subscription.feeSavingsUsed),
       feeSavingsLimit: toIdr(subscription.feeSavingsLimit),
       feeSavingsRemaining: toIdr(feeSavingsRemaining),
@@ -137,11 +227,10 @@ export class SubscriptionsService {
   async subscribe(
     userId: string,
     plan: SubscriptionPlan,
-    pin: string,
+    pin?: string,
     ip?: string,
+    options: { promoCode?: string; useTrial?: boolean } = {},
   ): Promise<Subscription> {
-    await this.walletService.verifyPin(userId, pin, ip);
-
     const planInfo = this.planPricing[plan];
     if (!planInfo) {
       throw new BadRequestException({
@@ -149,14 +238,58 @@ export class SubscriptionsService {
         message: 'Invalid subscription plan',
       });
     }
-    const walletTxSerial = await this.walletTxSerialService.getNext();
+
+    const wantsTrial = options.useTrial === true;
+    if (wantsTrial) {
+      const priorTrial = await this.prisma.subscription.findFirst({
+        where: { userId, trialEndsAt: { not: null } },
+        select: { id: true },
+      });
+      if (priorTrial) {
+        throw new ConflictException({
+          code: ErrorCodes.SUBSCRIPTION_ALREADY_ACTIVE,
+          message: 'Free trial has already been used for this account',
+        });
+      }
+    }
+
+    const campaignDiscount = wantsTrial
+      ? { campaign: null, discountSen: BigInt(0) }
+      : await this.resolveSubscriptionCampaign(userId, options.promoCode, planInfo.price);
+    const effectivePrice = wantsTrial
+      ? BigInt(0)
+      : planInfo.price - campaignDiscount.discountSen;
+    if (effectivePrice < BigInt(0)) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid subscription price after discount' });
+    }
+    if (effectivePrice > BigInt(0)) {
+      if (!pin) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Wallet PIN is required for paid subscriptions' });
+      }
+      await this.walletService.verifyPin(userId, pin, ip);
+    }
+
+    const walletTxSerial = effectivePrice > BigInt(0) ? await this.walletTxSerialService.getNext() : null;
 
     const now = new Date();
     const periodEnd = new Date(now);
-    periodEnd.setDate(periodEnd.getDate() + planInfo.durationDays);
+    periodEnd.setDate(periodEnd.getDate() + (wantsTrial ? this.getTrialDays() : planInfo.durationDays));
 
     const subscription = await this.prisma.$transaction(
       async (tx: Prisma.TransactionClient) => {
+        if (wantsTrial) {
+          const priorTrialInsideTx = await tx.subscription.findFirst({
+            where: { userId, trialEndsAt: { not: null } },
+            select: { id: true },
+          });
+          if (priorTrialInsideTx) {
+            throw new ConflictException({
+              code: ErrorCodes.SUBSCRIPTION_ALREADY_ACTIVE,
+              message: 'Free trial has already been used for this account',
+            });
+          }
+        }
+
         const existingPending = await tx.subscription.findFirst({
           where: { userId, status: SubscriptionStatus.PENDING },
           select: { id: true },
@@ -176,6 +309,7 @@ export class SubscriptionsService {
                 SubscriptionStatus.ACTIVE,
                 SubscriptionStatus.CANCELLED,
                 SubscriptionStatus.SUSPENDED,
+                SubscriptionStatus.PAUSED,
               ],
             },
             currentPeriodEnd: { gt: new Date() },
@@ -188,67 +322,92 @@ export class SubscriptionsService {
           });
         }
 
-        const walletRows = await tx.$queryRaw<
-          Array<{
-            id: string;
-            userId: string;
-            totalBalance: bigint;
-            availableBalance: bigint;
-            version: number;
-          }>
-        >`
-        SELECT id, "userId", "totalBalance", "availableBalance", version FROM wallets WHERE "userId" = ${userId} FOR UPDATE`;
-        const wallet = walletRows[0];
-        if (!wallet) {
-          throw new BadRequestException({
-            code: ErrorCodes.INSUFFICIENT_BALANCE,
-            message: 'Wallet not found',
+        let walletId: string | null = null;
+        let balanceBefore = BigInt(0);
+        let balanceAfter = BigInt(0);
+        if (effectivePrice > BigInt(0)) {
+          const walletRows = await tx.$queryRaw<
+            Array<{
+              id: string;
+              userId: string;
+              totalBalance: bigint;
+              availableBalance: bigint;
+              version: number;
+            }>
+          >`
+          SELECT id, "userId", "totalBalance", "availableBalance", version FROM wallets WHERE "userId" = ${userId} FOR UPDATE`;
+          const wallet = walletRows[0];
+          if (!wallet) {
+            throw new BadRequestException({
+              code: ErrorCodes.INSUFFICIENT_BALANCE,
+              message: 'Wallet not found',
+            });
+          }
+
+          if (wallet.availableBalance < effectivePrice) {
+            throw new BadRequestException({
+              code: ErrorCodes.INSUFFICIENT_BALANCE,
+              message: 'Insufficient wallet balance for subscription',
+            });
+          }
+
+          const updated = await tx.wallet.updateMany({
+            where: {
+              id: wallet.id,
+              version: wallet.version,
+              availableBalance: { gte: effectivePrice },
+            },
+            data: {
+              availableBalance: { decrement: effectivePrice },
+              totalBalance: { decrement: effectivePrice },
+              version: { increment: 1 },
+            },
           });
+
+          if (updated.count === 0) {
+            throw new BadRequestException({
+              code: ErrorCodes.INSUFFICIENT_BALANCE,
+              message: 'Concurrent wallet update — please retry',
+            });
+          }
+
+          walletId = wallet.id;
+          balanceBefore = wallet.totalBalance;
+          balanceAfter = wallet.totalBalance - effectivePrice;
         }
 
-        if (wallet.availableBalance < planInfo.price) {
-          throw new BadRequestException({
-            code: ErrorCodes.INSUFFICIENT_BALANCE,
-            message: 'Insufficient wallet balance for subscription',
+        if (campaignDiscount.campaign) {
+          const campaignUpdated = await tx.campaign.updateMany({
+            where: {
+              id: campaignDiscount.campaign.id,
+              status: CampaignStatus.ACTIVE,
+              OR: [
+                { maxRedemptions: null },
+                { currentRedemptions: { lt: campaignDiscount.campaign.maxRedemptions as number } },
+              ],
+            },
+            data: { currentRedemptions: { increment: 1 } },
           });
+          if (campaignUpdated.count === 0) {
+            throw new BadRequestException({ code: ErrorCodes.VOUCHER_USAGE_LIMIT_REACHED, message: 'Promo code has reached its maximum redemptions' });
+          }
         }
 
-        const updated = await tx.wallet.updateMany({
-          where: {
-            id: wallet.id,
-            version: wallet.version,
-            availableBalance: { gte: planInfo.price },
-          },
-          data: {
-            availableBalance: { decrement: planInfo.price },
-            totalBalance: { decrement: planInfo.price },
-            version: { increment: 1 },
-          },
-        });
-
-        if (updated.count === 0) {
-          throw new BadRequestException({
-            code: ErrorCodes.INSUFFICIENT_BALANCE,
-            message: 'Concurrent wallet update — please retry',
+        if (walletId && walletTxSerial !== null) {
+          const walletTxId = generateWalletTxId(walletTxSerial);
+          await tx.walletTransaction.create({
+            data: {
+              txId: walletTxId,
+              walletId,
+              type: WalletTransactionType.SUBSCRIPTION_PAYMENT,
+              status: WalletTransactionStatus.SUCCESS,
+              amount: effectivePrice,
+              balanceBefore,
+              balanceAfter,
+              description: `${planInfo.label} subscription payment${campaignDiscount.discountSen > BigInt(0) ? ` (discount Rp ${toIdr(campaignDiscount.discountSen).toLocaleString('id-ID')})` : ''}`,
+            },
           });
         }
-
-        const balanceBefore = wallet.totalBalance;
-        const balanceAfter = wallet.totalBalance - planInfo.price;
-
-        const walletTxId = generateWalletTxId(walletTxSerial);
-        await tx.walletTransaction.create({
-          data: {
-            txId: walletTxId,
-            walletId: wallet.id,
-            type: WalletTransactionType.SUBSCRIPTION_PAYMENT,
-            status: WalletTransactionStatus.SUCCESS,
-            amount: planInfo.price,
-            balanceBefore,
-            balanceAfter,
-            description: `${planInfo.label} subscription payment`,
-          },
-        });
 
         const feeSavingsLimitIdr = this.configService.get<number>('app.feeSavingsLimit') ?? 5000000;
         const feeSavingsLimitSen = toSen(feeSavingsLimitIdr);
@@ -258,11 +417,13 @@ export class SubscriptionsService {
             userId,
             plan,
             status: SubscriptionStatus.ACTIVE,
-            price: planInfo.price,
+            price: effectivePrice,
+            originalPrice: campaignDiscount.discountSen > BigInt(0) || wantsTrial ? planInfo.price : null,
+            trialEndsAt: wantsTrial ? periodEnd : null,
             currentPeriodStart: now,
             currentPeriodEnd: periodEnd,
             isAutoRenew: false,
-            lastPaymentAt: now,
+            lastPaymentAt: effectivePrice > BigInt(0) ? now : null,
             nextPaymentAt: periodEnd,
             feeSavingsLimit: feeSavingsLimitSen,
           },
@@ -296,14 +457,14 @@ export class SubscriptionsService {
     // supaya badge langsung muncul tanpa menunggu TTL.
     await this.verificationBadgeService.invalidate(userId);
 
-    this.logger.log(`User ${userId} subscribed to ${plan}, charged ${planInfo.price} sen`);
+    this.logger.log(`User ${userId} subscribed to ${plan}, charged ${effectivePrice} sen`);
 
     this.auditLogService.logUserAction({
       userId,
       action: UserAuditAction.SUBSCRIPTION_STARTED,
       entityType: 'Subscription',
       entityId: subscription.id,
-      description: `Subscribed to ${plan} plan`,
+      description: `Subscribed to ${plan} plan${wantsTrial ? ' using free trial' : ''}`,
     });
 
     return subscription;
@@ -369,6 +530,95 @@ export class SubscriptionsService {
     return updated;
   }
 
+  async pause(userId: string, resumeAt?: Date): Promise<Subscription> {
+    if (resumeAt !== undefined && (!Number.isFinite(resumeAt.getTime()) || resumeAt <= new Date())) {
+      throw new BadRequestException({ code: ErrorCodes.INVALID_DATE_RANGE, message: 'resumeAt must be a future date' });
+    }
+    const subscription = await this.prisma.subscription.findFirst({
+      where: { userId, status: SubscriptionStatus.ACTIVE, currentPeriodEnd: { gt: new Date() } },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    });
+    if (!subscription) {
+      throw new NotFoundException({ code: ErrorCodes.NO_ACTIVE_SUBSCRIPTION, message: 'No active subscription found' });
+    }
+
+    const now = new Date();
+    const updated = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const result = await tx.subscription.updateMany({
+        where: { id: subscription.id, status: SubscriptionStatus.ACTIVE, currentPeriodEnd: { gt: now } },
+        data: {
+          status: SubscriptionStatus.PAUSED,
+          pausedAt: now,
+          resumeAt: resumeAt ?? null,
+          isAutoRenew: false,
+        },
+      });
+      if (result.count === 0) {
+        throw new ConflictException({ code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT, message: 'Subscription changed concurrently — please retry' });
+      }
+      await tx.user.update({
+        where: { id: userId },
+        data: { isKahadePlus: false },
+      });
+      return tx.subscription.findUniqueOrThrow({ where: { id: subscription.id } });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+
+    await this.redis.del(`subscription_status:${userId}`).catch(() => undefined);
+    await this.verificationBadgeService.invalidate(userId);
+    this.auditLogService.logUserAction({
+      userId,
+      action: UserAuditAction.SUBSCRIPTION_CANCELLED,
+      entityType: 'Subscription',
+      entityId: updated.id,
+      description: `Paused ${updated.plan} subscription`,
+    });
+    return updated;
+  }
+
+  async resume(userId: string): Promise<Subscription> {
+    const subscription = await this.prisma.subscription.findFirst({
+      where: { userId, status: SubscriptionStatus.PAUSED, currentPeriodEnd: { gt: new Date() } },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    });
+    if (!subscription) {
+      throw new NotFoundException({ code: ErrorCodes.NO_ACTIVE_SUBSCRIPTION, message: 'No paused subscription found' });
+    }
+    return this.resumeSubscriptionById(subscription.id);
+  }
+
+  async resumeSubscriptionById(subscriptionId: string): Promise<Subscription> {
+    const now = new Date();
+    const updated = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const subscription = await tx.subscription.findUnique({ where: { id: subscriptionId } });
+      if (!subscription || subscription.status !== SubscriptionStatus.PAUSED || !subscription.currentPeriodEnd || subscription.currentPeriodEnd <= now) {
+        throw new NotFoundException({ code: ErrorCodes.NO_ACTIVE_SUBSCRIPTION, message: 'No resumable subscription found' });
+      }
+      const result = await tx.subscription.updateMany({
+        where: { id: subscription.id, status: SubscriptionStatus.PAUSED, currentPeriodEnd: { gt: now } },
+        data: { status: SubscriptionStatus.ACTIVE, pausedAt: null, resumeAt: null },
+      });
+      if (result.count === 0) {
+        throw new ConflictException({ code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT, message: 'Subscription changed concurrently — please retry' });
+      }
+      await tx.user.update({
+        where: { id: subscription.userId },
+        data: { isKahadePlus: true, subscriptionExpiresAt: subscription.currentPeriodEnd },
+      });
+      return tx.subscription.findUniqueOrThrow({ where: { id: subscription.id } });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+
+    await this.redis.del(`subscription_status:${updated.userId}`).catch(() => undefined);
+    await this.verificationBadgeService.invalidate(updated.userId);
+    this.auditLogService.logUserAction({
+      userId: updated.userId,
+      action: UserAuditAction.SUBSCRIPTION_STARTED,
+      entityType: 'Subscription',
+      entityId: updated.id,
+      description: `Resumed ${updated.plan} subscription`,
+    });
+    return updated;
+  }
+
   async getHistory(
     userId: string,
     page: number,
@@ -393,6 +643,10 @@ export class SubscriptionsService {
       plan: sub.plan,
       status: sub.status,
       price: toIdr(sub.price),
+      originalPrice: sub.originalPrice != null ? toIdr(sub.originalPrice) : null,
+      trialEndsAt: sub.trialEndsAt,
+      pausedAt: sub.pausedAt,
+      resumeAt: sub.resumeAt,
       currentPeriodStart: sub.currentPeriodStart,
       currentPeriodEnd: sub.currentPeriodEnd,
       isAutoRenew: sub.isAutoRenew,

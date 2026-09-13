@@ -88,6 +88,7 @@ const mockPrisma = {
   },
   voucherUsage: {
     deleteMany: jest.fn(),
+    findFirst: jest.fn(),
   },
   voucher: {
     updateMany: jest.fn(),
@@ -194,6 +195,7 @@ describe('OrderStateService', () => {
     mockPrisma.walletTransaction.findFirst.mockResolvedValue({ amount: BigInt(10_150_000) });
     mockPrisma.paymentTransaction.findFirst.mockResolvedValue(null);
     mockPrisma.voucherUsage.deleteMany.mockResolvedValue({ count: 1 });
+    mockPrisma.voucherUsage.findFirst.mockResolvedValue(null);
     mockPrisma.voucher.updateMany.mockResolvedValue({ count: 1 });
     mockPrisma.user.update.mockResolvedValue({});
     mockPrisma.$queryRaw.mockResolvedValue([]);

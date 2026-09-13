@@ -1,4 +1,4 @@
-import { IsNumber, IsInt, Min, Max, IsEnum, IsOptional, IsString, Length, Matches } from 'class-validator';
+import { IsNumber, IsInt, Min, Max, IsEnum, IsOptional, IsString, Length, Matches, MaxLength } from 'class-validator';
 import { Transform } from 'class-transformer';
 import { PaymentMethod } from '@prisma/client';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
@@ -35,6 +35,13 @@ export class TopupDto {
   @IsOptional()
   @IsString()
   cardToken?: string;
+
+  @ApiPropertyOptional({ description: 'TOPUP_BONUS voucher code to apply once the payment settles' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(50)
+  @Matches(/^[A-Z0-9_-]+$/i, { message: 'voucherCode may contain only A-Z, 0-9, underscore, or hyphen' })
+  voucherCode?: string;
 
   // Mobile sends this and has always collected it before /wallet/topup, but the
   // backend service never verified it (top-up already requires payment-gateway auth:

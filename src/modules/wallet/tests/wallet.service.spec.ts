@@ -17,7 +17,7 @@ import { MidtransService } from '../../payment/midtrans.service';
 import { OtpService } from '../../auth/otp.service';
 import { RealtimeService } from '../../realtime/realtime.service';
 import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
-import { PaymentMethod } from '@prisma/client';
+import { PaymentMethod, VoucherType } from '@prisma/client';
 import { bcryptHash, encryptAES, initializeCrypto } from '../../../common/utils/crypto.util';
 
 const mockWallet = {
@@ -59,6 +59,19 @@ const mockPrisma = {
   paymentTransaction: {
     create: jest.fn(),
     findFirst: jest.fn(),
+    findUnique: jest.fn(),
+    updateMany: jest.fn(),
+    update: jest.fn(),
+  },
+  voucherUsage: {
+    create: jest.fn(),
+    findFirst: jest.fn(),
+    delete: jest.fn(),
+  },
+  voucher: {
+    updateMany: jest.fn(),
+  },
+  campaign: {
     findUnique: jest.fn(),
     updateMany: jest.fn(),
   },
@@ -180,6 +193,11 @@ describe('WalletService', () => {
     mockRedis.expire.mockResolvedValue(1);
     mockRedis.setNx.mockResolvedValue(true);
     mockRedis.releaseLock.mockResolvedValue(true);
+    mockPrisma.voucherUsage.findFirst.mockResolvedValue(null);
+    mockPrisma.voucherUsage.create.mockResolvedValue({ id: 'voucher-usage-1' });
+    mockPrisma.voucher.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.campaign.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    mockPrisma.campaign.updateMany.mockResolvedValue({ count: 1 });
   });
 
   it('should be defined', () => {
@@ -229,6 +247,66 @@ describe('WalletService', () => {
     });
   });
 
+  describe('top-up settlement with bonus vouchers', () => {
+    it('credits paid amount plus TOPUP_BONUS and writes a separate bonus ledger row', async () => {
+      const paymentTx = {
+        id: 'payment-1',
+        userId: 'user-1',
+        status: 'PENDING',
+        amount: BigInt(1_000_000),
+        grossAmount: BigInt(1_007_000),
+        createdAt: new Date(),
+      };
+      const wallet = { ...mockWallet, availableBalance: BigInt(0), totalBalance: BigInt(0), version: 1 };
+      const tx = {
+        $queryRaw: jest.fn().mockResolvedValue([{ id: 'wallet-1' }]),
+        paymentTransaction: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        voucherUsage: {
+          findFirst: jest.fn().mockResolvedValue({
+            id: 'usage-1',
+            discountApplied: BigInt(100_000),
+            voucher: { code: 'TOPUP10' },
+          }),
+        },
+        wallet: {
+          findUnique: jest
+            .fn()
+            .mockResolvedValueOnce(wallet)
+            .mockResolvedValueOnce({ availableBalance: BigInt(1_100_000), totalBalance: BigInt(1_100_000) }),
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
+        walletTransaction: {
+          findFirst: jest.fn().mockResolvedValue({ id: 'pending-topup-ledger' }),
+          update: jest.fn().mockResolvedValue({}),
+          create: jest.fn().mockResolvedValue({ id: 'bonus-ledger' }),
+        },
+      };
+      mockPrisma.paymentTransaction.findUnique.mockResolvedValue(paymentTx);
+      mockPrisma.notification.create.mockResolvedValue({ id: 'notification-1' });
+      mockPrisma.$transaction.mockImplementationOnce(
+        async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx),
+      );
+      mockPrisma.wallet.findUnique.mockResolvedValue({ todayTopupAmount: paymentTx.amount });
+      mockPrisma.walletTransaction.aggregate.mockResolvedValue({ _sum: { amount: paymentTx.amount } });
+
+      await service.handleTopupSuccess('PAY-001', '10070.00');
+
+      expect(tx.wallet.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          availableBalance: { increment: BigInt(1_100_000) },
+          totalBalance: { increment: BigInt(1_100_000) },
+        }),
+      }));
+      expect(tx.walletTransaction.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          type: 'TOPUP_BONUS',
+          amount: BigInt(100_000),
+          description: expect.stringContaining('TOPUP10'),
+        }),
+      }));
+    });
+  });
+
   describe('post-settlement top-up reversal', () => {
     it('ignores a stale non-reversal event after the top-up already settled', async () => {
       mockPrisma.paymentTransaction.findUnique.mockResolvedValue({
@@ -257,6 +335,9 @@ describe('WalletService', () => {
       const tx = {
         paymentTransaction: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
         walletTransaction: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        voucherUsage: { findFirst: jest.fn().mockResolvedValue(null), delete: jest.fn() },
+        voucher: { updateMany: jest.fn() },
+        campaign: { findUnique: jest.fn().mockResolvedValue({ status: 'ACTIVE' }), updateMany: jest.fn() },
         wallet: {
           findUnique: jest
             .fn()
@@ -548,6 +629,63 @@ describe('WalletService', () => {
       });
       expect(failSpy).toHaveBeenCalledWith(expect.any(String), 'DENY');
       expect(mockAuditLog.logUserAction).not.toHaveBeenCalled();
+    });
+
+    it('reserves a TOPUP_BONUS voucher during initiation and exposes the pending bonus amount', async () => {
+      const now = new Date();
+      mockPrisma.wallet.findUnique.mockResolvedValue({ ...mockWallet, id: 'wallet-1' });
+      mockPrisma.wallet.updateMany.mockResolvedValue({ count: 1 });
+      mockPrisma.paymentTransaction.create.mockResolvedValue({
+        id: 'payment-1',
+        midtransOrderId: 'PAY-001',
+      });
+      mockPrisma.walletTransaction.create.mockResolvedValue({ id: 'wallet-tx-1' });
+      mockPrisma.user.findUnique.mockResolvedValue({ email: 'user@example.com', fullName: 'User' });
+      mockPrisma.$queryRaw
+        .mockResolvedValueOnce([{ id: 'wallet-1' }])
+        .mockResolvedValueOnce([{
+          id: 'voucher-1',
+          code: 'TOPUP10',
+          voucherType: VoucherType.TOPUP_BONUS,
+          discountAmount: BigInt(100_000),
+          discountPercent: null,
+          maxDiscountAmount: null,
+          maxUsageTotal: 10,
+          maxUsagePerUser: 1,
+          currentUsage: 0,
+          validFrom: new Date(now.getTime() - 1_000),
+          validUntil: new Date(now.getTime() + 86_400_000),
+          isActive: true,
+          minOrderValue: null,
+          assignedToUserId: 'user-1',
+          campaignId: 'campaign-1',
+        }])
+        .mockResolvedValueOnce([]);
+      mockPrisma.$transaction.mockImplementation(
+        async (callback: (tx: typeof mockPrisma) => Promise<unknown>) => callback(mockPrisma),
+      );
+      mockMidtrans.chargeTransaction.mockResolvedValue({
+        statusCode: '201',
+        transactionId: 'midtrans-pending-1',
+        orderId: 'PAY-001',
+        paymentType: 'bank_transfer',
+        transactionStatus: 'pending',
+        grossAmount: '10070.00',
+      });
+
+      await expect(service.topup('user-1', 10_000, PaymentMethod.QRIS, undefined, 'topup10')).resolves.toMatchObject({
+        topupBonus: 1_000,
+      });
+      expect(mockPrisma.voucherUsage.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ paymentTxId: 'payment-1', discountApplied: BigInt(100_000) }),
+      }));
+      expect(mockPrisma.voucher.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        data: { currentUsage: { increment: 1 } },
+      }));
+      expect(mockPrisma.campaign.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: 'campaign-1' }),
+        data: { currentRedemptions: { increment: 1 } },
+      }));
     });
 
     it('returns the successful top-up instruction when Redis lock release fails after persistence', async () => {

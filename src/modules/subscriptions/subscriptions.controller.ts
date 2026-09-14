@@ -100,4 +100,17 @@ export class SubscriptionsController {
   async getPlans(): Promise<Array<{ plan: string; label: string; price: number; durationDays: number; feeSavingsLimit: number }>> {
     return this.subscriptionsService.getPlans();
   }
+
+  @Post('upgrade')
+  @ApiOperation({ summary: 'Upgrade subscription with proration (11.1)' })
+  @UseGuards(KycRequiredGuard, UserThrottleGuard)
+  @Idempotency()
+  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  async upgrade(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: { newPlan: any; pin: string },
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.subscriptionsService.upgradeSubscription(userId, dto.newPlan, dto.pin, req.ip);
+  }
 }

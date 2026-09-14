@@ -14,7 +14,7 @@ import { DISPUTE_SLA_HOURS, POST_COMPLETION_DISPUTE_WINDOW_HOURS } from '../../c
 import { SubmitEvidenceDto } from './dto/submit-evidence.dto';
 import { SubmitClaimDto } from './dto/submit-claim.dto';
 
-const DISPUTE_EVIDENCE_ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+const DISPUTE_EVIDENCE_ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm'];
 
 /*
  * C-07: drop failed signatures from `fileUrls` and `fileTypes` in lockstep.
@@ -926,5 +926,54 @@ export class DisputesService {
 
       return newDispute;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+  }
+
+  async escalateDispute(disputeId: string, userId: string, reason?: string): Promise<Record<string, unknown>> {
+    const dispute = await this.prisma.dispute.findFirst({
+      where: { OR: [{ id: disputeId }, { disputeId }] },
+      include: { order: { select: { buyerId: true, sellerId: true } } },
+    });
+    if (!dispute) throw new NotFoundException({ code: ErrorCodes.DISPUTE_NOT_FOUND, message: 'Dispute not found' });
+    if (dispute.order.buyerId !== userId && dispute.order.sellerId !== userId) {
+      throw new ForbiddenException({ code: ErrorCodes.NOT_DISPUTE_PARTICIPANT, message: 'Not a participant' });
+    }
+    if (dispute.status === DisputeStatus.RESOLVED || dispute.status === DisputeStatus.ESCALATED) {
+      throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: `Dispute already ${dispute.status}` });
+    }
+    // Rate limit manual escalation: max 2 times per dispute
+    const escalationCount = await this.prisma.adminAuditLog.count({
+      where: { targetId: dispute.id, action: 'DISPUTE_ESCALATED' as any },
+    });
+    if (escalationCount >= 2) {
+      throw new BadRequestException({ code: ErrorCodes.RATE_LIMIT_EXCEEDED, message: 'Maximum escalation attempts reached for this dispute' });
+    }
+
+    const updated = await this.prisma.dispute.update({
+      where: { id: dispute.id },
+      data: { status: DisputeStatus.ESCALATED, isSlaBreached: true },
+    });
+
+    // Log audit
+    this.auditLog.logUserAction({
+      userId,
+      action: UserAuditAction.ORDER_DISPUTE_SUBMITTED,
+      entityType: 'Dispute',
+      entityId: dispute.id,
+      description: `User manually escalated dispute ${dispute.disputeId}: ${reason?.slice(0, 200) ?? 'no reason'}`,
+    });
+
+    // Notify admin via Redis alert
+    await this.prisma.adminAuditLog.create({
+      data: {
+        adminId: dispute.assignedAdminId ?? (await this.prisma.adminUser.findFirst({ where: { role: 'SUPER_ADMIN', isActive: true }, select: { id: true } }))?.id ?? 'system',
+        action: 'DISPUTE_ESCALATED' as any,
+        targetType: 'Dispute',
+        targetId: dispute.id,
+        description: `Manual escalation by user ${userId} for dispute ${dispute.disputeId}: ${reason ?? ''}`,
+        ipAddress: 'system',
+      },
+    }).catch(() => {});
+
+    return { disputeId: updated.disputeId, status: updated.status, escalatedAt: new Date() };
   }
 }

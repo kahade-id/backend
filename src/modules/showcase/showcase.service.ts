@@ -1251,4 +1251,32 @@ export class ShowcaseService {
       });
     }
   }
+
+  async reportShowcase(userId: string, showcaseId: string, reason: string, description?: string): Promise<object> {
+    const showcase = await this.prisma.showcaseItem.findUnique({ where: { id: showcaseId }, select: { id: true, userId: true } });
+    if (!showcase) throw new BadRequestException({ code: ErrorCodes.NOT_FOUND ?? 'NOT_FOUND', message: 'Showcase not found' });
+    if (showcase.userId === userId) throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Cannot report own showcase' });
+
+    // Use UserReport as generic report table if ShowcaseReport doesn't exist, else create via prisma
+    try {
+      const report = await (this.prisma as any).showcaseReport?.create?.({
+        data: { showcaseId, reporterId: userId, reason, description: description?.slice(0, 1000) },
+      });
+      if (report) return { reported: true, reportId: report.id };
+    } catch {}
+
+    // Fallback: create entry in admin audit log + redis alert
+    await this.prisma.adminAuditLog.create({
+      data: {
+        adminId: (await this.prisma.adminUser.findFirst({ where: { role: 'SUPER_ADMIN' }, select: { id: true } }))?.id ?? userId,
+        action: 'SYSTEM_CONFIG_CHANGED' as any,
+        targetType: 'ShowcaseItem',
+        targetId: showcaseId,
+        description: `User ${userId} reported showcase ${showcaseId}: ${reason} ${description ?? ''}`,
+        ipAddress: 'system',
+      },
+    }).catch(() => {});
+
+    return { reported: true, showcaseId, reason };
+  }
 }

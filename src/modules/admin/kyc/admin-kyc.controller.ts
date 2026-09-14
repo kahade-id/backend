@@ -109,4 +109,28 @@ export class AdminKycController {
   ): Promise<Record<string, unknown>> {
     return this.service.revokeKyc(kycId, admin.sub, dto.reason, req.ip || 'unknown');
   }
+
+  @Post('bulk/approve')
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN', 'KYC_ADMIN')
+  @ApiOperation({ summary: 'Bulk approve KYC requests (max 50)', description: 'Approves multiple pending KYC requests in one call.' })
+  async bulkApprove(
+    @Body() dto: { kycIds: string[]; notes?: string },
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.bulkApproveKyc(dto.kycIds, admin.sub, dto.notes, req.ip || 'unknown');
+  }
+
+  @Post('bulk/reject')
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN', 'KYC_ADMIN')
+  @ApiOperation({ summary: 'Bulk reject KYC requests (max 50)' })
+  async bulkReject(
+    @Body() dto: { kycIds: string[]; reason: string; notes?: string },
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.bulkRejectKyc(dto.kycIds, admin.sub, dto.reason, dto.notes, req.ip || 'unknown');
+  }
 }

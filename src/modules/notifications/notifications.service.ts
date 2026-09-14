@@ -10,12 +10,13 @@ const generateDeviceId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 
 const NOTIFICATION_DEDUP_WINDOW_MS = 60_000;
 const MAX_NOTIFICATION_PAGE = 10_000;
 
-const IN_APP_PREFERENCE_TYPES: ReadonlyArray<[keyof Pick<NotificationPreference, 'orderInApp' | 'walletInApp' | 'chatInApp' | 'disputeInApp' | 'rankingInApp'>, readonly NotificationType[]]> = [
+const IN_APP_PREFERENCE_TYPES: ReadonlyArray<[keyof Pick<NotificationPreference, 'orderInApp' | 'walletInApp' | 'chatInApp' | 'disputeInApp' | 'rankingInApp' | 'marketingInApp'>, readonly NotificationType[]]> = [
   ['orderInApp', [NotificationType.ORDER_NEW, NotificationType.ORDER_ACCEPTED, NotificationType.ORDER_REJECTED, NotificationType.ORDER_CANCELLED_TIMEOUT, NotificationType.ORDER_CANCELLED, NotificationType.ORDER_PAYMENT_RECEIVED, NotificationType.ORDER_SHIPPED, NotificationType.ORDER_DEADLINE_REMINDER, NotificationType.ORDER_EXTENSION_REQUESTED, NotificationType.ORDER_EXTENSION_APPROVED, NotificationType.ORDER_EXTENSION_REJECTED, NotificationType.ORDER_COMPLETED, NotificationType.ORDER_AUTOCOMPLETED, NotificationType.ORDER_DELIVERED]],
   ['walletInApp', [NotificationType.WALLET_TOPUP_SUCCESS, NotificationType.WALLET_TOPUP_FAILED, NotificationType.WALLET_WITHDRAW_SUCCESS, NotificationType.WALLET_WITHDRAW_FAILED, NotificationType.WALLET_FUNDS_RELEASED, NotificationType.WALLET_TRANSFER_SENT, NotificationType.WALLET_TRANSFER_RECEIVED]],
   ['chatInApp', [NotificationType.CHAT_NEW_MESSAGE]],
   ['disputeInApp', [NotificationType.DISPUTE_SUBMITTED, NotificationType.DISPUTE_ADMIN_JOINED, NotificationType.DISPUTE_DECISION]],
   ['rankingInApp', [NotificationType.RATING_NEW, NotificationType.BADGE_AWARDED, NotificationType.RANK_UPGRADED, NotificationType.SUBSCRIPTION_ACTIVATED, NotificationType.SUBSCRIPTION_EXPIRY_REMINDER, NotificationType.SUBSCRIPTION_EXPIRED, NotificationType.SUBSCRIPTION_RENEWED, NotificationType.REFERRAL_REWARD_RECEIVED]],
+  ['marketingInApp', [NotificationType.PROMO_OFFER, NotificationType.CAMPAIGN_ANNOUNCEMENT] as unknown as NotificationType[]],
 ];
 
 function criticalSecurityType(type: NotificationType): boolean {
@@ -272,9 +273,72 @@ export class NotificationsService {
       where: { userId },
       create: { userId, ...updateData },
       update: updateData,
-    });
+    } as any);
 
     return prefs;
+  }
+
+  // 7.2 Quiet hours check (WIB) + 7.3 per-category push toggles + language
+  async isInQuietHours(userId: string): Promise<boolean> {
+    try {
+      const prefs = await this.prisma.notificationPreference.findUnique({ where: { userId } }) as any;
+      if (!prefs || !prefs.quietHoursEnabled) return false;
+      const start = prefs.quietHoursStart || '22:00';
+      const end = prefs.quietHoursEnd || '07:00';
+      const now = new Date();
+      // Convert to WIB (Asia/Jakarta UTC+7)
+      const wibHour = (now.getUTCHours() + 7) % 24;
+      const wibMinute = now.getUTCMinutes();
+      const currentMinutes = wibHour * 60 + wibMinute;
+      const [sh, sm] = start.split(':').map(Number);
+      const [eh, em] = end.split(':').map(Number);
+      const startMinutes = sh * 60 + sm;
+      const endMinutes = eh * 60 + em;
+      if (startMinutes <= endMinutes) {
+        return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+      } else {
+        // Overnight range (e.g., 22:00-07:00)
+        return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  async shouldSendPush(userId: string, type: NotificationType): Promise<boolean> {
+    try {
+      const prefs = await this.prisma.notificationPreference.findUnique({ where: { userId } }) as any;
+      if (!prefs) return true;
+      if (criticalSecurityType(type)) return true;
+      if (await this.isInQuietHours(userId)) {
+        // During quiet hours, only critical types pass
+        return criticalSecurityType(type);
+      }
+      // Check per-category push toggles
+      const pushMap: Record<string, NotificationType[]> = {
+        orderPush: [NotificationType.ORDER_NEW, NotificationType.ORDER_ACCEPTED, NotificationType.ORDER_REJECTED, NotificationType.ORDER_CANCELLED_TIMEOUT, NotificationType.ORDER_CANCELLED, NotificationType.ORDER_PAYMENT_RECEIVED, NotificationType.ORDER_SHIPPED, NotificationType.ORDER_DEADLINE_REMINDER, NotificationType.ORDER_EXTENSION_REQUESTED, NotificationType.ORDER_EXTENSION_APPROVED, NotificationType.ORDER_EXTENSION_REJECTED, NotificationType.ORDER_COMPLETED, NotificationType.ORDER_AUTOCOMPLETED, NotificationType.ORDER_DELIVERED],
+        walletPush: [NotificationType.WALLET_TOPUP_SUCCESS, NotificationType.WALLET_TOPUP_FAILED, NotificationType.WALLET_WITHDRAW_SUCCESS, NotificationType.WALLET_WITHDRAW_FAILED, NotificationType.WALLET_FUNDS_RELEASED, NotificationType.WALLET_TRANSFER_SENT, NotificationType.WALLET_TRANSFER_RECEIVED],
+        chatPush: [NotificationType.CHAT_NEW_MESSAGE],
+        disputePush: [NotificationType.DISPUTE_SUBMITTED, NotificationType.DISPUTE_ADMIN_JOINED, NotificationType.DISPUTE_DECISION],
+        rankingPush: [NotificationType.RATING_NEW, NotificationType.BADGE_AWARDED, NotificationType.RANK_UPGRADED, NotificationType.SUBSCRIPTION_ACTIVATED, NotificationType.SUBSCRIPTION_EXPIRY_REMINDER, NotificationType.SUBSCRIPTION_EXPIRED, NotificationType.SUBSCRIPTION_RENEWED, NotificationType.REFERRAL_REWARD_RECEIVED],
+        marketingPush: [NotificationType.PROMO_OFFER, NotificationType.CAMPAIGN_ANNOUNCEMENT] as unknown as NotificationType[],
+      };
+      for (const [field, types] of Object.entries(pushMap)) {
+        if ((types as NotificationType[]).includes(type) && prefs[field] === false) return false;
+      }
+      return true;
+    } catch {
+      return true;
+    }
+  }
+
+  async getUserLanguage(userId: string): Promise<'id' | 'en'> {
+    try {
+      const prefs = await this.prisma.notificationPreference.findUnique({ where: { userId } }) as any;
+      return prefs?.language === 'en' ? 'en' : 'id';
+    } catch {
+      return 'id';
+    }
   }
 
   async deleteNotification(userId: string, notifId: string): Promise<{ message: string }> {

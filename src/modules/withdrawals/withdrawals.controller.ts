@@ -11,11 +11,8 @@ import { UpdateScheduleDto } from './dto/update-schedule.dto';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
 
-@ApiTags('withdrawals')
-@ApiBearerAuth('access-token')
-@Controller('withdrawals')
-export class WithdrawalsController {
-  constructor(private scheduledWithdrawalService: ScheduledWithdrawalService) {}
+export class WithdrawalsControllerBase {
+  constructor(protected scheduledWithdrawalService: ScheduledWithdrawalService) {}
 
   @Post('schedules')
   @UseGuards(UserThrottleGuard)
@@ -60,3 +57,13 @@ export class WithdrawalsController {
     return this.scheduledWithdrawalService.deleteSchedule(userId, scheduleId);
   }
 }
+
+@ApiTags('scheduled-withdrawals')
+@ApiBearerAuth('access-token')
+@Controller('scheduled-withdrawals')
+export class ScheduledWithdrawalsController extends WithdrawalsControllerBase {}
+
+@ApiTags('withdrawals')
+@ApiBearerAuth('access-token')
+@Controller('withdrawals')
+export class WithdrawalsController extends WithdrawalsControllerBase {}

@@ -57,4 +57,28 @@ export class SupportController {
   ): Promise<object> {
     return this.supportService.replyToTicket(userId, ticketId, dto);
   }
+
+  @UseGuards(UserThrottleGuard)
+  @Post('tickets/:ticketId/close')
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({ summary: 'Close own ticket (14.1)' })
+  async closeTicket(@CurrentUser('sub') userId: string, @Param('ticketId', ParseIdPipe) ticketId: string): Promise<object> {
+    return this.supportService.closeTicket(userId, ticketId);
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Post('tickets/:ticketId/reopen')
+  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  @ApiOperation({ summary: 'Reopen own closed ticket' })
+  async reopenTicket(@CurrentUser('sub') userId: string, @Param('ticketId', ParseIdPipe) ticketId: string): Promise<object> {
+    return this.supportService.reopenTicket(userId, ticketId);
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Post('tickets/:ticketId/rate')
+  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  @ApiOperation({ summary: 'Rate resolved ticket (14.1)' })
+  async rateTicket(@CurrentUser('sub') userId: string, @Param('ticketId', ParseIdPipe) ticketId: string, @Body() dto: { rating: number; comment?: string }): Promise<object> {
+    return this.supportService.rateTicket(userId, ticketId, dto.rating, dto.comment);
+  }
 }

@@ -921,4 +921,75 @@ export class SubscriptionsService {
     await this.redis.setex(cacheKey, SUBSCRIPTION_PLANS_TTL, JSON.stringify(plans));
     return plans;
   }
+
+  // 11.1 Subscription upgrade proration
+  async upgradeSubscription(userId: string, newPlan: SubscriptionPlan, pin: string, ip?: string): Promise<object> {
+    await this.walletService.verifyPin(userId, pin, ip);
+    const current = await this.prisma.subscription.findFirst({
+      where: { userId, status: { in: [SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELLED] }, currentPeriodEnd: { gt: new Date() } },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!current) throw new NotFoundException({ code: ErrorCodes.NO_ACTIVE_SUBSCRIPTION, message: 'No active subscription' });
+    if (current.plan === newPlan) throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Already on this plan' });
+
+    const currentPlanInfo = this.planPricing[current.plan];
+    const newPlanInfo = this.planPricing[newPlan];
+    if (!newPlanInfo) throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid plan' });
+
+    // Proration: calculate remaining value of current plan
+    const now = new Date();
+    const totalDuration = current.currentPeriodEnd.getTime() - current.currentPeriodStart.getTime();
+    const remaining = current.currentPeriodEnd.getTime() - now.getTime();
+    const remainingRatio = remaining / totalDuration;
+    const remainingValue = BigInt(Math.floor(Number(current.price) * remainingRatio));
+    const priceDiff = newPlanInfo.price - remainingValue;
+    const chargeAmount = priceDiff > 0 ? priceDiff : BigInt(0);
+
+    if (chargeAmount > 0) {
+      const walletRows = await this.prisma.$queryRaw<Array<{ id: string; totalBalance: bigint; availableBalance: bigint; version: number }>>`
+        SELECT id, \"totalBalance\", \"availableBalance\", version FROM wallets WHERE \"userId\" = ${userId} FOR UPDATE
+      `;
+      const wallet = walletRows[0];
+      if (!wallet || wallet.availableBalance < chargeAmount) throw new BadRequestException({ code: ErrorCodes.INSUFFICIENT_BALANCE, message: 'Insufficient balance for upgrade' });
+    }
+
+    const serial = await this.walletTxSerialService.getNext();
+    const updated = await this.prisma.$transaction(async (tx) => {
+      if (chargeAmount > 0) {
+        const w = await tx.wallet.findUnique({ where: { userId } });
+        if (!w) throw new BadRequestException({ code: ErrorCodes.WALLET_NOT_FOUND, message: 'Wallet not found' });
+        await tx.wallet.update({ where: { id: w.id }, data: { availableBalance: { decrement: chargeAmount }, totalBalance: { decrement: chargeAmount }, version: { increment: 1 } } });
+        await tx.walletTransaction.create({
+          data: {
+            txId: generateWalletTxId(serial),
+            walletId: w.id,
+            type: WalletTransactionType.SUBSCRIPTION_PAYMENT,
+            status: WalletTransactionStatus.SUCCESS,
+            amount: chargeAmount,
+            balanceBefore: w.totalBalance,
+            balanceAfter: w.totalBalance - chargeAmount,
+            description: `Upgrade from ${current.plan} to ${newPlan} (prorated)`,
+          },
+        });
+      }
+      const newEnd = new Date(now);
+      newEnd.setDate(newEnd.getDate() + newPlanInfo.durationDays);
+      const sub = await tx.subscription.update({
+        where: { id: current.id },
+        data: {
+          plan: newPlan,
+          price: newPlanInfo.price,
+          currentPeriodStart: now,
+          currentPeriodEnd: newEnd,
+          nextPaymentAt: newEnd,
+        },
+      });
+      await tx.user.update({ where: { id: userId }, data: { subscriptionExpiresAt: newEnd } });
+      return sub;
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+
+    await this.redis.del(`subscription_status:${userId}`).catch(() => {});
+    await this.verificationBadgeService.invalidate(userId);
+    return { subscription: updated, charged: toIdr(chargeAmount), proratedCredit: toIdr(remainingValue) };
+  }
 }

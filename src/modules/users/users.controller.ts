@@ -90,12 +90,26 @@ export class UsersController {
   }
 
   @Get('me/trust-score')
-  @ApiOperation({ summary: 'Get user trust score and badge' })
+  @ApiOperation({ summary: 'Get user trust score, badge, and factor breakdown' })
   async getMyTrustScore(@CurrentUser('sub') userId: string): Promise<object> {
-    const analytics = await this.userAnalyticsService.getUserAnalytics(userId, '30d');
-    const score = (analytics as { overview: { trustScore: number } }).overview.trustScore;
+    const [analytics, profile] = await Promise.all([
+      this.userAnalyticsService.getUserAnalytics(userId, '30d'),
+      this.usersService.getMyProfile(userId) as any,
+    ]);
+    const overview = (analytics as any).overview;
+    const score = overview.trustScore as number;
     const badge = this.userAnalyticsService.getTrustBadge(score);
-    return { score, badge };
+    const detailed = this.userAnalyticsService.calculateTrustScoreDetailed({
+      totalOrdersCompleted: overview.totalCompleted ?? 0,
+      totalOrdersCancelled: overview.totalCancelled ?? 0,
+      totalOrdersDisputed: overview.totalDisputed ?? 0,
+      averageRating: overview.avgRating ?? 0,
+      totalRatingCount: overview.ratingCount ?? 0,
+      kycStatus: profile?.kycStatus ?? 'UNVERIFIED',
+      isKahadePlus: profile?.isKahadePlus ?? false,
+      createdAt: overview.memberSince ? new Date(overview.memberSince) : new Date(),
+    });
+    return { score, badge, breakdown: detailed.breakdown, total: detailed.total };
   }
 
   @Put('me/avatar')

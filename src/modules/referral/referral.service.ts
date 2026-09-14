@@ -257,9 +257,12 @@ export class ReferralService {
         successfulReferrals: 0,
         totalRewardEarned: 0,
         pendingRewardCount: 0,
+        remainingSlots: 100,
+        maxSlots: 100,
       };
     }
 
+    const maxSlots = this.configService.get<number>('app.maxReferralsPerCode') ?? 100;
     const [totalReferrals, successfulReferrals, pendingRewardCount] = await Promise.all([
       this.prisma.referralRelation.count({
         where: { referrerId: userId },
@@ -281,6 +284,8 @@ export class ReferralService {
       successfulReferrals,
       totalRewardEarned: toIdr(referralCode.totalRewardEarned),
       pendingRewardCount,
+      remainingSlots: Math.max(0, maxSlots - totalReferrals),
+      maxSlots,
     };
   }
 

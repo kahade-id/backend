@@ -426,4 +426,19 @@ export class BankAccountsService {
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
   }
+
+  async updateBankAccount(userId: string, bankAccountId: string, accountName?: string): Promise<Record<string, unknown>> {
+    if (!accountName || !accountName.trim()) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'accountName required' });
+    }
+    const account = await this.prisma.bankAccount.findFirst({ where: { id: bankAccountId, userId, deletedAt: null } });
+    if (!account) throw new NotFoundException({ code: ErrorCodes.BANK_ACCOUNT_NOT_FOUND, message: 'Bank account not found' });
+    const encrypted = await encryptAES(accountName.trim());
+    const updated = await this.prisma.bankAccount.update({
+      where: { id: bankAccountId },
+      data: { accountName: encrypted },
+      select: { id: true, bankCode: true, bankName: true, accountName: true, isPrimary: true, isVerified: true },
+    });
+    return { ...updated, accountName: accountName.trim() };
+  }
 }

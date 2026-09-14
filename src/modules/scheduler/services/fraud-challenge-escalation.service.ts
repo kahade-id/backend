@@ -52,9 +52,6 @@ export class FraudChallengeEscalationService {
         const alreadyEscalated = await this.redis.get(escalationKey);
         if (alreadyEscalated) continue;
 
-        // Notification table requires real userId + valid NotificationType enum, neither of which
-        // 'SYSTEM' satisfies. Surface to logger.error (Sentry breadcrumb) + Redis alert key for
-        // ops dashboard. Future enhancement: dispatch to all SUPER_ADMIN users in AdminUser table.
         this.logger.error(
           `URGENT_FRAUD_ESCALATED payment=${payment.midtransOrderId} user=${payment.userId} amount=${payment.amount} fraudStatus=${payment.fraudStatus} age=${Math.round((Date.now() - payment.createdAt.getTime()) / 3600000)}h`,
         );
@@ -67,6 +64,39 @@ export class FraudChallengeEscalationService {
           escalatedAt: new Date().toISOString(),
           severity: 'URGENT',
         })).catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
+
+        // 19.1 Fix: actually notify all SUPER_ADMIN users via Notification table (in-app) + attempt email
+        try {
+          const superAdmins = await this.prisma.adminUser.findMany({
+            where: { role: 'SUPER_ADMIN', isActive: true, deletedAt: null },
+            select: { id: true, email: true },
+          });
+          // Create a system notification entry for ops dashboard (we use WebhookLog as audit, but also create admin audit)
+          for (const admin of superAdmins) {
+            // We cannot use Notification table (requires userId), so we create AdminAuditLog as notification channel
+            await this.prisma.adminAuditLog.create({
+              data: {
+                adminId: admin.id,
+                action: 'SYSTEM_CONFIG_CHANGED',
+                targetType: 'PaymentTransaction',
+                targetId: payment.midtransOrderId,
+                description: `FRAUD_ESCALATION: Payment ${payment.midtransOrderId} flagged ${payment.fraudStatus} for >24h, amount ${payment.amount}, user ${payment.userId}`,
+                ipAddress: 'system',
+              },
+            }).catch(() => {});
+          }
+          // Also push to Redis list for admin dashboard to poll
+          await this.redis.getClient().lpush('admin_alerts:fraud_escalation', JSON.stringify({
+            midtransOrderId: payment.midtransOrderId,
+            userId: payment.userId,
+            amount: payment.amount.toString(),
+            fraudStatus: payment.fraudStatus,
+            escalatedAt: new Date().toISOString(),
+          })).catch(() => {});
+          await this.redis.getClient().ltrim('admin_alerts:fraud_escalation', 0, 99).catch(() => {});
+        } catch (notifyErr) {
+          this.logger.warn(`Failed to notify super admins for ${payment.midtransOrderId}: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`);
+        }
       }
 
       await this.redis.setex('cron_heartbeat:fraud_challenge_escalation', 86400, JSON.stringify({

@@ -1,36 +1,85 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
+import { RedisService } from '../../redis/redis.service';
 import { escapeLikePattern } from '../../common/utils/search.util';
 
 @Injectable()
 export class SearchService {
   private readonly LIMIT = 5;
 
-  constructor(private prisma: PrismaService) {}
+  constructor(private prisma: PrismaService, private redis: RedisService) {}
 
   async search(userId: string, query: string, types?: string[], limit?: number): Promise<object> {
     const q = this.normalizeQuery(query);
-    if (!q) return { users: [], orders: [], transactions: [], totals: { users: 0, orders: 0, transactions: 0 } };
+    if (!q) return { users: [], orders: [], transactions: [], showcase: [], helpCenter: [], totals: { users: 0, orders: 0, transactions: 0, showcase: 0, helpCenter: 0 } };
 
     const effectiveLimit = Number.isSafeInteger(limit) ? Math.min(Math.max(limit as number, 1), 50) : this.LIMIT;
-    const typeSet = types?.length ? new Set(types) : new Set(['users', 'orders', 'transactions']);
+    const typeSet = types?.length ? new Set(types) : new Set(['users', 'orders', 'transactions', 'showcase', 'help-center']);
 
-    const [users, orders, transactions] = await Promise.all([
+    const [users, orders, transactions, showcase, helpCenter] = await Promise.all([
       typeSet.has('users') ? this.searchUsers(q, userId, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
       typeSet.has('orders') ? this.searchOrders(userId, q, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
       typeSet.has('transactions') ? this.searchTransactions(userId, q, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
+      typeSet.has('showcase') ? this.searchShowcase(q, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
+      typeSet.has('help-center') ? this.searchHelpCenter(q, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
     ]);
+
+    // Save search history async (best effort)
+    if (q.length >= 2) {
+      this.saveSearchHistory(userId, q).catch(() => {});
+    }
 
     return {
       users: users.results,
       orders: orders.results,
       transactions: transactions.results,
+      showcase: showcase.results,
+      helpCenter: helpCenter.results,
       totals: {
         users: users.total,
         orders: orders.total,
         transactions: transactions.total,
+        showcase: showcase.total,
+        helpCenter: helpCenter.total,
       },
+      // 13.1 hint: if main results empty, suggest trying help-center
+      ...(users.total === 0 && orders.total === 0 && transactions.total === 0 && showcase.total === 0 && helpCenter.total > 0
+        ? { hint: 'No results in users/orders/transactions/showcase, but found help articles — try help-center' }
+        : {}),
+      ...(users.total === 0 && orders.total === 0 && transactions.total === 0 && showcase.total === 0 && helpCenter.total === 0
+        ? { hint: 'No results found — try searching in Help Center or check your spelling' }
+        : {}),
     };
+  }
+
+  private async saveSearchHistory(userId: string, query: string): Promise<void> {
+    const key = `search_history:${userId}`;
+    try {
+      const client = this.redis.getClient();
+      await client.lrem(key, 0, query);
+      await client.lpush(key, query);
+      await client.ltrim(key, 0, 19);
+      await client.expire(key, 60 * 60 * 24 * 30);
+    } catch {}
+  }
+
+  async getSearchHistory(userId: string): Promise<{ history: string[] }> {
+    const key = `search_history:${userId}`;
+    try {
+      const client = this.redis.getClient();
+      const history = await client.lrange(key, 0, 19);
+      return { history };
+    } catch {
+      return { history: [] };
+    }
+  }
+
+  async clearSearchHistory(userId: string): Promise<{ cleared: boolean }> {
+    const key = `search_history:${userId}`;
+    try {
+      await this.redis.del(key);
+    } catch {}
+    return { cleared: true };
   }
 
   async suggestions(userId: string, query: string, limit?: number): Promise<object> {
@@ -231,6 +280,87 @@ export class SearchService {
     ]);
 
     return { results: rows, total };
+  }
+
+  private async searchShowcase(query: string, limit?: number): Promise<{ results: object[]; total: number }> {
+    const take = limit || this.LIMIT;
+    const tsQuery = this.buildTsQuery(query);
+    if (tsQuery) {
+      try {
+        const rows = await this.prisma.$queryRaw<object[]>`
+          SELECT id, title, description, "userId", "createdAt",
+                 ts_rank(to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,'')), to_tsquery('simple', ${tsQuery})) AS rank
+          FROM user_showcases
+          WHERE "deletedAt" IS NULL AND "isPublic" = true
+            AND to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,'')) @@ to_tsquery('simple', ${tsQuery})
+          ORDER BY rank DESC, "createdAt" DESC
+          LIMIT ${take}
+        `;
+        const countResult = await this.prisma.$queryRaw<{ count: bigint }[]>`
+          SELECT COUNT(*) as count FROM user_showcases
+          WHERE "deletedAt" IS NULL AND "isPublic" = true
+            AND to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,'')) @@ to_tsquery('simple', ${tsQuery})
+        `.catch(() => [{ count: BigInt(0) }]);
+        return { results: rows as object[], total: Number(countResult[0]?.count ?? 0) };
+      } catch {}
+    }
+    try {
+      const where = {
+        deletedAt: null,
+        isPublic: true,
+        OR: [
+          { title: { contains: escapeLikePattern(query), mode: 'insensitive' as const } },
+          { description: { contains: escapeLikePattern(query), mode: 'insensitive' as const } },
+        ],
+      } as any;
+      const [rows, total] = await Promise.all([
+        this.prisma.userShowcase.findMany({ where, select: { id: true, title: true, description: true, userId: true, createdAt: true }, take, orderBy: { createdAt: 'desc' } }),
+        this.prisma.userShowcase.count({ where }),
+      ]);
+      return { results: rows, total };
+    } catch {
+      return { results: [], total: 0 };
+    }
+  }
+
+  private async searchHelpCenter(query: string, limit?: number): Promise<{ results: object[]; total: number }> {
+    const take = limit || this.LIMIT;
+    const tsQuery = this.buildTsQuery(query);
+    if (tsQuery) {
+      try {
+        const rows = await this.prisma.$queryRaw<object[]>`
+          SELECT id, question, answer, "categoryId", "createdAt",
+                 ts_rank(to_tsvector('simple', COALESCE(question,'') || ' ' || COALESCE(answer,'')), to_tsquery('simple', ${tsQuery})) AS rank
+          FROM faq_items
+          WHERE "isActive" = true
+            AND to_tsvector('simple', COALESCE(question,'') || ' ' || COALESCE(answer,'')) @@ to_tsquery('simple', ${tsQuery})
+          ORDER BY rank DESC, "createdAt" DESC
+          LIMIT ${take}
+        `;
+        const countResult = await this.prisma.$queryRaw<{ count: bigint }[]>`
+          SELECT COUNT(*) as count FROM faq_items
+          WHERE "isActive" = true
+            AND to_tsvector('simple', COALESCE(question,'') || ' ' || COALESCE(answer,'')) @@ to_tsquery('simple', ${tsQuery})
+        `.catch(() => [{ count: BigInt(0) }]);
+        return { results: rows as object[], total: Number(countResult[0]?.count ?? 0) };
+      } catch {}
+    }
+    try {
+      const where = {
+        isActive: true,
+        OR: [
+          { question: { contains: escapeLikePattern(query), mode: 'insensitive' as const } },
+          { answer: { contains: escapeLikePattern(query), mode: 'insensitive' as const } },
+        ],
+      } as any;
+      const [rows, total] = await Promise.all([
+        this.prisma.faqItem.findMany({ where, select: { id: true, question: true, categoryId: true, createdAt: true }, take, orderBy: { createdAt: 'desc' } }),
+        this.prisma.faqItem.count({ where }),
+      ]);
+      return { results: rows, total };
+    } catch {
+      return { results: [], total: 0 };
+    }
   }
 
   private async getBlockedUserIds(userId: string): Promise<string[]> {

@@ -135,4 +135,48 @@ export class AdminBusinessVerificationController {
   ): Promise<Record<string, unknown>> {
     return this.service.revoke(verificationId, admin.sub, dto.reason, req.ip || 'unknown');
   }
+
+  @Post('bulk/approve')
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN', 'KYC_ADMIN')
+  @ApiOperation({ summary: 'Bulk approve business verifications (max 50)' })
+  async bulkApprove(
+    @Body() dto: { verificationIds: string[]; notes?: string },
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    const approved: string[] = [];
+    const failed: { id: string; reason: string }[] = [];
+    for (const id of dto.verificationIds.slice(0, 50)) {
+      try {
+        await this.service.approve(id, admin.sub, dto.notes, req.ip || 'unknown');
+        approved.push(id);
+      } catch (e) {
+        failed.push({ id, reason: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    return { approved, failed };
+  }
+
+  @Post('bulk/reject')
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN', 'KYC_ADMIN')
+  @ApiOperation({ summary: 'Bulk reject business verifications (max 50)' })
+  async bulkReject(
+    @Body() dto: { verificationIds: string[]; reason: string; notes?: string },
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    const rejected: string[] = [];
+    const failed: { id: string; reason: string }[] = [];
+    for (const id of dto.verificationIds.slice(0, 50)) {
+      try {
+        await this.service.reject(id, admin.sub, dto.reason, dto.notes, req.ip || 'unknown');
+        rejected.push(id);
+      } catch (e) {
+        failed.push({ id, reason: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    return { rejected, failed };
+  }
 }

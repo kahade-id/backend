@@ -357,4 +357,39 @@ export class ChatController {
   ): Promise<object> {
     return this.chatService.getRoomAttachments(userId, roomId, page, limit);
   }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 10000, limit: 30 } })
+  @Post('rooms/:roomId/typing')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Send typing indicator (16.1)' })
+  async typing(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+    @Body() dto: { isTyping: boolean },
+  ): Promise<{ sent: boolean }> {
+    return this.chatService.sendTypingIndicator(userId, roomId, dto.isTyping);
+  }
+
+  @Get('rooms/:roomId/read-receipts')
+  @ApiOperation({ summary: 'Get read receipts for room (16.2)' })
+  async readReceipts(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+  ): Promise<object> {
+    return this.chatService.getReadReceipts(userId, roomId);
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 10000, limit: 20 } })
+  @Post('rooms/:roomId/messages/:messageId/read')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Mark single message as read (16.2)' })
+  async markMessageRead(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+    @Param('messageId', ParseIdPipe) messageId: string,
+  ): Promise<object> {
+    return this.chatService.markMessageAsRead(userId, roomId, messageId);
+  }
 }

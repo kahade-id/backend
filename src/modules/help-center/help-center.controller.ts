@@ -39,4 +39,12 @@ export class HelpCenterController {
   async trackView(@Param('id', ParseIdPipe) id: string) {
     return this.helpCenterService.trackView(id);
   }
+
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Post('items/:id/feedback')
+  async feedback(@Param('id', ParseIdPipe) id: string, @Query('helpful') helpful: string) {
+    const isHelpful = helpful === 'true' || helpful === '1';
+    return this.helpCenterService.submitFeedback(id, isHelpful);
+  }
 }

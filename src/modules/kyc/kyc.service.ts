@@ -9,6 +9,9 @@ import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pag
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { UserAuditAction } from '@prisma/client';
 import { UploadService } from '../upload/upload.service';
+import { KycDocumentType } from './dto/submit-kyc.dto';
+
+export const MAX_KYC_ATTEMPTS = 10;
 
 @Injectable()
 export class KycService {
@@ -44,24 +47,17 @@ export class KycService {
     throw new Error(`${label} exhausted retry loop`);
   }
 
-  private async verifyKycFilesConfirmed(userId: string, ktpFileKey: string, selfieFileKey: string): Promise<void> {
-    const [ktpConfirmed, selfieConfirmed] = await Promise.all([
-      this.uploadService.isConfirmedUploadKey(userId, ktpFileKey),
-      this.uploadService.isConfirmedUploadKey(userId, selfieFileKey),
-    ]);
-
-    if (!ktpConfirmed || !selfieConfirmed) {
+  private async verifyKycFilesConfirmed(userId: string, fileKeys: string[]): Promise<void> {
+    const checks = await Promise.all(fileKeys.map(k => this.uploadService.isConfirmedUploadKey(userId, k)));
+    if (checks.some(c => !c)) {
       throw new BadRequestException({
         code: 'UPLOAD_NOT_CONFIRMED',
-        message: 'Both KTP and selfie files must be confirmed via /upload/confirm before submitting KYC',
+        message: 'All KYC files must be confirmed via /upload/confirm before submitting KYC',
       });
     }
   }
 
   private async canonicalizeLegacyNik(tx: Prisma.TransactionClient, nik: string, nikHash: string, userId: string): Promise<string | null> {
-    // The former implementation loaded and decrypted every active KYC row. Legacy
-    // Argon2 NIK hashes use a fixed, secret-derived salt, so the same NIK can be
-    // looked up deterministically without touching unrelated ciphertexts.
     const legacyArgonHash = await argon2HashNik(nik);
     const legacyRows = await tx.kycRequest.findMany({
       where: {
@@ -76,7 +72,34 @@ export class KycService {
     }
     return null;
   }
-  async submit(userId: string, ktpFileKey: string, selfieFileKey: string, nik: string, ipAddress?: string): Promise<Record<string, unknown>> {
+
+  private validateNikFormat(nik: string, docType: KycDocumentType): void {
+    if (docType === KycDocumentType.KTP) {
+      if (!/^\d{16}$/.test(nik)) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'NIK must be exactly 16 digits for KTP' });
+      }
+    } else {
+      // Passport: 6-12 alphanumeric
+      if (!/^[A-Z0-9]{6,12}$/i.test(nik)) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Passport number must be 6-12 alphanumeric characters' });
+      }
+    }
+  }
+
+  async submit(userId: string, ktpFileKey: string, selfieFileKey: string, nik: string, ipAddress?: string, extra?: { documentType?: KycDocumentType; passportFileKey?: string; livenessFileKey?: string }): Promise<Record<string, unknown>> {
+    const docType = extra?.documentType ?? KycDocumentType.KTP;
+    this.validateNikFormat(nik, docType);
+
+    const fileKeysToVerify: string[] = [];
+    if (docType === KycDocumentType.KTP) {
+      if (!ktpFileKey) throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'ktpFileKey required for KTP' });
+      fileKeysToVerify.push(ktpFileKey, selfieFileKey);
+    } else {
+      if (!extra?.passportFileKey) throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'passportFileKey required for PASSPORT' });
+      fileKeysToVerify.push(extra.passportFileKey, selfieFileKey);
+    }
+    if (extra?.livenessFileKey) fileKeysToVerify.push(extra.livenessFileKey);
+
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       select: { phoneVerified: true },
@@ -89,7 +112,7 @@ export class KycService {
       });
     }
 
-    await this.verifyKycFilesConfirmed(userId, ktpFileKey, selfieFileKey);
+    await this.verifyKycFilesConfirmed(userId, fileKeysToVerify);
 
     const latestKyc = await this.prisma.kycRequest.findFirst({
       where: { userId },
@@ -104,27 +127,23 @@ export class KycService {
           message: 'You already have a pending KYC request',
         });
       }
-
       if (latestKyc.status === KycStatus.APPROVED) {
         throw new BadRequestException({
           code: ErrorCodes.KYC_ALREADY_APPROVED,
           message: 'Your KYC has already been approved',
         });
       }
-
       if (latestKyc.status === KycStatus.REVOKED) {
         throw new ForbiddenException({
           code: ErrorCodes.KYC_REVOKED,
           message: 'Your KYC verification has been revoked. Please contact support to resolve this.',
         });
       }
-
       if (latestKyc.status === KycStatus.REJECTED) {
         const COOLDOWN_HOURS = 24;
         const hoursSinceReview = latestKyc.reviewedAt
           ? (Date.now() - latestKyc.reviewedAt.getTime()) / 3_600_000
           : Infinity;
-
         if (hoursSinceReview < COOLDOWN_HOURS) {
           const hoursRemaining = Math.ceil(COOLDOWN_HOURS - hoursSinceReview);
           throw new BadRequestException({
@@ -132,7 +151,6 @@ export class KycService {
             message: `KYC resubmission available in ${hoursRemaining} hour(s). Please use /kyc/resubmit.`,
           });
         }
-
         throw new BadRequestException({
           code: ErrorCodes.KYC_USE_RESUBMIT,
           message: 'Your previous KYC was rejected. Please use /kyc/resubmit to submit a new request.',
@@ -140,11 +158,9 @@ export class KycService {
       }
     }
 
-    // Canonical storage is deterministic HMAC so the database partial index can
-    // enforce one active identity. Argon2 raw hashes are retained only for rows
-    // written by the former implementation.
     const nikHash = hmacSHA256(nik);
-    const encryptedKtpUrl = await encryptKycKtp(ktpFileKey);
+    const mainDocKey = docType === KycDocumentType.KTP ? ktpFileKey : extra!.passportFileKey!;
+    const encryptedKtpUrl = await encryptKycKtp(mainDocKey);
     const encryptedSelfieUrl = await encryptKycSelfie(selfieFileKey);
     const encryptedNik = await encryptKycNik(nik);
 
@@ -155,71 +171,64 @@ export class KycService {
     try {
       kycRequest = await this.withSerializableRetry(
         () => this.prisma.$transaction(async (tx) => {
-      const concurrentPending = await tx.kycRequest.findFirst({
-        where: { userId, status: KycStatus.PENDING },
-      });
-      if (concurrentPending) {
-        throw new BadRequestException({
-          code: ErrorCodes.KYC_ALREADY_PENDING,
-          message: 'You already have a pending KYC request',
-        });
-      }
-
-      const concurrentApproved = await tx.kycRequest.findFirst({
-        where: { userId, status: KycStatus.APPROVED },
-      });
-      if (concurrentApproved) {
-        throw new BadRequestException({
-          code: ErrorCodes.KYC_ALREADY_APPROVED,
-          message: 'Your KYC has already been approved',
-        });
-      }
-
-      const existingNik = await tx.kycRequest.findFirst({ where: { ktpNumberHash: nikHash, status: { in: [KycStatus.APPROVED, KycStatus.PENDING, KycStatus.REVOKED] } } });
-      const legacyOwnerId = existingNik ? null : await this.canonicalizeLegacyNik(tx, nik, nikHash, userId);
-      if ((existingNik && existingNik.userId !== userId) || (legacyOwnerId && legacyOwnerId !== userId)) {
-        throw new BadRequestException({
-          code: ErrorCodes.KYC_DUPLICATE_NIK,
-          message: 'This NIK has already been used for KYC verification',
-        });
-      }
-
-      const attemptCount = await tx.kycRequest.count({
-        where: { userId },
-      });
-      const MAX_KYC_ATTEMPTS = 10;
-      if (attemptCount >= MAX_KYC_ATTEMPTS) {
-        throw new BadRequestException({
-          code: ErrorCodes.KYC_MAX_ATTEMPTS_REACHED,
-          message: 'Maximum KYC submission attempts reached. Please contact support.',
-        });
-      }
-
-      const created = await tx.kycRequest.create({
-        data: {
-          kycId,
-          userId,
-          ktpPhotoUrl: encryptedKtpUrl,
-          selfiePhotoUrl: encryptedSelfieUrl,
-          ktpNumber: encryptedNik,
-          ktpNumberHash: nikHash,
-          submittedIp: ipAddress,
-          attemptNumber: attemptCount + 1,
-        },
-      });
-
-      await tx.user.update({
-        where: { id: userId },
-        data: { kycStatus: KycStatus.PENDING },
-      });
-
-      return created;
+          const concurrentPending = await tx.kycRequest.findFirst({
+            where: { userId, status: KycStatus.PENDING },
+          });
+          if (concurrentPending) {
+            throw new BadRequestException({
+              code: ErrorCodes.KYC_ALREADY_PENDING,
+              message: 'You already have a pending KYC request',
+            });
+          }
+          const concurrentApproved = await tx.kycRequest.findFirst({
+            where: { userId, status: KycStatus.APPROVED },
+          });
+          if (concurrentApproved) {
+            throw new BadRequestException({
+              code: ErrorCodes.KYC_ALREADY_APPROVED,
+              message: 'Your KYC has already been approved',
+            });
+          }
+          const existingNik = await tx.kycRequest.findFirst({ where: { ktpNumberHash: nikHash, status: { in: [KycStatus.APPROVED, KycStatus.PENDING, KycStatus.REVOKED] } } });
+          const legacyOwnerId = existingNik ? null : await this.canonicalizeLegacyNik(tx, nik, nikHash, userId);
+          if ((existingNik && existingNik.userId !== userId) || (legacyOwnerId && legacyOwnerId !== userId)) {
+            throw new BadRequestException({
+              code: ErrorCodes.KYC_DUPLICATE_NIK,
+              message: 'This identity has already been used for KYC verification',
+            });
+          }
+          const attemptCount = await tx.kycRequest.count({
+            where: { userId },
+          });
+          if (attemptCount >= MAX_KYC_ATTEMPTS) {
+            throw new BadRequestException({
+              code: ErrorCodes.KYC_MAX_ATTEMPTS_REACHED,
+              message: 'Maximum KYC submission attempts reached. Please contact support.',
+            });
+          }
+          const created = await tx.kycRequest.create({
+            data: {
+              kycId,
+              userId,
+              ktpPhotoUrl: encryptedKtpUrl,
+              selfiePhotoUrl: encryptedSelfieUrl,
+              ktpNumber: encryptedNik,
+              ktpNumberHash: nikHash,
+              submittedIp: ipAddress,
+              attemptNumber: attemptCount + 1,
+            },
+          });
+          await tx.user.update({
+            where: { id: userId },
+            data: { kycStatus: KycStatus.PENDING },
+          });
+          return created;
         }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }),
         'KYC_SUBMIT_TX',
       );
     } catch (error: unknown) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
-        throw new ConflictException({ code: ErrorCodes.KYC_DUPLICATE_NIK, message: 'This NIK has already been used for an active KYC request' });
+        throw new ConflictException({ code: ErrorCodes.KYC_DUPLICATE_NIK, message: 'This identity has already been used for an active KYC request' });
       }
       throw error;
     }
@@ -229,7 +238,7 @@ export class KycService {
       action: UserAuditAction.KYC_SUBMITTED,
       entityType: 'KycRequest',
       entityId: kycRequest.id,
-      description: `KYC request submitted (${kycId})`,
+      description: `KYC request submitted (${kycId}) docType=${docType} liveness=${!!extra?.livenessFileKey}`,
       ipAddress,
     });
 
@@ -238,6 +247,8 @@ export class KycService {
       status: kycRequest.status,
       attemptNumber: kycRequest.attemptNumber,
       createdAt: kycRequest.createdAt,
+      documentType: docType,
+      livenessProvided: !!extra?.livenessFileKey,
     };
   }
 
@@ -276,7 +287,7 @@ export class KycService {
     const [data, total] = await Promise.all([
       this.prisma.kycRequest.findMany({
         where: { userId },
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         skip,
         take: safeLimit,
         select: {
@@ -294,7 +305,19 @@ export class KycService {
     return createPaginatedResponse(data, total, safePage, safeLimit);
   }
 
-  async resubmit(userId: string, ktpFileKey: string, selfieFileKey: string, nik: string, ipAddress?: string): Promise<Record<string, unknown>> {
+  async resubmit(userId: string, ktpFileKey: string, selfieFileKey: string, nik: string, ipAddress?: string, extra?: { documentType?: KycDocumentType; passportFileKey?: string; livenessFileKey?: string }): Promise<Record<string, unknown>> {
+    const docType = extra?.documentType ?? KycDocumentType.KTP;
+    this.validateNikFormat(nik, docType);
+
+    const fileKeysToVerify: string[] = [];
+    if (docType === KycDocumentType.KTP) {
+      fileKeysToVerify.push(ktpFileKey, selfieFileKey);
+    } else {
+      if (!extra?.passportFileKey) throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'passportFileKey required for PASSPORT' });
+      fileKeysToVerify.push(extra.passportFileKey, selfieFileKey);
+    }
+    if (extra?.livenessFileKey) fileKeysToVerify.push(extra.livenessFileKey);
+
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       select: { phoneVerified: true },
@@ -338,10 +361,11 @@ export class KycService {
       }
     }
 
-    await this.verifyKycFilesConfirmed(userId, ktpFileKey, selfieFileKey);
+    await this.verifyKycFilesConfirmed(userId, fileKeysToVerify);
 
     const nikHash = hmacSHA256(nik);
-    const encryptedKtpUrl = await encryptKycKtp(ktpFileKey);
+    const mainDocKey = docType === KycDocumentType.KTP ? ktpFileKey : extra!.passportFileKey!;
+    const encryptedKtpUrl = await encryptKycKtp(mainDocKey);
     const encryptedSelfieUrl = await encryptKycSelfie(selfieFileKey);
     const encryptedNik = await encryptKycNik(nik);
     const resubmitSerial = await this.getNextKycSerial();
@@ -351,80 +375,72 @@ export class KycService {
     try {
       updated = await this.withSerializableRetry(
         () => this.prisma.$transaction(async (tx) => {
-      const attemptCount = await tx.kycRequest.count({ where: { userId } });
-      const MAX_KYC_ATTEMPTS = 10;
-      if (attemptCount >= MAX_KYC_ATTEMPTS) {
-        throw new BadRequestException({
-          code: ErrorCodes.KYC_MAX_ATTEMPTS_REACHED,
-          message: 'Maximum KYC submission attempts reached. Please contact support.',
-        });
-      }
-
-      const concurrentPending = await tx.kycRequest.findFirst({
-        where: { userId, status: KycStatus.PENDING },
-      });
-      if (concurrentPending) {
-        throw new BadRequestException({
-          code: ErrorCodes.KYC_ALREADY_PENDING,
-          message: 'You already have a pending KYC request',
-        });
-      }
-
-      const concurrentApproved = await tx.kycRequest.findFirst({
-        where: { userId, status: KycStatus.APPROVED },
-      });
-      if (concurrentApproved) {
-        throw new BadRequestException({
-          code: ErrorCodes.KYC_ALREADY_APPROVED,
-          message: 'Your KYC has already been approved',
-        });
-      }
-
-      const existingNikOwner = await tx.kycRequest.findFirst({ where: { ktpNumberHash: nikHash, status: { in: [KycStatus.APPROVED, KycStatus.PENDING, KycStatus.REVOKED] } } });
-      const legacyOwnerId = existingNikOwner ? null : await this.canonicalizeLegacyNik(tx, nik, nikHash, userId);
-      if ((existingNikOwner && existingNikOwner.userId !== userId) || (legacyOwnerId && legacyOwnerId !== userId)) {
-        throw new BadRequestException({
-          code: ErrorCodes.KYC_DUPLICATE_NIK,
-          message: 'This NIK has already been used for KYC verification',
-        });
-      }
-
-      const locked = await tx.kycRequest.findFirst({
-        where: { id: latestKyc.id, status: KycStatus.REJECTED },
-      });
-      if (!locked) {
-        throw new ConflictException({
-          code: 'KYC_STATE_CHANGED',
-          message: 'KYC status changed concurrently. Please reload and try again.',
-        });
-      }
-
-      const result = await tx.kycRequest.create({
-        data: {
-          kycId: resubmitKycId,
-          userId,
-          status: KycStatus.PENDING,
-          ktpPhotoUrl: encryptedKtpUrl,
-          selfiePhotoUrl: encryptedSelfieUrl,
-          ktpNumber: encryptedNik,
-          ktpNumberHash: nikHash,
-          submittedIp: ipAddress ?? null,
-          attemptNumber: attemptCount + 1,
-        },
-      });
-
-      await tx.user.update({
-        where: { id: userId },
-        data: { kycStatus: KycStatus.PENDING },
-      });
-
-      return result!;
+          const attemptCount = await tx.kycRequest.count({ where: { userId } });
+          if (attemptCount >= MAX_KYC_ATTEMPTS) {
+            throw new BadRequestException({
+              code: ErrorCodes.KYC_MAX_ATTEMPTS_REACHED,
+              message: 'Maximum KYC submission attempts reached. Please contact support.',
+            });
+          }
+          const concurrentPending = await tx.kycRequest.findFirst({
+            where: { userId, status: KycStatus.PENDING },
+          });
+          if (concurrentPending) {
+            throw new BadRequestException({
+              code: ErrorCodes.KYC_ALREADY_PENDING,
+              message: 'You already have a pending KYC request',
+            });
+          }
+          const concurrentApproved = await tx.kycRequest.findFirst({
+            where: { userId, status: KycStatus.APPROVED },
+          });
+          if (concurrentApproved) {
+            throw new BadRequestException({
+              code: ErrorCodes.KYC_ALREADY_APPROVED,
+              message: 'Your KYC has already been approved',
+            });
+          }
+          const existingNikOwner = await tx.kycRequest.findFirst({ where: { ktpNumberHash: nikHash, status: { in: [KycStatus.APPROVED, KycStatus.PENDING, KycStatus.REVOKED] } } });
+          const legacyOwnerId = existingNikOwner ? null : await this.canonicalizeLegacyNik(tx, nik, nikHash, userId);
+          if ((existingNikOwner && existingNikOwner.userId !== userId) || (legacyOwnerId && legacyOwnerId !== userId)) {
+            throw new BadRequestException({
+              code: ErrorCodes.KYC_DUPLICATE_NIK,
+              message: 'This identity has already been used for KYC verification',
+            });
+          }
+          const locked = await tx.kycRequest.findFirst({
+            where: { id: latestKyc.id, status: KycStatus.REJECTED },
+          });
+          if (!locked) {
+            throw new ConflictException({
+              code: 'KYC_STATE_CHANGED',
+              message: 'KYC status changed concurrently. Please reload and try again.',
+            });
+          }
+          const result = await tx.kycRequest.create({
+            data: {
+              kycId: resubmitKycId,
+              userId,
+              status: KycStatus.PENDING,
+              ktpPhotoUrl: encryptedKtpUrl,
+              selfiePhotoUrl: encryptedSelfieUrl,
+              ktpNumber: encryptedNik,
+              ktpNumberHash: nikHash,
+              submittedIp: ipAddress ?? null,
+              attemptNumber: attemptCount + 1,
+            },
+          });
+          await tx.user.update({
+            where: { id: userId },
+            data: { kycStatus: KycStatus.PENDING },
+          });
+          return result!;
         }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }),
         'KYC_RESUBMIT_TX',
       );
     } catch (error: unknown) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
-        throw new ConflictException({ code: ErrorCodes.KYC_DUPLICATE_NIK, message: 'This NIK has already been used for an active KYC request' });
+        throw new ConflictException({ code: ErrorCodes.KYC_DUPLICATE_NIK, message: 'This identity has already been used for an active KYC request' });
       }
       throw error;
     }
@@ -433,15 +449,11 @@ export class KycService {
       userId,
       action: UserAuditAction.KYC_SUBMITTED,
       entityType: 'KycRequest',
-      // Was `updated.kycId` (the human-readable KYC-xxx id) while submit() above logs
-      // `kycRequest.id` (the cuid) under the same entityType. Two different id spaces
-      // in one entityType make the audit trail impossible to join reliably; every
-      // other module logs the row's `.id`, so align on that.
       entityId: updated.id,
       description: 'User resubmitted KYC after rejection',
       ipAddress,
     });
 
-    return { kycId: updated.kycId, status: updated.status };
+    return { kycId: updated.kycId, status: updated.status, documentType: docType, livenessProvided: !!extra?.livenessFileKey };
   }
 }

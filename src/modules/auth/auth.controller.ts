@@ -47,6 +47,7 @@ import {
   PhoneRegisterDto,
   RequestPhoneChangeDto,
   ConfirmPhoneChangeDto,
+  SocialLoginDto,
 } from './dto';
 
 @ApiTags('auth')
@@ -201,6 +202,32 @@ export class AuthController {
   }
 
   @Public()
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Post('social-login')
+  @HttpCode(HttpStatus.OK)
+  @AllowResponseFields('refreshToken')
+  async socialLogin(
+    @Body() dto: SocialLoginDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<Record<string, unknown>> {
+    const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
+    const deviceInfo = dto.deviceInfo || req.headers['user-agent'] || 'unknown';
+    try {
+      const result = await this.authService.socialLogin(dto.provider, dto.idToken, dto.deviceId, deviceInfo, ipAddress);
+      this.setRefreshTokenCookie(res, result.refreshToken);
+      this.setAccessTokenCookie(res, result.accessToken);
+      return result as unknown as Record<string, unknown>;
+    } catch (error: any) {
+      const response = error?.getResponse?.();
+      if (response && typeof response === 'object' && (response as any).code === 'TWO_FA_REQUIRED') {
+        return { requires2FA: true, tempToken: (response as any).tempToken };
+      }
+      throw error;
+    }
+  }
+
+  @Public()
   @Throttle({ default: { ttl: 3600000, limit: 20 } })
   @Post('phone-register')
   @HttpCode(HttpStatus.CREATED)
@@ -279,6 +306,10 @@ export class AuthController {
     @Query('token') token: string,
     @Res() res: Response,
   ): Promise<void> {
+    const appStoreUrl = this.configService.get<string>('app.appStoreUrl') || 'https://apps.apple.com/app/kahade';
+    const playStoreUrl = this.configService.get<string>('app.playStoreUrl') || 'https://play.google.com/store/apps/details?id=id.kahade.app';
+    const webAppUrl = this.configService.get<string>('app.webAppUrl') || this.configService.get<string>('app.appUrl') || 'https://kahade.id';
+
     const htmlPage = (
       title: string,
       heading: string,
@@ -292,11 +323,15 @@ export class AuthController {
 <title>${title}</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f7f7f7; color: #111; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 24px; }
-  .card { background: #fff; border-radius: 16px; padding: 32px; max-width: 420px; width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,0.06); text-align: center; }
+  .card { background: #fff; border-radius: 16px; padding: 32px; max-width: 440px; width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,0.06); text-align: center; }
   .icon { width: 56px; height: 56px; border-radius: 28px; margin: 0 auto 16px; display: flex; align-items: center; justify-content: center; font-size: 28px; color: #fff; background: ${success ? '#0C9C5F' : '#C62828'}; }
   h1 { font-size: 20px; margin: 0 0 8px; }
-  p { font-size: 14px; color: #444; margin: 0 0 16px; line-height: 1.5; }
-  a.btn { display: inline-block; padding: 10px 20px; border-radius: 8px; background: #0C9C5F; color: #fff; text-decoration: none; font-weight: 600; }
+  p { font-size: 14px; color: #444; margin: 0 0 16px; line-height: 1.6; }
+  a.btn { display: inline-block; padding: 12px 24px; border-radius: 8px; background: #0C9C5F; color: #fff; text-decoration: none; font-weight: 600; margin: 4px; }
+  a.btn.secondary { background: #f0f0f0; color: #333; }
+  .store-links { margin-top: 20px; padding-top: 16px; border-top: 1px solid #eee; }
+  .store-links p { font-size: 12px; color: #888; }
+  .hidden { display: none; }
 </style>
 </head>
 <body>
@@ -304,7 +339,54 @@ export class AuthController {
     <div class="icon">${success ? '✓' : '!'}</div>
     <h1>${heading}</h1>
     <p>${message}</p>
-    <a class="btn" href="kahade://email-verified">Buka Aplikasi Kahade</a>
+    ${success ? `
+    <div id="actions">
+      <a class="btn" id="openAppBtn" href="kahade://email-verified">Buka Aplikasi Kahade</a>
+      <a class="btn secondary" href="${webAppUrl}">Buka di Browser</a>
+    </div>
+    <div class="store-links" id="storeFallback">
+      <p>Belum punya aplikasi? Download sekarang:</p>
+      <a class="btn secondary" href="${playStoreUrl}" target="_blank" rel="noopener">Google Play</a>
+      <a class="btn secondary" href="${appStoreUrl}" target="_blank" rel="noopener">App Store</a>
+    </div>
+    <script>
+      (function() {
+        var openAppBtn = document.getElementById('openAppBtn');
+        var storeFallback = document.getElementById('storeFallback');
+        var appScheme = 'kahade://email-verified';
+        var attempted = false;
+        function tryOpenApp() {
+          if (attempted) return;
+          attempted = true;
+          var start = Date.now();
+          var iframe = document.createElement('iframe');
+          iframe.style.display = 'none';
+          iframe.src = appScheme;
+          document.body.appendChild(iframe);
+          setTimeout(function() {
+            document.body.removeChild(iframe);
+            if (Date.now() - start < 2500) {
+              if (storeFallback) storeFallback.style.display = 'block';
+            }
+          }, 2000);
+        }
+        if (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+          setTimeout(tryOpenApp, 500);
+        }
+        if (openAppBtn) {
+          openAppBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            tryOpenApp();
+            setTimeout(function() { window.location.href = appScheme; }, 100);
+          });
+        }
+      })();
+    </script>
+    ` : `
+    <div>
+      <a class="btn secondary" href="${webAppUrl}">Ke Halaman Utama</a>
+    </div>
+    `}
   </div>
 </body>
 </html>`;

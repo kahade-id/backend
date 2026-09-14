@@ -160,4 +160,21 @@ export class SessionsService {
 
     return { count: revokedIds.length };
   }
+
+  // 18.3 Sessions/devices cross-ref: list devices per session + revoke all
+  async getDevices(userId: string): Promise<{ devices: any[] }> {
+    const devices = await this.prisma.userDevice.findMany({
+      where: { userId },
+      orderBy: { lastLoginAt: 'desc' },
+      select: { id: true, deviceId: true, deviceName: true, deviceType: true, ipAddress: true, lastLoginAt: true, createdAt: true },
+    });
+    return { devices };
+  }
+
+  async revokeAllSessionsAndDevices(userId: string, currentSessionId: string): Promise<{ sessionsRevoked: number; devicesRevoked: number }> {
+    const sessionsResult = await this.revokeAllOtherSessions(userId, currentSessionId);
+    const devices = await this.prisma.userDevice.findMany({ where: { userId }, select: { id: true } });
+    await this.prisma.userDevice.updateMany({ where: { userId }, data: { pushToken: null } });
+    return { sessionsRevoked: sessionsResult.count, devicesRevoked: devices.length };
+  }
 }

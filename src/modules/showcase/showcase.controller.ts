@@ -233,4 +233,17 @@ export class ShowcaseController {
   ): Promise<object> {
     return this.showcaseService.getShowcaseDetail(showcaseId, viewerId ?? undefined, { clientIp: req.ip });
   }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 3600000, limit: 5 } })
+  @Post(':showcaseId/report')
+  @Idempotency()
+  @ApiOperation({ summary: 'Report a showcase item (17.1)' })
+  async reportShowcase(
+    @CurrentUser('sub') userId: string,
+    @Param('showcaseId', ParseIdPipe) showcaseId: string,
+    @Body() dto: { reason: string; description?: string },
+  ): Promise<object> {
+    return this.showcaseService.reportShowcase(userId, showcaseId, dto.reason, dto.description);
+  }
 }

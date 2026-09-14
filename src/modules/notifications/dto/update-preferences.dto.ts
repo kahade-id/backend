@@ -1,4 +1,4 @@
-import { IsOptional, IsBoolean } from 'class-validator';
+import { IsOptional, IsBoolean, IsString, IsIn, Matches } from 'class-validator';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 
 export class UpdatePreferencesDto {
@@ -86,4 +86,36 @@ export class UpdatePreferencesDto {
   @IsOptional()
   @IsBoolean()
   marketingEmail?: boolean;
+
+  @ApiPropertyOptional({ description: 'Marketing push notifications' })
+  @IsOptional()
+  @IsBoolean()
+  marketingPush?: boolean;
+
+  @ApiPropertyOptional({ description: 'Marketing in-app notifications' })
+  @IsOptional()
+  @IsBoolean()
+  marketingInApp?: boolean;
+
+  @ApiPropertyOptional({ description: 'Quiet hours enabled' })
+  @IsOptional()
+  @IsBoolean()
+  quietHoursEnabled?: boolean;
+
+  @ApiPropertyOptional({ description: 'Quiet hours start (HH:mm)' })
+  @IsOptional()
+  @IsString()
+  @Matches(/^([01]\d|2[0-3]):([0-5]\d)$/, { message: 'quietHoursStart must be HH:mm' })
+  quietHoursStart?: string;
+
+  @ApiPropertyOptional({ description: 'Quiet hours end (HH:mm)' })
+  @IsOptional()
+  @IsString()
+  @Matches(/^([01]\d|2[0-3]):([0-5]\d)$/, { message: 'quietHoursEnd must be HH:mm' })
+  quietHoursEnd?: string;
+
+  @ApiPropertyOptional({ description: 'Preferred language', enum: ['id', 'en'] })
+  @IsOptional()
+  @IsIn(['id', 'en'])
+  language?: string;
 }

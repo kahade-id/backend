@@ -65,6 +65,7 @@ import {
   randomInt as _cryptoRandomInt,
   timingSafeEqual as _timingSafeEqual,
 } from 'crypto';
+import { OAuth2Client } from 'google-auth-library';
 const TWO_FA_ATTEMPT_KEY = (userId: string): string => `2fa_attempts:${userId}`;
 
 let _dummyHash: string | undefined;
@@ -3849,5 +3850,186 @@ export class AuthService {
         this.redis.setex(SESSION_REVOKED_KEY(id), ttl, '1', { throwOnError: true }),
       ),
     );
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // SOCIAL LOGIN (Google, Apple)
+  // ─────────────────────────────────────────────────────────────────
+  async socialLogin(
+    provider: 'google' | 'apple',
+    idToken: string,
+    deviceId: string | undefined,
+    deviceInfo: string | undefined,
+    ipAddress: string,
+  ): Promise<{ accessToken: string; refreshToken: string; user: LoginUserPayload; isNewUser: boolean }> {
+    if (provider === 'google') {
+      return this.socialLoginGoogle(idToken, deviceId, deviceInfo, ipAddress);
+    }
+    // Apple login can be added similarly; for now treat as unsupported but structured
+    throw new BadRequestException({
+      code: 'SOCIAL_PROVIDER_NOT_SUPPORTED',
+      message: `Social provider ${provider} is not yet configured. Please use phone OTP login.`,
+    });
+  }
+
+  private async socialLoginGoogle(
+    idToken: string,
+    deviceId: string | undefined,
+    deviceInfo: string | undefined,
+    ipAddress: string,
+  ): Promise<{ accessToken: string; refreshToken: string; user: LoginUserPayload; isNewUser: boolean }> {
+    const googleClientId = this.configService.get<string>('app.googleClientId') || process.env.GOOGLE_CLIENT_ID;
+    if (!googleClientId) {
+      throw new ServiceUnavailableException({
+        code: 'SOCIAL_LOGIN_NOT_CONFIGURED',
+        message: 'Google login is not configured on this server.',
+      });
+    }
+    const client = new OAuth2Client(googleClientId);
+    let payload: { email?: string; name?: string; sub: string; picture?: string; email_verified?: boolean };
+    try {
+      const ticket = await client.verifyIdToken({ idToken, audience: googleClientId });
+      const p = ticket.getPayload();
+      if (!p || !p.email) throw new Error('No email in token');
+      payload = { email: p.email, name: p.name, sub: p.sub, picture: p.picture, email_verified: p.email_verified };
+    } catch (e) {
+      this.logger.warn(`Google ID token verification failed: ${e instanceof Error ? e.message : String(e)}`);
+      throw new BadRequestException({ code: 'INVALID_SOCIAL_TOKEN', message: 'Invalid Google ID token' });
+    }
+
+    const normalizedEmail = payload.email!.toLowerCase();
+    let user = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
+    let isNewUser = false;
+
+    if (!user) {
+      // Create new user from Google profile
+      const userId = generateUserId();
+      const myReferralCode = generateReferralCode();
+      const encryptedPhone = await encryptPii(`google_${payload.sub}`); // placeholder phone to satisfy unique constraint; will need real phone later
+      // Check if we can generate unique phone placeholder that won't collide
+      // Use google sub as phone hash base
+      const phoneHash = hashPhoneNumber(`+628000000000`); // temporary, will be replaced via phone verification flow
+      // Actually, phoneNumber is required unique. For social login without phone, we need to allow null? Schema says required.
+      // So we generate a synthetic but unique phone that user must change later.
+      // Better: create with random synthetic Indonesian number in reserved range that will be flagged unverified.
+      const syntheticPhone = `+62899${payload.sub.slice(0, 8).replace(/\D/g, '').padEnd(8, '0')}`;
+      const syntheticHash = hashPhoneNumber(syntheticPhone);
+      const syntheticEncrypted = await encryptPii(syntheticPhone);
+
+      try {
+        user = await this.prisma.$transaction(async (tx) => {
+          const newUser = await tx.user.create({
+            data: {
+              userId,
+              email: normalizedEmail,
+              emailVerified: payload.email_verified ?? true,
+              emailVerifiedAt: payload.email_verified ? new Date() : null,
+              fullName: payload.name || normalizedEmail.split('@')[0],
+              avatarUrl: payload.picture || null,
+              phoneNumber: syntheticEncrypted,
+              phoneNumberHash: syntheticHash,
+              phoneVerified: false,
+            },
+          });
+          await tx.wallet.create({ data: { userId: newUser.id } });
+          await tx.notificationPreference.create({ data: { userId: newUser.id } });
+          await tx.referralCode.create({ data: { userId: newUser.id, code: myReferralCode } });
+          return newUser;
+        });
+        isNewUser = true;
+      } catch (err) {
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+          // Race: user created between check and transaction
+          user = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
+          if (!user) throw err;
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+
+    if (!user.isActive || user.isBanned) {
+      throw new ForbiddenException({ code: ErrorCodes.ACCOUNT_INACTIVE, message: 'Account is inactive or banned' });
+    }
+
+    if (user.lockedUntil && user.lockedUntil > new Date()) {
+      const remaining = Math.ceil((user.lockedUntil.getTime() - Date.now()) / 1000);
+      throw new UnauthorizedException({ code: ErrorCodes.ACCOUNT_LOCKED, message: 'Account locked', lockoutRemainingSeconds: remaining });
+    }
+
+    const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({ where: { userId: user.id } });
+    if (twoFactorAuth?.isEnabled) {
+      // For social login, still require 2FA if enabled
+      const tempToken = this.tokenService.signTempToken({ sub: user.id, scope: '2fa_verify', deviceId: deviceId || 'social' });
+      // Return as if requires 2FA - caller should handle; we throw with temp token info via custom error? Instead we return partial and let controller handle.
+      // For simplicity, we enforce 2FA via temp token response structure similar to phone OTP.
+      // But our return type expects full login; so we handle by returning requires2FA via exception containing tempToken.
+      // To keep consistent, we will return tokens only if no 2FA; otherwise we throw a special response.
+      // We'll implement by returning a result that includes requires2FA flag - adjust method signature to allow.
+      // For now, we return tokens and let 2FA be checked separately if needed; simplest: require 2FA via temp token error.
+      throw new BadRequestException({
+        code: 'TWO_FA_REQUIRED',
+        message: '2FA verification required',
+        tempToken,
+      });
+    }
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: { lastLoginAt: new Date(), lastLoginIp: ipAddress, failedLoginAttempts: 0, lockedUntil: null },
+    });
+
+    const refreshToken = this.tokenService.signRefreshToken({ sub: user.id });
+    const sessionId = await this.saveSession(user.id, refreshToken, deviceId, deviceInfo, ipAddress);
+    if (deviceId) {
+      await this.trackDevice(user.id, deviceId, deviceInfo, ipAddress).catch(() => undefined);
+    }
+    const accessToken = this.tokenService.signAccessToken({
+      sub: user.id,
+      userId: user.userId,
+      email: user.email ?? '',
+      username: user.username ?? '',
+      sessionId,
+      kycStatus: user.kycStatus,
+      emailVerified: user.emailVerified,
+    });
+
+    this.auditLog.logUserAction({
+      userId: user.id,
+      action: UserAuditAction.LOGIN,
+      entityType: 'User',
+      entityId: user.id,
+      description: `User logged in via Google social login from ${ipAddress}`,
+      ipAddress,
+    });
+
+    return {
+      accessToken,
+      refreshToken,
+      isNewUser,
+      user: {
+        id: user.id,
+        userId: user.userId,
+        username: user.username,
+        email: user.email ?? '',
+        fullName: user.fullName,
+        avatarUrl: user.avatarUrl ?? null,
+        bio: user.bio ?? null,
+        accountType: user.accountType,
+        emailVerified: user.emailVerified,
+        kycStatus: user.kycStatus,
+        isKahadePlus: user.isKahadePlus,
+        subscriptionExpiresAt: user.subscriptionExpiresAt ? user.subscriptionExpiresAt.toISOString() : null,
+        membershipRank: user.membershipRank,
+        isMfaEnabled: twoFactorAuth?.isEnabled ?? false,
+        phoneNumber: await decryptPiiSafe(user.phoneNumber),
+        phoneVerified: user.phoneVerified ?? false,
+        dateOfBirth: user.dateOfBirth ? user.dateOfBirth.toISOString() : null,
+        gender: user.gender ?? null,
+        createdAt: user.createdAt.toISOString(),
+      },
+    };
   }
 }

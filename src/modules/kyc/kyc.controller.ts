@@ -5,7 +5,7 @@ import { KycService } from './kyc.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
-import { SubmitKycDto } from './dto/submit-kyc.dto';
+import { SubmitKycDto, KycDocumentType } from './dto/submit-kyc.dto';
 import { PaginationDto, PaginatedResponse } from '../../common/dto/pagination.dto';
 import { Request } from 'express';
 
@@ -19,15 +19,26 @@ export class KycController {
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 60000, limit: 3 } })
   @Idempotency()
-  @ApiOperation({ summary: 'Submit KYC request (gunakan fileKey dari /upload/confirm)' })
+  @ApiOperation({ summary: 'Submit KYC request (gunakan fileKey dari /upload/confirm). Supports KTP and PASSPORT.' })
   async submit(
     @CurrentUser('sub') userId: string,
     @Body() dto: SubmitKycDto,
     @Req() req: Request,
   ): Promise<Record<string, unknown>> {
     const ipAddress = req.ip;
-    this.validateKycFileOwnership(userId, dto.ktpFileKey, dto.selfieFileKey);
-    return this.kycService.submit(userId, dto.ktpFileKey, dto.selfieFileKey, dto.nik, ipAddress);
+    this.validateKycFileOwnership(userId, dto);
+    return this.kycService.submit(
+      userId,
+      dto.ktpFileKey ?? '',
+      dto.selfieFileKey,
+      dto.nik,
+      ipAddress,
+      {
+        documentType: dto.documentType ?? KycDocumentType.KTP,
+        passportFileKey: dto.passportFileKey,
+        livenessFileKey: dto.livenessFileKey,
+      },
+    );
   }
 
   @Get('status')
@@ -56,19 +67,38 @@ export class KycController {
     @Req() req: Request,
   ): Promise<Record<string, unknown>> {
     const ipAddress = req.ip;
-    this.validateKycFileOwnership(userId, dto.ktpFileKey, dto.selfieFileKey);
-    return this.kycService.resubmit(userId, dto.ktpFileKey, dto.selfieFileKey, dto.nik, ipAddress);
+    this.validateKycFileOwnership(userId, dto);
+    return this.kycService.resubmit(
+      userId,
+      dto.ktpFileKey ?? '',
+      dto.selfieFileKey,
+      dto.nik,
+      ipAddress,
+      {
+        documentType: dto.documentType ?? KycDocumentType.KTP,
+        passportFileKey: dto.passportFileKey,
+        livenessFileKey: dto.livenessFileKey,
+      },
+    );
   }
 
-  private validateKycFileOwnership(userId: string, ktpFileKey: string, selfieFileKey: string): void {
-    const ktpPrefix     = `uploads/kyc-ktp/${userId}/`;
-    const selfiePrefix  = `uploads/kyc-selfie/${userId}/`;
+  private validateKycFileOwnership(userId: string, dto: SubmitKycDto): void {
+    const checks: { key?: string; prefix: string }[] = [];
+    if (dto.documentType === KycDocumentType.PASSPORT) {
+      if (dto.passportFileKey) checks.push({ key: dto.passportFileKey, prefix: `uploads/kyc-passport/${userId}/` });
+    } else {
+      if (dto.ktpFileKey) checks.push({ key: dto.ktpFileKey, prefix: `uploads/kyc-ktp/${userId}/` });
+    }
+    checks.push({ key: dto.selfieFileKey, prefix: `uploads/kyc-selfie/${userId}/` });
+    if (dto.livenessFileKey) checks.push({ key: dto.livenessFileKey, prefix: `uploads/kyc-liveness/${userId}/` });
 
-    if (!ktpFileKey.startsWith(ktpPrefix) || !selfieFileKey.startsWith(selfiePrefix)) {
-      throw new BadRequestException({
-        code: 'FILE_ACCESS_DENIED',
-        message: 'File key does not belong to this user',
-      });
+    for (const c of checks) {
+      if (!c.key || !c.key.startsWith(c.prefix)) {
+        throw new BadRequestException({
+          code: 'FILE_ACCESS_DENIED',
+          message: `File key does not belong to this user or invalid prefix: ${c.prefix}`,
+        });
+      }
     }
   }
 }

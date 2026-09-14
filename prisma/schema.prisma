@@ -802,6 +802,8 @@ model User {
   orderLinksAccepted      OrderLink[]              @relation("OrderLinkAcceptor")
   transactionTemplates    TransactionTemplate[]    @relation("UserTransactionTemplates")
   idempotencyRecords      IdempotencyRecord[]
+  walletFavoriteRecipients WalletFavoriteRecipient[] @relation("WalletFavoriteOwner")
+  walletFavoritedBy      WalletFavoriteRecipient[] @relation("WalletFavoriteRecipient")
 
   //         — ketiga field ini sudah @unique, index dibuat otomatis. Redundan.
   @@index([kycStatus])
@@ -944,6 +946,13 @@ model NotificationPreference {
   rankingInApp   Boolean @default(true)
   rankingPush    Boolean @default(true)
   marketingEmail Boolean @default(false)
+  marketingPush  Boolean @default(false)
+  marketingInApp Boolean @default(false)
+
+  quietHoursEnabled Boolean @default(false)
+  quietHoursStart   String? @default("22:00")
+  quietHoursEnd     String? @default("07:00")
+  language          String  @default("id")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1361,6 +1370,13 @@ model Order {
   // Creator
   createdByBuyer Boolean @default(false) // true jika order dibuat oleh buyer; false jika oleh seller. Selalu di-set eksplisit saat INSERT.
 
+  // Reference attachments for order spec (2.1)
+  attachments String[] @default([])
+
+  // Source inquiry room that spawned this order (2.6) — links negotiation context
+  sourceInquiryRoomId String?
+  sourceInquiryRoom   ChatRoom? @relation("OrderSourceInquiry", fields: [sourceInquiryRoomId], references: [id], onDelete: SetNull)
+
   // Order Link reference
   orderLinkId String?
   orderLink   OrderLink? @relation(fields: [orderLinkId], references: [id], onDelete: SetNull)
@@ -1437,6 +1453,7 @@ model OrderExtensionRequest {
   responder     User?     @relation("ExtensionResponder", fields: [respondedBy], references: [id], onDelete: SetNull)
   respondedAt   DateTime?
   rejectionNote String?
+  expiresAt     DateTime? // Auto-expire if not responded within X hours (e.g. 48h)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt // Tambah updatedAt — status bisa berubah
@@ -1445,6 +1462,7 @@ model OrderExtensionRequest {
   @@index([orderId, status]) // Compound index untuk query "ada pending extension?"
   @@index([requestedBy])
   @@index([respondedBy])
+  @@index([status, expiresAt])
   @@map("order_extension_requests")
 }
 
@@ -1486,6 +1504,7 @@ model ChatRoom {
   messages         ChatMessage[]
   members          ChatRoomMember[]
   moderationEvents ChatModerationEvent[]
+  spawnedOrders    Order[]            @relation("OrderSourceInquiry")
 
   @@index([type, initiatorId])
   @@index([type, counterpartId])
@@ -2794,6 +2813,9 @@ model FaqItem {
   sortOrder  Int     @default(0)
   isActive   Boolean @default(true)
   viewCount  Int     @default(0)
+  helpfulCount    Int @default(0)
+  notHelpfulCount Int @default(0)
+  supportTickets  SupportTicket[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -2838,9 +2860,13 @@ model SupportTicket {
   subject     String                @db.VarChar(200)
   message     String                @db.Text
   category    SupportTicketCategory @default(GENERAL)
-  orderId     String?
-  status      SupportTicketStatus   @default(OPEN)
-  attachments Json                  @default("[]")
+  orderId          String?
+  relatedArticleId String?
+  relatedArticle   FaqItem? @relation(fields: [relatedArticleId], references: [id], onDelete: SetNull)
+  status           SupportTicketStatus   @default(OPEN)
+  attachments      Json                  @default("[]")
+  rating           Int?
+  ratingComment    String? @db.Text
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -2849,6 +2875,7 @@ model SupportTicket {
 
   @@index([userId])
   @@index([status])
+  @@index([relatedArticleId])
   @@map("support_tickets")
 }
 
@@ -3075,4 +3102,19 @@ model IdempotencyRecord {
   @@index([expiresAt])
   @@index([status, expiresAt])
   @@map("idempotency_records")
+}
+
+model WalletFavoriteRecipient {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation("WalletFavoriteOwner", fields: [userId], references: [id], onDelete: Cascade)
+  recipientId String
+  recipient   User     @relation("WalletFavoriteRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+  label       String?  @db.VarChar(50)
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, recipientId])
+  @@index([userId])
+  @@index([recipientId])
+  @@map("wallet_favorite_recipients")
 }

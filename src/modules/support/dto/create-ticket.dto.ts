@@ -25,6 +25,10 @@ export class CreateTicketDto {
   @IsOptional() @IsValidId()
   orderId?: string;
 
+  @ApiPropertyOptional({ description: 'Related help center article ID if user came from FAQ (14.2)' })
+  @IsOptional() @IsValidId()
+  relatedArticleId?: string;
+
   @ApiPropertyOptional({ description: 'Attachment file keys (max 5)', type: [String] })
   @IsOptional() @IsArray() @ArrayMaxSize(5, { message: 'Maximum 5 attachments per support ticket' }) @IsString({ each: true }) @MaxLength(512, { each: true }) @Matches(/^uploads\/[a-z-]+\/[A-Za-z0-9_-]+\/[\w.-]+$/, { each: true, message: 'Invalid attachment file key' })
   attachments?: string[];

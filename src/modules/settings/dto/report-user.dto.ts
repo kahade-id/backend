@@ -1,4 +1,4 @@
-import { IsString, IsEnum, IsOptional, IsArray, MaxLength, ArrayMaxSize, IsUrl } from 'class-validator';
+import { IsString, IsEnum, IsOptional, IsArray, MaxLength, ArrayMaxSize, Matches, MinLength } from 'class-validator';
 import { IsValidId } from '../../../common/decorators/is-valid-id.decorator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -12,6 +12,8 @@ export enum ReportCategoryDto {
   OTHER = 'OTHER',
 }
 
+const STORAGE_URL_PATTERN = /^https:\/\/cdn\.kahade\.id\//;
+
 export class ReportUserSettingsDto {
   @ApiProperty({ description: 'ID of the user being reported' })
   @IsValidId()
@@ -21,15 +23,16 @@ export class ReportUserSettingsDto {
   @IsEnum(ReportCategoryDto)
   category!: ReportCategoryDto;
 
-  @ApiProperty({ description: 'Report description', maxLength: 500 })
+  @ApiProperty({ description: 'Report description', minLength: 20, maxLength: 500 })
   @IsString()
+  @MinLength(20, { message: 'Report reason must be at least 20 characters' })
   @MaxLength(500)
   description!: string;
 
-  @ApiPropertyOptional({ description: 'Evidence URLs', type: [String], maxItems: 10 })
+  @ApiPropertyOptional({ description: 'Evidence URLs (must be platform CDN URLs)', type: [String], maxItems: 10 })
   @IsOptional()
   @IsArray()
-  @IsUrl({ protocols: ['http', 'https'] }, { each: true, message: 'Each evidence URL must be a valid HTTP(S) URL' })
+  @Matches(STORAGE_URL_PATTERN, { each: true, message: 'Evidence URLs must be platform storage URLs (https://cdn.kahade.id/)' })
   @MaxLength(500, { each: true })
   @ArrayMaxSize(10)
   evidenceUrls?: string[];

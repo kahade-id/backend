@@ -168,7 +168,7 @@ export class OrdersController {
     page: number;
     limit: number;
   }> {
-    return this.ordersService.getOrders(userId, query.page, query.limit, query.status as OrderStatus | undefined, query.role, query.search);
+    return this.ordersService.getOrders(userId, query.page, query.limit, query.status as OrderStatus | undefined, query.role, query.search, query.from, query.to, query.sortBy, query.sortOrder);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 30 } })
@@ -459,6 +459,16 @@ export class OrdersController {
     @Param('orderId', ParseIdPipe) orderId: string,
   ): Promise<object> {
     return this.invoiceService.getInvoiceData(orderId, userId);
+  }
+
+  @Get(':orderId/invoice/pdf')
+  @ApiOperation({ summary: 'Get invoice PDF (20.2)' })
+  async getInvoicePdf(
+    @CurrentUser('sub') userId: string,
+    @Param('orderId', ParseIdPipe) orderId: string,
+  ): Promise<{ pdfBase64: string; filename: string }> {
+    const buffer = await this.invoiceService.generateInvoicePdf(orderId, userId);
+    return { pdfBase64: buffer.toString('base64'), filename: `invoice-${orderId}.pdf` };
   }
 
   @Get(':orderId/receipt')

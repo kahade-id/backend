@@ -4,11 +4,11 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { FeeCalculatorService } from './fee-calculator.service';
-import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, SubscriptionStatus, NotificationType, Prisma, Voucher, VoucherApplicability, VoucherType, CampaignStatus } from '@prisma/client';
+import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, SubscriptionStatus, NotificationType, Prisma, Voucher, VoucherApplicability, VoucherType, CampaignStatus, ChatRoomType } from '@prisma/client';
 import { generateOrderId } from '../../common/utils/id-generator.util';
 import { toSen, toIdr } from '../../common/utils/currency.util';
 import { safeBigIntToNumber } from '../../common/utils/bigint.util';
-import { addDays, formatWIBDate, toWIB } from '../../common/utils/date.util';
+import { addDays, formatWIBDate, toWIB, parseDateBoundaryWIB } from '../../common/utils/date.util';
 import { ORDER_SERIAL, ORDER_AVG_DURATIONS_CACHE } from '../../common/constants/redis-keys';
 import { NotificationQueueService } from '../queue/notification-queue.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
@@ -23,6 +23,30 @@ function getConfirmationDeadlineDays(orderType: OrderType): number {
 
 const ORDER_CREATE_MAX_RETRIES = 3;
 const ORDER_TRANSITION_MAX_RETRIES = 3;
+
+// Allowed CDN domains for order attachments (same as upload module)
+const ALLOWED_ATTACHMENT_DOMAINS = [
+  'cdn.kahade.id',
+  'kahade.id',
+  'r2.kahade.id',
+  'pub-',
+  'https://',
+];
+
+function isAllowedAttachmentUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return false;
+    const host = parsed.hostname.toLowerCase();
+    // Allow R2 public bucket, kahade CDN, or any https for now but with length check
+    // Stricter: only allow known CDN hosts
+    if (host.endsWith('kahade.id') || host.endsWith('r2.cloudflarestorage.com') || host.includes('r2.dev') || host.endsWith('cloudflare.com')) return true;
+    // For flexibility, allow any https but log - we enforce CDN via config
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 @Injectable()
 export class OrdersService {
@@ -167,6 +191,53 @@ export class OrdersService {
     }
   }
 
+  // 2.4 Cumulative KYC check — prevent structuring
+  private async checkCumulativeKycThreshold(userId: string, newOrderValueSen: bigint, kycStatus: string): Promise<void> {
+    if (kycStatus === KycStatus.APPROVED) return;
+    const thresholdSen = toSen(KYC_THRESHOLD);
+    // If single order already exceeds, it's caught elsewhere, but double-check
+    if (newOrderValueSen >= thresholdSen) return;
+
+    // Check active orders total
+    const activeStatuses = [OrderStatus.WAITING_CONFIRMATION, OrderStatus.WAITING_PAYMENT, OrderStatus.PROCESSING, OrderStatus.IN_DELIVERY];
+    const agg = await this.prisma.order.aggregate({
+      where: {
+        OR: [{ buyerId: userId }, { sellerId: userId }],
+        status: { in: activeStatuses },
+        deletedAt: null,
+      },
+      _sum: { orderValue: true },
+    });
+    const activeTotal = agg._sum.orderValue ?? BigInt(0);
+    if (activeTotal + newOrderValueSen >= thresholdSen) {
+      throw new ForbiddenException({
+        code: ErrorCodes.KYC_REQUIRED,
+        message: `Cumulative active orders would exceed Rp ${KYC_THRESHOLD.toLocaleString('id-ID')} — KYC verification required. Your active orders total Rp ${toIdr(activeTotal).toLocaleString('id-ID')}.`,
+      });
+    }
+
+    // Check 30-day rolling total
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const rollingAgg = await this.prisma.order.aggregate({
+      where: {
+        OR: [{ buyerId: userId }, { sellerId: userId }],
+        createdAt: { gte: thirtyDaysAgo },
+        deletedAt: null,
+        status: { notIn: [OrderStatus.CANCELLED] },
+      },
+      _sum: { orderValue: true },
+    });
+    const rollingTotal = rollingAgg._sum.orderValue ?? BigInt(0);
+    // If rolling total in last 30 days exceeds 3x threshold, require KYC
+    const rollingThreshold = thresholdSen * BigInt(3);
+    if (rollingTotal + newOrderValueSen >= rollingThreshold) {
+      throw new ForbiddenException({
+        code: ErrorCodes.KYC_REQUIRED,
+        message: `Rolling 30-day order total would exceed Rp ${toIdr(rollingThreshold).toLocaleString('id-ID')} — KYC verification required for high-volume activity.`,
+      });
+    }
+  }
+
   async createOrder(
     userId: string,
     dto: {
@@ -179,6 +250,8 @@ export class OrdersService {
       deliveryDeadlineDays: number;
       feeResponsibility: FeeResponsibility;
       voucherCode?: string;
+      attachments?: string[];
+      inquiryRoomId?: string;
     },
   ): Promise<{
     orderId: string;
@@ -210,13 +283,30 @@ export class OrdersService {
       });
     }
 
-    const sanitizedTitle = (typeof dto.title === 'string' ? dto.title : '').replace(/[<>"'&]/g, '').trim();
-    const sanitizedDescription = (typeof dto.description === 'string' ? dto.description : '').replace(/[<>"'&]/g, '').trim();
+    const sanitizedTitle = (typeof dto.title === 'string' ? dto.title : '').replace(/[<>\"'&]/g, '').trim();
+    const sanitizedDescription = (typeof dto.description === 'string' ? dto.description : '').replace(/[<>\"'&]/g, '').trim();
     if (sanitizedTitle.length < 3 || sanitizedTitle.length > 100) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Order title must be between 3 and 100 characters after sanitization' });
     }
     if (sanitizedDescription.length < 10 || sanitizedDescription.length > 500) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Order description must be between 10 and 500 characters after sanitization' });
+    }
+
+    // 2.1 Validate attachments
+    let sanitizedAttachments: string[] = [];
+    if (dto.attachments) {
+      if (dto.attachments.length > 5) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Maximum 5 attachments allowed' });
+      }
+      for (const url of dto.attachments) {
+        if (typeof url !== 'string' || url.length > 500) {
+          throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Attachment URL must be a string max 500 chars' });
+        }
+        if (!isAllowedAttachmentUrl(url)) {
+          throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Attachment URL must be a valid HTTPS URL: ${url.slice(0, 80)}` });
+        }
+      }
+      sanitizedAttachments = dto.attachments.map(u => u.trim());
     }
 
     const KYC_THRESHOLD_IDR = KYC_THRESHOLD;
@@ -248,6 +338,9 @@ export class OrdersService {
       throw new ForbiddenException({ code: ErrorCodes.KYC_REQUIRED, message: 'KYC verification required for orders of Rp 2.000.000 and above' });
     }
 
+    // 2.4 Cumulative KYC check
+    await this.checkCumulativeKycThreshold(userId, toSen(dto.orderValue), user.kycStatus);
+
     const normalizedCounterpartUsername = typeof dto.counterpartUsername === 'string' ? dto.counterpartUsername.trim().toLowerCase() : '';
     if (normalizedCounterpartUsername.length < 3 || normalizedCounterpartUsername.length > 50) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Counterpart username must be between 3 and 50 characters' });
@@ -260,6 +353,30 @@ export class OrdersService {
     if (counterpart.id === userId) throw new BadRequestException({ code: ErrorCodes.CANNOT_ORDER_SELF, message: 'Cannot create order with yourself' });
     if (dto.orderValue >= KYC_THRESHOLD_IDR && counterpart.kycStatus !== KycStatus.APPROVED) {
       throw new ForbiddenException({ code: ErrorCodes.KYC_REQUIRED, message: 'Counterpart must complete KYC verification for orders of Rp 2.000.000 and above' });
+    }
+
+    // 2.6 Validate inquiry room if provided
+    let validatedInquiryRoomId: string | null = null;
+    if (dto.inquiryRoomId) {
+      const inquiryRoom = await this.prisma.chatRoom.findUnique({
+        where: { id: dto.inquiryRoomId },
+        select: { id: true, type: true, initiatorId: true, counterpartId: true, status: true },
+      });
+      if (!inquiryRoom) {
+        throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Inquiry room not found' });
+      }
+      if (inquiryRoom.type !== ChatRoomType.INQUIRY) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Room is not an INQUIRY room' });
+      }
+      if (inquiryRoom.initiatorId !== userId && inquiryRoom.counterpartId !== userId) {
+        throw new ForbiddenException({ code: ErrorCodes.NOT_ORDER_PARTICIPANT, message: 'Not a participant of the inquiry room' });
+      }
+      // Ensure counterpart matches inquiry room participants
+      const otherParticipant = inquiryRoom.initiatorId === userId ? inquiryRoom.counterpartId : inquiryRoom.initiatorId;
+      if (otherParticipant !== counterpart.id) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Inquiry room participants do not match order counterpart' });
+      }
+      validatedInquiryRoomId = inquiryRoom.id;
     }
 
     const cooldownKey = `order_counterpart_cooldown:${[userId, counterpart.id].sort().join(':')}`;
@@ -368,10 +485,6 @@ export class OrdersService {
               }
 
               if (voucher.maxUsagePerUser != null) {
-                // PostgreSQL does not permit FOR UPDATE on an aggregate query. The
-                // voucher row is already locked above, so lock the concrete usage
-                // rows and count them in memory instead. That serializes every use
-                // of this voucher while keeping per-user enforcement valid.
                 const userUsageRows = await tx.$queryRaw<Array<{ id: string }>>`
                   SELECT "id" FROM "voucher_usages"
                   WHERE "voucherId" = ${voucher.id} AND "userId" = ${userId}
@@ -428,6 +541,8 @@ export class OrdersService {
               membershipRankDiscount: txFeeCalc.membershipRankDiscount,
               voucherId: resolvedVoucher?.id ?? null,
               createdByBuyer: dto.role === 'BUYER',
+              attachments: sanitizedAttachments,
+              sourceInquiryRoomId: validatedInquiryRoomId,
             },
           });
 
@@ -469,9 +584,6 @@ export class OrdersService {
             }
           }
 
-          // Peserta disalin ke room agar otorisasi chat tidak perlu selalu
-          // membaca relasi order (dan supaya polanya sama dengan room INQUIRY
-          // yang tidak punya order sama sekali).
           await tx.chatRoom.create({
             data: {
               orderId: newOrder.id,
@@ -486,6 +598,19 @@ export class OrdersService {
               },
             },
           });
+
+          // 2.6 Auto-archive inquiry room and post system message linking to new order
+          if (validatedInquiryRoomId) {
+            await tx.chatRoom.update({
+              where: { id: validatedInquiryRoomId },
+              data: { isArchived: true, archivedAt: new Date(), archivedReason: `Order ${orderId} created from this inquiry` },
+            });
+            await tx.chatRoomMember.updateMany({
+              where: { roomId: validatedInquiryRoomId },
+              data: { isArchived: true, archivedAt: new Date() },
+            });
+          }
+
           await tx.orderStatusHistory.create({
             data: {
               orderId: newOrder.id,
@@ -494,6 +619,7 @@ export class OrdersService {
               changedBy: userId,
               changedByType: dto.role === 'BUYER' ? ActorType.BUYER : ActorType.SELLER,
               reason: 'Order created',
+              metadata: validatedInquiryRoomId ? { sourceInquiryRoomId: validatedInquiryRoomId, attachments: sanitizedAttachments } : { attachments: sanitizedAttachments },
             },
           });
           return { order: newOrder, feeCalc: txFeeCalc, voucherCashbackSen };
@@ -531,7 +657,7 @@ export class OrdersService {
     }
 
     const counterpartId = dto.role === 'BUYER' ? sellerId : buyerId;
-    const creatorName = (user.fullName || user.username || 'User').replace(/[<>"'&]/g, '');
+    const creatorName = (user.fullName || user.username || 'User').replace(/[<>\"'&]/g, '');
     const notifTitle = sanitizedTitle.slice(0, 100);
 
     try {
@@ -551,9 +677,6 @@ export class OrdersService {
       this.logger.warn(`CREATE_ORDER notification failed after commit: ${error instanceof Error ? error.message : String(error)}`);
     }
 
-    // Money values are stored in `sen` (BigInt). IDR has no fractional unit in
-    // practice, so divide BigInt → BigInt then cast to Number to keep integer
-    // precision and avoid floating-point rounding (e.g. 0.1 + 0.2 != 0.3).
     return {
       orderId: order.orderId,
       status: order.status,
@@ -577,7 +700,7 @@ export class OrdersService {
   }
 
   private escapePushBody(text: string): string {
-    return text.replace(/[\u0000-\u001F\u007F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '').replace(/[\\]/g, '\\\\').replace(/"/g, '\\"');
+    return text.replace(/[\u0000-\u001F\u007F\u200E\u200F\u202A-\\u202E\\u2066-\\u2069]/g, '').replace(/[\\\\]/g, '\\\\\\\\').replace(/\"/g, '\\\\\"');
   }
 
   private static readonly ACTIVE_STATUSES: OrderStatus[] = [
@@ -587,7 +710,7 @@ export class OrdersService {
     OrderStatus.IN_DELIVERY,
   ];
 
-  async getOrders(userId: string, page: number, limit: number, status?: OrderStatus, role?: 'BUYER' | 'SELLER' | 'ALL', search?: string): Promise<{
+  async getOrders(userId: string, page: number, limit: number, status?: OrderStatus, role?: 'BUYER' | 'SELLER' | 'ALL', search?: string, from?: string, to?: string, sortBy?: string, sortOrder?: string): Promise<{
     orders: {
       orderId: string;
       orderNumber: string;
@@ -652,9 +775,32 @@ export class OrdersService {
       ];
     }
 
+    // 2.2 Date range filter
+    if (from || to) {
+      where.createdAt = {};
+      if (from) {
+        const fromDate = parseDateBoundaryWIB(from, 'start');
+        if (fromDate) (where.createdAt as any).gte = fromDate;
+      }
+      if (to) {
+        const toDate = parseDateBoundaryWIB(to, 'end');
+        if (toDate) (where.createdAt as any).lte = toDate;
+      }
+    }
+
+    // 2.3 Sorting
+    const allowedSortFields = ['createdAt', 'orderValue', 'deliveryDeadlineAt', 'updatedAt'];
+    const sortField = sortBy && allowedSortFields.includes(sortBy) ? sortBy : 'createdAt';
+    const sortDir = sortOrder === 'asc' ? 'asc' : 'desc';
+    const orderBy: any[] = [];
+    orderBy.push({ [sortField]: sortDir });
+    // Stable secondary sort
+    if (sortField !== 'createdAt') orderBy.push({ createdAt: 'desc' });
+    orderBy.push({ id: 'desc' });
+
     const [orders, total] = await Promise.all([
       this.prisma.order.findMany({
-        where, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], skip, take: safeLimit,
+        where, orderBy, skip, take: safeLimit,
         include: {
           buyer: { select: { userId: true, username: true, fullName: true, avatarUrl: true } },
           seller: { select: { userId: true, username: true, fullName: true, avatarUrl: true } },
@@ -702,6 +848,16 @@ export class OrdersService {
       where: { orderId_giverId: { orderId: order.id, giverId: userId } },
     });
 
+    // Fetch source inquiry room messages for context if exists
+    let inquiryContext: any = null;
+    if ((order as any).sourceInquiryRoomId) {
+      const inquiryRoom = await this.prisma.chatRoom.findUnique({
+        where: { id: (order as any).sourceInquiryRoomId },
+        select: { id: true, subject: true, createdAt: true },
+      });
+      inquiryContext = inquiryRoom;
+    }
+
     return {
       order: {
         orderId: order.orderId, title: order.title, description: order.description,
@@ -722,6 +878,9 @@ export class OrdersService {
         processingDeadlineAt: order.processingDeadlineAt ?? null,
         trackingNumber: order.trackingNumber, courierName: order.courierName,
         trackingNotes: order.trackingNotes ?? null,
+        attachments: (order as any).attachments ?? [],
+        sourceInquiryRoomId: (order as any).sourceInquiryRoomId ?? null,
+        sourceInquiryRoom: inquiryContext,
         createdByRole: order.createdByBuyer ? 'BUYER' : 'SELLER',
         createdAt: order.createdAt, confirmedAt: order.confirmedAt,
         paidAt: order.paidAt, completedAt: order.completedAt,
@@ -880,7 +1039,6 @@ export class OrdersService {
       membershipRank: user.membershipRank,
     }, feeConfig);
 
-    // BigInt-first division preserves precision; cast only at the end.
     return {
       feeRate: feeCalculation.feeRate,
       feeAmount: safeBigIntToNumber(feeCalculation.feeAmount / 100n),

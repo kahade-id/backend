@@ -310,4 +310,17 @@ export class DisputesController {
   ): Promise<{ status: string }> {
     return this.mutualResolutionService.withdraw(disputeId, proposalId, userId);
   }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 3600000, limit: 3 } })
+  @Idempotency()
+  @Post(':disputeId/escalate')
+  @ApiOperation({ summary: 'Manually escalate dispute to admin (8.3)' })
+  async escalateDispute(
+    @CurrentUser('sub') userId: string,
+    @Param('disputeId', ParseIdPipe) disputeId: string,
+    @Body() dto: { reason?: string },
+  ): Promise<object> {
+    return this.disputesService.escalateDispute(disputeId, userId, dto.reason);
+  }
 }

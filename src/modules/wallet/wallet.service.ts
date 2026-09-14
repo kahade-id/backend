@@ -3847,4 +3847,98 @@ export class WalletService implements OnModuleInit {
   private async getNextPaymentSerial(): Promise<number> {
     return this.walletTxSerialService.getNextForPrefix('payment_serial');
   }
+
+  // Favorite transfer recipients (3.4)
+  async getFavoriteRecipients(userId: string): Promise<Record<string, unknown>[]> {
+    // Use raw query fallback if prisma model not yet generated
+    try {
+      const favs = await (this.prisma as any).walletFavoriteRecipient?.findMany?.({
+        where: { userId },
+        include: { recipient: { select: { id: true, userId: true, fullName: true, username: true, avatarUrl: true } } },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (favs) return favs;
+    } catch {}
+    // Fallback raw SQL
+    const rows = await this.prisma.$queryRaw<Array<{ id: string; recipientId: string; label: string | null; createdAt: Date; userId2: string; fullName: string; username: string | null; avatarUrl: string | null; recipientUserId: string }>>`
+      SELECT wfr.id, wfr."recipientId", wfr.label, wfr."createdAt",
+             u.id as "userId2", u."fullName", u.username, u."avatarUrl", u."userId" as "recipientUserId"
+      FROM wallet_favorite_recipients wfr
+      JOIN users u ON u.id = wfr."recipientId"
+      WHERE wfr."userId" = ${userId}
+      ORDER BY wfr."createdAt" DESC
+    `;
+    return rows.map(r => ({
+      id: r.id,
+      label: r.label,
+      createdAt: r.createdAt,
+      recipient: {
+        id: r.recipientId,
+        userId: r.recipientUserId,
+        fullName: r.fullName,
+        username: r.username,
+        avatarUrl: r.avatarUrl,
+      },
+    }));
+  }
+
+  async addFavoriteRecipient(userId: string, recipientId: string, label?: string): Promise<Record<string, unknown>> {
+    if (userId === recipientId) {
+      throw new BadRequestException({ code: ErrorCodes.CANNOT_TRANSFER_SELF, message: 'Cannot favorite yourself' });
+    }
+    const recipient = await this.prisma.user.findFirst({
+      where: { OR: [{ id: recipientId }, { userId: recipientId }, { username: recipientId }], deletedAt: null },
+      select: { id: true },
+    });
+    if (!recipient) throw new NotFoundException({ code: ErrorCodes.RECIPIENT_NOT_FOUND, message: 'Recipient not found' });
+    if (recipient.id === userId) throw new BadRequestException({ code: ErrorCodes.CANNOT_TRANSFER_SELF, message: 'Cannot favorite yourself' });
+
+    const safeLabel = label ? label.replace(/[\u0000-\u001F\u007F]/g, ' ').trim().slice(0, 50) : null;
+
+    try {
+      const created = await (this.prisma as any).walletFavoriteRecipient?.create?.({
+        data: { userId, recipientId: recipient.id, label: safeLabel },
+        include: { recipient: { select: { id: true, userId: true, fullName: true, username: true, avatarUrl: true } } },
+      });
+      if (created) return created;
+    } catch (e: any) {
+      if (e?.code === 'P2002') {
+        throw new ConflictException({ code: 'ALREADY_FAVORITED', message: 'Recipient already in favorites' });
+      }
+    }
+
+    // Raw SQL fallback
+    try {
+      const inserted = await this.prisma.$queryRaw<Array<{ id: string }>>`
+        INSERT INTO wallet_favorite_recipients (id, "userId", "recipientId", label, "createdAt")
+        VALUES (gen_random_uuid()::text, ${userId}, ${recipient.id}, ${safeLabel}, NOW())
+        RETURNING id
+      `;
+      const id = inserted[0]?.id;
+      if (!id) throw new Error('Insert failed');
+      const recipientFull = await this.prisma.user.findUnique({ where: { id: recipient.id }, select: { id: true, userId: true, fullName: true, username: true, avatarUrl: true } });
+      return { id, userId, recipientId: recipient.id, label: safeLabel, recipient: recipientFull };
+    } catch (e: any) {
+      if (e?.message?.includes('duplicate') || e?.code === '23505') {
+        throw new ConflictException({ code: 'ALREADY_FAVORITED', message: 'Recipient already in favorites' });
+      }
+      throw e;
+    }
+  }
+
+  async removeFavoriteRecipient(userId: string, id: string): Promise<{ message: string }> {
+    try {
+      const deleted = await (this.prisma as any).walletFavoriteRecipient?.deleteMany?.({ where: { id, userId } });
+      if (deleted && deleted.count > 0) return { message: 'Favorite removed' };
+      if (deleted && deleted.count === 0) throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Favorite not found' });
+    } catch (e) {
+      if (e instanceof NotFoundException) throw e;
+      // fallthrough to raw
+    }
+    const result = await this.prisma.$queryRaw<Array<{ id: string }>>`
+      DELETE FROM wallet_favorite_recipients WHERE id = ${id} AND "userId" = ${userId} RETURNING id
+    `;
+    if (!result.length) throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Favorite not found' });
+    return { message: 'Favorite removed' };
+  }
 }

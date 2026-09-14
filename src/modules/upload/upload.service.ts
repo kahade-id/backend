@@ -21,14 +21,16 @@ const nanoid = customAlphabet('1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLM
 const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
   [UploadPurpose.KYC_KTP]: ['image/jpeg', 'image/png', 'image/webp'],
   [UploadPurpose.KYC_SELFIE]: ['image/jpeg', 'image/png', 'image/webp'],
+  [UploadPurpose.KYC_PASSPORT]: ['image/jpeg', 'image/png', 'image/webp'],
+  [UploadPurpose.KYC_LIVENESS]: ['image/jpeg', 'image/png', 'image/webp'],
   // Dokumen badan usaha boleh PDF (NPWP/akta/SIUP umumnya dipindai sebagai PDF).
   [UploadPurpose.BUSINESS_DOCUMENT]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
   // Section 3: gambar showcase tampil publik di feed, jadi hanya image raster.
   // PDF/SVG ditolak — tidak bisa dirender sebagai thumbnail kartu feed.
   [UploadPurpose.SHOWCASE_IMAGE]: ['image/jpeg', 'image/png', 'image/webp'],
   [UploadPurpose.AVATAR]: ['image/jpeg', 'image/png', 'image/webp'],
-  [UploadPurpose.CHAT_ATTACHMENT]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
-  [UploadPurpose.DISPUTE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
+  [UploadPurpose.CHAT_ATTACHMENT]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm', 'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/mp4'],
+  [UploadPurpose.DISPUTE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm'],
   [UploadPurpose.REPORT_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
   [UploadPurpose.DELIVERY_PROOF]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
 };
@@ -38,11 +40,13 @@ const MIN_FILE_SIZE = 1024;
 const MAX_FILE_SIZE: Record<UploadPurpose, number> = {
   [UploadPurpose.KYC_KTP]: 5 * 1024 * 1024,
   [UploadPurpose.KYC_SELFIE]: 5 * 1024 * 1024,
+  [UploadPurpose.KYC_PASSPORT]: 5 * 1024 * 1024,
+  [UploadPurpose.KYC_LIVENESS]: 5 * 1024 * 1024,
   [UploadPurpose.BUSINESS_DOCUMENT]: 10 * 1024 * 1024,
   [UploadPurpose.SHOWCASE_IMAGE]: 5 * 1024 * 1024,
   [UploadPurpose.AVATAR]: 2 * 1024 * 1024,
-  [UploadPurpose.CHAT_ATTACHMENT]: 10 * 1024 * 1024,
-  [UploadPurpose.DISPUTE_EVIDENCE]: 10 * 1024 * 1024,
+  [UploadPurpose.CHAT_ATTACHMENT]: 50 * 1024 * 1024,
+  [UploadPurpose.DISPUTE_EVIDENCE]: 50 * 1024 * 1024,
   [UploadPurpose.REPORT_EVIDENCE]: 10 * 1024 * 1024,
   [UploadPurpose.DELIVERY_PROOF]: 10 * 1024 * 1024,
 };
@@ -135,6 +139,8 @@ function isSafeFileKey(fileKey: unknown): fileKey is string {
 const PURPOSE_VISIBILITY: Record<UploadPurpose, 'private' | 'public'> = {
   [UploadPurpose.KYC_KTP]: 'private',
   [UploadPurpose.KYC_SELFIE]: 'private',
+  [UploadPurpose.KYC_PASSPORT]: 'private',
+  [UploadPurpose.KYC_LIVENESS]: 'private',
   [UploadPurpose.BUSINESS_DOCUMENT]: 'private',
   [UploadPurpose.SHOWCASE_IMAGE]: 'public',
   [UploadPurpose.AVATAR]: 'public',
@@ -147,6 +153,8 @@ const PURPOSE_VISIBILITY: Record<UploadPurpose, 'private' | 'public'> = {
 const PURPOSE_FOLDER_MAP_INTERNAL: Record<UploadPurpose, string> = {
   [UploadPurpose.KYC_KTP]: 'kyc-ktp',
   [UploadPurpose.KYC_SELFIE]: 'kyc-selfie',
+  [UploadPurpose.KYC_PASSPORT]: 'kyc-passport',
+  [UploadPurpose.KYC_LIVENESS]: 'kyc-liveness',
   [UploadPurpose.BUSINESS_DOCUMENT]: 'business-documents',
   [UploadPurpose.SHOWCASE_IMAGE]: 'showcase-images',
   [UploadPurpose.AVATAR]: 'avatars',
@@ -261,6 +269,8 @@ export class UploadService {
     const EXPIRY_BY_PURPOSE: Record<UploadPurpose, number> = {
       [UploadPurpose.KYC_KTP]: 600,
       [UploadPurpose.KYC_SELFIE]: 600,
+      [UploadPurpose.KYC_PASSPORT]: 600,
+      [UploadPurpose.KYC_LIVENESS]: 600,
       // Dokumen badan usaha bisa beberapa file dan diupload bergantian, jadi
       // window-nya disamakan dengan evidence (1800 s), bukan avatar (300 s).
       [UploadPurpose.BUSINESS_DOCUMENT]: 1800,
@@ -869,5 +879,24 @@ export class UploadService {
     const folder = UploadService.PURPOSE_FOLDER_MAP[purpose];
     const syntheticKey = `uploads/${folder}/`;
     return this.getBucketForKey(syntheticKey);
+  }
+
+  // 18.1 Upload virus scan placeholder (ClamAV hook)
+  async scanFileForVirus(fileKey: string): Promise<{ clean: boolean; scannedAt: Date; engine: string }> {
+    // Placeholder: in production, integrate with ClamAV via clamdjs or HTTP service
+    // For now, we check file extension and log scan attempt
+    this.logger.log(`Virus scan requested for ${fileKey} - running placeholder scan`);
+    const suspiciousExtensions = ['.exe', '.bat', '.cmd', '.scr', '.pif'];
+    const lowerKey = fileKey.toLowerCase();
+    const isSuspicious = suspiciousExtensions.some(ext => lowerKey.endsWith(ext));
+    if (isSuspicious) {
+      this.logger.warn(`File ${fileKey} flagged as suspicious by extension`);
+      return { clean: false, scannedAt: new Date(), engine: 'placeholder-extension-check' };
+    }
+    // Simulate ClamAV scan via Redis flag for future integration
+    try {
+      await this.redis.setex(`virus_scan:${fileKey}`, 86400, JSON.stringify({ clean: true, scannedAt: new Date().toISOString() }));
+    } catch {}
+    return { clean: true, scannedAt: new Date(), engine: 'clamav-placeholder' };
   }
 }

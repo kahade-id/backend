@@ -19,3 +19,4 @@ export * from './request-otp.dto';
 export * from './verify-phone-otp.dto';
 export * from './phone-register.dto';
 export * from './change-phone.dto';
+export * from './social-login.dto';

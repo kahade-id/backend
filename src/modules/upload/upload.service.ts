@@ -29,7 +29,7 @@ const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
   // PDF/SVG ditolak — tidak bisa dirender sebagai thumbnail kartu feed.
   [UploadPurpose.SHOWCASE_IMAGE]: ['image/jpeg', 'image/png', 'image/webp'],
   [UploadPurpose.AVATAR]: ['image/jpeg', 'image/png', 'image/webp'],
-  [UploadPurpose.CHAT_ATTACHMENT]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
+  [UploadPurpose.CHAT_ATTACHMENT]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm', 'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/mp4'],
   [UploadPurpose.DISPUTE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm'],
   [UploadPurpose.REPORT_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
   [UploadPurpose.DELIVERY_PROOF]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
@@ -45,7 +45,7 @@ const MAX_FILE_SIZE: Record<UploadPurpose, number> = {
   [UploadPurpose.BUSINESS_DOCUMENT]: 10 * 1024 * 1024,
   [UploadPurpose.SHOWCASE_IMAGE]: 5 * 1024 * 1024,
   [UploadPurpose.AVATAR]: 2 * 1024 * 1024,
-  [UploadPurpose.CHAT_ATTACHMENT]: 10 * 1024 * 1024,
+  [UploadPurpose.CHAT_ATTACHMENT]: 50 * 1024 * 1024,
   [UploadPurpose.DISPUTE_EVIDENCE]: 50 * 1024 * 1024,
   [UploadPurpose.REPORT_EVIDENCE]: 10 * 1024 * 1024,
   [UploadPurpose.DELIVERY_PROOF]: 10 * 1024 * 1024,

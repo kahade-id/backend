@@ -1,4 +1,4 @@
-import { Controller, Get, Query, DefaultValuePipe, ParseIntPipe, BadRequestException, UseGuards, Logger, Req } from '@nestjs/common';
+import { Controller, Get, Query, DefaultValuePipe, ParseIntPipe, BadRequestException, UseGuards, Logger, Req, Res } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { AdminAnalyticsService } from '../admin-analytics.service';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
@@ -8,7 +8,7 @@ import { AdminRoute } from '../../../common/decorators/public.decorator';
 import { ParseDateQueryPipe, ParseEnumQueryPipe } from '../../../common/pipes/parse-query-string.pipe';
 import { ClampLimitPipe } from '../../../common/pipes/clamp-limit.pipe';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
-import { Request } from 'express';
+import { Request, Response } from 'express';
 
 function parseOptionalDate(value: string | undefined, field: string): Date | undefined {
   if (!value) return undefined;
@@ -22,7 +22,7 @@ function parseOptionalDate(value: string | undefined, field: string): Date | und
 @ApiTags('admin/analytics')
 @ApiBearerAuth('admin-token')
 @UseGuards(JwtAdminGuard, AdminRolesGuard)
-@AdminRoles('SUPER_ADMIN')
+@AdminRoles('SUPER_ADMIN', 'FINANCE_ADMIN')
 @AdminRoute()
 @Controller('admin/analytics')
 export class AdminAnalyticsController {
@@ -100,5 +100,26 @@ export class AdminAnalyticsController {
       parseOptionalDate(startDate, 'startDate'),
       parseOptionalDate(endDate, 'endDate'),
     );
+  }
+
+  @Get('export/csv')
+  @ApiOperation({ summary: 'Export analytics overview CSV (19.4)' })
+  async exportCsv(
+    @Query('startDate', new ParseDateQueryPipe('startDate')) startDate?: string,
+    @Query('endDate', new ParseDateQueryPipe('endDate')) endDate?: string,
+    @Res() res: Response,
+    @CurrentAdmin('sub') adminId?: string,
+    @Req() req?: Request,
+  ): Promise<void> {
+    this.logAdminAccess(adminId ?? 'unknown', 'analytics/export/csv', { startDate, endDate }, req!);
+    const overview = await this.analyticsService.getOverview(
+      parseOptionalDate(startDate, 'startDate'),
+      parseOptionalDate(endDate, 'endDate'),
+    ) as any;
+    const csvHeader = 'metric,value\n';
+    const csvRows = Object.entries(overview).map(([k, v]) => `${k},${typeof v === 'object' ? JSON.stringify(v).replace(/,/g, ';') : v}`).join('\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=\"analytics-export.csv\"');
+    res.send(csvHeader + csvRows);
   }
 }

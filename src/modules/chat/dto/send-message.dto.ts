@@ -23,6 +23,8 @@ export enum UserChatMessageType {
   TEXT = 'TEXT',
   IMAGE = 'IMAGE',
   FILE = 'FILE',
+  /** Video message — with optional caption */
+  VIDEO = 'VIDEO',
   /** Voice note — wajib lampiran audio + durationSeconds. */
   VOICE = 'VOICE',
 }
@@ -127,4 +129,10 @@ export class SendMessageDto {
   @Min(CHAT_VOICE_MIN_DURATION_SECONDS)
   @Max(CHAT_VOICE_MAX_DURATION_SECONDS)
   durationSeconds?: number;
+
+  @ApiPropertyOptional({ description: 'Caption for image/video attachments', maxLength: 500 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  caption?: string;
 }

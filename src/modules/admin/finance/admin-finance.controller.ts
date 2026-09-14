@@ -1,6 +1,7 @@
 import { AdminRoute } from '../../../common/decorators/public.decorator';
 import { Idempotency } from '../../../common/decorators/idempotency.decorator';
-import { Controller, Get, Post, Param, Query, Body, UseGuards, Req, BadRequestException, HttpCode } from '@nestjs/common';
+import { Controller, Get, Post, Param, Query, Body, UseGuards, Req, Res, BadRequestException, HttpCode } from '@nestjs/common';
+import { Response } from 'express';
 import { ParseIdPipe } from '../../../common/pipes/parse-id.pipe';
 import { ParseDateQueryPipe } from '../../../common/pipes/parse-query-string.pipe';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
@@ -186,5 +187,17 @@ export class AdminFinanceController {
       throw new BadRequestException({ code: 'INVALID_DATE_RANGE', message: 'from must be before or equal to to' });
     }
     return this.reconciliationService.getFinancialAuditTrail(userId, from, to);
+  }
+
+  @Get('export/csv')
+  @AdminRoles('SUPER_ADMIN', 'FINANCE_ADMIN')
+  @ApiOperation({ summary: 'Export finance summary CSV (19.4)' })
+  async exportCsv(@Res() res: Response): Promise<void> {
+    const summary = await this.service.getFinancialSummary() as any;
+    const csvHeader = 'metric,value\n';
+    const csvRows = Object.entries(summary).map(([k, v]) => `${k},${typeof v === 'object' ? JSON.stringify(v) : v}`).join('\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=\"finance-export.csv\"');
+    res.send(csvHeader + csvRows);
   }
 }

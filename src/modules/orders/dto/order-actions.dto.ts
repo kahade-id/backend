@@ -115,7 +115,22 @@ export class CancelOrderDto {
   note?: string;
 }
 
+export enum DisputeCategory {
+  ITEM_NOT_RECEIVED = 'ITEM_NOT_RECEIVED',
+  ITEM_NOT_AS_DESCRIBED = 'ITEM_NOT_AS_DESCRIBED',
+  DAMAGED_ITEM = 'DAMAGED_ITEM',
+  WRONG_ITEM = 'WRONG_ITEM',
+  SERVICE_NOT_RENDERED = 'SERVICE_NOT_RENDERED',
+  PAYMENT_ISSUE = 'PAYMENT_ISSUE',
+  FRAUD = 'FRAUD',
+  OTHER = 'OTHER',
+}
+
 export class SubmitDisputeDto {
+  @ApiProperty({ description: 'Dispute category', enum: DisputeCategory })
+  @IsEnum(DisputeCategory)
+  category!: DisputeCategory;
+
   @ApiProperty({ description: 'Dispute claim', minLength: 20, maxLength: 2000 })
   @IsString()
   @MinLength(20)
@@ -133,7 +148,7 @@ export class SubmitDisputeDto {
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(10)
-  @IsIn(['image/jpeg', 'image/png', 'image/webp', 'application/pdf'], { each: true, message: 'Invalid file type. Allowed: image/jpeg, image/png, image/webp, application/pdf' })
+  @IsIn(['image/jpeg', 'image/png', 'image/webp', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm'], { each: true, message: 'Invalid file type. Allowed: image/jpeg, image/png, image/webp, application/pdf, video/mp4, video/quicktime, video/webm' })
   fileTypes?: string[];
 }
 

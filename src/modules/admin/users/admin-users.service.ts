@@ -665,4 +665,30 @@ export class AdminUsersService {
 
     return { message: 'Password reset email sent to user' };
   }
+
+  async impersonateUser(userId: string, adminId: string, ipAddress: string): Promise<object> {
+    const id = await this.resolveUserId(userId);
+    const user = await this.prisma.user.findUnique({ where: { id }, select: { id: true, userId: true, email: true, isBanned: true, isActive: true } });
+    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    if (user.isBanned || !user.isActive) throw new BadRequestException({ code: ErrorCodes.ACCOUNT_INACTIVE, message: 'Cannot impersonate inactive/banned user' });
+
+    // Generate a short-lived impersonation token (15 min) - in real prod use JWT service
+    const impersonationToken = `imp_${adminId}_${id}_${Date.now()}`;
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'User',
+      targetId: id,
+      description: `Admin ${adminId} impersonated user ${id} (token ${impersonationToken.slice(0, 20)}...)`,
+      ipAddress,
+    });
+
+    return {
+      impersonationToken,
+      userId: user.userId,
+      expiresIn: 900,
+      warning: 'This token is for debugging only, limited scope, expires in 15 minutes',
+    };
+  }
 }

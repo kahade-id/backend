@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Query, Param, Req, Res, ParseIntPipe, DefaultValuePipe, UseGuards, HttpCode } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Body, Query, Param, Req, Res, ParseIntPipe, DefaultValuePipe, UseGuards, HttpCode } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { ParseIdPipe } from '../../common/pipes/parse-id.pipe';
 import { ClampLimitPipe } from '../../common/pipes/clamp-limit.pipe';
@@ -189,7 +189,7 @@ export class WalletController {
 
   @Throttle({ default: { ttl: 60000, limit: 5 } })
   @Get('export')
-  @ApiOperation({ summary: 'Export wallet transactions as CSV or XLSX' })
+  @ApiOperation({ summary: 'Export wallet transactions as CSV or XLSX (streaming)' })
   async exportTransactions(
     @CurrentUser('sub') userId: string,
     @Query() query: ExportCsvDto,
@@ -203,6 +203,18 @@ export class WalletController {
       const filename = `kahade_transactions_${dateStr}.xlsx`;
       res.set({
         'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length': buffer.length.toString(),
+      });
+      res.send(buffer);
+      return;
+    }
+
+    if (format === 'pdf') {
+      const buffer = await this.walletExportService.exportTransactionsPdf(userId, query.from, query.to, query.types);
+      const filename = `kahade_report_${dateStr}.pdf`;
+      res.set({
+        'Content-Type': 'application/pdf',
         'Content-Disposition': `attachment; filename="${filename}"`,
         'Content-Length': buffer.length.toString(),
       });
@@ -225,25 +237,86 @@ export class WalletController {
 
   @Throttle({ default: { ttl: 60000, limit: 5 } })
   @Get('export/csv')
-  @ApiOperation({ summary: 'Export wallet transactions as CSV' })
+  @ApiOperation({ summary: 'Export wallet transactions as CSV (streaming file)' })
   async exportCsv(
     @CurrentUser('sub') userId: string,
     @Query() query: ExportCsvDto,
-  ): Promise<{ csv: string; filename: string }> {
-    const csv = await this.walletExportService.exportTransactionsCsv(userId, query.from, query.to, query.types);
-    const filename = `kahade_transactions_${formatWIBDate()}.csv`;
-    return { csv, filename };
+    @Res() res: Response,
+  ): Promise<void> {
+    const dateStr = formatWIBDate();
+    const filename = `kahade_transactions_${dateStr}.csv`;
+    res.set({
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Transfer-Encoding': 'chunked',
+    });
+    const found = await this.walletExportService.streamTransactionsCsv(userId, res, query.from, query.to, query.types);
+    if (!found) {
+      res.status(200);
+    }
+    res.end();
   }
 
   @Throttle({ default: { ttl: 60000, limit: 5 } })
   @Get('export/pdf')
-  @ApiOperation({ summary: 'Export wallet transactions as printable HTML report' })
+  @ApiOperation({ summary: 'Export wallet transactions as PDF (real PDF file)' })
   async exportPdf(
     @CurrentUser('sub') userId: string,
     @Query() query: ExportCsvDto,
-  ): Promise<{ html: string; filename: string }> {
+    @Res() res: Response,
+  ): Promise<void> {
+    const buffer = await this.walletExportService.exportTransactionsPdf(userId, query.from, query.to, query.types);
+    const filename = `kahade_report_${formatWIBDate()}.pdf`;
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Length': buffer.length.toString(),
+    });
+    res.send(buffer);
+  }
+
+  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  @Get('export/html')
+  @ApiOperation({ summary: 'Export wallet transactions as printable HTML report' })
+  async exportHtml(
+    @CurrentUser('sub') userId: string,
+    @Query() query: ExportCsvDto,
+    @Res() res: Response,
+  ): Promise<void> {
     const html = await this.walletExportService.exportTransactionsHtml(userId, query.from, query.to);
     const filename = `kahade_report_${formatWIBDate()}.html`;
-    return { html, filename };
+    res.set({
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+    });
+    res.send(html);
+  }
+
+  // Favorite recipients for transfer
+  @Get('favorite-recipients')
+  @ApiOperation({ summary: 'List saved favorite transfer recipients' })
+  async getFavoriteRecipients(@CurrentUser('sub') userId: string): Promise<object> {
+    return this.walletService.getFavoriteRecipients(userId);
+  }
+
+  @Post('favorite-recipients')
+  @UseGuards(UserThrottleGuard)
+  @ApiOperation({ summary: 'Add a favorite transfer recipient' })
+  async addFavoriteRecipient(
+    @CurrentUser('sub') userId: string,
+    @Body('recipientId') recipientId: string,
+    @Body('label') label?: string,
+  ): Promise<object> {
+    return this.walletService.addFavoriteRecipient(userId, recipientId, label);
+  }
+
+  @Delete('favorite-recipients/:id')
+  @UseGuards(UserThrottleGuard)
+  @ApiOperation({ summary: 'Remove a favorite transfer recipient' })
+  async removeFavoriteRecipient(
+    @CurrentUser('sub') userId: string,
+    @Param('id', ParseIdPipe) id: string,
+  ): Promise<object> {
+    return this.walletService.removeFavoriteRecipient(userId, id);
   }
 }

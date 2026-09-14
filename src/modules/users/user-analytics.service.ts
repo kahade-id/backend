@@ -132,37 +132,74 @@ export class UserAnalyticsService {
     isKahadePlus: boolean;
     createdAt: Date;
   }): number {
-    let score = 0;
+    return this.calculateTrustScoreDetailed(user).total;
+  }
 
-    if (user.kycStatus === 'APPROVED') score += 20;
-    if (user.isKahadePlus) score += 5;
+  calculateTrustScoreDetailed(user: {
+    totalOrdersCompleted: number;
+    totalOrdersCancelled: number;
+    totalOrdersDisputed: number;
+    averageRating: unknown;
+    totalRatingCount: number;
+    kycStatus: string;
+    isKahadePlus: boolean;
+    createdAt: Date;
+  }): { total: number; breakdown: Record<string, { score: number; max: number; label: string; suggestion?: string }>; } {
+    const breakdown: Record<string, { score: number; max: number; label: string; suggestion?: string }> = {};
+    let total = 0;
 
+    // KYC
+    const kycScore = user.kycStatus === 'APPROVED' ? 20 : 0;
+    breakdown.kyc = { score: kycScore, max: 20, label: 'KYC Verification', suggestion: kycScore === 0 ? 'Complete KYC verification to gain 20 points' : undefined };
+    total += kycScore;
+
+    // Kahade Plus
+    const plusScore = user.isKahadePlus ? 5 : 0;
+    breakdown.kahadePlus = { score: plusScore, max: 5, label: 'Kahade Plus Membership', suggestion: plusScore === 0 ? 'Subscribe to Kahade Plus for 5 points' : undefined };
+    total += plusScore;
+
+    // Completion rate
     const completedOrders = Number.isFinite(user.totalOrdersCompleted) ? Math.max(0, user.totalOrdersCompleted) : 0;
     const cancelledOrders = Number.isFinite(user.totalOrdersCancelled) ? Math.max(0, user.totalOrdersCancelled) : 0;
     const disputedOrders = Number.isFinite(user.totalOrdersDisputed) ? Math.max(0, user.totalOrdersDisputed) : 0;
     const totalOrders = completedOrders + cancelledOrders + disputedOrders;
+    let completionScore = 0;
     if (totalOrders > 0) {
       const completionRate = completedOrders / totalOrders;
-      score += Math.round(completionRate * 25);
+      completionScore = Math.round(completionRate * 25);
     }
+    breakdown.completionRate = { score: completionScore, max: 25, label: 'Order Completion Rate', suggestion: completionScore < 20 ? 'Complete more orders without cancellation to improve' : undefined };
+    total += completionScore;
 
+    // Rating
     const parsedRating = Number(user.averageRating);
     const rating = Number.isFinite(parsedRating) ? Math.min(5, Math.max(0, parsedRating)) : 0;
     const ratingCount = Number.isFinite(user.totalRatingCount) ? Math.max(0, user.totalRatingCount) : 0;
+    let ratingScore = 0;
     if (ratingCount > 0 && rating > 0) {
-      score += Math.round((rating / 5) * 25);
+      ratingScore = Math.round((rating / 5) * 25);
     }
+    breakdown.rating = { score: ratingScore, max: 25, label: 'Average Rating', suggestion: ratingScore < 20 ? 'Provide excellent service to get higher ratings' : undefined };
+    total += ratingScore;
 
-    if (completedOrders >= 50) score += 15;
-    else if (completedOrders >= 20) score += 10;
-    else if (completedOrders >= 5) score += 5;
+    // Experience
+    let expScore = 0;
+    if (completedOrders >= 50) expScore = 15;
+    else if (completedOrders >= 20) expScore = 10;
+    else if (completedOrders >= 5) expScore = 5;
+    breakdown.experience = { score: expScore, max: 15, label: 'Transaction Experience', suggestion: expScore < 15 ? `Complete ${completedOrders < 5 ? 5 - completedOrders : completedOrders < 20 ? 20 - completedOrders : 50 - completedOrders} more orders to reach next level` : undefined };
+    total += expScore;
 
+    // Account age
     const accountAgeDays = (Date.now() - user.createdAt.getTime()) / (1000 * 60 * 60 * 24);
-    if (accountAgeDays >= 365) score += 10;
-    else if (accountAgeDays >= 180) score += 7;
-    else if (accountAgeDays >= 30) score += 3;
+    let ageScore = 0;
+    if (accountAgeDays >= 365) ageScore = 10;
+    else if (accountAgeDays >= 180) ageScore = 7;
+    else if (accountAgeDays >= 30) ageScore = 3;
+    breakdown.accountAge = { score: ageScore, max: 10, label: 'Account Age', suggestion: ageScore < 10 ? 'Older accounts are more trusted' : undefined };
+    total += ageScore;
 
-    return Math.min(100, Math.max(0, score));
+    return { total: Math.min(100, Math.max(0, total)), breakdown };
   }
 
   getTrustBadge(score: number): { label: string; labelEn: string; color: string } {

@@ -5,6 +5,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import * as ExcelJS from 'exceljs';
 import { toIdr } from '../../common/utils/currency.util';
 import { formatWIBDate, parseDateBoundaryWIB, toWIB } from '../../common/utils/date.util';
+import PDFDocument from 'pdfkit';
 
 function escapeHtml(str: string | null | undefined): string {
   if (!str) return '';
@@ -35,6 +36,8 @@ const TYPE_LABELS: Record<string, string> = {
   DISPUTE_RELEASE: 'Dispute Release',
   TRANSFER_SENT: 'Transfer Sent',
   TRANSFER_RECEIVED: 'Transfer Received',
+  CAMPAIGN_CASHBACK: 'Cashback',
+  TOPUP_BONUS: 'Topup Bonus',
 };
 
 const STATUS_LABELS: Record<string, string> = {
@@ -52,12 +55,6 @@ interface ExportFilters {
 }
 
 const CURSOR_BATCH_SIZE = 500;
-/**
- * Hard cap on rows produced by the in-memory export variants (XLSX workbook
- * buffer, CSV-as-JSON, HTML report). The streaming CSV path is unbounded by
- * design; these three materialise the whole result, so a pathological ledger
- * must fail fast with an actionable message instead of exhausting heap.
- */
 const MAX_IN_MEMORY_EXPORT_ROWS = 20_000;
 
 @Injectable()
@@ -67,12 +64,6 @@ export class WalletExportService {
     private configService: ConfigService,
   ) {}
 
-  /**
-   * Enforce the operator-configured export window (EXPORT_MAX_DATE_RANGE_DAYS,
-   * default 90 days). Previously only the DTO checked the range, and only when
-   * BOTH `from` and `to` were present — `?from=2019-01-01` alone bypassed the
-   * limit entirely and the configured value was never read anywhere.
-   */
   private clampExportRange(startDate?: string, endDate?: string): { start?: string; end?: string } {
     const maxDays = this.configService.get<number>('app.exportMaxDateRangeDays') ?? 90;
     const now = new Date();
@@ -169,8 +160,6 @@ export class WalletExportService {
     description: string | null;
     order: { orderId: string; title: string } | null;
   }): string {
-    // AUDIT: the export label is a local (WIB) date/time for users; emitting raw UTC
-    // silently shifted every statement row up to 7h backwards at the app's boundary.
     const date = toWIB(tx.createdAt).format('YYYY-MM-DD HH:mm:ss');
     const amount = toIdr(tx.amount);
     const balanceAfter = toIdr(tx.balanceAfter);
@@ -181,9 +170,6 @@ export class WalletExportService {
     const desc = sanitizeCell(rawDesc);
 
     return [
-      // AUDIT: "Transaction ID" must be the human ledger id (WLT-…) shown everywhere
-      // in the app/API; the internal cuid was exported instead, so statements could
-      // not be matched against support cases.
       date,
       tx.txId,
       sanitizeCell(type),
@@ -300,8 +286,8 @@ export class WalletExportService {
         const amount = toIdr(tx.amount);
         const balanceAfter = toIdr(tx.balanceAfter);
         sheet.addRow({
-          date: toWIB(tx.createdAt).format('YYYY-MM-DD HH:mm:ss'), // AUDIT: WIB-consistent
-          txId: sanitizeCell(tx.txId), // AUDIT: user-facing ledger id, not internal cuid
+          date: toWIB(tx.createdAt).format('YYYY-MM-DD HH:mm:ss'),
+          txId: sanitizeCell(tx.txId),
           type: sanitizeCell(TYPE_LABELS[tx.type] || tx.type),
           description: sanitizeCell(tx.description || tx.order?.title || ''),
           amount,
@@ -317,6 +303,108 @@ export class WalletExportService {
 
     const buffer = await workbook.xlsx.writeBuffer();
     return Buffer.from(buffer);
+  }
+
+  async exportTransactionsPdf(
+    userId: string,
+    startDate?: string,
+    endDate?: string,
+    types?: string[],
+  ): Promise<Buffer> {
+    this.clampExportRange(startDate, endDate);
+    const wallet = await this.prisma.wallet.findUnique({ where: { userId } });
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { fullName: true, userId: true },
+    });
+
+    const transactions: Array<{
+      createdAt: Date;
+      type: string;
+      status: string;
+      amount: bigint;
+      balanceAfter: bigint;
+      description: string | null;
+      order: { orderId: string; title: string } | null;
+      txId: string;
+    }> = [];
+
+    if (wallet) {
+      for await (const tx of this.fetchTransactionsCursor(wallet.id, { startDate, endDate, types })) {
+        this.assertInMemoryRowCap(transactions.length + 1);
+        transactions.push(tx as any);
+      }
+    }
+
+    return new Promise<Buffer>((resolve, reject) => {
+      try {
+        const doc = new PDFDocument({ margin: 40, size: 'A4' });
+        const chunks: Buffer[] = [];
+        doc.on('data', (c: Buffer) => chunks.push(c));
+        doc.on('end', () => resolve(Buffer.concat(chunks)));
+        doc.on('error', reject);
+
+        // Header
+        doc.fontSize(16).font('Helvetica-Bold').text('Kahade Financial Report', { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(10).font('Helvetica').text(`${user?.fullName || ''} (${user?.userId || ''})`, { align: 'center' });
+        const periodStr = startDate && endDate ? `${startDate} - ${endDate}` : 'All Time';
+        doc.text(`Period: ${periodStr}`, { align: 'center' });
+        doc.moveDown(1);
+
+        // Summary
+        const INCOME_TYPES = ['TOP_UP', 'ORDER_RELEASE', 'ORDER_REFUND', 'REFERRAL_REWARD', 'ADMIN_CREDIT', 'DISPUTE_RELEASE', 'TRANSFER_RECEIVED', 'CAMPAIGN_CASHBACK', 'TOPUP_BONUS'];
+        const totalIn = transactions.filter(t => INCOME_TYPES.includes(t.type) && t.status === 'SUCCESS').reduce((s, t) => s + toIdr(t.amount), 0);
+        const totalOut = transactions.filter(t => !INCOME_TYPES.includes(t.type) && t.status === 'SUCCESS').reduce((s, t) => s + toIdr(t.amount), 0);
+        doc.fontSize(10).font('Helvetica-Bold').text(`Total In: Rp ${totalIn.toLocaleString('id-ID')} | Total Out: Rp ${totalOut.toLocaleString('id-ID')} | Net: Rp ${(totalIn - totalOut).toLocaleString('id-ID')}`);
+        doc.moveDown(1);
+
+        // Table header
+        doc.fontSize(8).font('Helvetica-Bold');
+        const tableTop = doc.y;
+        const colX = [40, 110, 190, 260, 340, 420];
+        doc.text('Date', colX[0], tableTop, { width: 65 });
+        doc.text('Type', colX[1], tableTop, { width: 75 });
+        doc.text('Amount', colX[2], tableTop, { width: 70 });
+        doc.text('Status', colX[3], tableTop, { width: 60 });
+        doc.text('Order', colX[4], tableTop, { width: 70 });
+        doc.text('Desc', colX[5], tableTop, { width: 90 });
+        doc.moveDown(0.5);
+        doc.moveTo(40, doc.y).lineTo(555, doc.y).stroke();
+        doc.moveDown(0.5);
+
+        // Rows
+        doc.font('Helvetica').fontSize(7);
+        for (const tx of transactions.slice(0, 1000)) {
+          if (doc.y > 750) {
+            doc.addPage();
+          }
+          const y = doc.y;
+          const dateStr = toWIB(tx.createdAt).format('YYYY-MM-DD');
+          const typeLabel = TYPE_LABELS[tx.type] || tx.type;
+          const amountStr = `Rp ${toIdr(tx.amount).toLocaleString('id-ID')}`;
+          const statusLabel = STATUS_LABELS[tx.status] || tx.status;
+          const orderId = tx.order?.orderId || '-';
+          const desc = (tx.description || tx.order?.title || '').slice(0, 40);
+
+          doc.text(dateStr, colX[0], y, { width: 65 });
+          doc.text(typeLabel, colX[1], y, { width: 75 });
+          doc.text(amountStr, colX[2], y, { width: 70 });
+          doc.text(statusLabel, colX[3], y, { width: 60 });
+          doc.text(orderId, colX[4], y, { width: 70 });
+          doc.text(desc, colX[5], y, { width: 90 });
+          doc.moveDown(0.8);
+        }
+
+        doc.moveDown(1);
+        doc.fontSize(8).text(`Generated: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })} WIB`, { align: 'center' });
+        doc.text('Kahade — PT Kawal Hak Dengan Aman', { align: 'center' });
+
+        doc.end();
+      } catch (e) {
+        reject(e);
+      }
+    });
   }
 
   async exportTransactionsHtml(

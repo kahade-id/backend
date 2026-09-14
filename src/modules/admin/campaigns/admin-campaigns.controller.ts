@@ -93,6 +93,18 @@ export class AdminCampaignsController {
   }
 
   @UseGuards(UserThrottleGuard)
+  @Post(':campaignId/pause')
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({ summary: 'Pause a campaign (19.5)' })
+  async pauseCampaign(
+    @CurrentAdmin('sub') adminId: string,
+    @Param('campaignId', ParseIdPipe) campaignId: string,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.campaignService.updateCampaign(campaignId, adminId, { status: 'PAUSED' as any }, req.ip || 'unknown');
+  }
+
+  @UseGuards(UserThrottleGuard)
   @Delete(':campaignId')
   @Throttle({ default: { ttl: 60000, limit: 5 } })
   @ApiOperation({ summary: 'Delete a campaign' })

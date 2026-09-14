@@ -1,5 +1,6 @@
 import { AdminRoute } from '../../../common/decorators/public.decorator';
-import { Controller, Get, Post, Delete, Param, Body, Query, UseGuards, Req } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Param, Body, Query, UseGuards, Req, Res } from '@nestjs/common';
+import { Response } from 'express';
 import { ParseIdPipe } from '../../../common/pipes/parse-id.pipe';
 import { ApiTags, ApiBearerAuth, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { Request } from 'express';
@@ -201,5 +202,25 @@ export class AdminUsersController {
   @ApiResponse({ status: 409, description: 'Flag state changed concurrently.' })
   clearReviewFlag(@Param('userId', ParseIdPipe) userId: string, @CurrentAdmin() admin: AdminJwtPayload, @Req() req: Request): Promise<object> {
     return this.service.clearReviewFlag(userId, admin.sub, req.ip || 'unknown');
+  }
+
+  @Get('export/csv')
+  @AdminRoles('SUPER_ADMIN')
+  @ApiOperation({ summary: 'Export users CSV (19.4)' })
+  async exportCsv(@Query() query: UserListQueryDto, @Res() res: Response): Promise<void> {
+    const data = await this.service.listUsers(query.page ?? 1, 1000, query.search, query.status, query.sortBy, query.sortOrder) as any;
+    const users = data.data || data.users || [];
+    const csvHeader = 'userId,email,username,fullName,status,createdAt\n';
+    const csvRows = (users as any[]).map((u: any) => `${u.userId ?? ''},${u.email ?? ''},${u.username ?? ''},${(u.fullName ?? '').replace(/,/g, ' ')},${u.status ?? ''},${u.createdAt ?? ''}`).join('\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=\"users-export.csv\"');
+    res.send(csvHeader + csvRows);
+  }
+
+  @Post(':userId/impersonate')
+  @AdminRoles('SUPER_ADMIN')
+  @ApiOperation({ summary: 'Impersonate user (19.3)' })
+  async impersonate(@Param('userId', ParseIdPipe) userId: string, @CurrentAdmin() admin: AdminJwtPayload, @Req() req: Request): Promise<object> {
+    return this.service.impersonateUser(userId, admin.sub, req.ip || 'unknown');
   }
 }

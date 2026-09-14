@@ -46,4 +46,21 @@ export class SessionsController {
   ): Promise<{ message: string }> {
     return this.sessionsService.revokeSession(userId, sessionId);
   }
+
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @UseGuards(UserThrottleGuard)
+  @Get('devices')
+  async getDevices(@CurrentUser('sub') userId: string): Promise<object> {
+    return this.sessionsService.getDevices(userId);
+  }
+
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @UseGuards(UserThrottleGuard)
+  @Delete()
+  async revokeAll(
+    @CurrentUser('sub') userId: string,
+    @CurrentUser('sessionId') currentSessionId: string,
+  ): Promise<object> {
+    return this.sessionsService.revokeAllSessionsAndDevices(userId, currentSessionId);
+  }
 }

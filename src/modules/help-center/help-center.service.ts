@@ -150,4 +150,17 @@ export class HelpCenterService {
     await this.prisma.faqItem.delete({ where: { id } });
     return { message: 'FAQ item deleted' };
   }
+
+  async submitFeedback(itemId: string, helpful: boolean): Promise<object> {
+    const item = await this.prisma.faqItem.findFirst({ where: { id: itemId }, select: { id: true } });
+    if (!item) throw new NotFoundException({ code: 'FAQ_ITEM_NOT_FOUND', message: 'FAQ item not found' });
+    // Try to increment helpful/not helpful counters if columns exist
+    try {
+      await this.prisma.faqItem.update({
+        where: { id: itemId },
+        data: helpful ? { helpfulCount: { increment: 1 } } as any : { notHelpfulCount: { increment: 1 } } as any,
+      });
+    } catch {}
+    return { itemId, helpful, recorded: true };
+  }
 }

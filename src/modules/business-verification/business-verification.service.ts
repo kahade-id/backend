@@ -18,6 +18,9 @@ import * as ErrorCodes from '../../common/constants/error-codes';
 /** Jeda sebelum boleh resubmit setelah ditolak — sama seperti KYC. */
 const RESUBMIT_COOLDOWN_HOURS = 24;
 
+/** Max attempts — konsisten dengan KYC (5.3, 6.1) */
+export const MAX_BUSINESS_VERIFICATION_ATTEMPTS = 10;
+
 /** NPWP lama 15 digit, format baru (NIK badan) 16 digit. */
 const NPWP_DIGIT_LENGTHS = [15, 16];
 
@@ -242,6 +245,12 @@ export class BusinessVerificationService {
     );
 
     const previousCount = await this.prisma.businessVerification.count({ where: { userId } });
+    if (previousCount >= MAX_BUSINESS_VERIFICATION_ATTEMPTS) {
+      throw new BadRequestException({
+        code: ErrorCodes.BUSINESS_VERIFICATION_MAX_ATTEMPTS_REACHED ?? ErrorCodes.VALIDATION_ERROR,
+        message: 'Maximum business verification attempts reached. Please contact support.',
+      });
+    }
     const serial = await this.serialService.getNextForPrefix('business_verification_serial');
     const verificationId = generateBusinessVerificationId(serial);
 

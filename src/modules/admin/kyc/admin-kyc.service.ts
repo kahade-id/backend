@@ -605,4 +605,32 @@ export class AdminKycService {
       ...(decryptErrors.length > 0 ? { partialErrors: decryptErrors } : {}),
     };
   }
+
+  async bulkApproveKyc(kycIds: string[], adminId: string, notes?: string, ipAddress: string = 'internal'): Promise<{ approved: string[]; failed: { id: string; reason: string }[] }> {
+    const approved: string[] = [];
+    const failed: { id: string; reason: string }[] = [];
+    for (const id of kycIds.slice(0, 50)) {
+      try {
+        await this.approveKyc(id, adminId, notes, ipAddress);
+        approved.push(id);
+      } catch (e) {
+        failed.push({ id, reason: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    return { approved, failed };
+  }
+
+  async bulkRejectKyc(kycIds: string[], adminId: string, reason: string, notes?: string, ipAddress: string = 'internal'): Promise<{ rejected: string[]; failed: { id: string; reason: string }[] }> {
+    const rejected: string[] = [];
+    const failed: { id: string; reason: string }[] = [];
+    for (const id of kycIds.slice(0, 50)) {
+      try {
+        await this.rejectKyc(id, adminId, reason, notes, ipAddress);
+        rejected.push(id);
+      } catch (e) {
+        failed.push({ id, reason: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    return { rejected, failed };
+  }
 }

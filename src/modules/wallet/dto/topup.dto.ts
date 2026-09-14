@@ -43,13 +43,10 @@ export class TopupDto {
   @Matches(/^[A-Z0-9_-]+$/i, { message: 'voucherCode may contain only A-Z, 0-9, underscore, or hyphen' })
   voucherCode?: string;
 
-  // Mobile sends this and has always collected it before /wallet/topup, but the
-  // backend service never verified it (top-up already requires payment-gateway auth:
-  // bank OTP, 3DS, etc). Declaring it optional unbreaks the flow (forbidNonWhitelisted
-  // was rejecting every request) without adding unnecessary friction. Ideal fix: remove
-  // the PIN prompt from mobile — top-up doesn't need double-auth when the gateway
-  // already authenticated the payment.
-  @ApiPropertyOptional({ description: 'Wallet PIN (6 digits) — collected by mobile but not verified for top-up' })
+  // Deprecated: Mobile previously collected PIN before top-up but backend never verified it.
+  // Top-up is secured via payment gateway auth (bank OTP, 3DS). This field is now ignored
+  // to remove unnecessary UX friction. Kept optional for backward compatibility.
+  @ApiPropertyOptional({ description: 'Deprecated: Wallet PIN is no longer required for top-up (payment gateway secures it). Ignored if sent.', deprecated: true })
   @IsOptional()
   @IsString()
   @Length(6, 6, { message: 'Wallet PIN must be exactly 6 digits' })

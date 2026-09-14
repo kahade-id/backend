@@ -106,4 +106,28 @@ export class RatingsController {
   ): Promise<{ message: string }> {
     return this.ratingReplyService.deleteReply(userId, replyId);
   }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Idempotency()
+  @Delete(':ratingId')
+  @ApiOperation({ summary: 'Delete own rating (within 7 days)' })
+  async deleteRating(
+    @CurrentUser('sub') userId: string,
+    @Param('ratingId', ParseIdPipe) ratingId: string,
+  ): Promise<{ deleted: boolean }> {
+    return this.ratingsService.deleteRating(userId, ratingId);
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @Idempotency()
+  @Post(':ratingId/helpful')
+  @ApiOperation({ summary: 'Toggle helpful for a rating' })
+  async toggleHelpful(
+    @CurrentUser('sub') userId: string,
+    @Param('ratingId', ParseIdPipe) ratingId: string,
+  ): Promise<{ helpful: boolean; helpfulCount: number }> {
+    return this.ratingsService.toggleHelpful(userId, ratingId);
+  }
 }

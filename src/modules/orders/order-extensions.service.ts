@@ -138,6 +138,7 @@ export class OrderExtensionsService {
             extensionDays: dto.extensionDays,
             reason: normalizedReason,
             status: DeadlineExtensionStatus.PENDING,
+            expiresAt: addDays(new Date(), 2), // 48h expiry per audit 2.5
           },
         });
       }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }), 'REQUEST_EXTENSION_TX');
@@ -348,6 +349,7 @@ export class OrderExtensionsService {
         respondedBy: ext.respondedBy,
         respondedAt: ext.respondedAt,
         rejectionNote: ext.rejectionNote,
+        expiresAt: (ext as any).expiresAt ?? null,
         createdAt: ext.createdAt,
         updatedAt: ext.updatedAt,
         requestedByUser: ext.requester

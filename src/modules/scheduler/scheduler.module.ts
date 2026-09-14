@@ -33,6 +33,7 @@ import {
   CampaignActivationService,
   ReferralLeaderboardRefreshService,
   DormantWinbackVoucherService,
+  ExpireExtensionRequestsService,
 } from './services';
 import { AdminFinanceModule } from '../admin/finance/admin-finance.module';
 import { WithdrawalsModule } from '../withdrawals/withdrawals.module';
@@ -85,6 +86,7 @@ import { CampaignService } from '../admin/campaign.service';
     CampaignActivationService,
     ReferralLeaderboardRefreshService,
     DormantWinbackVoucherService,
+    ExpireExtensionRequestsService,
     CampaignService,
     WalletTxSerialService,
     MidtransService,

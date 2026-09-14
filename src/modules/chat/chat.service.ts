@@ -1938,4 +1938,44 @@ export class ChatService {
       });
     }
   }
+
+  // 16.1 typing indicator
+  async sendTypingIndicator(userId: string, roomId: string, isTyping: boolean): Promise<{ sent: boolean }> {
+    const room = await this.validateRoomAccess(userId, roomId);
+    this.emitChatEvent(room, 'chat.typing', { roomId, userId, isTyping, at: new Date().toISOString() });
+    return { sent: true };
+  }
+
+  // 16.2 read receipts
+  async getReadReceipts(userId: string, roomId: string): Promise<object> {
+    await this.validateRoomAccess(userId, roomId);
+    const messages = await this.prisma.chatMessage.findMany({
+      where: { roomId, isDeleted: false },
+      select: { id: true, readAt: true, senderId: true },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+    return {
+      roomId,
+      receipts: messages.map(m => ({
+        messageId: m.id,
+        readAt: m.readAt,
+        isRead: !!(m.readAt && typeof m.readAt === 'object' && Object.keys(m.readAt as any).length > 0),
+      })),
+    };
+  }
+
+  async markMessageAsRead(userId: string, roomId: string, messageId: string): Promise<object> {
+    await this.validateRoomAccess(userId, roomId);
+    const now = new Date().toISOString();
+    const jsonPatch = JSON.stringify({ [userId]: now });
+    await this.prisma.$executeRaw(
+      Prisma.sql`
+        UPDATE chat_messages
+        SET \"readAt\" = COALESCE(\"readAt\", '{}'::jsonb) || ${jsonPatch}::jsonb
+        WHERE id = ${messageId} AND \"roomId\" = ${roomId} AND \"isDeleted\" = false
+      `,
+    );
+    return { messageId, readAt: now, userId };
+  }
 }

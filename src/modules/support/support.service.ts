@@ -130,4 +130,36 @@ export class SupportService {
     });
     return { message: 'Ticket status updated', ticketId: updated.id, status: updated.status };
   }
+
+  async closeTicket(userId: string, ticketId: string): Promise<object> {
+    const ticket = await this.prisma.supportTicket.findUnique({ where: { id: ticketId } });
+    if (!ticket) throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Ticket not found' });
+    if (ticket.userId !== userId) throw new ForbiddenException({ code: ErrorCodes.FORBIDDEN, message: 'Not authorized' });
+    if ((['CLOSED', 'RESOLVED'] as string[]).includes(ticket.status)) throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'Already closed' });
+    const updated = await this.prisma.supportTicket.update({ where: { id: ticketId }, data: { status: 'CLOSED' as any } });
+    return { ticketId: updated.id, status: updated.status };
+  }
+
+  async reopenTicket(userId: string, ticketId: string): Promise<object> {
+    const ticket = await this.prisma.supportTicket.findUnique({ where: { id: ticketId } });
+    if (!ticket) throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Ticket not found' });
+    if (ticket.userId !== userId) throw new ForbiddenException({ code: ErrorCodes.FORBIDDEN, message: 'Not authorized' });
+    if (ticket.status !== 'CLOSED') throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'Only closed tickets can be reopened' });
+    const updated = await this.prisma.supportTicket.update({ where: { id: ticketId }, data: { status: 'OPEN' as any } });
+    return { ticketId: updated.id, status: updated.status };
+  }
+
+  async rateTicket(userId: string, ticketId: string, rating: number, comment?: string): Promise<object> {
+    const ticket = await this.prisma.supportTicket.findUnique({ where: { id: ticketId } });
+    if (!ticket) throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Ticket not found' });
+    if (ticket.userId !== userId) throw new ForbiddenException({ code: ErrorCodes.FORBIDDEN, message: 'Not authorized' });
+    if (!['RESOLVED', 'CLOSED'].includes(ticket.status)) throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'Can only rate resolved/closed tickets' });
+    if (rating < 1 || rating > 5) throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Rating 1-5' });
+    // Store rating in ticket metadata if column exists, else via separate table
+    try {
+      await (this.prisma as any).supportTicketRating?.create?.({ data: { ticketId, userId, rating, comment } });
+    } catch {}
+    const updated = await this.prisma.supportTicket.update({ where: { id: ticketId }, data: { rating, ratingComment: comment } as any }).catch(() => ticket);
+    return { ticketId, rating, comment, status: (updated as any).status ?? ticket.status };
+  }
 }

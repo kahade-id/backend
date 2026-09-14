@@ -105,7 +105,7 @@ export class AdminAnalyticsService {
       switch (trunc) {
         case 'week':
           return this.prisma.$queryRaw<OrderStatRow[]>`
-            SELECT date_trunc('week', "createdAt") AS period,
+            SELECT date_trunc('week', ("createdAt" AT TIME ZONE 'Asia/Jakarta')) AS period,
               COUNT(*)::int AS total_orders,
               COUNT(*) FILTER (WHERE status = 'COMPLETED')::int AS completed,
               COUNT(*) FILTER (WHERE status = 'DISPUTED')::int AS disputed,
@@ -119,7 +119,7 @@ export class AdminAnalyticsService {
             GROUP BY period ORDER BY period ASC`;
         case 'month':
           return this.prisma.$queryRaw<OrderStatRow[]>`
-            SELECT date_trunc('month', "createdAt") AS period,
+            SELECT date_trunc('month', ("createdAt" AT TIME ZONE 'Asia/Jakarta')) AS period,
               COUNT(*)::int AS total_orders,
               COUNT(*) FILTER (WHERE status = 'COMPLETED')::int AS completed,
               COUNT(*) FILTER (WHERE status = 'DISPUTED')::int AS disputed,
@@ -133,7 +133,7 @@ export class AdminAnalyticsService {
             GROUP BY period ORDER BY period ASC`;
         default:
           return this.prisma.$queryRaw<OrderStatRow[]>`
-            SELECT date_trunc('day', "createdAt") AS period,
+            SELECT date_trunc('day', ("createdAt" AT TIME ZONE 'Asia/Jakarta')) AS period,
               COUNT(*)::int AS total_orders,
               COUNT(*) FILTER (WHERE status = 'COMPLETED')::int AS completed,
               COUNT(*) FILTER (WHERE status = 'DISPUTED')::int AS disputed,
@@ -205,10 +205,11 @@ export class AdminAnalyticsService {
     const start = startDate || new Date('2020-01-01');
     const end = endDate || new Date();
 
+    // Unified timezone: Asia/Jakarta (WIB) — consistent with dashboard.service
     const results = await this.prisma.$queryRaw<UserGrowthRow[]>`
-      SELECT date_trunc('day', "createdAt") AS day,
+      SELECT (("createdAt" AT TIME ZONE 'Asia/Jakarta')::date) AS day,
         COUNT(*)::int AS new_users,
-        SUM(COUNT(*)::int) OVER (ORDER BY date_trunc('day', "createdAt"))::int AS cumulative
+        SUM(COUNT(*)::int) OVER (ORDER BY (("createdAt" AT TIME ZONE 'Asia/Jakarta')::date))::int AS cumulative
       FROM "users"
       WHERE "createdAt" >= ${start}
         AND "createdAt" <= ${end}

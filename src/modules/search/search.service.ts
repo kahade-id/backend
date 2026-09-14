@@ -1,12 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
+import { RedisService } from '../../redis/redis.service';
 import { escapeLikePattern } from '../../common/utils/search.util';
 
 @Injectable()
 export class SearchService {
   private readonly LIMIT = 5;
 
-  constructor(private prisma: PrismaService) {}
+  constructor(private prisma: PrismaService, private redis: RedisService) {}
 
   async search(userId: string, query: string, types?: string[], limit?: number): Promise<object> {
     const q = this.normalizeQuery(query);
@@ -21,6 +22,11 @@ export class SearchService {
       typeSet.has('transactions') ? this.searchTransactions(userId, q, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
     ]);
 
+    // Save search history async (best effort)
+    if (q.length >= 2) {
+      this.saveSearchHistory(userId, q).catch(() => {});
+    }
+
     return {
       users: users.results,
       orders: orders.results,
@@ -31,6 +37,36 @@ export class SearchService {
         transactions: transactions.total,
       },
     };
+  }
+
+  private async saveSearchHistory(userId: string, query: string): Promise<void> {
+    const key = `search_history:${userId}`;
+    try {
+      const client = this.redis.getClient();
+      await client.lrem(key, 0, query);
+      await client.lpush(key, query);
+      await client.ltrim(key, 0, 19);
+      await client.expire(key, 60 * 60 * 24 * 30);
+    } catch {}
+  }
+
+  async getSearchHistory(userId: string): Promise<{ history: string[] }> {
+    const key = `search_history:${userId}`;
+    try {
+      const client = this.redis.getClient();
+      const history = await client.lrange(key, 0, 19);
+      return { history };
+    } catch {
+      return { history: [] };
+    }
+  }
+
+  async clearSearchHistory(userId: string): Promise<{ cleared: boolean }> {
+    const key = `search_history:${userId}`;
+    try {
+      await this.redis.del(key);
+    } catch {}
+    return { cleared: true };
   }
 
   async suggestions(userId: string, query: string, limit?: number): Promise<object> {

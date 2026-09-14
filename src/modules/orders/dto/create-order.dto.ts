@@ -73,4 +73,16 @@ export class CreateOrderDto {
   @IsString()
   @MaxLength(50)
   voucherCode?: string;
+
+  @ApiPropertyOptional({ description: 'Reference attachment URLs (R2 CDN) for order spec — max 5', type: [String] })
+  @IsOptional()
+  @IsString({ each: true })
+  @MaxLength(500, { each: true })
+  attachments?: string[];
+
+  @ApiPropertyOptional({ description: 'Source inquiry room ID if order originates from an INQUIRY chat (links negotiation context)' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  inquiryRoomId?: string;
 }

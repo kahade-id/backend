@@ -69,4 +69,20 @@ export class SearchController {
     const limit = parseLimit(limitParam, 6, 20);
     return this.searchService.suggestions(userId, q, limit);
   }
+
+  @Get('history')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @ApiOperation({ summary: 'Get search history (13.2)' })
+  async history(@CurrentUser('sub') userId: string): Promise<object> {
+    return this.searchService.getSearchHistory(userId);
+  }
+
+  @Get('history/clear')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({ summary: 'Clear search history' })
+  async clearHistory(@CurrentUser('sub') userId: string): Promise<object> {
+    return this.searchService.clearSearchHistory(userId);
+  }
 }

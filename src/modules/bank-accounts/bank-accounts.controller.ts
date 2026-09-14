@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Delete, Param, Body, UseGuards, HttpCode } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Param, Body, UseGuards, HttpCode, Patch } from '@nestjs/common';
 import { ParseIdPipe } from '../../common/pipes/parse-id.pipe';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
@@ -41,6 +41,14 @@ export class BankAccountsController {
   @HttpCode(200)
   setPrimary(@CurrentUser() user: UserJwtPayload, @Param('id', ParseIdPipe) id: string): Promise<Record<string, unknown>> {
     return this.service.setPrimaryBankAccount(user.sub, id);
+  }
+
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @Patch(':id')
+  update(@CurrentUser() user: UserJwtPayload, @Param('id', ParseIdPipe) id: string, @Body() dto: { accountName: string }): Promise<Record<string, unknown>> {
+    return this.service.updateBankAccount(user.sub, id, dto.accountName);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 5 } })

@@ -6,6 +6,9 @@ export const ALLOWED_EVIDENCE_MIME_TYPES = [
   'image/png',
   'image/webp',
   'application/pdf',
+  'video/mp4',
+  'video/quicktime',
+  'video/webm',
 ] as const;
 
 export class SubmitEvidenceDto {

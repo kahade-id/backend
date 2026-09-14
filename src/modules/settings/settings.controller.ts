@@ -50,7 +50,7 @@ export class SettingsController {
   }
 
   @UseGuards(UserThrottleGuard)
-  @Throttle({ default: { ttl: 3600000, limit: 5 } })
+  @Throttle({ default: { ttl: 86400000, limit: 5 } })
   @Post('report')
   reportUser(
     @CurrentUser('sub') userId: string,

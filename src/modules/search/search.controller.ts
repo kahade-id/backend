@@ -6,7 +6,7 @@ import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import { Throttle } from '@nestjs/throttler';
 import { ParseQueryStringPipe } from '../../common/pipes/parse-query-string.pipe';
 
-const ALLOWED_SEARCH_TYPES = new Set(['users', 'orders', 'transactions']);
+const ALLOWED_SEARCH_TYPES = new Set(['users', 'orders', 'transactions', 'showcase', 'help-center']);
 
 function parseLimit(value: string | undefined, fallback: number, max: number): number {
   if (value === undefined || value.trim() === '') return fallback;

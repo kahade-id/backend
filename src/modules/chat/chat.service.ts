@@ -754,6 +754,7 @@ export class ChatService {
     dto: {
       messageType?: UserChatMessageType;
       content?: string;
+      caption?: string;
       attachments?: SendMessageDto['attachments'];
       replyToId?: string;
       durationSeconds?: number;
@@ -773,12 +774,14 @@ export class ChatService {
 
     const userMessageType = dto.messageType ?? UserChatMessageType.TEXT;
     const messageType = userMessageType as unknown as ChatMessageType;
+    // 15.3 caption support: allow caption as content for media messages
+    const effectiveContent = (dto.content?.trim() ? dto.content : (dto as any).caption) as string | undefined;
 
-    if (userMessageType === UserChatMessageType.TEXT && (!dto.content || dto.content.trim().length === 0)) {
+    if (userMessageType === UserChatMessageType.TEXT && (!effectiveContent || effectiveContent.trim().length === 0)) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Text messages must have non-empty content' });
     }
 
-    if (dto.content && dto.content.length > CHAT_MESSAGE_MAX_LENGTH) {
+    if (effectiveContent && effectiveContent.length > CHAT_MESSAGE_MAX_LENGTH) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Message content must not exceed ${CHAT_MESSAGE_MAX_LENGTH} characters` });
     }
 
@@ -815,8 +818,8 @@ export class ChatService {
      * "bukti-transfer-0812xxxx.pdf" adalah cara yang sama umumnya untuk
      * menyelundupkan kontak.
      */
-    const verdict = dto.content
-      ? moderateText(dto.content, { maxAction: this.circumventionAction() })
+    const verdict = effectiveContent
+      ? moderateText(effectiveContent, { maxAction: this.circumventionAction() })
       : null;
 
     if (verdict?.blocked) {
@@ -833,7 +836,7 @@ export class ChatService {
       });
     }
 
-    const content = verdict && dto.content ? sanitizeText(verdict.text.trim()) : null;
+    const content = verdict && effectiveContent ? sanitizeText(verdict.text.trim()) : null;
     const attachmentNames = new Map<string, string>();
     if (dto.attachments?.length) {
       for (const attachment of dto.attachments) {
@@ -891,7 +894,7 @@ export class ChatService {
     this.emitChatEvent(room, 'chat.new_message', serialized);
     if (recipientId) {
       this.realtime.emitToUser(recipientId, 'chat.new_message', serialized);
-      await this.notifyNewMessage(room, recipientId, userId, message.id, dto.content, userMessageType);
+      await this.notifyNewMessage(room, recipientId, userId, message.id, effectiveContent, userMessageType);
     }
 
     return serialized;
@@ -1069,6 +1072,15 @@ export class ChatService {
       });
     }
     await this.assertNotDisputeLocked(room);
+
+    // 15.1 Edit window 15 minutes
+    const editWindowMs = 15 * 60 * 1000;
+    if (Date.now() - new Date(message.createdAt).getTime() > editWindowMs) {
+      throw new BadRequestException({
+        code: ErrorCodes.CHAT_MESSAGE_NOT_EDITABLE,
+        message: 'Message can only be edited within 15 minutes of sending',
+      });
+    }
 
     const trimmed = (content ?? '').trim();
     if (!trimmed || trimmed.length > CHAT_MESSAGE_MAX_LENGTH) {

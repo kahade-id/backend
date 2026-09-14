@@ -39,6 +39,12 @@ export class SupportService {
       }
     }
 
+    let relatedArticleId: string | null = null;
+    if ((dto as any).relatedArticleId) {
+      const article = await this.prisma.faqItem.findUnique({ where: { id: (dto as any).relatedArticleId } });
+      if (article) relatedArticleId = article.id;
+    }
+
     return this.prisma.supportTicket.create({
       data: {
         userId,
@@ -48,7 +54,8 @@ export class SupportService {
         orderId: linkedOrderId ?? null,
         attachments,
         status: 'OPEN',
-      },
+        ...(relatedArticleId ? { relatedArticleId } : {}),
+      } as any,
     });
   }
 

@@ -700,7 +700,7 @@ export class OrdersService {
   }
 
   private escapePushBody(text: string): string {
-    return text.replace(/[\u0000-\u001F\u007F\u200E\u200F\u202A-\\u202E\\u2066-\\u2069]/g, '').replace(/[\\\\]/g, '\\\\\\\\').replace(/\"/g, '\\\\\"');
+    return text.replace(/[\u0000-\u001F\u007F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '').replace(/[\\]/g, '\\\\').replace(/\"/g, '\\\"');
   }
 
   private static readonly ACTIVE_STATUSES: OrderStatus[] = [

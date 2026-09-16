@@ -126,7 +126,7 @@ export class InvoiceService {
       doc.text(`Buyer Claim: ${dispute.buyerClaim ?? '-'}`);
       doc.text(`Seller Claim: ${dispute.sellerClaim ?? '-'}`);
       doc.moveDown();
-      doc.text(`Resolution: ${dispute.resolution ?? '-'}`);
+      doc.text(`Resolved At: ${dispute.resolvedAt ?? '-'}`);
       doc.end();
     });
   }

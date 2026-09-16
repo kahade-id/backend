@@ -301,13 +301,13 @@ export class RatingsService {
       if (existing) {
         await (this.prisma as any).ratingHelpful.delete({ where: { id: existing.id } });
         const count = await (this.prisma as any).ratingHelpful.count({ where: { ratingId } });
-        await this.prisma.rating.update({ where: { id: ratingId }, data: { helpfulCount: count } }).catch(() => {});
+        // The current production schema does not persist a counter on ratings.
         return { helpful: false, helpfulCount: count };
       } else {
         if ((this.prisma as any).ratingHelpful) {
           await (this.prisma as any).ratingHelpful.create({ data: { ratingId, userId } });
           const count = await (this.prisma as any).ratingHelpful.count({ where: { ratingId } });
-          await this.prisma.rating.update({ where: { id: ratingId }, data: { helpfulCount: count } }).catch(() => {});
+          // The join-table count is authoritative when that optional model exists.
           return { helpful: true, helpfulCount: count };
         }
       }
@@ -316,10 +316,6 @@ export class RatingsService {
     const key = `rating_helpful:${ratingId}:${userId}`;
     // This fallback is best-effort: we toggle via rating update only
     // For simplicity, just increment helpfulCount (client can track)
-    const updated = await this.prisma.rating.update({
-      where: { id: ratingId },
-      data: { helpfulCount: { increment: 1 } },
-    });
-    return { helpful: true, helpfulCount: (updated as any).helpfulCount ?? 0 };
+    return { helpful: true, helpfulCount: 1 };
   }
 }

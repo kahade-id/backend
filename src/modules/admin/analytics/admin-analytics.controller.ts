@@ -105,9 +105,9 @@ export class AdminAnalyticsController {
   @Get('export/csv')
   @ApiOperation({ summary: 'Export analytics overview CSV (19.4)' })
   async exportCsv(
+    @Res() res: Response,
     @Query('startDate', new ParseDateQueryPipe('startDate')) startDate?: string,
     @Query('endDate', new ParseDateQueryPipe('endDate')) endDate?: string,
-    @Res() res: Response,
     @CurrentAdmin('sub') adminId?: string,
     @Req() req?: Request,
   ): Promise<void> {

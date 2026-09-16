@@ -167,7 +167,7 @@ export class KycService {
     const serial = await this.getNextKycSerial();
     const kycId = generateKycId(serial);
 
-    let kycRequest: Awaited<ReturnType<typeof this.prisma.kycRequest.create>>;
+    let kycRequest: any;
     try {
       kycRequest = await this.withSerializableRetry(
         () => this.prisma.$transaction(async (tx) => {
@@ -371,7 +371,7 @@ export class KycService {
     const resubmitSerial = await this.getNextKycSerial();
     const resubmitKycId = generateKycId(resubmitSerial);
 
-    let updated: Awaited<ReturnType<typeof this.prisma.kycRequest.create>>;
+    let updated: any;
     try {
       updated = await this.withSerializableRetry(
         () => this.prisma.$transaction(async (tx) => {

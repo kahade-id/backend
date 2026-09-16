@@ -1253,7 +1253,7 @@ export class ShowcaseService {
   }
 
   async reportShowcase(userId: string, showcaseId: string, reason: string, description?: string): Promise<object> {
-    const showcase = await this.prisma.showcaseItem.findUnique({ where: { id: showcaseId }, select: { id: true, userId: true } });
+    const showcase = await this.prisma.userShowcase.findUnique({ where: { id: showcaseId }, select: { id: true, userId: true } });
     if (!showcase) throw new BadRequestException({ code: ErrorCodes.NOT_FOUND ?? 'NOT_FOUND', message: 'Showcase not found' });
     if (showcase.userId === userId) throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Cannot report own showcase' });
 

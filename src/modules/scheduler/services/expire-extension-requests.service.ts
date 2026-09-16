@@ -29,7 +29,7 @@ export class ExpireExtensionRequestsService {
         try {
           await this.prisma.orderExtensionRequest.update({
             where: { id: req.id },
-            data: { status: DeadlineExtensionStatus.EXPIRED, reviewedAt: now },
+            data: { status: DeadlineExtensionStatus.EXPIRED },
           });
           this.logger.log(`Extension request ${req.id} expired`);
         } catch (e) {

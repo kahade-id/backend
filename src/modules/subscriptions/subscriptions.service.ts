@@ -930,6 +930,9 @@ export class SubscriptionsService {
       orderBy: { createdAt: 'desc' },
     });
     if (!current) throw new NotFoundException({ code: ErrorCodes.NO_ACTIVE_SUBSCRIPTION, message: 'No active subscription' });
+    if (!current.currentPeriodStart || !current.currentPeriodEnd) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Subscription period is not initialized' });
+    }
     if (current.plan === newPlan) throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Already on this plan' });
 
     const currentPlanInfo = this.planPricing[current.plan];

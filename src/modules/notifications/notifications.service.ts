@@ -16,7 +16,7 @@ const IN_APP_PREFERENCE_TYPES: ReadonlyArray<[keyof Pick<NotificationPreference,
   ['chatInApp', [NotificationType.CHAT_NEW_MESSAGE]],
   ['disputeInApp', [NotificationType.DISPUTE_SUBMITTED, NotificationType.DISPUTE_ADMIN_JOINED, NotificationType.DISPUTE_DECISION]],
   ['rankingInApp', [NotificationType.RATING_NEW, NotificationType.BADGE_AWARDED, NotificationType.RANK_UPGRADED, NotificationType.SUBSCRIPTION_ACTIVATED, NotificationType.SUBSCRIPTION_EXPIRY_REMINDER, NotificationType.SUBSCRIPTION_EXPIRED, NotificationType.SUBSCRIPTION_RENEWED, NotificationType.REFERRAL_REWARD_RECEIVED]],
-  ['marketingInApp', [NotificationType.PROMO_OFFER, NotificationType.CAMPAIGN_ANNOUNCEMENT] as unknown as NotificationType[]],
+  ['marketingInApp', [NotificationType.VOUCHER_ISSUED, NotificationType.CAMPAIGN_CASHBACK_CREDITED, NotificationType.TOPUP_BONUS_CREDITED]],
 ];
 
 function criticalSecurityType(type: NotificationType): boolean {
@@ -321,7 +321,7 @@ export class NotificationsService {
         chatPush: [NotificationType.CHAT_NEW_MESSAGE],
         disputePush: [NotificationType.DISPUTE_SUBMITTED, NotificationType.DISPUTE_ADMIN_JOINED, NotificationType.DISPUTE_DECISION],
         rankingPush: [NotificationType.RATING_NEW, NotificationType.BADGE_AWARDED, NotificationType.RANK_UPGRADED, NotificationType.SUBSCRIPTION_ACTIVATED, NotificationType.SUBSCRIPTION_EXPIRY_REMINDER, NotificationType.SUBSCRIPTION_EXPIRED, NotificationType.SUBSCRIPTION_RENEWED, NotificationType.REFERRAL_REWARD_RECEIVED],
-        marketingPush: [NotificationType.PROMO_OFFER, NotificationType.CAMPAIGN_ANNOUNCEMENT] as unknown as NotificationType[],
+        marketingPush: [NotificationType.VOUCHER_ISSUED, NotificationType.CAMPAIGN_CASHBACK_CREDITED, NotificationType.TOPUP_BONUS_CREDITED],
       };
       for (const [field, types] of Object.entries(pushMap)) {
         if ((types as NotificationType[]).includes(type) && prefs[field] === false) return false;

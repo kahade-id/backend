@@ -20,19 +20,24 @@ describe('MidtransService Iris payout logging', () => {
     const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue({
       ok: false,
       status: 422,
-      text: async () => JSON.stringify({
-        payouts: [{ beneficiary_account: '081234567890', beneficiary_name: 'Sensitive Recipient' }],
-      }),
+      text: async () =>
+        JSON.stringify({
+          payouts: [
+            { beneficiary_account: '081234567890', beneficiary_name: 'Sensitive Recipient' },
+          ],
+        }),
     } as Response);
     const service = new MidtransService(configService as never);
 
-    await expect(service.createIrisPayout({
-      referenceNo: 'WLT-20260820-000001',
-      beneficiaryName: 'Sensitive Recipient',
-      beneficiaryAccount: '081234567890',
-      beneficiaryBank: 'bca',
-      amount: 10000,
-    })).rejects.toBeInstanceOf(ServiceUnavailableException);
+    await expect(
+      service.createIrisPayout({
+        referenceNo: 'WLT-20260820-000001',
+        beneficiaryName: 'Sensitive Recipient',
+        beneficiaryAccount: '081234567890',
+        beneficiaryBank: 'bca',
+        amount: 10000,
+      }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const messages = logError.mock.calls.map(([message]) => String(message)).join('\n');
@@ -68,7 +73,9 @@ describe('isMidtransNotFoundError (regresi circuit-breaker produksi)', () => {
 
   it('mengenali 404 dari ApiResponse.status_code string', async () => {
     const { isMidtransNotFoundError } = await import('./midtrans.service');
-    const err = new Error('Midtrans API is returning API error. HTTP status code: 404.') as Error & {
+    const err = new Error(
+      'Midtrans API is returning API error. HTTP status code: 404.',
+    ) as Error & {
       ApiResponse?: Record<string, unknown>;
     };
     err.ApiResponse = { status_code: '404', status_message: "Transaction doesn't exist." };
@@ -106,9 +113,7 @@ describe('isMidtransNotFoundError (regresi circuit-breaker produksi)', () => {
     ) as Error & { httpStatusCode?: number };
     notFound.httpStatusCode = 404;
     notFound.name = 'MidtransError';
-    jest
-      .spyOn(Logger.prototype, 'warn')
-      .mockImplementation();
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation();
     jest.spyOn(Logger.prototype, 'error').mockImplementation();
     const statusMock = jest.fn();
     for (let i = 0; i < 6; i++) statusMock.mockRejectedValueOnce(notFound);

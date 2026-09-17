@@ -35,9 +35,10 @@ export function isMidtransNotFoundError(error: unknown): boolean {
   const err = error as Record<string, unknown>;
   const http = typeof err.httpStatusCode === 'number' ? err.httpStatusCode : undefined;
   const api = err.ApiResponse as Record<string, unknown> | undefined;
-  const apiStatus = typeof api?.status_code === 'string' || typeof api?.status_code === 'number'
-    ? Number(api?.status_code)
-    : undefined;
+  const apiStatus =
+    typeof api?.status_code === 'string' || typeof api?.status_code === 'number'
+      ? Number(api?.status_code)
+      : undefined;
   if (http === 404 || apiStatus === 404) return true;
   const message = err instanceof Error ? err.message : String(err);
   return message.includes("Transaction doesn't exist") || message.includes('404');
@@ -318,8 +319,7 @@ export class MidtransService implements OnModuleInit {
     }
 
     const actions = raw['actions'] as
-      | Array<{ name: string; method: string; url: string }>
-      | undefined;
+      Array<{ name: string; method: string; url: string }> | undefined;
     if (actions && actions.length > 0) {
       result.actions = actions;
 

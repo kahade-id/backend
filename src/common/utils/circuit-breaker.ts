@@ -50,7 +50,11 @@ function defaultIsTransientError(error: unknown): boolean {
   }
 
   const name = (err as any)?.name;
-  if (name === 'BadRequestException' || name === 'NotFoundException' || name === 'ForbiddenException') {
+  if (
+    name === 'BadRequestException' ||
+    name === 'NotFoundException' ||
+    name === 'ForbiddenException'
+  ) {
     return false;
   }
 

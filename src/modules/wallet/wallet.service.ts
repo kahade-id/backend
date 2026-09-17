@@ -1753,10 +1753,12 @@ export class WalletService implements OnModuleInit {
       });
     }
 
-    if (sender.kycStatus !== KycStatus.APPROVED) {
+    // KYC hanya diwajibkan untuk transfer DI ATAS batas bebas-KYC (Rp 2 juta).
+    // Transfer kecil tetap bisa dilakukan tanpa KYC sesuai kebijakan produk.
+    if (amount > WALLET_KYC_FREE_LIMIT && sender.kycStatus !== KycStatus.APPROVED) {
       throw new ForbiddenException({
         code: ErrorCodes.SENDER_KYC_REQUIRED,
-        message: 'KYC verification is required before sending transfers',
+        message: `KYC verification is required for transfers above Rp ${WALLET_KYC_FREE_LIMIT.toLocaleString('id-ID')}`,
       });
     }
     const senderWallet = await this.prisma.wallet.findUnique({ where: { userId: sender.id } });

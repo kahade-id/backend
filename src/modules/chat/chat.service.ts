@@ -318,8 +318,8 @@ export class ChatService {
           cr."isArchived" AS is_archived,
           cr."createdAt" AS room_created_at,
           cr."updatedAt" AS room_updated_at,
-          cm.is_archived AS member_archived,
-          cm.is_muted AS member_muted,
+          cm."isArchived" AS member_archived,
+          cm."isMuted" AS member_muted,
           cm."mutedUntil" AS member_muted_until,
           o."orderId" AS order_id,
           o.title AS order_title,
@@ -374,7 +374,7 @@ export class ChatService {
             -- 20260913_chat_trust_safety_and_features).
             OR (cr."initiatorId" IS NULL AND (o."buyerId" = ${userId} OR o."sellerId" = ${userId}))
           )
-          AND COALESCE(cm.is_archived, false) = ${archivedOnly}
+          AND COALESCE(cm."isArchived", false) = ${archivedOnly}
         ORDER BY cr."updatedAt" DESC
         OFFSET ${skip}
         LIMIT ${safeLimit}
@@ -391,7 +391,7 @@ export class ChatService {
             OR cr."counterpartId" = ${userId}
             OR (cr."initiatorId" IS NULL AND (o."buyerId" = ${userId} OR o."sellerId" = ${userId}))
           )
-          AND COALESCE(cm.is_archived, false) = ${archivedOnly}
+          AND COALESCE(cm."isArchived", false) = ${archivedOnly}
       `,
     ]);
 

@@ -234,11 +234,22 @@ describe('OrdersService', () => {
       await expect(service.createOrder('nonexistent', dto)).rejects.toThrow(NotFoundException);
     });
 
-    it('should throw ForbiddenException when user KYC is not APPROVED and orderValue >= 2M', async () => {
+    it('should throw ForbiddenException when user KYC is not APPROVED and orderValue > 2M', async () => {
       mockPrisma.user.findUnique.mockResolvedValue({ ...mockUser, kycStatus: KycStatus.PENDING });
-      const highValueDto = { ...dto, orderValue: 2_000_000 };
+      const highValueDto = { ...dto, orderValue: 2_500_000 };
 
       await expect(service.createOrder('user-db-1', highValueDto)).rejects.toThrow(ForbiddenException);
+    });
+
+    it('should NOT require KYC when orderValue equals exactly 2M (policy: above 2M only)', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ ...mockUser, kycStatus: KycStatus.PENDING });
+      const boundaryDto = { ...dto, orderValue: 2_000_000 };
+
+      // Gate KYC dilewati (sama-sama user, tapi itu justru bukti gate lolos —
+      // gagal dengan CANNOT_ORDER_SELF, bukan KYC_REQUIRED).
+      await expect(service.createOrder('user-db-1', boundaryDto)).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'CANNOT_ORDER_SELF' }),
+      });
     });
 
     it('should allow non-KYC user to create order below 2M threshold', async () => {

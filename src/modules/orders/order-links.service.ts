@@ -264,7 +264,7 @@ export class OrderLinksService {
       throw new ForbiddenException({ code: ErrorCodes.COUNTERPART_SUSPENDED, message: 'The order link creator account is suspended' });
     }
 
-    if (orderValueIdr >= KYC_THRESHOLD) {
+    if (orderValueIdr > KYC_THRESHOLD) {
       if (buyer?.kycStatus !== KycStatus.APPROVED) {
         throw new ForbiddenException({ code: ErrorCodes.KYC_REQUIRED, message: 'KYC verification required for high-value orders (buyer)' });
       }
@@ -344,7 +344,7 @@ export class OrderLinksService {
           select: { id: true },
         });
         if (freshBlocked) throw new ForbiddenException({ code: ErrorCodes.USER_BLOCKED, message: 'Cannot accept order from blocked user' });
-        if (orderValueIdr >= KYC_THRESHOLD && (freshBuyer.kycStatus !== KycStatus.APPROVED || freshSeller.kycStatus !== KycStatus.APPROVED)) {
+        if (orderValueIdr > KYC_THRESHOLD && (freshBuyer.kycStatus !== KycStatus.APPROVED || freshSeller.kycStatus !== KycStatus.APPROVED)) {
           throw new ForbiddenException({ code: ErrorCodes.KYC_REQUIRED, message: 'KYC verification required for high-value orders' });
         }
 

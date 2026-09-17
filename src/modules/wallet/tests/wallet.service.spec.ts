@@ -1701,10 +1701,24 @@ describe('WalletService', () => {
 
     it('lets an unblocked pair continue past the gate', async () => {
       mockPrisma.blockList.findFirst.mockResolvedValue(null);
-      // Sender tanpa KYC: kegagalan berikutnya adalah SENDER_KYC_REQUIRED,
-      // bukti bahwa gate block sudah dilewati tanpa perlu setup PIN penuh.
+      // Sender tanpa KYC dengan nilai di bawah batas bebas-KYC: kegagalan
+      // berikutnya adalah WALLET_PIN_NOT_SET, bukti bahwa gate block sudah
+      // dilewati dan KYC tidak lagi menjadi penghalang transfer kecil.
       mockPrisma.user.findUnique.mockResolvedValue({ ...sender, kycStatus: 'PENDING' });
+      mockPrisma.wallet.findUnique
+        .mockResolvedValueOnce({ userId: 'user-1', isLocked: false, walletPinHash: null })
+        .mockResolvedValueOnce({ userId: 'user-2', isLocked: false });
       await expect(service.transfer('user-1', 'user-2', 10000, '481723')).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'NOT_FOUND' }),
+      });
+    });
+
+    it('requires KYC only for transfers above the free limit', async () => {
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      // Sender tanpa KYC: transfer DI ATAS batas tetap ditolak dengan
+      // SENDER_KYC_REQUIRED sesuai kebijakan produk.
+      mockPrisma.user.findUnique.mockResolvedValue({ ...sender, kycStatus: 'PENDING' });
+      await expect(service.transfer('user-1', 'user-2', 2_500_000, '481723')).rejects.toMatchObject({
         response: expect.objectContaining({ code: 'SENDER_KYC_REQUIRED' }),
       });
     });

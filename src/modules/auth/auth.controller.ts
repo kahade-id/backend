@@ -594,14 +594,19 @@ export class AuthController {
     @Body() dto: ForgotPasswordDto,
     @Req() req: Request,
   ): Promise<{ message: string }> {
-    if (!dto.captchaId || dto.captchaAnswer === undefined) {
-      throw new UnauthorizedException({
-        code: ErrorCodes.CAPTCHA_REQUIRED,
-        message: 'Captcha verification is required',
-      });
-    }
-    await this.captchaService.verifyChallenge(dto.captchaId, dto.captchaAnswer);
     const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
+    // Captcha hanya diwajibkan setelah banyak percobaan (perilaku sama dengan
+    // login). Jika client tetap mengirim captcha, tetap diverifikasi.
+    const captchaRequired = await this.captchaService.shouldRequireLoginCaptcha(ipAddress);
+    if (captchaRequired || (dto.captchaId && dto.captchaAnswer !== undefined)) {
+      if (!dto.captchaId || dto.captchaAnswer === undefined) {
+        throw new UnauthorizedException({
+          code: ErrorCodes.CAPTCHA_REQUIRED,
+          message: 'Captcha verification is required after repeated attempts',
+        });
+      }
+      await this.captchaService.verifyChallenge(dto.captchaId, dto.captchaAnswer);
+    }
     return this.authService.forgotPassword(dto.email, ipAddress);
   }
 

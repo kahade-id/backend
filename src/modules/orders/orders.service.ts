@@ -191,53 +191,6 @@ export class OrdersService {
     }
   }
 
-  // 2.4 Cumulative KYC check — prevent structuring
-  private async checkCumulativeKycThreshold(userId: string, newOrderValueSen: bigint, kycStatus: string): Promise<void> {
-    if (kycStatus === KycStatus.APPROVED) return;
-    const thresholdSen = toSen(KYC_THRESHOLD);
-    // If single order already exceeds, it's caught elsewhere, but double-check
-    if (newOrderValueSen >= thresholdSen) return;
-
-    // Check active orders total
-    const activeStatuses = [OrderStatus.WAITING_CONFIRMATION, OrderStatus.WAITING_PAYMENT, OrderStatus.PROCESSING, OrderStatus.IN_DELIVERY];
-    const agg = await this.prisma.order.aggregate({
-      where: {
-        OR: [{ buyerId: userId }, { sellerId: userId }],
-        status: { in: activeStatuses },
-        deletedAt: null,
-      },
-      _sum: { orderValue: true },
-    });
-    const activeTotal = agg._sum.orderValue ?? BigInt(0);
-    if (activeTotal + newOrderValueSen >= thresholdSen) {
-      throw new ForbiddenException({
-        code: ErrorCodes.KYC_REQUIRED,
-        message: `Cumulative active orders would exceed Rp ${KYC_THRESHOLD.toLocaleString('id-ID')} — KYC verification required. Your active orders total Rp ${toIdr(activeTotal).toLocaleString('id-ID')}.`,
-      });
-    }
-
-    // Check 30-day rolling total
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const rollingAgg = await this.prisma.order.aggregate({
-      where: {
-        OR: [{ buyerId: userId }, { sellerId: userId }],
-        createdAt: { gte: thirtyDaysAgo },
-        deletedAt: null,
-        status: { notIn: [OrderStatus.CANCELLED] },
-      },
-      _sum: { orderValue: true },
-    });
-    const rollingTotal = rollingAgg._sum.orderValue ?? BigInt(0);
-    // If rolling total in last 30 days exceeds 3x threshold, require KYC
-    const rollingThreshold = thresholdSen * BigInt(3);
-    if (rollingTotal + newOrderValueSen >= rollingThreshold) {
-      throw new ForbiddenException({
-        code: ErrorCodes.KYC_REQUIRED,
-        message: `Rolling 30-day order total would exceed Rp ${toIdr(rollingThreshold).toLocaleString('id-ID')} — KYC verification required for high-volume activity.`,
-      });
-    }
-  }
-
   async createOrder(
     userId: string,
     dto: {
@@ -334,12 +287,10 @@ export class OrdersService {
       throw new BadRequestException({ code: ErrorCodes.RATE_LIMIT_EXCEEDED, message: 'Too many order creation attempts. Please wait before trying again.' });
     }
 
-    if (dto.orderValue >= KYC_THRESHOLD_IDR && user.kycStatus !== KycStatus.APPROVED) {
-      throw new ForbiddenException({ code: ErrorCodes.KYC_REQUIRED, message: 'KYC verification required for orders of Rp 2.000.000 and above' });
+    if (dto.orderValue > KYC_THRESHOLD_IDR && user.kycStatus !== KycStatus.APPROVED) {
+      throw new ForbiddenException({ code: ErrorCodes.KYC_REQUIRED, message: 'KYC verification required for orders above Rp 2.000.000' });
     }
 
-    // 2.4 Cumulative KYC check
-    await this.checkCumulativeKycThreshold(userId, toSen(dto.orderValue), user.kycStatus);
 
     const normalizedCounterpartUsername = typeof dto.counterpartUsername === 'string' ? dto.counterpartUsername.trim().toLowerCase() : '';
     if (normalizedCounterpartUsername.length < 3 || normalizedCounterpartUsername.length > 50) {
@@ -351,8 +302,8 @@ export class OrdersService {
       throw new ForbiddenException({ code: ErrorCodes.COUNTERPART_SUSPENDED, message: 'Counterpart account is suspended' });
     }
     if (counterpart.id === userId) throw new BadRequestException({ code: ErrorCodes.CANNOT_ORDER_SELF, message: 'Cannot create order with yourself' });
-    if (dto.orderValue >= KYC_THRESHOLD_IDR && counterpart.kycStatus !== KycStatus.APPROVED) {
-      throw new ForbiddenException({ code: ErrorCodes.KYC_REQUIRED, message: 'Counterpart must complete KYC verification for orders of Rp 2.000.000 and above' });
+    if (dto.orderValue > KYC_THRESHOLD_IDR && counterpart.kycStatus !== KycStatus.APPROVED) {
+      throw new ForbiddenException({ code: ErrorCodes.KYC_REQUIRED, message: 'Counterpart must complete KYC verification for orders above Rp 2.000.000' });
     }
 
     // 2.6 Validate inquiry room if provided
@@ -435,11 +386,11 @@ export class OrdersService {
             throw new ForbiddenException({ code: ErrorCodes.COUNTERPART_SUSPENDED, message: 'Counterpart account is suspended' });
           }
 
-          if (dto.orderValue >= KYC_THRESHOLD_IDR && txUser.kycStatus !== KycStatus.APPROVED) {
-            throw new ForbiddenException({ code: ErrorCodes.KYC_REQUIRED, message: 'KYC verification required for orders of Rp 2.000.000 and above' });
+          if (dto.orderValue > KYC_THRESHOLD_IDR && txUser.kycStatus !== KycStatus.APPROVED) {
+            throw new ForbiddenException({ code: ErrorCodes.KYC_REQUIRED, message: 'KYC verification required for orders above Rp 2.000.000' });
           }
-          if (dto.orderValue >= KYC_THRESHOLD_IDR && txCounterpart.kycStatus !== KycStatus.APPROVED) {
-            throw new ForbiddenException({ code: ErrorCodes.KYC_REQUIRED, message: 'Counterpart must complete KYC verification for orders of Rp 2.000.000 and above' });
+          if (dto.orderValue > KYC_THRESHOLD_IDR && txCounterpart.kycStatus !== KycStatus.APPROVED) {
+            throw new ForbiddenException({ code: ErrorCodes.KYC_REQUIRED, message: 'Counterpart must complete KYC verification for orders above Rp 2.000.000' });
           }
 
           const block = await tx.blockList.findFirst({

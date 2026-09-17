@@ -13,7 +13,7 @@ import { RedisService } from '../../../redis/redis.service';
 import { cronJitter } from '../../../common/utils/cron-jitter.util';
 import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { startOfDayWIB } from '../../../common/utils/date.util';
-import { MidtransService } from '../../payment/midtrans.service';
+import { MidtransService, isMidtransNotFoundError } from '../../payment/midtrans.service';
 import { WalletService } from '../../wallet/wallet.service';
 
 @Injectable()
@@ -187,6 +187,17 @@ export class PendingTopupCleanupService {
             `Pending top-up ${tx.paymentTx.midtransOrderId} retained: provider status=${providerStatus || 'unknown'} is not terminal`,
           );
         } catch (error) {
+          if (isMidtransNotFoundError(error)) {
+            // Provider menjawab definitif: charge tidak pernah dibuat (user
+            // batal di halaman bayar). Ini kegagalan terminal, bukan gangguan —
+            // tandai gagal agar limit harian dilepas dan baris tidak menggantung
+            // selamanya (bug produksi: 404 memicu circuit OPEN tiap jam).
+            this.logger.log(
+              `Pending top-up ${tx.paymentTx.midtransOrderId} confirmed failed: transaction does not exist at provider.`,
+            );
+            providerConfirmedFailures.push(tx);
+            continue;
+          }
           this.logger.warn(
             `Pending top-up ${tx.paymentTx.midtransOrderId} retained because provider status is unavailable: ` +
               `${error instanceof Error ? error.message : String(error)}`,

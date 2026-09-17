@@ -19,9 +19,24 @@ function defaultIsTransientError(error: unknown): boolean {
 
   const err = error as Record<string, unknown>;
 
-  const status = (err as any)?.status ?? (err as any)?.statusCode ?? (err as any)?.response?.statusCode;
+  const status =
+    (err as any)?.status ??
+    (err as any)?.statusCode ??
+    // midtrans-client mengekspos HTTP status di `httpStatusCode`
+    // (lihat node_modules/midtrans-client/lib/midtransError.js). Tanpa ini,
+    // 404 "Transaction doesn't exist" dihitung transien dan membuka circuit
+    // breaker walau provider menjawab normal (bug produksi 2026-09-16).
+    (err as any)?.httpStatusCode ??
+    (err as any)?.response?.statusCode;
   if (typeof status === 'number') {
     if (status >= 400 && status < 500) return false;
+  }
+
+  // Status bisnis Midtrans terkadang hanya ada di body JSON respons
+  // (`ApiResponse.status_code`), bukan di HTTP status.
+  const apiStatusCode = Number((err as any)?.ApiResponse?.status_code);
+  if (Number.isFinite(apiStatusCode) && apiStatusCode >= 400 && apiStatusCode < 500) {
+    return false;
   }
 
   const code = (err as any)?.response?.code ?? (err as any)?.code;

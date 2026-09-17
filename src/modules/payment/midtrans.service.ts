@@ -23,6 +23,26 @@ function isCircuitOpenError(error: unknown): boolean {
   return (response as { code?: unknown }).code === 'SERVICE_CIRCUIT_OPEN';
 }
 
+/**
+ * True bila error berasal dari midtrans-client dan provider secara eksplisit
+ * menjawab bahwa transaksi tidak ada (HTTP 404 / status_code 404 /
+ * status_message "Transaction doesn't exist"). Jawaban seperti ini BUKAN
+ * gangguan layanan — memperlakuannya sebagai error transien merusak
+ * reconciler (top-up PENDING tidak pernah terekonsiliasi) dan circuit breaker.
+ */
+export function isMidtransNotFoundError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const err = error as Record<string, unknown>;
+  const http = typeof err.httpStatusCode === 'number' ? err.httpStatusCode : undefined;
+  const api = err.ApiResponse as Record<string, unknown> | undefined;
+  const apiStatus = typeof api?.status_code === 'string' || typeof api?.status_code === 'number'
+    ? Number(api?.status_code)
+    : undefined;
+  if (http === 404 || apiStatus === 404) return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes("Transaction doesn't exist") || message.includes('404');
+}
+
 type MidtransRefundTransactionApi = {
   refund(
     orderId: string,
@@ -333,6 +353,17 @@ export class MidtransService implements OnModuleInit {
       return await this.circuitBreaker.execute(() => this.coreApi!.transaction.status(orderId));
     } catch (error) {
       if (isCircuitOpenError(error)) {
+        throw error;
+      }
+      // 404 "Transaction doesn't exist" adalah jawaban FINAL dari provider —
+      // charge tidak pernah dibuat (user batal di halaman bayar) atau
+      // transaksi lama telah dihapus. Bukan gangguan layanan: dilempar
+      // apa adanya agar pemanggil bisa memperlakukannya sebagai kegagalan
+      // terminal, dan TIDAK menghitung failure untuk circuit breaker.
+      if (isMidtransNotFoundError(error)) {
+        this.logger.warn(
+          `Midtrans transaction not found (never charged or purged): orderId=${orderId}`,
+        );
         throw error;
       }
       this.logger.error(

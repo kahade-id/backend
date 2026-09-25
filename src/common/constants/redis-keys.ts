@@ -90,3 +90,10 @@ export const DAILY_TRANSFER_AMOUNT = (userId: string, date: string): string =>
 // verification revoked langsung menghilangkan badge tanpa delay berarti.
 export const PROFILE_VERIFICATION_BADGES = (userId: string): string =>
   `profile:badges:${userId}`;
+
+export const OTP_TRIGGER = (refCode: string): string => `otp_trigger:${refCode}`;
+export const OTP_TRIGGER_INBOX = (inboxId: string): string => `otp_trigger_inbox:${inboxId}`;
+export const OTP_TRIGGER_COOLDOWN = (phone: string, purpose: string): string =>
+  `otp_trigger_cooldown:${phone}:${purpose}`;
+export const OTP_TRIGGER_PHONE_RATE = (phone: string): string => `otp_trigger_phone_rate:${phone}`;
+export const OTP_TRIGGER_IP_RATE = (ip: string): string => `otp_trigger_ip_rate:${ip}`;

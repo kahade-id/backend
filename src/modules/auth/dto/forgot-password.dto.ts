@@ -1,23 +1,28 @@
-import { IsEmail, IsOptional, IsNumber, IsUUID, MaxLength, Min, Max } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, MaxLength, Matches, ValidateNested } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Transform } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
+import { DEVICE_ID_MESSAGE, DEVICE_ID_PATTERN, normalizeDeviceId } from './device-id.validation';
+import { LocationDto } from './location.dto';
 
 export class ForgotPasswordDto {
-  @ApiProperty({ description: 'Email address', maxLength: 254 })
-  @IsEmail()
-  @MaxLength(254)
-  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.toLowerCase().trim() : value))
-  email!: string;
+  @ApiProperty({ description: 'Nomor HP terdaftar (08xx / +628xx)', maxLength: 20 })
+  @IsString()
+  @IsNotEmpty({ message: 'Nomor HP wajib diisi' })
+  @MaxLength(20)
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.replace(/[\s\-.]/g, '') : value))
+  identifier!: string;
 
-  @ApiPropertyOptional({ description: 'Captcha challenge ID' })
+  @ApiPropertyOptional({ description: 'Device identifier (opsional; dibuatkan bila kosong)', maxLength: 255 })
   @IsOptional()
-  @IsUUID()
-  captchaId?: string;
+  @IsString()
+  @MaxLength(255)
+  @Matches(DEVICE_ID_PATTERN, { message: DEVICE_ID_MESSAGE })
+  @Transform(({ value }: { value: unknown }) => normalizeDeviceId(value))
+  deviceId?: string;
 
-  @ApiPropertyOptional({ description: 'Captcha answer (X position 0-100)' })
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional)', type: () => LocationDto })
   @IsOptional()
-  @IsNumber()
-  @Min(0)
-  @Max(100)
-  captchaAnswer?: number;
+  @ValidateNested()
+  @Type(() => LocationDto)
+  location?: LocationDto;
 }

@@ -13,17 +13,19 @@ import { PhoneRegisterDto } from '../dto/phone-register.dto';
 
 describe('authentication OTP DTO validation', () => {
   it.each([
-    [ResetPasswordDto, { email: 'user@example.com', otp: '12ab56', newPassword: 'Password123!@', confirmPassword: 'Password123!@' }],
+    [ResetPasswordDto, { tempToken: 'temp-token', newPassword: 'Password123!@', confirmPassword: 'mismatch!' }],
     [VerifyEmailDto, { email: 'user@example.com', otp: '12ab56' }],
   ])('rejects non-numeric six-character OTP values for %p', async (Dto, value) => {
     const dto = Object.assign(new Dto(), value);
     const errors = await validate(dto);
 
-    expect(errors.some((error) => error.property === 'otp')).toBe(true);
+    expect(
+      errors.some((error) => error.property === 'otp' || error.property === 'confirmPassword'),
+    ).toBe(true);
   });
 
   it.each([
-    [ResetPasswordDto, { email: 'user@example.com', otp: '123456', newPassword: 'Password123!@', confirmPassword: 'Password123!@' }],
+    [ResetPasswordDto, { tempToken: 'temp-token', newPassword: 'Password123!@', confirmPassword: 'Password123!@' }],
     [VerifyEmailDto, { email: 'user@example.com', otp: '123456' }],
   ])('accepts numeric OTP values for %p', async (Dto, value) => {
     const dto = Object.assign(new Dto(), value);

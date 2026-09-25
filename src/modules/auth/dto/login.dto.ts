@@ -1,13 +1,15 @@
-import { IsEmail, IsString, IsNotEmpty, IsOptional, IsNumber, IsUUID, MaxLength, Min, Max } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsNumber, IsUUID, MaxLength, Min, Max } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Transform } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
+import { LocationDto } from './location.dto';
 
 export class LoginDto {
-  @ApiProperty({ description: 'User email address', maxLength: 254 })
-  @IsEmail()
+  @ApiProperty({ description: 'Username, email, atau nomor HP', maxLength: 254 })
+  @IsString()
+  @IsNotEmpty({ message: 'Username/email/nomor HP wajib diisi' })
   @MaxLength(254)
-  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.toLowerCase().trim() : value))
-  email!: string;
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
+  identifier!: string;
 
   @ApiProperty({ description: 'User password', maxLength: 72 })
   @IsString()
@@ -38,4 +40,9 @@ export class LoginDto {
   @Min(0)
   @Max(100)
   captchaAnswer?: number;
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional)', type: LocationDto })
+  @IsOptional()
+  @Type(() => LocationDto)
+  location?: LocationDto;
 }

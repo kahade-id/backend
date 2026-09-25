@@ -11,7 +11,8 @@ export const RATING_EDIT_WINDOW_DAYS = 7;
 export const ACCOUNT_LOCK_MAX_ATTEMPTS = 5;
 export const ACCOUNT_LOCK_DURATION_MINUTES = 30;
 
-export const PASSWORD_MIN_LENGTH = 12;
+// Kebijakan password terpusat di src/modules/auth/password-policy.ts
+// (min 8 karakter, tanpa syarat complexity, blocklist password umum).
 const MIN_BCRYPT_ROUNDS = 12;
 const parsedBcryptRounds = parseInt(process.env.BCRYPT_ROUNDS || '12', 10);
 const parsedBcryptRoundsAdmin = parseInt(process.env.BCRYPT_ROUNDS_ADMIN || '14', 10);

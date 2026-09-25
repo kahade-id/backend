@@ -20,3 +20,5 @@ export * from './verify-phone-otp.dto';
 export * from './phone-register.dto';
 export * from './change-phone.dto';
 export * from './social-login.dto';
+export * from './location.dto';
+export * from './otp-trigger.dto';

@@ -628,17 +628,18 @@ model User {
   usernameChangedAt DateTime?
 
   // Extended profile (collected at registration)
-  phoneNumber     String    @unique
-  phoneNumberHash String?   @unique
-  phoneVerified   Boolean   @default(false)
+  phoneNumber      String            @unique
+  phoneNumberHash  String?           @unique
+  phoneVerified    Boolean           @default(false)
   // phoneVerifiedAt dibuat simetris dengan emailVerifiedAt: badge "Email & Phone
   // Verified" adalah kombinasi keduanya, jadi UI "Tentang" perlu tanggal kapan
   // masing-masing diverifikasi. Legacy rows (phoneVerified=true sebelum kolom ini
   // ada) tetap NULL — badge tetap tampil, earnedAt-nya fallback ke memberSince.
-  phoneVerifiedAt DateTime?
-  dateOfBirth     DateTime? @db.Date
-  gender          Gender?
-  address         String?   @db.VarChar(500)
+  phoneVerifiedAt  DateTime?
+  authLocationLogs AuthLocationLog[]
+  dateOfBirth      DateTime?         @db.Date
+  gender           Gender?
+  address          String?           @db.VarChar(500)
 
   // Verification
   emailVerified   Boolean   @default(false)
@@ -766,44 +767,44 @@ model User {
   disputeEvidences          DisputeEvidence[]          @relation("DisputeEvidenceSubmitter")
   mutualResolutionProposals MutualResolutionProposal[] @relation("MutualResolutionProposer")
 
-  extensionRequests       OrderExtensionRequest[]  @relation("ExtensionRequester")
-  extensionResponses      OrderExtensionRequest[]  @relation("ExtensionResponder")
+  extensionRequests        OrderExtensionRequest[]   @relation("ExtensionRequester")
+  extensionResponses       OrderExtensionRequest[]   @relation("ExtensionResponder")
   // Badge system — reverse relations untuk UserBadge
-  badges                  UserBadge[]
+  badges                   UserBadge[]
   // Password history — untuk cegah password cycling
-  passwordHistories       PasswordHistory[]
+  passwordHistories        PasswordHistory[]
   // Social links
-  links                   UserLink[]
+  links                    UserLink[]
   // Follow system
-  followers               Follow[]                 @relation("FollowingUser")
-  following               Follow[]                 @relation("FollowerUser")
+  followers                Follow[]                  @relation("FollowingUser")
+  following                Follow[]                  @relation("FollowerUser")
   // Favorites system
-  favoritesGiven          UserFavorite[]           @relation("FavoriteOwner")
-  favoritesReceived       UserFavorite[]           @relation("FavoriteTarget")
+  favoritesGiven           UserFavorite[]            @relation("FavoriteOwner")
+  favoritesReceived        UserFavorite[]            @relation("FavoriteTarget")
   // Saved-profile system, intentionally separate from favorites
-  savedProfilesGiven      UserSavedProfile[]       @relation("SavedProfileOwner")
-  savedProfilesReceived   UserSavedProfile[]       @relation("SavedProfileTarget")
+  savedProfilesGiven       UserSavedProfile[]        @relation("SavedProfileOwner")
+  savedProfilesReceived    UserSavedProfile[]        @relation("SavedProfileTarget")
   // Order links
-  orderLinksCreated       OrderLink[]              @relation("OrderLinkCreator")
+  orderLinksCreated        OrderLink[]               @relation("OrderLinkCreator")
   // Profile Q&A
-  questionsAsked          ProfileQuestion[]        @relation("QuestionAsker")
-  questionsReceived       ProfileQuestion[]        @relation("QuestionReceiver")
-  questionComments        ProfileQuestionComment[] @relation("CommentAuthor")
+  questionsAsked           ProfileQuestion[]         @relation("QuestionAsker")
+  questionsReceived        ProfileQuestion[]         @relation("QuestionReceiver")
+  questionComments         ProfileQuestionComment[]  @relation("CommentAuthor")
   // Section 4: upvote pertanyaan profil
-  questionUpvotes         ProfileQuestionUpvote[]
-  supportTickets          SupportTicket[]          @relation("UserSupportTickets")
-  showcaseItems           UserShowcase[]
+  questionUpvotes          ProfileQuestionUpvote[]
+  supportTickets           SupportTicket[]           @relation("UserSupportTickets")
+  showcaseItems            UserShowcase[]
   // Section 3: interaksi sosial pada showcase (like & komentar)
-  showcaseLikes           ShowcaseLike[]
-  showcaseComments        ShowcaseComment[]
-  scheduledWithdrawals    ScheduledWithdrawal[]    @relation("UserScheduledWithdrawals")
-  deliveryProofsSubmitted DeliveryProof[]          @relation("DeliveryProofSubmitter")
-  ratingReplies           RatingReply[]            @relation("RatingReplies")
-  orderLinksAccepted      OrderLink[]              @relation("OrderLinkAcceptor")
-  transactionTemplates    TransactionTemplate[]    @relation("UserTransactionTemplates")
-  idempotencyRecords      IdempotencyRecord[]
+  showcaseLikes            ShowcaseLike[]
+  showcaseComments         ShowcaseComment[]
+  scheduledWithdrawals     ScheduledWithdrawal[]     @relation("UserScheduledWithdrawals")
+  deliveryProofsSubmitted  DeliveryProof[]           @relation("DeliveryProofSubmitter")
+  ratingReplies            RatingReply[]             @relation("RatingReplies")
+  orderLinksAccepted       OrderLink[]               @relation("OrderLinkAcceptor")
+  transactionTemplates     TransactionTemplate[]     @relation("UserTransactionTemplates")
+  idempotencyRecords       IdempotencyRecord[]
   walletFavoriteRecipients WalletFavoriteRecipient[] @relation("WalletFavoriteOwner")
-  walletFavoritedBy      WalletFavoriteRecipient[] @relation("WalletFavoriteRecipient")
+  walletFavoritedBy        WalletFavoriteRecipient[] @relation("WalletFavoriteRecipient")
 
   //         — ketiga field ini sudah @unique, index dibuat otomatis. Redundan.
   @@index([kycStatus])
@@ -917,6 +918,37 @@ model OtpCode {
   @@index([expiresAt])
   @@index([userId, type, isUsed])
   @@map("otp_codes")
+}
+
+// ============================================================
+// AUTH LOCATION LOGS — lokasi presisi saat momen sensitif auth
+// (login, register, forgot/reset password, otp trigger, migrasi HP).
+// Dipakai untuk security log, deteksi lokasi baru, dan
+// impossible-travel heuristic (kolom suspicious). Tidak memblokir
+// flow — lokasi boleh null bila user menolak izin (fallback IP).
+// ============================================================
+
+model AuthLocationLog {
+  id        String  @id @default(cuid())
+  userId    String?
+  user      User?   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  event     String // login | register | forgot_password | password_reset | otp_trigger | phone_migration | password_change
+  latitude  Float
+  longitude Float
+  accuracy  Float? // meter, bila dilaporkan client
+  ipAddress String?
+  deviceId  String?
+
+  // Heuristik impossible-travel: jarak > 500 km dalam < 2 jam dari
+  // log terakhir user yang sama. Murni penanda untuk review, tidak
+  // memblokir autentikasi.
+  suspicious Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([event, createdAt])
+  @@map("auth_location_logs")
 }
 
 // ============================================================
@@ -1504,7 +1536,7 @@ model ChatRoom {
   messages         ChatMessage[]
   members          ChatRoomMember[]
   moderationEvents ChatModerationEvent[]
-  spawnedOrders    Order[]            @relation("OrderSourceInquiry")
+  spawnedOrders    Order[]               @relation("OrderSourceInquiry")
 
   @@index([type, initiatorId])
   @@index([type, counterpartId])
@@ -2806,15 +2838,15 @@ model FaqItem {
   categoryId String
   category   FaqCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
 
-  question   String  @db.Text
-  questionEn String? @db.Text
-  answer     String  @db.Text
-  answerEn   String? @db.Text
-  sortOrder  Int     @default(0)
-  isActive   Boolean @default(true)
-  viewCount  Int     @default(0)
-  helpfulCount    Int @default(0)
-  notHelpfulCount Int @default(0)
+  question        String          @db.Text
+  questionEn      String?         @db.Text
+  answer          String          @db.Text
+  answerEn        String?         @db.Text
+  sortOrder       Int             @default(0)
+  isActive        Boolean         @default(true)
+  viewCount       Int             @default(0)
+  helpfulCount    Int             @default(0)
+  notHelpfulCount Int             @default(0)
   supportTickets  SupportTicket[]
 
   createdAt DateTime @default(now())
@@ -2854,19 +2886,19 @@ model TransactionTemplate {
 }
 
 model SupportTicket {
-  id          String                @id @default(cuid())
-  userId      String
-  user        User                  @relation("UserSupportTickets", fields: [userId], references: [id], onDelete: Cascade)
-  subject     String                @db.VarChar(200)
-  message     String                @db.Text
-  category    SupportTicketCategory @default(GENERAL)
+  id               String                @id @default(cuid())
+  userId           String
+  user             User                  @relation("UserSupportTickets", fields: [userId], references: [id], onDelete: Cascade)
+  subject          String                @db.VarChar(200)
+  message          String                @db.Text
+  category         SupportTicketCategory @default(GENERAL)
   orderId          String?
   relatedArticleId String?
-  relatedArticle   FaqItem? @relation(fields: [relatedArticleId], references: [id], onDelete: SetNull)
+  relatedArticle   FaqItem?              @relation(fields: [relatedArticleId], references: [id], onDelete: SetNull)
   status           SupportTicketStatus   @default(OPEN)
   attachments      Json                  @default("[]")
   rating           Int?
-  ratingComment    String? @db.Text
+  ratingComment    String?               @db.Text
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

@@ -1,7 +1,8 @@
-import { IsString, IsNotEmpty, MaxLength, Matches, IsOptional, Length } from 'class-validator';
+import { IsString, IsNotEmpty, MaxLength, Matches, IsOptional, Length, ValidateNested } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Transform } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { DEVICE_ID_MESSAGE, DEVICE_ID_PATTERN, normalizeDeviceId } from './device-id.validation';
+import { LocationDto } from './location.dto';
 
 export class VerifyPhoneOtpDto {
   @ApiProperty({ description: 'Indonesian phone number', maxLength: 20 })
@@ -32,4 +33,10 @@ export class VerifyPhoneOtpDto {
   @IsString()
   @MaxLength(512)
   deviceInfo?: string;
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi saat verifikasi (opsional)', type: () => LocationDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LocationDto)
+  location?: LocationDto;
 }

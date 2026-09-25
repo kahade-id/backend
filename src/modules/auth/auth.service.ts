@@ -15,7 +15,11 @@ import { RedisService } from '../../redis/redis.service';
 import { TokenService } from './token.service';
 import type { RefreshTokenPayload, TempTokenPayload, DecodedTokenPayload } from './token.service';
 import { OtpService } from './otp.service';
-import { OtpType, NotificationType, UserAuditAction, Gender, Prisma } from '@prisma/client';
+import { OtpTriggerService, type TriggerPayload } from './otp-trigger.service';
+import { OtpTriggerPurpose } from './dto/otp-trigger.dto';
+import { AuthLocationService } from './auth-location.service';
+import type { LocationDto } from './dto/location.dto';
+import { OtpType, NotificationType, UserAuditAction, Gender, Prisma, User } from '@prisma/client';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import {
   generateUserId,
@@ -32,6 +36,7 @@ import {
   hmacPinDigest,
 } from '../../common/utils/crypto.util';
 import { hashPhoneNumber, encryptPii, decryptPiiSafe } from '../../common/utils/pii.util';
+import { normalizeIndonesianPhone } from '../../common/utils/phone.util';
 import { addMinutes } from '../../common/utils/date.util';
 import { generateBackupCodes, hashOtp, verifyOtp } from '../../common/utils/otp.util';
 import {
@@ -46,10 +51,10 @@ import {
   RESERVED_USERNAMES,
   ACCOUNT_LOCK_MAX_ATTEMPTS,
   ACCOUNT_LOCK_DURATION_MINUTES,
-  PASSWORD_MIN_LENGTH,
   MAX_REFERRALS,
   OTP_MAX_ATTEMPTS,
 } from '../../common/constants/app.constants';
+import { validatePasswordPolicy } from './password-policy';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import * as speakeasy from 'speakeasy';
 import { Logger } from '@nestjs/common';
@@ -77,44 +82,12 @@ void bcryptHash(_cryptoRandomBytes(32).toString('hex'), getBcryptRounds()).then(
 
 const TWO_FA_MAX_ATTEMPTS = 5;
 
-function validatePasswordComplexity(password: string): void {
-  if (password.length < PASSWORD_MIN_LENGTH) {
-    throw new BadRequestException({
-      code: ErrorCodes.VALIDATION_ERROR,
-      message: `Password must be at least ${PASSWORD_MIN_LENGTH} characters`,
-    });
-  }
-  if (!/[A-Z]/.test(password)) {
-    throw new BadRequestException({
-      code: ErrorCodes.VALIDATION_ERROR,
-      message: 'Password must contain at least one uppercase letter',
-    });
-  }
-  if (!/[a-z]/.test(password)) {
-    throw new BadRequestException({
-      code: ErrorCodes.VALIDATION_ERROR,
-      message: 'Password must contain at least one lowercase letter',
-    });
-  }
-  if (!/\d/.test(password)) {
-    throw new BadRequestException({
-      code: ErrorCodes.VALIDATION_ERROR,
-      message: 'Password must contain at least one number',
-    });
-  }
-  if (!/[^A-Za-z0-9]/.test(password)) {
-    throw new BadRequestException({
-      code: ErrorCodes.VALIDATION_ERROR,
-      message: 'Password must contain at least one special character',
-    });
-  }
-}
 
 interface LoginUserPayload {
   id: string;
   userId: string;
   username: string | null;
-  email: string;
+  email: string | null;
   fullName: string;
   avatarUrl: string | null;
   bio: string | null;
@@ -148,6 +121,8 @@ export class AuthService {
     private configService: ConfigService,
     private auditLog: AuditLogService,
     private realtime: RealtimeService,
+    private locationService: AuthLocationService,
+    private otpTriggerService: OtpTriggerService,
     @InjectQueue(EMAIL_QUEUE) private readonly emailQueue: Queue<EmailJobData>,
   ) {}
 
@@ -166,7 +141,7 @@ export class AuthService {
       });
     }
     if (dto.password) {
-      validatePasswordComplexity(dto.password);
+      validatePasswordPolicy(dto.password);
     }
 
     if (dto.dateOfBirth) {
@@ -332,135 +307,32 @@ export class AuthService {
   }
 
   /** Normalize phone to E.164 Indonesia format: 08xx → +628xx
-   *  Returns null if the number is not a recognizable Indonesian format.
+   *  Delegates to shared util (also used by OtpTriggerService).
    */
   private normalizePhoneNumber(phone: string): string {
-    const cleaned = phone.replace(/[\s\-.]/g, '');
-    const strictIndonesianPhone = /^(\+62|62|0)8[1-9][0-9]{7,10}$/;
-    if (!strictIndonesianPhone.test(cleaned)) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: 'Only valid Indonesian mobile numbers are accepted (e.g. 08xx or +628xx)',
-      });
-    }
-    if (cleaned.startsWith('0')) {
-      // Local format: 08xxx → +628xxx
-      return '+62' + cleaned.slice(1);
-    }
-    if (cleaned.startsWith('62') && !cleaned.startsWith('+62')) {
-      // Without plus: 628xxx → +628xxx
-      return '+' + cleaned;
-    }
-    if (cleaned.startsWith('+62')) {
-      // Already E.164 Indonesia
-      return cleaned;
-    }
-    throw new BadRequestException({
-      code: ErrorCodes.VALIDATION_ERROR,
-      message: 'Only Indonesian phone numbers (+62) are accepted',
-    });
+    return normalizeIndonesianPhone(phone);
   }
 
-  // ─────────────────────────────────────────────────────────────────
-  // REQUEST PHONE OTP (e-wallet style)
-  // ─────────────────────────────────────────────────────────────────
-  async requestPhoneOtp(
-    phoneNumber: string,
-    method: 'SMS' | 'WHATSAPP',
-    ipAddress?: string,
-    deviceId?: string,
-  ): Promise<{ message: string; debugCode?: string }> {
-    const normalizedPhone = this.normalizePhoneNumber(phoneNumber);
-    const phoneHash = hashPhoneNumber(normalizedPhone);
-
-    // Capability check first — fail before generatePhoneOtp() can burn the
-    // user's cooldown / rate-limit counters / DB row on a delivery channel
-    // the configured provider can't fulfill (e.g. SMS while OTP_PROVIDER=fonnte).
-    if (!this.otpGateway.supportsMethod(method)) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message:
-          method === 'SMS'
-            ? 'SMS delivery is not configured. Please use WhatsApp instead.'
-            : 'WhatsApp delivery is not configured. Please use SMS instead.',
+  /**
+   * Resolusi identifier login: email (mengandung @) → nomor HP Indonesia
+   * → username (disimpan lowercase). Dipakai oleh login().
+   */
+  private async findUserByIdentifier(identifier: string) {
+    const trimmed = identifier.trim();
+    if (trimmed.includes('@')) {
+      return this.prisma.user.findUnique({ where: { email: trimmed.toLowerCase() } });
+    }
+    const digits = trimmed.replace(/[\s\-.]/g, '');
+    if (/^(\+62|62|0)8[1-9][0-9]{7,10}$/.test(digits)) {
+      const normalized = normalizeIndonesianPhone(trimmed);
+      const phoneHash = hashPhoneNumber(normalized);
+      return this.prisma.user.findFirst({
+        where: { OR: [{ phoneNumberHash: phoneHash }, { phoneNumber: normalized }] },
       });
     }
-
-    const existingUser = await this.prisma.user.findFirst({
-      where: { OR: [{ phoneNumberHash: phoneHash }, { phoneNumber: normalizedPhone }] },
-      select: { id: true, isActive: true, isBanned: true, lockedUntil: true },
-    });
-
-    if (existingUser) {
-      if (!existingUser.isActive || existingUser.isBanned) {
-        return { message: 'If this number is valid, an OTP has been sent.' };
-      }
-      if (existingUser.lockedUntil && existingUser.lockedUntil > new Date()) {
-        return { message: 'If this number is valid, an OTP has been sent.' };
-      }
-    }
-
-    const otpMethod = method === 'WHATSAPP' ? ('WHATSAPP' as const) : ('SMS' as const);
-    const otp = await this.otpService.generatePhoneOtp(
-      normalizedPhone,
-      OtpType.PHONE_LOGIN,
-      otpMethod,
-      existingUser?.id,
-      { purpose: 'phone_login', deviceId },
-      ipAddress,
-    );
-
-    let delivery: { success: boolean; error?: string };
-    try {
-      delivery = await this.otpGateway.sendOtp(normalizedPhone, otp, method);
-    } catch (error) {
-      this.logger.error(
-        `OTP delivery threw for phoneHash=${phoneHash.slice(0, 12)} via ${method}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      await this.otpService
-        .invalidatePhoneOtps(normalizedPhone, OtpType.PHONE_LOGIN)
-        .catch(cleanupError => {
-          this.logger.error(
-            `Failed to invalidate undelivered phone OTP: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
-          );
-        });
-      throw new ServiceUnavailableException({
-        code: 'OTP_DELIVERY_FAILED',
-        message: 'OTP delivery is temporarily unavailable. Please try again later.',
-      });
-    }
-
-    if (!delivery.success) {
-      this.logger.error(
-        `OTP delivery failed for phoneHash=${phoneHash.slice(0, 12)} via ${method}: ${delivery.error ?? 'unknown'}`,
-      );
-      await this.otpService
-        .invalidatePhoneOtps(normalizedPhone, OtpType.PHONE_LOGIN)
-        .catch(cleanupError => {
-          this.logger.error(
-            `Failed to invalidate undelivered phone OTP: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
-          );
-        });
-      // Defensive: should be unreachable now that supportsMethod is checked
-      // above, but keep the surface so a misconfigured provider still produces
-      // a useful error instead of the generic message.
-      if (delivery.error === 'OTP_DELIVERY_SMS_UNSUPPORTED') {
-        throw new BadRequestException({
-          code: ErrorCodes.VALIDATION_ERROR,
-          message: 'SMS delivery is not configured. Please use WhatsApp instead.',
-        });
-      }
-      throw new ServiceUnavailableException({
-        code: 'OTP_DELIVERY_FAILED',
-        message: 'OTP delivery is temporarily unavailable. Please try again later.',
-      });
-    }
-
-    return {
-      message: 'If this number is valid, an OTP has been sent.',
-      ...(this.shouldExposeDebugOtp() ? { debugCode: otp } : {}),
-    };
+    return this.prisma.user.findUnique({ where: { username: trimmed.toLowerCase() } });
   }
+
 
   private shouldExposeDebugOtp(): boolean {
     const nodeEnv = (
@@ -482,8 +354,11 @@ export class AuthService {
     deviceId: string,
     deviceInfo: string | undefined,
     ipAddress: string,
+    location?: LocationDto,
   ): Promise<
     | { status: 'new_user'; tempToken: string }
+    | { status: 'password_reset'; tempToken: string }
+    | { status: 'migration_verified'; tempToken: string }
     | {
         status: 'existing_user';
         requires2FA?: boolean;
@@ -553,6 +428,64 @@ export class AuthService {
         code: ErrorCodes.OTP_INVALID,
         message: 'Invalid or expired OTP',
       });
+    }
+
+    // Percabangan berdasarkan purpose trigger WhatsApp (disimpan di metadata
+    // OTP oleh webhook). Tanpa triggerPurpose → perilaku lama (login/register).
+    const triggerPurpose = typeof metadata?.triggerPurpose === 'string' ? metadata.triggerPurpose : undefined;
+
+    if (triggerPurpose === 'forgot_password') {
+      if (!existingUser) {
+        throw new NotFoundException({
+          code: ErrorCodes.NOT_FOUND,
+          message: 'Nomor HP tidak terdaftar di Kahade.',
+        });
+      }
+      const tempToken = this.tokenService.signTempToken({
+        sub: existingUser.id,
+        scope: 'password_reset',
+        deviceId,
+      });
+      await this.locationService.logEvent({
+        userId: existingUser.id,
+        event: 'forgot_password',
+        location: location ?? null,
+        ipAddress,
+        deviceId,
+      });
+      return { status: 'password_reset', tempToken };
+    }
+
+    if (triggerPurpose === 'migrate_phone') {
+      const boundUserId = typeof metadata?.userId === 'string' ? metadata.userId : undefined;
+      const migratingUser = boundUserId
+        ? await this.prisma.user.findUnique({ where: { id: boundUserId } })
+        : null;
+      if (!migratingUser) {
+        throw new UnauthorizedException({
+          code: ErrorCodes.UNAUTHORIZED,
+          message: 'Sesi migrasi tidak valid. Silakan masuk ulang.',
+        });
+      }
+      if (!migratingUser.isActive || migratingUser.isBanned) {
+        throw new ForbiddenException({
+          code: ErrorCodes.ACCOUNT_INACTIVE,
+          message: 'Account is inactive',
+        });
+      }
+      if (migratingUser.lockedUntil && migratingUser.lockedUntil > new Date()) {
+        throw new UnauthorizedException({
+          code: ErrorCodes.ACCOUNT_LOCKED,
+          message: 'Account is temporarily locked due to too many failed attempts',
+        });
+      }
+      const tempToken = this.tokenService.signTempToken({
+        sub: migratingUser.id,
+        scope: 'phone_migration',
+        deviceId,
+        extra: { phone: normalizedPhone },
+      });
+      return { status: 'migration_verified', tempToken };
     }
 
     if (!existingUser) {
@@ -980,21 +913,26 @@ export class AuthService {
   // ─────────────────────────────────────────────────────────────────
   // PHONE REGISTER (e-wallet style — after OTP verification)
   // ─────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────
+  // PHONE REGISTER (pendaftaran via nomor HP — disederhanakan)
+  // ─────────────────────────────────────────────────────────────────
+  /**
+   * Registrasi akun baru via nomor HP yang sudah diverifikasi OTP WhatsApp.
+   * Hanya butuh: nama lengkap, password (min 8, tanpa complexity), dan
+   * username opsional (dibuat otomatis bila kosong). Email, tanggal lahir,
+   * gender, alamat, dan PIN wallet diisi belakangan lewat pengaturan profil.
+   */
   async phoneRegister(
     dto: {
       tempToken: string;
       fullName: string;
-      username: string;
-      dateOfBirth: string;
-      gender: string;
-      email: string;
+      username?: string;
       password: string;
-      pin: string;
-      address?: string;
+      deviceId: string;
+      deviceInfo?: string;
+      location?: LocationDto;
       referralCode?: string;
     },
-    deviceId: string,
-    deviceInfo: string | undefined,
     ipAddress: string,
   ): Promise<{
     accessToken: string;
@@ -1023,7 +961,7 @@ export class AuthService {
         message: 'Invalid registration token. Please verify your phone number again.',
       });
     }
-    if (!payload.deviceId || payload.deviceId !== deviceId) {
+    if (!payload.deviceId || payload.deviceId !== dto.deviceId) {
       throw new UnauthorizedException({
         code: ErrorCodes.TEMP_TOKEN_EXPIRED,
         message:
@@ -1033,41 +971,40 @@ export class AuthService {
 
     const phoneNumber = payload.sub;
 
-    if (dto.dateOfBirth) {
-      const dob = new Date(dto.dateOfBirth + 'T00:00:00Z');
-      if (isNaN(dob.getTime())) {
+    validatePasswordPolicy(dto.password);
+
+    // Username: pakai yang diberikan, atau buat otomatis dari nama.
+    let normalizedUsername: string;
+    if (dto.username && dto.username.trim()) {
+      normalizedUsername = dto.username.trim().toLowerCase();
+      if (normalizedUsername.length < 3 || normalizedUsername.length > 30) {
         throw new BadRequestException({
           code: ErrorCodes.VALIDATION_ERROR,
-          message: 'Invalid date of birth format. Use ISO 8601 (YYYY-MM-DD)',
+          message: 'Username must be between 3 and 30 characters',
         });
       }
-      const age = (Date.now() - dob.getTime()) / (365.25 * 24 * 60 * 60 * 1000);
-      if (age < 13 || age > 120) {
+      if (!/^[a-z0-9][a-z0-9._-]*[a-z0-9]$/.test(normalizedUsername)) {
         throw new BadRequestException({
           code: ErrorCodes.VALIDATION_ERROR,
-          message: 'Date of birth must represent an age between 13 and 120 years',
+          message:
+            'Username may only contain lowercase letters, numbers, dots, dashes and underscores',
         });
       }
-    }
-
-    const normalizedUsername = dto.username.toLowerCase();
-    if (RESERVED_USERNAMES.includes(normalizedUsername)) {
-      throw new BadRequestException({
-        code: ErrorCodes.USERNAME_RESERVED,
-        message: 'Username is already taken',
-      });
-    }
-
-    validatePasswordComplexity(dto.password);
-    this.validatePinPolicy(dto.pin);
-
-    const normalizedEmail = dto.email.toLowerCase().trim();
-    const existingEmail = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
-    if (existingEmail) {
-      throw new ConflictException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: 'Email already registered',
-      });
+      if (RESERVED_USERNAMES.includes(normalizedUsername)) {
+        throw new BadRequestException({
+          code: ErrorCodes.USERNAME_RESERVED,
+          message: 'Username is already taken',
+        });
+      }
+      const taken = await this.prisma.user.findUnique({ where: { username: normalizedUsername } });
+      if (taken) {
+        throw new BadRequestException({
+          code: ErrorCodes.USERNAME_TAKEN,
+          message: 'Username is already taken',
+        });
+      }
+    } else {
+      normalizedUsername = await this.generateUniqueUsernameFromName(dto.fullName);
     }
 
     const phoneHash = hashPhoneNumber(phoneNumber);
@@ -1081,6 +1018,7 @@ export class AuthService {
       });
     }
 
+    // Referral opsional — diabaikan diam-diam bila tidak valid (perilaku lama).
     let referralCodeRecord: {
       id: string;
       userId: string;
@@ -1105,12 +1043,7 @@ export class AuthService {
     const myReferralCode = generateReferralCode();
 
     const encryptedPhone = await encryptPii(phoneNumber);
-    const encryptedAddress = dto.address ? await encryptPii(dto.address) : undefined;
-
     const hashedPassword = await bcryptHash(dto.password, getBcryptRounds());
-    const pinPepper = this.getWalletPinPepper();
-    const pinDigest = hmacPinDigest(pinPepper, dto.pin);
-    const hashedPin = await bcryptHash(pinDigest, getBcryptRounds());
 
     const registrationTokenKey = TOKEN_BLACKLIST(`phone_register:${payload.jti}`);
     const registrationTokenTtl = Math.max(
@@ -1132,7 +1065,6 @@ export class AuthService {
       userId: string;
       phoneNumber: string;
       fullName: string;
-      email: string | null;
     };
     try {
       user = await this.prisma.$transaction(
@@ -1145,19 +1077,16 @@ export class AuthService {
               phoneVerified: true,
               // OTP registration memverifikasi nomor HP di titik ini — catat waktunya.
               phoneVerifiedAt: new Date(),
-              email: normalizedEmail,
+              email: null,
               emailVerified: false,
               password: hashedPassword,
               passwordChangedAt: new Date(),
               fullName: dto.fullName,
               username: normalizedUsername,
-              dateOfBirth: new Date(dto.dateOfBirth + 'T00:00:00Z'),
-              gender: dto.gender as Gender,
-              ...(encryptedAddress ? { address: encryptedAddress } : {}),
             },
           });
 
-          await tx.wallet.create({ data: { userId: newUser.id, walletPinHash: hashedPin } });
+          await tx.wallet.create({ data: { userId: newUser.id } });
           await tx.notificationPreference.create({ data: { userId: newUser.id } });
           await tx.referralCode.create({ data: { userId: newUser.id, code: myReferralCode } });
 
@@ -1214,35 +1143,21 @@ export class AuthService {
             message: 'Phone number already registered',
           });
         }
-        if (target.includes('email')) {
-          throw new ConflictException({
-            code: ErrorCodes.VALIDATION_ERROR,
-            message: 'Email already registered',
-          });
-        }
       }
       throw err;
     }
-
-    // Fire-and-forget: failures to enqueue the verification email must not fail
-    // registration — the user can always resend via /auth/resend-verification.
-    this.sendVerificationEmail(user.id, normalizedEmail, ipAddress).catch((err: unknown) => {
-      this.logger.warn(
-        `sendVerificationEmail failed for new user ${user.id}: ${err instanceof Error ? err.message : err}`,
-      );
-    });
 
     const refreshToken = this.tokenService.signRefreshToken({ sub: user.id });
     const sessionId = await this.saveSession(
       user.id,
       refreshToken,
-      deviceId,
-      deviceInfo,
+      dto.deviceId,
+      dto.deviceInfo,
       ipAddress,
     );
 
-    if (deviceId) {
-      await this.trackDevice(user.id, deviceId, deviceInfo, ipAddress).catch(err =>
+    if (dto.deviceId) {
+      await this.trackDevice(user.id, dto.deviceId, dto.deviceInfo, ipAddress).catch(err =>
         this.logger.error('trackDevice failed in phoneRegister()', err),
       );
     }
@@ -1250,7 +1165,7 @@ export class AuthService {
     const accessToken = this.tokenService.signAccessToken({
       sub: user.id,
       userId: user.userId,
-      email: normalizedEmail,
+      email: null,
       username: normalizedUsername,
       sessionId,
       kycStatus: 'UNVERIFIED',
@@ -1266,6 +1181,14 @@ export class AuthService {
       ipAddress,
     });
 
+    await this.locationService.logEvent({
+      userId: user.id,
+      event: 'register',
+      location: dto.location ?? null,
+      ipAddress,
+      deviceId: dto.deviceId,
+    });
+
     return {
       accessToken,
       refreshToken,
@@ -1273,7 +1196,7 @@ export class AuthService {
         id: user.id,
         userId: user.userId,
         username: normalizedUsername,
-        email: normalizedEmail,
+        email: null,
         fullName: user.fullName,
         avatarUrl: null,
         bio: null,
@@ -1284,13 +1207,26 @@ export class AuthService {
         subscriptionExpiresAt: null,
         membershipRank: 'BRONZE',
         isMfaEnabled: false,
-        phoneNumber: phoneNumber,
+        phoneNumber,
         phoneVerified: true,
-        dateOfBirth: dto.dateOfBirth,
-        gender: dto.gender,
+        dateOfBirth: null,
+        gender: null,
         createdAt: new Date().toISOString(),
       },
     };
+  }
+
+  /** Buat username unik dari nama lengkap: nama + 4 digit acak. */
+  private async generateUniqueUsernameFromName(fullName: string): Promise<string> {
+    const base = fullName.toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 16) || 'kahade';
+    for (let i = 0; i < 10; i++) {
+      const candidate = `${base}${_cryptoRandomInt(1000, 10000)}`.slice(0, 30);
+      if (RESERVED_USERNAMES.includes(candidate)) continue;
+      const taken = await this.prisma.user.findUnique({ where: { username: candidate } });
+      if (!taken) return candidate;
+    }
+    const fallback = `${base}${_cryptoRandomBytes(3).toString('hex')}`.slice(0, 30);
+    return fallback;
   }
 
   // ─────────────────────────────────────────────────────────────────
@@ -1606,92 +1542,81 @@ export class AuthService {
   }
 
   // ─────────────────────────────────────────────────────────────────
-  // FORGOT PASSWORD
+  // FORGOT PASSWORD (via OTP WhatsApp user-initiated)
   // ─────────────────────────────────────────────────────────────────
-  async forgotPassword(email: string, ipAddress?: string): Promise<{ message: string }> {
-    const normalizedEmail = email.toLowerCase();
-
-    if (ipAddress) {
-      const ipRateLimitKey = `forgot_password_ip_rate:${ipAddress}`;
-      const ipRequestCount = await this.redis.incrWithTtl(ipRateLimitKey, 3600);
-      if (ipRequestCount > 5) {
-        return { message: 'If this email exists, a password reset code has been sent.' };
-      }
-    }
-
-    const rateLimitKey = `forgot_password_rate:${normalizedEmail}`;
-    const requestCount = await this.redis.incrWithTtl(rateLimitKey, 3600);
-    if (requestCount > 3) {
-      return { message: 'If this email exists, a password reset code has been sent.' };
-    }
-
-    const user = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
-
-    if (user && user.isActive && !user.isBanned) {
-      try {
-        await this.otpService.invalidateOtps(normalizedEmail, OtpType.PASSWORD_RESET);
-        const otp = await this.otpService.generateOtp(
-          normalizedEmail,
-          OtpType.PASSWORD_RESET,
-          user.id,
-          undefined,
-          ipAddress,
-        );
-        await this.sendPasswordResetEmail(normalizedEmail, otp);
-      } catch (error) {
-        this.logger.warn(
-          `forgotPassword OTP generation suppressed: ${error instanceof Error ? error.message : error}`,
-        );
-      }
-    }
-
-    return { message: 'If this email exists, a password reset code has been sent.' };
+  /**
+   * Lupa password: identifier HARUS nomor HP. Membuat challenge trigger
+   * WhatsApp (purpose=forgot_password); user mengirim refCode ke nomor
+   * resmi Kahade, menerima OTP, lalu verifikasi → tempToken password_reset.
+   */
+  async forgotPassword(
+    dto: { identifier: string; deviceId?: string; location?: LocationDto },
+    ipAddress: string,
+  ): Promise<TriggerPayload> {
+    const phoneNumber = normalizeIndonesianPhone(dto.identifier);
+    return this.otpTriggerService.createTrigger(
+      {
+        phoneNumber,
+        deviceId: dto.deviceId,
+        purpose: OtpTriggerPurpose.FORGOT_PASSWORD,
+        location: dto.location,
+      },
+      ipAddress,
+    );
   }
 
   // ─────────────────────────────────────────────────────────────────
-  // RESET PASSWORD
+  // RESET PASSWORD (via tempToken password_reset)
   // ─────────────────────────────────────────────────────────────────
   async resetPassword(
-    email: string,
-    otp: string,
-    newPassword: string,
-    confirmPassword: string,
+    dto: {
+      tempToken: string;
+      newPassword: string;
+      confirmPassword?: string;
+      location?: LocationDto;
+    },
+    ipAddress: string,
   ): Promise<{ message: string }> {
-    if (newPassword !== confirmPassword) {
+    if (dto.confirmPassword !== undefined && dto.newPassword !== dto.confirmPassword) {
       throw new BadRequestException({
         code: ErrorCodes.PASSWORDS_DO_NOT_MATCH,
         message: 'Passwords do not match',
       });
     }
 
-    validatePasswordComplexity(newPassword);
+    validatePasswordPolicy(dto.newPassword);
 
-    const normalizedEmail = email.toLowerCase();
-    // AUDIT-8: public endpoint — distinct USER_NOT_FOUND / ACCOUNT_INACTIVE / ACCOUNT_BANNED
-    // responses before OTP verification are an enumeration oracle. Callers that never received
-    // a PASSWORD_RESET OTP get the same generic OTP error either way.
-    const user = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
-    if (!user) {
-      throw new BadRequestException({
-        code: ErrorCodes.OTP_INVALID,
-        message: 'Invalid or expired reset code',
+    let payload: TempTokenPayload;
+    try {
+      payload = this.tokenService.verifyTempToken(dto.tempToken);
+    } catch {
+      throw new UnauthorizedException({
+        code: ErrorCodes.TEMP_TOKEN_EXPIRED,
+        message: 'Reset token expired. Please request a new OTP.',
+      });
+    }
+    if (payload.scope !== 'password_reset') {
+      throw new UnauthorizedException({
+        code: ErrorCodes.UNAUTHORIZED,
+        message: 'Invalid token scope',
       });
     }
 
-    if (!user.isActive) {
+    const user = await this.prisma.user.findUnique({ where: { id: payload.sub } });
+    if (!user || !user.isActive || user.isBanned) {
       throw new BadRequestException({
         code: ErrorCodes.OTP_INVALID,
-        message: 'Invalid or expired reset code',
+        message: 'Invalid or expired reset token',
       });
     }
-    if (user.isBanned) {
-      throw new BadRequestException({
-        code: ErrorCodes.OTP_INVALID,
-        message: 'Invalid or expired reset code',
+    if (user.lockedUntil && user.lockedUntil > new Date()) {
+      throw new UnauthorizedException({
+        code: ErrorCodes.ACCOUNT_LOCKED,
+        message: 'Account is temporarily locked due to too many failed attempts',
       });
     }
 
-    const isSamePassword = user.password ? await bcryptCompare(newPassword, user.password) : false;
+    const isSamePassword = user.password ? await bcryptCompare(dto.newPassword, user.password) : false;
     if (isSamePassword) {
       throw new BadRequestException({
         code: ErrorCodes.PASSWORD_SAME_AS_OLD,
@@ -1705,7 +1630,7 @@ export class AuthService {
       take: 5,
     });
     for (const historical of recentPasswords) {
-      const isReused = await bcryptCompare(newPassword, historical.passwordHash);
+      const isReused = await bcryptCompare(dto.newPassword, historical.passwordHash);
       if (isReused) {
         throw new BadRequestException({
           code: ErrorCodes.PASSWORD_RECENTLY_USED,
@@ -1714,18 +1639,7 @@ export class AuthService {
       }
     }
 
-    // Do not consume the recovery factor until every deterministic account and
-    // password-policy check has passed. A user who mistypes a disallowed new
-    // password should be able to correct it without requesting another OTP.
-    const isValid = await this.otpService.verifyOtp(normalizedEmail, OtpType.PASSWORD_RESET, otp);
-    if (!isValid) {
-      throw new BadRequestException({
-        code: ErrorCodes.OTP_INVALID,
-        message: 'Invalid or expired reset code',
-      });
-    }
-
-    const hashedPassword = await bcryptHash(newPassword, getBcryptRounds());
+    const hashedPassword = await bcryptHash(dto.newPassword, getBcryptRounds());
 
     const resetSessionIds = await this.prisma.$transaction(
       async (tx: Prisma.TransactionClient) => {
@@ -1739,11 +1653,7 @@ export class AuthService {
         });
         // User.password is nullable in the schema while PasswordHistory.passwordHash
         // is required, so a null password would make Prisma reject this write and
-        // turn a reset into a 500. Both current registration paths always set a
-        // password, so this is unreachable today — but the same null case is already
-        // guarded at the isSamePassword check above, and a future passwordless path
-        // (social login) would otherwise land here. Skip history when there is no
-        // previous password to record.
+        // turn a reset into a 500. Skip history when there is no previous password.
         if (user.password) {
           await tx.passwordHistory.create({
             data: { userId: user.id, passwordHash: user.password },
@@ -1779,15 +1689,15 @@ export class AuthService {
       );
     });
 
-    // Fire-and-forget: dispatchEmail already logs the error before rethrowing;
-    // we swallow the rejection here because this is a post-action confirmation
-    // and must not retroactively fail the password-reset flow.
-    this.dispatchEmail({
-      to: normalizedEmail,
-      subject: 'Kahade - Your Password Has Been Reset',
-      templateName: 'password-reset-confirm',
-      templateContext: {},
-    }).catch(() => undefined);
+    // Konfirmasi email hanya bila user punya email (registrasi baru tanpa email).
+    if (user.email) {
+      this.dispatchEmail({
+        to: user.email,
+        subject: 'Kahade - Your Password Has Been Reset',
+        templateName: 'password-reset-confirm',
+        templateContext: {},
+      }).catch(() => undefined);
+    }
     this.createSecurityNotification(
       user.id,
       'Password Reset',
@@ -1799,19 +1709,168 @@ export class AuthService {
       action: UserAuditAction.PASSWORD_RESET,
       entityType: 'User',
       entityId: user.id,
-      description: 'Password reset via email OTP',
+      description: 'Password reset via WhatsApp OTP',
+      ipAddress,
+    });
+
+    await this.locationService.logEvent({
+      userId: user.id,
+      event: 'password_reset',
+      location: dto.location ?? null,
+      ipAddress,
+      deviceId: payload.deviceId,
     });
 
     return { message: 'Password reset successfully. Please log in again.' };
   }
 
   // ─────────────────────────────────────────────────────────────────
+  // CONFIRM PHONE MIGRATION (akun lama → tambah & verifikasi nomor HP)
+  // ─────────────────────────────────────────────────────────────────
+  /**
+   * Konfirmasi migrasi: tempToken scope=phone_migration (diterbitkan setelah
+   * password valid di login() atau setelah OTP terverifikasi dengan purpose
+   * migrate_phone) + nomor HP yang sudah diverifikasi via WhatsApp.
+   * Menerbitkan sesi penuh; hormati 2FA bila aktif.
+   */
+  async confirmPhoneMigration(
+    dto: {
+      tempToken: string;
+      deviceId: string;
+      deviceInfo?: string;
+      location?: LocationDto;
+    },
+    ipAddress: string,
+  ): Promise<LoginResult> {
+    let payload: TempTokenPayload;
+    try {
+      payload = this.tokenService.verifyTempToken(dto.tempToken);
+    } catch {
+      throw new UnauthorizedException({
+        code: ErrorCodes.TEMP_TOKEN_EXPIRED,
+        message: 'Sesi migrasi kedaluwarsa. Silakan masuk ulang.',
+      });
+    }
+    if (payload.scope !== 'phone_migration') {
+      throw new UnauthorizedException({
+        code: ErrorCodes.UNAUTHORIZED,
+        message: 'Token tidak valid untuk migrasi',
+      });
+    }
+    if (!payload.deviceId || payload.deviceId !== dto.deviceId) {
+      throw new UnauthorizedException({
+        code: ErrorCodes.UNAUTHORIZED,
+        message: 'Token migrasi tidak berlaku untuk perangkat ini',
+      });
+    }
+    if (!payload.phone) {
+      throw new UnauthorizedException({
+        code: ErrorCodes.UNAUTHORIZED,
+        message: 'Nomor HP belum diverifikasi. Selesaikan verifikasi WhatsApp dulu.',
+      });
+    }
+
+    const phoneNumber = normalizeIndonesianPhone(payload.phone);
+    const phoneHash = hashPhoneNumber(phoneNumber);
+
+    const user = await this.prisma.user.findUnique({ where: { id: payload.sub } });
+    if (!user || !user.isActive || user.isBanned) {
+      throw new UnauthorizedException({
+        code: ErrorCodes.UNAUTHORIZED,
+        message: 'Akun tidak valid',
+      });
+    }
+    if (user.lockedUntil && user.lockedUntil > new Date()) {
+      throw new UnauthorizedException({
+        code: ErrorCodes.ACCOUNT_LOCKED,
+        message: 'Account is temporarily locked due to too many failed attempts',
+      });
+    }
+
+    const owner = await this.prisma.user.findFirst({
+      where: {
+        OR: [{ phoneNumberHash: phoneHash }, { phoneNumber }],
+        NOT: { id: user.id },
+      },
+      select: { id: true },
+    });
+    if (owner) {
+      throw new ConflictException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Nomor HP sudah dipakai akun lain.',
+      });
+    }
+
+    const encryptedPhone = await encryptPii(phoneNumber);
+    const updatedUser = await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        phoneNumber: encryptedPhone,
+        phoneNumberHash: phoneHash,
+        phoneVerified: true,
+        phoneVerifiedAt: new Date(),
+      },
+    });
+
+    this.auditLog.logUserAction({
+      userId: user.id,
+      action: UserAuditAction.PROFILE_UPDATED,
+      entityType: 'User',
+      entityId: user.id,
+      description: `Phone migration completed from ${ipAddress}`,
+      ipAddress,
+    });
+
+    await this.locationService.logEvent({
+      userId: user.id,
+      event: 'phone_migration',
+      location: dto.location ?? null,
+      ipAddress,
+      deviceId: dto.deviceId,
+    });
+
+    const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({
+      where: { userId: user.id },
+    });
+    if (twoFactorAuth?.isEnabled) {
+      let skipTwoFa = false;
+      if (dto.deviceId) {
+        const trusted = await this.prisma.userDevice.findFirst({
+          where: { userId: user.id, deviceId: dto.deviceId, isTrusted: true },
+        });
+        skipTwoFa = !!trusted;
+      }
+      if (!skipTwoFa) {
+        const tempToken = this.tokenService.signTempToken({
+          sub: user.id,
+          scope: '2fa_verify',
+          deviceId: dto.deviceId,
+        });
+        return { requires2FA: true, tempToken };
+      }
+    }
+
+    return this.issueLoginSession(updatedUser, ipAddress, {
+      deviceId: dto.deviceId,
+      deviceInfo: dto.deviceInfo,
+      isMfaEnabled: twoFactorAuth?.isEnabled ?? false,
+      location: dto.location,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────
   // LOGIN
   // ─────────────────────────────────────────────────────────────────
   async login(
-    dto: { email: string; password: string; deviceId: string; deviceInfo?: string },
+    dto: {
+      identifier: string;
+      password: string;
+      deviceId: string;
+      deviceInfo?: string;
+      location?: LocationDto;
+    },
     ipAddress: string,
-  ): Promise<LoginResult> {
+  ): Promise<LoginResult | { requiresPhoneMigration: true; migrationToken: string }> {
     const LOGIN_IP_KEY = `login_ip_rate:${ipAddress}`;
     const ipAttempts = await this.redis.incrWithTtl(LOGIN_IP_KEY, 900);
     if (ipAttempts > 20) {
@@ -1825,8 +1884,7 @@ export class AuthService {
     }
 
     const loginStart = Date.now();
-    const normalizedEmail = dto.email.trim().toLowerCase();
-    const user = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
+    const user = await this.findUserByIdentifier(dto.identifier.trim());
 
     if (!user) {
       const fallbackHash =
@@ -1951,6 +2009,24 @@ export class AuthService {
       }
     }
 
+    // Migrasi wajib: akun lama yang nomor HP-nya belum terverifikasi harus
+    // verifikasi via WhatsApp dulu sebelum sesi diterbitkan.
+    if (isPasswordValid && !user.phoneVerified) {
+      const migrationToken = this.tokenService.signTempToken({
+        sub: user.id,
+        scope: 'phone_migration',
+        deviceId: dto.deviceId,
+      });
+      await this.locationService.logEvent({
+        userId: user.id,
+        event: 'login',
+        location: dto.location ?? null,
+        ipAddress,
+        deviceId: dto.deviceId,
+      });
+      return { requiresPhoneMigration: true as const, migrationToken };
+    }
+
     // Do not reset lockout counters here; verify2faLogin() re-checks and clears them
     // after the second factor succeeds so a tempToken cannot bypass a concurrent lockout.
     const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({
@@ -1988,6 +2064,31 @@ export class AuthService {
       }
     }
 
+    return this.issueLoginSession(user, ipAddress, {
+      deviceId: dto.deviceId,
+      deviceInfo: dto.deviceInfo,
+      password: dto.password,
+      isMfaEnabled: twoFactorAuth?.isEnabled ?? false,
+      location: dto.location,
+    });
+  }
+
+  /**
+   * Menerbitkan sesi login penuh: reset lockout, upgrade bcrypt bila perlu,
+   * simpan sesi + device, terbitkan token, catat audit.
+   * Dipakai oleh login() dan confirmPhoneMigration().
+   */
+  private async issueLoginSession(
+    user: User,
+    ipAddress: string,
+    opts: {
+      deviceId: string;
+      deviceInfo?: string;
+      password?: string;
+      isMfaEnabled?: boolean;
+      location?: LocationDto;
+    },
+  ): Promise<LoginResult> {
     const lockoutCycleKey = `lockout_cycles:${user.id}`;
     await this.redis
       .del(lockoutCycleKey)
@@ -2001,13 +2102,13 @@ export class AuthService {
       lastLoginIp: ipAddress,
     };
 
-    const storedRounds = user.password ? this.extractBcryptRounds(user.password) : 0;
+    const storedRounds = user.password && opts.password ? this.extractBcryptRounds(user.password) : 0;
     if (storedRounds > 0 && storedRounds < getBcryptRounds()) {
       // AUDIT-9: do NOT stamp passwordChangedAt here. The field means "the user rotated
       // their password" (surfaced by GET /users/me and usable for iat-based session
       // invalidation); a transparent server-side cost-factor upgrade is not a password
       // change and previously rewrote that security signal on login.
-      updateData.password = await bcryptHash(dto.password, getBcryptRounds());
+      updateData.password = await bcryptHash(opts.password as string, getBcryptRounds());
       this.logger.log(
         `[CRY-020] Upgraded password hash rounds from ${storedRounds} to ${getBcryptRounds()} for user ${user.id}`,
       );
@@ -2022,14 +2123,14 @@ export class AuthService {
     const sessionId = await this.saveSession(
       user.id,
       refreshToken,
-      dto.deviceId,
-      dto.deviceInfo,
+      opts.deviceId,
+      opts.deviceInfo,
       ipAddress,
     );
 
-    if (dto.deviceId) {
-      await this.trackDevice(user.id, dto.deviceId, dto.deviceInfo, ipAddress).catch(err =>
-        this.logger.error('trackDevice failed in login()', err),
+    if (opts.deviceId) {
+      await this.trackDevice(user.id, opts.deviceId, opts.deviceInfo, ipAddress).catch(err =>
+        this.logger.error('trackDevice failed in issueLoginSession()', err),
       );
     }
 
@@ -2052,6 +2153,14 @@ export class AuthService {
       ipAddress,
     });
 
+    await this.locationService.logEvent({
+      userId: user.id,
+      event: 'login',
+      location: opts.location ?? null,
+      ipAddress,
+      deviceId: opts.deviceId,
+    });
+
     return {
       accessToken,
       refreshToken,
@@ -2071,7 +2180,7 @@ export class AuthService {
           ? user.subscriptionExpiresAt.toISOString()
           : null,
         membershipRank: user.membershipRank,
-        isMfaEnabled: twoFactorAuth?.isEnabled ?? false,
+        isMfaEnabled: opts.isMfaEnabled ?? false,
         phoneNumber: await decryptPiiSafe(user.phoneNumber),
         phoneVerified: user.phoneVerified ?? false,
         dateOfBirth: user.dateOfBirth ? user.dateOfBirth.toISOString() : null,
@@ -2583,6 +2692,7 @@ export class AuthService {
     dto: ChangePasswordDto,
     currentAccessTokenJti?: string,
     _currentSessionId?: string,
+    ipAddress?: string,
   ): Promise<{ message: string }> {
     if (dto.newPassword !== dto.confirmPassword) {
       throw new BadRequestException({
@@ -2609,7 +2719,7 @@ export class AuthService {
         message: 'Current password is incorrect',
       });
     }
-    validatePasswordComplexity(dto.newPassword);
+    validatePasswordPolicy(dto.newPassword);
 
     const isSamePassword = await bcryptCompare(dto.newPassword, user.password);
     if (isSamePassword) {
@@ -2700,6 +2810,14 @@ export class AuthService {
       entityType: 'User',
       entityId: userId,
       description: 'Password changed by user',
+    });
+
+    await this.locationService.logEvent({
+      userId,
+      event: 'password_change',
+      location: dto.location ?? null,
+      ipAddress: ipAddress ?? undefined,
+      deviceId: undefined,
     });
 
     this.createSecurityNotification(

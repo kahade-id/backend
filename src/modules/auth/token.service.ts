@@ -45,6 +45,8 @@ export interface TempTokenPayload {
   jti?: string;
   iss?: string;
   aud?: string;
+  /** Klaim tambahan opsional, mis. nomor HP yang diverifikasi (migrasi). */
+  phone?: string;
 }
 
 export interface DecodedTokenPayload {
@@ -71,8 +73,8 @@ export class TokenService {
   signAccessToken(payload: {
     sub: string;
     userId: string;
-    email: string;
-    username: string;
+    email?: string | null;
+    username?: string | null;
     sessionId: string;
     kycStatus?: string;
     emailVerified?: boolean;
@@ -133,14 +135,27 @@ export class TokenService {
   }
 
   /** Sign temp token (5 minutes) — for 2FA/MFA flow */
-  signTempToken(payload: { sub: string; scope: string; deviceId?: string }): string {
+  signTempToken(payload: {
+    sub: string;
+    scope: string;
+    deviceId?: string;
+    extra?: Record<string, unknown>;
+  }): string {
     const jti = nanoid();
     const tempSecret = this.configService.get<string>('jwt.tempSecret');
     if (!tempSecret) {
       throw new Error('JWT_TEMP_SECRET is not configured. Cannot issue temp tokens.');
     }
     return this.jwtService.sign(
-      { ...payload, jti, iss: TOKEN_ISSUER, aud: TEMP_TOKEN_AUDIENCE },
+      {
+        sub: payload.sub,
+        scope: payload.scope,
+        deviceId: payload.deviceId,
+        ...(payload.extra ?? {}),
+        jti,
+        iss: TOKEN_ISSUER,
+        aud: TEMP_TOKEN_AUDIENCE,
+      },
       {
         secret: tempSecret,
         expiresIn: this.configService.get('jwt.tempExpiresIn') ?? '5m',

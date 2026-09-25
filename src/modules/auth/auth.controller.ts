@@ -3,11 +3,13 @@ import {
   Post,
   Get,
   Body,
+  Param,
   Query,
   Req,
   Res,
   HttpCode,
   HttpStatus,
+  GoneException,
   UnauthorizedException,
   UseGuards,
 } from '@nestjs/common';
@@ -25,7 +27,6 @@ import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import { AllowResponseFields } from '../../common/decorators/allow-response-fields.decorator';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import {
-  RegisterDto,
   LoginDto,
   SetUsernameDto,
   VerifyEmailDto,
@@ -42,13 +43,19 @@ import {
   CorrectEmailDto,
   RefreshTokenDto,
   VerifyPasswordDto,
-  RequestOtpDto,
   VerifyPhoneOtpDto,
   PhoneRegisterDto,
   RequestPhoneChangeDto,
   ConfirmPhoneChangeDto,
   SocialLoginDto,
+  RequestOtpTriggerDto,
+  ConfirmPhoneMigrationDto,
 } from './dto';
+import {
+  OtpTriggerService,
+  type TriggerPayload,
+  type OtpTriggerStatus,
+} from './otp-trigger.service';
 
 @ApiTags('auth')
 @Controller('auth')
@@ -59,6 +66,7 @@ export class AuthController {
     private csrfService: CsrfService,
     private captchaService: CaptchaService,
     private otpGateway: OtpGatewayService,
+    private otpTriggerService: OtpTriggerService,
   ) {}
 
   @Public()
@@ -131,25 +139,12 @@ export class AuthController {
 
   @Public()
   @Post('register')
-  @Throttle({ default: { ttl: 3600000, limit: 5 } })
-  @HttpCode(HttpStatus.CREATED)
-  async register(@Body() dto: RegisterDto, @Req() req: Request): Promise<{ message: string }> {
-    const emailAuthEnabled = this.configService.get<boolean>('app.emailAuthEnabled') ?? false;
-    if (!emailAuthEnabled) {
-      throw new UnauthorizedException({
-        code: 'EMAIL_AUTH_DISABLED',
-        message:
-          'Email/password registration is not available. Please use phone number registration.',
-      });
-    }
-    if (!dto.captchaId || dto.captchaAnswer === undefined) {
-      throw new UnauthorizedException({
-        code: ErrorCodes.CAPTCHA_REQUIRED,
-        message: 'Captcha verification is required',
-      });
-    }
-    await this.captchaService.verifyChallenge(dto.captchaId, dto.captchaAnswer);
-    return this.authService.register(dto, req.ip);
+  @HttpCode(HttpStatus.GONE)
+  async register(): Promise<never> {
+    throw new GoneException({
+      code: 'AUTH_FLOW_DEPRECATED',
+      message: 'Pendaftaran email sudah tidak tersedia. Daftar dengan nomor HP via OTP WhatsApp.',
+    });
   }
 
   @Public()
@@ -161,15 +156,97 @@ export class AuthController {
   }
 
   @Public()
-  @Throttle({ default: { ttl: 60000, limit: 10 } })
   @Post('request-otp')
+  @HttpCode(HttpStatus.GONE)
+  async requestOtp(): Promise<never> {
+    throw new GoneException({
+      code: 'AUTH_FLOW_DEPRECATED',
+      message:
+        'Pengiriman OTP langsung sudah tidak tersedia. Minta kode via WhatsApp ke nomor resmi Kahade.',
+    });
+  }
+
+  /**
+   * Satu-satunya cara memperoleh OTP: user-initiated via WhatsApp.
+   * Response berisi refCode + link wa.me; user mengirim "KAHADE <refCode>"
+   * ke +6285786035715, lalu bot membalas OTP.
+   */
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Post('otp-trigger')
   @HttpCode(HttpStatus.OK)
-  async requestOtp(
-    @Body() dto: RequestOtpDto,
+  async otpTrigger(
+    @Body() dto: RequestOtpTriggerDto,
     @Req() req: Request,
-  ): Promise<{ message: string; debugCode?: string }> {
+  ): Promise<TriggerPayload> {
     const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
-    return this.authService.requestPhoneOtp(dto.phoneNumber, dto.method, ipAddress, dto.deviceId);
+    return this.otpTriggerService.createTrigger(dto, ipAddress);
+  }
+
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Get('otp-trigger/status/:refCode')
+  @HttpCode(HttpStatus.OK)
+  async otpTriggerStatus(
+    @Param('refCode') refCode: string,
+  ): Promise<{ status: OtpTriggerStatus }> {
+    const { status } = await this.otpTriggerService.getTriggerStatus(refCode);
+    return { status };
+  }
+
+  /**
+   * Webhook pesan masuk Fonnte. Diproteksi shared secret (bukan JWT user).
+   * Selalu 200 — Fonnte me-retry bila respons non-2xx.
+   */
+  @Public()
+  @Post('webhooks/fonnte')
+  @HttpCode(HttpStatus.OK)
+  async fonnteWebhook(@Body() body: Record<string, unknown>, @Req() req: Request): Promise<{ ok: true }> {
+    const secret =
+      (req.headers['x-fonnte-secret'] as string | undefined) ??
+      (typeof body.webhookSecret === 'string' ? body.webhookSecret : undefined);
+    if (!this.otpTriggerService.verifyWebhookSecret(secret)) {
+      throw new UnauthorizedException({
+        code: ErrorCodes.UNAUTHORIZED,
+        message: 'Invalid webhook secret',
+      });
+    }
+    await this.otpTriggerService.handleFonnteWebhook(body);
+    return { ok: true };
+  }
+
+  /**
+   * Konfirmasi migrasi nomor HP untuk akun lama. Menerbitkan sesi penuh
+   * (atau requires2FA bila 2FA aktif).
+   */
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Post('migrate-phone/confirm')
+  @HttpCode(HttpStatus.OK)
+  @AllowResponseFields('refreshToken')
+  async confirmPhoneMigration(
+    @Body() dto: ConfirmPhoneMigrationDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<Record<string, unknown>> {
+    const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
+    const deviceInfo = req.headers['user-agent'] || 'unknown';
+    const result = await this.authService.confirmPhoneMigration(
+      {
+        tempToken: dto.tempToken,
+        deviceId: dto.deviceId,
+        deviceInfo,
+        location: dto.location,
+      },
+      ipAddress,
+    );
+    if ('refreshToken' in result && result.refreshToken) {
+      this.setRefreshTokenCookie(res, result.refreshToken);
+      if ('accessToken' in result && result.accessToken) {
+        this.setAccessTokenCookie(res, result.accessToken);
+      }
+    }
+    return result as unknown as Record<string, unknown>;
   }
 
   @Public()
@@ -189,6 +266,7 @@ export class AuthController {
       dto.deviceId,
       dto.deviceInfo,
       ipAddress,
+      dto.location,
     );
 
     if (result.status === 'existing_user' && 'refreshToken' in result && result.refreshToken) {
@@ -238,9 +316,20 @@ export class AuthController {
     @Res({ passthrough: true }) res: Response,
   ): Promise<Record<string, unknown>> {
     const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
-    const deviceId = dto.deviceId;
     const deviceInfo = req.headers['user-agent'] || 'unknown';
-    const result = await this.authService.phoneRegister(dto, deviceId, deviceInfo, ipAddress);
+    const result = await this.authService.phoneRegister(
+      {
+        tempToken: dto.tempToken,
+        fullName: dto.fullName,
+        username: dto.username,
+        password: dto.password,
+        deviceId: dto.deviceId,
+        deviceInfo,
+        location: dto.location,
+        referralCode: dto.referralCode,
+      },
+      ipAddress,
+    );
 
     this.setRefreshTokenCookie(res, result.refreshToken);
     this.setAccessTokenCookie(res, result.accessToken);
@@ -461,13 +550,6 @@ export class AuthController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<Record<string, unknown>> {
-    const emailAuthEnabled = this.configService.get<boolean>('app.emailAuthEnabled') ?? false;
-    if (!emailAuthEnabled) {
-      throw new UnauthorizedException({
-        code: 'EMAIL_AUTH_DISABLED',
-        message: 'Email/password login is not available. Please use phone number login.',
-      });
-    }
     const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
     const captchaRequired = await this.captchaService.shouldRequireLoginCaptcha(ipAddress);
     if (captchaRequired) {
@@ -482,7 +564,16 @@ export class AuthController {
 
     let result: Awaited<ReturnType<AuthService['login']>>;
     try {
-      result = await this.authService.login(dto, ipAddress);
+      result = await this.authService.login(
+        {
+          identifier: dto.identifier,
+          password: dto.password,
+          deviceId: dto.deviceId,
+          deviceInfo: dto.deviceInfo,
+          location: dto.location,
+        },
+        ipAddress,
+      );
     } catch (error) {
       const response = error instanceof UnauthorizedException ? error.getResponse() : null;
       const code =
@@ -593,29 +684,32 @@ export class AuthController {
   async forgotPassword(
     @Body() dto: ForgotPasswordDto,
     @Req() req: Request,
-  ): Promise<{ message: string }> {
+  ): Promise<TriggerPayload> {
     const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
-    // Captcha hanya diwajibkan setelah banyak percobaan (perilaku sama dengan
-    // login). Jika client tetap mengirim captcha, tetap diverifikasi.
-    const captchaRequired = await this.captchaService.shouldRequireLoginCaptcha(ipAddress);
-    if (captchaRequired || (dto.captchaId && dto.captchaAnswer !== undefined)) {
-      if (!dto.captchaId || dto.captchaAnswer === undefined) {
-        throw new UnauthorizedException({
-          code: ErrorCodes.CAPTCHA_REQUIRED,
-          message: 'Captcha verification is required after repeated attempts',
-        });
-      }
-      await this.captchaService.verifyChallenge(dto.captchaId, dto.captchaAnswer);
-    }
-    return this.authService.forgotPassword(dto.email, ipAddress);
+    return this.authService.forgotPassword(
+      { identifier: dto.identifier, deviceId: dto.deviceId, location: dto.location },
+      ipAddress,
+    );
   }
 
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 5 } })
   @Post('reset-password')
   @HttpCode(HttpStatus.OK)
-  async resetPassword(@Body() dto: ResetPasswordDto): Promise<{ message: string }> {
-    return this.authService.resetPassword(dto.email, dto.otp, dto.newPassword, dto.confirmPassword);
+  async resetPassword(
+    @Body() dto: ResetPasswordDto,
+    @Req() req: Request,
+  ): Promise<{ message: string }> {
+    const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
+    return this.authService.resetPassword(
+      {
+        tempToken: dto.tempToken,
+        newPassword: dto.newPassword,
+        confirmPassword: dto.confirmPassword,
+        location: dto.location,
+      },
+      ipAddress,
+    );
   }
 
   @Throttle({ default: { ttl: 60000, limit: 5 } })
@@ -638,8 +732,10 @@ export class AuthController {
     @CurrentUser('jti') accessTokenJti: string,
     @CurrentUser('sessionId') sessionId: string,
     @Body() dto: ChangePasswordDto,
+    @Req() req: Request,
   ): Promise<{ message: string }> {
-    return this.authService.changePassword(userId, dto, accessTokenJti, sessionId);
+    const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
+    return this.authService.changePassword(userId, dto, accessTokenJti, sessionId, ipAddress);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 10 } })

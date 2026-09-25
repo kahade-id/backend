@@ -1,37 +1,36 @@
-import { IsEmail, IsString, Length, MinLength, MaxLength, Matches } from 'class-validator';
-import { ApiProperty } from '@nestjs/swagger';
-import { Transform } from 'class-transformer';
+import { IsString, IsNotEmpty, IsOptional, MinLength, MaxLength } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
 import { Match } from '../../../common/decorators/match.decorator';
+import { LocationDto } from './location.dto';
 
-const PASSWORD_REGEX =
-  /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()\-_=+{};:,<.>/?\\|'"`~[\]@])/;
-const PASSWORD_MSG =
-  'Password must contain at least 1 uppercase, 1 lowercase, 1 digit, and 1 special character';
-
+/**
+ * Reset password via OTP WhatsApp: tempToken didapat dari verify-otp
+ * dengan status 'password_reset' (scope password_reset).
+ * Password: minimal 8 karakter, tanpa syarat kombinasi karakter.
+ */
 export class ResetPasswordDto {
-  @ApiProperty({ description: 'Email address', maxLength: 254 })
-  @IsEmail()
-  @MaxLength(254)
-  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.toLowerCase().trim() : value))
-  email!: string;
-
-  @ApiProperty({ description: 'OTP code (6 digits)', minLength: 6, maxLength: 6 })
+  @ApiProperty({ description: 'Temp token dari verify-otp (scope password_reset)' })
   @IsString()
-  @Length(6, 6)
-  @Matches(/^\d{6}$/, { message: 'otp must contain exactly 6 digits' })
-  otp!: string;
+  @IsNotEmpty()
+  tempToken!: string;
 
-  @ApiProperty({ description: 'New password', minLength: 12, maxLength: 72 })
+  @ApiProperty({ description: 'New password (min 8 karakter)', minLength: 8, maxLength: 72 })
   @IsString()
-  @MinLength(12)
+  @MinLength(8, { message: 'Password minimal 8 karakter' })
   @MaxLength(72)
-  @Matches(PASSWORD_REGEX, { message: PASSWORD_MSG })
   newPassword!: string;
 
-  @ApiProperty({ description: 'Confirm new password', minLength: 12, maxLength: 72 })
+  @ApiPropertyOptional({ description: 'Confirm new password (opsional; bila dikirim harus sama)', minLength: 8, maxLength: 72 })
+  @IsOptional()
   @IsString()
-  @MinLength(12)
+  @MinLength(8)
   @MaxLength(72)
   @Match('newPassword', { message: 'confirmPassword must match newPassword' })
-  confirmPassword!: string;
+  confirmPassword?: string;
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional)', type: LocationDto })
+  @IsOptional()
+  @Type(() => LocationDto)
+  location?: LocationDto;
 }

@@ -6,6 +6,8 @@ import { TokenService } from './token.service';
 import { OtpService } from './otp.service';
 import { CaptchaService } from './captcha.service';
 import { OtpGatewayService } from './otp-gateway.service';
+import { OtpTriggerService } from './otp-trigger.service';
+import { AuthLocationService } from './auth-location.service';
 import { QueueModule } from '../queue/queue.module';
 import { AuditLogModule } from '../../common/services/audit-log.module';
 
@@ -17,7 +19,15 @@ import { AuditLogModule } from '../../common/services/audit-log.module';
     AuditLogModule,
   ],
   controllers: [AuthController],
-  providers: [AuthService, TokenService, OtpService, CaptchaService, OtpGatewayService],
-  exports: [AuthService, TokenService, OtpService, CaptchaService, OtpGatewayService, JwtModule],
+  providers: [
+    AuthService,
+    TokenService,
+    OtpService,
+    CaptchaService,
+    OtpGatewayService,
+    OtpTriggerService,
+    AuthLocationService,
+  ],
+  exports: [AuthService, TokenService, OtpService, CaptchaService, OtpGatewayService, OtpTriggerService, AuthLocationService, JwtModule],
 })
 export class AuthModule {}

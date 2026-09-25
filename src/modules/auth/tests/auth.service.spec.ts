@@ -14,6 +14,8 @@ import { RedisService } from '../../../redis/redis.service';
 import { TokenService } from '../token.service';
 import { OtpService } from '../otp.service';
 import { OtpGatewayService } from '../otp-gateway.service';
+import { OtpTriggerService } from '../otp-trigger.service';
+import { AuthLocationService } from '../auth-location.service';
 import { RealtimeService } from '../../realtime/realtime.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
@@ -36,6 +38,7 @@ const mockUser = {
   kycStatus: 'PENDING',
   isKahadePlus: false,
   membershipRank: 'BASIC',
+  phoneVerified: true,
 };
 
 const mockPrisma = {
@@ -174,6 +177,8 @@ describe('AuthService', () => {
         { provide: ConfigService, useValue: mockConfig },
         { provide: AuditLogService, useValue: mockAuditLog },
         { provide: RealtimeService, useValue: { emitToUser: jest.fn(), emitToRoom: jest.fn() } },
+        { provide: OtpTriggerService, useValue: { createTrigger: jest.fn(), getTriggerStatus: jest.fn() } },
+        { provide: AuthLocationService, useValue: { logEvent: jest.fn().mockResolvedValue(undefined) } },
         { provide: getQueueToken(EMAIL_QUEUE), useValue: mockEmailQueue },
       ],
     }).compile();
@@ -482,53 +487,11 @@ describe('AuthService', () => {
       });
     });
 
-    it('fails closed when the OTP provider cannot deliver the code', async () => {
-      mockPrisma.user.findFirst.mockResolvedValue(null);
-      mockOtpService.generatePhoneOtp.mockResolvedValue('123456');
-      mockOtpGateway.supportsMethod.mockReturnValue(true);
-      mockOtpGateway.sendOtp.mockResolvedValue({ success: false, error: 'OTP_DELIVERY_NETWORK_ERROR' });
-
-      await expect(
-        service.requestPhoneOtp('+628123456789', 'WHATSAPP', '127.0.0.1'),
-      ).rejects.toMatchObject({
-        status: 503,
-        response: expect.objectContaining({ code: 'OTP_DELIVERY_FAILED' }),
-      });
-      expect(mockOtpService.invalidatePhoneOtps).toHaveBeenCalledWith('+628123456789', OtpType.PHONE_LOGIN);
-    });
-
-    it('cleans up and fails closed when the OTP provider throws', async () => {
-      mockPrisma.user.findFirst.mockResolvedValue(null);
-      mockOtpService.generatePhoneOtp.mockResolvedValue('123456');
-      mockOtpGateway.supportsMethod.mockReturnValue(true);
-      mockOtpGateway.sendOtp.mockRejectedValue(new Error('provider timeout'));
-
-      await expect(
-        service.requestPhoneOtp('+628123456789', 'WHATSAPP', '127.0.0.1'),
-      ).rejects.toMatchObject({
-        status: 503,
-        response: expect.objectContaining({ code: 'OTP_DELIVERY_FAILED' }),
-      });
-      expect(mockOtpService.invalidatePhoneOtps).toHaveBeenCalledWith('+628123456789', OtpType.PHONE_LOGIN);
-    });
-
-    it('does not write the raw phone number to delivery-failure logs', async () => {
-      const phone = '+628123456789';
-      mockPrisma.user.findFirst.mockResolvedValue(null);
-      mockOtpService.generatePhoneOtp.mockResolvedValue('123456');
-      mockOtpGateway.supportsMethod.mockReturnValue(true);
-      mockOtpGateway.sendOtp.mockRejectedValue(new Error('provider timeout'));
-      const errorSpy = jest.spyOn((service as any).logger, 'error').mockImplementation(() => undefined);
-
-      await expect(service.requestPhoneOtp(phone, 'WHATSAPP', '127.0.0.1')).rejects.toMatchObject({ status: 503 });
-
-      expect(errorSpy.mock.calls.map((call) => String(call[0])).join('\n')).not.toContain(phone);
-    });
   });
 
   describe('login', () => {
     const loginDto = {
-      email: 'user@example.com',
+      identifier: 'user@example.com',
       password: 'CorrectPassword123!',
       deviceId: 'device-abc',
       deviceInfo: 'Test Browser',
@@ -538,7 +501,7 @@ describe('AuthService', () => {
       mockPrisma.user.findUnique.mockResolvedValue(null);
 
       await expect(
-        service.login({ ...loginDto, email: '  USER@EXAMPLE.COM  ' }, '127.0.0.1'),
+        service.login({ ...loginDto, identifier: '  USER@EXAMPLE.COM  ' }, '127.0.0.1'),
       ).rejects.toThrow(UnauthorizedException);
 
       expect(mockPrisma.user.findUnique).toHaveBeenCalledWith({
@@ -638,7 +601,6 @@ describe('AuthService', () => {
         subscriptionExpiresAt: null,
         membershipRank: 'BASIC',
         phoneNumber: null,
-        phoneVerified: false,
         dateOfBirth: null,
         gender: null,
         createdAt: new Date(),
@@ -673,6 +635,7 @@ describe('AuthService', () => {
 
       mockPrisma.user.findUnique.mockResolvedValue({
         ...mockUser,
+        phoneVerified: true,
         password: hashedPassword,
         emailVerified: true,
         avatarUrl: null,
@@ -682,7 +645,6 @@ describe('AuthService', () => {
         subscriptionExpiresAt: null,
         membershipRank: 'BASIC',
         phoneNumber: null,
-        phoneVerified: false,
         dateOfBirth: null,
         gender: null,
         createdAt: new Date(),
@@ -750,120 +712,155 @@ describe('AuthService', () => {
   });
 
   describe('phoneRegister temp token', () => {
+    const baseDto = {
+      tempToken: 'temp-token',
+      fullName: 'Test User',
+      password: 'KahadeTest4821!',
+      deviceId: 'device-1',
+      deviceInfo: 'test-device',
+    };
+
     it('rejects a registration temp token without a JTI claim', async () => {
       mockTokenService.verifyTempToken.mockReturnValue({
         sub: '+628123456789',
         scope: 'phone_register',
       });
 
-      await expect(service.phoneRegister({
-        tempToken: 'temp-token',
-        fullName: 'Test User',
-        username: 'test-user',
-        dateOfBirth: '2000-01-01',
-        gender: 'OTHER',
-        email: 'new@example.com',
-        password: 'Strong!123',
-        pin: '135790',
-      }, 'device-1', 'test-device', '127.0.0.1')).rejects.toThrow('Invalid registration token');
+      await expect(service.phoneRegister({ ...baseDto }, '127.0.0.1')).rejects.toThrow('Invalid registration token');
       expect(mockRedis.setNx).not.toHaveBeenCalled();
+    });
+
+    it('rejects a registration temp token bound to another device', async () => {
+      mockTokenService.verifyTempToken.mockReturnValue({
+        sub: '+628123456789',
+        scope: 'phone_register',
+        jti: 'jti-1',
+        deviceId: 'device-other',
+      });
+
+      await expect(service.phoneRegister({ ...baseDto }, '127.0.0.1')).rejects.toThrow('not valid for this device');
+      expect(mockRedis.setNx).not.toHaveBeenCalled();
+    });
+
+    it('auto-generates a username when none is provided', async () => {
+      mockTokenService.verifyTempToken.mockReturnValue({
+        sub: '+628123456789',
+        scope: 'phone_register',
+        jti: 'jti-2',
+        deviceId: 'device-1',
+        exp: Math.floor(Date.now() / 1000) + 300,
+      });
+      mockPrisma.user.findFirst.mockResolvedValue(null);
+      mockPrisma.user.findUnique.mockResolvedValue(null);
+      mockRedis.setNx.mockResolvedValueOnce(true);
+      mockPrisma.$transaction.mockImplementation(
+        async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => fn(mockPrisma),
+      );
+      mockPrisma.user.create.mockResolvedValue({
+        id: 'user-new', userId: 'usr_new123', phoneNumber: 'enc', fullName: 'Test User',
+      });
+      mockPrisma.wallet.create.mockResolvedValue({});
+      mockPrisma.notificationPreference.create.mockResolvedValue({});
+      mockPrisma.referralCode.create.mockResolvedValue({});
+
+      const result = await service.phoneRegister({ ...baseDto }, '127.0.0.1');
+
+      expect(result.user.username).toMatch(/^testuser\d{4}$/);
+      expect(result.user.email).toBeNull();
+      expect(result.user.phoneVerified).toBe(true);
+      // Wallet dibuat tanpa PIN — PIN di-setup belakangan.
+      expect(mockPrisma.wallet.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ userId: 'user-new' }) }),
+      );
     });
   });
 
   // ─── forgotPassword ──────────────────────────────────────────────
 
   describe('forgotPassword', () => {
-    it('should always return ambiguous message to prevent user enumeration (user exists)', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ ...mockUser, isActive: true });
-      mockOtpService.invalidateOtps.mockResolvedValue(undefined);
-      mockOtpService.generateOtp.mockResolvedValue('111111');
-      mockEmailQueue.add.mockResolvedValue({ id: 'job-1' });
+    const triggerPayload = {
+      refCode: 'ABCDEF123456',
+      triggerText: 'KAHADE ABCDEF123456',
+      whatsappUrl: 'https://wa.me/6285786035715?text=KAHADE%20ABCDEF123456',
+      expiresInSeconds: 600,
+      expiresAt: new Date().toISOString(),
+    };
 
-      const result = await service.forgotPassword('user@example.com');
+    it('delegates to the WhatsApp trigger flow with purpose forgot_password', async () => {
+      const triggerSvc = (service as any).otpTriggerService;
+      triggerSvc.createTrigger = jest.fn().mockResolvedValue(triggerPayload);
 
-      expect(result.message).toContain('If this email');
+      const result = await service.forgotPassword(
+        { identifier: '081234567890', deviceId: 'device-1' },
+        '127.0.0.1',
+      );
+
+      expect(result).toEqual(triggerPayload);
+      expect(triggerSvc.createTrigger).toHaveBeenCalledWith(
+        expect.objectContaining({
+          phoneNumber: '+6281234567890',
+          purpose: 'forgot_password',
+          deviceId: 'device-1',
+        }),
+        '127.0.0.1',
+      );
     });
 
-    it('sends email verification as a manual OTP without placing the secret in a URL', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue(null);
-      mockPrisma.user.findFirst.mockResolvedValue(null);
-      mockPrisma.$transaction.mockImplementation(async (callback: (client: typeof mockPrisma) => unknown) => callback(mockPrisma));
-      mockPrisma.user.create.mockResolvedValue({ id: 'user-new', userId: 'usr-new', email: 'new@example.com' });
-      mockOtpService.invalidateOtps.mockResolvedValue(undefined);
-      mockOtpService.generateOtp.mockResolvedValue('123456');
-      mockEmailQueue.add.mockResolvedValue({ id: 'job-1' });
-
-      await service.register({
-        fullName: 'New User', email: 'new@example.com', password: 'Password123!@', confirmPassword: 'Password123!@',
-      }, '127.0.0.1');
-
-      expect(mockEmailQueue.add).toHaveBeenCalledWith('send', expect.objectContaining({
-        templateName: 'verify-email',
-        templateContext: { otp: '123456' },
-      }), expect.any(Object));
-      expect(JSON.stringify(mockEmailQueue.add.mock.calls)).not.toContain('verifyUrl');
-    });
-
-    it('should always return ambiguous message to prevent user enumeration (user does not exist)', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue(null);
-
-      const result = await service.forgotPassword('nonexistent@example.com');
-
-      expect(result.message).toContain('If this email');
-      expect(mockOtpService.generateOtp).not.toHaveBeenCalled();
-    });
-
-    it('does not write the requested email address to logs when recovery delivery fails', async () => {
-      const email = 'sensitive-recovery@example.com';
-      const loggerWarn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
-      mockPrisma.user.findUnique.mockResolvedValue({ ...mockUser, email, isActive: true, isBanned: false });
-      mockOtpService.invalidateOtps.mockRejectedValue(new Error('provider unavailable'));
-
-      await expect(service.forgotPassword(email)).resolves.toEqual(expect.objectContaining({ message: expect.any(String) }));
-
-      expect(loggerWarn.mock.calls.flat().join(' ')).not.toContain(email);
-      loggerWarn.mockRestore();
+    it('rejects non-Indonesian identifiers', async () => {
+      await expect(
+        service.forgotPassword({ identifier: 'not-a-phone' }, '127.0.0.1'),
+      ).rejects.toThrow();
     });
   });
 
   describe('resetPassword', () => {
-    it('does not consume a valid reset OTP when the proposed password is the current password', async () => {
-      const existingPassword = 'ExistingPassword123!@';
-      mockPrisma.user.findUnique.mockResolvedValue({
-        ...mockUser,
-        password: await bcryptHash(existingPassword, 4),
-      });
+    const resetPayload = (overrides = {}) => ({
+      sub: 'db-id-1',
+      scope: 'password_reset',
+      deviceId: 'device-1',
+      jti: 'jti-reset-1',
+      ...overrides,
+    });
+
+    it('does not touch sessions when the proposed password is the current password', async () => {
+      mockTokenService.verifyTempToken.mockReturnValue(resetPayload());
+      const { hash } = require('bcrypt');
+      const hashedPassword = await hash('ExistingPassword123', 4);
+      mockPrisma.user.findUnique.mockResolvedValue({ ...mockUser, password: hashedPassword });
       mockPrisma.passwordHistory.findMany.mockResolvedValue([]);
 
       await expect(service.resetPassword(
-        'user@example.com',
-        '123456',
-        existingPassword,
-        existingPassword,
+        { tempToken: 'temp-token', newPassword: 'ExistingPassword123', confirmPassword: 'ExistingPassword123' },
+        '127.0.0.1',
       )).rejects.toThrow(BadRequestException);
 
-      expect(mockOtpService.verifyOtp).not.toHaveBeenCalled();
       expect(mockPrisma.userSession.updateMany).not.toHaveBeenCalled();
     });
 
+    it('rejects a temp token with the wrong scope', async () => {
+      mockTokenService.verifyTempToken.mockReturnValue(resetPayload({ scope: '2fa_verify' }));
+
+      await expect(service.resetPassword(
+        { tempToken: 'temp-token', newPassword: 'NewPassword123' },
+        '127.0.0.1',
+      )).rejects.toThrow('Invalid token scope');
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    });
+
     it('revokes trusted devices after a successful password reset', async () => {
-      const currentPassword = 'ExistingPassword123!@';
-      mockPrisma.user.findUnique.mockResolvedValue({
-        ...mockUser,
-        password: await bcryptHash(currentPassword, 4),
-      });
+      mockTokenService.verifyTempToken.mockReturnValue(resetPayload());
+      const { hash } = require('bcrypt');
+      const hashedPassword = await hash('OldPassword123', 4);
+      mockPrisma.user.findUnique.mockResolvedValue({ ...mockUser, password: hashedPassword });
       mockPrisma.passwordHistory.findMany.mockResolvedValue([]);
-      mockOtpService.verifyOtp.mockResolvedValue(true);
       mockPrisma.userSession.findMany.mockResolvedValue([{ id: 'reset-session-1' }]);
       mockPrisma.userSession.updateMany.mockResolvedValue({ count: 1 });
       mockPrisma.userDevice.updateMany.mockResolvedValue({ count: 1 });
       mockPrisma.$transaction.mockImplementation(async (callback: (client: typeof mockPrisma) => unknown) => callback(mockPrisma));
 
       await expect(service.resetPassword(
-        'user@example.com',
-        '123456',
-        'NewPassword123!@',
-        'NewPassword123!@',
+        { tempToken: 'temp-token', newPassword: 'NewPassword123' },
+        '127.0.0.1',
       )).resolves.toEqual(expect.objectContaining({ message: expect.any(String) }));
 
       expect(mockPrisma.userDevice.updateMany).toHaveBeenCalledWith({
@@ -877,20 +874,21 @@ describe('AuthService', () => {
     });
 
     it('completes durable reset and trust revocation when Redis propagation fails', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({
-        ...mockUser,
-        password: await bcryptHash('ExistingPassword123!@', 4),
-      });
+      mockTokenService.verifyTempToken.mockReturnValue(resetPayload());
+      const { hash } = require('bcrypt');
+      const hashedPassword = await hash('OldPassword123', 4);
+      mockPrisma.user.findUnique.mockResolvedValue({ ...mockUser, password: hashedPassword });
       mockPrisma.passwordHistory.findMany.mockResolvedValue([]);
-      mockOtpService.verifyOtp.mockResolvedValue(true);
       mockPrisma.userSession.findMany.mockResolvedValue([{ id: 'reset-session-1' }]);
       mockPrisma.userSession.updateMany.mockResolvedValue({ count: 1 });
       mockPrisma.userDevice.updateMany.mockResolvedValue({ count: 1 });
       mockPrisma.$transaction.mockImplementation(async (callback: (client: typeof mockPrisma) => unknown) => callback(mockPrisma));
       mockRedis.setex.mockRejectedValue(new Error('redis unavailable'));
 
-      await expect(service.resetPassword('user@example.com', '123456', 'NewPassword123!@', 'NewPassword123!@'))
-        .resolves.toEqual(expect.objectContaining({ message: expect.any(String) }));
+      await expect(service.resetPassword(
+        { tempToken: 'temp-token', newPassword: 'NewPassword123' },
+        '127.0.0.1',
+      )).resolves.toEqual(expect.objectContaining({ message: expect.any(String) }));
       expect(mockPrisma.userSession.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         data: expect.objectContaining({ isRevoked: true, revokedReason: 'password_reset' }),
       }));

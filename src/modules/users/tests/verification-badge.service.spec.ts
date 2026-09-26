@@ -28,6 +28,7 @@ function baseUser(overrides: Partial<BadgeSourceUser> = {}): BadgeSourceUser {
     kahadePlusSince: null,
     isVip: false,
     vipGrantedAt: null,
+    address: null,
     memberSince: new Date('2025-01-01T00:00:00.000Z'),
     deletedAt: null,
     ...overrides,
@@ -66,7 +67,7 @@ describe('VerificationBadgeService', () => {
 
   it('should be defined', () => expect(service).toBeDefined());
 
-  describe('computeBadges — 5 kategori independen', () => {
+  describe('computeBadges — 6 kategori independen', () => {
     it('returns an empty array for a bare account', () => {
       expect(service.computeBadges(baseUser(), null, NOW)).toEqual([]);
     });
@@ -162,7 +163,56 @@ describe('VerificationBadgeService', () => {
       expect(badges[0].earnedAt).toEqual(new Date('2026-07-07T00:00:00.000Z'));
     });
 
-    it('orders badges by display priority KYC > Business > Kahade+ > Trusted > Contact', () => {
+    it('FULLY_VERIFIED requires KYC + email + phone + non-empty address', () => {
+      // Tanpa alamat → tidak dapat FULLY_VERIFIED walau KYC+kontak lengkap.
+      const noAddress = service.computeBadges(
+        baseUser({
+          emailVerified: true,
+          emailVerifiedAt: NOW,
+          phoneVerified: true,
+          phoneVerifiedAt: NOW,
+          kycStatus: KycStatus.APPROVED,
+          kycApprovedAt: NOW,
+          address: null,
+        }),
+        null,
+        NOW,
+      );
+      expect(noAddress.map((b) => b.type)).not.toContain('FULLY_VERIFIED');
+
+      // Alamat kosong/spasi saja → tidak dihitung.
+      const blankAddress = service.computeBadges(
+        baseUser({
+          emailVerified: true,
+          phoneVerified: true,
+          kycStatus: KycStatus.APPROVED,
+          address: '   ',
+        }),
+        null,
+        NOW,
+      );
+      expect(blankAddress.map((b) => b.type)).not.toContain('FULLY_VERIFIED');
+
+      // Lengkap semua → dapat FULLY_VERIFIED dengan earnedAt = yang paling belakang.
+      const full = service.computeBadges(
+        baseUser({
+          emailVerified: true,
+          emailVerifiedAt: new Date('2026-01-01T00:00:00.000Z'),
+          phoneVerified: true,
+          phoneVerifiedAt: new Date('2026-02-01T00:00:00.000Z'),
+          kycStatus: KycStatus.APPROVED,
+          kycApprovedAt: new Date('2026-03-01T00:00:00.000Z'),
+          address: 'Jl. Merdeka No. 1, Jakarta',
+        }),
+        null,
+        NOW,
+      );
+      const fv = full.find((b) => b.type === 'FULLY_VERIFIED');
+      expect(fv).toBeDefined();
+      expect(fv!.earnedAt).toEqual(new Date('2026-03-01T00:00:00.000Z'));
+    });
+
+    it('orders badges by display priority Full > KYC > Business > Kahade+ > Trusted > Contact', () => {
       const badges = service.computeBadges(
         baseUser({
           accountType: UserAccountType.BUSINESS,
@@ -176,12 +226,13 @@ describe('VerificationBadgeService', () => {
           kahadePlusSince: NOW,
           isVip: true,
           vipGrantedAt: NOW,
+          address: 'Jl. Merdeka No. 1, Jakarta',
         }),
         { status: BusinessVerificationStatus.APPROVED, approvedAt: NOW },
         NOW,
       );
       expect(badges.map((b) => b.type)).toEqual([...VERIFICATION_BADGE_TYPES]);
-      expect(badges.map((b) => b.priority)).toEqual([1, 2, 3, 4, 5]);
+      expect(badges.map((b) => b.priority)).toEqual([1, 2, 3, 4, 5, 6]);
     });
 
     it('every badge carries a stable labelKey, short label and icon for the UI', () => {
@@ -343,7 +394,7 @@ describe('VerificationBadgeService', () => {
   });
 
   describe('getCatalog', () => {
-    it('lists all five badge types in display priority order', () => {
+    it('lists all six badge types in display priority order', () => {
       const catalog = service.getCatalog();
       expect(catalog.map((c) => c.type)).toEqual([...VERIFICATION_BADGE_TYPES]);
       expect(catalog.every((c) => !('earnedAt' in c))).toBe(true);

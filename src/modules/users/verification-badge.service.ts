@@ -28,6 +28,7 @@ import * as ErrorCodes from '../../common/constants/error-codes';
  */
 
 export const VERIFICATION_BADGE_TYPES = [
+  'FULLY_VERIFIED',
   'KYC_VERIFIED',
   'BUSINESS_VERIFIED',
   'KAHADE_PLUS',
@@ -79,6 +80,8 @@ export interface BadgeSourceUser {
   kahadePlusSince: Date | null;
   isVip: boolean;
   vipGrantedAt: Date | null;
+  /** Alamat profil — syarat badge FULLY_VERIFIED (non-empty). */
+  address: string | null;
   memberSince: Date;
   deletedAt: Date | null;
 }
@@ -89,17 +92,26 @@ export interface BadgeSourceBusinessVerification {
 }
 
 const BADGE_PRIORITY: Record<VerificationBadgeType, number> = {
-  KYC_VERIFIED: 1,
-  BUSINESS_VERIFIED: 2,
-  KAHADE_PLUS: 3,
-  TRUSTED_BY_KAHADE: 4,
-  CONTACT_VERIFIED: 5,
+  FULLY_VERIFIED: 1,
+  KYC_VERIFIED: 2,
+  BUSINESS_VERIFIED: 3,
+  KAHADE_PLUS: 4,
+  TRUSTED_BY_KAHADE: 5,
+  CONTACT_VERIFIED: 6,
 };
 
 const BADGE_META: Record<
   VerificationBadgeType,
   Pick<VerificationBadge, 'labelKey' | 'label' | 'shortLabel' | 'description' | 'icon'>
 > = {
+  FULLY_VERIFIED: {
+    labelKey: 'badge.fullyVerified',
+    label: 'Terverifikasi Penuh',
+    shortLabel: 'Terverifikasi',
+    description:
+      'Menyelesaikan seluruh verifikasi: identitas (KYC), email, nomor handphone, dan alamat.',
+    icon: 'seal-check',
+  },
   KYC_VERIFIED: {
     labelKey: 'badge.kycVerified',
     label: 'Identitas Terverifikasi',
@@ -207,6 +219,18 @@ export class VerificationBadgeService {
       push('CONTACT_VERIFIED', latest(user.emailVerifiedAt, user.phoneVerifiedAt));
     }
 
+    // (f) Verifikasi penuh — KYC + email + HP + alamat terisi (tier abu-abu).
+    // earnedAt = yang paling belakang, karena badge baru lengkap saat itu.
+    if (
+      user.kycStatus === KycStatus.APPROVED &&
+      user.emailVerified &&
+      user.phoneVerified &&
+      user.address != null &&
+      user.address.trim().length > 0
+    ) {
+      push('FULLY_VERIFIED', latest(user.kycApprovedAt, user.emailVerifiedAt, user.phoneVerifiedAt));
+    }
+
     // Urutan prioritas tampil sudah eksplisit; sort stabil agar UI bisa langsung
     // render tanpa mengurutkan sendiri.
     return badges.sort((a, b) => a.priority - b.priority);
@@ -269,6 +293,7 @@ export class VerificationBadgeService {
         kahadePlusSince: true,
         isVip: true,
         vipGrantedAt: true,
+        address: true,
         memberSince: true,
         deletedAt: true,
       },

@@ -55,7 +55,7 @@ const visibleOwner = {
 const mockPrisma: any = {
   user: { findUnique: jest.fn() },
   blockList: { findFirst: jest.fn(), findMany: jest.fn() },
-  follow: { findUnique: jest.fn(), findMany: jest.fn() },
+  follow: { findUnique: jest.fn(), findMany: jest.fn(), count: jest.fn() },
   userFavorite: { findUnique: jest.fn(), findMany: jest.fn(), count: jest.fn() },
 };
 const mockRedis = { get: jest.fn(), set: jest.fn(), del: jest.fn(), setex: jest.fn() };
@@ -85,6 +85,7 @@ describe('UsersService.getPublicProfile (Section 2 — Profile Core)', () => {
     mockPrisma.blockList.findMany.mockResolvedValue([]);
     mockPrisma.follow.findUnique.mockResolvedValue(null);
     mockPrisma.follow.findMany.mockResolvedValue([]);
+    mockPrisma.follow.count.mockResolvedValue(0);
     mockPrisma.userFavorite.findUnique.mockResolvedValue(null);
     mockPrisma.userFavorite.findMany.mockResolvedValue([]);
     mockPrisma.userFavorite.count.mockResolvedValue(0);
@@ -210,6 +211,10 @@ describe('UsersService.getPublicProfile (Section 2 — Profile Core)', () => {
       mockPrisma.follow.findMany
         .mockResolvedValueOnce([{ follower: { username: 'a', fullName: 'A', avatarUrl: null } }])
         .mockResolvedValueOnce([{ following: { username: 'b', fullName: 'B', avatarUrl: null } }]);
+      // SS-019: counter sekarang dihitung dari query viewer-aware (bukan _count).
+      mockPrisma.follow.count
+        .mockResolvedValueOnce(3) // followers
+        .mockResolvedValueOnce(1); // following
 
       const { social } = (await service.getPublicProfile('seller', VIEWER_ID)) as any;
       expect(social).toMatchObject({
@@ -245,6 +250,22 @@ describe('UsersService.getPublicProfile (Section 2 — Profile Core)', () => {
       ];
       for (const orderBy of orderBys) {
         expect(orderBy[orderBy.length - 1]).toEqual({ id: 'desc' });
+      }
+    });
+
+    it('SS-019: counters use the same viewer block exclusion as follower/following lists', async () => {
+      mockPrisma.blockList.findMany.mockResolvedValue([
+        { blockerId: VIEWER_ID, blockedId: 'enemy-1' },
+        { blockerId: 'enemy-2', blockedId: VIEWER_ID },
+      ]);
+      mockPrisma.follow.count.mockResolvedValue(7);
+
+      await service.getPublicProfile('seller', VIEWER_ID);
+
+      expect(mockPrisma.follow.count).toHaveBeenCalledTimes(2);
+      for (const call of mockPrisma.follow.count.mock.calls) {
+        const rel = call[0].where.follower ?? call[0].where.following;
+        expect(rel.id).toEqual({ notIn: expect.arrayContaining(['enemy-1', 'enemy-2']) });
       }
     });
   });
@@ -323,12 +344,13 @@ describe('UsersService.getPublicProfile (Section 2 — Profile Core)', () => {
 
   describe('deprecated flat aliases', () => {
     it('keeps the legacy flat fields so existing clients do not break', async () => {
+      // SS-019: alias memakai counter viewer-aware (count -> 0 di beforeEach).
       const result = (await service.getPublicProfile('seller')) as any;
       expect(result.username).toBe('seller');
       expect(result.fullName).toBe('Toko Seller');
       expect(result.isKycVerified).toBe(true);
       expect(result.isVip).toBe(false);
-      expect(result.followersCount).toBe(3);
+      expect(result.followersCount).toBe(0);
       expect(result.stats).toMatchObject({ totalOrders: 42, avgRating: 4.75, ratingCount: 30 });
       expect(result.recentRatings).toHaveLength(1);
     });

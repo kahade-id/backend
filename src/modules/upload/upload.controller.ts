@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Body, Query, UseInterceptors, UploadedFile, BadRequestException, ForbiddenException, HttpCode, UseGuards, StreamableFile, Header } from '@nestjs/common';
+import { Controller, Post, Get, Body, Query, UseInterceptors, UploadedFile, BadRequestException, ForbiddenException, GoneException, HttpCode, UseGuards, StreamableFile, Header } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiBearerAuth, ApiOperation, ApiConsumes, ApiBody } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
@@ -39,24 +39,40 @@ export class UploadController {
 
   @UseGuards(UserThrottleGuard)
   @Post('presigned-url')
-  @ApiOperation({ summary: 'Generate pre-signed upload URL' })
+  @ApiOperation({
+    summary: '[DEPRECATED — 410 Gone] Generate pre-signed upload URL',
+    description:
+      'SS-016: alur presigned dihapus 2026-09-26 (R2 → storage self-hosted). ' +
+      'Selalu 410. Gunakan POST /v1/upload/direct (multipart).',
+  })
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   async getPresignedUrl(
     @CurrentUser('sub') userId: string,
     @Body() dto: PresignedUrlDto,
   ): Promise<{ uploadUrl: string; fileKey: string; expiresIn: number; minFileSize: number; maxFileSize: number }> {
-    return this.uploadService.generatePresignedUrl(userId, dto.purpose, dto.fileName, dto.contentType, dto.fileSize);
+    throw new GoneException({
+      code: 'DEPRECATED',
+      message: 'Presigned URL upload is no longer supported. Use POST /v1/upload/direct instead.',
+    });
   }
 
   @UseGuards(UserThrottleGuard)
   @Post('confirm')
-  @ApiOperation({ summary: 'Confirm file upload was completed' })
+  @ApiOperation({
+    summary: '[DEPRECATED — 410 Gone] Confirm file upload was completed',
+    description:
+      'SS-016: bagian dari alur presigned yang sudah dihapus. Selalu 410. ' +
+      'Gunakan POST /v1/upload/direct (multipart).',
+  })
   @Throttle({ default: { ttl: 60000, limit: 20 } })
   async confirmUpload(
     @CurrentUser('sub') userId: string,
     @Body() dto: ConfirmUploadDto,
   ): Promise<{ fileKey: string; confirmed: boolean; sha256?: string; verified?: boolean }> {
-    return this.uploadService.confirmUpload(userId, dto.fileKey, dto.sha256);
+    throw new GoneException({
+      code: 'DEPRECATED',
+      message: 'Presigned upload confirmation is no longer supported. Use POST /v1/upload/direct instead.',
+    });
   }
 
   @UseGuards(UserThrottleGuard)

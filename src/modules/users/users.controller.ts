@@ -420,6 +420,23 @@ export class UsersController {
     return this.showcaseService.getMyShowcase(userId);
   }
 
+  // SS-012: dideklarasikan SEBELUM route berparameter agar segmen "deleted"
+  // tidak ditangkap sebagai :id.
+  @Get('me/showcase/deleted')
+  @ApiOperation({
+    summary: 'List my soft-deleted showcase items (restorable within 30 days)',
+    description:
+      'SS-012: daftar item yang di-soft-delete milik user beserta deletedAt ' +
+      'dan daysRemaining — menggantikan pelacakan lokal di perangkat.',
+  })
+  async listDeletedShowcase(
+    @CurrentUser('sub') userId: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ): Promise<object> {
+    return this.showcaseService.listDeletedShowcaseItems(userId, page ? Number(page) : undefined, limit ? Number(limit) : undefined);
+  }
+
   @Post('me/showcase')
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 60000, limit: 10 } })

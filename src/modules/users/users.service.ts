@@ -322,12 +322,6 @@ export class UsersService {
           orderBy: [{ displayOrder: 'asc' }, { id: 'asc' }],
           select: { id: true, platform: true, url: true, label: true, displayOrder: true },
         },
-        _count: {
-          select: {
-            followers: { where: { follower: { isActive: true, isBanned: false, deletedAt: null, profileVisible: true } } },
-            following: { where: { following: { isActive: true, isBanned: false, deletedAt: null, profileVisible: true } } },
-          },
-        },
       },
     });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
@@ -367,7 +361,7 @@ export class UsersService {
       ...(excludedIds.length > 0 ? { id: { notIn: excludedIds } } : {}),
     };
 
-    const [followRow, followedByRow, favoriteRow, followerPreview, followingPreview, favorites, verificationBadges] =
+    const [followRow, followedByRow, favoriteRow, followerPreview, followingPreview, favorites, verificationBadges, followersCount, followingCount] =
       await Promise.all([
         viewerId && !isOwnProfile
           ? this.prisma.follow.findUnique({
@@ -409,6 +403,11 @@ export class UsersService {
           },
         }),
         this.verificationBadgeService.getBadges(user.id),
+        // SS-019: counter memakai visibleUserFilter yang SAMA PERSIS dengan
+        // GET /users/:username/followers|following → angka profil == total list
+        // untuk viewer yang sama (termasuk eksklusi block khusus viewer).
+        this.prisma.follow.count({ where: { followingId: user.id, follower: visibleUserFilter } }),
+        this.prisma.follow.count({ where: { followerId: user.id, following: visibleUserFilter } }),
       ]);
 
     const favoritesTotal = await this.prisma.userFavorite.count({
@@ -466,8 +465,8 @@ export class UsersService {
 
       // ================= Follower / following =================
       social: {
-        followersCount: user._count.followers,
-        followingCount: user._count.following,
+        followersCount,
+        followingCount,
         isFollowing: Boolean(followRow),
         isFollowedBy: Boolean(followedByRow),
         // Preview saja — list lengkap lewat GET /users/:username/followers|following
@@ -539,8 +538,8 @@ export class UsersService {
       isVip: user.isVip,
       membershipRank: user.membershipRank,
       recentRatings: user.ratingsReceived,
-      followersCount: user._count.followers,
-      followingCount: user._count.following,
+      followersCount,
+      followingCount,
       isFollowing: Boolean(followRow),
       // Viewer yang memblokir owner: sebelumnya field ini satu-satunya sinyal,
       // sekarang relasi block apa pun sudah ditolak 403 di atas. Dipertahankan

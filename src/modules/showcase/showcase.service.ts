@@ -178,13 +178,12 @@ export class ShowcaseService {
    */
   private async getViewerExcludedIds(viewerId?: string): Promise<string[]> {
     if (!viewerId) return [];
-    // S5 (audit Discovery 2026-09-26): cap 1000 seperti getBlockedUserIds di
-    // modul search — block list adalah filter relevansi, bukan security
-    // boundary (visibleOwnerFilter yang menegakkan privasi).
+    // SS-008 (audit 2026-09-26): TANPA cap. excludedIds dipakai sebagai
+    // `id: { notIn }` di visibleOwnerFilter — inilah penegak blokir di feed.
+    // Cap 1000 lama membocorkan konten dari akun yang diblokir melewati batas.
     const blocks = await this.prisma.blockList.findMany({
       where: { OR: [{ blockerId: viewerId }, { blockedId: viewerId }] },
       select: { blockerId: true, blockedId: true },
-      take: 1000,
     });
     const ids = new Set<string>();
     for (const block of blocks) {
@@ -441,6 +440,46 @@ export class ShowcaseService {
         // Benefit 7 Kahade+: batas gambar per item berbasis subscription.
         maxImagesPerItem: await this.subscriptionsService.getMaxShowcaseImages(userId),
       },
+    };
+  }
+
+  /**
+   * SS-012: daftar item milik user yang sedang di-soft-delete (dapat dipulihkan
+   * dalam 30 hari). Menggantikan pelacakan lokal di perangkat (SecureStore)
+   * yang hilang saat ganti perangkat/install ulang.
+   */
+  async listDeletedShowcaseItems(userId: string, page?: number, limit?: number): Promise<object> {
+    const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page as number)) : 1;
+    const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit as number)), 50) : 20;
+    const skip = (safePage - 1) * safeLimit;
+    const retentionMs = 30 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+
+    const [items, total] = await Promise.all([
+      this.prisma.userShowcase.findMany({
+        where: { userId, deletedAt: { not: null } },
+        orderBy: [{ deletedAt: 'desc' }, { id: 'desc' }],
+        skip,
+        take: safeLimit,
+        include: SHOWCASE_INCLUDE,
+      }) as unknown as Promise<ShowcaseRow[]>,
+      this.prisma.userShowcase.count({ where: { userId, deletedAt: { not: null } } }),
+    ]);
+
+    return {
+      items: items.map((item) => {
+        const deletedAt = (item.deletedAt as Date).getTime();
+        const daysRemaining = Math.max(0, Math.ceil((deletedAt + retentionMs - now) / (24 * 60 * 60 * 1000)));
+        return {
+          ...this.serializeShowcase(item, { isOwner: true }),
+          deletedAt: new Date(deletedAt).toISOString(),
+          daysRemaining,
+          restorable: now - deletedAt <= retentionMs,
+        };
+      }),
+      total,
+      page: safePage,
+      limit: safeLimit,
     };
   }
 
@@ -1573,12 +1612,10 @@ export class ShowcaseService {
    * menghasilkan 404/403 yang sama seperti jalur baca lainnya, jadi halaman
    * share tidak bisa dipakai untuk mengintip konten privat.
    *
-   * S-4: setiap pemanggilan yang lolos visibility check mencatat satu kejadian
-   * share via atomic increment `shareCount` (pola yang sama dengan viewCount,
-   * tapi tanpa dedupe — share memang dihitung per pembukaan deep link).
-   * Nilai aktual diambil dari hasil `update` supaya payload tidak memakai
-   * asumsi basi. Item yang tidak terlihat → 404 SEBELUM increment, jadi tidak
-   * ada share tercatat untuk konten yang tidak boleh diakses.
+   * SS-005 (audit 2026-09-26): method ini MURNI — tidak lagi menaikkan
+   * `shareCount`. Fetch metadata (retry, preview link, crawler) BUKAN aksi
+   * share. Counter hanya naik lewat `recordShareOpen` (deep link dibuka) atau
+   * `POST /v1/showcase/:showcaseId/share` (user menyelesaikan share sheet).
    */
   async getSharePayload(showcaseId: string, viewerId?: string): Promise<object> {
     const visible = await this.findVisibleShowcase(showcaseId, viewerId);
@@ -1586,11 +1623,6 @@ export class ShowcaseService {
       throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
     }
     const { row } = visible;
-    const updated = await this.prisma.userShowcase.update({
-      where: { id: row.id },
-      data: { shareCount: { increment: 1 } },
-      select: { shareCount: true },
-    });
     const coverImageUrl = row.images.length > 0 ? row.images[0].imageUrl : null;
     const priceMin = toNumber(row.priceMin);
     const priceMax = toNumber(row.priceMax);
@@ -1612,9 +1644,29 @@ export class ShowcaseService {
       shareUrl: this.buildShareUrl(row.id),
       // FX-001: scheme "kahade" sesuai app.json frontend (bukan "kahade-frontend").
       appUrl: `kahade://showcase/${encodeURIComponent(row.id)}`,
-      // S-4: nilai SETELAH increment pada pemanggilan ini.
-      shareCount: updated.shareCount,
+      // SS-005: nilai terkini TANPA increment — baca murni.
+      shareCount: row.shareCount,
     };
+  }
+
+  /**
+   * Mencatat satu kejadian share nyata: deep link dibuka atau user
+   * menyelesaikan share sheet. Increment atomik; item yang tidak visible
+   * → 404 sebelum increment (tidak ada share tercatat untuk konten privat).
+   * Idempotent per pemanggilan — pemanggil (deep-link page / share sheet)
+   * yang bertanggung jawab memanggil tepat sekali per aksi nyata.
+   */
+  async recordShareOpen(showcaseId: string, viewerId?: string): Promise<{ shareCount: number }> {
+    const visible = await this.findVisibleShowcase(showcaseId, viewerId);
+    if (!visible) {
+      throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
+    }
+    const updated = await this.prisma.userShowcase.update({
+      where: { id: visible.row.id },
+      data: { shareCount: { increment: 1 } },
+      select: { shareCount: true },
+    });
+    return { shareCount: updated.shareCount };
   }
 
   // ==================================================================

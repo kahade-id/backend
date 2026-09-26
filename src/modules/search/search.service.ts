@@ -121,8 +121,7 @@ export class SearchService {
     // adalah judul karya/etalase.
     const thirdLimit = Math.max(Math.ceil(effectiveLimit / 3), 1);
 
-    const blockedIds = await this.getBlockedUserIds(userId);
-    const blockedIdsArray = blockedIds.length > 0 ? blockedIds : ['__none__'];
+    const blockExclusion = this.blockExclusionSql('id', userId);
 
     const users = await this.prisma.$queryRaw<{ label: string; type: string }[]>`
       SELECT "fullName" AS label, 'user' AS type
@@ -136,7 +135,7 @@ export class SearchService {
         AND "isBanned" = false
         AND "deletedAt" IS NULL
         AND "profileVisible" = true
-        AND id NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
+        ${blockExclusion}
       ORDER BY ts_rank(
         to_tsvector('simple', coalesce(username, '') || ' ' || "fullName"),
         to_tsquery('simple', ${tsQuery})
@@ -154,7 +153,7 @@ export class SearchService {
         -- & getFeed — judul milik akun banned/nonaktif/privat tidak boleh bocor
         -- di autocomplete.
         AND "userId" IN (SELECT id FROM users WHERE "isActive" = true AND "isBanned" = false AND "deletedAt" IS NULL AND "profileVisible" = true)
-        AND "userId" NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
+        ${this.blockExclusionSql('"userId"', userId)}
         AND to_tsvector('simple', COALESCE(title,''))
             @@ to_tsquery('simple', ${tsQuery})
       ORDER BY ts_rank(
@@ -182,7 +181,6 @@ export class SearchService {
     const take = limit || this.LIMIT;
     const tsQuery = this.buildTsQuery(query);
     const blockedIds = userId ? await this.getBlockedUserIds(userId) : [];
-    const blockedIdsArray = blockedIds.length > 0 ? blockedIds : ['__none__'];
 
     const activeFilters = {
       isActive: true,
@@ -211,7 +209,7 @@ export class SearchService {
             AND "isBanned" = false
             AND "deletedAt" IS NULL
             AND "profileVisible" = true
-            AND id NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
+            ${this.blockExclusionSql('id', userId)}
           ORDER BY rank DESC
           LIMIT ${take}
         `.catch(() => []),
@@ -223,7 +221,7 @@ export class SearchService {
             AND "isBanned" = false
             AND "deletedAt" IS NULL
             AND "profileVisible" = true
-            AND id NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
+            ${this.blockExclusionSql('id', userId)}
         `.catch(() => [{ count: BigInt(0) }]),
       ]);
       results = rows;
@@ -434,7 +432,6 @@ export class SearchService {
     // item milik akun yang diblokir / akun nonaktif / profil privat tidak
     // boleh muncul di hasil pencarian (feed getFeed sudah menyaring ini).
     const blockedIds = userId ? await this.getBlockedUserIds(userId) : [];
-    const blockedIdsArray = blockedIds.length > 0 ? blockedIds : ['__none__'];
     // Fragmen SQL mentah (bukan parameter) — Prisma mengutip string biasa
     // sebagai nilai, jadi harus dibungkus Prisma.raw.
     const ownerVisibilitySql = Prisma.raw(`sc."userId" IN (SELECT id FROM users WHERE "isActive" = true AND "isBanned" = false AND "deletedAt" IS NULL AND "profileVisible" = true)`);
@@ -458,7 +455,7 @@ export class SearchService {
           WHERE sc."deletedAt" IS NULL AND sc."visibility" = 'PUBLIC' AND sc."isActive" = true
             AND ${ownerVisibilitySql}
             ${locationSql}
-            AND sc."userId" NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
+            ${this.blockExclusionSql('sc."userId"', userId)}
             AND to_tsvector('simple', COALESCE(sc.title,'') || ' ' || COALESCE(sc.description,'')) @@ to_tsquery('simple', ${tsQuery})
           ORDER BY rank DESC, sc."createdAt" DESC
           LIMIT ${take}
@@ -468,7 +465,7 @@ export class SearchService {
           WHERE sc."deletedAt" IS NULL AND sc."visibility" = 'PUBLIC' AND sc."isActive" = true
             AND ${ownerVisibilitySql}
             ${locationSql}
-            AND sc."userId" NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
+            ${this.blockExclusionSql('sc."userId"', userId)}
             AND to_tsvector('simple', COALESCE(sc.title,'') || ' ' || COALESCE(sc.description,'')) @@ to_tsquery('simple', ${tsQuery})
         `.catch(() => [{ count: BigInt(0) }]);
         return {
@@ -550,17 +547,15 @@ export class SearchService {
   }
 
   private async getBlockedUserIds(userId: string): Promise<string[]> {
-    // Unbounded before: every id is interpolated into the `unnest(...::text[])`
-    // parameter of the search queries below, so a user with a large block list
-    // produced an ever-growing query payload on every keystroke of /search and
-    // /search/suggestions. Cap it — the block list is a relevance filter, not a
-    // security boundary (profileVisible/isActive/isBanned do that work).
+    // SS-008 (audit 2026-09-26): TANPA cap — dipakai untuk filter `notIn` di
+    // jalur ORM. Cap 1000 lama membocorkan hasil dari akun yang diblokir
+    // melewati batas. Jalur raw SQL memakai blockExclusionSql (subquery)
+    // agar payload query tetap kecil.
     const blocks = await this.prisma.blockList.findMany({
       where: {
         OR: [{ blockerId: userId }, { blockedId: userId }],
       },
       select: { blockerId: true, blockedId: true },
-      take: 1000,
     });
     const ids = new Set<string>();
     for (const b of blocks) {
@@ -568,6 +563,22 @@ export class SearchService {
       else ids.add(b.blockerId);
     }
     return Array.from(ids);
+  }
+
+  /**
+   * SS-008 sweep: fragmen `AND <kolom> NOT IN (subquery block_lists)` —
+   * ekuivalen dengan filter block di jalur ORM, tanpa memuat ribuan id ke
+   * payload query (kekhawatiran komentar lama soal "payload per-keystroke").
+   * Tanpa viewer → fragmen kosong (tanpa filter).
+   */
+  private blockExclusionSql(column: 'id' | '"userId"' | 'sc."userId"', viewerId?: string): Prisma.Sql {
+    if (!viewerId) return Prisma.sql``;
+    const col = Prisma.raw(column === 'id' ? 'id' : column);
+    return Prisma.sql`AND ${col} NOT IN (
+      SELECT CASE WHEN "blockerId" = ${viewerId} THEN "blockedId" ELSE "blockerId" END
+      FROM block_lists
+      WHERE "blockerId" = ${viewerId} OR "blockedId" = ${viewerId}
+    )`;
   }
 
   private normalizeQuery(query: string): string {

@@ -173,6 +173,23 @@ export class ShowcaseController {
 
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @Post(':showcaseId/share')
+  @ApiOperation({
+    summary: 'Record a completed share action',
+    description:
+      'SS-005: mencatat SATU kejadian share nyata (user menyelesaikan share sheet). ' +
+      'GET :showcaseId/share hanya mengembalikan metadata tanpa menaikkan counter. ' +
+      'Item PRIVATE/tidak visible ditolak 404 sebelum increment.',
+  })
+  async recordShare(
+    @Param('showcaseId', ParseIdPipe) showcaseId: string,
+    @CurrentUser('sub') viewerId: string | null,
+  ): Promise<{ shareCount: number }> {
+    return this.showcaseService.recordShareOpen(showcaseId, viewerId ?? undefined);
+  }
+
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Get(':showcaseId/comments')
   @ApiOperation({
     summary: 'List comments of a showcase item (nested replies)',

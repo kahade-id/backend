@@ -3,6 +3,7 @@ import { BadRequestException, ConflictException, NotFoundException } from '@nest
 import { ConfigService } from '@nestjs/config';
 import { UploadService } from '../upload.service';
 import { RedisService } from '../../../redis/redis.service';
+import { LocalStorageService } from '../local-storage.service';
 
 jest.mock('@aws-sdk/client-s3', () => ({
   S3Client: jest.fn().mockImplementation(() => ({ send: jest.fn() })),
@@ -50,6 +51,15 @@ describe('UploadService — confirmUpload', () => {
         UploadService,
         { provide: RedisService, useValue: mockRedis },
         { provide: ConfigService, useValue: mockConfig },
+        // Pre-existing: UploadService butuh LocalStorageService (self-hosted
+        // storage) — modul uji belum di-update saat migrasi dari R2.
+        { provide: LocalStorageService, useValue: {
+          deleteFile: jest.fn().mockResolvedValue(true),
+          fileExists: jest.fn().mockResolvedValue(true),
+          getFileSize: jest.fn().mockResolvedValue(1024),
+          getContentType: jest.fn().mockResolvedValue('image/jpeg'),
+          readFileRange: jest.fn().mockResolvedValue(Buffer.alloc(16)),
+        } },
       ],
     }).compile();
 

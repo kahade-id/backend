@@ -146,6 +146,31 @@ describe('SearchService', () => {
   });
 
   describe('searchShowcase privacy (T2)', () => {
+    // SS-008: filter block sekarang berupa subquery bersarang (nilai
+    // interpolasi Sql), bukan literal inline — render rekursif untuk inspeksi.
+    function renderSql(call: any[]): string {
+      const renderValue = (v: any): string => {
+        if (v && Array.isArray(v.strings) && Array.isArray(v.values)) {
+          const parts: string[] = [];
+          v.strings.forEach((s: string, i: number) => {
+            parts.push(s);
+            if (i < v.values.length) parts.push(renderValue(v.values[i]));
+          });
+          return parts.join('');
+        }
+        if (v && typeof v.text === 'string') return v.text;
+        return '[?]';
+      };
+      const strings: string[] = call[0];
+      const values: any[] = call.slice(1);
+      const parts: string[] = [];
+      strings.forEach((s: string, i: number) => {
+        parts.push(s);
+        if (i < values.length) parts.push(renderValue(values[i]));
+      });
+      return parts.join('');
+    }
+
     it('excludes showcase items of blocked users', async () => {
       mockPrisma.blockList.findMany.mockResolvedValue([
         { blockerId: 'u1', blockedId: 'blocked1' },
@@ -155,10 +180,11 @@ describe('SearchService', () => {
       const calls = mockPrisma.$queryRaw.mock.calls;
       expect(calls.length).toBeGreaterThan(0);
       // Semua query mentah showcase harus memuat filter NOT IN untuk userId pemilik.
-      const sqlTexts = calls.map((c: any[]) =>
-        c[0].map((s: string) => s).join(' '),
-      );
+      const sqlTexts = calls.map((c: any[]) => renderSql(c));
       expect(sqlTexts.some((t: string) => t.includes('"userId" NOT IN'))).toBe(true);
+      // SS-008: tidak ada lagi array id yang di-unnest; pakai subquery block_lists.
+      expect(sqlTexts.some((t: string) => t.includes('FROM block_lists'))).toBe(true);
+      expect(sqlTexts.some((t: string) => t.includes('unnest'))).toBe(false);
     });
   });
 

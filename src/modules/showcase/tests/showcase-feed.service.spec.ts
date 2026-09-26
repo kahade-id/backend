@@ -129,8 +129,9 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
       expect(mockPrisma.blockList.findMany).toHaveBeenCalledWith({
         where: { OR: [{ blockerId: VIEWER_ID }, { blockedId: VIEWER_ID }] },
         select: { blockerId: true, blockedId: true },
-        // S5 (audit Discovery 2026-09-26): cap 1000 seperti modul search.
-        take: 1000,
+        // SS-008 (audit Batch 5 2026-09-26): cap 1000 DIHAPUS — semua relasi
+        // block harus dihormati; filter block adalah batas privasi, bukan
+        // sekadar relevansi.
       });
       expect(lastQuery().where.user.id.notIn).toEqual(expect.arrayContaining([ENEMY_ID, 'enemy-2']));
     });

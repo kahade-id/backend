@@ -13,7 +13,9 @@ import { safeErrorMessage } from '../../../common/utils/background-reliability.u
  * lebih dari 30 hari. Berjalan sekali sehari jam 03:00 WIB.
  *
  * Alur: user hapus etalase → deletedAt di-set (soft delete, bisa
- * dipulihkan 30 hari) → cron ini hard delete + bersihkan gambar R2.
+ * dipulihkan 30 hari) → cron ini bersihkan file storage DULU lalu hard delete
+ * baris DB. Bila cleanup gagal, baris DB dipertahankan untuk retry jalan
+ * berikutnya (tidak ada file yatim).
  */
 @Injectable()
 export class ShowcaseHardDeleteService {
@@ -43,37 +45,62 @@ export class ShowcaseHardDeleteService {
     const cutoff = new Date(Date.now() - ShowcaseHardDeleteService.RETENTION_DAYS * 24 * 60 * 60 * 1000);
     this.logger.log(`Starting showcase hard delete (deletedAt < ${cutoff.toISOString()})...`);
 
-    try {
-      // Ambil batch kecil agar tidak membebani DB bila banyak.
-      const expired = await this.prisma.userShowcase.findMany({
-        where: { deletedAt: { lt: cutoff } },
-        select: {
-          id: true,
-          userId: true,
-          images: { select: { fileKey: true } },
-        },
-        take: 500,
-        orderBy: { deletedAt: 'asc' },
-      });
+    // SS-013: loop batch sampai tidak ada lagi item kedaluwarsa (bukan cuma
+    // 500 pertama). Batas aman per jalan agar satu run tidak berjalan selamanya.
+    const BATCH_SIZE = 500;
+    const MAX_PER_RUN = 5000;
+    let deleted = 0;
+    let skipped = 0;
+    let processed = 0;
 
-      let deleted = 0;
-      for (const item of expired) {
-        try {
-          // Hard delete: cascade hapus likes, comments, images, reports.
-          await this.prisma.userShowcase.delete({ where: { id: item.id } });
-          const fileKeys = item.images.map((img) => img.fileKey).filter((k): k is string => Boolean(k));
-          if (fileKeys.length > 0) {
-            await this.uploadService.cleanupFileKeys(item.userId, fileKeys).catch((err) => {
-              this.logger.warn(`R2 cleanup failed for showcase ${item.id}: ${safeErrorMessage(err)}`);
-            });
+    try {
+      for (;;) {
+        const expired = await this.prisma.userShowcase.findMany({
+          where: { deletedAt: { lt: cutoff } },
+          select: {
+            id: true,
+            userId: true,
+            images: { select: { fileKey: true } },
+          },
+          take: BATCH_SIZE,
+          orderBy: { deletedAt: 'asc' },
+        });
+        if (expired.length === 0) break;
+
+        for (const item of expired) {
+          processed++;
+          try {
+            // SS-014: bersihkan storage DULU, baru hapus baris DB.
+            // Bila cleanup gagal, baris DB dipertahankan → retry di jalan
+            // berikutnya (tidak ada file yatim tanpa catatan).
+            const fileKeys = item.images.map((img) => img.fileKey).filter((k): k is string => Boolean(k));
+            if (fileKeys.length > 0) {
+              const result = await this.uploadService.cleanupFileKeys(item.userId, fileKeys);
+              if (result.errors.length > 0) {
+                this.logger.error(
+                  `Storage cleanup gagal untuk showcase ${item.id} — baris DB dipertahankan untuk retry: ` +
+                  result.errors.map((e) => `${e.fileKey}: ${e.reason}`).join('; '),
+                );
+                skipped++;
+                continue;
+              }
+            }
+            // Hard delete: cascade hapus likes, comments, images, reports.
+            await this.prisma.userShowcase.delete({ where: { id: item.id } });
+            deleted++;
+          } catch (err) {
+            this.logger.error(`Failed to hard delete showcase ${item.id}: ${safeErrorMessage(err)}`);
+            skipped++;
           }
-          deleted++;
-        } catch (err) {
-          this.logger.warn(`Failed to hard delete showcase ${item.id}: ${safeErrorMessage(err)}`);
+        }
+
+        if (processed >= MAX_PER_RUN) {
+          this.logger.warn(`Showcase hard delete mencapai batas ${MAX_PER_RUN} item/jalan — sisa dilanjut besok.`);
+          break;
         }
       }
 
-      this.logger.log(`Showcase hard delete selesai: ${deleted}/${expired.length} item dihapus permanen.`);
+      this.logger.log(`Showcase hard delete selesai: ${deleted} dihapus permanen, ${skipped} dilewati (retry berikutnya).`);
     } catch (err) {
       this.logger.error(`Showcase hard delete gagal: ${safeErrorMessage(err)}`);
     }

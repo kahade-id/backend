@@ -4,9 +4,11 @@ describe('DeepLinksController', () => {
   const usersService = { getPublicProfile: jest.fn() };
   const orderLinksService = { getLinkByToken: jest.fn() };
   // Section 3: halaman share showcase.
-  const showcaseService = { getSharePayload: jest.fn() };
+  const showcaseService = { getSharePayload: jest.fn(), recordShareOpen: jest.fn().mockResolvedValue({ shareCount: 4 }) };
   let controller: DeepLinksController;
   let response: { status: jest.Mock; type: jest.Mock; set: jest.Mock; send: jest.Mock };
+  // SS-005: req minimal untuk deteksi bot (user-agent).
+  const humanReq = { get: jest.fn().mockReturnValue('Mozilla/5.0 (Linux; Android 14)') };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -114,7 +116,7 @@ describe('DeepLinksController', () => {
         priceLabel: 'Rp 150000 - Rp 350000',
         authorUsername: 'seller',
       });
-      await controller.showcase('cshowcase000000000000001', response as never);
+      await controller.showcase('cshowcase000000000000001', humanReq as never, response as never);
       const html = String(response.send.mock.calls[0][0]);
       expect(response.status).toHaveBeenCalledWith(200);
       expect(html).toContain('Ilustrasi karakter');
@@ -125,7 +127,7 @@ describe('DeepLinksController', () => {
 
     it('does not leak PRIVATE, deleted or blocked items', async () => {
       showcaseService.getSharePayload.mockRejectedValue({ response: { code: 'SHOWCASE_NOT_FOUND' } });
-      await controller.showcase('cshowcase000000000000001', response as never);
+      await controller.showcase('cshowcase000000000000001', humanReq as never, response as never);
       const html = String(response.send.mock.calls[0][0]);
       expect(response.status).toHaveBeenCalledWith(200);
       expect(html).toContain('privat, sudah dihapus, atau tidak tersedia');
@@ -133,10 +135,28 @@ describe('DeepLinksController', () => {
     });
 
     it('rejects a malformed showcase id before querying the service', async () => {
-      await controller.showcase('../etc/passwd', response as never);
+      await controller.showcase('../etc/passwd', humanReq as never, response as never);
       expect(response.status).toHaveBeenCalledWith(404);
       expect(showcaseService.getSharePayload).not.toHaveBeenCalled();
       expect(String(response.send.mock.calls[0][0])).not.toContain('../etc/passwd');
+    });
+
+    it('SS-005: pembukaan oleh manusia mencatat share; bot/crawler tidak', async () => {
+      showcaseService.getSharePayload.mockResolvedValue({
+        title: 'Ilustrasi karakter',
+        description: 'Komisi ilustrasi full body',
+        priceLabel: 'Rp 150000 - Rp 350000',
+        authorUsername: 'seller',
+      });
+
+      await controller.showcase('cshowcase000000000000001', humanReq as never, response as never);
+      expect(showcaseService.recordShareOpen).toHaveBeenCalledWith('cshowcase000000000000001');
+
+      jest.clearAllMocks();
+      const botReq = { get: jest.fn().mockReturnValue('facebookexternalhit/1.1') };
+      await controller.showcase('cshowcase000000000000001', botReq as never, response as never);
+      expect(showcaseService.getSharePayload).toHaveBeenCalled();
+      expect(showcaseService.recordShareOpen).not.toHaveBeenCalled();
     });
   });
 });

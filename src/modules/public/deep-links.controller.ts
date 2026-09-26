@@ -1,6 +1,6 @@
-import { Controller, Get, Header, Param, Res } from '@nestjs/common';
+import { Controller, Get, Header, Param, Req, Res } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 import { Public } from '../../common/decorators/public.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { UsersService } from '../users/users.service';
@@ -25,6 +25,16 @@ function appSchemeUrl(path: string): string {
 
 const USERNAME_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9_-]|\.(?=[a-zA-Z0-9])){2,29}$/;
 const PUBLIC_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+
+/**
+ * SS-005: pola User-Agent crawler/bot umum. Pembukaan halaman deep link oleh
+ * bot (preview OG, indexer) BUKAN aksi share nyata → tidak menaikkan counter.
+ */
+const BOT_UA_RE = /bot|crawl|spider|slurp|mediapartners|baidu|yandex|facebookexternalhit|twitterbot|linkedinbot|embedly|quora|pinterest|slackbot|discordbot|telegrambot|whatsapp|google-inspection-tool/i;
+function isBotUserAgent(req: Request): boolean {
+  const ua = req.get('user-agent') ?? '';
+  return BOT_UA_RE.test(ua);
+}
 
 function page({ title, description, appUrl, detail }: { title: string; description: string; appUrl: string; detail: string }): string {
   const safeTitle = escapeHtml(title);
@@ -143,7 +153,7 @@ export class DeepLinksController {
   @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Get('showcase/:showcaseId')
   @Header('Content-Type', 'text/html; charset=utf-8')
-  async showcase(@Param('showcaseId') showcaseId: string, @Res() response: Response): Promise<void> {
+  async showcase(@Param('showcaseId') showcaseId: string, @Req() req: Request, @Res() response: Response): Promise<void> {
     const safeId = String(showcaseId ?? '').trim();
     if (!PUBLIC_ID_RE.test(safeId)) {
       response.status(404).send(page({ title: 'Showcase tidak ditemukan', description: 'Konten showcase Kahade tidak tersedia.', appUrl: appSchemeUrl('showcase/invalid'), detail: 'ID showcase pada tautan tidak valid.' }));
@@ -156,6 +166,11 @@ export class DeepLinksController {
       const record = payload as Record<string, unknown>;
       title = String(record.title ?? title);
       detail = `${String(record.description ?? 'Item showcase Kahade')}\nHarga: ${String(record.priceLabel ?? '—')}\nOleh: @${String(record.authorUsername ?? 'pengguna Kahade')}`;
+      // SS-005: pembukaan deep link oleh manusia = aksi share nyata → catat.
+      // Bot/crawler (preview OG) dilewati agar tidak menggembungkan counter.
+      if (!isBotUserAgent(req)) {
+        await this.showcaseService.recordShareOpen(safeId).catch(() => undefined);
+      }
     } catch {
       detail = 'Konten ini privat, sudah dihapus, atau tidak tersedia. Buka aplikasi untuk melihat status terbaru.';
     }

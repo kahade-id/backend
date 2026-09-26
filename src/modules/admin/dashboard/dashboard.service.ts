@@ -72,6 +72,20 @@ export class DashboardService {
     return result;
   }
 
+  // AW-018: SATU pintu invalidasi cache summary dashboard. Dipanggil oleh
+  // service admin yang bermutasi dan memengaruhi angka (ban/unban user,
+  // approve/reject KYC, resolve dispute, force-cancel/complete order,
+  // approve/reject withdrawal). Best-effort: kegagalan Redis tidak boleh
+  // menggagalkan aksi admin — entri lama paling lama bertahan sampai TTL.
+  async invalidateSummaryCache(): Promise<void> {
+    try {
+      await this.redis.del(DASHBOARD_SUMMARY_CACHE_KEY);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[DashboardService] failed to invalidate summary cache', err);
+    }
+  }
+
   private getPeriodStartDate(period: string = '30d'): Date {
     const now = new Date();
     switch (period) {
@@ -105,6 +119,12 @@ export class DashboardService {
     const endDateFilter = endDate
       ? Prisma.sql` AND "createdAt" <= ${endDate}`
       : Prisma.empty;
+    // AW-013: revenue (fee order COMPLETED) dibucket pada completedAt —
+    // konsisten dengan getFinancialSummary (feeToday/feeThisMonth) dan
+    // getRevenue bulanan. Bucket "orders" tetap berbasis kreasi (createdAt).
+    const endDateFilterCompleted = endDate
+      ? Prisma.sql` AND "completedAt" <= ${endDate}`
+      : Prisma.empty;
 
     const [ordersByDay, revenueByDay] = await Promise.all([
       this.prisma.$queryRaw<Array<{ day: string; count: bigint }>>`
@@ -115,10 +135,10 @@ export class DashboardService {
         ORDER BY day ASC
       `,
       this.prisma.$queryRaw<Array<{ day: string; revenue: bigint }>>`
-        SELECT ("createdAt" AT TIME ZONE 'Asia/Jakarta')::date::text as day, COALESCE(SUM("feeAmount"), 0)::bigint as revenue
+        SELECT ("completedAt" AT TIME ZONE 'Asia/Jakarta')::date::text as day, COALESCE(SUM("feeAmount"), 0)::bigint as revenue
         FROM orders
-        WHERE "createdAt" >= ${startDate}${endDateFilter} AND status = 'COMPLETED'
-        GROUP BY ("createdAt" AT TIME ZONE 'Asia/Jakarta')::date
+        WHERE "completedAt" >= ${startDate}${endDateFilterCompleted} AND status = 'COMPLETED'
+        GROUP BY ("completedAt" AT TIME ZONE 'Asia/Jakarta')::date
         ORDER BY day ASC
       `,
     ]);

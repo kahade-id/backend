@@ -21,6 +21,7 @@ import { generateNotifId, generateWalletTxId } from '../../../common/utils/id-ge
 import { parseJwtTtl } from '../../../common/utils/jwt.util';
 import { decryptPiiSafe, hashPhoneNumber, normalizePhoneNumber } from '../../../common/utils/pii.util';
 import { escapeLikePattern } from '../../../common/utils/search.util';
+import { DashboardService } from '../dashboard/dashboard.service';
 
 @Injectable()
 export class AdminUsersService {
@@ -36,6 +37,9 @@ export class AdminUsersService {
     private otpService: OtpService,
     private verificationBadge: VerificationBadgeService,
     @InjectQueue(EMAIL_QUEUE) private readonly emailQueue: Queue<EmailJobData>,
+    // AW-018: invalidasi cache summary dashboard setelah mutasi yang
+    // memengaruhi angka (via helper terpusat, bukan del() manual).
+    private readonly dashboard: DashboardService,
   ) {
     this.accessTokenTtlSeconds = parseJwtTtl(
       this.configService.get<string>('jwt.expiresIn') ?? '15m',
@@ -85,7 +89,7 @@ export class AdminUsersService {
         take: safeLimit,
         orderBy: { [orderField]: orderDir },
         select: {
-          id: true, userId: true, email: true, fullName: true,
+          id: true, userId: true, username: true, email: true, fullName: true,
           kycStatus: true, isBanned: true, banReason: true,
           emailVerified: true, isActive: true, isKahadePlus: true,
           membershipRank: true, averageRating: true,
@@ -230,6 +234,9 @@ export class AdminUsersService {
       ipAddress,
     });
 
+    // AW-018: angka dashboard (total/verifikasi user) bisa berubah.
+    await this.dashboard.invalidateSummaryCache();
+
     return updated;
   }
 
@@ -261,6 +268,9 @@ export class AdminUsersService {
       after: { isBanned: false },
       ipAddress,
     });
+
+    // AW-018: angka dashboard (total/verifikasi user) bisa berubah.
+    await this.dashboard.invalidateSummaryCache();
 
     return result;
   }
@@ -693,6 +703,9 @@ export class AdminUsersService {
       after: { availableBalance: balanceAfter.toString() },
       ipAddress,
     });
+
+    // AW-018: totalWalletBalance di summary dashboard berubah.
+    await this.dashboard.invalidateSummaryCache();
 
     return { txId, type: dto.type, amount: dto.amount, reason: dto.reason, balanceAfter: toIdr(balanceAfter) };
   }

@@ -6,9 +6,10 @@ import { RedisModule } from '../../../redis/redis.module';
 import { OrdersModule } from '../../orders/orders.module';
 import { WalletModule } from '../../wallet/wallet.module';
 import { ReferralModule } from '../../referral/referral.module';
+import { DashboardModule } from '../dashboard/dashboard.module';
 
 @Module({
-  imports: [AuditLogModule, RedisModule, OrdersModule, WalletModule, ReferralModule],
+  imports: [AuditLogModule, RedisModule, OrdersModule, WalletModule, ReferralModule, DashboardModule],
   controllers: [AdminOrdersController],
   providers: [AdminOrdersService],
 })

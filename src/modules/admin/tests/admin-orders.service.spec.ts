@@ -9,6 +9,7 @@ import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial
 import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
 import { RedisService } from '../../../redis/redis.service';
+import { DashboardService } from '../dashboard/dashboard.service';
 
 function buildPrisma() {
   const buyerWallet = { id: 'wallet-buyer', availableBalance: 0n, escrowBalance: 0n, totalBalance: 0n, version: 1, isLocked: false };
@@ -51,6 +52,8 @@ describe('AdminOrdersService — forceComplete terminal cleanup', () => {
         { provide: WalletTxSerialService, useValue: { getNext: jest.fn().mockResolvedValue(1) } },
         { provide: ReferralService, useValue: { createReferralRewardIfEligible: jest.fn() } },
         { provide: MembershipRankService, useValue: { checkAndUpdateMembershipRank: jest.fn() } },
+        // AW-018: mock helper invalidasi cache dashboard terpusat.
+        { provide: DashboardService, useValue: { invalidateSummaryCache: jest.fn() } },
       ],
     }).compile();
 

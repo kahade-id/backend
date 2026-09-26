@@ -7,12 +7,14 @@ import { ReconciliationProcessor, RECONCILIATION_QUEUE } from './reconciliation.
 import { PrismaModule } from '../../../prisma/prisma.module';
 import { AuditLogModule } from '../../../common/services/audit-log.module';
 import { PaymentModule } from '../../../modules/payment/payment.module';
+import { DashboardModule } from '../dashboard/dashboard.module';
 
 @Module({
   imports: [
     PrismaModule,
     AuditLogModule,
     PaymentModule,
+    DashboardModule, // AW-018: invalidasi cache summary dashboard
     BullModule.registerQueue({
       name: RECONCILIATION_QUEUE,
       defaultJobOptions: {

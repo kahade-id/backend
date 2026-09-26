@@ -1,5 +1,6 @@
 import { ServiceUnavailableException } from '@nestjs/common';
 import { AdminFinanceService } from './admin-finance.service';
+import { DashboardService } from '../dashboard/dashboard.service';
 
 jest.mock('../../../common/utils/crypto.util', () => ({
   decryptAES: jest.fn(async (value: string) => value),
@@ -15,6 +16,8 @@ describe('AdminFinanceService payout submission safety', () => {
   };
   const auditLog = { logAdminAction: jest.fn().mockResolvedValue(undefined) };
   const midtrans = { createIrisPayout: jest.fn() };
+  // AW-018: mock helper invalidasi cache dashboard terpusat.
+  const dashboard = { invalidateSummaryCache: jest.fn(async () => undefined) };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -37,7 +40,7 @@ describe('AdminFinanceService payout submission safety', () => {
 
   it('keeps withdrawal PROCESSING when Iris submission outcome is ambiguous', async () => {
     midtrans.createIrisPayout.mockRejectedValueOnce(new Error('request timed out after provider acceptance'));
-    const service = new AdminFinanceService(prisma as never, auditLog as never, midtrans as never);
+    const service = new AdminFinanceService(prisma as never, auditLog as never, midtrans as never, dashboard as never);
 
     await expect(service.approveWithdrawal('WLT-1', {}, 'admin-1')).rejects.toBeInstanceOf(ServiceUnavailableException);
 

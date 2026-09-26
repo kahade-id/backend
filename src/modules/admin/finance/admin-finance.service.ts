@@ -17,6 +17,7 @@ import { MidtransService } from '../../../modules/payment/midtrans.service';
 import { decryptAES } from '../../../common/utils/crypto.util';
 import { toIdr } from '../../../common/utils/currency.util';
 import { parseDateBoundaryWIB, startOfDayWIB, toWIB } from '../../../common/utils/date.util';
+import { DashboardService } from '../dashboard/dashboard.service';
 
 @Injectable()
 export class AdminFinanceService {
@@ -34,6 +35,8 @@ export class AdminFinanceService {
     private readonly prisma: PrismaService,
     private readonly auditLog: AuditLogService,
     private readonly midtransService: MidtransService,
+    // AW-018: invalidasi cache summary dashboard (via helper terpusat).
+    private readonly dashboard: DashboardService,
   ) {}
 
   async listTransactions(query: FinanceTransactionQueryDto): Promise<object> {
@@ -470,6 +473,9 @@ export class AdminFinanceService {
       ipAddress,
     });
 
+    // AW-018: totalWalletBalance/totalEscrowBalance di summary bisa berubah.
+    await this.dashboard.invalidateSummaryCache();
+
     return {
       ...updated,
       amount: toIdr(updated.amount),
@@ -572,6 +578,9 @@ export class AdminFinanceService {
       description: `Rejected withdrawal ${tx.txId ?? tx.id} (refunded to user)${adminNote ? ': ' + adminNote : ''}`,
       ipAddress,
     });
+
+    // AW-018: pendingWithdrawals di summary dashboard berubah.
+    await this.dashboard.invalidateSummaryCache();
 
     return {
       ...updated,

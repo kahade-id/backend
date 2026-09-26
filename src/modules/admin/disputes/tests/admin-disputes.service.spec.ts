@@ -7,6 +7,7 @@ import { AuditLogService } from '../../../../common/services/audit-log.service';
 import { UploadService } from '../../../upload/upload.service';
 import { RealtimeService } from '../../../realtime/realtime.service';
 import { ChatService } from '../../../chat/chat.service';
+import { DashboardService } from '../../dashboard/dashboard.service';
 
 describe('AdminDisputesService round-two boundaries', () => {
   const prisma: any = {
@@ -27,6 +28,8 @@ describe('AdminDisputesService round-two boundaries', () => {
         { provide: UploadService, useValue: {} },
         { provide: RealtimeService, useValue: {} },
         { provide: ChatService, useValue: {} },
+        // AW-018: mock helper invalidasi cache dashboard terpusat.
+        { provide: DashboardService, useValue: { invalidateSummaryCache: jest.fn() } },
       ],
     }).compile();
     service = module.get(AdminDisputesService);

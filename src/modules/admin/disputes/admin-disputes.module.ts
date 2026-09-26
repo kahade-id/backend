@@ -5,9 +5,10 @@ import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial
 import { AuditLogModule } from '../../../common/services/audit-log.module';
 import { UploadModule } from '../../upload/upload.module';
 import { ChatModule } from '../../chat/chat.module';
+import { DashboardModule } from '../dashboard/dashboard.module';
 
 @Module({
-  imports: [AuditLogModule, UploadModule, ChatModule],
+  imports: [AuditLogModule, UploadModule, ChatModule, DashboardModule],
   controllers: [AdminDisputesController],
   providers: [AdminDisputesService, WalletTxSerialService],
   exports: [AdminDisputesService],

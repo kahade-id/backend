@@ -6,6 +6,7 @@ import { PrismaService } from '../../../../prisma/prisma.service';
 import { RedisService } from '../../../../redis/redis.service';
 import { AuditLogService } from '../../../../common/services/audit-log.service';
 import { WalletTxSerialService } from '../../../../common/services/wallet-tx-serial.service';
+import { DashboardService } from '../../dashboard/dashboard.service';
 import { OtpService } from '../../../auth/otp.service';
 import { VerificationBadgeService } from '../../../users/verification-badge.service';
 import { EMAIL_QUEUE } from '../../../queue/processors/email.processor';
@@ -56,6 +57,8 @@ describe('AdminUsersService — siklus hidup flaggedForReview (Section 6)', () =
         { provide: OtpService, useValue: mockOtp },
         { provide: VerificationBadgeService, useValue: mockVerificationBadge },
         { provide: `BullQueue_${EMAIL_QUEUE}`, useValue: mockEmailQueue },
+        // AW-018: mock helper invalidasi cache dashboard terpusat.
+        { provide: DashboardService, useValue: { invalidateSummaryCache: jest.fn() } },
       ],
     }).compile();
     service = module.get<AdminUsersService>(AdminUsersService);

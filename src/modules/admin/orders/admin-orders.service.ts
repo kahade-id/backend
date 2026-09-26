@@ -18,6 +18,7 @@ import { toIdr } from '../../../common/utils/currency.util';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { escapeLikePattern } from '../../../common/utils/search.util';
+import { DashboardService } from '../dashboard/dashboard.service';
 
 function serializeOrder(order: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -45,6 +46,8 @@ export class AdminOrdersService {
     private walletTxSerialService: WalletTxSerialService,
     private referralService: ReferralService,
     private membershipRankService: MembershipRankService,
+    // AW-018: invalidasi cache summary dashboard (via helper terpusat).
+    private readonly dashboard: DashboardService,
   ) {}
 
   private async withSerializableRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
@@ -172,6 +175,9 @@ export class AdminOrdersService {
     });
 
     this.logger.log(`Admin ${adminId} force-cancelled order ${order.orderId}`);
+
+    // AW-018: activeOrders di summary dashboard berubah.
+    await this.dashboard.invalidateSummaryCache();
 
     return { orderId: order.orderId, status: OrderStatus.CANCELLED };
   }
@@ -470,6 +476,9 @@ export class AdminOrdersService {
         },
       }).catch((err: unknown) => this.logger.warn(`silent-catch: admin force-complete cashback notification failed: ${err instanceof Error ? err.message : String(err)}`));
     }
+
+    // AW-018: activeOrders/completedOrders di summary dashboard berubah.
+    await this.dashboard.invalidateSummaryCache();
 
     return { orderId: order.orderId, status: OrderStatus.COMPLETED };
   }

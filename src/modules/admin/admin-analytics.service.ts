@@ -2,16 +2,6 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { toIdr } from '../../common/utils/currency.util';
 
-interface OrderStatRow {
-  period: Date;
-  total_orders: number;
-  completed: number;
-  disputed: number;
-  cancelled: number;
-  gmv: bigint;
-  revenue: bigint;
-}
-
 interface UserGrowthRow {
   day: Date;
   new_users: number;
@@ -41,8 +31,10 @@ export class AdminAnalyticsService {
       this.prisma.user.count({ where: { createdAt: dateFilter, deletedAt: null } }),
       this.prisma.order.count({ where: { createdAt: dateFilter, deletedAt: null } }),
       this.prisma.order.count({ where: { status: 'COMPLETED', completedAt: dateFilter, deletedAt: null } }),
-      this.prisma.order.count({ where: { status: 'DISPUTED', createdAt: dateFilter, deletedAt: null } }),
-      this.prisma.order.count({ where: { status: 'CANCELLED', createdAt: dateFilter, deletedAt: null } }),
+      // AW-013: metrik status dikenali pada tanggal statusnya (bukan tanggal
+      // pembuatan) agar konsisten dengan GMV/revenue berbasis completedAt.
+      this.prisma.order.count({ where: { status: 'DISPUTED', disputedAt: dateFilter, deletedAt: null } }),
+      this.prisma.order.count({ where: { status: 'CANCELLED', cancelledAt: dateFilter, deletedAt: null } }),
       this.prisma.order.aggregate({
         where: { status: 'COMPLETED', completedAt: dateFilter, deletedAt: null },
         _sum: { orderValue: true },
@@ -101,62 +93,84 @@ export class AdminAnalyticsService {
     const start = startDate || new Date('2020-01-01');
     const end = endDate || new Date();
 
-    const queryByTrunc = (trunc: 'day' | 'week' | 'month') => {
-      switch (trunc) {
-        case 'week':
-          return this.prisma.$queryRaw<OrderStatRow[]>`
-            SELECT date_trunc('week', ("createdAt" AT TIME ZONE 'Asia/Jakarta')) AS period,
-              COUNT(*)::int AS total_orders,
-              COUNT(*) FILTER (WHERE status = 'COMPLETED')::int AS completed,
-              COUNT(*) FILTER (WHERE status = 'DISPUTED')::int AS disputed,
-              COUNT(*) FILTER (WHERE status = 'CANCELLED')::int AS cancelled,
-              COALESCE(SUM("orderValue") FILTER (WHERE status = 'COMPLETED'), 0)::bigint AS gmv,
-              COALESCE(SUM("feeAmount") FILTER (WHERE status = 'COMPLETED'), 0)::bigint AS revenue
-            FROM "orders"
-            WHERE "createdAt" >= ${start}
-              AND "createdAt" <= ${end}
-              AND "deletedAt" IS NULL
-            GROUP BY period ORDER BY period ASC`;
-        case 'month':
-          return this.prisma.$queryRaw<OrderStatRow[]>`
-            SELECT date_trunc('month', ("createdAt" AT TIME ZONE 'Asia/Jakarta')) AS period,
-              COUNT(*)::int AS total_orders,
-              COUNT(*) FILTER (WHERE status = 'COMPLETED')::int AS completed,
-              COUNT(*) FILTER (WHERE status = 'DISPUTED')::int AS disputed,
-              COUNT(*) FILTER (WHERE status = 'CANCELLED')::int AS cancelled,
-              COALESCE(SUM("orderValue") FILTER (WHERE status = 'COMPLETED'), 0)::bigint AS gmv,
-              COALESCE(SUM("feeAmount") FILTER (WHERE status = 'COMPLETED'), 0)::bigint AS revenue
-            FROM "orders"
-            WHERE "createdAt" >= ${start}
-              AND "createdAt" <= ${end}
-              AND "deletedAt" IS NULL
-            GROUP BY period ORDER BY period ASC`;
-        default:
-          return this.prisma.$queryRaw<OrderStatRow[]>`
-            SELECT date_trunc('day', ("createdAt" AT TIME ZONE 'Asia/Jakarta')) AS period,
-              COUNT(*)::int AS total_orders,
-              COUNT(*) FILTER (WHERE status = 'COMPLETED')::int AS completed,
-              COUNT(*) FILTER (WHERE status = 'DISPUTED')::int AS disputed,
-              COUNT(*) FILTER (WHERE status = 'CANCELLED')::int AS cancelled,
-              COALESCE(SUM("orderValue") FILTER (WHERE status = 'COMPLETED'), 0)::bigint AS gmv,
-              COALESCE(SUM("feeAmount") FILTER (WHERE status = 'COMPLETED'), 0)::bigint AS revenue
-            FROM "orders"
-            WHERE "createdAt" >= ${start}
-              AND "createdAt" <= ${end}
-              AND "deletedAt" IS NULL
-            GROUP BY period ORDER BY period ASC`;
-      }
-    };
+    // AW-013 — SATU definisi untuk semua endpoint analitik admin:
+    // - metrik kreasi (total order dibuat) dibucket pada createdAt;
+    // - metrik status dibucket pada tanggal statusnya:
+    //   completed/GMV/revenue → completedAt (hanya order COMPLETED),
+    //   disputed → disputedAt, cancelled → cancelledAt.
+    // Sebelumnya semuanya dibucket createdAt sambil menghitung status SAAT INI,
+    // sehingga order yang dibuat di luar rentang tapi selesai di dalam rentang
+    // tidak pernah terhitung GMV-nya (dan sebaliknya).
+    interface BucketRow {
+      period: Date;
+      kind: string;
+      total_orders: number;
+      gmv: bigint;
+      revenue: bigint;
+    }
+    const trunc = groupBy === 'week' ? 'week' : groupBy === 'month' ? 'month' : 'day';
+    const rows = await this.prisma.$queryRaw<BucketRow[]>`
+      SELECT date_trunc(${trunc}, (m."metricDate" AT TIME ZONE 'Asia/Jakarta')) AS period,
+        m.kind AS kind,
+        COUNT(*)::int AS total_orders,
+        COALESCE(SUM(m."orderValue"), 0)::bigint AS gmv,
+        COALESCE(SUM(m."feeAmount"), 0)::bigint AS revenue
+      FROM (
+        SELECT "createdAt" AS "metricDate", 'total'::text AS kind,
+          0::bigint AS "orderValue", 0::bigint AS "feeAmount"
+        FROM "orders"
+        WHERE "createdAt" >= ${start} AND "createdAt" <= ${end} AND "deletedAt" IS NULL
+        UNION ALL
+        SELECT "completedAt" AS "metricDate", 'completed'::text AS kind,
+          "orderValue", "feeAmount"
+        FROM "orders"
+        WHERE status = 'COMPLETED'
+          AND "completedAt" IS NOT NULL
+          AND "completedAt" >= ${start} AND "completedAt" <= ${end}
+          AND "deletedAt" IS NULL
+        UNION ALL
+        SELECT "disputedAt" AS "metricDate", 'disputed'::text AS kind,
+          0::bigint AS "orderValue", 0::bigint AS "feeAmount"
+        FROM "orders"
+        WHERE status = 'DISPUTED'
+          AND "disputedAt" IS NOT NULL
+          AND "disputedAt" >= ${start} AND "disputedAt" <= ${end}
+          AND "deletedAt" IS NULL
+        UNION ALL
+        SELECT "cancelledAt" AS "metricDate", 'cancelled'::text AS kind,
+          0::bigint AS "orderValue", 0::bigint AS "feeAmount"
+        FROM "orders"
+        WHERE status = 'CANCELLED'
+          AND "cancelledAt" IS NOT NULL
+          AND "cancelledAt" >= ${start} AND "cancelledAt" <= ${end}
+          AND "deletedAt" IS NULL
+      ) m
+      GROUP BY period, m.kind
+      ORDER BY period ASC, m.kind ASC`;
 
-    const results = await queryByTrunc(groupBy);
-    return results.map((row: OrderStatRow) => ({
-      period: row.period,
-      totalOrders: Number(row.total_orders),
-      completed: Number(row.completed),
-      disputed: Number(row.disputed),
-      cancelled: Number(row.cancelled),
-      gmv: toIdr(BigInt(row.gmv)),
-      revenue: toIdr(BigInt(row.revenue)),
+    const buckets = new Map<string, { period: Date; totalOrders: number; completed: number; disputed: number; cancelled: number; gmv: bigint; revenue: bigint }>();
+    for (const row of rows) {
+      const key = new Date(row.period).toISOString();
+      let b = buckets.get(key);
+      if (!b) {
+        b = { period: new Date(row.period), totalOrders: 0, completed: 0, disputed: 0, cancelled: 0, gmv: 0n, revenue: 0n };
+        buckets.set(key, b);
+      }
+      const n = Number(row.total_orders);
+      if (row.kind === 'total') b.totalOrders = n;
+      else if (row.kind === 'completed') { b.completed = n; b.gmv = BigInt(row.gmv); b.revenue = BigInt(row.revenue); }
+      else if (row.kind === 'disputed') b.disputed = n;
+      else if (row.kind === 'cancelled') b.cancelled = n;
+    }
+
+    return [...buckets.values()].map((b) => ({
+      period: b.period,
+      totalOrders: b.totalOrders,
+      completed: b.completed,
+      disputed: b.disputed,
+      cancelled: b.cancelled,
+      gmv: toIdr(b.gmv),
+      revenue: toIdr(b.revenue),
     }));
   }
 

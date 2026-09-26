@@ -8,6 +8,7 @@ import { AuditLogModule } from '../../../common/services/audit-log.module';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { AuthModule } from '../../auth/auth.module';
 import { VerificationBadgeModule } from '../../users/verification-badge.module';
+import { DashboardModule } from '../dashboard/dashboard.module';
 import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
 
 @Module({
@@ -17,6 +18,7 @@ import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
     AuditLogModule,
     AuthModule,
     VerificationBadgeModule,
+    DashboardModule, // AW-018: invalidasi cache summary dashboard
     BullModule.registerQueue({
       name: EMAIL_QUEUE,
       settings: { stalledInterval: 30_000, maxStalledCount: 1 },

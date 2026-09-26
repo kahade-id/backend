@@ -20,6 +20,7 @@ import { generateNotifId } from '../../../common/utils/id-generator.util';
 import { escapeHtml } from '../../../common/utils/sanitize.util';
 import { EMAIL_QUEUE, EmailJobData } from '../../queue/processors/email.processor';
 import * as ErrorCodes from '../../../common/constants/error-codes';
+import { DashboardService } from '../dashboard/dashboard.service';
 
 @Injectable()
 export class AdminKycService {
@@ -31,6 +32,8 @@ export class AdminKycService {
     private uploadService: UploadService,
     private verificationBadgeService: VerificationBadgeService,
     @InjectQueue(EMAIL_QUEUE) private readonly emailQueue: Queue<EmailJobData>,
+    // AW-018: invalidasi cache summary dashboard (via helper terpusat).
+    private readonly dashboard: DashboardService,
   ) {}
 
   private async invalidateKycCache(userId: string): Promise<void> {
@@ -213,6 +216,9 @@ export class AdminKycService {
         });
     }
 
+    // AW-018: pendingKyc / verifiedUsers di summary dashboard bisa berubah.
+    await this.dashboard.invalidateSummaryCache();
+
     return updated;
   }
 
@@ -334,6 +340,9 @@ export class AdminKycService {
         });
     }
 
+    // AW-018: pendingKyc di summary dashboard bisa berubah.
+    await this.dashboard.invalidateSummaryCache();
+
     return updated;
   }
 
@@ -446,6 +455,9 @@ export class AdminKycService {
           this.logger.error(`Failed to queue KYC revocation email for ${request.user?.email}`, err);
         });
     }
+
+    // AW-018: verifiedUsers di summary dashboard bisa berubah.
+    await this.dashboard.invalidateSummaryCache();
 
     return updated;
   }

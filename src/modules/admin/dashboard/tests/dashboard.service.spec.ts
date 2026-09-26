@@ -44,4 +44,12 @@ describe('DashboardService control-plane contracts', () => {
       .rejects.toBeInstanceOf(BadRequestException);
     expect(prisma.$queryRaw).not.toHaveBeenCalled();
   });
+
+  it('AW-018: invalidateSummaryCache deletes the summary key and never throws', async () => {
+    await service.invalidateSummaryCache();
+    expect(redis.del).toHaveBeenCalledWith('dashboard:summary_v2');
+
+    redis.del.mockRejectedValueOnce(new Error('redis down'));
+    await expect(service.invalidateSummaryCache()).resolves.toBeUndefined();
+  });
 });

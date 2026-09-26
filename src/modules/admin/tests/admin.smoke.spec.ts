@@ -90,6 +90,8 @@ async function build<T>(target: any, extras: any[] = []): Promise<T> {
       // verifikasi post-commit (AdminKycService, AdminSubscriptionsService,
       // AdminBusinessVerificationService).
       { provide: VerificationBadgeService, useValue: { invalidate: jest.fn(), getBadges: jest.fn(), loadBadges: jest.fn(), computeBadges: jest.fn(), getCatalog: jest.fn(), getPublicBadgesByUsername: jest.fn() } },
+      // AW-018: mock helper invalidasi cache dashboard terpusat.
+      { provide: DashboardService, useValue: { invalidateSummaryCache: jest.fn(async () => undefined) } },
       ...extras,
     ],
   }).compile();

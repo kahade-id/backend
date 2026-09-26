@@ -44,6 +44,29 @@ describe('AdminAnalyticsService', () => {
     expect(mockPrisma.$queryRaw).not.toHaveBeenCalled();
   });
 
+  it('AW-013: buckets completion metrics by completedAt, not createdAt', async () => {
+    mockPrisma.$queryRaw.mockResolvedValue([
+      { period: new Date('2026-01-05T00:00:00Z'), kind: 'total', total_orders: 4, gmv: 0n, revenue: 0n },
+      { period: new Date('2026-01-05T00:00:00Z'), kind: 'completed', total_orders: 2, gmv: 10000000n, revenue: 250000n },
+      { period: new Date('2026-01-05T00:00:00Z'), kind: 'disputed', total_orders: 1, gmv: 0n, revenue: 0n },
+      { period: new Date('2026-01-06T00:00:00Z'), kind: 'cancelled', total_orders: 1, gmv: 0n, revenue: 0n },
+    ]);
+    const result = await service.getOrderStats(new Date('2026-01-01'), new Date('2026-01-31'), 'day') as Array<Record<string, unknown>>;
+    const sql = mockPrisma.$queryRaw.mock.calls[0][0].join(' ');
+    // Satu definisi: completed/GMV/revenue dari completedAt; disputed dari
+    // disputedAt; cancelled dari cancelledAt; total dari createdAt.
+    expect(sql).toContain('"completedAt"');
+    expect(sql).toContain('"disputedAt"');
+    expect(sql).toContain('"cancelledAt"');
+    expect(sql).toContain('UNION ALL');
+    const day5 = result.find(r => (r.period as Date).toISOString().startsWith('2026-01-05'));
+    expect(day5).toMatchObject({ totalOrders: 4, completed: 2, disputed: 1, cancelled: 0 });
+    expect(day5?.gmv).toBe(100000); // toIdr: sen → rupiah
+    expect(day5?.revenue).toBe(2500);
+    const day6 = result.find(r => (r.period as Date).toISOString().startsWith('2026-01-06'));
+    expect(day6).toMatchObject({ totalOrders: 0, completed: 0, disputed: 0, cancelled: 1 });
+  });
+
   it('filters deleted rows in order stats and user growth raw queries', async () => {
     mockPrisma.$queryRaw.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
     await service.getOrderStats(undefined, undefined, 'month');

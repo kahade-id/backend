@@ -18,6 +18,7 @@ import { UploadService } from '../../upload/upload.service';
 import { RealtimeService } from '../../realtime/realtime.service';
 import { escapeLikePattern } from '../../../common/utils/search.util';
 import { ChatService } from '../../chat/chat.service';
+import { DashboardService } from '../dashboard/dashboard.service';
 
 const DISPUTE_APOLOGY_VOUCHER_AMOUNT = BigInt(10_000 * 100);
 const DISPUTE_APOLOGY_VALID_DAYS = 30;
@@ -33,6 +34,8 @@ export class AdminDisputesService {
     private uploadService: UploadService,
     private realtime: RealtimeService,
     private chatService: ChatService,
+    // AW-018: invalidasi cache summary dashboard (via helper terpusat).
+    private readonly dashboard: DashboardService,
   ) {}
 
   private apologyVoucherCode(disputeId: string): string {
@@ -646,6 +649,9 @@ export class AdminDisputesService {
       }).catch((err: unknown) => this.logger.warn(`silent-catch: dispute apology voucher notification failed: ${err instanceof Error ? err.message : String(err)}`));
     }
 
+    // AW-018: openDisputes di summary dashboard berubah.
+    await this.dashboard.invalidateSummaryCache();
+
     return result.decision;
   }
 
@@ -715,6 +721,9 @@ export class AdminDisputesService {
       after: { assignedAdminId: resolvedAssigneeId, isReassign },
       ipAddress: _ipAddress,
     });
+
+    // AW-018: OPEN→ASSIGNED mengubah hitungan openDisputes di summary.
+    await this.dashboard.invalidateSummaryCache();
 
     return this.prisma.dispute.findUniqueOrThrow({
       where: { id: dispute.id },
@@ -850,6 +859,9 @@ export class AdminDisputesService {
       after: { status: DisputeStatus.UNDER_REVIEW },
       ipAddress,
     });
+
+    // AW-018: ASSIGNED→UNDER_REVIEW mengubah hitungan openDisputes di summary.
+    await this.dashboard.invalidateSummaryCache();
 
     return this.prisma.dispute.findUnique({
       where: { id: dispute.id },

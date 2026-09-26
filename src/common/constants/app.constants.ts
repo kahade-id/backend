@@ -130,6 +130,8 @@ export const SHOWCASE_TITLE_MAX_LENGTH = 100;
 export const SHOWCASE_DESCRIPTION_MAX_LENGTH = 500;
 export const SHOWCASE_CATEGORY_MAX_LENGTH = 60;
 export const SHOWCASE_COMMENT_MAX_LENGTH = 1000;
+/** Batas balasan per komentar root di GET comments (S-3: cegah response raksasa). */
+export const SHOWCASE_REPLY_LIMIT = 20;
 /** Feed discover: cursor-based, jadi limitnya lebih kecil dari MAX_LIMIT (100)
  *  supaya satu halaman tetap ringan (tiap item ikut memuat author + gambar). */
 export const SHOWCASE_FEED_DEFAULT_LIMIT = 20;

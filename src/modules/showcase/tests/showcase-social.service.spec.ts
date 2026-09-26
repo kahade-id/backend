@@ -8,7 +8,7 @@ import { RedisService } from '../../../redis/redis.service';
 import { UploadService } from '../../upload/upload.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import * as ErrorCodes from '../../../common/constants/error-codes';
-import { SHOWCASE_COMMENT_MAX_LENGTH } from '../../../common/constants/app.constants';
+import { SHOWCASE_COMMENT_MAX_LENGTH, SHOWCASE_REPLY_LIMIT } from '../../../common/constants/app.constants';
 
 const OWNER_ID = 'owner-1';
 const VIEWER_ID = 'viewer-1';
@@ -108,6 +108,7 @@ const mockPrisma: any = {
     findFirst: jest.fn(),
     findUnique: jest.fn(),
     count: jest.fn(),
+    groupBy: jest.fn(),
     create: jest.fn(),
     update: jest.fn(),
     delete: jest.fn(),
@@ -151,6 +152,7 @@ describe('ShowcaseService — like & komentar', () => {
     mockPrisma.showcaseComment.findFirst.mockResolvedValue(null);
     mockPrisma.showcaseComment.findUnique.mockResolvedValue(null);
     mockPrisma.showcaseComment.count.mockResolvedValue(0);
+    mockPrisma.showcaseComment.groupBy.mockResolvedValue([]);
     mockPrisma.showcaseComment.create.mockImplementation(async (args: any) => commentRow(args.data));
     mockPrisma.showcaseComment.update.mockImplementation(async (args: any) => commentRow(args.data));
     mockPrisma.showcaseComment.delete.mockResolvedValue({ id: COMMENT_ID });
@@ -342,20 +344,45 @@ describe('ShowcaseService — like & komentar', () => {
   });
 
   describe('listComments', () => {
-    it('nests replies under their root comment with a single extra query', async () => {
+    it('nests replies under their root comment with per-root limits', async () => {
       const root = commentRow();
       const reply = commentRow({ id: REPLY_ID, parentId: COMMENT_ID, userId: OWNER_ID, content: 'Masih, silakan DM.' });
       mockPrisma.showcaseComment.findMany
         .mockResolvedValueOnce([root])
         .mockResolvedValueOnce([reply]);
+      mockPrisma.showcaseComment.groupBy.mockResolvedValue([
+        { parentId: COMMENT_ID, _count: { _all: 1 } },
+      ]);
       mockPrisma.showcaseComment.count.mockResolvedValue(1);
 
       const result = (await service.listComments(SHOWCASE_ID, VIEWER_ID, 1, 20)) as any;
       expect(result.data).toHaveLength(1);
+      expect(result.data[0]).toMatchObject({ replyCount: 1 });
       expect(result.data[0].replies).toHaveLength(1);
       expect(result.data[0].replies[0]).toMatchObject({ id: REPLY_ID, content: 'Masih, silakan DM.' });
+      // roots + 1 per-root replies query (dibatasi SHOWCASE_REPLY_LIMIT)
       expect(mockPrisma.showcaseComment.findMany).toHaveBeenCalledTimes(2);
-      expect(mockPrisma.showcaseComment.findMany.mock.calls[1][0].where.parentId).toEqual({ in: [COMMENT_ID] });
+      expect(mockPrisma.showcaseComment.findMany.mock.calls[1][0]).toMatchObject({
+        where: expect.objectContaining({ parentId: COMMENT_ID }),
+        take: SHOWCASE_REPLY_LIMIT,
+      });
+    });
+
+    it('limits replies per root while reporting the accurate total replyCount', async () => {
+      const root = commentRow();
+      const limitedReplies = Array.from({ length: SHOWCASE_REPLY_LIMIT }, (_, i) =>
+        commentRow({ id: `reply-${i}`, parentId: COMMENT_ID }),
+      );
+      mockPrisma.showcaseComment.findMany
+        .mockResolvedValueOnce([root])
+        .mockResolvedValueOnce(limitedReplies);
+      mockPrisma.showcaseComment.groupBy.mockResolvedValue([
+        { parentId: COMMENT_ID, _count: { _all: 25 } },
+      ]);
+
+      const result = (await service.listComments(SHOWCASE_ID, VIEWER_ID, 1, 20)) as any;
+      expect(result.data[0].replies).toHaveLength(SHOWCASE_REPLY_LIMIT);
+      expect(result.data[0]).toMatchObject({ replyCount: 25 });
     });
 
     it('hides moderated comments from everyone except the showcase owner', async () => {
@@ -397,6 +424,9 @@ describe('ShowcaseService — like & komentar', () => {
 
     it('orders replies oldest-first so a thread reads chronologically', async () => {
       mockPrisma.showcaseComment.findMany.mockResolvedValueOnce([commentRow()]).mockResolvedValueOnce([]);
+      mockPrisma.showcaseComment.groupBy.mockResolvedValue([
+        { parentId: COMMENT_ID, _count: { _all: 1 } },
+      ]);
       await service.listComments(SHOWCASE_ID, VIEWER_ID, 1, 20);
       expect(mockPrisma.showcaseComment.findMany.mock.calls[1][0].orderBy).toEqual([{ createdAt: 'asc' }, { id: 'asc' }]);
     });
@@ -405,6 +435,7 @@ describe('ShowcaseService — like & komentar', () => {
       mockPrisma.showcaseComment.findMany.mockResolvedValueOnce([]);
       await service.listComments(SHOWCASE_ID, VIEWER_ID, 1, 20);
       expect(mockPrisma.showcaseComment.findMany).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.showcaseComment.groupBy).not.toHaveBeenCalled();
     });
 
     it('returns 404 for an invisible item', async () => {
@@ -520,6 +551,21 @@ describe('ShowcaseService — like & komentar', () => {
       await service.deleteComment(VIEWER_ID, REPLY_ID);
       expect(mockPrisma.showcaseComment.delete).toHaveBeenCalled();
       expect(mockPrisma.userShowcase.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('subtracts only visible replies when deleting a hidden root (hide → delete)', async () => {
+      // Root sudah dikeluarkan dari commentCount saat di-hide, jadi saat
+      // dihapus hanya balasannya yang masih tampil yang dikurangi.
+      mockPrisma.showcaseComment.findUnique.mockResolvedValue({
+        id: COMMENT_ID, userId: VIEWER_ID, showcaseId: SHOWCASE_ID, parentId: null, isHidden: true,
+      });
+      mockPrisma.showcaseComment.count.mockResolvedValue(2);
+      await service.deleteComment(VIEWER_ID, COMMENT_ID);
+      expect(mockPrisma.showcaseComment.delete).toHaveBeenCalledWith({ where: { id: COMMENT_ID } });
+      expect(mockPrisma.userShowcase.updateMany).toHaveBeenCalledWith({
+        where: { id: SHOWCASE_ID, commentCount: { gte: 2 } },
+        data: { commentCount: { decrement: 2 } },
+      });
     });
 
     it('returns 404 for an unknown comment', async () => {

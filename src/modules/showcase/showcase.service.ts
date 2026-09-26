@@ -15,6 +15,7 @@ import {
   SHOWCASE_FEED_MAX_LIMIT,
   SHOWCASE_MAX_IMAGES,
   SHOWCASE_MAX_ITEMS,
+  SHOWCASE_REPLY_LIMIT,
   SHOWCASE_VIEW_DEDUPE_TTL_SECONDS,
 } from '../../common/constants/app.constants';
 import { CreateShowcaseItemDto, UpdateShowcaseItemDto } from './dto/showcase-item.dto';
@@ -378,40 +379,61 @@ export class ShowcaseService {
   }
 
   async createShowcaseItem(userId: string, dto: CreateShowcaseItemDto): Promise<object> {
-    const count = await this.prisma.userShowcase.count({ where: { userId } });
-    if (count >= SHOWCASE_MAX_ITEMS) {
-      throw new BadRequestException({
-        code: ErrorCodes.SHOWCASE_ITEM_LIMIT_REACHED,
-        message: `Maximum ${SHOWCASE_MAX_ITEMS} showcase items allowed`,
-      });
-    }
-
     const title = this.normalizeTitle(dto.title);
     this.assertPriceRange(dto.priceMin, dto.priceMax);
     const imageFileKeys = await this.prepareImageKeys(userId, dto.imageFileKeys);
 
-    const item = (await this.prisma.userShowcase.create({
-      data: {
-        userId,
-        title,
-        description: this.normalizeDescription(dto.description),
-        category: this.normalizeCategory(dto.category),
-        visibility: dto.visibility ?? ShowcaseVisibility.PUBLIC,
-        priceMin: dto.priceMin !== undefined ? BigInt(dto.priceMin) : null,
-        priceMax: dto.priceMax !== undefined ? BigInt(dto.priceMax) : null,
-        sortOrder: dto.sortOrder ?? count,
-        images: {
-          create: imageFileKeys.map((image, index) => ({
-            imageUrl: image.imageUrl,
-            fileKey: image.fileKey,
-            sortOrder: index,
-          })),
-        },
-      },
-      include: SHOWCASE_INCLUDE,
-    })) as unknown as ShowcaseRow;
+    const limitError = () =>
+      new BadRequestException({
+        code: ErrorCodes.SHOWCASE_ITEM_LIMIT_REACHED,
+        message: `Maximum ${SHOWCASE_MAX_ITEMS} showcase items allowed`,
+      });
 
-    return this.serializeShowcase(item, { isOwner: true });
+    // S-2: count + create dibungkus transaksi serializable supaya dua request
+    // paralel tidak bisa sama-sama lolos cek batas 20 item. Konflik serialisasi
+    // (P2034) ditangani dengan verifikasi ulang batas di luar transaksi.
+    try {
+      const item = (await this.prisma.$transaction(
+        async (tx) => {
+          const count = await tx.userShowcase.count({ where: { userId } });
+          if (count >= SHOWCASE_MAX_ITEMS) {
+            throw limitError();
+          }
+          return (await tx.userShowcase.create({
+            data: {
+              userId,
+              title,
+              description: this.normalizeDescription(dto.description),
+              category: this.normalizeCategory(dto.category),
+              visibility: dto.visibility ?? ShowcaseVisibility.PUBLIC,
+              priceMin: dto.priceMin !== undefined ? BigInt(dto.priceMin) : null,
+              priceMax: dto.priceMax !== undefined ? BigInt(dto.priceMax) : null,
+              sortOrder: dto.sortOrder ?? count,
+              images: {
+                create: imageFileKeys.map((image, index) => ({
+                  imageUrl: image.imageUrl,
+                  fileKey: image.fileKey,
+                  sortOrder: index,
+                })),
+              },
+            },
+            include: SHOWCASE_INCLUDE,
+          })) as unknown as ShowcaseRow;
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      )) as unknown as ShowcaseRow;
+
+      return this.serializeShowcase(item, { isOwner: true });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2034') {
+        // Race pada cek batas: verifikasi ulang di luar transaksi.
+        const count = await this.prisma.userShowcase.count({ where: { userId } });
+        if (count >= SHOWCASE_MAX_ITEMS) {
+          throw limitError();
+        }
+      }
+      throw err;
+    }
   }
 
   async updateShowcaseItem(userId: string, itemId: string, dto: UpdateShowcaseItemDto): Promise<object> {
@@ -450,7 +472,10 @@ export class ShowcaseService {
     }
 
     const item = (await this.prisma.userShowcase.update({
-      where: { id: itemId },
+      // Defense-in-depth: findOwnedShowcase sudah memastikan kepemilikan,
+      // tapi where ikut memfilter userId supaya update tidak pernah bisa
+      // menyentuh baris milik user lain walau ada bug di alur atas.
+      where: { id: itemId, userId },
       data,
       include: SHOWCASE_INCLUDE,
     })) as unknown as ShowcaseRow;
@@ -906,31 +931,43 @@ export class ShowcaseService {
       this.prisma.showcaseComment.count({ where }),
     ]);
 
-    // Semua balasan untuk root di halaman ini diambil sekali (bukan N+1).
-    const replies =
-      roots.length > 0
-        ? ((await this.prisma.showcaseComment.findMany({
-            where: {
-              parentId: { in: roots.map((root) => root.id) },
-              user: authorFilter,
-              ...(visible.isOwner ? {} : { isHidden: false }),
-            },
-            orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-            include: COMMENT_INCLUDE,
-          })) as unknown as CommentRow[])
+    // S-3: Balasan diambil per root dengan batas SHOWCASE_REPLY_LIMIT supaya satu
+    // root viral tidak menghasilkan response raksasa. replyCount total tiap root
+    // tetap akurat via groupBy. Query per root tetap ringan (indexed by parentId)
+    // dan hanya dijalankan untuk root yang memang punya balasan.
+    const rootIds = roots.map((root) => root.id);
+    const replyWhere: Prisma.ShowcaseCommentWhereInput = {
+      user: authorFilter,
+      ...(visible.isOwner ? {} : { isHidden: false }),
+    };
+    const replyCountRows =
+      rootIds.length > 0
+        ? await this.prisma.showcaseComment.groupBy({
+            by: ['parentId'],
+            where: { parentId: { in: rootIds }, ...replyWhere },
+            _count: { _all: true },
+          })
         : [];
+    const replyCountByParent = new Map<string, number>();
+    for (const row of replyCountRows) {
+      if (row.parentId) replyCountByParent.set(row.parentId, row._count._all);
+    }
 
     const repliesByParent = new Map<string, CommentRow[]>();
-    for (const reply of replies) {
-      const parentId = reply.parentId as string | null;
-      if (!parentId) continue;
-      const bucket = repliesByParent.get(parentId);
-      if (bucket) bucket.push(reply);
-      else repliesByParent.set(parentId, [reply]);
+    for (const root of roots) {
+      if ((replyCountByParent.get(root.id) ?? 0) === 0) continue;
+      const replies = (await this.prisma.showcaseComment.findMany({
+        where: { parentId: root.id, ...replyWhere },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        take: SHOWCASE_REPLY_LIMIT,
+        include: COMMENT_INCLUDE,
+      })) as unknown as CommentRow[];
+      repliesByParent.set(root.id, replies);
     }
 
     const data = roots.map((root) => ({
       ...this.serializeComment(root as CommentRow),
+      replyCount: replyCountByParent.get(root.id) ?? 0,
       replies: (repliesByParent.get(root.id) ?? []).map((reply) => this.serializeComment(reply)),
     }));
 
@@ -1094,14 +1131,17 @@ export class ShowcaseService {
     await this.prisma.$transaction(async (tx) => {
       // Menghapus root ikut menghapus balasannya (FK ON DELETE CASCADE), jadi
       // counter harus dikurangi sebanyak komentar + balasan yang masih tampil.
-      let removed = 1;
+      // Root yang sedang hidden sudah tidak termasuk dalam commentCount
+      // (dikurangi saat di-hide di setCommentHidden), jadi saat dihapus hanya
+      // balasannya yang masih tampil yang perlu dikurangi.
+      let removed: number;
       if (existing.parentId === null) {
         const visibleReplies = await tx.showcaseComment.count({
           where: { parentId: commentId, isHidden: false },
         });
-        removed += visibleReplies;
-      } else if (existing.isHidden) {
-        removed = 0;
+        removed = existing.isHidden ? visibleReplies : 1 + visibleReplies;
+      } else {
+        removed = existing.isHidden ? 0 : 1;
       }
       await tx.showcaseComment.delete({ where: { id: commentId } });
       if (removed > 0) {

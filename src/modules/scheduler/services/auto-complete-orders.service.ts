@@ -18,6 +18,7 @@ import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
+import { creditCashbackIfEligible } from '../../../common/utils/cashback-credit.util';
 import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { toIdr } from '../../../common/utils/currency.util';
 import { AUTO_COMPLETE_GRACE_PERIOD_HOURS } from '../../../common/constants/app.constants';
@@ -371,6 +372,18 @@ export class AutoCompleteDeliveredOrdersService {
                       },
                     });
 
+                    // Batch 1-money (EO-005): cashback voucher juga dikredit pada
+                    // auto-complete — sebelumnya hangus diam-diam.
+                    const cashbackResult = await creditCashbackIfEligible(
+                      tx,
+                      () => this.walletTxSerialService.getNext(),
+                      {
+                        orderDbId: order.id,
+                        orderPublicId: order.orderId,
+                        source: 'auto-complete',
+                      },
+                    );
+
                     if (order.feeAmount > BigInt(0) && feeTxSerial !== null) {
                       const feeBalanceBefore = buyerWallet.totalBalance;
                       const feeTxId = generateWalletTxId(feeTxSerial);
@@ -487,7 +500,7 @@ export class AutoCompleteDeliveredOrdersService {
 
                     this.logger.log(`Auto-completed order ${order.orderId}`);
 
-                    return { completed: true as const };
+                    return { completed: true as const, cashback: cashbackResult };
                   },
                   { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
                 ),
@@ -526,6 +539,28 @@ export class AutoCompleteDeliveredOrdersService {
             }
 
             if (!outcome?.completed) continue;
+
+            // Batch 1-money (EO-005): notifikasi cashback bila dikredit oleh helper.
+            if (outcome.cashback?.credited && outcome.cashback.userId) {
+              const cashbackIdr = toIdr(outcome.cashback.amount).toLocaleString('id-ID');
+              this.prisma.notification
+                .create({
+                  data: {
+                    notifId: generateNotifId(),
+                    userId: outcome.cashback.userId,
+                    type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
+                    category: getCategoryForType(NotificationType.CAMPAIGN_CASHBACK_CREDITED),
+                    title: 'Cashback Credited',
+                    body: `Cashback Rp ${cashbackIdr} from order "${order.title}" has been credited to your wallet.`,
+                    isRead: false,
+                  },
+                })
+                .catch((notificationError: unknown) =>
+                  this.logger.warn(
+                    `silent-catch: auto-complete cashback notification failed: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`,
+                  ),
+                );
+            }
 
             const postAmountIdr = toIdr(order.sellerReceiveAmount).toLocaleString('id-ID');
             this.prisma.notification

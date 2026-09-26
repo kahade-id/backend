@@ -55,3 +55,39 @@ export function formatIdr(amount: number): string {
 export function formatSen(sen: bigint): string {
   return formatIdr(toIdr(sen));
 }
+
+/**
+ * Convert a percent value (e.g. 2.5 = 2.5%) to integer basis points as BigInt — EXACT.
+ *
+ * WF-004: string-based conversion avoids binary float error
+ * (Number(2.675) * 100 = 267.4999… → Math.round gives 267 instead of 268).
+ * Accepts Prisma.Decimal (via toFixed), string, or number.
+ * Rounds half-up to the nearest basis point.
+ */
+export function percentToBpsBigInt(
+  pct: string | number | { toFixed(digits: number): string },
+): bigint {
+  let s: string;
+  if (typeof pct === 'number') {
+    if (!Number.isFinite(pct) || pct < 0) {
+      throw new RangeError(`percentToBpsBigInt: input must be a finite non-negative number, got ${pct}`);
+    }
+    s = pct.toFixed(6);
+  } else if (typeof pct === 'string') {
+    s = pct.trim();
+  } else {
+    s = pct.toFixed(6);
+  }
+  if (s.startsWith('-')) {
+    throw new RangeError(`percentToBpsBigInt: negative percent not allowed: ${s}`);
+  }
+  if (!/[0-9]/.test(s)) {
+    throw new RangeError(`percentToBpsBigInt: cannot parse percent value: ${s}`);
+  }
+  const [intPartRaw, fracPartRaw = ''] = s.split('.');
+  const intPart = intPartRaw.replace(/[^0-9]/g, '') || '0';
+  const frac = (fracPartRaw.replace(/[^0-9]/g, '') + '000000').slice(0, 6);
+  // bps = percent × 100, computed at 1e6 scale then rounded half-up.
+  const scaled = BigInt(intPart) * 100n * 1_000_000n + BigInt(frac) * 100n;
+  return (scaled + 500_000n) / 1_000_000n;
+}

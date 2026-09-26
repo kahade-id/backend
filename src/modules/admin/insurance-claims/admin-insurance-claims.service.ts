@@ -1,16 +1,42 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
+import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
-import { AuditAction, InsuranceClaimStatus, Prisma } from '@prisma/client';
+import {
+  AuditAction,
+  InsuranceClaimStatus,
+  NotificationType,
+  Prisma,
+  WalletTransactionStatus,
+  WalletTransactionType,
+} from '@prisma/client';
 import { toIdr } from '../../../common/utils/currency.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { escapeLikePattern } from '../../../common/utils/search.util';
+import { generateNotifId, generateWalletTxId } from '../../../common/utils/id-generator.util';
+import { getCategoryForType } from '../../notifications/notification-category.map';
 
 const TERMINAL_STATUSES: InsuranceClaimStatus[] = [
   InsuranceClaimStatus.PAID,
   InsuranceClaimStatus.REJECTED,
 ];
+
+/**
+ * Batch 1-money (INS-003): peta transisi status yang diizinkan.
+ * Sebelumnya guard hanya blacklist status terminal sehingga DRAFT bisa
+ * langsung loncat ke PAID tanpa persetujuan.
+ */
+const ALLOWED_TRANSITIONS: Record<string, InsuranceClaimStatus[]> = {
+  APPROVED: [InsuranceClaimStatus.DRAFT, InsuranceClaimStatus.SUBMITTED],
+  REJECTED: [
+    InsuranceClaimStatus.DRAFT,
+    InsuranceClaimStatus.SUBMITTED,
+    InsuranceClaimStatus.APPROVED,
+  ],
+  // PAID hanya dari APPROVED — di sinilah payout atomik (INS-001) berjalan.
+  PAID: [InsuranceClaimStatus.APPROVED],
+};
 
 /**
  * Admin klaim asuransi Kahade+ (Benefit 3).
@@ -23,6 +49,7 @@ export class AdminInsuranceClaimsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditLog: AuditLogService,
+    private readonly walletTxSerial: WalletTxSerialService,
   ) {}
 
   async listClaims(page: number, limit: number, status?: string, search?: string): Promise<object> {
@@ -84,6 +111,22 @@ export class AdminInsuranceClaimsService {
       });
     }
 
+    // INS-003: hanya transisi yang terdaftar yang diizinkan.
+    const allowedFrom = ALLOWED_TRANSITIONS[status] ?? [];
+    if (!allowedFrom.includes(claim.status)) {
+      throw new BadRequestException({
+        code: ErrorCodes.INSURANCE_INVALID_STATUS,
+        message: `Transisi status ${claim.status} → ${status} tidak diizinkan`,
+      });
+    }
+
+    // INS-001: PAID harus menggerakkan uang — payout atomik + idempoten.
+    // Klaim yang sudah PAID/berubah status di tengah jalan ditolak agar
+    // tidak terjadi double-credit.
+    if (status === 'PAID') {
+      return this.payClaim(claimId, note, adminId, ipAddress, claim);
+    }
+
     const updated = await this.prisma.insuranceClaim.update({
       where: { id: claimId },
       data: {
@@ -105,6 +148,142 @@ export class AdminInsuranceClaimsService {
       ...updated,
       amount: toIdr(updated.amount),
       cap: toIdr(updated.cap),
+    };
+  }
+
+  /**
+   * INS-001: bayar klaim asuransi — kredit wallet user + jurnal ledger +
+   * status PAID + notifikasi, semua dalam satu transaksi Serializable.
+   *
+   * Idempotensi berlapis:
+   * - Guard `updateMany({ where: { id, status: APPROVED } })` pada klaim:
+   *   bila 0 baris terpengaruh, klaim sudah diproses/diubah → Conflict.
+   * - OCC `version` pada wallet: bila 0 baris terpengaruh → Conflict, retry.
+   * - `txId` unik dari WalletTxSerialService (kolom unique di DB).
+   */
+  private async payClaim(
+    claimId: string,
+    note: string | undefined,
+    adminId: string,
+    ipAddress: string,
+    claim: { id: string; userId: string; status: InsuranceClaimStatus; amount: bigint; claimType: string },
+  ): Promise<object> {
+    // Serial dibuat sebelum transaksi (pola adjustWallet): rollback tidak
+    // membuat lubang serial yang fatal, hanya gap nomor urut.
+    const txId = generateWalletTxId(await this.walletTxSerial.getNext());
+    const amountSen = claim.amount;
+    if (amountSen <= BigInt(0)) {
+      throw new BadRequestException({
+        code: ErrorCodes.INSURANCE_INVALID_STATUS,
+        message: 'Nominal klaim tidak valid untuk dibayarkan',
+      });
+    }
+
+    let paidClaim!: { id: string; status: InsuranceClaimStatus; amount: bigint; cap: bigint; note: string | null; createdAt: Date; updatedAt: Date; orderId: string | null; claimType: string; userId: string };
+
+    await this.prisma.$transaction(
+      async (tx: Prisma.TransactionClient) => {
+        // 1. Klaim status → PAID hanya bila masih APPROVED (idempotency guard).
+        const claimed = await tx.insuranceClaim.updateMany({
+          where: { id: claimId, status: InsuranceClaimStatus.APPROVED },
+          data: {
+            status: InsuranceClaimStatus.PAID,
+            ...(note !== undefined ? { note: note.trim() || null } : {}),
+          },
+        });
+        if (claimed.count === 0) {
+          throw new ConflictException({
+            code: ErrorCodes.INSURANCE_INVALID_STATUS,
+            message: 'Klaim sudah diproses atau statusnya berubah; payout dibatalkan',
+          });
+        }
+
+        // 2. Wallet user — tolak bila terkunci (admin harus unlock dulu).
+        const wallet = await tx.wallet.findUnique({ where: { userId: claim.userId } });
+        if (!wallet) {
+          throw new NotFoundException({
+            code: ErrorCodes.WALLET_NOT_FOUND,
+            message: 'Wallet user tidak ditemukan',
+          });
+        }
+        if (wallet.isLocked) {
+          throw new BadRequestException({
+            code: ErrorCodes.WALLET_LOCKED,
+            message: `Wallet terkunci${wallet.lockReason ? `: ${wallet.lockReason}` : ''}. Buka kunci wallet sebelum membayar klaim.`,
+          });
+        }
+
+        const balanceBefore = wallet.availableBalance;
+        const balanceAfter = wallet.availableBalance + amountSen;
+
+        const walletUpdated = await tx.wallet.updateMany({
+          where: { id: wallet.id, version: wallet.version },
+          data: {
+            availableBalance: balanceAfter,
+            totalBalance: wallet.totalBalance + amountSen,
+            version: { increment: 1 },
+          },
+        });
+        if (walletUpdated.count === 0) {
+          throw new ConflictException({
+            code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT,
+            message: 'Concurrent wallet update detected, please retry',
+          });
+        }
+
+        // 3. Jurnal ledger — ADMIN_CREDIT (preseden: adjustWallet admin).
+        await tx.walletTransaction.create({
+          data: {
+            txId,
+            walletId: wallet.id,
+            type: WalletTransactionType.ADMIN_CREDIT,
+            status: WalletTransactionStatus.SUCCESS,
+            amount: amountSen,
+            balanceBefore,
+            balanceAfter,
+            description: `Pembayaran klaim asuransi ${claimId} (${claim.claimType})`,
+          },
+        });
+
+        // 4. Notifikasi ke user.
+        const notifType = NotificationType.WALLET_TOPUP_SUCCESS;
+        await tx.notification.create({
+          data: {
+            notifId: generateNotifId(),
+            userId: claim.userId,
+            type: notifType,
+            category: getCategoryForType(notifType),
+            title: 'Klaim asuransi dibayar',
+            body: `Klaim asuransi Anda sebesar Rp ${toIdr(amountSen).toLocaleString('id-ID')} telah dibayarkan ke saldo wallet.`,
+            isRead: false,
+          },
+        });
+
+        const fresh = await tx.insuranceClaim.findUnique({ where: { id: claimId } });
+        if (!fresh) {
+          throw new NotFoundException({
+            code: ErrorCodes.INSURANCE_CLAIM_NOT_FOUND,
+            message: 'Klaim asuransi tidak ditemukan',
+          });
+        }
+        paidClaim = fresh;
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'InsuranceClaim',
+      targetId: claimId,
+      description: `Membayar klaim asuransi ${claimId} (${toIdr(amountSen)} IDR) ke wallet user ${claim.userId}; ledger ${txId}`,
+      ipAddress,
+    });
+
+    return {
+      ...paidClaim,
+      amount: toIdr(paidClaim.amount),
+      cap: toIdr(paidClaim.cap),
     };
   }
 }

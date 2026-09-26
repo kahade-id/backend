@@ -8,6 +8,7 @@ import { AuditLogService } from '../../../common/services/audit-log.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { RedisService } from '../../../redis/redis.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
+import { creditCashbackIfEligible } from '../../../common/utils/cashback-credit.util';
 import { OrderStateService } from '../../orders/order-state.service';
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { ReferralService } from '../../referral/referral.service';
@@ -224,7 +225,7 @@ export class AdminOrdersService {
       ? await this.walletTxSerialService.getNext()
       : null;
 
-    await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    const forceCompleteCashback = await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const orderUpdated = await tx.order.updateMany({
         where: { id: order.id, status: { in: completableStatuses }, deletedAt: null },
         data: { status: OrderStatus.COMPLETED, completedAt: new Date() },
@@ -338,6 +339,15 @@ export class AdminOrdersService {
             description: `Admin force-complete: payment received for order ${order.orderId}`,
           },
         });
+
+        // Batch 1-money (EO-005): cashback voucher juga dikredit pada force-complete —
+        // sebelumnya hangus diam-diam.
+        const cashbackResult = await creditCashbackIfEligible(tx, () => this.walletTxSerialService.getNext(), {
+          orderDbId: order.id,
+          orderPublicId: order.orderId,
+          source: 'force-complete',
+        });
+        return cashbackResult;
       }
 
       if (order.feeAmount > BigInt(0) && feeTxSerial !== null) {
@@ -444,6 +454,22 @@ export class AdminOrdersService {
     }
 
     this.logger.log(`Admin ${adminId} force-completed order ${order.orderId}`);
+
+    // Batch 1-money (EO-005): beritahu penerima bila cashback dikredit.
+    if (forceCompleteCashback?.credited && forceCompleteCashback.userId) {
+      const cashbackIdr = toIdr(forceCompleteCashback.amount).toLocaleString('id-ID');
+      this.prisma.notification.create({
+        data: {
+          notifId: generateNotifId(),
+          userId: forceCompleteCashback.userId,
+          type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
+          category: getCategoryForType(NotificationType.CAMPAIGN_CASHBACK_CREDITED),
+          title: 'Cashback Credited',
+          body: `Cashback Rp ${cashbackIdr} from order "${order.title}" has been credited to your wallet.`,
+          isRead: false,
+        },
+      }).catch((err: unknown) => this.logger.warn(`silent-catch: admin force-complete cashback notification failed: ${err instanceof Error ? err.message : String(err)}`));
+    }
 
     return { orderId: order.orderId, status: OrderStatus.COMPLETED };
   }

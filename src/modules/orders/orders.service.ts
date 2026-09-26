@@ -980,6 +980,7 @@ export class OrdersService {
     voucherCashback: number;
     membershipRankDiscount: number;
     isKahadePlusApplied: boolean;
+    feeWaivedAmount: number;
   }> {
     if (!Number.isSafeInteger(dto.orderValue) || dto.orderValue < this.configuredMinOrderValue || dto.orderValue > this.configuredMaxOrderValue) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Order value must be an integer between Rp ${this.configuredMinOrderValue.toLocaleString('id-ID')} and Rp ${this.configuredMaxOrderValue.toLocaleString('id-ID')}` });
@@ -1067,18 +1068,47 @@ export class OrdersService {
       membershipRank: user.membershipRank,
     }, feeConfig);
 
+    // WF-019: sertakan estimasi Kahade+ fee waiver di preview agar angka
+    // estimasi = yang benar-benar dibayar saat createOrder. estimateWaiverAmount
+    // bersifat READ-ONLY (tidak menghabiskan kuota) — tidak seperti
+    // waiveFeeIfEligible yang mencatat usage di dalam transaksi order.
+    // Yang dibebaskan = porsi fee creator order (role BUYER/SELLER), cerminan
+    // logika createOrder.
+    let feeWaivedSen = BigInt(0);
+    let adjFeeAmount = feeCalculation.feeAmount;
+    let adjBuyerFeeAmount = feeCalculation.buyerFeeAmount;
+    let adjSellerFeeAmount = feeCalculation.sellerFeeAmount;
+    let adjBuyerPayAmount = feeCalculation.buyerPayAmount;
+    let adjSellerReceiveAmount = feeCalculation.sellerReceiveAmount;
+    if (user.isKahadePlus) {
+      const creatorRole = dto.role ?? 'BUYER';
+      const creatorFeeSen = creatorRole === 'BUYER' ? feeCalculation.buyerFeeAmount : feeCalculation.sellerFeeAmount;
+      feeWaivedSen = await this.subscriptionsService.estimateWaiverAmount(userId, creatorFeeSen);
+      if (feeWaivedSen > BigInt(0)) {
+        adjFeeAmount = adjFeeAmount - feeWaivedSen;
+        if (creatorRole === 'BUYER') {
+          adjBuyerFeeAmount = adjBuyerFeeAmount - feeWaivedSen;
+          adjBuyerPayAmount = adjBuyerPayAmount - feeWaivedSen;
+        } else {
+          adjSellerFeeAmount = adjSellerFeeAmount - feeWaivedSen;
+          adjSellerReceiveAmount = adjSellerReceiveAmount + feeWaivedSen;
+        }
+      }
+    }
+
     return {
       orderValue: dto.orderValue,
       feeRate: feeCalculation.feeRate,
-      feeAmount: safeBigIntToNumber(feeCalculation.feeAmount / 100n),
-      buyerFeeAmount: safeBigIntToNumber(feeCalculation.buyerFeeAmount / 100n),
-      sellerFeeAmount: safeBigIntToNumber(feeCalculation.sellerFeeAmount / 100n),
-      buyerPayAmount: safeBigIntToNumber(feeCalculation.buyerPayAmount / 100n),
-      sellerReceiveAmount: safeBigIntToNumber(feeCalculation.sellerReceiveAmount / 100n),
+      feeAmount: safeBigIntToNumber(adjFeeAmount / 100n),
+      buyerFeeAmount: safeBigIntToNumber(adjBuyerFeeAmount / 100n),
+      sellerFeeAmount: safeBigIntToNumber(adjSellerFeeAmount / 100n),
+      buyerPayAmount: safeBigIntToNumber(adjBuyerPayAmount / 100n),
+      sellerReceiveAmount: safeBigIntToNumber(adjSellerReceiveAmount / 100n),
       voucherDiscount: safeBigIntToNumber(feeCalculation.voucherDiscount / 100n),
       voucherCashback: safeBigIntToNumber(voucherCashbackSen / 100n),
       membershipRankDiscount: safeBigIntToNumber((feeCalculation.membershipRankDiscount ?? BigInt(0)) / 100n),
       isKahadePlusApplied: effectiveKahadePlusEst,
+      feeWaivedAmount: safeBigIntToNumber(feeWaivedSen / 100n),
     };
   }
 

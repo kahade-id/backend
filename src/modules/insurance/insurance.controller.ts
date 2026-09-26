@@ -26,6 +26,17 @@ export class InsuranceController {
     return this.insuranceService.createClaim(userId, dto);
   }
 
+  @Post('claims/:claimId/submit')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({ summary: 'Ajukan klaim DRAFT untuk direview admin (DRAFT → SUBMITTED)' })
+  async submitClaim(
+    @CurrentUser('sub') userId: string,
+    @Param('claimId', ParseIdPipe) claimId: string,
+  ): Promise<Record<string, unknown>> {
+    return this.insuranceService.submitClaim(userId, claimId);
+  }
+
   @Get('claims')
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @ApiOperation({ summary: 'Daftar klaim asuransi milik user' })

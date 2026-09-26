@@ -39,6 +39,17 @@ export interface FlashQrisPayment {
 
 export type FlashQrisStatus = 'PENDING' | 'SUCCESS' | 'FAILED' | 'UNKNOWN';
 
+/**
+ * Detail pembayaran dari API Flash — dipakai untuk verifikasi amount
+ * (WF-007). `amountIdr` null bila field amount tidak ada / tidak bisa
+ * diparse dari respons Flash (shape tak terdokumentasi penuh).
+ */
+export interface FlashQrisPaymentDetail {
+  status: FlashQrisStatus;
+  amountIdr: number | null;
+  transactionId: string;
+}
+
 @Injectable()
 export class FlashQrisService {
   private readonly logger = new Logger(FlashQrisService.name);
@@ -155,6 +166,20 @@ export class FlashQrisService {
    * Cek status pembayaran — dipakai untuk polling frontend & rekonsiliasi.
    */
   async getPaymentStatus(transactionId: string): Promise<FlashQrisStatus> {
+    const detail = await this.getPaymentDetail(transactionId);
+    return detail.status;
+  }
+
+  /**
+   * Ambil status + nominal terbayar dari API Flash.
+   *
+   * WF-007: nominal dipakai untuk verifikasi amount sebelum aktivasi
+   * subscription (fail-closed bila mismatch). Parsing defensif: field
+   * amount di respons Flash tidak terdokumentasi penuh, sehingga ketidakhadiran
+   * field menghasilkan `amountIdr: null` (bukan error) — pemanggil yang
+   * memutuskan kebijakan fail-open/fail-closed.
+   */
+  async getPaymentDetail(transactionId: string): Promise<FlashQrisPaymentDetail> {
     this.assertEnabled();
     const token = await this.getToken();
     try {
@@ -165,14 +190,31 @@ export class FlashQrisService {
           timeout: 15_000,
         },
       );
-      return this.mapStatus(res.data?.data?.status);
+      const data = res.data?.data ?? {};
+      return {
+        status: this.mapStatus(data?.status),
+        amountIdr: this.parseAmountIdr(data?.amount ?? data?.gross_amount ?? data?.paid_amount),
+        transactionId,
+      };
     } catch (err) {
       if (err instanceof AxiosError && err.response?.status === 404) {
-        return 'UNKNOWN';
+        return { status: 'UNKNOWN', amountIdr: null, transactionId };
       }
       this.logger.warn(`Gagal cek status QRIS Flash ${transactionId}: ${err instanceof Error ? err.message : String(err)}`);
-      return 'UNKNOWN';
+      return { status: 'UNKNOWN', amountIdr: null, transactionId };
     }
+  }
+
+  /** Parse nominal IDR dari berbagai kemungkinan shape respons Flash. */
+  private parseAmountIdr(raw: unknown): number | null {
+    if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) return Math.round(raw);
+    if (typeof raw === 'string') {
+      const cleaned = raw.replace(/[^0-9.]/g, '');
+      if (!cleaned) return null;
+      const n = Number(cleaned);
+      if (Number.isFinite(n) && n >= 0) return Math.round(n);
+    }
+    return null;
   }
 
   private mapStatus(raw: unknown): 'PENDING' | 'SUCCESS' | 'FAILED' {

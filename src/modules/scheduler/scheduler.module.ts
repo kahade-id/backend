@@ -35,6 +35,7 @@ import {
   ReferralLeaderboardRefreshService,
   DormantWinbackVoucherService,
   ExpireExtensionRequestsService,
+  RefundReconciliationService,
 } from './services';
 import { AdminFinanceModule } from '../admin/finance/admin-finance.module';
 import { WithdrawalsModule } from '../withdrawals/withdrawals.module';
@@ -92,6 +93,7 @@ import { ShowcaseHardDeleteService } from './services/showcase-hard-delete.servi
     ReferralLeaderboardRefreshService,
     DormantWinbackVoucherService,
     ExpireExtensionRequestsService,
+    RefundReconciliationService,
     CampaignService,
     WalletTxSerialService,
     MidtransService,

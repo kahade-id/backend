@@ -150,6 +150,7 @@ export class OrderQrisPaymentService {
       },
       orderBy: { createdAt: 'desc' },
       select: {
+        id: true,
         midtransOrderId: true,
         status: true,
         amount: true,
@@ -168,12 +169,55 @@ export class OrderQrisPaymentService {
         typeof instructions.qrCodeUrl === 'string' &&
         instructions.qrCodeUrl.length > 0;
       if (!hasQrInstructions) {
-        throw new ServiceUnavailableException({
-          code: 'QRIS_INSTRUCTIONS_PENDING',
-          message: 'QRIS payment is still being reconciled. Check payment status before retrying.',
+        // WF-021: charge sebelumnya gagal di tengah (baris PENDING tanpa
+        // instruksi QR) — user tidak mungkin membayar karena tidak ada QR
+        // yang bisa di-scan. Tandai FAILED agar initiate() dapat membuat
+        // charge baru, bukan dead-end QRIS_INSTRUCTIONS_PENDING s/d expiry.
+        // Aman: tanpa instruksi tidak ada dana yang bergerak.
+        const abandoned = await this.prisma.paymentTransaction.updateMany({
+          where: { id: activePayment.id, status: PaymentStatus.PENDING },
+          data: { status: PaymentStatus.FAILED, failedAt: now },
         });
+        if (abandoned.count !== 1) {
+          // Status berubah konkuren (mis. webhook expire/settle) di antara
+          // baca dan tulis — baca ulang; jangan buat charge ganda.
+          const fresh = await this.prisma.paymentTransaction.findUnique({
+            where: { id: activePayment.id },
+            select: {
+              status: true,
+              providerInstructions: true,
+              midtransOrderId: true,
+              amount: true,
+              paymentFee: true,
+              grossAmount: true,
+              expiredAt: true,
+            },
+          });
+          const freshInstructions = fresh?.providerInstructions;
+          const freshHasQr =
+            freshInstructions &&
+            typeof freshInstructions === 'object' &&
+            !Array.isArray(freshInstructions) &&
+            typeof (freshInstructions as { qrCodeUrl?: unknown }).qrCodeUrl === 'string' &&
+            ((freshInstructions as { qrCodeUrl: string }).qrCodeUrl.length > 0);
+          if (fresh && freshHasQr) {
+            return { ...this.serializePayment(fresh), orderId };
+          }
+          // WF-021: defensif — bila status berubah menjadi SUCCESS konkuren
+          // (tak terjangkau dalam praktik: charge tanpa QR tak bisa dibayar),
+          // jangan buat charge baru; kembalikan state terbaru.
+          if (fresh && fresh.status === PaymentStatus.SUCCESS) {
+            return { ...this.serializePayment(fresh), orderId };
+          }
+          // EXPIRED/FAILED konkuren → lanjut buat charge baru di bawah.
+        }
+        this.logger.warn(
+          `QRIS charge tanpa instruksi ditandai FAILED agar bisa retry: ` +
+          `order=${orderId} payment=${activePayment.midtransOrderId}`,
+        );
+      } else {
+        return { ...this.serializePayment(activePayment), orderId };
       }
-      return { ...this.serializePayment(activePayment), orderId };
     }
 
     const escrowAmount = toIdr(order.buyerPayAmount);

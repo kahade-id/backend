@@ -7,6 +7,7 @@ import { DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE } from '../../../common/constan
 import { PrismaService } from '../../../prisma/prisma.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
+import { creditCashbackIfEligible } from '../../../common/utils/cashback-credit.util';
 import { DisputeDecisionDto, validateSplitPercents } from './dispute-decision.dto';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { toIdr } from '../../../common/utils/currency.util';
@@ -558,6 +559,18 @@ export class AdminDisputesService {
           });
           this.logger.log(`Dispute ${disputeId}: platform retained fee ${platformRetainAmount} from order ${dispute.orderId}`);
         }
+      }
+
+      // Batch 1-money (V-003): bila verdict meneruskan dana ke seller (order efektif
+      // selesai), kreditkan cashback voucher. Untuk post-completion dispute, guard ledger
+      // di helper membuat ini no-op (sudah dikredit saat complete). Refund penuh ke buyer
+      // (sellerAmount == 0) tidak memicu cashback.
+      if (sellerAmount > BigInt(0)) {
+        await creditCashbackIfEligible(tx, () => this.walletTxSerialService.getNext(), {
+          orderDbId: dispute.orderId,
+          orderPublicId: order.orderId,
+          source: 'dispute-verdict',
+        });
       }
 
       const apologyVoucherRecipients = this.disputeApologyRecipients(dto.decision, order, buyerAmount, sellerAmount);

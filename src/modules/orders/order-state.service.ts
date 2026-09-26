@@ -9,6 +9,7 @@ import { MembershipRankService } from './membership-rank.service';
 import { OrderStatus, OrderCancelReason, ActorType, WalletTransactionType, WalletTransactionStatus, SubscriptionStatus, NotificationType, Prisma, VoucherType } from '@prisma/client';
 import { addDays, resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
+import { creditCashbackIfEligible } from '../../common/utils/cashback-credit.util';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { FeeCalculatorService } from './fee-calculator.service';
 import { NotificationQueueService } from '../queue/notification-queue.service';
@@ -543,21 +544,9 @@ export class OrderStateService {
         throw new ConflictException({ code: ErrorCodes.ESCROW_LOCK_MISSING, message: 'Escrow lock ledger is missing or does not match this order' });
       }
 
-      const cashbackUsage = await tx.voucherUsage.findFirst({
-        where: {
-          orderId: order.id,
-          voucher: { voucherType: VoucherType.WALLET_CASHBACK },
-        },
-        select: {
-          id: true,
-          userId: true,
-          discountApplied: true,
-          voucher: { select: { code: true } },
-        },
-      });
-      const cashbackAmount = cashbackUsage?.discountApplied ?? BigInt(0);
-      const cashbackRecipientIsBuyer = cashbackUsage?.userId === order.buyerId;
-      const cashbackRecipientIsSeller = cashbackUsage?.userId === order.sellerId;
+      // Batch 1-money (EO-005): kredit cashback kini via helper bersama idempoten
+      // (creditCashbackIfEligible) yang dipanggil setelah update escrow utama di bawah.
+      // Update wallet di sini TIDAK lagi melipat cashback — net effect identik.
 
       if (buyerWallet.isLocked) {
         throw new BadRequestException({ code: 'WALLET_LOCKED', message: 'Buyer wallet is locked. Cannot proceed with escrow release.' });
@@ -570,17 +559,13 @@ export class OrderStateService {
       const buyerBalanceAfter = buyerWallet.escrowBalance - order.buyerPayAmount;
       const sellerBalanceBefore = sellerWallet.availableBalance;
       const sellerBalanceAfter = sellerWallet.availableBalance + order.sellerReceiveAmount;
-      const buyerCashbackAmount = cashbackRecipientIsBuyer ? cashbackAmount : BigInt(0);
-      const sellerCashbackAmount = cashbackRecipientIsSeller ? cashbackAmount : BigInt(0);
-
+      // Batch 1-money (EO-005): cashback dikredit terpisah via creditCashbackIfEligible
+      // setelah update escrow utama — tidak lagi dilipat di sini.
       const buyerWalletData: Prisma.WalletUpdateManyMutationInput = {
         escrowBalance: { decrement: order.buyerPayAmount },
-        totalBalance: { decrement: order.buyerPayAmount - buyerCashbackAmount },
+        totalBalance: { decrement: order.buyerPayAmount },
         version: { increment: 1 },
       };
-      if (buyerCashbackAmount > BigInt(0)) {
-        buyerWalletData.availableBalance = { increment: buyerCashbackAmount };
-      }
 
       const buyerUpdated = await tx.wallet.updateMany({
         where: { id: buyerWallet.id, version: buyerWallet.version, escrowBalance: { gte: order.buyerPayAmount } },
@@ -593,8 +578,8 @@ export class OrderStateService {
       const sellerUpdated = await tx.wallet.updateMany({
         where: { id: sellerWallet.id, version: sellerWallet.version },
         data: {
-          availableBalance: { increment: order.sellerReceiveAmount + sellerCashbackAmount },
-          totalBalance: { increment: order.sellerReceiveAmount + sellerCashbackAmount },
+          availableBalance: { increment: order.sellerReceiveAmount },
+          totalBalance: { increment: order.sellerReceiveAmount },
           version: { increment: 1 },
         },
       });
@@ -632,26 +617,13 @@ export class OrderStateService {
         },
       });
 
-      if (cashbackUsage && cashbackAmount > BigInt(0) && (cashbackRecipientIsBuyer || cashbackRecipientIsSeller)) {
-        const cashbackWallet = cashbackRecipientIsBuyer ? buyerWallet : sellerWallet;
-        const cashbackBalanceBefore = cashbackRecipientIsBuyer
-          ? buyerWallet.availableBalance
-          : sellerWallet.availableBalance + order.sellerReceiveAmount;
-        const cashbackTxId = generateWalletTxId(await nextCashbackTxSerial());
-        await tx.walletTransaction.create({
-          data: {
-            txId: cashbackTxId,
-            walletId: cashbackWallet.id,
-            type: WalletTransactionType.CAMPAIGN_CASHBACK,
-            status: WalletTransactionStatus.SUCCESS,
-            amount: cashbackAmount,
-            balanceBefore: cashbackBalanceBefore,
-            balanceAfter: cashbackBalanceBefore + cashbackAmount,
-            orderId: order.id,
-            description: `Campaign cashback for order ${order.orderId} using voucher ${cashbackUsage.voucher.code}`,
-          },
-        });
-      }
+      // Batch 1-money (EO-005): kredit cashback via helper bersama idempoten.
+      // Dijalankan setelah update escrow utama agar balanceBefore ledger konsisten.
+      await creditCashbackIfEligible(tx, nextCashbackTxSerial, {
+        orderDbId: order.id,
+        orderPublicId: order.orderId,
+        source: 'completeOrder',
+      });
 
       // feeAmount = buyerPayAmount − sellerReceiveAmount.
       // The fee amount is removed from the buyer's escrow (already done above via
@@ -1036,6 +1008,11 @@ export class OrderStateService {
       }
     }), 'ADMIN_CANCEL_ORDER_TX');
 
+    // Batch 1-money (WF-022): refund provider tetap best-effort di sini agar cancel admin
+    // tidak gagal karena provider. Retry ditangani cron refund-reconciliation
+    // (refund-reconciliation.service.ts): klaim yang gagal dilepas oleh requestRefund
+    // dan dicoba ulang tiap jam; klaim basi yang webhook-nya tak kunjung tiba
+    // direkonsiliasi ke status provider.
     await this.orderQrisPaymentService.requestRefundForOrder(orderId, `Admin cancelled order: ${reason}`).catch((error: unknown) => {
       this.logger.error(`ADMIN_CANCEL_QRIS_REFUND_REQUEST_FAILED orderId=${orderId}: ${error instanceof Error ? error.message : String(error)}`);
     });

@@ -37,10 +37,35 @@ export class InsuranceService {
     const capSen = toSen(INSURANCE_DEFAULT_CAP_IDR);
     const finalAmount = amountSen > capSen ? capSen : amountSen;
 
+    // Batch 1-money (INS-002): orderId tidak boleh fiktif/milik orang lain.
+    // orderId di sini adalah ID publik order (format ORD-YYYYMMDD-SERIAL).
+    const normalizedOrderId = dto.orderId?.trim() || null;
+    if (normalizedOrderId) {
+      const order = await this.prisma.order.findUnique({
+        where: { orderId: normalizedOrderId },
+        select: { id: true, buyerId: true, sellerId: true, status: true },
+      });
+      if (!order) {
+        throw new NotFoundException({
+          code: ErrorCodes.ORDER_NOT_FOUND,
+          message: 'Order terkait tidak ditemukan',
+        });
+      }
+      if (order.buyerId !== userId && order.sellerId !== userId) {
+        throw new ForbiddenException({
+          code: ErrorCodes.ORDER_NOT_FOUND,
+          message: 'Order tersebut bukan milik Anda',
+        });
+      }
+      // NOTE: aturan kelayakan produk (status order yang eligible, jendela
+      // waktu klaim) belum didefinisikan tim produk — gerbangnya tetap review
+      // admin. Jangan mengada-ada aturan di sini.
+    }
+
     const claim = await this.prisma.insuranceClaim.create({
       data: {
         userId,
-        orderId: dto.orderId?.trim() || null,
+        orderId: normalizedOrderId,
         claimType: dto.claimType.trim().toUpperCase(),
         amount: finalAmount,
         cap: capSen,
@@ -50,6 +75,34 @@ export class InsuranceService {
 
     this.logger.log(`Insurance claim ${claim.id} dibuat oleh user ${userId} (${dto.claimType})`);
     return this.serialize(claim);
+  }
+
+  /**
+   * Batch 1-money (SP-005): user mengajukan klaim DRAFT-nya untuk direview.
+   * Melengkapi rantai DRAFT → SUBMITTED → APPROVED → PAID.
+   */
+  async submitClaim(userId: string, claimId: string): Promise<Record<string, unknown>> {
+    const claim = await this.prisma.insuranceClaim.findFirst({
+      where: { id: claimId, userId },
+    });
+    if (!claim) {
+      throw new NotFoundException({
+        code: ErrorCodes.INSURANCE_CLAIM_NOT_FOUND,
+        message: 'Klaim asuransi tidak ditemukan',
+      });
+    }
+    if (claim.status !== InsuranceClaimStatus.DRAFT) {
+      throw new ForbiddenException({
+        code: ErrorCodes.INSURANCE_INVALID_STATUS,
+        message: `Klaim dengan status ${claim.status} tidak dapat diajukan ulang`,
+      });
+    }
+    const updated = await this.prisma.insuranceClaim.update({
+      where: { id: claimId },
+      data: { status: InsuranceClaimStatus.SUBMITTED },
+    });
+    this.logger.log(`Insurance claim ${claimId} diajukan (SUBMITTED) oleh user ${userId}`);
+    return this.serialize(updated);
   }
 
   async listClaims(

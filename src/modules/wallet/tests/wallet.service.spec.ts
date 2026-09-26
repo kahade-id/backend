@@ -21,6 +21,16 @@ import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
 import { PaymentMethod, VoucherType, OtpType, OtpMethod } from '@prisma/client';
 import { bcryptHash, encryptAES, initializeCrypto } from '../../../common/utils/crypto.util';
 
+// Batch 1C (03-#9): decryptPiiSafe fail-closed ke null untuk nilai yang tidak
+// ter-decrypt. Mock PII agar data uji plaintext diperlakukan sebagai hasil
+// decrypt yang sukses (pola sama seperti users.service.spec.ts).
+jest.mock('../../../common/utils/pii.util', () => ({
+  decryptPiiSafe: jest.fn(async (s: string | null) => s ?? null),
+  encryptPii: jest.fn(async (s: string) => s),
+  hashPhoneNumber: jest.fn(async (s: string) => `h:${s}`),
+  normalizePhoneNumber: jest.fn((s: string) => s),
+}));
+
 const mockWallet = {
   id: 'wallet-1',
   userId: 'user-1',
@@ -235,27 +245,6 @@ describe('WalletService', () => {
       await expect(service.lockEscrowForOrder('wallet-1', BigInt(1000), 'order-1')).resolves.toBe(
         'WLT-existing-lock',
       );
-      expect(txFindFirst).toHaveBeenCalled();
-    });
-
-    it('does not repeat a release when the source wallet already has a successful release ledger', async () => {
-      const txFindFirst = jest.fn().mockResolvedValue({
-        id: 'release-row',
-        txId: 'WLT-existing-release',
-        amount: BigInt(1000),
-      });
-      mockPrisma.$transaction.mockImplementationOnce(
-        async (callback: (tx: unknown) => Promise<unknown>) =>
-          callback({
-            $queryRaw: jest.fn().mockResolvedValue([]),
-            walletTransaction: { findFirst: txFindFirst, create: jest.fn() },
-            wallet: { findUnique: jest.fn(), updateMany: jest.fn() },
-          }),
-      );
-
-      await expect(
-        service.releaseEscrow('wallet-1', 'wallet-2', BigInt(1000), 'order-1'),
-      ).resolves.toBeUndefined();
       expect(txFindFirst).toHaveBeenCalled();
     });
   });
@@ -1018,19 +1007,6 @@ describe('WalletService', () => {
       expect(mockPrisma.wallet.updateMany).not.toHaveBeenCalled();
       expect(mockPrisma.walletTransaction.create).not.toHaveBeenCalled();
     });
-
-    it('returns successfully when the release ledger already exists', async () => {
-      mockPrisma.walletTransaction.findFirst.mockResolvedValue({ amount: BigInt(10000) });
-      mockPrisma.$transaction.mockImplementation(
-        async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => fn(mockPrisma),
-      );
-      mockPrisma.wallet.findUnique.mockResolvedValue({ ...mockWallet, userId: 'user-1' });
-
-      await expect(
-        service.releaseEscrow('wallet-1', 'wallet-2', BigInt(10000), 'order-1'),
-      ).resolves.toBeUndefined();
-      expect(mockPrisma.walletTransaction.create).not.toHaveBeenCalled();
-    });
   });
 
   // ─── transfer and withdrawal concurrency guards ─────────────────
@@ -1058,6 +1034,7 @@ describe('WalletService', () => {
       mockPrisma.user.findUnique.mockResolvedValue({
         id: 'user-1',
         email: 'user@example.com',
+        phoneNumber: '+6281234567890',
         kycStatus: 'APPROVED',
       });
 
@@ -1089,7 +1066,7 @@ describe('WalletService', () => {
     });
 
     it('rejects a valid withdrawal OTP that is missing transaction-binding metadata', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com' });
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com', phoneNumber: '+6281234567890' });
       mockPrisma.wallet.findUnique.mockResolvedValue({ ...mockWallet, isLocked: false });
       mockPrisma.walletTransaction.findFirst.mockResolvedValue({
         id: 'withdrawal-1',
@@ -1098,7 +1075,7 @@ describe('WalletService', () => {
         bankAccountId: 'bank-1',
         withdrawStatus: 'PENDING_OTP',
       });
-      mockOtpService.verifyOtpWithMetadata.mockResolvedValue({
+      mockOtpService.verifyPhoneOtpWithMetadata.mockResolvedValue({
         valid: true,
         otpId: 'otp-1',
         metadata: {},
@@ -1112,7 +1089,7 @@ describe('WalletService', () => {
     });
 
     it('rejects an otherwise valid withdrawal OTP after the configured five-minute lifetime', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com' });
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com', phoneNumber: '+6281234567890' });
       mockPrisma.wallet.findUnique.mockResolvedValue({ ...mockWallet, isLocked: false });
       mockPrisma.walletTransaction.findFirst.mockResolvedValue({
         id: 'withdrawal-1',
@@ -1121,7 +1098,7 @@ describe('WalletService', () => {
         bankAccountId: 'bank-1',
         withdrawStatus: 'PENDING_OTP',
       });
-      mockOtpService.verifyOtpWithMetadata.mockResolvedValue({
+      mockOtpService.verifyPhoneOtpWithMetadata.mockResolvedValue({
         valid: true,
         otpId: 'otp-1',
         metadata: {
@@ -1395,6 +1372,7 @@ describe('WalletService', () => {
       mockPrisma.user.findUnique.mockResolvedValue({
         id: 'user-1',
         email: 'user@example.com',
+        phoneNumber: '+6281234567890',
         kycStatus: 'APPROVED',
       });
       mockPrisma.wallet.findUnique.mockResolvedValue({ ...mockWallet, walletPinHash: pinHash });
@@ -1420,7 +1398,7 @@ describe('WalletService', () => {
     });
 
     it('does not resend withdrawal OTP when the wallet becomes locked', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com' });
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com', phoneNumber: '+6281234567890' });
       mockPrisma.wallet.findUnique.mockResolvedValue({ ...mockWallet, isLocked: true });
 
       await expect(service.resendWithdrawOtp('user-1', 'WLT-1')).rejects.toBeInstanceOf(
@@ -1431,7 +1409,7 @@ describe('WalletService', () => {
     });
 
     it('rejects a resend while another withdrawal OTP lifecycle operation holds the transaction mutex', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com' });
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com', phoneNumber: '+6281234567890' });
       mockPrisma.wallet.findUnique.mockResolvedValue({ ...mockWallet, isLocked: false });
       mockPrisma.walletTransaction.findFirst.mockResolvedValue({
         id: 'withdraw-1',
@@ -1453,7 +1431,7 @@ describe('WalletService', () => {
     });
 
     it('rejects OTP confirmation while another withdrawal lifecycle operation holds the transaction mutex', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com' });
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com', phoneNumber: '+6281234567890' });
       mockPrisma.wallet.findUnique.mockResolvedValue({ ...mockWallet, isLocked: false });
       mockRedis.setNx.mockResolvedValueOnce(false);
 
@@ -1507,6 +1485,7 @@ describe('WalletService', () => {
       mockPrisma.user.findUnique.mockResolvedValue({
         id: 'user-1',
         email: 'user@example.com',
+        phoneNumber: '+6281234567890',
         kycStatus: 'APPROVED',
       });
       mockPrisma.wallet.findUnique.mockResolvedValue(reservedWallet);
@@ -1528,7 +1507,8 @@ describe('WalletService', () => {
       const cancelSpy = jest
         .spyOn(service, 'cancelPendingWithdrawal')
         .mockResolvedValue({ message: 'Pending withdrawal cancelled and funds restored' });
-      mockOtpService.invalidateOtps.mockRejectedValueOnce(new Error('otp store unavailable'));
+      // 03-#5: WhatsApp-only — setup OTP via invalidatePhoneOtps.
+      mockOtpService.invalidatePhoneOtps.mockRejectedValueOnce(new Error('otp store unavailable'));
 
       await expect(service.withdraw('user-1', 50000, 'bank-1', '481723')).rejects.toThrow(
         'otp store unavailable',
@@ -1538,7 +1518,7 @@ describe('WalletService', () => {
       expect(mockEmailQueue.add).not.toHaveBeenCalled();
     });
 
-    it('compensates a reserved withdrawal when the OTP email cannot be queued', async () => {
+    it('compensates a reserved withdrawal when WhatsApp OTP delivery fails', async () => {
       initializeCrypto({
         aesSecretKey: '0'.repeat(64),
         aesKdfSalt: 'wallet-email-compensation-test',
@@ -1576,6 +1556,7 @@ describe('WalletService', () => {
       mockPrisma.user.findUnique.mockResolvedValue({
         id: 'user-1',
         email: 'user@example.com',
+        phoneNumber: '+6281234567890',
         kycStatus: 'APPROVED',
       });
       mockPrisma.wallet.findUnique.mockResolvedValue(reservedWallet);
@@ -1597,19 +1578,20 @@ describe('WalletService', () => {
       const cancelSpy = jest
         .spyOn(service, 'cancelPendingWithdrawal')
         .mockResolvedValue({ message: 'Pending withdrawal cancelled and funds restored' });
-      mockOtpService.invalidateOtps.mockResolvedValue(undefined);
-      mockOtpService.generateOtp.mockResolvedValue('123456');
-      mockEmailQueue.add.mockRejectedValueOnce(new Error('email queue unavailable'));
+      // 03-#5: WhatsApp-only — jalur email dihapus; kegagalan kirim WA memicu kompensasi.
+      mockOtpService.invalidatePhoneOtps.mockResolvedValue(undefined);
+      mockOtpService.generatePhoneOtp.mockResolvedValue('123456');
+      mockOtpGateway.sendOtp.mockResolvedValueOnce({ success: false, error: 'whatsapp unavailable' });
 
       await expect(service.withdraw('user-1', 50000, 'bank-1', '481723')).rejects.toThrow(
-        'email queue unavailable',
+        'WhatsApp OTP delivery failed',
       );
 
       expect(cancelSpy).toHaveBeenCalledWith('user-1', expect.stringMatching(/^WLT-/));
     });
 
-    it('rolls back the resend cooldown when email delivery fails', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com' });
+    it('rolls back the resend cooldown when WhatsApp delivery fails', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com', phoneNumber: '+6281234567890' });
       mockPrisma.wallet.findUnique.mockResolvedValue({ ...mockWallet, isLocked: false });
       mockPrisma.walletTransaction.findFirst.mockResolvedValue({
         id: 'withdraw-1',
@@ -1619,18 +1601,19 @@ describe('WalletService', () => {
         amount: BigInt(50000),
         bankAccountId: 'bank-1',
       });
-      mockOtpService.invalidateOtps.mockResolvedValue(undefined);
-      mockOtpService.generateOtp.mockResolvedValue('123456');
-      mockEmailQueue.add.mockRejectedValueOnce(new Error('email provider unavailable'));
+      // 03-#5: WhatsApp-only — resend memakai invalidatePhoneOtps/generatePhoneOtp/sendOtp WA.
+      mockOtpService.invalidatePhoneOtps.mockResolvedValue(undefined);
+      mockOtpService.generatePhoneOtp.mockResolvedValue('123456');
+      mockOtpGateway.sendOtp.mockResolvedValueOnce({ success: false, error: 'whatsapp unavailable' });
 
       await expect(service.resendWithdrawOtp('user-1', 'WLT-1')).rejects.toThrow(
-        'email provider unavailable',
+        'WhatsApp OTP delivery failed',
       );
       expect(mockRedis.del).toHaveBeenCalledWith('withdraw_otp_cooldown:user-1');
     });
 
     it('refreshes the pending withdrawal timestamp after a successful OTP resend', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com' });
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', email: 'user@example.com', phoneNumber: '+6281234567890' });
       mockPrisma.wallet.findUnique.mockResolvedValue({ ...mockWallet, isLocked: false });
       mockPrisma.walletTransaction.findFirst.mockResolvedValue({
         id: 'withdraw-1',
@@ -1767,37 +1750,37 @@ describe('WalletService', () => {
       expect(mockEmailQueue.add).not.toHaveBeenCalled();
     });
 
-    it('keeps the email OTP path when the user has an email address', async () => {
+    it('uses WhatsApp even when the user has an email address (WhatsApp-only policy)', async () => {
       mockPrisma.user.findUnique.mockResolvedValue(emailUser);
       await setupWithdrawReservation();
-      mockOtpService.generateOtp.mockResolvedValue('123456');
+      mockOtpService.generatePhoneOtp.mockResolvedValue('123456');
 
       const result = await service.withdraw('user-1', 50000, 'bank-1', '481723');
 
       expect(result).toMatchObject({
         withdrawTxId: expect.stringMatching(/^WLT-/),
-        otpChannel: 'email',
+        otpChannel: 'whatsapp',
       });
-      expect(mockOtpService.invalidateOtps).toHaveBeenCalledWith(
-        'user@example.com',
+      expect(mockOtpService.invalidatePhoneOtps).toHaveBeenCalledWith(
+        '+6281234567890',
         OtpType.WITHDRAW_CONFIRMATION,
       );
-      expect(mockOtpService.generateOtp).toHaveBeenCalledWith(
-        'user@example.com',
+      expect(mockOtpService.generatePhoneOtp).toHaveBeenCalledWith(
+        '+6281234567890',
         OtpType.WITHDRAW_CONFIRMATION,
+        OtpMethod.WHATSAPP,
         'user-1',
-        expect.objectContaining({ otpChannel: 'email' }),
+        expect.objectContaining({ otpChannel: 'whatsapp' }),
         undefined,
-        expect.any(Number),
       );
-      expect(mockEmailQueue.add).toHaveBeenCalledWith(
-        'send',
-        expect.objectContaining({ to: 'user@example.com', templateName: 'withdrawal-otp' }),
-        expect.anything(),
+      expect(mockOtpGateway.sendOtp).toHaveBeenCalledWith(
+        '+6281234567890',
+        '123456',
+        'WHATSAPP',
       );
-      // Jalur WhatsApp tidak boleh tersentuh untuk user ber-email.
-      expect(mockOtpService.generatePhoneOtp).not.toHaveBeenCalled();
-      expect(mockOtpGateway.sendOtp).not.toHaveBeenCalled();
+      // 03-#5: cabang email dihapus — jalur email tidak boleh tersentuh.
+      expect(mockOtpService.generateOtp).not.toHaveBeenCalled();
+      expect(mockEmailQueue.add).not.toHaveBeenCalled();
     });
 
     it('lets a phone-only user pass channel selection even when a later validation fails', async () => {

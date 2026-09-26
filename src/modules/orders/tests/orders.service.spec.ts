@@ -160,6 +160,12 @@ const mockNotificationQueue = { enqueue: jest.fn() };
  */
 describe('OrdersService', () => {
   let service: OrdersService;
+  let subscriptionsMock: {
+    waiveFeeIfEligible: jest.Mock;
+    estimateWaiverAmount: jest.Mock;
+    isActive: jest.Mock;
+    getMaxShowcaseImages: jest.Mock;
+  };
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
@@ -180,6 +186,7 @@ describe('OrdersService', () => {
             isActive: jest.fn().mockResolvedValue(false),
             getMaxShowcaseImages: jest.fn().mockResolvedValue(8),
             waiveFeeIfEligible: jest.fn().mockImplementation(async (_userId: string, fee: bigint) => fee),
+            estimateWaiverAmount: jest.fn().mockResolvedValue(BigInt(0)),
           },
         },
       ],
@@ -190,12 +197,10 @@ describe('OrdersService', () => {
     // resetAllMocks menghapus mockImplementation inline di atas — pasang ulang
     // default mock Kahade+ (pass-through tanpa waiver agar ekspektasi fee lama
     // tetap valid; test waiver spesifik meng-override per-test).
-    const subscriptionsMock = module.get(SubscriptionsService) as unknown as {
-      waiveFeeIfEligible: jest.Mock;
-      isActive: jest.Mock;
-      getMaxShowcaseImages: jest.Mock;
-    };
+    const subscriptionsMockLocal = module.get(SubscriptionsService) as unknown as typeof subscriptionsMock;
+    subscriptionsMock = subscriptionsMockLocal;
     subscriptionsMock.waiveFeeIfEligible.mockImplementation(async (_userId: string, fee: bigint) => fee);
+    subscriptionsMock.estimateWaiverAmount.mockResolvedValue(BigInt(0));
     subscriptionsMock.isActive.mockResolvedValue(false);
     subscriptionsMock.getMaxShowcaseImages.mockResolvedValue(8);
     mockNotificationQueue.enqueue.mockResolvedValue(undefined);
@@ -792,6 +797,30 @@ describe('OrdersService', () => {
         expect.objectContaining({ isKahadePlus: true }),
         expect.objectContaining({ kahadeFeeRateBps: expect.any(Number) }),
       );
+    });
+
+    it('should apply Kahade+ fee waiver estimate in calculateFee (WF-019)', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ ...mockUser, isKahadePlus: true });
+      mockPrisma.subscription.findFirst.mockResolvedValue({
+        id: 'sub-1',
+        feeSavingsUsed: BigInt(0),
+        feeSavingsLimit: BigInt(500_000_000),
+      });
+      // Kuota mencukupi untuk membebaskan seluruh porsi fee buyer (150.000 sen).
+      subscriptionsMock.estimateWaiverAmount.mockResolvedValue(BigInt(150_000));
+
+      const result = await service.calculateFee(
+        { orderValue: 100_000, feeResponsibility: FeeResponsibility.BUYER },
+        'user-db-1',
+      );
+
+      // feeAmount & buyerPayAmount berkurang sebesar waiver; field baru terisi.
+      expect(result).toHaveProperty('feeWaivedAmount', 1500);
+      expect(result).toHaveProperty('feeAmount', 0);
+      expect(result).toHaveProperty('buyerFeeAmount', 0);
+      expect(result).toHaveProperty('buyerPayAmount', 100_000);
+      expect(result).toHaveProperty('sellerReceiveAmount', 100_000);
+      expect(subscriptionsMock.estimateWaiverAmount).toHaveBeenCalledWith('user-db-1', BigInt(150_000));
     });
 
     it('should throw BadRequestException when voucher usage limit is reached during fee calculation', async () => {

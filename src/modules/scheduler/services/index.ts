@@ -27,3 +27,4 @@ export { CampaignActivationService } from './campaign-activation.service';
 export { ReferralLeaderboardRefreshService } from './referral-leaderboard-refresh.service';
 export { DormantWinbackVoucherService } from './dormant-winback-voucher.service';
 export { ExpireExtensionRequestsService } from './expire-extension-requests.service';
+export { RefundReconciliationService } from './refund-reconciliation.service';

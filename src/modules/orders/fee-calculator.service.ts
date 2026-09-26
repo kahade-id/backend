@@ -1,4 +1,4 @@
-import { Injectable, InternalServerErrorException, Optional } from '@nestjs/common';
+import { Injectable, InternalServerErrorException, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
 import { RedisService } from '../../redis/redis.service';
@@ -48,6 +48,8 @@ interface FeeCalculationResult {
 
 @Injectable()
 export class FeeCalculatorService {
+  private readonly logger = new Logger(FeeCalculatorService.name);
+
   constructor(
     private configService: ConfigService,
     private redis: RedisService,
@@ -176,7 +178,17 @@ export class FeeCalculatorService {
     } else {
       const bps = this.configService.get<number>('app.kahadeFeeRateBps');
       if (bps !== undefined && !isNaN(bps)) return bps;
-      const rate = this.configService.get<number>('app.kahadeFeeRate') ?? 1.5;
+      // WF-018: fallback HARUS sama dengan default kanonis 2.5%
+      // (env.validation.ts, app.config.ts, app.constants.ts). Nilai 1.5%
+      // sebelumnya membuat platform under-charge 40% secara diam-diam bila
+      // registrasi config gagal.
+      const rate = this.configService.get<number>('app.kahadeFeeRate');
+      if (rate === undefined || isNaN(rate)) {
+        this.logger.warn(
+          'FEE_RATE_FALLBACK: app.kahadeFeeRate tidak terdaftar — memakai default kanonis 2.5%. Periksa registrasi config!',
+        );
+        return 250;
+      }
       return Math.round(rate * 100);
     }
   }

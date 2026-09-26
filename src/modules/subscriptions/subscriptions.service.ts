@@ -46,6 +46,18 @@ import {
 
 const SUBSCRIPTION_PLANS_TTL = 300;
 
+/**
+ * WF-023: dilempar di dalam $transaction aktivasi untuk me-rollback total
+ * bila klaim atomik gagal (webhook konkuren sudah memproses). Bukan error
+ * operasional — ditangkap dan diperlakukan sebagai "sudah diproses".
+ */
+class SubscriptionActivationRaceError extends Error {
+  constructor(paymentTxId: string) {
+    super(`Subscription activation race lost for payment ${paymentTxId}`);
+    this.name = 'SubscriptionActivationRaceError';
+  }
+}
+
 const RANK_ORDER: MembershipRank[] = [MembershipRank.BRONZE, MembershipRank.SILVER, MembershipRank.GOLD, MembershipRank.PLATINUM, MembershipRank.DIAMOND];
 
 const PLAN_METADATA: Record<SubscriptionPlan, { durationDays: number; label: string }> = {
@@ -452,6 +464,29 @@ export class SubscriptionsService {
       select: { feeWaivedAmount: true },
     });
     return usage?.feeWaivedAmount ?? BigInt(0);
+  }
+
+  /**
+   * WF-019: estimasi READ-ONLY berapa fee yang akan dibebaskan untuk order
+   * berikutnya — TANPA menulis/menghabiskan kuota (tidak seperti
+   * waiveFeeIfEligible yang mencatat usage di dalam transaksi order).
+   *
+   * Dipakai endpoint estimasi calculate-fee agar preview = yang dibayar.
+   * Mengembalikan 0n bila tidak eligible (tidak ada subscription aktif /
+   * kuota habis). Waiver parsial bila sisa kuota < fee (cerminan
+   * waiveFeeIfEligible).
+   */
+  async estimateWaiverAmount(userId: string, feeAmountSen: bigint): Promise<bigint> {
+    if (feeAmountSen <= BigInt(0)) return BigInt(0);
+    const subscription = await this.getSubscription(userId);
+    if (!subscription) return BigInt(0);
+    const quotaSen = BigInt(
+      this.configService.get<number>('app.plusFeeWaiverQuotaSen') ?? PLUS_FEE_WAIVER_QUOTA_SEN,
+    );
+    const waivedSoFar = await this.getFeeWaivedThisPeriod(userId);
+    const remaining = quotaSen - waivedSoFar;
+    if (remaining <= BigInt(0)) return BigInt(0);
+    return feeAmountSen < remaining ? feeAmountSen : remaining;
   }
 
   /**
@@ -898,7 +933,12 @@ export class SubscriptionsService {
 
   /**
    * Dipanggil webhook Flash saat pembayaran QRIS sukses — aktivasi subscription.
-   * Idempotent: hanya memproses sekali.
+   * Idempotent: hanya memproses sekali (klaim atomik di dalam transaksi).
+   *
+   * WF-007: nominal terbayar dari API Flash dibandingkan dengan nominal yang
+   * ditagih (fail-closed saat mismatch). WF-023: guard status dipindah ke
+   * dalam transaksi via updateMany ber-guard WHERE agar dua webhook konkuren
+   * tidak menduplikasi aktivasi/audit-log.
    */
   async activateQrisSubscription(flashTransactionId: string, externalId: string): Promise<void> {
     const paymentTx = await this.prisma.paymentTransaction.findFirst({
@@ -916,12 +956,33 @@ export class SubscriptionsService {
     if (paymentTx.status === PaymentStatus.SUCCESS) return; // sudah diproses
 
     // Verifikasi ke Flash sebelum aktivasi (docs tidak punya signature webhook).
-    const flashStatus = await this.flashQrisService.getPaymentStatus(
+    // WF-007: pakai detail (status + amount), bukan status saja.
+    const flashDetail = await this.flashQrisService.getPaymentDetail(
       paymentTx.flashTransactionId ?? flashTransactionId,
     );
-    if (flashStatus !== 'SUCCESS') {
-      this.logger.warn(`Webhook QRIS Flash: status Flash bukan SUCCESS (${flashStatus}) untuk ${paymentTx.id}`);
+    if (flashDetail.status !== 'SUCCESS') {
+      this.logger.warn(`Webhook QRIS Flash: status Flash bukan SUCCESS (${flashDetail.status}) untuk ${paymentTx.id}`);
       return;
+    }
+
+    // WF-007: nominal yang dibayar harus sama dengan yang ditagih.
+    // Bandingkan dalam rupiah bulat (fail-closed bila mismatch).
+    const expectedIdr = Math.round(toIdr(paymentTx.grossAmount));
+    if (flashDetail.amountIdr !== null && Math.round(flashDetail.amountIdr) !== expectedIdr) {
+      this.logger.error(
+        `FLASH_AMOUNT_MISMATCH: subscription ${paymentTx.id} dibayar ${flashDetail.amountIdr} IDR, ` +
+        `diharapkan ${expectedIdr} IDR — aktivasi DITOLAK`,
+      );
+      return;
+    }
+    if (flashDetail.amountIdr === null) {
+      // Shape amount respons Flash tak terdokumentasi penuh: jangan matikan
+      // alur, tapi catat agar termonitor. Jangkar kepercayaan utama tetap
+      // status SUCCESS yang diverifikasi via API Flash.
+      this.logger.warn(
+        `Webhook QRIS Flash: amount tidak tersedia di respons Flash untuk ${paymentTx.id} — ` +
+        `aktivasi dilanjut berdasarkan status SUCCESS terverifikasi`,
+      );
     }
 
     const subscription = paymentTx.subscriptions[0];
@@ -931,28 +992,45 @@ export class SubscriptionsService {
     }
 
     const now = new Date();
-    await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      await tx.paymentTransaction.update({
-        where: { id: paymentTx.id },
-        data: { status: PaymentStatus.SUCCESS, paidAt: now, webhookReceivedAt: now },
+    // WF-023: klaim atomik — guard status di WHERE dalam satu transaksi.
+    // Pemenang klaim memproses penuh; yang kalah rollback total (tanpa
+    // side-effect: tanpa audit log ganda, tanpa notifikasi ganda).
+    try {
+      await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        const claimedPayment = await tx.paymentTransaction.updateMany({
+          where: { id: paymentTx.id, status: PaymentStatus.PENDING },
+          data: { status: PaymentStatus.SUCCESS, paidAt: now, webhookReceivedAt: now },
+        });
+        const claimedSub = await tx.subscription.updateMany({
+          where: { id: subscription.id, status: SubscriptionStatus.PENDING },
+          data: {
+            status: SubscriptionStatus.ACTIVE,
+            lastPaymentAt: now,
+            nextPaymentAt: subscription.currentPeriodEnd,
+          },
+        });
+        if (claimedPayment.count !== 1 || claimedSub.count !== 1) {
+          // Diklaim pihak lain (webhook konkuren / polling) — rollback.
+          throw new SubscriptionActivationRaceError(paymentTx.id);
+        }
+        await tx.user.update({
+          where: { id: subscription.userId },
+          data: {
+            isKahadePlus: true,
+            subscriptionExpiresAt: subscription.currentPeriodEnd,
+            ...(await this.buildKahadePlusSinceData(tx, subscription.userId, now)),
+          },
+        });
       });
-      await tx.subscription.update({
-        where: { id: subscription.id },
-        data: {
-          status: SubscriptionStatus.ACTIVE,
-          lastPaymentAt: now,
-          nextPaymentAt: subscription.currentPeriodEnd,
-        },
-      });
-      await tx.user.update({
-        where: { id: subscription.userId },
-        data: {
-          isKahadePlus: true,
-          subscriptionExpiresAt: subscription.currentPeriodEnd,
-          ...(await this.buildKahadePlusSinceData(tx, subscription.userId, now)),
-        },
-      });
-    });
+    } catch (err) {
+      if (err instanceof SubscriptionActivationRaceError) {
+        this.logger.warn(
+          `Webhook QRIS Flash: aktivasi ${paymentTx.id} tidak diklaim (sudah diproses konkuren)`,
+        );
+        return;
+      }
+      throw err;
+    }
 
     await this.redis.del(`subscription_status:${subscription.userId}`).catch(() => undefined);
     await this.verificationBadgeService.invalidate(subscription.userId);

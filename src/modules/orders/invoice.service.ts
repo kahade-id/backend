@@ -94,7 +94,8 @@ export class InvoiceService {
       doc.text(`Item: ${data.items.title}`);
       doc.text(`Value: Rp ${data.items.orderValue}`);
       doc.moveDown();
-      doc.text(`Fee: Rp ${data.fees.feeAmount} (${Number(data.fees.feeRate) * 100}%)`);
+      // WF-005: feeRate SUDAH dalam persen (150 bps → 1.5); jangan dikali 100 lagi.
+      doc.text(`Fee: Rp ${data.fees.feeAmount} (${Number(data.fees.feeRate).toFixed(1)}%)`);
       doc.text(`Buyer Pay: Rp ${data.totals.buyerPayAmount}`);
       doc.text(`Seller Receive: Rp ${data.totals.sellerReceiveAmount}`);
       doc.moveDown();

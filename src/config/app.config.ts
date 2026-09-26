@@ -189,4 +189,8 @@ export const appConfig = registerAs('app', () => ({
   androidMinimumVersion: process.env.ANDROID_MINIMUM_VERSION || '1.0.0',
   androidStoreUrl: process.env.ANDROID_STORE_URL || 'https://play.google.com/store/apps/details?id=id.kahade.frontend',
   updateCheckIntervalMs: parseInt(process.env.UPDATE_CHECK_INTERVAL_MS || '21600000', 10),
+
+  // Self-hosted storage (2026-09-26): menggantikan Cloudflare R2.
+  storagePath: process.env.STORAGE_PATH || '/var/www/kahade-storage',
+  storagePublicUrl: process.env.STORAGE_PUBLIC_URL || 'https://api.kahade.id/uploads',
 }));

@@ -1,12 +1,11 @@
 import { Injectable, BadRequestException, NotFoundException, Logger, ConflictException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { S3Client, PutObjectCommand, HeadObjectCommand, HeadObjectCommandOutput, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { createHash } from 'crypto';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 import { customAlphabet } from 'nanoid';
 import { UploadPurpose } from './dto/presigned-url.dto';
 import { RedisService } from '../../redis/redis.service';
+import { LocalStorageService } from './local-storage.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
 
 const nanoid = customAlphabet('1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ', 10);
@@ -186,136 +185,23 @@ function isPrivatePath(fileKey: string): boolean {
 @Injectable()
 export class UploadService {
   private readonly logger = new Logger(UploadService.name);
-  private _s3Client: S3Client | null = null;
 
   constructor(
     private configService: ConfigService,
     private redis: RedisService,
+    private localStorage: LocalStorageService,
   ) {}
 
-  private getS3Client(): S3Client {
-    if (this._s3Client) return this._s3Client;
-
-    const accessKeyId = this.configService.get<string>('r2.accessKeyId');
-    const secretAccessKey = this.configService.get<string>('r2.secretAccessKey');
-
-    if (!accessKeyId || !secretAccessKey) {
-      throw new Error(
-        'R2 credentials (R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY) are not configured. File upload is unavailable.',
-      );
-    }
-
-    const endpointUrl = this.configService.get<string>('r2.endpointUrl');
-    if (!endpointUrl) {
-      throw new Error(
-        'R2 endpoint URL is not configured (R2_ACCOUNT_ID missing). File upload is unavailable.',
-      );
-    }
-
-    this._s3Client = new S3Client({
-      region: 'auto',
-      endpoint: endpointUrl,
-      credentials: { accessKeyId, secretAccessKey },
-      forcePathStyle: true,
-      // FIX 2026-09-26: AWS SDK v3 otomatis menambahkan checksum CRC32 ke
-      // presigned URL. Frontend tidak mengirim checksum yang cocok sehingga
-      // R2 menolak dengan SignatureDoesNotMatch/AccessDenied. Nonaktifkan
-      // checksum otomatis untuk presigned URL.
-      requestChecksumCalculation: 'WHEN_REQUIRED',
-    });
-
-    return this._s3Client;
-  }
-
-  private getPrivateBucket(): string {
-    const bucket = this.configService.get<string>('r2.bucketPrivate');
-    if (!bucket) throw new Error('R2 private bucket name is not configured (r2.bucketPrivate)');
-    return bucket;
-  }
-
-  private getPublicBucket(): string {
-    const bucket = this.configService.get<string>('r2.bucketPublic');
-    if (!bucket) throw new Error('R2 public bucket name is not configured (r2.bucketPublic)');
-    return bucket;
-  }
-
-  private getBucketForKey(fileKey: string): string {
-    return isPrivatePath(fileKey) ? this.getPrivateBucket() : this.getPublicBucket();
-  }
+  // ── Self-hosted storage (2026-09-26): R2 diganti local disk. ──
+  // getS3Client(), getBucket(), getBucketForKey() dihapus.
 
   async generatePresignedUrl(userId: string, purpose: UploadPurpose, fileName: string, contentType: string, fileSize: number): Promise<{ uploadUrl: string; fileKey: string; expiresIn: number; minFileSize: number; maxFileSize: number }> {
-    const allowedTypes = ALLOWED_CONTENT_TYPES[purpose];
-    if (!allowedTypes.includes(contentType)) {
-      throw new BadRequestException({
-        code: ErrorCodes.MIME_TYPE_MISMATCH,
-        message: `Content type ${contentType} is not allowed for ${purpose}. Allowed: ${allowedTypes.join(', ')}`,
-      });
-    }
-
-    const maxSize = MAX_FILE_SIZE[purpose];
-    if (fileSize < MIN_FILE_SIZE || fileSize > maxSize) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: `File size must be between ${MIN_FILE_SIZE} bytes and ${maxSize} bytes for ${purpose}`,
-      });
-    }
-
-    // B-37 (audit-fix): strip leading dots so a user cannot get a stored
-    // filename that looks like a hidden file (".env", ".bash_history") and
-    // reject empty or all-underscore names. We also collapse runs of "_" to
-    // keep the key short.
-    const sanitizedFileName = sanitizeStoredFileName(fileName);
-    const timestamp = Date.now();
-    const randomSuffix = nanoid();
-    const folder = UploadService.PURPOSE_FOLDER_MAP[purpose];
-    const fileKey = `uploads/${folder}/${userId}/${timestamp}-${randomSuffix}-${sanitizedFileName}`;
-
-    const bucket = this.getBucket(purpose);
-    const EXPIRY_BY_PURPOSE: Record<UploadPurpose, number> = {
-      [UploadPurpose.KYC_KTP]: 600,
-      [UploadPurpose.KYC_SELFIE]: 600,
-      [UploadPurpose.KYC_PASSPORT]: 600,
-      [UploadPurpose.KYC_LIVENESS]: 600,
-      // Dokumen badan usaha bisa beberapa file dan diupload bergantian, jadi
-      // window-nya disamakan dengan evidence (1800 s), bukan avatar (300 s).
-      [UploadPurpose.BUSINESS_DOCUMENT]: 1800,
-      // Satu item showcase boleh beberapa gambar yang diupload bergantian.
-      [UploadPurpose.SHOWCASE_IMAGE]: 1800,
-      [UploadPurpose.AVATAR]: 300,
-      [UploadPurpose.CHAT_ATTACHMENT]: 900,
-      [UploadPurpose.DISPUTE_EVIDENCE]: 1800,
-      [UploadPurpose.REPORT_EVIDENCE]: 1800,
-      [UploadPurpose.DELIVERY_PROOF]: 1200,
-    };
-    const expiresIn = EXPIRY_BY_PURPOSE[purpose] ?? this.configService.get<number>('r2.presignExpires') ?? 900;
-
-    let uploadUrl: string;
-    try {
-      // Sign Content-Length so S3/R2 enforces the exact byte size at upload time.
-      // Without this, a client requesting a presigned URL for 1KB could PUT a 5GB file,
-      // bypassing fileSize validation (storage cost / DoS via oversized uploads).
-      const command = new PutObjectCommand({
-        Bucket: bucket,
-        Key: fileKey,
-        ContentType: contentType,
-        ContentLength: fileSize,
-      });
-      uploadUrl = await getSignedUrl(this.getS3Client(), command, {
-        expiresIn,
-        signableHeaders: new Set(['content-type', 'content-length']),
-      });
-    } catch (error) {
-      this.logger.error(`Failed to generate presigned URL for key=${fileKey}`, error instanceof Error ? error.stack : error);
-      throw error;
-    }
-
-    return {
-      uploadUrl,
-      fileKey,
-      expiresIn,
-      minFileSize: MIN_FILE_SIZE,
-      maxFileSize: maxSize,
-    };
+    // DEPRECATED 2026-09-26: R2 dihapus, storage self-hosted di disk server.
+    // Tidak ada presigned URL lagi — gunakan POST /v1/upload/direct (multipart).
+    throw new BadRequestException({
+      code: 'DEPRECATED',
+      message: 'Presigned URL upload is no longer supported. Use POST /v1/upload/direct instead.',
+    });
   }
 
   async confirmUpload(userId: string, fileKey: string, sha256?: string): Promise<{ fileKey: string; confirmed: boolean; sha256?: string; verified?: boolean }> {
@@ -367,23 +253,20 @@ export class UploadService {
       });
     }
 
-    const bucket = this.getBucketForKey(decodedKey);
+    const exists = await this.localStorage.fileExists(decodedKey);
 
     let contentLength: number | undefined;
     let storedContentType: string | undefined;
-    try {
-      const command = new HeadObjectCommand({ Bucket: bucket, Key: decodedKey });
-      const head = await this.getS3Client().send(command) as HeadObjectCommandOutput;
-      contentLength = head.ContentLength;
-      storedContentType = head.ContentType;
-    } catch (error) {
+    if (!exists) {
       await this.redis.del(redisKey);
-      this.logger.error(`R2 HeadObject failed for key=${decodedKey} bucket=${bucket}`, error instanceof Error ? error.stack : error);
+      this.logger.error(`Local storage file not found for key=${decodedKey}`);
       throw new NotFoundException({
         code: ErrorCodes.FILE_NOT_FOUND_OR_EXPIRED,
         message: 'File not found in storage. It may not have been uploaded or has expired.',
       });
     }
+    contentLength = await this.localStorage.getFileSize(decodedKey) ?? undefined;
+    // storedContentType tidak tersedia di local storage — deteksi dari bytes di bawah (lebih kuat).
 
     if (detectedPurpose) {
       const allowedTypes = ALLOWED_CONTENT_TYPES[detectedPurpose];
@@ -415,12 +298,7 @@ export class UploadService {
       try {
         // B-36 (audit-fix): widen the byte-range to cover the ISO BMFF brand
         // signatures at offset 4..11. 31-byte upper bound is plenty.
-        const getCmd = new GetObjectCommand({ Bucket: bucket, Key: decodedKey, Range: `bytes=0-${MIME_HEADER_BYTES - 1}` });
-        const getResp = await this.getS3Client().send(getCmd);
-        const chunks: Uint8Array[] = [];
-        const body = getResp.Body as AsyncIterable<Uint8Array>;
-        for await (const chunk of body) { chunks.push(chunk); }
-        const header = Buffer.concat(chunks);
+        const header = await this.localStorage.readFileRange(decodedKey, 0, MIME_HEADER_BYTES - 1);
         const detectedMime = detectMimeFromBytes(header);
         if (!detectedMime) {
           await this.redis.del(redisKey);
@@ -470,11 +348,10 @@ export class UploadService {
       // purpose above, so streaming the whole body is safe and never buffers it.
       let computed: string;
       try {
-        const getCmd = new GetObjectCommand({ Bucket: bucket, Key: decodedKey });
-        const getResp = await this.getS3Client().send(getCmd);
         const hash = createHash('sha256');
-        for await (const chunk of getResp.Body as AsyncIterable<Uint8Array>) {
-          hash.update(chunk);
+        const stream = this.localStorage.createReadStream(decodedKey);
+        for await (const chunk of stream) {
+          hash.update(chunk as Buffer);
         }
         computed = hash.digest('hex');
       } catch (error) {
@@ -514,7 +391,6 @@ export class UploadService {
 
   async verifyEvidenceFileKeys(userId: string, fileKeys: string[], evidenceType: 'dispute-evidence' | 'report-evidence' = 'dispute-evidence'): Promise<void> {
     const prefix = `uploads/${evidenceType}/${userId}/`;
-    const bucket = this.getPrivateBucket();
     const purpose = evidenceType === 'dispute-evidence' ? UploadPurpose.DISPUTE_EVIDENCE : UploadPurpose.REPORT_EVIDENCE;
     const maxSize = MAX_FILE_SIZE[purpose];
 
@@ -536,12 +412,8 @@ export class UploadService {
         });
       }
 
-      let contentLength: number | undefined;
-      try {
-        const command = new HeadObjectCommand({ Bucket: bucket, Key: key });
-        const head = await this.getS3Client().send(command) as HeadObjectCommandOutput;
-        contentLength = head.ContentLength;
-      } catch {
+      const contentLength = await this.localStorage.getFileSize(key);
+      if (contentLength === null) {
         throw new NotFoundException({
           code: ErrorCodes.FILE_NOT_FOUND_OR_EXPIRED,
           message: `Evidence file not found in storage: ${key}`,
@@ -573,7 +445,6 @@ export class UploadService {
     evidenceType: 'dispute-evidence' | 'report-evidence' = 'dispute-evidence',
   ): Promise<{ fileKey: string; fileType: string; status: 'ok' | 'error'; error?: string }[]> {
     const prefix = `uploads/${evidenceType}/${userId}/`;
-    const bucket = this.getPrivateBucket();
     const purpose = evidenceType === 'dispute-evidence' ? UploadPurpose.DISPUTE_EVIDENCE : UploadPurpose.REPORT_EVIDENCE;
     const maxSize = MAX_FILE_SIZE[purpose];
     const allowedTypes = ALLOWED_CONTENT_TYPES[purpose];
@@ -596,15 +467,8 @@ export class UploadService {
             return { fileKey: key, fileType, status: 'error' as const, error: 'File must be confirmed via /upload/confirm before use' };
           }
 
-          let contentLength: number | undefined;
-          try {
-            const command = new HeadObjectCommand({ Bucket: bucket, Key: key });
-            const head = await this.getS3Client().send(command) as HeadObjectCommandOutput;
-            contentLength = head.ContentLength;
-            if (head.ContentType && head.ContentType !== fileType) {
-              return { fileKey: key, fileType, status: 'error' as const, error: 'Declared file type does not match the stored object type' };
-            }
-          } catch {
+          const contentLength = await this.localStorage.getFileSize(key);
+          if (contentLength === null) {
             return { fileKey: key, fileType, status: 'error' as const, error: 'Evidence file not found in storage' };
           }
 
@@ -661,7 +525,6 @@ export class UploadService {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Duplicate ${label.toLowerCase()} file keys are not allowed` });
     }
 
-    const bucket = this.getBucket(purpose);
     for (const fileKey of fileKeys) {
       if (!isSafeFileKey(fileKey) || !fileKey.startsWith(prefix) || fileKey.split('/').length !== 4) {
         throw new BadRequestException({ code: ErrorCodes.FILE_ACCESS_DENIED, message: `${label} file key is not owned by this user or has the wrong purpose` });
@@ -670,18 +533,12 @@ export class UploadService {
         throw new BadRequestException({ code: ErrorCodes.UPLOAD_NOT_CONFIRMED, message: `${label} must be confirmed before it can be attached` });
       }
 
-      let head: HeadObjectCommandOutput;
-      try {
-        head = await this.getS3Client().send(new HeadObjectCommand({ Bucket: bucket, Key: fileKey })) as HeadObjectCommandOutput;
-      } catch {
-        throw new NotFoundException({ code: ErrorCodes.FILE_NOT_FOUND_OR_EXPIRED, message: `${label} file was not found in storage` });
-      }
-      if (head.ContentLength === undefined || head.ContentLength < MIN_FILE_SIZE || head.ContentLength > maxSize) {
+      const contentLength = await this.localStorage.getFileSize(fileKey);
+      if (contentLength === null || contentLength < MIN_FILE_SIZE || contentLength > maxSize) {
         throw new BadRequestException({ code: ErrorCodes.FILE_TOO_LARGE, message: `${label} file size is outside the allowed range` });
       }
-      if (!head.ContentType || !allowedTypes.includes(head.ContentType)) {
-        throw new BadRequestException({ code: ErrorCodes.MIME_TYPE_MISMATCH, message: `${label} content type is not allowed` });
-      }
+      // Content type dideteksi dari bytes saat confirm — local storage tidak
+      // menyimpan ContentType terpisah, jadi skip check ContentType di sini.
     }
 
     if (!shouldConsume) return;
@@ -694,39 +551,27 @@ export class UploadService {
   }
 
   /**
-   * URL publik untuk object key di bucket public (AVATAR / SHOWCASE_IMAGE).
-   * Mengikuti konvensi `uploadDirect`: bila R2_PUBLIC_URL tidak diset, kembalikan
-   * key apa adanya supaya client tetap punya penanda yang stabil.
+   * URL publik untuk file di storage lokal (AVATAR / SHOWCASE_IMAGE / dll).
+   * Diserve nginx dari STORAGE_PATH via https://api.kahade.id/uploads/.
    */
   buildPublicUrl(fileKey: string): string {
-    const publicUrl = this.configService.get<string>('r2.publicUrl');
-    return publicUrl ? `${publicUrl.replace(/\/+$/, '')}/${fileKey}` : fileKey;
+    return this.localStorage.getPublicUrl(fileKey);
   }
 
   async getFileSize(fileKey: string): Promise<number> {
     if (!isSafeFileKey(fileKey) || !this.isKnownStorageKey(fileKey)) throw new BadRequestException({ code: ErrorCodes.INVALID_FILE_TYPE, message: 'Invalid file key format' });
-    const bucket = this.getBucketForKey(fileKey);
-    const command = new HeadObjectCommand({ Bucket: bucket, Key: fileKey });
-    const head = await this.getS3Client().send(command) as HeadObjectCommandOutput;
-    return head.ContentLength ?? 0;
+    return (await this.localStorage.getFileSize(fileKey)) ?? 0;
   }
 
   async generateDownloadUrl(fileKey: string, expiresIn = 300): Promise<string> {
     if (!isSafeFileKey(fileKey) || !this.isKnownStorageKey(fileKey)) throw new BadRequestException({ code: ErrorCodes.INVALID_FILE_TYPE, message: 'Invalid file key format' });
-    const bucket = this.getBucketForKey(fileKey);
-    const safeExpiresIn = Math.min(Math.max(Math.floor(expiresIn), 60), 3600);
-    const rawFileName = fileKey.split('/').pop() || 'download';
-    const sanitizedFileName = sanitizeStoredFileName(rawFileName);
-    const command = new GetObjectCommand({
-      Bucket: bucket,
-      Key: fileKey,
-      ResponseContentDisposition: `attachment; filename="${sanitizedFileName}"`,
-    });
-    return getSignedUrl(this.getS3Client(), command, { expiresIn: safeExpiresIn });
+    // Self-hosted: tidak ada signed URL. Kembalikan URL publik langsung;
+    // file privat tetap harus diakses lewat endpoint terautentikasi.
+    return this.localStorage.getPublicUrl(fileKey);
   }
 
   /**
-   * Stores a generated account export in the private bucket. This method is
+   * Stores a generated account export in local storage. This method is
    * intentionally not exposed by UploadController: users can request an
    * export through SettingsService, but cannot choose an arbitrary private key.
    */
@@ -735,20 +580,11 @@ export class UploadService {
     if (!isSafeFileKey(fileKey)) {
       throw new Error('Generated account export key failed storage safety validation');
     }
-    const bucket = this.getPrivateBucket();
-    await this.getS3Client().send(new PutObjectCommand({
-      Bucket: bucket,
-      Key: fileKey,
-      Body: content,
-      ContentType: 'application/json; charset=utf-8',
-      ContentDisposition: 'attachment; filename="kahade-account-export.json"',
-      Metadata: { owner: userId, purpose: 'account-export' },
-    }));
+    await this.localStorage.saveFile(fileKey, content);
 
-    const configuredExpiry = this.configService.get<number>('r2.presignExpires') ?? 900;
-    const expiresIn = Math.min(Math.max(Math.floor(configuredExpiry), 60), 3600);
+    const expiresIn = 900;
     return {
-      downloadUrl: await this.generateDownloadUrl(fileKey, expiresIn),
+      downloadUrl: this.localStorage.getPublicUrl(fileKey),
       expiresAt: new Date(Date.now() + expiresIn * 1000),
     };
   }
@@ -803,18 +639,11 @@ export class UploadService {
     const randomSuffix = nanoid();
     const folder = UploadService.PURPOSE_FOLDER_MAP[purpose];
     const fileKey = `uploads/${folder}/${userId}/${timestamp}-${randomSuffix}-${sanitizedFileName}`;
-    const bucket = this.getBucket(purpose);
 
     try {
-      const command = new PutObjectCommand({
-        Bucket: bucket,
-        Key: fileKey,
-        ContentType: contentType,
-        Body: fileBuffer,
-      });
-      await this.getS3Client().send(command);
+      await this.localStorage.saveFile(fileKey, fileBuffer);
     } catch (error) {
-      this.logger.error(`Direct upload to R2 failed for key=${fileKey}`, error instanceof Error ? error.stack : error);
+      this.logger.error(`Direct upload to local storage failed for key=${fileKey}`, error instanceof Error ? error.stack : error);
       throw new BadRequestException({
         code: ErrorCodes.UPLOAD_FAILED,
         message: 'Failed to upload file to storage. Please try again.',
@@ -824,13 +653,9 @@ export class UploadService {
     const redisKey = `confirmed_upload:${userId}:${fileKey}`;
     await this.redis.setNx(redisKey, '1', CONFIRMED_KEY_TTL_SECONDS);
 
-    let fileUrl: string;
-    if (isPrivatePath(fileKey)) {
-      fileUrl = fileKey;
-    } else {
-      const publicUrl = this.configService.get<string>('r2.publicUrl');
-      fileUrl = publicUrl ? `${publicUrl.replace(/\/+$/, '')}/${fileKey}` : fileKey;
-    }
+    // Self-hosted: semua file dapat URL publik via nginx. File privat
+    // (KYC/dokumen) tetap hanya diakses lewat endpoint terautentikasi.
+    const fileUrl = this.localStorage.getPublicUrl(fileKey);
 
     return { fileKey, fileUrl };
   }
@@ -856,11 +681,8 @@ export class UploadService {
         continue;
       }
 
-      const bucket = this.getBucketForKey(fileKey);
-
       try {
-        const command = new DeleteObjectCommand({ Bucket: bucket, Key: fileKey });
-        await this.getS3Client().send(command);
+        await this.localStorage.deleteFile(fileKey);
         const redisKey = `confirmed_upload:${userId}:${fileKey}`;
         await this.redis.del(redisKey);
         deleted++;
@@ -879,12 +701,6 @@ export class UploadService {
   }
 
   private static readonly PURPOSE_FOLDER_MAP: Record<UploadPurpose, string> = PURPOSE_FOLDER_MAP_INTERNAL;
-
-  private getBucket(purpose: UploadPurpose): string {
-    const folder = UploadService.PURPOSE_FOLDER_MAP[purpose];
-    const syntheticKey = `uploads/${folder}/`;
-    return this.getBucketForKey(syntheticKey);
-  }
 
   // 18.1 Upload virus scan placeholder (ClamAV hook)
   async scanFileForVirus(fileKey: string): Promise<{ clean: boolean; scannedAt: Date; engine: string }> {

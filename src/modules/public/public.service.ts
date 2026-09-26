@@ -202,8 +202,8 @@ export class PublicService {
       }
     }
 
-    const monthlyPrice = finiteNumber(this.configService.get<number>('app.subscriptionMonthlyPrice'), 29000, 0);
-    const annualPrice = finiteNumber(this.configService.get<number>('app.subscriptionAnnualPrice'), 299000, 0);
+    const monthlyPrice = finiteNumber(this.configService.get<number>('app.subscriptionMonthlyPrice'), 99000, 0);
+    const yearlyPrice = finiteNumber(this.configService.get<number>('app.subscriptionYearlyPrice'), 899000, 0);
     const kahadePlusFeeRate = finiteNumber(this.configService.get<number>('app.kahadePlusFeeRate'), 0.5, 0);
     const feeSavingsLimit = finiteNumber(this.configService.get<number>('app.feeSavingsLimit'), 5000000, 0);
     const feeSavingsLimitFormatted = new Intl.NumberFormat('id-ID').format(feeSavingsLimit);
@@ -226,9 +226,9 @@ export class PublicService {
           ],
         },
         {
-          plan: 'ANNUAL',
-          name: 'Kahade Plus Annual',
-          price: annualPrice,
+          plan: 'YEARLY',
+          name: 'Kahade Plus Yearly',
+          price: yearlyPrice,
           currency: 'IDR',
           period: '12 months',
           feeRate: kahadePlusFeeRate,
@@ -238,7 +238,7 @@ export class PublicService {
             `Fee savings up to Rp ${feeSavingsLimitFormatted} per period`,
             'Priority support',
             'Kahade Plus badge',
-            `Save ${monthlyPrice > 0 ? Math.round(((monthlyPrice * 12 - annualPrice) / (monthlyPrice * 12)) * 100) : 0}% vs monthly`,
+            `Save ${monthlyPrice > 0 ? Math.round(((monthlyPrice * 12 - yearlyPrice) / (monthlyPrice * 12)) * 100) : 0}% vs monthly`,
           ],
         },
       ],

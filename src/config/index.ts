@@ -4,6 +4,7 @@ export * from './jwt.config';
 export * from './crypto.config';
 export * from './redis.config';
 export * from './midtrans.config';
+export * from './flash.config';
 export * from './r2.config';
 export * from './smtp.config';
 export * from './fcm.config';

@@ -7,6 +7,7 @@ import { AuditLogModule } from '../../common/services/audit-log.module';
 import { VerificationBadgeModule } from '../users/verification-badge.module';
 import { ShowcaseController } from './showcase.controller';
 import { ShowcaseService } from './showcase.service';
+import { SubscriptionsModule } from '../subscriptions/subscriptions.module';
 
 /**
  * Section 3 — Showcase sebagai konten sosial + feed discover.
@@ -18,7 +19,7 @@ import { ShowcaseService } from './showcase.service';
  * tanpa memindahkan route lama.
  */
 @Module({
-  imports: [ConfigModule, PrismaModule, RedisModule, UploadModule, AuditLogModule, VerificationBadgeModule],
+  imports: [ConfigModule, PrismaModule, RedisModule, UploadModule, AuditLogModule, VerificationBadgeModule, SubscriptionsModule],
   controllers: [ShowcaseController],
   providers: [ShowcaseService],
   exports: [ShowcaseService],

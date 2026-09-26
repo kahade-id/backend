@@ -8,7 +8,7 @@ import { BullModule } from '@nestjs/bull';
 import { Logger as NestLogger } from '@nestjs/common';
 
 // Config
-import { appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, r2Config, smtpConfig, fcmConfig, chatConfig } from './config';
+import { appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, flashConfig, r2Config, smtpConfig, fcmConfig, chatConfig } from './config';
 import { validateEnv } from './config/env.validation';
 import { initializeCrypto } from './common/utils/crypto.util';
 import { getRuntimeEnvFile } from './config/runtime-env-file';
@@ -35,11 +35,13 @@ import { NotificationsModule } from './modules/notifications/notifications.modul
 import { ReferralModule } from './modules/referral/referral.module';
 import { VouchersModule } from './modules/vouchers/vouchers.module';
 import { SubscriptionsModule } from './modules/subscriptions/subscriptions.module';
+import { InsuranceModule } from './modules/insurance/insurance.module';
 import { SettingsModule } from './modules/settings/settings.module';
 import { UploadModule } from './modules/upload/upload.module';
 import { PublicModule } from './modules/public/public.module';
 import { BadgesModule } from './modules/badges/badges.module';
 import { PaymentModule } from './modules/payment/payment.module';
+import { WebhooksModule } from './modules/webhooks/webhooks.module';
 import { QueueModule } from './modules/queue/queue.module';
 import { SchedulerModule } from './modules/scheduler/scheduler.module';
 import { PushModule } from './modules/push/push.module';
@@ -73,7 +75,7 @@ const runtimeEnvFile = getRuntimeEnvFile();
     ConfigModule.forRoot({
       isGlobal: true,
       ...(runtimeEnvFile ? { envFilePath: runtimeEnvFile } : {}),
-      load: [appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, r2Config, smtpConfig, fcmConfig, chatConfig],
+      load: [appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, flashConfig, r2Config, smtpConfig, fcmConfig, chatConfig],
       validate: validateEnv,
     }),
 
@@ -147,11 +149,13 @@ const runtimeEnvFile = getRuntimeEnvFile();
     ReferralModule,
     VouchersModule,
     SubscriptionsModule,
+    InsuranceModule,
     SettingsModule,
     UploadModule,
     PublicModule,
     BadgesModule,
     PaymentModule,
+    WebhooksModule,
     QueueModule,
     SchedulerModule,
     PushModule,

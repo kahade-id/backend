@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Query, Req, UseGuards, DefaultValuePipe, ParseIntPipe } from '@nestjs/common';
+import { Controller, Get, Post, Body, Query, Param, Req, UseGuards, DefaultValuePipe, ParseIntPipe } from '@nestjs/common';
 import { ClampLimitPipe } from '../../common/pipes/clamp-limit.pipe';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
@@ -19,14 +19,20 @@ import { SubscribeDto, RenewDto, PauseSubscriptionDto } from './dto/subscribe.dt
 export class SubscriptionsController {
   constructor(private subscriptionsService: SubscriptionsService) {}
 
+  @Get('me')
+  @ApiOperation({ summary: 'Ringkasan status Kahade+ milik user (spek Kahade+)' })
+  async getMe(@CurrentUser('sub') userId: string): Promise<Record<string, unknown>> {
+    return this.subscriptionsService.getMe(userId);
+  }
+
   @Get('status')
   async getStatus(@CurrentUser('sub') userId: string): Promise<Record<string, unknown>> {
     return this.subscriptionsService.getStatus(userId);
   }
 
   @Post('subscribe')
-  @ApiOperation({ summary: 'Start Kahade Plus subscription, with optional one-lifetime trial or first-period promo code' })
-  @UseGuards(KycRequiredGuard, UserThrottleGuard)
+  @ApiOperation({ summary: 'Start Kahade Plus subscription, with optional promo code (free grant or discount). Tidak butuh KYC.' })
+  @UseGuards(UserThrottleGuard)
   @Idempotency()
   @Throttle({ default: { ttl: 60000, limit: 5 } })
   async subscribe(
@@ -36,8 +42,30 @@ export class SubscriptionsController {
   ): Promise<Subscription> {
     return this.subscriptionsService.subscribe(userId, dto.plan, dto.pin, req.ip, {
       promoCode: dto.promoCode,
-      useTrial: dto.useTrial,
     });
+  }
+
+  @Post('subscribe-qris')
+  @ApiOperation({ summary: 'Start Kahade Plus subscription via QRIS (Flash Mobile). Returns qrString to render. PIN required.' })
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  async subscribeQris(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: SubscribeDto,
+    @Req() req: Request,
+  ): Promise<{ subscriptionId: string; subscription: Subscription; qrString: string; expiredAt: Date; flashTransactionId: string }> {
+    const result = await this.subscriptionsService.subscribeQris(userId, dto.plan, dto.pin ?? '', req.ip, dto.promoCode);
+    return { subscriptionId: result.subscription.id, ...result };
+  }
+
+  @Get('qris-status/:id')
+  @ApiOperation({ summary: 'Poll QRIS subscription payment status (PENDING/ACTIVE)' })
+  async getQrisStatus(
+    @CurrentUser('sub') userId: string,
+    @Param('id') id: string,
+  ): Promise<{ status: string; qrString: string | null; expiredAt: Date | null }> {
+    return this.subscriptionsService.getQrisStatus(userId, id);
   }
 
   @Post('pause')
@@ -65,8 +93,18 @@ export class SubscriptionsController {
   @Idempotency()
   @UseGuards(UserThrottleGuard)
   @Post('cancel')
+  @ApiOperation({ summary: 'Cancel at period end — benefit tetap aktif sampai currentPeriodEnd' })
   async cancel(@CurrentUser('sub') userId: string): Promise<Subscription> {
     return this.subscriptionsService.cancel(userId);
+  }
+
+  @Throttle({ default: { ttl: 60000, limit: 3 } })
+  @Idempotency()
+  @UseGuards(UserThrottleGuard)
+  @Post('reactivate')
+  @ApiOperation({ summary: 'Batalkan pembatalan — lanjutkan langganan sebelum periode berakhir' })
+  async reactivate(@CurrentUser('sub') userId: string): Promise<Subscription> {
+    return this.subscriptionsService.reactivate(userId);
   }
 
   @Get('history')

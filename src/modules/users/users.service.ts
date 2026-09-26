@@ -21,6 +21,7 @@ import { ReportUserDto } from './dto/report-user.dto';
 import { UpdateLinksDto } from './dto/update-links.dto';
 import { OgMetadataService } from './og-metadata.service';
 import { VerificationBadgeService } from './verification-badge.service';
+import { UserAnalyticsService } from './user-analytics.service';
 import { generateNotifId } from '../../common/utils/id-generator.util';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import { verifyOtp } from '../../common/utils/otp.util';
@@ -46,6 +47,10 @@ export class UsersService {
     private auditLog: AuditLogService,
     private ogMetadataService: OgMetadataService,
     private verificationBadgeService: VerificationBadgeService,
+    // TrustScore profil publik — reuse logika UserAnalyticsService (satu sumber,
+    // tanpa duplikasi rumus). Service ini hanya bergantung pada PrismaService,
+    // jadi tidak ada circular dependency.
+    private userAnalyticsService: UserAnalyticsService,
     // Section 6: agregasi laporan -> flag moderasi internal.
     private reportFlagService: ReportFlagService,
   ) {}
@@ -294,6 +299,9 @@ export class UsersService {
         id: true, userId: true, username: true, fullName: true, avatarUrl: true, headerUrl: true,
         accountType: true, bio: true, kycStatus: true, isVip: true, membershipRank: true,
         totalOrdersCompleted: true, averageRating: true, totalRatingCount: true, memberSince: true,
+        // BUG#5: field tambahan khusus untuk menghitung trustScore publik
+        // (reuse UserAnalyticsService.calculateTrustScore — tanpa duplikasi rumus).
+        totalOrdersCancelled: true, totalOrdersDisputed: true, createdAt: true, isKahadePlus: true,
         profileVisible: true, showContactEmail: true, contactEmail: true, showContactPhone: true, contactPhone: true,
         isActive: true, isBanned: true, deletedAt: true,
         // Achievement badge (model Badge/UserBadge) — berbeda dari badge verifikasi.
@@ -421,6 +429,21 @@ export class UsersService {
       badgeEarnedDates[badge.type] = badge.earnedAt ? badge.earnedAt.toISOString() : null;
     }
 
+    // BUG#5: trustScore profil publik — dihitung dengan rumus yang SAMA
+    // dengan endpoint GET /v1/users/me/trust-score (UserAnalyticsService),
+    // tanpa duplikasi logika. Nilainya publik by-design (ditampilkan di tab
+    // "Tentang" profil siapa pun).
+    const publicTrustScore = this.userAnalyticsService.calculateTrustScore({
+      totalOrdersCompleted: user.totalOrdersCompleted,
+      totalOrdersCancelled: user.totalOrdersCancelled,
+      totalOrdersDisputed: user.totalOrdersDisputed,
+      averageRating: user.averageRating,
+      totalRatingCount: user.totalRatingCount,
+      kycStatus: user.kycStatus,
+      isKahadePlus: user.isKahadePlus,
+      createdAt: user.createdAt,
+    });
+
     return {
       // ================= Identity =================
       identity: {
@@ -508,6 +531,10 @@ export class UsersService {
       accountType: user.accountType,
       bio: user.bio,
       isKycVerified: user.kycStatus === KycStatus.APPROVED,
+      // BUG#5: skor kepercayaan publik — dihitung di atas via UserAnalyticsService
+      // (rumus sama dengan GET /v1/users/me/trust-score). Dibaca frontend sebagai
+      // `profile.trustScore` untuk tab "Tentang".
+      trustScore: publicTrustScore,
       isVip: user.isVip,
       membershipRank: user.membershipRank,
       recentRatings: user.ratingsReceived,

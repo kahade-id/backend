@@ -10,6 +10,7 @@ import { RedisService } from '../../../redis/redis.service';
 import { UploadService } from '../../upload/upload.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
+import { SubscriptionsService } from '../../subscriptions/subscriptions.service';
 import { ReportShowcaseDto } from '../dto/report-showcase.dto';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 
@@ -83,6 +84,12 @@ const mockUpload = {};
 const mockConfig = { get: jest.fn() };
 const mockAuditLog = { logUserAction: jest.fn(), logAdminAction: jest.fn() };
 
+// Benefit 7 Kahade+: batas gambar etalase berbasis subscription.
+const mockSubscriptions = {
+  isActive: jest.fn().mockResolvedValue(false),
+  getMaxShowcaseImages: jest.fn().mockResolvedValue(8),
+};
+
 describe('ShowcaseService — reportShowcase (K-1)', () => {
   let service: ShowcaseService;
   let dbShowcase: any;
@@ -111,6 +118,7 @@ describe('ShowcaseService — reportShowcase (K-1)', () => {
         { provide: ConfigService, useValue: mockConfig },
         { provide: AuditLogService, useValue: mockAuditLog },
         { provide: VerificationBadgeService, useValue: { getBadges: jest.fn().mockResolvedValue([]) } },
+        { provide: SubscriptionsService, useValue: mockSubscriptions },
       ],
     }).compile();
     service = module.get<ShowcaseService>(ShowcaseService);

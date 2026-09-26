@@ -8,6 +8,7 @@ import { RedisService } from '../../../redis/redis.service';
 import { FeeCalculatorService } from '../fee-calculator.service';
 import { RealtimeService } from '../../realtime/realtime.service';
 import { NotificationQueueService } from '../../queue/notification-queue.service';
+import { SubscriptionsService } from '../../subscriptions/subscriptions.service';
 import { KycStatus, FeeResponsibility, OrderStatus, OrderType } from '@prisma/client';
 
 const mockUser = {
@@ -170,11 +171,33 @@ describe('OrdersService', () => {
         { provide: RealtimeService, useValue: { emitToUser: jest.fn(), emitToRoom: jest.fn(), emitToOrder: jest.fn() } },
         { provide: ConfigService, useValue: { get: jest.fn().mockReturnValue(undefined) } },
         { provide: NotificationQueueService, useValue: mockNotificationQueue },
+        // Kahade+ (tim subscriptions): Benefit 1 (fee waiver) terintegrasi di
+        // titik kalkulasi fee createOrder — mock pass-through (tanpa waiver)
+        // agar ekspektasi fee lama tetap valid.
+        {
+          provide: SubscriptionsService,
+          useValue: {
+            isActive: jest.fn().mockResolvedValue(false),
+            getMaxShowcaseImages: jest.fn().mockResolvedValue(8),
+            waiveFeeIfEligible: jest.fn().mockImplementation(async (_userId: string, fee: bigint) => fee),
+          },
+        },
       ],
     }).compile();
 
     service = module.get<OrdersService>(OrdersService);
     jest.resetAllMocks();
+    // resetAllMocks menghapus mockImplementation inline di atas — pasang ulang
+    // default mock Kahade+ (pass-through tanpa waiver agar ekspektasi fee lama
+    // tetap valid; test waiver spesifik meng-override per-test).
+    const subscriptionsMock = module.get(SubscriptionsService) as unknown as {
+      waiveFeeIfEligible: jest.Mock;
+      isActive: jest.Mock;
+      getMaxShowcaseImages: jest.Mock;
+    };
+    subscriptionsMock.waiveFeeIfEligible.mockImplementation(async (_userId: string, fee: bigint) => fee);
+    subscriptionsMock.isActive.mockResolvedValue(false);
+    subscriptionsMock.getMaxShowcaseImages.mockResolvedValue(8);
     mockNotificationQueue.enqueue.mockResolvedValue(undefined);
 
     mockRedis.incr.mockResolvedValue(1);

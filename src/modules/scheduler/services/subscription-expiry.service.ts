@@ -10,13 +10,13 @@ import { cronJitter } from '../../../common/utils/cron-jitter.util';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
 import { toSen } from '../../../common/utils/currency.util';
-import { SUBSCRIPTION_MONTHLY_PRICE, SUBSCRIPTION_ANNUAL_PRICE } from '../../../common/constants/app.constants';
+import { SUBSCRIPTION_MONTHLY_PRICE, SUBSCRIPTION_YEARLY_PRICE } from '../../../common/constants/app.constants';
 import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
 
 const PLAN_METADATA: Record<SubscriptionPlan, { durationDays: number; label: string }> = {
   MONTHLY: { durationDays: 30, label: 'Kahade Plus Monthly' },
-  ANNUAL: { durationDays: 366, label: 'Kahade Plus Annual' },
+  YEARLY: { durationDays: 366, label: 'Kahade Plus Yearly' },
 };
 
 const GRACE_PERIOD_DAYS = 3;
@@ -35,11 +35,11 @@ export class SubscriptionExpiryService {
   ) {
     const monthlyPriceSen = this.configService.get<number>('app.subscriptionMonthlyPriceSen')
       ?? SUBSCRIPTION_MONTHLY_PRICE * 100;
-    const annualPriceSen = this.configService.get<number>('app.subscriptionAnnualPriceSen')
-      ?? SUBSCRIPTION_ANNUAL_PRICE * 100;
+    const yearlyPriceSen = this.configService.get<number>('app.subscriptionYearlyPriceSen')
+      ?? SUBSCRIPTION_YEARLY_PRICE * 100;
     this.planPricing = {
       MONTHLY: { price: BigInt(monthlyPriceSen), ...PLAN_METADATA.MONTHLY },
-      ANNUAL: { price: BigInt(annualPriceSen), ...PLAN_METADATA.ANNUAL },
+      YEARLY: { price: BigInt(yearlyPriceSen), ...PLAN_METADATA.YEARLY },
     };
   }
 
@@ -225,6 +225,36 @@ export class SubscriptionExpiryService {
 
     for (const sub of expiredSubs) {
       try {
+        // Cancel-at-period-end (2026-09-26): user sudah memilih berhenti —
+        // langsung EXPIRED tanpa auto-renew dan tanpa grace period.
+        if (sub.cancelAtPeriodEnd) {
+          const finalized = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+            const updated = await tx.subscription.updateMany({
+              where: {
+                id: sub.id,
+                status: { in: [SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELLED] },
+                currentPeriodEnd: { lt: now },
+              },
+              data: {
+                status: SubscriptionStatus.EXPIRED,
+                isAutoRenew: false,
+                cancelAtPeriodEnd: false,
+              },
+            });
+            if (updated.count === 0) return false;
+            await tx.user.update({
+              where: { id: sub.user.id },
+              data: { isKahadePlus: false, subscriptionExpiresAt: sub.currentPeriodEnd },
+            });
+            return true;
+          });
+          if (finalized) {
+            await this.verificationBadgeService.invalidate(sub.userId);
+            this.logger.log(`Subscription ${sub.id} expired after cancel-at-period-end for user ${sub.userId}`);
+          }
+          continue;
+        }
+
         if (sub.isAutoRenew && sub.status === SubscriptionStatus.ACTIVE) {
           const renewResult = await this.tryAutoRenew(sub);
           if (renewResult === 'SUCCESS') {

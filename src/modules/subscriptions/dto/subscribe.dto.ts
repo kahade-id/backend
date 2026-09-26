@@ -1,5 +1,4 @@
 import {
-  IsBoolean,
   IsEnum,
   IsOptional,
   IsString,
@@ -8,15 +7,8 @@ import {
   MaxLength,
   IsDateString,
 } from 'class-validator';
-import { Transform } from 'class-transformer';
 import { SubscriptionPlan, PaymentMethod } from '@prisma/client';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-
-const toBoolean = ({ value }: { value: unknown }) => {
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'string') return value.toLowerCase() === 'true';
-  return value;
-};
 
 export class SubscribeDto {
   @ApiProperty({ enum: SubscriptionPlan, description: 'Subscription plan' })
@@ -24,7 +16,7 @@ export class SubscribeDto {
   plan!: SubscriptionPlan;
 
   @ApiPropertyOptional({
-    description: 'Wallet PIN for paid subscription verification. Optional only when useTrial=true.',
+    description: 'Wallet PIN for paid subscription verification. Not needed for free promo-code subscriptions.',
   })
   @IsOptional()
   @IsString()
@@ -38,7 +30,7 @@ export class SubscribeDto {
   paymentMethod?: PaymentMethod;
 
   @ApiPropertyOptional({
-    description: 'Active SUBSCRIPTION_DISCOUNT campaign promo code for the first paid period',
+    description: 'Kode promo: kode GRATIS dari admin (durasi ditentukan admin) atau kode campaign SUBSCRIPTION_DISCOUNT',
   })
   @IsOptional()
   @IsString()
@@ -47,14 +39,6 @@ export class SubscribeDto {
     message: 'promoCode may contain only A-Z, 0-9, underscore, or hyphen',
   })
   promoCode?: string;
-
-  @ApiPropertyOptional({
-    description: 'Start the one-lifetime free trial instead of charging wallet balance',
-  })
-  @IsOptional()
-  @IsBoolean()
-  @Transform(toBoolean)
-  useTrial?: boolean;
 }
 
 export class RenewDto {

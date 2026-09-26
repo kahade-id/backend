@@ -8,17 +8,19 @@ import { UploadService } from '../upload/upload.service';
 import { UploadPurpose } from '../upload/dto/presigned-url.dto';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { escapeLikePattern } from '../../common/utils/search.util';
+import { sanitizeShowcaseHtml } from '../../common/utils/sanitize-html.util';
 import {
   ORDER_MAX_VALUE,
   ORDER_MIN_VALUE,
   SHOWCASE_COMMENT_MAX_LENGTH,
   SHOWCASE_FEED_MAX_LIMIT,
-  SHOWCASE_MAX_IMAGES,
+  SHOWCASE_MAX_IMAGES_ABSOLUTE,
   SHOWCASE_MAX_ITEMS,
   SHOWCASE_REPLY_LIMIT,
   SHOWCASE_SEARCH_MIN_LENGTH,
   SHOWCASE_VIEW_DEDUPE_TTL_SECONDS,
 } from '../../common/constants/app.constants';
+import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 import { CreateShowcaseItemDto, UpdateShowcaseItemDto } from './dto/showcase-item.dto';
 import { CreateShowcaseCommentDto, UpdateShowcaseCommentDto } from './dto/showcase-comment.dto';
 import { ShowcaseFeedQueryDto, ShowcaseFeedSort } from './dto/showcase-feed-query.dto';
@@ -161,6 +163,7 @@ export class ShowcaseService {
     private readonly configService: ConfigService,
     private readonly auditLog: AuditLogService,
     private readonly verificationBadgeService: VerificationBadgeService,
+    private readonly subscriptionsService: SubscriptionsService,
   ) {}
 
   // ==================================================================
@@ -347,6 +350,9 @@ export class ShowcaseService {
       id: row.id,
       title: row.title,
       description: row.description,
+      // Benefit 7 Kahade+: deskripsi HTML subscriber (disimpan apa adanya;
+      // frontend wajib mensanitasi sebelum render).
+      descriptionHtml: row.descriptionHtml ?? null,
       category: row.category,
       visibility: row.visibility,
       isActive: row.isActive,
@@ -428,7 +434,11 @@ export class ShowcaseService {
     return {
       items: items.map((item) => this.serializeShowcase(item, { isOwner: true })),
       total: items.length,
-      limits: { maxItems: SHOWCASE_MAX_ITEMS, maxImagesPerItem: SHOWCASE_MAX_IMAGES },
+      limits: {
+        maxItems: SHOWCASE_MAX_ITEMS,
+        // Benefit 7 Kahade+: batas gambar per item berbasis subscription.
+        maxImagesPerItem: await this.subscriptionsService.getMaxShowcaseImages(userId),
+      },
     };
   }
 
@@ -458,6 +468,10 @@ export class ShowcaseService {
               userId,
               title,
               description: this.normalizeDescription(dto.description),
+              // Benefit 7 Kahade+: deskripsi HTML subscriber — DISANITASI di
+              // backend sebelum disimpan (allowlist); frontend juga mensanitasi
+              // sebelum kirim/render (defense in depth).
+              descriptionHtml: dto.descriptionHtml != null ? sanitizeShowcaseHtml(dto.descriptionHtml) : null,
               category: this.normalizeCategory(dto.category),
               visibility: dto.visibility ?? ShowcaseVisibility.PUBLIC,
               priceMin: dto.priceMin !== undefined ? BigInt(dto.priceMin) : null,
@@ -502,6 +516,7 @@ export class ShowcaseService {
     const data: Prisma.UserShowcaseUpdateInput = {};
     if (dto.title !== undefined) data.title = this.normalizeTitle(dto.title);
     if (dto.description !== undefined) data.description = this.normalizeDescription(dto.description);
+    if (dto.descriptionHtml !== undefined) data.descriptionHtml = sanitizeShowcaseHtml(dto.descriptionHtml);
     if (dto.category !== undefined) data.category = this.normalizeCategory(dto.category);
     if (dto.visibility !== undefined) data.visibility = dto.visibility;
     if (dto.priceMin !== undefined) data.priceMin = BigInt(dto.priceMin);
@@ -598,14 +613,17 @@ export class ShowcaseService {
     fileKeys: string[] | undefined,
   ): Promise<{ fileKey: string; imageUrl: string }[]> {
     if (!fileKeys || fileKeys.length === 0) return [];
-    if (fileKeys.length > SHOWCASE_MAX_IMAGES) {
+    // Benefit 7 Kahade+: batas gambar berbasis subscription (18 aktif / 8 biasa).
+    // DTO hanya menegakkan batas atas absolut (18); batas per-user di sini.
+    const maxImages = await this.subscriptionsService.getMaxShowcaseImages(userId);
+    if (fileKeys.length > maxImages) {
       throw new BadRequestException({
         code: ErrorCodes.SHOWCASE_IMAGE_LIMIT_REACHED,
-        message: `Maximum ${SHOWCASE_MAX_IMAGES} images per showcase item`,
+        message: `Maximum ${maxImages} images per showcase item`,
       });
     }
     await this.uploadService.verifyUserFileKeys(userId, fileKeys, UploadPurpose.SHOWCASE_IMAGE, {
-      maxFiles: SHOWCASE_MAX_IMAGES,
+      maxFiles: maxImages,
       consume: true,
       label: 'Showcase image',
     });
@@ -626,10 +644,11 @@ export class ShowcaseService {
 
   async attachImages(userId: string, itemId: string, fileKeys: string[]): Promise<object> {
     const existing = await this.findOwnedShowcase(userId, itemId);
-    if (existing.images.length + fileKeys.length > SHOWCASE_MAX_IMAGES) {
+    const maxImages = await this.subscriptionsService.getMaxShowcaseImages(userId);
+    if (existing.images.length + fileKeys.length > maxImages) {
       throw new BadRequestException({
         code: ErrorCodes.SHOWCASE_IMAGE_LIMIT_REACHED,
-        message: `Maximum ${SHOWCASE_MAX_IMAGES} images per showcase item`,
+        message: `Maximum ${maxImages} images per showcase item`,
       });
     }
     const prepared = await this.prepareImageKeys(userId, fileKeys);

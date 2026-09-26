@@ -135,8 +135,18 @@ export const KAHADE_PLUS_FEE_RATE = 0.5;
 export const FEE_MIN_SEN = 500_000;     // Rp 5.000
 export const FEE_MAX_SEN = 25_000_000;  // Rp 250.000
 
-export const SUBSCRIPTION_MONTHLY_PRICE = 29000;
-export const SUBSCRIPTION_ANNUAL_PRICE = 299000;
+export const SUBSCRIPTION_MONTHLY_PRICE = 99000;
+export const SUBSCRIPTION_YEARLY_PRICE = 899000;
+
+// Benefit 1 Kahade+: kuota pembebasan fee per periode billing —
+// Rp 990.000 = 99.000.000 sen. Reset tiap awal periode billing.
+export const PLUS_FEE_WAIVER_QUOTA_SEN = 99_000_000;
+// Benefit 1: limit kuota dalam IDR (untuk response API).
+export const PLUS_FEE_WAIVER_QUOTA_IDR = 990_000;
+
+// Benefit 3 Kahade+: cap default klaim asuransi (IDR). Syarat & cap detail
+// menyusul dari tim produk — nilai ini hanya placeholder.
+export const INSURANCE_DEFAULT_CAP_IDR = 10_000_000;
 
 export const UPLOAD_MAX_AVATAR_MB = 2;
 export const UPLOAD_MAX_CHAT_MB = 10;
@@ -155,8 +165,14 @@ export const SEARCH_MAX_RESULTS = MAX_LIMIT;
 export const SHOWCASE_MAX_ITEMS = 20;
 /** Batas gambar per item showcase. */
 export const SHOWCASE_MAX_IMAGES = 8;
+/** Batas gambar per item showcase untuk subscriber Kahade+ aktif (Benefit 7). */
+export const SHOWCASE_MAX_IMAGES_SUBSCRIBER = 18;
+/** Batas atas absolut validasi DTO — enforce per-user di service layer. */
+export const SHOWCASE_MAX_IMAGES_ABSOLUTE = 18;
 export const SHOWCASE_TITLE_MAX_LENGTH = 100;
 export const SHOWCASE_DESCRIPTION_MAX_LENGTH = 500;
+/** Panjang maksimum descriptionHtml (Benefit 7); backend simpan apa adanya. */
+export const SHOWCASE_DESCRIPTION_HTML_MAX_LENGTH = 10000;
 export const SHOWCASE_CATEGORY_MAX_LENGTH = 60;
 export const SHOWCASE_COMMENT_MAX_LENGTH = 1000;
 /** Batas balasan per komentar root di GET comments (S-3: cegah response raksasa). */

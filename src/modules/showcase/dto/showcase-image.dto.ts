@@ -1,6 +1,6 @@
 import { ArrayMaxSize, ArrayMinSize, ArrayUnique, IsArray, IsString } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
-import { SHOWCASE_MAX_IMAGES } from '../../../common/constants/app.constants';
+import { SHOWCASE_MAX_IMAGES_ABSOLUTE } from '../../../common/constants/app.constants';
 
 /**
  * Section 3 — manajemen gambar showcase (one-to-many).
@@ -13,7 +13,7 @@ export class AttachShowcaseImagesDto {
   @ApiProperty({ type: [String], description: 'Object key gambar yang sudah dikonfirmasi.' })
   @IsArray()
   @ArrayMinSize(1)
-  @ArrayMaxSize(SHOWCASE_MAX_IMAGES)
+  @ArrayMaxSize(SHOWCASE_MAX_IMAGES_ABSOLUTE)
   @ArrayUnique()
   @IsString({ each: true })
   fileKeys!: string[];
@@ -28,7 +28,7 @@ export class ReorderShowcaseImagesDto {
   })
   @IsArray()
   @ArrayMinSize(1)
-  @ArrayMaxSize(SHOWCASE_MAX_IMAGES)
+  @ArrayMaxSize(SHOWCASE_MAX_IMAGES_ABSOLUTE)
   @ArrayUnique()
   @IsString({ each: true })
   imageIds!: string[];

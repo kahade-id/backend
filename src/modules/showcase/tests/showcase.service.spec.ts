@@ -9,6 +9,7 @@ import { RedisService } from '../../../redis/redis.service';
 import { UploadService } from '../../upload/upload.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
+import { SubscriptionsService } from '../../subscriptions/subscriptions.service';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { SHOWCASE_MAX_IMAGES, SHOWCASE_MAX_ITEMS } from '../../../common/constants/app.constants';
 
@@ -111,6 +112,12 @@ const mockUpload = {
 };
 const mockConfig = { get: jest.fn((key: string) => (key === 'app.publicWebBaseUrl' ? 'https://kahade.id' : undefined)) };
 
+// Benefit 7 Kahade+: batas gambar etalase berbasis subscription.
+const mockSubscriptions = {
+  isActive: jest.fn().mockResolvedValue(false),
+  getMaxShowcaseImages: jest.fn().mockResolvedValue(8),
+};
+
 describe('ShowcaseService — owner CRUD, images, public read, view counter', () => {
   let service: ShowcaseService;
   /** Baris yang "ada di database" untuk userShowcase.findFirst. */
@@ -176,6 +183,7 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
         { provide: ConfigService, useValue: mockConfig },
         { provide: AuditLogService, useValue: { logUserAction: jest.fn(), logAdminAction: jest.fn() } },
         { provide: VerificationBadgeService, useValue: { getBadges: jest.fn().mockResolvedValue([]) } },
+        { provide: SubscriptionsService, useValue: mockSubscriptions },
       ],
     }).compile();
     service = module.get<ShowcaseService>(ShowcaseService);

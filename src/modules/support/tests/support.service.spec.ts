@@ -4,6 +4,7 @@ import { SupportService } from '../support.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { UploadService } from '../../upload/upload.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
+import { SubscriptionsService } from '../../subscriptions/subscriptions.service';
 
 const mockPrisma = {
   supportTicket: { create: jest.fn(), findMany: jest.fn(), count: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
@@ -14,12 +15,16 @@ const mockPrisma = {
 
 const mockUpload = { verifyUserFileKeys: jest.fn() };
 const mockAuditLog = { logAdminAction: jest.fn() };
+// Benefit 4 Kahade+: tiket subscriber otomatis priority — di-reset tiap test
+// via jest.resetAllMocks(), jadi implementasi default diset ulang di beforeEach.
+const mockSubscriptions = { isActive: jest.fn() };
 
 describe('SupportService', () => {
   let service: SupportService;
 
   beforeEach(async () => {
     jest.resetAllMocks();
+    mockSubscriptions.isActive.mockResolvedValue(false);
     mockUpload.verifyUserFileKeys.mockResolvedValue(undefined);
     // R2-C: createTicket validates the linked order belongs to the requester.
     mockPrisma.order.findFirst.mockResolvedValue({ buyerId: 'u1', sellerId: 'u2' });
@@ -30,6 +35,8 @@ describe('SupportService', () => {
         { provide: PrismaService, useValue: mockPrisma },
         { provide: UploadService, useValue: mockUpload },
         { provide: AuditLogService, useValue: mockAuditLog },
+        // Benefit 4 Kahade+: tiket subscriber otomatis priority.
+        { provide: SubscriptionsService, useValue: mockSubscriptions },
       ],
     }).compile();
     service = module.get<SupportService>(SupportService);
@@ -61,6 +68,23 @@ describe('SupportService', () => {
       await service.createTicket('u1', { subject: 'S', message: 'M', category: 'PAYMENT', orderId: 'ORD-1' } as any);
       expect(mockPrisma.supportTicket.create).toHaveBeenCalledWith(expect.objectContaining({
         data: expect.objectContaining({ category: 'PAYMENT', orderId: 'ORD-1' }),
+      }));
+    });
+
+    it('marks ticket priority=true for active Kahade+ subscribers (Benefit 4)', async () => {
+      mockSubscriptions.isActive.mockResolvedValueOnce(true);
+      mockPrisma.supportTicket.create.mockResolvedValue({ id: 't-prio' });
+      await service.createTicket('u1', { subject: 'S', message: 'M' } as any);
+      expect(mockPrisma.supportTicket.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ priority: true }),
+      }));
+    });
+
+    it('marks ticket priority=false for non-subscribers', async () => {
+      mockPrisma.supportTicket.create.mockResolvedValue({ id: 't-normal' });
+      await service.createTicket('u1', { subject: 'S', message: 'M' } as any);
+      expect(mockPrisma.supportTicket.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ priority: false }),
       }));
     });
 

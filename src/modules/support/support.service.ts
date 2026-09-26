@@ -6,6 +6,7 @@ import { UploadPurpose } from '../upload/dto/presigned-url.dto';
 import { UploadService } from '../upload/upload.service';
 import { AuditAction, SupportTicketStatus } from '@prisma/client';
 import { AuditLogService } from '../../common/services/audit-log.service';
+import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 
 const TERMINAL_TICKET_STATUSES = ['CLOSED', 'RESOLVED'] as const;
 
@@ -15,6 +16,7 @@ export class SupportService {
     private readonly prisma: PrismaService,
     private readonly uploadService: UploadService,
     private readonly auditLog: AuditLogService,
+    private readonly subscriptionsService: SubscriptionsService,
   ) {}
 
   async createTicket(userId: string, dto: CreateTicketDto): Promise<object> {
@@ -45,6 +47,11 @@ export class SupportService {
       if (article) relatedArticleId = article.id;
     }
 
+    // Benefit 4 Kahade+ — bantuan prioritas: tiket dari subscriber aktif
+    // otomatis ditandai priority. Fail-safe: bila pengecekan gagal, tiket
+    // tetap dibuat sebagai non-prioritas.
+    const priority = await this.subscriptionsService.isActive(userId).catch(() => false);
+
     return this.prisma.supportTicket.create({
       data: {
         userId,
@@ -54,8 +61,9 @@ export class SupportService {
         orderId: linkedOrderId ?? null,
         attachments,
         status: 'OPEN',
+        priority,
         ...(relatedArticleId ? { relatedArticleId } : {}),
-      } as any,
+      },
     });
   }
 

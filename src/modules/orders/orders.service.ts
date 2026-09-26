@@ -11,6 +11,7 @@ import { safeBigIntToNumber } from '../../common/utils/bigint.util';
 import { addDays, formatWIBDate, toWIB, parseDateBoundaryWIB } from '../../common/utils/date.util';
 import { ORDER_SERIAL, ORDER_AVG_DURATIONS_CACHE } from '../../common/constants/redis-keys';
 import { NotificationQueueService } from '../queue/notification-queue.service';
+import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { CONFIRMATION_DEADLINE_DAYS, KYC_THRESHOLD, CONFIRMATION_DEADLINE_DAYS_MAP, ORDER_MIN_VALUE, ORDER_MAX_VALUE, DELIVERY_DEADLINE_DAYS_MIN, DELIVERY_DEADLINE_DAYS_MAX, POST_COMPLETION_DISPUTE_WINDOW_HOURS } from '../../common/constants/app.constants';
 import { escapeLikePattern } from '../../common/utils/search.util';
@@ -62,6 +63,7 @@ export class OrdersService {
     private feeCalculator: FeeCalculatorService,
     private configService: ConfigService,
     private notificationQueue: NotificationQueueService,
+    private subscriptionsService: SubscriptionsService,
   ) {
     this.configuredMinOrderValue = this.configService.get<number>('app.orderMinValue') ?? ORDER_MIN_VALUE;
     this.configuredMaxOrderValue = this.configService.get<number>('app.orderMaxValue') ?? ORDER_MAX_VALUE;
@@ -500,6 +502,35 @@ export class OrdersService {
             membershipRank: txUser.membershipRank,
           }, feeConfig);
 
+          // Benefit 1 Kahade+ — pembebasan fee untuk subscriber aktif (kuota
+          // Rp 990.000 per bulan kalender WIB, dicatat di SubscriptionUsage).
+          // Integrasi MINIMAL di titik kalkulasi fee: fungsi fee (FeeCalculator)
+          // TIDAK diubah dan state machine escrow TIDAK disentuh — hanya hasil
+          // kalkulasi yang disesuaikan SEBELUM order disimpan. Yang dibebaskan
+          // adalah porsi fee yang dibayar creator order (userId sebagai
+          // BUYER/SELLER sesuai dto.role).
+          const creatorFeeSen = dto.role === 'BUYER' ? txFeeCalc.buyerFeeAmount : txFeeCalc.sellerFeeAmount;
+          if (creatorFeeSen > BigInt(0)) {
+            const feeAfterWaiver = await this.subscriptionsService.waiveFeeIfEligible(userId, creatorFeeSen, tx);
+            // waiveFeeIfEligible mengembalikan fee SETELAH waiver: 0n = bebas
+            // penuh, feeAmountSen = tanpa waiver, atau nilai di antaranya
+            // (waiver parsial bila sisa kuota bulanan < fee).
+            const waivedAmount = creatorFeeSen - feeAfterWaiver;
+            if (waivedAmount > BigInt(0)) {
+              txFeeCalc.feeAmount = txFeeCalc.feeAmount - waivedAmount;
+              if (dto.role === 'BUYER') {
+                txFeeCalc.buyerFeeAmount = feeAfterWaiver;
+                txFeeCalc.buyerPayAmount = txFeeCalc.buyerPayAmount - waivedAmount;
+              } else {
+                txFeeCalc.sellerFeeAmount = feeAfterWaiver;
+                txFeeCalc.sellerReceiveAmount = txFeeCalc.sellerReceiveAmount + waivedAmount;
+              }
+              this.logger.log(
+                `Plus fee waiver applied at order create: user ${userId} fee ${waivedAmount} sen waived of ${creatorFeeSen} sen (role ${dto.role})`,
+              );
+            }
+          }
+
           const deadlineDays = getConfirmationDeadlineDays(dto.orderType);
           const confirmationDeadlineAt = toWIB().add(deadlineDays, 'day').toDate();
 
@@ -873,6 +904,11 @@ export class OrdersService {
         sourceInquiryRoomId: (order as any).sourceInquiryRoomId ?? null,
         sourceInquiryRoom: inquiryContext,
         createdByRole: order.createdByBuyer ? 'BUYER' : 'SELLER',
+        // BUG#1 (2026-09-26): peran viewer eksplisit. Sebelumnya frontend
+        // menginfer peran dari pencocokan ID lintas namespace (me.id cuid
+        // internal vs buyer/seller.id public USR-XXX) yang tidak pernah cocok,
+        // sehingga layar selalu "Peran Anda belum terkonfirmasi".
+        myRole: order.buyerId === userId ? 'BUYER' : 'SELLER',
         createdAt: order.createdAt, confirmedAt: order.confirmedAt,
         paidAt: order.paidAt, completedAt: order.completedAt,
         cancelledAt: order.cancelledAt,
@@ -1106,6 +1142,7 @@ export class OrdersService {
       isKycVerified: boolean;
       membershipRank: string;
       avgRating: unknown;
+      totalOrdersCompleted: number;
     } | null;
     isBlocked: boolean;
     canCreateOrder: boolean;
@@ -1146,6 +1183,10 @@ export class OrdersService {
         isKycVerified: counterpart.kycStatus === KycStatus.APPROVED,
         membershipRank: counterpart.membershipRank,
         avgRating: counterpart.averageRating,
+        // BUG#5 (pola drift yang sama): frontend membaca `completedOrders` /
+        // `totalOrdersCompleted` untuk kartu validasi lawan transaksi, tapi
+        // field ini tidak pernah dikirim — selalu undefined di UI.
+        totalOrdersCompleted: counterpart.totalOrdersCompleted,
       },
       isBlocked: !!block,
       canCreateOrder,

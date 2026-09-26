@@ -17,13 +17,14 @@ export class AdminSupportService {
     private readonly auditLog: AuditLogService,
   ) {}
 
-  async listTickets(page: number, limit: number, status?: string, category?: string, search?: string): Promise<object> {
+  async listTickets(page: number, limit: number, status?: string, category?: string, search?: string, priority?: boolean): Promise<object> {
     const safeLimit = Math.min(Math.max(1, Math.floor(limit)), 100);
     const safePage = Math.max(1, Math.floor(page));
     const skip = (safePage - 1) * safeLimit;
     const where: Prisma.SupportTicketWhereInput = {};
     if (status) where.status = status as SupportTicketStatus;
     if (category) where.category = category as SupportTicketCategory;
+    if (priority !== undefined) where.priority = priority;
     const normalizedSearch = search?.trim();
     if (normalizedSearch) {
       where.OR = [

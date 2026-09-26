@@ -245,8 +245,14 @@ export class DisputesService {
 
     // SEC-DSP-01: strip internal admin notes — user-facing detail must not leak deliberation.
     const { orderId: _orderId, buyerId: _buyerId, sellerId: _sellerId, adminNotes: _adminNotes, ...disputeFields } = dispute as Record<string, unknown>;
+    // FIX ×100 (2026-09-26): decision amounts disimpan dalam sen — konversi ke IDR
+    // agar konsisten dengan kontrak API (lihat bug #3 search.service.ts).
+    const decision = dispute.decision as { buyerAmount: bigint; sellerAmount: bigint } | null;
     return {
       ...disputeFields,
+      decision: decision
+        ? { ...decision, buyerAmount: toIdr(decision.buyerAmount), sellerAmount: toIdr(decision.sellerAmount) }
+        : decision,
       evidences: signedEvidences,
       order: {
         orderId: dispute.order.orderId,

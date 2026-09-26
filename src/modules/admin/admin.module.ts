@@ -13,6 +13,7 @@ import { AdminReportsModule } from './reports/admin-reports.module';
 import { AdminShowcaseReportsModule } from './showcase-reports/admin-showcase-reports.module';
 import { AdminBadgesModule } from './badges/admin-badges.module';
 import { AdminSubscriptionsModule } from './subscriptions/admin-subscriptions.module';
+import { AdminInsuranceClaimsModule } from './insurance-claims/admin-insurance-claims.module';
 import { AdminRatingsModule } from './ratings/admin-ratings.module';
 import { AdminReferralModule } from './referral/admin-referral.module';
 import { AdminManagementModule } from './management/admin-management.module';
@@ -37,6 +38,7 @@ import { AdminChatModule } from './chat/admin-chat.module';
     AdminShowcaseReportsModule,
     AdminBadgesModule,
     AdminSubscriptionsModule,
+    AdminInsuranceClaimsModule,
     AdminRatingsModule,
     AdminReferralModule,
     AdminManagementModule,

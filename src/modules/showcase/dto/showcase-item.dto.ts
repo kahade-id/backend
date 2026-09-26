@@ -7,8 +7,9 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { ShowcaseVisibility } from '@prisma/client';
 import {
   SHOWCASE_CATEGORY_MAX_LENGTH,
+  SHOWCASE_DESCRIPTION_HTML_MAX_LENGTH,
   SHOWCASE_DESCRIPTION_MAX_LENGTH,
-  SHOWCASE_MAX_IMAGES,
+  SHOWCASE_MAX_IMAGES_ABSOLUTE,
   SHOWCASE_TITLE_MAX_LENGTH,
 } from '../../../common/constants/app.constants';
 
@@ -37,6 +38,17 @@ export class CreateShowcaseItemDto {
   @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
   @MaxLength(SHOWCASE_DESCRIPTION_MAX_LENGTH)
   description?: string;
+
+  @ApiPropertyOptional({
+    maxLength: SHOWCASE_DESCRIPTION_HTML_MAX_LENGTH,
+    description:
+      'Deskripsi HTML khusus subscriber Kahade+ (Benefit 7). ' +
+      'Disanitasi allowlist di backend sebelum disimpan.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(SHOWCASE_DESCRIPTION_HTML_MAX_LENGTH)
+  descriptionHtml?: string;
 
   @ApiPropertyOptional({
     maxLength: SHOWCASE_CATEGORY_MAX_LENGTH,
@@ -78,12 +90,12 @@ export class CreateShowcaseItemDto {
     type: [String],
     description:
       'Object key hasil upload presigned (purpose SHOWCASE_IMAGE) yang sudah dikonfirmasi ' +
-      'lewat POST /upload/confirm. Maksimum ' + String(SHOWCASE_MAX_IMAGES) + ' gambar.',
+      'lewat POST /upload/confirm. Maksimum ' + String(SHOWCASE_MAX_IMAGES_ABSOLUTE) + ' gambar (batas atas absolut; batas per-user mengikuti status Kahade+).',
   })
   @IsOptional()
   @IsArray()
   @ArrayMinSize(1)
-  @ArrayMaxSize(SHOWCASE_MAX_IMAGES)
+  @ArrayMaxSize(SHOWCASE_MAX_IMAGES_ABSOLUTE)
   @ArrayUnique()
   @IsString({ each: true })
   imageFileKeys?: string[];
@@ -103,6 +115,17 @@ export class UpdateShowcaseItemDto {
   @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
   @MaxLength(SHOWCASE_DESCRIPTION_MAX_LENGTH)
   description?: string;
+
+  @ApiPropertyOptional({
+    maxLength: SHOWCASE_DESCRIPTION_HTML_MAX_LENGTH,
+    description:
+      'Deskripsi HTML khusus subscriber Kahade+ (Benefit 7). ' +
+      'Disanitasi allowlist di backend sebelum disimpan.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(SHOWCASE_DESCRIPTION_HTML_MAX_LENGTH)
+  descriptionHtml?: string;
 
   @ApiPropertyOptional({ maxLength: SHOWCASE_CATEGORY_MAX_LENGTH })
   @IsOptional()
@@ -155,7 +178,7 @@ export class UpdateShowcaseItemDto {
       'imageFileKeys must contain at least 1 image: a showcase item cannot be left without images. ' +
       'Remove individual images via DELETE /users/me/showcase/images/:imageId instead.',
   })
-  @ArrayMaxSize(SHOWCASE_MAX_IMAGES)
+  @ArrayMaxSize(SHOWCASE_MAX_IMAGES_ABSOLUTE)
   @ArrayUnique()
   @IsString({ each: true })
   imageFileKeys?: string[];

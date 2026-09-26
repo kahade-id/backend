@@ -33,6 +33,47 @@ import {
 const SKIP_PREFIX = 'SKIP_ROLLBACK:';
 const MAX_SCHEDULE_MIN_AMOUNT = 100_000_000;
 
+// DRIFT-01 (fix 2026-09-26): field rekening yang aman dibawa ke response jadwal.
+// accountNumber/accountName terenkripsi — didekripsi + di-mask di formatBankAccount;
+// nomor mentah TIDAK PERNAH dikirim ke klien.
+const BANK_ACCOUNT_SELECT = {
+  id: true,
+  bankCode: true,
+  bankName: true,
+  accountName: true,
+  accountNumber: true,
+} as const;
+
+/** Schedule + relasi bankAccount untuk formatSchedule (DRIFT-01). */
+type ScheduleWithBankAccount = Prisma.ScheduledWithdrawalGetPayload<{
+  include: { bankAccount: { select: typeof BANK_ACCOUNT_SELECT } };
+}>;
+
+/**
+ * DRIFT-02 (fix 2026-09-26): hitung penarikan berikutnya dari dayOfWeek.
+ * Eksekusi cron berjalan tiap 06:00 WIB (`process-scheduled-withdrawals`), jadi
+ * next run = 06:00 WIB berikutnya pada weekday yang cocok. Kalau hari ini cocok
+ * dan sekarang belum lewat 06:00 WIB → hari ini 06:00; kalau sudah lewat →
+ * minggu depan. Return ISO string (UTC).
+ */
+function computeNextRunAt(dayOfWeek: number): string {
+  const WIB_OFFSET_MS = 7 * 3600_000;
+  const shiftedNow = new Date(Date.now() + WIB_OFFSET_MS); // jam "UTC" yang menunjukkan WIB
+  const todayDow = shiftedNow.getUTCDay();
+  const addDays = (dayOfWeek - todayDow + 7) % 7;
+  const shiftedToday6am = Date.UTC(
+    shiftedNow.getUTCFullYear(),
+    shiftedNow.getUTCMonth(),
+    shiftedNow.getUTCDate(),
+    6, 0, 0,
+  );
+  let targetShifted = shiftedToday6am + addDays * 86400_000;
+  if (targetShifted <= shiftedNow.getTime()) {
+    targetShifted += 7 * 86400_000;
+  }
+  return new Date(targetShifted - WIB_OFFSET_MS).toISOString();
+}
+
 @Injectable()
 export class ScheduledWithdrawalService {
   private readonly logger = new Logger(ScheduledWithdrawalService.name);
@@ -334,7 +375,7 @@ export class ScheduledWithdrawalService {
       });
     }
 
-    let schedule: Awaited<ReturnType<typeof this.prisma.scheduledWithdrawal.create>>;
+    let schedule: ScheduleWithBankAccount;
     try {
       schedule = await this.prisma.scheduledWithdrawal.create({
         data: {
@@ -343,6 +384,9 @@ export class ScheduledWithdrawalService {
           dayOfWeek: dto.dayOfWeek,
           minAmount: dto.minAmount === undefined ? 0n : toSen(dto.minAmount),
         },
+        // DRIFT-01 (fix 2026-09-26): formatSchedule butuh relasi bankAccount
+        // untuk objek nested di response — tanpa include, kontrak frontend crash.
+        include: { bankAccount: { select: BANK_ACCOUNT_SELECT } },
       });
     } catch (err) {
       // R2-G (audit): the "already exists" pre-check races with concurrent requests;
@@ -364,9 +408,11 @@ export class ScheduledWithdrawalService {
     const schedules = await this.prisma.scheduledWithdrawal.findMany({
       where: { userId, isActive: true },
       orderBy: { dayOfWeek: 'asc' },
+      // DRIFT-01 (fix 2026-09-26): sertakan relasi bankAccount untuk objek nested.
+      include: { bankAccount: { select: BANK_ACCOUNT_SELECT } },
     });
 
-    return schedules.map(s => this.formatSchedule(s));
+    return Promise.all(schedules.map(s => this.formatSchedule(s)));
   }
 
   async updateSchedule(
@@ -441,11 +487,13 @@ export class ScheduledWithdrawalService {
       data.bankAccountId = dto.bankAccountId;
     }
 
-    let updated: Awaited<ReturnType<typeof this.prisma.scheduledWithdrawal.update>>;
+    let updated: ScheduleWithBankAccount;
     try {
       updated = await this.prisma.scheduledWithdrawal.update({
         where: { id: scheduleId },
         data,
+        // DRIFT-01 (fix 2026-09-26): sertakan relasi bankAccount untuk objek nested.
+        include: { bankAccount: { select: BANK_ACCOUNT_SELECT } },
       });
     } catch (err) {
       // R2-G (audit): day-of-week moves race against another create/update the same
@@ -483,25 +531,52 @@ export class ScheduledWithdrawalService {
     return { message: 'Schedule deactivated' };
   }
 
-  private formatSchedule(s: {
-    id: string;
-    dayOfWeek: number;
-    minAmount: bigint;
-    isActive: boolean;
-    bankAccountId: string;
-    lastExecutedAt: Date | null;
-    createdAt: Date;
-  }): object {
+  private formatSchedule(s: ScheduleWithBankAccount): Promise<object> {
     const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-    return {
+    return this.formatBankAccount(s.bankAccount).then(bankAccount => ({
       id: s.id,
       dayOfWeek: s.dayOfWeek,
       dayName: dayNames[s.dayOfWeek],
       minAmount: toIdr(s.minAmount),
       isActive: s.isActive,
       bankAccountId: s.bankAccountId,
-      lastExecutedAt: s.lastExecutedAt,
+      // DRIFT-01 (fix 2026-09-26): objek rekening terdenormalisasi — frontend
+      // mengharapkan nested `bankAccount`, bukan cuma flat `bankAccountId`.
+      bankAccount,
+      // DRIFT-02 (fix 2026-09-26): kontrak frontend memakai `lastRunAt` /
+      // `nextRunAt`, bukan `lastExecutedAt`. ISO string eksplisit (bukan Date
+      // mentah) agar serialisasi deterministik.
+      lastRunAt: s.lastExecutedAt ? s.lastExecutedAt.toISOString() : null,
+      nextRunAt: computeNextRunAt(s.dayOfWeek),
       createdAt: s.createdAt,
+    }));
+  }
+
+  /**
+   * DRIFT-02 (fix 2026-09-26): rekening terdenormalisasi untuk response jadwal.
+   * KEAMANAN: nomor rekening mentah TIDAK PERNAH dikirim — pola masking sama
+   * dengan bank-accounts.service.ts (`****` + 4 digit terakhir).
+   */
+  private async formatBankAccount(acc: ScheduleWithBankAccount['bankAccount']): Promise<object> {
+    let maskedAccountNumber = '****';
+    let accountName = 'Bank account';
+    try {
+      const plain = await decryptAES(acc.accountNumber);
+      maskedAccountNumber = `****${plain.slice(-4)}`;
+    } catch {
+      // biarkan mask default bila dekripsi gagal
+    }
+    try {
+      accountName = await decryptAES(acc.accountName);
+    } catch {
+      // fallback: accountName mungkin belum terenkripsi (data pra-migrasi)
+    }
+    return {
+      id: acc.id,
+      bankName: acc.bankName,
+      bankCode: acc.bankCode,
+      maskedAccountNumber,
+      accountName,
     };
   }
 

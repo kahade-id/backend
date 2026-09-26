@@ -32,6 +32,7 @@ export class AdminSupportController {
       query.status,
       query.category,
       query.search,
+      query.priority,
     );
   }
 

@@ -3,11 +3,24 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { escapeLikePattern } from '../../common/utils/search.util';
+import { toIdr } from '../../common/utils/currency.util';
 import { VerificationBadgeService } from '../users/verification-badge.service';
 
 @Injectable()
 export class SearchService {
   private readonly LIMIT = 5;
+
+  /**
+   * BUG #3 (2026-09-26): kolom moneter di DB disimpan dalam SEN (IDR x 100),
+   * sedangkan kontrak API = IDR. Nilai mentah dari $queryRaw bisa berupa
+   * bigint ATAU string (tergantung parsing driver pg), jadi normalisasi dulu
+   * sebelum toIdr().
+   */
+  private senToIdr(v: unknown): number {
+    if (typeof v === 'bigint') return toIdr(v);
+    if (typeof v === 'number') return toIdr(BigInt(Math.trunc(v)));
+    return toIdr(BigInt(v as string));
+  }
 
   constructor(
     private prisma: PrismaService,
@@ -281,7 +294,12 @@ export class SearchService {
                 @@ to_tsquery('simple', ${tsQuery})
         `.catch(() => [{ count: BigInt(0) }]),
       ]);
-      return { results: rows, total: Number(countResult[0]?.count ?? 0) };
+      // BUG #3: "orderValue" dari DB dalam sen — konversi ke IDR sesuai kontrak API.
+      const results = (rows as Array<Record<string, unknown>>).map((r) => ({
+        ...r,
+        orderValue: this.senToIdr(r.orderValue),
+      }));
+      return { results, total: Number(countResult[0]?.count ?? 0) };
     }
 
     const where = {
@@ -299,7 +317,9 @@ export class SearchService {
       this.prisma.order.count({ where }),
     ]);
 
-    return { results: rows, total };
+    // BUG #3: orderValue dari DB dalam sen — konversi ke IDR sesuai kontrak API.
+    const orderResults = rows.map((r) => ({ ...r, orderValue: this.senToIdr(r.orderValue) }));
+    return { results: orderResults, total };
   }
 
   private async searchTransactions(userId: string, query: string, limit?: number): Promise<{ results: object[]; total: number }> {
@@ -325,7 +345,9 @@ export class SearchService {
       this.prisma.walletTransaction.count({ where }),
     ]);
 
-    return { results: rows, total };
+    // BUG #3: amount dari DB dalam sen — konversi ke IDR sesuai kontrak API.
+    const txResults = rows.map((r) => ({ ...r, amount: this.senToIdr(r.amount) }));
+    return { results: txResults, total };
   }
 
   private async searchShowcase(query: string, userId: string | undefined, limit?: number, location?: string): Promise<{ results: object[]; total: number }> {

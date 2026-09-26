@@ -5,9 +5,10 @@ import { SubscriptionsService } from './subscriptions.service';
 import { WalletModule } from '../wallet/wallet.module';
 import { AuditLogModule } from '../../common/services/audit-log.module';
 import { VerificationBadgeModule } from '../users/verification-badge.module';
+import { PaymentModule } from '../payment/payment.module';
 
 @Module({
-  imports: [PrismaModule, WalletModule, AuditLogModule, VerificationBadgeModule],
+  imports: [PrismaModule, WalletModule, AuditLogModule, VerificationBadgeModule, PaymentModule],
   controllers: [SubscriptionsController],
   providers: [SubscriptionsService],
   exports: [SubscriptionsService],

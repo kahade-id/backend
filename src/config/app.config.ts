@@ -103,10 +103,13 @@ export const appConfig = registerAs('app', () => ({
   accountLockMaxCycles: parseInt(process.env.ACCOUNT_LOCK_MAX_CYCLES || '5', 10),
   maxSessionsPerUser: parseInt(process.env.MAX_SESSIONS_PER_USER || '5', 10),
   redisAuthFailOpen: process.env.REDIS_AUTH_FAIL_OPEN === 'true',
-  subscriptionMonthlyPrice: parseInt(process.env.SUBSCRIPTION_MONTHLY_PRICE || '29000', 10),
-  subscriptionAnnualPrice: parseInt(process.env.SUBSCRIPTION_ANNUAL_PRICE || '299000', 10),
-  subscriptionMonthlyPriceSen: parseInt(process.env.SUBSCRIPTION_MONTHLY_PRICE_SEN || String(parseInt(process.env.SUBSCRIPTION_MONTHLY_PRICE || '29000', 10) * 100), 10),
-  subscriptionAnnualPriceSen: parseInt(process.env.SUBSCRIPTION_ANNUAL_PRICE_SEN || String(parseInt(process.env.SUBSCRIPTION_ANNUAL_PRICE || '299000', 10) * 100), 10),
+  subscriptionMonthlyPrice: parseInt(process.env.SUBSCRIPTION_MONTHLY_PRICE || '99000', 10),
+  // Spek Kahade+: plan tahunan memakai enum YEARLY (dulu ANNUAL). Env var lama
+  // SUBSCRIPTION_ANNUAL_PRICE sengaja TIDAK dibaca lagi agar harga lama
+  // (299000) tidak terbawa; gunakan SUBSCRIPTION_YEARLY_PRICE bila perlu custom.
+  subscriptionYearlyPrice: parseInt(process.env.SUBSCRIPTION_YEARLY_PRICE || '899000', 10),
+  subscriptionMonthlyPriceSen: parseInt(process.env.SUBSCRIPTION_MONTHLY_PRICE_SEN || String(parseInt(process.env.SUBSCRIPTION_MONTHLY_PRICE || '99000', 10) * 100), 10),
+  subscriptionYearlyPriceSen: parseInt(process.env.SUBSCRIPTION_YEARLY_PRICE_SEN || String(parseInt(process.env.SUBSCRIPTION_YEARLY_PRICE || '899000', 10) * 100), 10),
   exportMaxDateRangeDays: parseInt(process.env.EXPORT_MAX_DATE_RANGE_DAYS || '90', 10),
   orderCreateRateLimit: (() => {
     const v = parseInt(process.env.ORDER_CREATE_RATE_LIMIT || '5', 10);

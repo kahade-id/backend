@@ -116,11 +116,13 @@ enum WalletTransactionStatus {
 
 enum PaymentProvider {
   MIDTRANS
+  FLASH
 }
 
 enum PaymentPurpose {
   TOPUP
   ORDER_ESCROW
+  SUBSCRIPTION
 }
 
 enum PaymentMethod {
@@ -301,7 +303,7 @@ enum NotificationType {
 
 enum SubscriptionPlan {
   MONTHLY
-  ANNUAL
+  YEARLY
 }
 
 enum SubscriptionStatus {
@@ -320,6 +322,16 @@ enum AdminRole {
   KYC_ADMIN
   FINANCE_ADMIN
   CUSTOMER_SUPPORT
+}
+
+// Status klaim asuransi Kahade+ (Benefit 3). Syarat & cap detail menyusul —
+// field-nya disiapkan di sini (claimType, amount, cap).
+enum InsuranceClaimStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  PAID
 }
 
 enum SupportTicketStatus {
@@ -711,9 +723,9 @@ model User {
   // phone verified + alamat lengkap + Kahade Plus aktif. Bisa di-revoke admin
   // kapanpun — revoke tidak menghapus syarat otomatisnya, hanya menonaktifkan
   // badge sampai di-restore.
-  grayVerifiedRevokedAt     DateTime?
-  grayVerifiedRevokedBy     String? // Admin user ID (soft FK ke admin_users.id)
-  grayVerifiedRevokeReason  String?
+  grayVerifiedRevokedAt    DateTime?
+  grayVerifiedRevokedBy    String? // Admin user ID (soft FK ke admin_users.id)
+  grayVerifiedRevokeReason String?
 
   // Section 6: sinyal moderasi hasil agregasi laporan user.
   // Di-set otomatis oleh ReportFlagService bila >= REPORT_FLAG_THRESHOLD (3)
@@ -752,46 +764,50 @@ model User {
   deletedAt DateTime? // Soft delete
 
   // Relations
-  sessions                UserSession[]
-  devices                 UserDevice[]
-  twoFactorAuth           TwoFactorAuth?
-  otpCodes                OtpCode[]
-  kycRequests             KycRequest[]
+  sessions                 UserSession[]
+  devices                  UserDevice[]
+  twoFactorAuth            TwoFactorAuth?
+  otpCodes                 OtpCode[]
+  kycRequests              KycRequest[]
   // Verifikasi badan usaha (badge "Business Verified") — domain terpisah dari KYC
-  businessVerifications   BusinessVerification[]
-  bankAccounts            BankAccount[]
-  wallet                  Wallet?
-  ordersAsBuyer           Order[]                 @relation("BuyerOrders")
-  ordersAsSeller          Order[]                 @relation("SellerOrders")
-  chatMessages            ChatMessage[]
-  chatRoomsAsInitiator    ChatRoom[]              @relation("ChatRoomInitiator")
-  chatRoomsAsCounterpart  ChatRoom[]              @relation("ChatRoomCounterpart")
-  chatRoomMemberships     ChatRoomMember[]
-  chatReactions           ChatMessageReaction[]
-  chatMessageEdits        ChatMessageEdit[]
-  chatPinnedMessages      ChatMessage[]           @relation("ChatMessagePinnedBy")
-  chatModerationEvents    ChatModerationEvent[]
-  ratingsGiven            Rating[]                @relation("RatingGiver")
-  ratingsReceived         Rating[]                @relation("RatingReceiver")
-  notifications           Notification[]
-  notificationPreference  NotificationPreference?
-  voucherUsages           VoucherUsage[]
-  referralCode            ReferralCode?
-  referralUsed            ReferralRelation?       @relation("RefereeUser") // fix typo: ReferreeUser → RefereeUser
-  referralsGiven          ReferralRelation[]      @relation("ReferrerUser")
-  referralRewards         ReferralReward[]
-  subscriptions           Subscription[]
-  membershipRankHistories MembershipRankHistory[]
-  blockedUsers            BlockList[]             @relation("BlockerUser")
-  blockedByUsers          BlockList[]             @relation("BlockedUser")
-  reportsSubmitted        UserReport[]            @relation("ReportSubmitter")
-  reportsReceived         UserReport[]            @relation("ReportTarget")
-  showcaseReportsSubmitted ShowcaseReport[]       @relation("ShowcaseReportReporter")
-  auditLogs               AuditLog[]
-  paymentTransactions     PaymentTransaction[]
-  initiatedDisputes       Dispute[]               @relation("DisputeInitiatorUser")
-  requestedDisputeCalls   DisputeCall[]           @relation("DisputeCallRequester")
-  disputeMessages         DisputeMessage[]        @relation("DisputeMessageSender")
+  businessVerifications    BusinessVerification[]
+  bankAccounts             BankAccount[]
+  wallet                   Wallet?
+  ordersAsBuyer            Order[]                 @relation("BuyerOrders")
+  ordersAsSeller           Order[]                 @relation("SellerOrders")
+  chatMessages             ChatMessage[]
+  chatRoomsAsInitiator     ChatRoom[]              @relation("ChatRoomInitiator")
+  chatRoomsAsCounterpart   ChatRoom[]              @relation("ChatRoomCounterpart")
+  chatRoomMemberships      ChatRoomMember[]
+  chatReactions            ChatMessageReaction[]
+  chatMessageEdits         ChatMessageEdit[]
+  chatPinnedMessages       ChatMessage[]           @relation("ChatMessagePinnedBy")
+  chatModerationEvents     ChatModerationEvent[]
+  ratingsGiven             Rating[]                @relation("RatingGiver")
+  ratingsReceived          Rating[]                @relation("RatingReceiver")
+  notifications            Notification[]
+  notificationPreference   NotificationPreference?
+  voucherUsages            VoucherUsage[]
+  referralCode             ReferralCode?
+  referralUsed             ReferralRelation?       @relation("RefereeUser") // fix typo: ReferreeUser → RefereeUser
+  referralsGiven           ReferralRelation[]      @relation("ReferrerUser")
+  referralRewards          ReferralReward[]
+  subscriptions            Subscription[]
+  // Kode promo langganan gratis yang dikunci ke user ini (opsional).
+  assignedPromoCodes       SubscriptionPromoCode[] @relation("PromoCodeAssignee")
+  // Klaim asuransi Kahade+ (Benefit 3).
+  insuranceClaims          InsuranceClaim[]
+  membershipRankHistories  MembershipRankHistory[]
+  blockedUsers             BlockList[]             @relation("BlockerUser")
+  blockedByUsers           BlockList[]             @relation("BlockedUser")
+  reportsSubmitted         UserReport[]            @relation("ReportSubmitter")
+  reportsReceived          UserReport[]            @relation("ReportTarget")
+  showcaseReportsSubmitted ShowcaseReport[]        @relation("ShowcaseReportReporter")
+  auditLogs                AuditLog[]
+  paymentTransactions      PaymentTransaction[]
+  initiatedDisputes        Dispute[]               @relation("DisputeInitiatorUser")
+  requestedDisputeCalls    DisputeCall[]           @relation("DisputeCallRequester")
+  disputeMessages          DisputeMessage[]        @relation("DisputeMessageSender")
 
   disputeEvidences          DisputeEvidence[]          @relation("DisputeEvidenceSubmitter")
   mutualResolutionProposals MutualResolutionProposal[] @relation("MutualResolutionProposer")
@@ -1212,15 +1228,15 @@ model Wallet {
   walletPinHash String?
 
   // Security
-  isLocked   Boolean   @default(false)
-  lockedAt   DateTime?
-  lockReason String?
+  isLocked       Boolean   @default(false)
+  lockedAt       DateTime?
+  lockReason     String?
   // Kode stabil untuk alasan penguncian (i18n di klien/admin).
   // `lockReason` tetap menyimpan detail operasional berbahasa Inggris
   // (order id, nominal) untuk kebutuhan rekonsiliasi; tampilan ke manusia
   // memakai kode ini, bukan teks mentah.
   lockReasonCode String?
-  lockedBy   String? // Admin ID (soft FK ke admin_users.id)
+  lockedBy       String? // Admin ID (soft FK ke admin_users.id)
 
   version   Int       @default(0) // Optimistic locking
   createdAt DateTime  @default(now())
@@ -1330,6 +1346,10 @@ model PaymentTransaction {
   qrCodeUrl            String?
   deepLinkUrl          String?
   providerInstructions Json?
+
+  // Flash Mobile (MNC) QRIS response
+  flashTransactionId String?
+  flashQrString      String? @db.Text
 
   // Webhook data
   webhookReceivedAt DateTime?
@@ -1786,10 +1806,10 @@ model Dispute {
   isSlaBreached Boolean   @default(false)
 
   // SLA tahap kedua: setelah ESCALATED, admin punya 3x24 jam untuk putusan.
-  escalatedAt                 DateTime?
-  escalationSlaDeadlineAt     DateTime?
-  escalationSlaWarningSentAt  DateTime?
-  isEscalationSlaBreached     Boolean   @default(false)
+  escalatedAt                DateTime?
+  escalationSlaDeadlineAt    DateTime?
+  escalationSlaWarningSentAt DateTime?
+  isEscalationSlaBreached    Boolean   @default(false)
 
   // Kategori sengketa (diisi saat buka sengketa)
   category DisputeCategory?
@@ -2209,8 +2229,8 @@ model Subscription {
   // Harga katalog sebelum promo periode pertama; NULL untuk legacy/tanpa promo.
   originalPrice BigInt?
 
-  // Trial 1x seumur user; scheduler expiry membaca currentPeriodEnd yang sama dengan trialEndsAt.
-  trialEndsAt DateTime?
+  // Kode promo gratis admin yang dipakai untuk mengaktifkan langganan ini.
+  promoCodeUsed String?
 
   // Pause sementara: entitlement dicabut sampai resumeAt, lalu auto-resume via scheduler.
   pausedAt DateTime?
@@ -2225,9 +2245,13 @@ model Subscription {
   //     (current_period_end > current_period_start)
   //   );
 
-  isAutoRenew  Boolean   @default(false)
-  cancelledAt  DateTime?
-  cancelReason String?
+  isAutoRenew       Boolean   @default(false)
+  cancelledAt       DateTime?
+  cancelReason      String?
+  // Cancel-at-period-end (keputusan produk 2026-09-26): user yang membatalkan
+  // TETAP menikmati benefit sampai currentPeriodEnd; auto-renew dimatikan dan
+  // scheduler langsung menandai EXPIRED saat periode berakhir (tanpa grace).
+  cancelAtPeriodEnd Boolean   @default(false)
 
   paymentMethod   PaymentMethod?
   paymentTxId     String?
@@ -2254,16 +2278,124 @@ model Subscription {
   // CREATE UNIQUE INDEX sub_one_active_per_user ON subscriptions(user_id)
   // WHERE status = 'ACTIVE';
 
+  // Pemakaian kuota pembebasan fee per periode billing (Benefit 1 Kahade+).
+  // Satu baris per (subscription, periodStart); feeWaivedAmount diakumulasi
+  // (capped kuota) setiap kali fee dibebaskan saat order dibuat.
+  usages SubscriptionUsage[]
+
   @@index([userId])
   @@index([status])
   @@index([userId, status]) // compound untuk query "apakah user X punya active subscription?"
   @@index([paymentTxId]) // webhook lookup "find subscription by payment"
   @@index([nextPaymentAt]) // [M-02] auto-renewal cron: base index untuk nextPaymentAt filter
   @@index([status, resumeAt]) // auto-resume subscription PAUSED yang jatuh tempo
-  @@index([userId, trialEndsAt]) // validasi trial 1x seumur user
   @@index([status, isAutoRenew, nextPaymentAt])
   // WHERE status='ACTIVE' AND is_auto_renew=true AND next_payment_at<=now()
   @@map("subscriptions")
+}
+
+// ============================================================
+// SUBSCRIPTION PROMO CODE — kode promo langganan GRATIS yang dikelola admin
+// (keputusan produk 2026-09-26: trial dihapus, promo code tetap ada).
+//
+// Admin membuat kode untuk user pilihan dengan durasi bebas (3/7/14/30 hari
+// bahkan 1 tahun). Satu kode bisa dibatasi sekali pakai (default) atau
+// beberapa kali pakai (maxRedemptions), dan bisa dikunci ke user tertentu
+// (assignedUserId).
+// ============================================================
+
+model SubscriptionPromoCode {
+  id   String @id @default(cuid())
+  code String @unique // dinormalisasi UPPERCASE saat dibuat
+
+  // Durasi langganan gratis dalam hari, ditentukan admin (mis. 3/7/14/30/365).
+  durationDays Int
+
+  // Batas total pemakaian; NULL = tak terbatas. Default 1 (sekali pakai).
+  maxRedemptions     Int? @default(1)
+  currentRedemptions Int  @default(0)
+
+  // Jika diisi, hanya user ini yang boleh memakai kode tersebut.
+  assignedUserId String?
+  assignedUser   User?   @relation("PromoCodeAssignee", fields: [assignedUserId], references: [id], onDelete: SetNull)
+
+  status SubscriptionPromoCodeStatus @default(ACTIVE)
+
+  // Masa berlaku kode; NULL = tidak kedaluwarsa.
+  expiresAt DateTime?
+
+  createdBy String
+  note      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([assignedUserId])
+  @@map("subscription_promo_codes")
+}
+
+enum SubscriptionPromoCodeStatus {
+  ACTIVE
+  DISABLED
+}
+
+// ============================================================
+// SUBSCRIPTION USAGE — kuota pembebasan fee Kahade+ per periode billing
+// (Benefit 1: tanpa biaya transaksi, kuota Rp 990.000 per periode).
+// ============================================================
+
+model SubscriptionUsage {
+  id             String       @id @default(cuid())
+  subscriptionId String
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  // Awal periode billing subscription yang bersangkutan
+  // (= subscription.currentPeriodStart saat baris dibuat).
+  periodStart DateTime
+
+  // Total fee yang sudah dibebaskan pada periode ini (dalam sen).
+  feeWaivedAmount BigInt @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([subscriptionId, periodStart])
+  @@index([subscriptionId])
+  @@map("subscription_usages")
+}
+
+// ============================================================
+// INSURANCE CLAIMS — klaim asuransi Kahade+ (Benefit 3).
+// Syarat & cap detail menyusul; field disiapkan di sini.
+// ============================================================
+
+model InsuranceClaim {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Order terkait (opsional — klaim bisa diajukan tanpa order spesifik).
+  orderId String?
+
+  // Jenis klaim, mis. "ORDER_PROTECTION". Nilai bebas (string) agar syarat
+  // detail bisa ditambahkan tanpa migration enum.
+  claimType String @db.VarChar(60)
+
+  // Nominal yang diklaim (dalam sen) dan batas maksimum klaim ini (dalam sen).
+  amount BigInt
+  cap    BigInt
+
+  status InsuranceClaimStatus @default(DRAFT)
+  note   String?              @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([userId, status])
+  @@map("insurance_claims")
 }
 
 // ============================================================
@@ -2944,6 +3076,9 @@ model SupportTicket {
   attachments      Json                  @default("[]")
   rating           Int?
   ratingComment    String?               @db.Text
+  // Benefit 4 Kahade+: tiket dari subscriber aktif otomatis prioritas.
+  // Di-set saat tiket dibuat via SubscriptionsService.isActive().
+  priority         Boolean               @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -2952,6 +3087,7 @@ model SupportTicket {
 
   @@index([userId])
   @@index([status])
+  @@index([priority])
   @@index([relatedArticleId])
   @@map("support_tickets")
 }
@@ -3017,18 +3153,22 @@ model UserShowcase {
   userId String
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  title       String             @db.VarChar(100)
-  description String?            @db.VarChar(500)
+  title           String             @db.VarChar(100)
+  description     String?            @db.VarChar(500)
+  /// Deskripsi HTML khusus subscriber Kahade+ (Benefit 7 — Custom Etalase).
+  /// Backend menyimpan apa adanya (dibatasi panjang); sanitasi dilakukan
+  /// saat render di frontend.
+  descriptionHtml String?            @db.Text
   /// Kategori bebas-terkendali untuk filter feed discover (mis. "ilustrasi",
   /// "jasa video"). Nullable: item lama tanpa kategori tetap muncul di feed.
-  category    String?            @db.VarChar(60)
+  category        String?            @db.VarChar(60)
   /// PRIVATE menyembunyikan item dari feed discover DAN dari profil publik;
   /// hanya pemilik (dan admin) yang bisa melihatnya.
-  visibility  ShowcaseVisibility @default(PUBLIC)
-  priceMin    BigInt?
-  priceMax    BigInt?
-  isActive    Boolean            @default(true)
-  sortOrder   Int                @default(0)
+  visibility      ShowcaseVisibility @default(PUBLIC)
+  priceMin        BigInt?
+  priceMax        BigInt?
+  isActive        Boolean            @default(true)
+  sortOrder       Int                @default(0)
 
   /// Counter denormalisasi. Selalu di-update lewat Prisma atomic increment
   /// ({ increment } / { decrement }) di dalam transaksi yang sama dengan

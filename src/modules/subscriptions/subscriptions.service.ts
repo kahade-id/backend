@@ -20,19 +20,28 @@ import {
   CampaignStatus,
   CampaignType,
   MembershipRank,
+  KycStatus,
+  PaymentMethod,
+  PaymentProvider,
+  PaymentPurpose,
+  PaymentStatus,
 } from '@prisma/client';
 import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { WalletService } from '../wallet/wallet.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { VerificationBadgeService } from '../users/verification-badge.service';
-import { generateWalletTxId } from '../../common/utils/id-generator.util';
+import { generateWalletTxId, generatePaymentTxId } from '../../common/utils/id-generator.util';
+import { FlashQrisService } from '../payment/flash-qris.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { toIdr, toSen } from '../../common/utils/currency.util';
 import { SUBSCRIPTION_PLANS_CACHE } from '../../common/constants/redis-keys';
 import {
   SUBSCRIPTION_MONTHLY_PRICE,
-  SUBSCRIPTION_ANNUAL_PRICE,
+  SUBSCRIPTION_YEARLY_PRICE,
+  PLUS_FEE_WAIVER_QUOTA_SEN,
+  SHOWCASE_MAX_IMAGES,
+  SHOWCASE_MAX_IMAGES_SUBSCRIBER,
 } from '../../common/constants/app.constants';
 
 const SUBSCRIPTION_PLANS_TTL = 300;
@@ -41,8 +50,12 @@ const RANK_ORDER: MembershipRank[] = [MembershipRank.BRONZE, MembershipRank.SILV
 
 const PLAN_METADATA: Record<SubscriptionPlan, { durationDays: number; label: string }> = {
   MONTHLY: { durationDays: 30, label: 'Kahade Plus Monthly' },
-  ANNUAL: { durationDays: 366, label: 'Kahade Plus Annual' },
+  YEARLY: { durationDays: 365, label: 'Kahade Plus Yearly' },
 };
+
+// Fitur early-access Kahade+ (Benefit 6). Daftar ini yang diekspos di GET /me.
+export const EARLY_ACCESS_FEATURES = ['patungan', 'split-bill'] as const;
+export type EarlyAccessFeature = (typeof EARLY_ACCESS_FEATURES)[number];
 
 @Injectable()
 export class SubscriptionsService {
@@ -60,16 +73,17 @@ export class SubscriptionsService {
     private redis: RedisService,
     private auditLogService: AuditLogService,
     private verificationBadgeService: VerificationBadgeService,
+    private flashQrisService: FlashQrisService,
   ) {
     const monthlyPriceSen =
       this.configService.get<number>('app.subscriptionMonthlyPriceSen') ??
       SUBSCRIPTION_MONTHLY_PRICE * 100;
-    const annualPriceSen =
-      this.configService.get<number>('app.subscriptionAnnualPriceSen') ??
-      SUBSCRIPTION_ANNUAL_PRICE * 100;
+    const yearlyPriceSen =
+      this.configService.get<number>('app.subscriptionYearlyPriceSen') ??
+      SUBSCRIPTION_YEARLY_PRICE * 100;
     this.planPricing = {
       MONTHLY: { price: BigInt(monthlyPriceSen), ...PLAN_METADATA.MONTHLY },
-      ANNUAL: { price: BigInt(annualPriceSen), ...PLAN_METADATA.ANNUAL },
+      YEARLY: { price: BigInt(yearlyPriceSen), ...PLAN_METADATA.YEARLY },
     };
   }
 
@@ -85,10 +99,6 @@ export class SubscriptionsService {
   ): Promise<{ kahadePlusSince?: Date }> {
     const user = await tx.user.findUnique({ where: { id: userId }, select: { kahadePlusSince: true } });
     return user?.kahadePlusSince ? {} : { kahadePlusSince: since };
-  }
-
-  private getTrialDays(): number {
-    return Math.min(30, Math.max(1, Math.trunc(this.configService.get<number>('app.subscriptionTrialDays') ?? 7)));
   }
 
   private async isDormantUser(userId: string, totalOrdersCompleted: number, days: number): Promise<boolean> {
@@ -108,6 +118,45 @@ export class SubscriptionsService {
   private isRankEligible(current: MembershipRank, minimum?: MembershipRank | null): boolean {
     if (!minimum) return true;
     return RANK_ORDER.indexOf(current) >= RANK_ORDER.indexOf(minimum);
+  }
+
+  /**
+   * Kode promo GRATIS dari admin (SubscriptionPromoCode).
+   *
+   * Keputusan produk 2026-09-26: admin membuat kode untuk user pilihan dengan
+   * durasi bebas (3/7/14/30 hari bahkan 1 tahun). Satu kode default sekali
+   * pakai (maxRedemptions=1), bisa diatur admin; bisa dikunci ke user tertentu
+   * (assignedUserId). Return null bila tidak ada kode / bukan kode promo gratis
+   * (pemanggil lanjut cek campaign discount).
+   */
+  private async resolvePromoCodeGrant(
+    userId: string,
+    promoCode: string | undefined,
+  ): Promise<{ id: string; code: string; durationDays: number; maxRedemptions: number | null } | null> {
+    const normalized = promoCode?.trim().toUpperCase();
+    if (!normalized) return null;
+    if (!/^[A-Z0-9_-]{3,32}$/.test(normalized)) return null;
+
+    const promo = await this.prisma.subscriptionPromoCode.findUnique({
+      where: { code: normalized },
+    });
+    if (!promo) return null;
+    if (promo.status !== 'ACTIVE') {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Promo code is not active' });
+    }
+    if (promo.expiresAt && promo.expiresAt <= new Date()) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Promo code has expired' });
+    }
+    if (promo.assignedUserId && promo.assignedUserId !== userId) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Promo code is not assigned to your account' });
+    }
+    if (promo.maxRedemptions !== null && promo.currentRedemptions >= promo.maxRedemptions) {
+      throw new BadRequestException({ code: ErrorCodes.VOUCHER_USAGE_LIMIT_REACHED, message: 'Promo code has reached its maximum redemptions' });
+    }
+    if (promo.durationDays < 1 || promo.durationDays > 366) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Promo code has invalid duration' });
+    }
+    return { id: promo.id, code: promo.code, durationDays: promo.durationDays, maxRedemptions: promo.maxRedemptions };
   }
 
   private async resolveSubscriptionCampaign(
@@ -209,9 +258,9 @@ export class SubscriptionsService {
       plan: subscription.plan,
       status: subscription.status,
       cancelledAt: subscription.cancelledAt,
+      cancelAtPeriodEnd: subscription.cancelAtPeriodEnd,
       currentPeriodStart: subscription.currentPeriodStart,
       currentPeriodEnd: subscription.currentPeriodEnd,
-      trialEndsAt: subscription.trialEndsAt,
       pausedAt: subscription.pausedAt,
       resumeAt: subscription.resumeAt,
       feeSavingsUsed: toIdr(subscription.feeSavingsUsed),
@@ -224,12 +273,234 @@ export class SubscriptionsService {
     };
   }
 
+  /**
+   * SOURCE OF TRUTH status Kahade+ (spek Kahade+).
+   *
+   * true hanya jika user punya subscription dengan status ACTIVE dan
+   * currentPeriodEnd > now. Subscription PAUSED / CANCELLED / SUSPENDED /
+   * EXPIRED tidak dihitung aktif. Semua benefit (fee waiver, grey badge,
+   * prioritas support, early access, dst.) WAJIB memakai method ini —
+   * jangan baca kolom isKahadePlus / subscriptionExpiresAt langsung.
+   */
+  async isActive(userId: string): Promise<boolean> {
+    return (await this.getSubscription(userId)) !== null;
+  }
+
+  /**
+   * Mengembalikan subscription aktif user (status ACTIVE, periode berjalan),
+   * atau null bila tidak ada. Pasangan dari isActive() untuk kasus yang butuh
+   * datanya, bukan hanya boolean.
+   */
+  async getSubscription(userId: string): Promise<Subscription | null> {
+    const now = new Date();
+    return this.prisma.subscription.findFirst({
+      where: {
+        userId,
+        status: SubscriptionStatus.ACTIVE,
+        currentPeriodEnd: { gt: now },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    });
+  }
+
+  /**
+   * Benefit 2 — Centang Abu: true jika subscriber aktif DAN KYC lengkap
+   * (kycStatus APPROVED + email terverifikasi + no HP terverifikasi +
+   * alamat terisi). Sumber status: kolom denormalisasi di tabel users
+   * (di-sync oleh KycService saat approve/reject).
+   */
+  async hasGreyBadge(userId: string): Promise<boolean> {
+    if (!(await this.isActive(userId))) return false;
+    return this.isKycComplete(userId);
+  }
+
+  private async isKycComplete(userId: string): Promise<boolean> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        kycStatus: true,
+        emailVerified: true,
+        phoneVerified: true,
+        address: true,
+      },
+    });
+    if (!user) return false;
+    return (
+      user.kycStatus === KycStatus.APPROVED &&
+      user.emailVerified === true &&
+      user.phoneVerified === true &&
+      user.address != null &&
+      user.address.trim().length > 0
+    );
+  }
+
+  /**
+   * Benefit 6 — Akses Awal: true jika subscriber aktif.
+   */
+  async isFeatureEnabled(userId: string, feature: EarlyAccessFeature): Promise<boolean> {
+    if (!EARLY_ACCESS_FEATURES.includes(feature)) return false;
+    return this.isActive(userId);
+  }
+
+  /**
+   * Benefit 7 — Custom Etalase: batas gambar per item showcase berbasis
+   * subscription. 18 untuk subscriber aktif, 8 untuk yang lain.
+   */
+  async getMaxShowcaseImages(userId: string): Promise<number> {
+    return (await this.isActive(userId)) ? SHOWCASE_MAX_IMAGES_SUBSCRIBER : SHOWCASE_MAX_IMAGES;
+  }
+
+  /**
+   * Awal bulan kalender berjalan dalam WIB (UTC+7), sebagai Date UTC.
+   * Kuota fee waiver Kahade+ direset tiap bulan kalender — termasuk untuk
+   * paket YEARLY (bukan sekali per periode billing tahunan).
+   */
+  private getQuotaMonthStart(now: Date = new Date()): Date {
+    const wibMs = now.getTime() + 7 * 60 * 60 * 1000;
+    const wib = new Date(wibMs);
+    const monthStartWibUtc = Date.UTC(wib.getUTCFullYear(), wib.getUTCMonth(), 1, 0, 0, 0, 0);
+    return new Date(monthStartWibUtc - 7 * 60 * 60 * 1000);
+  }
+
+  /**
+   * Benefit 1 — Tanpa Biaya Transaksi.
+   *
+   * Jika user subscriber aktif dan sisa kuota bulan kalender berjalan (WIB) > 0,
+   * fee dibebaskan SEBESAR sisa kuota (return fee setelah dikurangi waiver;
+   * 0n = bebas penuh, feeAmountSen = tanpa waiver). Pencatatan usage memakai
+   * SELECT FOR UPDATE di dalam transaksi pemanggil sehingga dua order
+   * konkuren tidak bisa membebaskan melebihi kuota (race-safe).
+   *
+   * Kuota Rp 990.000 (99.000.000 sen) per bulan kalender; reset tiap awal
+   * bulan (satu baris SubscriptionUsage per pasangan subscription+monthStart).
+   *
+   * Dipanggil di titik kalkulasi platform fee (orders.service createOrder).
+   * `client` diisi tx Prisma pemanggil agar pencatatan usage ikut transaksi order.
+   */
+  async waiveFeeIfEligible(
+    userId: string,
+    feeAmountSen: bigint,
+    client?: Prisma.TransactionClient,
+  ): Promise<bigint> {
+    if (feeAmountSen <= BigInt(0)) return feeAmountSen;
+    const db = (client ?? this.prisma) as Prisma.TransactionClient;
+
+    const subscription = await db.subscription.findFirst({
+      where: {
+        userId,
+        status: SubscriptionStatus.ACTIVE,
+        currentPeriodEnd: { gt: new Date() },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      select: { id: true },
+    });
+    if (!subscription) return feeAmountSen;
+
+    const quotaSen = BigInt(
+      this.configService.get<number>('app.plusFeeWaiverQuotaSen') ?? PLUS_FEE_WAIVER_QUOTA_SEN,
+    );
+    // Periode kuota = bulan kalender WIB, BUKAN periode billing subscription.
+    const periodStart = this.getQuotaMonthStart();
+
+    const usage = await db.subscriptionUsage.upsert({
+      where: {
+        subscriptionId_periodStart: { subscriptionId: subscription.id, periodStart },
+      },
+      create: { subscriptionId: subscription.id, periodStart, feeWaivedAmount: BigInt(0) },
+      update: {},
+      select: { id: true },
+    });
+
+    // Kunci baris usage dalam transaksi ini — order konkuren antre di sini,
+    // sehingga keputusan waiver selalu memakai angka sisa kuota terkini.
+    const locked = await db.$queryRaw<Array<{ feeWaivedAmount: bigint }>>`
+      SELECT "feeWaivedAmount" FROM "subscription_usages"
+      WHERE "id" = ${usage.id} FOR UPDATE
+    `;
+    const waivedSoFar = locked[0]?.feeWaivedAmount ?? BigInt(0);
+    const remaining = quotaSen - waivedSoFar;
+    if (remaining <= BigInt(0)) return feeAmountSen;
+
+    // Waiver parsial bila sisa kuota < fee: user tetap dapat potongan sebesar
+    // sisa kuota, bukan all-or-nothing.
+    const waived = feeAmountSen < remaining ? feeAmountSen : remaining;
+    await db.subscriptionUsage.update({
+      where: { id: usage.id },
+      data: { feeWaivedAmount: waivedSoFar + waived },
+    });
+
+    this.logger.log(
+      `Plus fee waiver: user ${userId} dibebaskan ${waived} sen (sisa kuota ${remaining} sen, bulan ${periodStart.toISOString()})`,
+    );
+    return feeAmountSen - waived;
+  }
+
+  /**
+   * Total fee yang sudah dibebaskan pada bulan kalender berjalan (WIB),
+   * dalam sen. Periode kuota = bulan kalender, bukan periode billing.
+   */
+  async getFeeWaivedThisPeriod(userId: string): Promise<bigint> {
+    const subscription = await this.getSubscription(userId);
+    if (!subscription) return BigInt(0);
+    const usage = await this.prisma.subscriptionUsage.findUnique({
+      where: {
+        subscriptionId_periodStart: {
+          subscriptionId: subscription.id,
+          periodStart: this.getQuotaMonthStart(),
+        },
+      },
+      select: { feeWaivedAmount: true },
+    });
+    return usage?.feeWaivedAmount ?? BigInt(0);
+  }
+
+  /**
+   * GET /v1/subscriptions/me — ringkasan status Kahade+ untuk user.
+   */
+  async getMe(userId: string): Promise<Record<string, unknown>> {
+    const subscription = await this.getSubscription(userId);
+    const active = subscription !== null;
+    const feeWaivedSen = active ? await this.getFeeWaivedThisPeriod(userId) : BigInt(0);
+    const quotaSen = BigInt(
+      this.configService.get<number>('app.plusFeeWaiverQuotaSen') ?? PLUS_FEE_WAIVER_QUOTA_SEN,
+    );
+    const earlyAccess: Record<string, boolean> = {};
+    for (const feature of EARLY_ACCESS_FEATURES) {
+      earlyAccess[feature] = active;
+    }
+    return {
+      isActive: active,
+      plan: subscription?.plan ?? null,
+      status: subscription?.status ?? null,
+      currentPeriodStart: subscription?.currentPeriodStart ?? null,
+      currentPeriodEnd: subscription?.currentPeriodEnd ?? null,
+      // Cancel-at-period-end (2026-09-26): true bila user membatalkan tapi
+      // benefit masih berjalan sampai currentPeriodEnd.
+      cancelAtPeriodEnd: subscription?.cancelAtPeriodEnd ?? false,
+      feeWaivedThisPeriod: toIdr(feeWaivedSen),
+      feeWaiverLimit: toIdr(quotaSen),
+      showGreyBadge: active ? await this.isKycComplete(userId) : false,
+      earlyAccess,
+    };
+  }
+
+  /**
+   * Berlangganan Kahade+.
+   *
+   * Keputusan produk 2026-09-26:
+   * - Trial DIHAPUS — tidak ada lagi `useTrial`.
+   * - Kode promo: (a) kode promo GRATIS dari admin (SubscriptionPromoCode)
+   *   → langganan gratis dengan durasi hari yang ditentukan admin, tanpa PIN;
+   *   (b) kode campaign SUBSCRIPTION_DISCOUNT → diskon harga (tetap bayar via
+   *   wallet + PIN bila masih ada sisa harga).
+   * - Berlangganan TIDAK mensyaratkan KYC.
+   */
   async subscribe(
     userId: string,
     plan: SubscriptionPlan,
     pin?: string,
     ip?: string,
-    options: { promoCode?: string; useTrial?: boolean } = {},
+    options: { promoCode?: string } = {},
   ): Promise<Subscription> {
     const planInfo = this.planPricing[plan];
     if (!planInfo) {
@@ -239,24 +510,13 @@ export class SubscriptionsService {
       });
     }
 
-    const wantsTrial = options.useTrial === true;
-    if (wantsTrial) {
-      const priorTrial = await this.prisma.subscription.findFirst({
-        where: { userId, trialEndsAt: { not: null } },
-        select: { id: true },
-      });
-      if (priorTrial) {
-        throw new ConflictException({
-          code: ErrorCodes.SUBSCRIPTION_ALREADY_ACTIVE,
-          message: 'Free trial has already been used for this account',
-        });
-      }
-    }
+    // Kode promo gratis dari admin — dicek dulu sebelum campaign discount.
+    const promoGrant = await this.resolvePromoCodeGrant(userId, options.promoCode);
 
-    const campaignDiscount = wantsTrial
+    const campaignDiscount = promoGrant
       ? { campaign: null, discountSen: BigInt(0) }
       : await this.resolveSubscriptionCampaign(userId, options.promoCode, planInfo.price);
-    const effectivePrice = wantsTrial
+    const effectivePrice = promoGrant
       ? BigInt(0)
       : planInfo.price - campaignDiscount.discountSen;
     if (effectivePrice < BigInt(0)) {
@@ -271,25 +531,15 @@ export class SubscriptionsService {
 
     const walletTxSerial = effectivePrice > BigInt(0) ? await this.walletTxSerialService.getNext() : null;
 
+    // Durasi periode: kode promo gratis memakai durationDays dari admin,
+    // selain itu memakai durasi paket (30/365 hari).
+    const durationDays = promoGrant ? promoGrant.durationDays : planInfo.durationDays;
     const now = new Date();
     const periodEnd = new Date(now);
-    periodEnd.setDate(periodEnd.getDate() + (wantsTrial ? this.getTrialDays() : planInfo.durationDays));
+    periodEnd.setDate(periodEnd.getDate() + durationDays);
 
     const subscription = await this.prisma.$transaction(
       async (tx: Prisma.TransactionClient) => {
-        if (wantsTrial) {
-          const priorTrialInsideTx = await tx.subscription.findFirst({
-            where: { userId, trialEndsAt: { not: null } },
-            select: { id: true },
-          });
-          if (priorTrialInsideTx) {
-            throw new ConflictException({
-              code: ErrorCodes.SUBSCRIPTION_ALREADY_ACTIVE,
-              message: 'Free trial has already been used for this account',
-            });
-          }
-        }
-
         const existingPending = await tx.subscription.findFirst({
           where: { userId, status: SubscriptionStatus.PENDING },
           select: { id: true },
@@ -393,6 +643,24 @@ export class SubscriptionsService {
           }
         }
 
+        // Kode promo gratis: catat pemakaian secara atomik (race-safe).
+        if (promoGrant) {
+          const promoUpdated = await tx.subscriptionPromoCode.updateMany({
+            where: {
+              id: promoGrant.id,
+              status: 'ACTIVE',
+              OR: [
+                { maxRedemptions: null },
+                { currentRedemptions: { lt: promoGrant.maxRedemptions as number } },
+              ],
+            },
+            data: { currentRedemptions: { increment: 1 } },
+          });
+          if (promoUpdated.count === 0) {
+            throw new BadRequestException({ code: ErrorCodes.VOUCHER_USAGE_LIMIT_REACHED, message: 'Promo code has reached its maximum redemptions' });
+          }
+        }
+
         if (walletId && walletTxSerial !== null) {
           const walletTxId = generateWalletTxId(walletTxSerial);
           await tx.walletTransaction.create({
@@ -418,14 +686,15 @@ export class SubscriptionsService {
             plan,
             status: SubscriptionStatus.ACTIVE,
             price: effectivePrice,
-            originalPrice: campaignDiscount.discountSen > BigInt(0) || wantsTrial ? planInfo.price : null,
-            trialEndsAt: wantsTrial ? periodEnd : null,
+            originalPrice: campaignDiscount.discountSen > BigInt(0) || promoGrant ? planInfo.price : null,
             currentPeriodStart: now,
             currentPeriodEnd: periodEnd,
             isAutoRenew: false,
             lastPaymentAt: effectivePrice > BigInt(0) ? now : null,
             nextPaymentAt: periodEnd,
             feeSavingsLimit: feeSavingsLimitSen,
+            // Kode promo gratis admin yang dipakai untuk langganan ini (audit).
+            promoCodeUsed: promoGrant ? promoGrant.code : undefined,
           },
         });
 
@@ -464,12 +733,292 @@ export class SubscriptionsService {
       action: UserAuditAction.SUBSCRIPTION_STARTED,
       entityType: 'Subscription',
       entityId: subscription.id,
-      description: `Subscribed to ${plan} plan${wantsTrial ? ' using free trial' : ''}`,
+      description: `Subscribed to ${plan} plan${promoGrant ? ` (promo ${promoGrant.code})` : ''}`,
     });
 
     return subscription;
   }
 
+  /**
+   * Berlangganan Kahade+ via QRIS (Flash Mobile/MNC).
+   *
+   * Keputusan produk 2026-09-26: pembayaran = Wallet/QRIS + PIN. Midtrans
+   * TIDAK dipakai lagi; QRIS diproses via Flash Mobile.
+   *
+   * Alur:
+   * 1. Verifikasi PIN wallet (wajib — sesuai "Wallet/QRIS + PIN").
+   * 2. Buat subscription status PENDING + PaymentTransaction.
+   * 3. Buat QRIS dinamis di Flash → kembalikan qrString untuk dirender di app.
+   * 4. User scan & bayar → webhook Flash → activateQrisSubscription().
+   * 5. Frontend polling GET /v1/subscriptions/qris-status/:id sebagai fallback.
+   */
+  async subscribeQris(
+    userId: string,
+    plan: SubscriptionPlan,
+    pin: string,
+    ip?: string,
+    promoCode?: string,
+  ): Promise<{ subscription: Subscription; qrString: string; expiredAt: Date; flashTransactionId: string }> {
+    const planInfo = this.planPricing[plan];
+    if (!planInfo) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Invalid subscription plan',
+      });
+    }
+    if (!pin || !/^\d{6}$/.test(pin)) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Wallet PIN is required for QRIS subscription payment',
+      });
+    }
+
+    const promoGrant = await this.resolvePromoCodeGrant(userId, promoCode);
+    if (promoGrant) {
+      // Kode gratis → tidak perlu QRIS; pakai jalur subscribe biasa (gratis).
+      const subscription = await this.subscribe(userId, plan, undefined, ip, { promoCode });
+      return { subscription, qrString: '', expiredAt: new Date(), flashTransactionId: '' };
+    }
+
+    const campaignDiscount = await this.resolveSubscriptionCampaign(userId, promoCode, planInfo.price);
+    const effectivePrice = planInfo.price - campaignDiscount.discountSen;
+    if (effectivePrice <= BigInt(0)) {
+      // Didiskon 100% → gratis, tidak perlu QRIS.
+      const subscription = await this.subscribe(userId, plan, undefined, ip, { promoCode });
+      return { subscription, qrString: '', expiredAt: new Date(), flashTransactionId: '' };
+    }
+
+    await this.walletService.verifyPin(userId, pin, ip);
+
+    const durationDays = planInfo.durationDays;
+    const now = new Date();
+    const periodEnd = new Date(now);
+    periodEnd.setDate(periodEnd.getDate() + durationDays);
+    const amountIdr = toIdr(effectivePrice);
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { fullName: true, email: true, phoneNumber: true },
+    });
+
+    // Buat subscription PENDING + payment transaction dulu (external_id stabil).
+    const pending = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const existingPending = await tx.subscription.findFirst({
+        where: { userId, status: SubscriptionStatus.PENDING },
+        select: { id: true },
+      });
+      if (existingPending) {
+        throw new ConflictException({
+          code: ErrorCodes.SUBSCRIPTION_ALREADY_ACTIVE,
+          message: 'A subscription payment is already pending',
+        });
+      }
+      const existingActive = await tx.subscription.findFirst({
+        where: {
+          userId,
+          status: { in: [SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELLED, SubscriptionStatus.SUSPENDED, SubscriptionStatus.PAUSED] },
+          currentPeriodEnd: { gt: new Date() },
+        },
+        select: { id: true },
+      });
+      if (existingActive) {
+        throw new ConflictException({
+          code: ErrorCodes.SUBSCRIPTION_ALREADY_ACTIVE,
+          message: 'You already have an active subscription period — use renew instead',
+        });
+      }
+
+      const paymentTx = await tx.paymentTransaction.create({
+        data: {
+          midtransOrderId: `SUBS-QRIS-${Date.now()}-${userId.slice(-6)}`,
+          userId,
+          provider: PaymentProvider.FLASH,
+          purpose: PaymentPurpose.SUBSCRIPTION,
+          method: PaymentMethod.QRIS,
+          status: PaymentStatus.PENDING,
+          amount: effectivePrice,
+          grossAmount: effectivePrice,
+        },
+      });
+
+      const sub = await tx.subscription.create({
+        data: {
+          userId,
+          plan,
+          status: SubscriptionStatus.PENDING,
+          price: effectivePrice,
+          originalPrice: campaignDiscount.discountSen > BigInt(0) ? planInfo.price : null,
+          currentPeriodStart: now,
+          currentPeriodEnd: periodEnd,
+          isAutoRenew: false,
+          paymentMethod: PaymentMethod.QRIS,
+          paymentTxId: paymentTx.id,
+          promoCodeUsed: promoCode?.trim().toUpperCase() || undefined,
+        },
+      });
+
+      return { sub, paymentTx };
+    });
+
+    // Buat QRIS di Flash (di luar transaksi DB).
+    const externalId = pending.paymentTx.midtransOrderId.slice(0, 16);
+    const qris = await this.flashQrisService.createQrisPayment({
+      externalId,
+      amountIdr,
+      description: `${planInfo.label} — Kahade+`,
+      fullname: user?.fullName ?? '',
+      email: user?.email ?? '',
+      phoneNumber: user?.phoneNumber ?? '',
+    });
+
+    await this.prisma.paymentTransaction.update({
+      where: { id: pending.paymentTx.id },
+      data: {
+        flashTransactionId: qris.transactionId,
+        flashQrString: qris.qrString,
+        expiredAt: qris.expiredAt,
+      },
+    });
+
+    this.auditLogService.logUserAction({
+      userId,
+      action: UserAuditAction.SUBSCRIPTION_STARTED,
+      entityType: 'Subscription',
+      entityId: pending.sub.id,
+      description: `QRIS payment initiated for ${plan} plan (${amountIdr} IDR)`,
+    });
+
+    return {
+      subscription: pending.sub,
+      qrString: qris.qrString,
+      expiredAt: qris.expiredAt,
+      flashTransactionId: qris.transactionId,
+    };
+  }
+
+  /**
+   * Dipanggil webhook Flash saat pembayaran QRIS sukses — aktivasi subscription.
+   * Idempotent: hanya memproses sekali.
+   */
+  async activateQrisSubscription(flashTransactionId: string, externalId: string): Promise<void> {
+    const paymentTx = await this.prisma.paymentTransaction.findFirst({
+      where: {
+        OR: [{ flashTransactionId }, { midtransOrderId: externalId }],
+        provider: PaymentProvider.FLASH,
+        purpose: PaymentPurpose.SUBSCRIPTION,
+      },
+      include: { subscriptions: true },
+    });
+    if (!paymentTx) {
+      this.logger.warn(`Webhook QRIS Flash: payment tx tidak ditemukan (${flashTransactionId}/${externalId})`);
+      return;
+    }
+    if (paymentTx.status === PaymentStatus.SUCCESS) return; // sudah diproses
+
+    // Verifikasi ke Flash sebelum aktivasi (docs tidak punya signature webhook).
+    const flashStatus = await this.flashQrisService.getPaymentStatus(
+      paymentTx.flashTransactionId ?? flashTransactionId,
+    );
+    if (flashStatus !== 'SUCCESS') {
+      this.logger.warn(`Webhook QRIS Flash: status Flash bukan SUCCESS (${flashStatus}) untuk ${paymentTx.id}`);
+      return;
+    }
+
+    const subscription = paymentTx.subscriptions[0];
+    if (!subscription || subscription.status !== SubscriptionStatus.PENDING) {
+      this.logger.warn(`Webhook QRIS Flash: subscription tidak PENDING untuk ${paymentTx.id}`);
+      return;
+    }
+
+    const now = new Date();
+    await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await tx.paymentTransaction.update({
+        where: { id: paymentTx.id },
+        data: { status: PaymentStatus.SUCCESS, paidAt: now, webhookReceivedAt: now },
+      });
+      await tx.subscription.update({
+        where: { id: subscription.id },
+        data: {
+          status: SubscriptionStatus.ACTIVE,
+          lastPaymentAt: now,
+          nextPaymentAt: subscription.currentPeriodEnd,
+        },
+      });
+      await tx.user.update({
+        where: { id: subscription.userId },
+        data: {
+          isKahadePlus: true,
+          subscriptionExpiresAt: subscription.currentPeriodEnd,
+          ...(await this.buildKahadePlusSinceData(tx, subscription.userId, now)),
+        },
+      });
+    });
+
+    await this.redis.del(`subscription_status:${subscription.userId}`).catch(() => undefined);
+    await this.verificationBadgeService.invalidate(subscription.userId);
+
+    this.auditLogService.logUserAction({
+      userId: subscription.userId,
+      action: UserAuditAction.SUBSCRIPTION_STARTED,
+      entityType: 'Subscription',
+      entityId: subscription.id,
+      description: `QRIS payment confirmed — ${subscription.plan} activated`,
+    });
+    this.logger.log(`Subscription ${subscription.id} activated via Flash QRIS`);
+  }
+
+  /**
+   * Status pembayaran QRIS untuk polling frontend.
+   */
+  async getQrisStatus(userId: string, subscriptionId: string): Promise<{ status: string; qrString: string | null; expiredAt: Date | null }> {
+    const subscription = await this.prisma.subscription.findFirst({
+      where: { id: subscriptionId, userId },
+      include: { paymentTx: true },
+    });
+    if (!subscription) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Subscription not found' });
+    }
+    // Sinkronisasi ringan: tanya Flash bila masih PENDING dan belum kedaluwarsa.
+    if (
+      subscription.status === SubscriptionStatus.PENDING &&
+      subscription.paymentTx?.flashTransactionId &&
+      (!subscription.paymentTx.expiredAt || subscription.paymentTx.expiredAt > new Date())
+    ) {
+      const flashStatus = await this.flashQrisService.getPaymentStatus(subscription.paymentTx.flashTransactionId);
+      if (flashStatus === 'SUCCESS') {
+        await this.activateQrisSubscription(subscription.paymentTx.flashTransactionId, '');
+      } else if (flashStatus === 'FAILED') {
+        await this.prisma.paymentTransaction.update({
+          where: { id: subscription.paymentTx.id },
+          data: { status: PaymentStatus.FAILED, failedAt: new Date() },
+        });
+      }
+      const refreshed = await this.prisma.subscription.findUnique({ where: { id: subscription.id } });
+      return {
+        status: refreshed?.status ?? subscription.status,
+        qrString: subscription.paymentTx.flashQrString,
+        expiredAt: subscription.paymentTx.expiredAt,
+      };
+    }
+    return {
+      status: subscription.status,
+      qrString: subscription.paymentTx?.flashQrString ?? null,
+      expiredAt: subscription.paymentTx?.expiredAt ?? null,
+    };
+  }
+
+  /**
+   * Cancel-at-period-end (keputusan produk 2026-09-26).
+   *
+   * User TETAP menikmati semua benefit sampai currentPeriodEnd; yang berubah:
+   * - cancelAtPeriodEnd = true (flag)
+   * - isAutoRenew = false (tidak diperpanjang otomatis)
+   * - status TETAP ACTIVE — isActive()/getSubscription() tidak berubah sehingga
+   *   grey badge, fee waiver, dll. jalan terus sampai periode berakhir.
+   * - Scheduler expiry: saat periode berakhir langsung EXPIRED (tanpa grace).
+   *
+   * Batalkan pembatalan via reactivate() selama periode masih berjalan.
+   */
   async cancel(userId: string): Promise<Subscription> {
     const subscription = await this.prisma.subscription.findFirst({
       where: { userId, status: SubscriptionStatus.ACTIVE },
@@ -481,19 +1030,22 @@ export class SubscriptionsService {
         message: 'No active subscription found',
       });
     }
+    if (subscription.cancelAtPeriodEnd) {
+      throw new ConflictException({
+        code: ErrorCodes.INVALID_STATUS,
+        message: 'Subscription is already scheduled for cancellation at period end',
+      });
+    }
 
-    // Mark subscription as CANCELLED (prevents auto-renewal) but keep isKahadePlus=true
-    // and subscriptionExpiresAt intact so user retains benefits until currentPeriodEnd.
-    // The subscription-expiry scheduler will revoke isKahadePlus when the period ends.
     const updated = await this.prisma.$transaction(
       async tx => {
         const result = await tx.subscription.updateMany({
-          where: { id: subscription.id, status: SubscriptionStatus.ACTIVE },
+          where: { id: subscription.id, status: SubscriptionStatus.ACTIVE, cancelAtPeriodEnd: false },
           data: {
-            status: SubscriptionStatus.CANCELLED,
+            cancelAtPeriodEnd: true,
             isAutoRenew: false,
             cancelledAt: new Date(),
-            cancelReason: 'User requested cancellation',
+            cancelReason: 'User requested cancellation (at period end)',
           },
         });
         if (result.count === 0) {
@@ -504,8 +1056,8 @@ export class SubscriptionsService {
         }
         const sub = await tx.subscription.findUniqueOrThrow({ where: { id: subscription.id } });
 
-        // Do NOT clear isKahadePlus or subscriptionExpiresAt here — the scheduler
-        // (subscription-expiry.service.ts) handles that when currentPeriodEnd passes.
+        // Status tetap ACTIVE — benefit dicabut scheduler saat currentPeriodEnd
+        // lewat (subscription-expiry.service.ts). Jangan clear isKahadePlus di sini.
 
         return sub;
       },
@@ -514,9 +1066,8 @@ export class SubscriptionsService {
 
     // AUDIT-24: drop the 300 s order-creation cache as soon as entitlement changes.
     await this.redis.del(`subscription_status:${userId}`).catch(() => undefined);
-    // Cancellation TIDAK langsung mencabut Plus (benefit bertahan sampai
-    // currentPeriodEnd), tapi badge cache tetap di-refresh supaya state terbaru
-    // terbaca tanpa menunggu TTL.
+    // Benefit bertahan sampai akhir periode, tapi badge cache tetap di-refresh
+    // supaya state terbaru terbaca tanpa menunggu TTL.
     await this.verificationBadgeService.invalidate(userId);
 
     this.auditLogService.logUserAction({
@@ -524,7 +1075,52 @@ export class SubscriptionsService {
       action: UserAuditAction.SUBSCRIPTION_CANCELLED,
       entityType: 'Subscription',
       entityId: updated.id,
-      description: `Cancelled ${updated.plan} subscription`,
+      description: `Cancelled ${updated.plan} subscription (effective at period end ${updated.currentPeriodEnd?.toISOString()})`,
+    });
+
+    return updated;
+  }
+
+  /**
+   * Membatalkan pembatalan: user berubah pikiran sebelum periode berakhir.
+   * Mengembalikan cancelAtPeriodEnd=false dan menyalakan auto-renew kembali.
+   */
+  async reactivate(userId: string): Promise<Subscription> {
+    const subscription = await this.prisma.subscription.findFirst({
+      where: {
+        userId,
+        status: SubscriptionStatus.ACTIVE,
+        cancelAtPeriodEnd: true,
+        currentPeriodEnd: { gt: new Date() },
+      },
+    });
+
+    if (!subscription) {
+      throw new NotFoundException({
+        code: ErrorCodes.NO_ACTIVE_SUBSCRIPTION,
+        message: 'No cancellable subscription found to reactivate',
+      });
+    }
+
+    const updated = await this.prisma.subscription.update({
+      where: { id: subscription.id },
+      data: {
+        cancelAtPeriodEnd: false,
+        isAutoRenew: true,
+        cancelledAt: null,
+        cancelReason: null,
+      },
+    });
+
+    await this.redis.del(`subscription_status:${userId}`).catch(() => undefined);
+    await this.verificationBadgeService.invalidate(userId);
+
+    this.auditLogService.logUserAction({
+      userId,
+      action: UserAuditAction.SUBSCRIPTION_AUTO_RENEW_TOGGLED,
+      entityType: 'Subscription',
+      entityId: updated.id,
+      description: `Reactivated ${updated.plan} subscription (cancellation undone)`,
     });
 
     return updated;
@@ -644,7 +1240,6 @@ export class SubscriptionsService {
       status: sub.status,
       price: toIdr(sub.price),
       originalPrice: sub.originalPrice != null ? toIdr(sub.originalPrice) : null,
-      trialEndsAt: sub.trialEndsAt,
       pausedAt: sub.pausedAt,
       resumeAt: sub.resumeAt,
       currentPeriodStart: sub.currentPeriodStart,

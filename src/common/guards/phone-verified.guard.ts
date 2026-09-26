@@ -1,8 +1,10 @@
 import { Injectable, CanActivate, ExecutionContext, ForbiddenException } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import * as ErrorCodes from '../constants/error-codes';
 import { PHONE_VERIFIED_GUARD } from '../constants/redis-keys';
+import { IS_PUBLIC_KEY } from '../decorators/public.decorator';
 
 const PHONE_CACHE_TTL = 300;
 
@@ -11,9 +13,19 @@ export class PhoneVerifiedGuard implements CanActivate {
   constructor(
     private prisma: PrismaService,
     private redis: RedisService,
+    private reflector: Reflector,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
+    // Batch 1A: hormati @Public() (mis. endpoint signed-download) — sama
+    // seperti JwtAuthGuard global. Tanpa ini, route publik di controller yang
+    // memakai guard ini di level class akan selalu 403.
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (isPublic) return true;
+
     const request = context.switchToHttp().getRequest();
     const user = request.user;
     const userId = user?.sub;

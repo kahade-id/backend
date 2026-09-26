@@ -41,6 +41,7 @@ import { addMinutes } from '../../common/utils/date.util';
 import { generateBackupCodes, hashOtp, verifyOtp } from '../../common/utils/otp.util';
 import {
   TOKEN_BLACKLIST,
+  TEMP_TOKEN_USED,
   TOTP_USED_CODE,
   SESSION_REVOKED_KEY,
   BACKUP_CODE_USED,
@@ -125,6 +126,35 @@ export class AuthService {
     private otpTriggerService: OtpTriggerService,
     @InjectQueue(EMAIL_QUEUE) private readonly emailQueue: Queue<EmailJobData>,
   ) {}
+
+  /**
+   * 03-#4: Klaim atomik token sekali-pakai (SET NX) SEBELUM mutasi.
+   * Pola check-then-set sebelumnya (cek via get sebelum transaksi, tulis
+   * best-effort setelah commit) punya race TOCTOU: dua request konkuren
+   * bisa sama-sama lolos cek awal. Klaim di sini fail-closed: bila klaim
+   * gagal, token dianggap sudah dipakai.
+   */
+  private async claimTempTokenOnce(
+    jti: string | undefined,
+    expSeconds: number | undefined,
+    errorCode: string,
+    message: string,
+  ): Promise<void> {
+    if (!jti) {
+      throw new UnauthorizedException({ code: errorCode, message });
+    }
+    const ttl = Math.max(60, Math.min(15 * 60, Math.floor(expSeconds ?? 600)));
+    const claimed = await this.redis.setNx(TEMP_TOKEN_USED(jti), '1', ttl, { throwOnError: true });
+    if (!claimed) {
+      throw new UnauthorizedException({ code: errorCode, message });
+    }
+  }
+
+  private getTempTokenTtlFromPayload(payload: TempTokenPayload): number | undefined {
+    const exp = (payload as TempTokenPayload & { exp?: number }).exp;
+    if (!exp) return undefined;
+    return Math.max(0, exp - Math.floor(Date.now() / 1000));
+  }
 
   // ─────────────────────────────────────────────────────────────────
   // REGISTER
@@ -1598,17 +1628,17 @@ export class AuthService {
       });
     }
 
-    // Temp token sekali pakai: tolak replay dalam sisa masa berlaku token
-    // (konsisten dengan verify2faLogin yang mem-blacklist jti setelah sukses).
-    if (payload.jti) {
-      const alreadyConsumed = await this.redis.get(TOKEN_BLACKLIST(payload.jti)).catch(() => null);
-      if (alreadyConsumed) {
-        throw new UnauthorizedException({
-          code: ErrorCodes.TEMP_TOKEN_EXPIRED,
-          message: 'Reset token has already been used. Please request a new OTP.',
-        });
-      }
-    }
+    // Temp token sekali pakai: klaim atomik (SET NX) SEBELUM mutasi.
+    // 03-#4: pola check-then-set sebelumnya punya race TOCTOU — dua request
+    // konkuren bisa sama-sama lolos cek awal. Bila transaksi di bawah gagal
+    // setelah klaim, token tetap dianggap terpakai (fail-closed, konsisten
+    // dengan phoneRegister).
+    await this.claimTempTokenOnce(
+      payload.jti,
+      this.getTempTokenTtlFromPayload(payload),
+      ErrorCodes.TEMP_TOKEN_EXPIRED,
+      'Reset token has already been used. Please request a new OTP.',
+    );
 
     const user = await this.prisma.user.findUnique({ where: { id: payload.sub } });
     if (!user || !user.isActive || user.isBanned) {
@@ -1699,22 +1729,9 @@ export class AuthService {
 
     // Tandai temp token sudah dipakai agar tidak bisa di-replay selama sisa
     // masa berlakunya (5 menit). Best-effort: reset yang sudah tersimpan di
-    // DB tidak boleh gagal hanya karena Redis tidak tersedia.
-    if (payload.jti) {
-      const tempTtlSeconds =
-        Math.max(
-          ((payload as TempTokenPayload & { exp?: number }).exp ?? 0) -
-            Math.floor(Date.now() / 1000),
-          1,
-        ) + 60;
-      await this.redis
-        .setex(TOKEN_BLACKLIST(payload.jti), tempTtlSeconds, '1', { throwOnError: true })
-        .catch((err: unknown) => {
-          this.logger.warn(
-            `[SECURITY] Password reset persisted but temp-token blacklist propagation failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-    }
+    // 03-#4: token sudah diklaim atomik (SET NX) sebelum transaksi — tidak
+    // perlu tulis best-effort setelah commit; menulis setelah commit justru
+    // membuka race TOCTOU yang ingin ditutup.
 
     // Konfirmasi email hanya bila user punya email (registrasi baru tanpa email).
     if (user.email) {
@@ -1798,16 +1815,14 @@ export class AuthService {
       });
     }
 
-    // Temp token sekali pakai: tolak replay dalam sisa masa berlaku token.
-    if (payload.jti) {
-      const alreadyConsumed = await this.redis.get(TOKEN_BLACKLIST(payload.jti)).catch(() => null);
-      if (alreadyConsumed) {
-        throw new UnauthorizedException({
-          code: ErrorCodes.TEMP_TOKEN_EXPIRED,
-          message: 'Token migrasi sudah dipakai. Silakan masuk ulang.',
-        });
-      }
-    }
+    // Temp token sekali pakai: klaim atomik (SET NX) SEBELUM mutasi.
+    // 03-#4: pola check-then-set sebelumnya punya race TOCTOU.
+    await this.claimTempTokenOnce(
+      payload.jti,
+      this.getTempTokenTtlFromPayload(payload),
+      ErrorCodes.TEMP_TOKEN_EXPIRED,
+      'Token migrasi sudah dipakai. Silakan masuk ulang.',
+    );
 
     const phoneNumber = normalizeIndonesianPhone(payload.phone);
     const phoneHash = hashPhoneNumber(phoneNumber);
@@ -1851,24 +1866,8 @@ export class AuthService {
       },
     });
 
-    // Tandai temp token sudah dipakai agar tidak bisa di-replay selama sisa
-    // masa berlakunya. Best-effort: migrasi yang sudah tersimpan tidak boleh
-    // gagal hanya karena Redis tidak tersedia.
-    if (payload.jti) {
-      const tempTtlSeconds =
-        Math.max(
-          ((payload as TempTokenPayload & { exp?: number }).exp ?? 0) -
-            Math.floor(Date.now() / 1000),
-          1,
-        ) + 60;
-      await this.redis
-        .setex(TOKEN_BLACKLIST(payload.jti), tempTtlSeconds, '1', { throwOnError: true })
-        .catch((err: unknown) => {
-          this.logger.warn(
-            `[SECURITY] Phone migration persisted but temp-token blacklist propagation failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-    }
+    // 03-#4: token sudah diklaim atomik sebelum mutasi — tidak perlu tulis
+    // best-effort setelah commit.
 
     this.auditLog.logUserAction({
       userId: user.id,
@@ -2275,31 +2274,21 @@ export class AuthService {
       });
     }
 
-    // Guard against temp-token replay: reject if the JTI has already been consumed
-    // (blacklisted after a successful 2FA login). Without this check, an attacker
-    // who intercepts a temp token could reuse it within the 5-minute expiry window
-    // with a different TOTP code from the next 30-second period.
-    if (!payload.jti) {
-      throw new UnauthorizedException({
-        code: ErrorCodes.TEMP_TOKEN_EXPIRED,
-        message: 'Invalid temp token — missing jti claim',
-      });
-    }
+    // 03-#4: temp token diklaim atomik (SET NX) SETELAH TOTP valid, sebelum
+    // sesi dibuat — menutup race TOCTOU pada jalur sukses sambil tetap
+    // mengizinkan retry kode TOTP yang salah ketik. Klaim di awal akan
+    // membakar token hanya karena salah ketik (UX buruk); klaim di sini
+    // tetap fail-closed untuk dua request konkuren dengan TOTP valid.
+    // (Pengecekan di bawah dihapus — digantikan klaim atomik.)
     if (!payload.deviceId || payload.deviceId !== deviceId) {
       throw new UnauthorizedException({
         code: ErrorCodes.TEMP_TOKEN_EXPIRED,
         message: 'Temp token is not valid for this device. Please log in again.',
       });
     }
-    const alreadyConsumed = await this.redis.get(TOKEN_BLACKLIST(payload.jti), {
-      throwOnError: true,
-    });
-    if (alreadyConsumed) {
-      throw new UnauthorizedException({
-        code: ErrorCodes.TEMP_TOKEN_EXPIRED,
-        message: 'Temp token has already been used. Please log in again.',
-      });
-    }
+    // 03-#4: pre-check check-then-set dihapus — digantikan klaim atomik
+    // setelah TOTP valid (di bawah). Tanpa pre-check pun aman: dua request
+    // konkuren dengan TOTP valid akan berebut klaim SET NX.
 
     const userId = payload.sub;
 
@@ -2415,16 +2404,18 @@ export class AuthService {
       await client.expire(redisKey, 90);
     }
 
+    // 03-#4: klaim atomik temp token SETELAH TOTP valid, SEBELUM sesi dibuat.
+    // Dua request konkuren dengan TOTP valid: hanya satu yang memenangkan
+    // klaim; yang kalah ditolak. Fail-closed bila Redis tidak tersedia.
+    await this.claimTempTokenOnce(
+      payload.jti,
+      this.getTempTokenTtlFromPayload(payload),
+      ErrorCodes.TEMP_TOKEN_EXPIRED,
+      'Temp token has already been used. Please log in again.',
+    );
+
     // Clear the attempt counter on successful login
     await this.redis.del(attemptKey);
-
-    const jwtExp = (payload as unknown as { exp?: number }).exp;
-    const tempTtlSeconds = jwtExp
-      ? Math.max(jwtExp - Math.floor(Date.now() / 1000), 0) + 60
-      : this.getTempTokenTtlSeconds() + 60;
-    await this.redis.setex(TOKEN_BLACKLIST(payload.jti), tempTtlSeconds, '1', {
-      throwOnError: true,
-    });
 
     const lockoutCycleKey2fa = `lockout_cycles:${user.id}`;
     await this.redis
@@ -3980,16 +3971,6 @@ export class AuthService {
     }
 
     return session.id;
-  }
-
-  private getTempTokenTtlSeconds(): number {
-    const expiresIn: string = this.configService.get<string>('jwt.tempExpiresIn') ?? '5m';
-    const match = expiresIn.match(/^(\d+)([smhd])$/);
-    if (!match) return 5 * 60;
-    const value = parseInt(match[1], 10);
-    const unit = match[2];
-    const multipliers: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };
-    return value * (multipliers[unit] ?? 60);
   }
 
   private getAccessTokenTtlSeconds(): number {

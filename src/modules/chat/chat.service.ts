@@ -947,6 +947,69 @@ export class ChatService {
     }
   }
 
+  // Batch 1A (ST-004): ekstrak fileKey dari stable storage URL
+  // (https://api.kahade.id/uploads/chat-attachments/<userId>/<file>)
+  // atau dari raw key. Dipakai untuk normalisasi persist + signing saat baca.
+  private extractChatFileKey(rawUrl: string): string | null {
+    if (!rawUrl || typeof rawUrl !== 'string') return null;
+    if (rawUrl.startsWith('uploads/')) return rawUrl;
+    try {
+      const parsed = new URL(rawUrl);
+      const storagePublicUrl = this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads';
+      const base = new URL(storagePublicUrl);
+      if (parsed.hostname !== base.hostname) return null;
+      // pathname: /uploads/chat-attachments/<userId>/<file>
+      const prefix = base.pathname.replace(/\/+$/, '');
+      let rel = decodeURIComponent(parsed.pathname);
+      if (prefix && rel.startsWith(prefix)) rel = rel.slice(prefix.length);
+      rel = rel.replace(/^\/+/, '');
+      if (!rel.startsWith('uploads/')) rel = `uploads/${rel}`;
+      return rel;
+    } catch {
+      return null;
+    }
+  }
+
+  // Batch 1A (ST-004): normalisasi URL lampiran menjadi stable storage URL
+  // sebelum persist. Klien mungkin mengirim signed URL dari /v1/chat/upload
+  // (untuk preview langsung) — signed URL kedaluwarsa dan TIDAK BOLEH
+  // dipersist. Verifikasi signature, lalu simpan bentuk stabilnya.
+  private normalizeAttachmentUrl(userId: string, rawUrl: string, label: string): string {
+    try {
+      const parsed = new URL(rawUrl);
+      const apiHost = (() => {
+        try {
+          const storagePublicUrl = this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads';
+          return new URL(storagePublicUrl.replace(/\/uploads\/?$/, '')).hostname;
+        } catch { return null; }
+      })();
+      if (apiHost && parsed.hostname === apiHost && parsed.pathname === '/v1/upload/s') {
+        if (!this.uploadService) {
+          throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `${label} cannot be verified (storage unavailable)` });
+        }
+        const params = parsed.searchParams;
+        const fileKey = this.uploadService.verifySignedDownload(
+          params.get('key') || '',
+          params.get('exp') || '',
+          params.get('sig') || '',
+        );
+        if (!fileKey) {
+          throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `${label} has an invalid or expired signature` });
+        }
+        const segments = fileKey.split('/');
+        if (segments.length !== 4 || segments[1] !== 'chat-attachments' || segments[2] !== userId) {
+          throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `${label} does not belong to this user` });
+        }
+        const storagePublicUrl = (this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads').replace(/\/+$/, '');
+        return `${storagePublicUrl}/${fileKey.slice('uploads/'.length)}`;
+      }
+    } catch (e) {
+      if (e instanceof BadRequestException) throw e;
+      // Bukan signed URL — lanjutkan ke validasi stable URL di bawah.
+    }
+    return rawUrl;
+  }
+
   private validateAttachments(userId: string, attachments: NonNullable<SendMessageDto['attachments']>, skipOwnershipCheck = false): void {
     const trustedHostnames: string[] = [];
     const r2Endpoint = this.configService.get<string>('r2.endpointUrl');
@@ -957,6 +1020,23 @@ export class ChatService {
     if (r2PublicUrl) {
       try { trustedHostnames.push(new URL(r2PublicUrl).hostname); } catch {}
     }
+    // Batch 1A (ST-008): storage self-hosted — lampiran berupa URL
+    // https://api.kahade.id/uploads/... atau signed URL /v1/upload/s.
+    // Sebelumnya hanya hostname R2 yang dipercaya → lampiran self-hosted
+    // ditolak `domain mismatch` (atau `Storage is not configured` bila env
+    // R2 dihapus).
+    const storagePublicUrl = this.configService.get<string>('app.storagePublicUrl');
+    if (storagePublicUrl) {
+      try { trustedHostnames.push(new URL(storagePublicUrl).hostname); } catch {}
+    }
+    // Host API sendiri (untuk signed URL /v1/upload/s?...).
+    const apiHost = (() => {
+      try {
+        const base = (storagePublicUrl || '').replace(/\/uploads\/?$/, '');
+        return base ? new URL(base).hostname : null;
+      } catch { return null; }
+    })();
+    if (apiHost && !trustedHostnames.includes(apiHost)) trustedHostnames.push(apiHost);
     if (trustedHostnames.length === 0) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Storage is not configured' });
     }
@@ -1006,13 +1086,17 @@ export class ChatService {
     };
 
     for (const a of attachments) {
+      // Batch 1A (ST-004): normalisasi signed URL → stable URL sebelum validasi
+      // & persist, agar URL kedaluwarsa tidak tersimpan di DB.
       if (a.fileUrl) {
+        a.fileUrl = this.normalizeAttachmentUrl(userId, a.fileUrl, 'Attachment file URL');
         validateStorageUrl(a.fileUrl, 'Attachment file URL');
         if (!skipOwnershipCheck) {
           validateOwnership(a.fileUrl, 'Attachment file URL');
         }
       }
       if (a.thumbnailUrl) {
+        a.thumbnailUrl = this.normalizeAttachmentUrl(userId, a.thumbnailUrl, 'Attachment thumbnail URL');
         validateStorageUrl(a.thumbnailUrl, 'Attachment thumbnail URL');
         if (!skipOwnershipCheck) {
           validateOwnership(a.thumbnailUrl, 'Attachment thumbnail URL');
@@ -1755,11 +1839,16 @@ export class ChatService {
   // ============================================================
 
   private async toReadableAttachmentUrl(rawUrl: string): Promise<string> {
-    if (!rawUrl || !rawUrl.startsWith('uploads/') || !this.uploadService) return rawUrl;
+    if (!rawUrl || !this.uploadService) return rawUrl;
     try {
       // URL signing is intentionally performed at read time, not persisted with
       // the message. Persisted chat records must remain readable after expiry.
-      return await this.uploadService.generateDownloadUrl(rawUrl, 300);
+      // Batch 1A (ST-004): lampiran dipersist sebagai stable storage URL
+      // (https://api.kahade.id/uploads/chat-attachments/...) — ekstrak fileKey
+      // lalu buat signed URL segar. Bentuk raw key lawas tetap didukung.
+      const fileKey = this.extractChatFileKey(rawUrl);
+      if (!fileKey) return rawUrl;
+      return await this.uploadService.generateDownloadUrl(fileKey, 300);
     } catch (error) {
       this.logger.warn(`Unable to sign chat attachment URL: ${(error as Error).message}`);
       return '';

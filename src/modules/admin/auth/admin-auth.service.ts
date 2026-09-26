@@ -1,13 +1,13 @@
 import { Injectable, UnauthorizedException, ForbiddenException, Logger, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as speakeasy from 'speakeasy';
-import { AuditAction } from '@prisma/client';
+import { AuditAction, AdminRole } from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
-import { bcryptCompare, decryptAES, sha256 } from '../../../common/utils/crypto.util';
+import { bcryptCompare, decryptAES, encryptAES, sha256 } from '../../../common/utils/crypto.util';
 import { TokenService } from '../../auth/token.service';
-import { ADMIN_TOKEN_BLACKLIST, ADMIN_REFRESH_BLACKLIST, ADMIN_2FA_ATTEMPT_KEY, TOTP_USED_CODE } from '../../../common/constants/redis-keys';
+import { ADMIN_TOKEN_BLACKLIST, ADMIN_REFRESH_BLACKLIST, ADMIN_2FA_ATTEMPT_KEY, ADMIN_MFA_SETUP, TOTP_USED_CODE } from '../../../common/constants/redis-keys';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 
 const ADMIN_LOCK_MAX_ATTEMPTS = 5;
@@ -36,6 +36,7 @@ export class AdminAuthService {
     ipAddress?: string,
   ): Promise<
     | { requiresMfa: true; tempToken: string }
+    | { requiresMfaSetup: true; tempToken: string }
     | { accessToken: string; refreshToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }
   > {
     const normalizedEmail = email.toLowerCase();
@@ -88,12 +89,14 @@ export class AdminAuthService {
       throw new UnauthorizedException({ code: ErrorCodes.INVALID_CREDENTIALS, message: 'Invalid email or password' });
     }
 
-    const mfaRequired = await this.isAdminMfaRequired();
+    const mfaRequired = await this.shouldEnforceAdminMfa();
     if (mfaRequired && !admin.isMfaEnabled) {
-      throw new ForbiddenException({
-        code: ErrorCodes.MFA_NOT_CONFIGURED,
-        message: '2FA is required for all admin accounts. Please contact a super admin to set up 2FA.',
-      });
+      // 03-#8: jangan lock-out — kembalikan jalur enroll MFA via tempToken
+      // (scope admin_mfa_setup). Admin menyelesaikan setup di endpoint
+      // POST /v1/admin/auth/mfa/setup + /mfa/enable.
+      const tempToken = this.tokenService.signTempToken({ sub: admin.id, scope: 'admin_mfa_setup' });
+      this.logger.warn(`Admin ${admin.email} logged in without MFA — MFA setup required (grace path)`);
+      return { requiresMfaSetup: true, tempToken };
     }
 
     if (admin.isMfaEnabled) {
@@ -291,6 +294,107 @@ export class AdminAuthService {
     };
   }
 
+  /**
+   * 03-#8: mulai enroll MFA admin. Dipanggil dengan tempToken scope
+   * `admin_mfa_setup` (dari login yang mengembalikan requiresMfaSetup).
+   * Mengembalikan otpauthUrl + secret untuk dipindai di aplikasi authenticator.
+   * Secret disimpan terenkripsi di Redis (TTL 10 menit) hingga diverifikasi
+   * di enableMfa — tidak langsung ditulis ke DB.
+   */
+  async setupMfa(tempToken: string): Promise<{ otpauthUrl: string; secret: string }> {
+    const admin = await this.verifyMfaSetupToken(tempToken);
+
+    const secret = speakeasy.generateSecret({ length: 32, name: `Kahade Admin (${admin.email})` });
+    const encrypted = await this.encryptMfaSecret(secret.base32);
+    // SET NX agar setup yang sudah berjalan tidak tertimpa oleh request ganda.
+    await this.redis.setNx(ADMIN_MFA_SETUP(admin.id), encrypted, 10 * 60, { throwOnError: true });
+
+    this.auditLogService.logAdminAction({
+      adminId: admin.id,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'ADMIN_USER',
+      targetId: admin.id,
+      description: 'MFA setup initiated',
+      ipAddress: 'unknown',
+    });
+
+    return { otpauthUrl: secret.otpauth_url!, secret: secret.base32 };
+  }
+
+  /**
+   * 03-#8: selesaikan enroll MFA. Verifikasi TOTP terhadap secret yang
+   * disimpan saat setupMfa, lalu simpan terenkripsi di DB + aktifkan MFA,
+   * dan kembalikan sesi penuh (setara login sukses).
+   */
+  async enableMfa(
+    tempToken: string,
+    totpToken: string,
+    ipAddress?: string,
+  ): Promise<{ accessToken: string; refreshToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }> {
+    const admin = await this.verifyMfaSetupToken(tempToken);
+
+    const stored = await this.redis.get(ADMIN_MFA_SETUP(admin.id), { throwOnError: true });
+    if (!stored) {
+      throw new BadRequestException({
+        code: ErrorCodes.MFA_NOT_CONFIGURED,
+        message: 'MFA setup session expired. Please start setup again.',
+      });
+    }
+    const secret = await this.decryptMfaSecret(stored);
+
+    const isValid = speakeasy.totp.verify({ secret, encoding: 'base32', token: totpToken, window: 1 });
+    if (!isValid) {
+      throw new UnauthorizedException({ code: ErrorCodes.INVALID_MFA, message: 'Invalid 2FA code' });
+    }
+
+    // Klaim kode TOTP agar tidak bisa dipakai ulang (pola sama seperti login).
+    await this.claimTotpCode(admin.id, totpToken);
+
+    await this.prisma.adminUser.update({
+      where: { id: admin.id },
+      data: { mfaSecret: stored, isMfaEnabled: true },
+    });
+    await this.redis.del(ADMIN_MFA_SETUP(admin.id), { throwOnError: true });
+
+    this.auditLogService.logAdminAction({
+      adminId: admin.id,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'ADMIN_USER',
+      targetId: admin.id,
+      description: 'MFA enabled',
+      ipAddress: ipAddress ?? 'unknown',
+    });
+    this.logger.log(`Admin MFA enabled for ${admin.email}`);
+
+    // Kembalikan sesi penuh — setara login sukses setelah MFA.
+    return this.issueAdminSession(admin, ipAddress);
+  }
+
+  private async verifyMfaSetupToken(tempToken: string) {
+    let payload: { sub: string; scope: string };
+    try {
+      payload = this.tokenService.verifyTempToken(tempToken) as { sub: string; scope: string };
+    } catch {
+      throw new UnauthorizedException({ code: ErrorCodes.TEMP_TOKEN_EXPIRED, message: 'Setup session expired' });
+    }
+    if (payload.scope !== 'admin_mfa_setup') {
+      throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Invalid token scope' });
+    }
+    const admin = await this.prisma.adminUser.findUnique({ where: { id: payload.sub } });
+    if (!admin || !admin.isActive || admin.deletedAt) {
+      throw new UnauthorizedException({ code: ErrorCodes.ADMIN_NOT_FOUND, message: 'Admin not found' });
+    }
+    return admin;
+  }
+
+  private async encryptMfaSecret(secret: string): Promise<string> {
+    return encryptAES(secret);
+  }
+
+  private async decryptMfaSecret(encrypted: string): Promise<string> {
+    return decryptAES(encrypted);
+  }
+
   async refreshAdminToken(
     refreshToken: string,
   ): Promise<{ accessToken: string; refreshToken: string }> {
@@ -480,15 +584,89 @@ export class AdminAuthService {
     return value * (multipliers[match[2]] ?? 60);
   }
 
+  /**
+   * Terbitkan sesi admin penuh (dipakai login sukses & selesai enroll MFA).
+   */
+  private async issueAdminSession(
+    admin: { id: string; adminId: string; fullName: string; email: string; role: AdminRole; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: Date | null },
+    ipAddress?: string,
+  ): Promise<{ accessToken: string; refreshToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }> {
+    await this.prisma.adminUser.update({
+      where: { id: admin.id },
+      data: {
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+        lastLoginAt: new Date(),
+        lastLoginIp: ipAddress,
+      },
+    });
+
+    const accessToken = this.tokenService.signAdminAccessToken({
+      sub: admin.id,
+      adminId: admin.adminId,
+      email: admin.email,
+      role: admin.role,
+    });
+    const refreshToken = this.tokenService.signAdminRefreshToken({ sub: admin.id });
+
+    this.auditLogService.logAdminAction({
+      adminId: admin.id,
+      action: AuditAction.ADMIN_LOGIN,
+      targetType: 'AdminUser',
+      targetId: admin.id,
+      description: `Admin ${admin.adminId} logged in`,
+      ipAddress: ipAddress ?? 'unknown',
+    });
+
+    return {
+      accessToken,
+      refreshToken,
+      admin: {
+        id: admin.id,
+        adminId: admin.adminId,
+        fullName: admin.fullName,
+        email: admin.email,
+        role: admin.role,
+        isActive: admin.isActive,
+        isMfaEnabled: true,
+        lastLoginAt: new Date().toISOString(),
+      },
+    };
+  }
+
   private async isAdminMfaRequired(): Promise<boolean> {
     try {
       const config = await this.prisma.systemConfig.findUnique({
         where: { key: 'admin_mfa_required' },
       });
-      return config?.value === 'true';
+      // 03-#8: default fail-closed — MFA wajib kecuali eksplisit dinonaktifkan.
+      // Kunci di-seed 'true' di prisma/seed.ts.
+      if (!config) return true;
+      return config.value === 'true';
     } catch (err) {
       this.logger.error('Failed to check admin MFA requirement from DB — defaulting to required (fail-closed)', err);
       return true;
     }
+  }
+
+  /**
+   * 03-#8: bootstrap guard — bila BELUM ADA admin dengan MFA aktif, lewati
+   * penegakan (dengan warning keras) agar deploy pertama tidak mengunci
+   * seluruh admin. Setelah ≥1 admin mengaktifkan MFA, penegakan penuh.
+   */
+  private async shouldEnforceAdminMfa(): Promise<boolean> {
+    const required = await this.isAdminMfaRequired();
+    if (!required) return false;
+    const mfaCount = await this.prisma.adminUser.count({
+      where: { isMfaEnabled: true, isActive: true, deletedAt: null },
+    });
+    if (mfaCount === 0) {
+      this.logger.error(
+        '[SECURITY] admin_mfa_required=true but no admin has MFA enabled — enforcement deferred (bootstrap). ' +
+          'Enroll MFA immediately via POST /v1/admin/auth/mfa/setup.',
+      );
+      return false;
+    }
+    return true;
   }
 }

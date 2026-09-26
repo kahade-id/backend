@@ -1,4 +1,4 @@
-import { PrismaClient, KycStatus, UserAccountType, AdminRole, VoucherType } from '@prisma/client';
+import { PrismaClient, KycStatus, UserAccountType, AdminRole, VoucherType, SystemConfigDataType } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { initializeCrypto } from '../src/common/utils/crypto.util';
 import { encryptPii, hashPhoneNumber, normalizePhoneNumber } from '../src/common/utils/pii.util';
@@ -58,6 +58,23 @@ async function main() {
   } else {
     console.log('- Admin already exists, skipping.');
   }
+
+  // ── 1b. System config: admin MFA wajib (03-#8) ─────────────────────
+  // Fail-closed: isAdminMfaRequired() default true bila kunci absen, tetapi
+  // seed eksplisit agar posture terdokumentasi. Bootstrap guard di service
+  // mencegah lockout total bila belum ada admin dengan MFA aktif.
+  await prisma.systemConfig.upsert({
+    where: { key: 'admin_mfa_required' },
+    update: {},
+    create: {
+      key: 'admin_mfa_required',
+      value: 'true',
+      description: 'Wajibkan MFA TOTP untuk semua admin saat login (03-#8).',
+      dataType: SystemConfigDataType.BOOLEAN,
+      isPublic: false,
+    },
+  });
+  console.log('✓ SystemConfig seeded: admin_mfa_required=true');
 
   // ── 2. Test Buyer (KYC APPROVED) ──────────────────────────────────
   const buyerEmail = 'buyer@test.kahade.id';

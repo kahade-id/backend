@@ -163,6 +163,10 @@ export class KycService {
     const encryptedKtpUrl = await encryptKycKtp(mainDocKey);
     const encryptedSelfieUrl = await encryptKycSelfie(selfieFileKey);
     const encryptedNik = await encryptKycNik(nik);
+    // 03-#6: enkripsi & simpan liveness key (pola sama seperti dokumen lain).
+    const encryptedLivenessKey = extra?.livenessFileKey
+      ? await encryptKycSelfie(extra.livenessFileKey)
+      : null;
 
     const serial = await this.getNextKycSerial();
     const kycId = generateKycId(serial);
@@ -214,6 +218,9 @@ export class KycService {
               selfiePhotoUrl: encryptedSelfieUrl,
               ktpNumber: encryptedNik,
               ktpNumberHash: nikHash,
+              // 03-#6: simpan jenis dokumen & liveness agar bisa diaudit admin.
+              documentType: docType,
+              livenessFileKey: encryptedLivenessKey,
               submittedIp: ipAddress,
               attemptNumber: attemptCount + 1,
             },
@@ -395,6 +402,10 @@ export class KycService {
     const encryptedKtpUrl = await encryptKycKtp(mainDocKey);
     const encryptedSelfieUrl = await encryptKycSelfie(selfieFileKey);
     const encryptedNik = await encryptKycNik(nik);
+    // 03-#6: enkripsi & simpan liveness key (pola sama seperti dokumen lain).
+    const encryptedLivenessKey = extra?.livenessFileKey
+      ? await encryptKycSelfie(extra.livenessFileKey)
+      : null;
     const resubmitSerial = await this.getNextKycSerial();
     const resubmitKycId = generateKycId(resubmitSerial);
 
@@ -453,6 +464,9 @@ export class KycService {
               selfiePhotoUrl: encryptedSelfieUrl,
               ktpNumber: encryptedNik,
               ktpNumberHash: nikHash,
+              // 03-#6: simpan jenis dokumen & liveness agar bisa diaudit admin.
+              documentType: docType,
+              livenessFileKey: encryptedLivenessKey,
               submittedIp: ipAddress ?? null,
               attemptNumber: attemptCount + 1,
             },

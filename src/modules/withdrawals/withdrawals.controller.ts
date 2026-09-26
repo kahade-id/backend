@@ -1,6 +1,7 @@
 import {
-  Controller, Get, Post, Put, Delete, Body, Param, UseGuards,
+  Controller, Get, Post, Put, Delete, Body, Param, Req, UseGuards,
 } from '@nestjs/common';
+import { Request } from 'express';
 import { ParseIdPipe } from '../../common/pipes/parse-id.pipe';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
@@ -22,8 +23,9 @@ export class WithdrawalsControllerBase {
   async createSchedule(
     @CurrentUser('sub') userId: string,
     @Body() dto: CreateScheduleDto,
+    @Req() req: Request,
   ): Promise<object> {
-    return this.scheduledWithdrawalService.createSchedule(userId, dto);
+    return this.scheduledWithdrawalService.createSchedule(userId, dto, req.ip);
   }
 
   @Get('schedules')
@@ -41,8 +43,9 @@ export class WithdrawalsControllerBase {
     @CurrentUser('sub') userId: string,
     @Param('scheduleId', ParseIdPipe) scheduleId: string,
     @Body() dto: UpdateScheduleDto,
+    @Req() req: Request,
   ): Promise<object> {
-    return this.scheduledWithdrawalService.updateSchedule(userId, scheduleId, dto);
+    return this.scheduledWithdrawalService.updateSchedule(userId, scheduleId, dto, req.ip);
   }
 
   @Throttle({ default: { ttl: 3600000, limit: 10 } })

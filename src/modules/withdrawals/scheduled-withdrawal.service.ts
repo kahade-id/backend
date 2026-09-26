@@ -19,6 +19,7 @@ import { toSen, toIdr } from '../../common/utils/currency.util';
 import { startOfDayWIB } from '../../common/utils/date.util';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
+import { WalletService } from '../wallet/wallet.service';
 import { decryptAES } from '../../common/utils/crypto.util';
 import {
   WALLET_MIN_WITHDRAW,
@@ -85,6 +86,7 @@ export class ScheduledWithdrawalService {
     private prisma: PrismaService,
     private walletTxSerialService: WalletTxSerialService,
     private configService: ConfigService,
+    private walletService: WalletService,
   ) {
     // Same config keys and fallbacks as WalletService, so the manual and automated
     // withdrawal paths cannot drift apart when an operator overrides a limit.
@@ -339,8 +341,14 @@ export class ScheduledWithdrawalService {
       bankAccountId: string;
       dayOfWeek: number;
       minAmount?: number;
+      pin: string;
     },
+    ip?: string,
   ): Promise<object> {
+    // WF-003: jadwal penarikan otomatis adalah otorisasi penarikan — wajib PIN,
+    // sama seperti penarikan manual.
+    await this.walletService.assertWalletPin(userId, dto.pin, ip);
+
     if (!Number.isInteger(dto.dayOfWeek) || dto.dayOfWeek < 0 || dto.dayOfWeek > 6) {
       throw new BadRequestException({
         code: ErrorCodes.INVALID_SCHEDULE,
@@ -423,8 +431,13 @@ export class ScheduledWithdrawalService {
       minAmount?: number;
       isActive?: boolean;
       bankAccountId?: string;
+      pin: string;
     },
+    ip?: string,
   ): Promise<object> {
+    // WF-003: perubahan jadwal (termasuk toggle aktif/nonaktif) wajib PIN.
+    await this.walletService.assertWalletPin(userId, dto.pin, ip);
+
     const schedule = await this.prisma.scheduledWithdrawal.findUnique({
       where: { id: scheduleId },
     });

@@ -54,8 +54,12 @@ export class LocalStorageService {
     try {
       const stat = await fs.promises.stat(this.resolvePath(fileKey));
       return stat.isFile();
-    } catch {
-      return false;
+    } catch (e) {
+      // Batch 1A (ST-020): bedakan "tidak ada" vs "disk error". Sebelumnya
+      // SEMUA error ditelan sebagai false — insiden disk tidak terdeteksi.
+      if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+      this.logger.error(`fileExists disk error for key=${fileKey}: ${(e as Error).message}`);
+      throw e;
     }
   }
 
@@ -63,8 +67,11 @@ export class LocalStorageService {
     try {
       const stat = await fs.promises.stat(this.resolvePath(fileKey));
       return stat.isFile() ? stat.size : null;
-    } catch {
-      return null;
+    } catch (e) {
+      // Batch 1A (ST-020): lihat fileExists — ENOENT → null, error lain → throw.
+      if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+      this.logger.error(`getFileSize disk error for key=${fileKey}: ${(e as Error).message}`);
+      throw e;
     }
   }
 
@@ -99,5 +106,20 @@ export class LocalStorageService {
   getPublicUrl(fileKey: string): string {
     const relative = fileKey.startsWith('uploads/') ? fileKey.slice('uploads/'.length) : fileKey;
     return `${this.publicBaseUrl}/${relative}`;
+  }
+
+  // Batch 1A: content-type untuk endpoint download terautentikasi.
+  // Dipetakan dari ekstensi nama file (key sudah disanitasi saat upload).
+  getContentType(fileKey: string): string {
+    const ext = fileKey.split('.').pop()?.toLowerCase() ?? '';
+    const map: Record<string, string> = {
+      jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp',
+      heic: 'image/heic', heif: 'image/heif', avif: 'image/avif',
+      pdf: 'application/pdf',
+      mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm',
+      mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', m4a: 'audio/mp4',
+      json: 'application/json',
+    };
+    return map[ext] ?? 'application/octet-stream';
   }
 }

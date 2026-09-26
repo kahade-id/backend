@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { ConfigService } from '@nestjs/config';
 import { S3Client, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { RedisService } from '../../../redis/redis.service';
@@ -84,11 +86,34 @@ export class OrphanedUploadCleanupService {
       // check (user.avatarUrl / user.headerUrl), so the Redis-confirmed-key caveat
       // of the uploads/ pass does not apply; deletions still respect the same
       // destructive gate.
-      for (const bucket of buckets) {
-        if (lease.lost()) throw new Error('Orphaned upload cleanup lease lost');
-        totalDeleted += await this.cleanupBucket(bucket, cutoffMs, destructiveDeleteEnabled);
-        totalDeleted += await this.cleanupProfileMedia(bucket, cutoffMs, destructiveDeleteEnabled, lease);
+      // Batch 1A (ST-011): R2 adalah legacy opsional — jangan gagalkan seluruh
+      // cron bila kredensial R2 tidak ada; skip S3 dengan warning dan lanjutkan
+      // pemindaian disk lokal (storage self-hosted adalah jalur utama).
+      const r2Available = Boolean(
+        this.configService.get<string>('r2.accessKeyId') &&
+        this.configService.get<string>('r2.secretAccessKey') &&
+        this.configService.get<string>('r2.endpointUrl'),
+      );
+      if (r2Available) {
+        for (const bucket of buckets) {
+          if (lease.lost()) throw new Error('Orphaned upload cleanup lease lost');
+          totalDeleted += await this.cleanupBucket(bucket, cutoffMs, destructiveDeleteEnabled);
+          totalDeleted += await this.cleanupProfileMedia(bucket, cutoffMs, destructiveDeleteEnabled, lease);
+        }
+      } else {
+        this.logger.warn('R2 not configured — skipping S3 orphan scan (self-hosted storage is the primary path).');
       }
+
+      // Batch 1A (ST-011): pindai disk lokal untuk file yatim. Logika orphan
+      // sama (Redis confirmed key 24 jam); destructive delete memakai gate
+      // yang sama (ORPHAN_CLEANUP_ENABLED).
+      if (lease.lost()) throw new Error('Orphaned upload cleanup lease lost');
+      totalDeleted += await this.cleanupLocalDisk(cutoffMs, destructiveDeleteEnabled, lease);
+
+      // Batch 1A (ST-019): export akun kedaluwarsa setelah 24 jam — hapus dari
+      // disk agar dump PII tidak menumpuk.
+      if (lease.lost()) throw new Error('Orphaned upload cleanup lease lost');
+      totalDeleted += await this.cleanupExpiredAccountExports();
 
       this.logger.log(`Orphaned upload cleanup completed: ${totalDeleted} files ${destructiveDeleteEnabled ? 'deleted' : 'WOULD-be-deleted (dry-run)'}`);
       await this.redis.setex('cron_heartbeat:orphaned_upload_cleanup', 86400, JSON.stringify({ ranAt: new Date().toISOString(), totalDeleted, dryRun: !destructiveDeleteEnabled })).catch((err: unknown) => this.logger.warn(`Failed to write orphan cleanup heartbeat: ${safeErrorMessage(err)}`));
@@ -165,8 +190,7 @@ export class OrphanedUploadCleanupService {
     return deleted;
   }
 
-  private async cleanupBucket(bucket: string, cutoffMs: number, destructiveDeleteEnabled: boolean): Promise<number> {
-    let deleted = 0;
+  private async cleanupBucket(bucket: string, cutoffMs: number, destructiveDeleteEnabled: boolean): Promise<number> {    let deleted = 0;
     let continuationToken: string | undefined;
     const s3 = this.getS3Client();
 
@@ -230,6 +254,101 @@ export class OrphanedUploadCleanupService {
       }
     } while (continuationToken);
 
+    return deleted;
+  }
+
+  // ── Batch 1A (ST-011): pemindaian disk lokal ──
+  // Mirror dari logika S3 di atas untuk storage self-hosted: file di
+  // <STORAGE_PATH>/uploads/... yang lebih tua dari cutoff dan tidak punya
+  // Redis confirmed key dianggap yatim. Destructive delete memakai gate yang
+  // sama (ORPHAN_CLEANUP_ENABLED); default DRY-RUN (hanya log).
+
+  private async walkLocalFiles(dir: string, out: string[]): Promise<void> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) await this.walkLocalFiles(full, out);
+      else if (e.isFile()) out.push(full);
+    }
+  }
+
+  private async cleanupLocalDisk(cutoffMs: number, destructiveDeleteEnabled: boolean, lease: { lost(): boolean }): Promise<number> {
+    const storagePath = this.configService.get<string>('app.storagePath') || '/var/www/kahade-storage';
+    const uploadsDir = path.join(storagePath, 'uploads');
+    const files: string[] = [];
+    await this.walkLocalFiles(uploadsDir, files);
+
+    let orphanCount = 0;
+    let deleted = 0;
+    for (const full of files) {
+      if (lease.lost()) throw new Error('Orphaned upload cleanup lease lost');
+      let stat: fs.Stats;
+      try {
+        stat = await fs.promises.stat(full);
+      } catch {
+        continue;
+      }
+      if (stat.mtimeMs > cutoffMs) continue;
+      // Jangan sentuh export akun di sini — ditangani cleanupExpiredAccountExports.
+      const rel = path.relative(storagePath, full).split(path.sep).join('/');
+      if (rel.startsWith('account-exports/')) continue;
+
+      // fileKey bentuk: uploads/<folder>/<userId>/<file>
+      const parts = rel.split('/');
+      if (parts.length < 4 || parts[0] !== 'uploads') continue;
+      const userId = parts[2];
+      const fileKey = rel;
+      let isConfirmed = false;
+      try {
+        isConfirmed = (await this.redis.get(`confirmed_upload:${userId}:${fileKey}`, { throwOnError: true })) !== null;
+      } catch {
+        this.logger.error('Redis became unavailable during local cleanup — aborting to prevent deleting confirmed files');
+        return deleted;
+      }
+      if (isConfirmed) continue;
+      orphanCount++;
+      if (!destructiveDeleteEnabled) continue;
+      try {
+        await fs.promises.unlink(full);
+        deleted++;
+      } catch (err) {
+        this.logger.warn(`Failed to delete orphaned local file ${rel}: ${safeErrorMessage(err)}`);
+      }
+    }
+
+    if (orphanCount > 0 && !destructiveDeleteEnabled) {
+      this.logger.warn(`DRY-RUN (local disk): ${orphanCount} orphan candidate(s) under ${uploadsDir} older than cutoff; set ORPHAN_CLEANUP_ENABLED=true to delete`);
+    } else if (deleted > 0) {
+      this.logger.log(`Deleted ${deleted} orphaned files from local disk`);
+    }
+    // Samakan konvensi hitungan dengan pass S3 (dry-run ikut dihitung).
+    return destructiveDeleteEnabled ? deleted : orphanCount;
+  }
+
+  // Batch 1A (ST-019): export akun (dump PII) kedaluwarsa 24 jam setelah dibuat.
+  private async cleanupExpiredAccountExports(): Promise<number> {
+    const storagePath = this.configService.get<string>('app.storagePath') || '/var/www/kahade-storage';
+    const exportsDir = path.join(storagePath, 'uploads', 'account-exports');
+    const files: string[] = [];
+    await this.walkLocalFiles(exportsDir, files);
+    const cutoffMs = Date.now() - 24 * 60 * 60 * 1000;
+    let deleted = 0;
+    for (const full of files) {
+      try {
+        const stat = await fs.promises.stat(full);
+        if (stat.mtimeMs > cutoffMs) continue;
+        await fs.promises.unlink(full);
+        deleted++;
+      } catch {
+        // File hilang di tengah jalan — abaikan.
+      }
+    }
+    if (deleted > 0) this.logger.log(`Deleted ${deleted} expired account export file(s)`);
     return deleted;
   }
 }

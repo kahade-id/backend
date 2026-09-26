@@ -321,12 +321,12 @@ export class ChatController {
   @HttpCode(200)
   @ApiOperation({ summary: 'Upload a file attachment to a chat room' })
   @ApiConsumes('multipart/form-data')
-  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 10 * 1024 * 1024 } }))
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 50 * 1024 * 1024 } }))
   async uploadChatFile(
     @CurrentUser('sub') userId: string,
     @Param('roomId', ParseIdPipe) roomId: string,
     @UploadedFile() file: MulterFile,
-  ): Promise<{ url: string; fileUrl: string }> {
+  ): Promise<{ url: string; fileUrl: string; fileKey: string }> {
     if (!file) {
       throw new BadRequestException({ code: 'VALIDATION_ERROR', message: 'File is required' });
     }
@@ -338,13 +338,15 @@ export class ChatController {
       file.mimetype,
       file.buffer,
     );
-    // Chat attachments are stored in the private bucket. Return a short-lived
-    // read URL, not the internal object key (which is neither HTTPS nor readable
-    // by the mobile image component and was later rejected by SendMessageDto).
-    const readableUrl = result.fileUrl.startsWith('https://')
-      ? result.fileUrl
-      : await this.uploadService.generateDownloadUrl(result.fileKey, 900);
-    return { url: readableUrl, fileUrl: readableUrl };
+    // Chat attachments are private. uploadDirect() already returns a short-lived
+    // signed URL for private purposes (Batch 1A: ST-004) — use it directly
+    // for immediate preview. The client may send this signed URL (or the
+    // fileKey) in sendMessage; ChatService normalizes it to a stable storage
+    // URL before persisting and re-signs at read time.
+    // (Sebelumnya: fileUrl berupa URL publik permanen, sehingga controller ini
+    // memanggil ulang generateDownloadUrl().)
+    const readableUrl = result.fileUrl;
+    return { url: readableUrl, fileUrl: readableUrl, fileKey: result.fileKey };
   }
 
   @Get('rooms/:roomId/attachments')

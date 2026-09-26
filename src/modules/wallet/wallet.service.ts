@@ -1101,6 +1101,23 @@ export class WalletService implements OnModuleInit {
     return this.dummyPinHash;
   }
 
+  /**
+   * Verifikasi PIN wallet untuk otorisasi aksi sensitif lintas modul
+   * (mis. jadwal penarikan otomatis). Publik agar modul lain (withdrawals)
+   * dapat mewajibkan PIN tanpa menduplikasi logika rate-limit & lockout.
+   * Melempar UnauthorizedException bila PIN salah/belum diset.
+   */
+  async assertWalletPin(userId: string, pin: string, ip?: string): Promise<void> {
+    const wallet = await this.prisma.wallet.findUnique({
+      where: { userId },
+      select: { walletPinHash: true },
+    });
+    if (!wallet) {
+      throw new NotFoundException({ code: ErrorCodes.WALLET_NOT_FOUND, message: 'Wallet not found' });
+    }
+    await this.verifyWalletPin(wallet, pin, userId, ip);
+  }
+
   private async verifyWalletPin(
     wallet: { walletPinHash: string | null },
     pin: string,
@@ -1175,23 +1192,23 @@ export class WalletService implements OnModuleInit {
 
   /**
    * Menentukan kanal OTP untuk konfirmasi withdraw.
-   * Prioritas: email (jika ada) → WhatsApp (jika ada nomor HP).
-   * Konsisten dengan kebijakan OTP WA-only untuk user registrasi HP.
+   *
+   * 03-#5: WhatsApp-only sesuai keputusan produk (OTP hanya via WhatsApp
+   * yang diinisiasi pelanggan). Cabang email dihapus — user tanpa nomor HP
+   * terverifikasi mendapat error jelas, bukan fallback email.
    */
   private async getWithdrawOtpChannel(user: {
     email: string | null;
     phoneNumber: string | null;
-  }): Promise<{ channel: 'email' | 'whatsapp'; identity: string }> {
-    if (user.email) {
-      return { channel: 'email', identity: user.email };
-    }
+    phoneVerified?: boolean;
+  }): Promise<{ channel: 'whatsapp'; identity: string }> {
     const phone = await decryptPiiSafe(user.phoneNumber);
     if (phone) {
       return { channel: 'whatsapp', identity: phone };
     }
     throw new BadRequestException({
       code: 'OTP_CHANNEL_UNAVAILABLE',
-      message: 'Add an email address or phone number before requesting a withdrawal confirmation code.',
+      message: 'Verifikasi nomor HP Anda terlebih dahulu untuk menerima kode konfirmasi penarikan via WhatsApp.',
     });
   }
 
@@ -1476,45 +1493,19 @@ export class WalletService implements OnModuleInit {
         timestamp: Date.now(),
         otpChannel: otpChannel.channel,
       };
-      if (otpChannel.channel === 'whatsapp') {
-        await this.otpService.invalidatePhoneOtps(otpChannel.identity, OtpType.WITHDRAW_CONFIRMATION);
-        otp = await this.otpService.generatePhoneOtp(
-          otpChannel.identity,
-          OtpType.WITHDRAW_CONFIRMATION,
-          OtpMethod.WHATSAPP,
-          userId,
-          otpMetadata,
-          ip,
-        );
-        const delivery = await this.otpGateway.sendOtp(otpChannel.identity, otp, 'WHATSAPP');
-        if (!delivery.success) {
-          throw new Error(`WhatsApp OTP delivery failed: ${delivery.error ?? 'unknown'}`);
-        }
-      } else {
-        await this.otpService.invalidateOtps(otpChannel.identity, OtpType.WITHDRAW_CONFIRMATION);
-        otp = await this.otpService.generateOtp(
-          otpChannel.identity,
-          OtpType.WITHDRAW_CONFIRMATION,
-          userId,
-          otpMetadata,
-          ip,
-          this.withdrawOtpDigits,
-        );
-        await this.emailQueue.add(
-          'send',
-          {
-            to: otpChannel.identity,
-            subject: 'Kahade - Withdrawal Confirmation Code',
-            templateName: 'withdrawal-otp',
-            templateContext: { otp },
-          },
-          {
-            attempts: 3,
-            backoff: { type: 'exponential', delay: 5000 },
-            removeOnComplete: true,
-            removeOnFail: 50,
-          },
-        );
+      // 03-#5: WhatsApp-only — cabang email dihapus sesuai kebijakan OTP.
+      await this.otpService.invalidatePhoneOtps(otpChannel.identity, OtpType.WITHDRAW_CONFIRMATION);
+      otp = await this.otpService.generatePhoneOtp(
+        otpChannel.identity,
+        OtpType.WITHDRAW_CONFIRMATION,
+        OtpMethod.WHATSAPP,
+        userId,
+        otpMetadata,
+        ip,
+      );
+      const delivery = await this.otpGateway.sendOtp(otpChannel.identity, otp, 'WHATSAPP');
+      if (!delivery.success) {
+        throw new Error(`WhatsApp OTP delivery failed: ${delivery.error ?? 'unknown'}`);
       }
     } catch (otpError) {
       this.logger.error(
@@ -3390,20 +3381,13 @@ export class WalletService implements OnModuleInit {
         });
       }
 
-      const otpResult =
-        otpChannel.channel === 'whatsapp'
-          ? await this.otpService.verifyPhoneOtpWithMetadata(
-              otpChannel.identity,
-              OtpType.WITHDRAW_CONFIRMATION,
-              otpCode,
-              { consume: false },
-            )
-          : await this.otpService.verifyOtpWithMetadata(
-              otpChannel.identity,
-              OtpType.WITHDRAW_CONFIRMATION,
-              otpCode,
-              { consume: false },
-            );
+      // 03-#5: WhatsApp-only — verifikasi selalu via kanal WhatsApp.
+      const otpResult = await this.otpService.verifyPhoneOtpWithMetadata(
+        otpChannel.identity,
+        OtpType.WITHDRAW_CONFIRMATION,
+        otpCode,
+        { consume: false },
+      );
       if (!otpResult.valid) {
         throw new UnauthorizedException({
           code: ErrorCodes.OTP_INVALID,
@@ -3618,46 +3602,19 @@ export class WalletService implements OnModuleInit {
           timestamp: Date.now(),
           otpChannel: otpChannel.channel,
         };
-        if (otpChannel.channel === 'whatsapp') {
-          await this.otpService.invalidatePhoneOtps(otpChannel.identity, OtpType.WITHDRAW_CONFIRMATION);
-          const otp = await this.otpService.generatePhoneOtp(
-            otpChannel.identity,
-            OtpType.WITHDRAW_CONFIRMATION,
-            OtpMethod.WHATSAPP,
-            userId,
-            otpMetadata,
-            ipAddress,
-          );
-          const delivery = await this.otpGateway.sendOtp(otpChannel.identity, otp, 'WHATSAPP');
-          if (!delivery.success) {
-            throw new Error(`WhatsApp OTP delivery failed: ${delivery.error ?? 'unknown'}`);
-          }
-        } else {
-          await this.otpService.invalidateOtps(otpChannel.identity, OtpType.WITHDRAW_CONFIRMATION);
-          const otp = await this.otpService.generateOtp(
-            otpChannel.identity,
-            OtpType.WITHDRAW_CONFIRMATION,
-            userId,
-            otpMetadata,
-            ipAddress,
-            this.withdrawOtpDigits,
-          );
-
-          await this.emailQueue.add(
-            'send',
-            {
-              to: otpChannel.identity,
-              subject: 'Kahade - Withdrawal Confirmation Code',
-              templateName: 'withdrawal-otp',
-              templateContext: { otp },
-            },
-            {
-              attempts: 3,
-              backoff: { type: 'exponential', delay: 5000 },
-              removeOnComplete: true,
-              removeOnFail: 50,
-            },
-          );
+        // 03-#5: WhatsApp-only — cabang email dihapus sesuai kebijakan OTP.
+        await this.otpService.invalidatePhoneOtps(otpChannel.identity, OtpType.WITHDRAW_CONFIRMATION);
+        const otp = await this.otpService.generatePhoneOtp(
+          otpChannel.identity,
+          OtpType.WITHDRAW_CONFIRMATION,
+          OtpMethod.WHATSAPP,
+          userId,
+          otpMetadata,
+          ipAddress,
+        );
+        const delivery = await this.otpGateway.sendOtp(otpChannel.identity, otp, 'WHATSAPP');
+        if (!delivery.success) {
+          throw new Error(`WhatsApp OTP delivery failed: ${delivery.error ?? 'unknown'}`);
         }
 
         const refreshed = await this.prisma.walletTransaction.updateMany({

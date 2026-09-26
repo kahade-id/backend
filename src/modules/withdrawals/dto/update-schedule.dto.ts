@@ -1,5 +1,5 @@
-import { IsInt, IsBoolean, IsOptional, Min, Max } from 'class-validator';
-import { ApiPropertyOptional } from '@nestjs/swagger';
+import { IsInt, IsBoolean, IsOptional, IsString, IsNotEmpty, Length, Matches, Min, Max } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { IsValidId } from '../../../common/decorators/is-valid-id.decorator';
 
 export class UpdateScheduleDto {
@@ -26,4 +26,11 @@ export class UpdateScheduleDto {
   @IsOptional()
   @IsValidId()
   bankAccountId?: string;
+
+  @ApiProperty({ description: '6-digit wallet PIN — required to authorize any change to an automated withdrawal schedule', minLength: 6, maxLength: 6 })
+  @IsString()
+  @IsNotEmpty()
+  @Length(6, 6, { message: 'Wallet PIN must be exactly 6 digits' })
+  @Matches(/^\d{6}$/, { message: 'Wallet PIN must consist of 6 numeric digits' })
+  pin!: string;
 }

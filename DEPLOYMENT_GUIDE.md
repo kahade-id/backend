@@ -458,14 +458,35 @@ MIDTRANS_IRIS_IS_PRODUCTION=true
 MIDTRANS_NOTIFICATION_URL=https://api.kahade.id/v1/payments/midtrans-webhook
 MIDTRANS_ALLOWED_CIDRS=103.208.23.0/24,103.208.24.0/24
 
-# ─── Cloudflare R2 (S3-compatible storage) ───────────────────
-# Untuk KYC documents, avatars, chat attachments
-R2_ACCESS_KEY_ID=
-R2_SECRET_ACCESS_KEY=
-R2_ACCOUNT_ID=your_cloudflare_account_id
-R2_BUCKET_PUBLIC=kahade-uploads-public-prod
-R2_BUCKET_PRIVATE=kahade-uploads-private-prod
-R2_PUBLIC_URL=https://cdn.kahade.id
+# ─── Self-hosted storage (pengganti Cloudflare R2, 2026-09-26) ───
+# Upload disimpan di disk server, diserve nginx. R2 sudah dibuang dari jalur
+# upload (keputusan produk: tanpa spend Cloudflare). Var R2_* di bawah ini
+# DEPRECATED — hanya diisi bila masih butuh baca file legacy di R2.
+# R2_ACCESS_KEY_ID=
+# R2_SECRET_ACCESS_KEY=
+# R2_ACCOUNT_ID=
+# R2_BUCKET_PUBLIC=
+# R2_BUCKET_PRIVATE=
+# R2_PUBLIC_URL=
+
+# Direktori penyimpanan file (harus dapat ditulis user `kahade`).
+STORAGE_PATH=/var/www/kahade-storage
+# URL publik untuk file PUBLIK (prefix avatars/, showcase-images/ via nginx).
+STORAGE_PUBLIC_URL=https://api.kahade.id/uploads
+# Secret opsional untuk signed URL file privat; fallback ke JWT_SECRET bila kosong.
+# STORAGE_URL_SECRET=
+
+# Model keamanan file (Batch 1A):
+# - Prefix PUBLIK (disserve nginx tanpa auth): uploads/avatars/, uploads/showcase-images/
+# - Prefix PRIVAT (404 di nginx; HANYA via signed URL backend):
+#   uploads/kyc-ktp/, kyc-selfie/, kyc-passport/, kyc-liveness/,
+#   business-documents/, dispute-evidence/, report-evidence/, delivery-proof/,
+#   chat-attachments/, account-exports/
+# - generateDownloadUrl(fileKey, expiresIn): file privat → signed URL HMAC ke
+#   GET /v1/upload/s?key=&exp=&sig= (kedaluwarsa sesuai expiresIn).
+# - Backup: /var/www/kahade-storage HARUS masuk jadwal backup (rsync/offsite).
+#   Tanpa backup, satu disk = single point of failure.
+# - Monitoring: deploy/storage-disk-check.sh via cron tiap 30 menit.
 
 # ─── SMTP (Email) ───────────────────────────────────────────
 SMTP_HOST=smtp.your-provider.com

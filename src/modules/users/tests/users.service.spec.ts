@@ -8,6 +8,8 @@ import { AuditLogService } from '../../../common/services/audit-log.service';
 import { OgMetadataService } from '../og-metadata.service';
 import { VerificationBadgeService } from '../verification-badge.service';
 import { ReportFlagService } from '../../../common/services/report-flag.service';
+import { LocalStorageService } from '../../upload/local-storage.service';
+import { UserAnalyticsService } from '../user-analytics.service';
 import { Prisma } from '@prisma/client';
 import { bcryptHash } from '../../../common/utils/crypto.util';
 import * as cryptoUtils from '../../../common/utils/crypto.util';
@@ -46,9 +48,18 @@ const mockAudit = { logUserAction: jest.fn() };
 const mockConfig = { get: jest.fn() };
 const mockOg = { invalidateUserOgCache: jest.fn() };
 // Section 1/2: getPublicProfile sekarang menyertakan badge verifikasi.
-const mockVerificationBadges = { getBadges: jest.fn(), invalidate: jest.fn(), loadBadges: jest.fn(), computeBadges: jest.fn(), getCatalog: jest.fn(), getPublicBadgesByUsername: jest.fn() };
+const mockVerificationBadges = { getBadges: jest.fn(), getSealTierMap: jest.fn(), invalidate: jest.fn(), loadBadges: jest.fn(), computeBadges: jest.fn(), getCatalog: jest.fn(), getPublicBadgesByUsername: jest.fn() };
 // Section 6: agregasi laporan -> flag moderasi internal.
 const mockReportFlag = { evaluateTarget: jest.fn() };
+// Batch 1B (SS-007/ST-007): avatar & cover kini memakai LocalStorageService.
+const mockLocalStorage = {
+  saveFile: jest.fn(),
+  deleteFile: jest.fn(),
+  getFileSize: jest.fn(),
+  getPublicUrl: jest.fn((key: string) => `https://api.kahade.id/uploads/${key}`),
+};
+// Pre-existing: UserAnalyticsService belum di-mock di file test ini.
+const mockUserAnalytics = {};
 
 describe('UsersService', () => {
   let service: UsersService;
@@ -61,6 +72,7 @@ describe('UsersService', () => {
     mockPrisma.notification.create.mockResolvedValue({});
     mockOg.invalidateUserOgCache.mockResolvedValue(undefined);
     mockVerificationBadges.getBadges.mockResolvedValue([]);
+    mockVerificationBadges.getSealTierMap.mockResolvedValue(new Map());
     mockReportFlag.evaluateTarget.mockResolvedValue({ flaggedForReview: false, distinctReporters: 1 });
     mockPrisma.$transaction.mockImplementation(async (fn: any) => fn(mockPrisma));
     mockPrisma.rating.aggregate.mockResolvedValue({ _avg: { stars: null } });
@@ -75,6 +87,10 @@ describe('UsersService', () => {
         { provide: VerificationBadgeService, useValue: mockVerificationBadges },
         // Section 6: agregasi laporan -> flag moderasi internal.
         { provide: ReportFlagService, useValue: mockReportFlag },
+        // Batch 1B (SS-007/ST-007): avatar & cover kini memakai LocalStorageService.
+        { provide: LocalStorageService, useValue: mockLocalStorage },
+        // Pre-existing: UserAnalyticsService belum di-mock di file test ini.
+        { provide: UserAnalyticsService, useValue: mockUserAnalytics },
       ],
     }).compile();
     service = module.get<UsersService>(UsersService);

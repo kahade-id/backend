@@ -49,19 +49,21 @@ export class AdminAuthController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Admin login' })
   @ApiBody({ type: AdminLoginDto })
-  @ApiResponse({ status: 200, description: 'Login successful or MFA required (requiresMfa: true + tempToken).' })
+  @ApiResponse({ status: 200, description: 'Login successful, MFA required (requiresMfa: true + tempToken), or MFA setup required (requiresMfaSetup: true + tempToken).' })
   async login(
     @Body() dto: AdminLoginDto,
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<
     | { requiresMfa: true; tempToken: string }
+    | { requiresMfaSetup: true; tempToken: string }
     | { accessToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }
   > {
     const ip = req.ip || 'unknown';
     const result = await this.adminAuthService.login(dto.email, dto.password, dto.totpToken, ip);
 
     if ('requiresMfa' in result) return result;
+    if ('requiresMfaSetup' in result) return result;
 
     this.setRefreshCookie(res, result.refreshToken);
     const { refreshToken: _rt, ...body } = result;
@@ -146,5 +148,45 @@ export class AdminAuthController {
     @CurrentAdmin() admin: AdminJwtPayload,
   ): Promise<{ id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: Date | null; lastLoginIp: string | null }> {
     return this.adminAuthService.getProfile(admin.sub);
+  }
+
+  /**
+   * 03-#8: mulai enroll MFA admin. Body: { tempToken } dari login yang
+   * mengembalikan requiresMfaSetup. Mengembalikan otpauthUrl + secret
+   * untuk dipindai di aplikasi authenticator.
+   */
+  @Public()
+  @Throttle({ default: { ttl: 300000, limit: 5 } })
+  @Post('mfa/setup')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Admin MFA setup — get TOTP secret (requiresMfaSetup tempToken)' })
+  @ApiResponse({ status: 200, description: 'otpauthUrl + secret returned.' })
+  async mfaSetup(
+    @Body() dto: { tempToken: string },
+  ): Promise<{ otpauthUrl: string; secret: string }> {
+    return this.adminAuthService.setupMfa(dto.tempToken);
+  }
+
+  /**
+   * 03-#8: selesaikan enroll MFA. Body: { tempToken, totpToken }.
+   * Mengembalikan sesi penuh (accessToken + refresh cookie).
+   */
+  @Public()
+  @Throttle({ default: { ttl: 300000, limit: 5 } })
+  @Post('mfa/enable')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Admin MFA enable — verify TOTP and activate MFA' })
+  @ApiResponse({ status: 200, description: 'MFA enabled; session tokens returned.' })
+  async mfaEnable(
+    @Body() dto: { tempToken: string; totpToken: string },
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ accessToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }> {
+    const ip = req.ip || 'unknown';
+    const result = await this.adminAuthService.enableMfa(dto.tempToken, dto.totpToken, ip);
+
+    this.setRefreshCookie(res, result.refreshToken);
+    const { refreshToken: _rt, ...body } = result;
+    return body;
   }
 }

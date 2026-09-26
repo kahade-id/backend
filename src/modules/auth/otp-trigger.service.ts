@@ -51,6 +51,10 @@ interface TriggerRecord {
   createdAt: string;
   expiresAt: string;
   otpSentAt?: string;
+  /** 03-#3: true untuk record decoy anti-enumerasi — webhook tidak boleh
+   * menyelesaikan/mengirim OTP untuknya, tetapi siklus status polling
+   * harus identik dengan trigger asli. */
+  decoy?: boolean;
 }
 
 export interface TriggerPayload {
@@ -133,16 +137,20 @@ export class OtpTriggerService {
       // Prekondisi per purpose.
       // Catatan anti-enumerasi: untuk REGISTER (nomor sudah terdaftar) dan
       // FORGOT_PASSWORD (nomor tidak dikenal / akun nonaktif / terkunci),
-      // kembalikan payload "decoy" yang bentuknya identik dengan sukses.
-      // refCode decoy TIDAK disimpan di Redis sehingga polling status selalu
-      // EXPIRED dan webhook tidak akan pernah menyelesaikannya — penyerang
-      // tidak bisa membedakan nomor terdaftar vs tidak dari respons endpoint
-      // ini (konsisten dengan perlindungan enumerasi email di register()).
+      // kembalikan payload "decoy" yang bentuknya identik dengan sukses
+      // DAN siklus status polling-nya identik (record WAITING di Redis
+      // dengan flag decoy; webhook menyelesaikannya tanpa mengirim OTP —
+      // lihat handleFonnteWebhook). 03-#3: sebelumnya decoy tidak disimpan
+      // sehingga langsung EXPIRED — orakel enumerasi via polling.
       let boundUserId: string | undefined;
       if (dto.purpose === OtpTriggerPurpose.REGISTER) {
         const existing = await this.findUserByPhone(phoneNumber, phoneHash);
         if (existing) {
-          return this.buildDecoyTriggerPayload();
+          return this.buildDecoyTriggerPayload({
+            phoneNumber,
+            deviceId: dto.deviceId,
+            purpose: dto.purpose,
+          });
         }
       } else if (dto.purpose === OtpTriggerPurpose.FORGOT_PASSWORD) {
         const user = await this.findUserByPhone(phoneNumber, phoneHash);
@@ -152,7 +160,11 @@ export class OtpTriggerService {
           user.isBanned ||
           (user.lockedUntil && user.lockedUntil > new Date())
         ) {
-          return this.buildDecoyTriggerPayload();
+          return this.buildDecoyTriggerPayload({
+            phoneNumber,
+            deviceId: dto.deviceId,
+            purpose: dto.purpose,
+          });
         }
         boundUserId = user.id;
       } else if (dto.purpose === OtpTriggerPurpose.MIGRATE_PHONE) {
@@ -250,13 +262,22 @@ export class OtpTriggerService {
 
   // ── Webhook pesan masuk Fonnte ───────────────────────────────────
 
+  /**
+   * 03-#7: bila FONNTE_WEBHOOK_SECRET tidak diset, webhook DITERIMA dengan
+   * warning KERAS (fail-open sementara). JANGAN diam-diam membiarkannya:
+   * langkah produksi = set FONNTE_WEBHOOK_SECRET di .env + update URL
+   * webhook di dashboard Fonnte. Setelah itu, ubah ke fail-closed
+   * (return false di sini) agar webhook tanpa secret ditolak.
+   */
   verifyWebhookSecret(provided?: string): boolean {
     const expected = this.config.get<string>('FONNTE_WEBHOOK_SECRET');
     if (!expected) {
-      // Secret belum dikonfigurasi: izinkan dengan peringatan. Gate utama
+      // Secret belum dikonfigurasi: izinkan dengan peringatan KERAS. Gate utama
       // tetap pencocokan refCode (48-bit, TTL 10 mnt) + nomor pengirim.
-      this.logger.warn(
-        '[OTP-TRIGGER] FONNTE_WEBHOOK_SECRET belum diset — webhook berjalan tanpa verifikasi secret.',
+      this.logger.error(
+        '[SECURITY] FONNTE_WEBHOOK_SECRET is not set — accepting Fonnte webhook without secret verification (fail-open). ' +
+          'ACTION REQUIRED: set FONNTE_WEBHOOK_SECRET in production .env and update the webhook URL in the Fonnte dashboard ' +
+          'to https://api.kahade.id/v1/auth/webhooks/fonnte?webhookSecret=<secret>, then switch verifyWebhookSecret to fail-closed (return false when !expected).',
       );
       return true;
     }
@@ -316,6 +337,16 @@ export class OtpTriggerService {
         return;
       }
 
+      // 03-#3: record decoy anti-enumerasi — selesaikan TANPA mengirim OTP.
+      // Siklus status polling (WAITING → COMPLETED) tetap identik dengan
+      // trigger asli sehingga tidak ada orakel enumerasi.
+      if (record.decoy === true) {
+        record.status = 'COMPLETED';
+        record.otpSentAt = new Date().toISOString();
+        await this.redis.set(OTP_TRIGGER(refCode), JSON.stringify(record), TRIGGER_TTL_SECONDS);
+        return;
+      }
+
       let otp: string;
       try {
         otp = await this.otpService.generatePhoneOtp(
@@ -328,6 +359,9 @@ export class OtpTriggerService {
             deviceId: record.deviceId,
             triggerPurpose: record.purpose,
             refCode,
+            // 03-#2: verifyPhoneOtp() untuk migrate_phone membaca metadata.userId.
+            // Tanpa ini migrasi nomor HP selalu gagal Unauthorized.
+            ...(record.userId ? { userId: record.userId } : {}),
           },
           undefined,
         );
@@ -368,15 +402,32 @@ export class OtpTriggerService {
 
   /**
    * Payload "decoy" anti-enumerasi: bentuknya identik dengan respons sukses
-   * createTrigger, tetapi refCode-nya acak dan TIDAK disimpan di Redis.
-   * Polling status untuk kode ini selalu mengembalikan EXPIRED dan webhook
-   * tidak akan pernah menyelesaikannya, sehingga pemanggil tidak bisa
-   * membedakan nomor terdaftar vs tidak terdaftar dari endpoint ini.
+   * createTrigger DAN refCode-nya disimpan di Redis sebagai record berstatus
+   * WAITING dengan flag `decoy` (TTL sama dengan trigger asli).
+   *
+   * 03-#3: versi sebelumnya tidak menyimpan apa pun sehingga polling status
+   * decoy langsung EXPIRED vs WAITING untuk trigger asli — orakel enumerasi.
+   * Sekarang polling decoy mengikuti siklus yang sama; webhook menyelesaikan
+   * decoy TANPA mengirim OTP (lihat handleFonnteWebhook).
    */
-  private buildDecoyTriggerPayload(): TriggerPayload {
-    const refCode = randomBytes(REFCODE_BYTES).toString('hex').toUpperCase();
+  private async buildDecoyTriggerPayload(ctx: {
+    phoneNumber: string;
+    deviceId?: string;
+    purpose: OtpTriggerPurpose;
+  }): Promise<TriggerPayload> {
     const now = new Date();
     const expiresAt = new Date(now.getTime() + TRIGGER_TTL_SECONDS * 1000);
+    const record: TriggerRecord = {
+      phoneNumber: ctx.phoneNumber,
+      deviceId: ctx.deviceId,
+      purpose: ctx.purpose,
+      status: 'WAITING',
+      createdAt: now.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+      decoy: true,
+    };
+    // Klaim atomik agar refCode decoy tidak bertabrakan dengan trigger asli.
+    const refCode = await this.claimUniqueRefCode(record);
     const triggerText = `KAHADE ${refCode}`;
     return {
       refCode,

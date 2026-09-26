@@ -498,7 +498,7 @@ export class AdminKycService {
     adminId: string,
     ipAddress: string = 'unknown',
     adminPassword?: string,
-  ): Promise<{ ktpUrl: string | null; selfieUrl: string | null; partialErrors?: string[] }> {
+  ): Promise<{ ktpUrl: string | null; selfieUrl: string | null; livenessUrl: string | null; documentType: string | null; partialErrors?: string[] }> {
     if (!adminPassword) {
       throw new UnauthorizedException({
         code: ErrorCodes.UNAUTHORIZED,
@@ -543,6 +543,7 @@ export class AdminKycService {
     // ciphertext doesn't prevent the admin from accessing the other (valid) document.
     let ktpFileKey: string | null = null;
     let selfieFileKey: string | null = null;
+    let livenessFileKey: string | null = null;
     const decryptErrors: string[] = [];
 
     try {
@@ -557,6 +558,15 @@ export class AdminKycService {
       decryptErrors.push('Selfie photo is unavailable');
       this.logger.error(`[AdminKycService] Selfie photo decryption failed for kycId=${kycId}`, err);
     }
+    // 03-#6: liveness key kini disimpan — dekripsi independen seperti dokumen lain.
+    if (request.livenessFileKey) {
+      try {
+        livenessFileKey = await decryptAES(request.livenessFileKey);
+      } catch (err) {
+        decryptErrors.push('Liveness video is unavailable');
+        this.logger.error(`[AdminKycService] Liveness decryption failed for kycId=${kycId}`, err);
+      }
+    }
 
     if (!ktpFileKey && !selfieFileKey) {
       throw new BadRequestException({
@@ -567,6 +577,7 @@ export class AdminKycService {
 
     let ktpUrl: string | null = null;
     let selfieUrl: string | null = null;
+    let livenessUrl: string | null = null;
     if (ktpFileKey) {
       try {
         ktpUrl = await this.uploadService.generateDownloadUrl(ktpFileKey, 300);
@@ -589,6 +600,17 @@ export class AdminKycService {
         decryptErrors.push('Selfie download URL is unavailable');
       }
     }
+    if (livenessFileKey) {
+      try {
+        livenessUrl = await this.uploadService.generateDownloadUrl(livenessFileKey, 300);
+      } catch (err) {
+        this.logger.error(
+          `[AdminKycService] Liveness signed URL generation failed for kycId=${kycId}`,
+          err,
+        );
+        decryptErrors.push('Liveness download URL is unavailable');
+      }
+    }
 
     this.auditLog.logAdminAction({
       adminId,
@@ -602,6 +624,8 @@ export class AdminKycService {
     return {
       ktpUrl,
       selfieUrl,
+      livenessUrl,
+      documentType: request.documentType ?? null,
       ...(decryptErrors.length > 0 ? { partialErrors: decryptErrors } : {}),
     };
   }

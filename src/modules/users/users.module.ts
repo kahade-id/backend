@@ -12,9 +12,10 @@ import { ShowcaseModule } from "../showcase/showcase.module";
 import { KycRequiredGuard } from "../../common/guards/kyc-required.guard";
 import { AuditLogModule } from "../../common/services/audit-log.module";
 import { ReportFlagService } from "../../common/services/report-flag.service";
+import { UploadModule } from "../upload/upload.module";
 
 @Module({
-  imports: [ConfigModule, AuditLogModule, VerificationBadgeModule, ShowcaseModule],
+  imports: [ConfigModule, AuditLogModule, VerificationBadgeModule, ShowcaseModule, UploadModule],
   controllers: [UsersController],
   providers: [UsersService, UserSearchService, UserStatsService, UserAnalyticsService, ProfileQAService, OgMetadataService, KycRequiredGuard, ReportFlagService],
   exports: [UsersService, UserSearchService, UserStatsService, UserAnalyticsService, ProfileQAService, OgMetadataService],

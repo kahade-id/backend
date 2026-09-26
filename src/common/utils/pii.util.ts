@@ -1,4 +1,7 @@
 import { encryptAES, decryptAES, hmacSHA256 } from './crypto.util';
+import { Logger } from '@nestjs/common';
+
+const piiLogger = new Logger('decryptPiiSafe');
 
 export function normalizePhoneNumber(phone: string): string {
   const cleaned = phone.replace(/[\s\-.]/g, '');
@@ -27,7 +30,14 @@ export async function decryptPiiSafe(value: string | null | undefined): Promise<
   if (!value) return null;
   try {
     return await decryptAES(value);
-  } catch {
-    return value;
+  } catch (err) {
+    // 03-#9: FAIL-CLOSED. Sebelumnya mengembalikan ciphertext mentah sebagai
+    // "nilai" — ciphertext bisa tampil sebagai nomor HP di UI/admin, bahkan
+    // diteruskan sebagai identitas kanal WhatsApp. Kembalikan null dan log
+    // insiden TANPA mengutip nilai PII.
+    piiLogger.error(
+      `PII decryption failed (returning null, fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
   }
 }

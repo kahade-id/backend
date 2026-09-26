@@ -1,37 +1,38 @@
 import { Injectable, BadRequestException, NotFoundException, Logger, ConflictException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createHash } from 'crypto';
+import { createHash, createHmac, timingSafeEqual } from 'crypto';
+import { Readable } from 'stream';
 
 import { customAlphabet } from 'nanoid';
 import { UploadPurpose } from './dto/presigned-url.dto';
 import { RedisService } from '../../redis/redis.service';
 import { LocalStorageService } from './local-storage.service';
+import { encryptAES, decryptAES } from '../../common/utils/crypto.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
 
 const nanoid = customAlphabet('1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ', 10);
 
-// NOTE (audit): image/heic, image/heif and image/avif are recognised by
-// `detectMimeFromBytes` but are intentionally NOT allowed here. The effect is
-// that an iPhone HEIC upload is rejected with a clear MIME_TYPE_MISMATCH rather
-// than a vague "unable to identify file type". Admitting them would require
-// server-side transcoding first: browsers do not render HEIC, so the admin KYC
-// review screen and the dispute-evidence viewer would show broken images.
-// See OPEN QUESTION in the audit report.
+// NOTE (batch 1A, ST-016): image/heic & image/heif DITERIMA untuk KYC, dokumen
+// bisnis, bukti, dan lampiran chat — format default kamera iPhone tidak boleh
+// ditolak. Magic-byte detection sudah mencakup brand ftyp HEIC/HEIF.
+// AVATAR & SHOWCASE_IMAGE tetap tanpa HEIC: keduanya dirender langsung oleh
+// browser/<Image> dan browser tidak merender HEIC — klaim itu tetap valid
+// untuk konten yang tampil publik.
 const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
-  [UploadPurpose.KYC_KTP]: ['image/jpeg', 'image/png', 'image/webp'],
-  [UploadPurpose.KYC_SELFIE]: ['image/jpeg', 'image/png', 'image/webp'],
-  [UploadPurpose.KYC_PASSPORT]: ['image/jpeg', 'image/png', 'image/webp'],
-  [UploadPurpose.KYC_LIVENESS]: ['image/jpeg', 'image/png', 'image/webp'],
+  [UploadPurpose.KYC_KTP]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'],
+  [UploadPurpose.KYC_SELFIE]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'],
+  [UploadPurpose.KYC_PASSPORT]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'],
+  [UploadPurpose.KYC_LIVENESS]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'],
   // Dokumen badan usaha boleh PDF (NPWP/akta/SIUP umumnya dipindai sebagai PDF).
-  [UploadPurpose.BUSINESS_DOCUMENT]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
+  [UploadPurpose.BUSINESS_DOCUMENT]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf'],
   // Section 3: gambar showcase tampil publik di feed, jadi hanya image raster.
   // PDF/SVG ditolak — tidak bisa dirender sebagai thumbnail kartu feed.
   [UploadPurpose.SHOWCASE_IMAGE]: ['image/jpeg', 'image/png', 'image/webp'],
   [UploadPurpose.AVATAR]: ['image/jpeg', 'image/png', 'image/webp'],
-  [UploadPurpose.CHAT_ATTACHMENT]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm', 'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/mp4'],
-  [UploadPurpose.DISPUTE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm'],
-  [UploadPurpose.REPORT_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
-  [UploadPurpose.DELIVERY_PROOF]: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
+  [UploadPurpose.CHAT_ATTACHMENT]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm', 'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/mp4'],
+  [UploadPurpose.DISPUTE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm'],
+  [UploadPurpose.REPORT_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf'],
+  [UploadPurpose.DELIVERY_PROOF]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf'],
 };
 
 const MIN_FILE_SIZE = 1024;
@@ -177,9 +178,19 @@ const PRIVATE_FOLDER_PREFIXES: string[] = (Object.keys(PURPOSE_VISIBILITY) as Up
   .filter((p) => PURPOSE_VISIBILITY[p] === 'private')
   .map((p) => `uploads/${PURPOSE_FOLDER_MAP_INTERNAL[p]}/`);
 
-function isPrivatePath(fileKey: string): boolean {
+// Batch 1A (ST-005): visibility classification yang di-ENFORCE. Sebelumnya
+// `isPrivatePath()` adalah dead code (nol call site) — sekarang dipakai oleh
+// generateDownloadUrl(), uploadDirect(), dan endpoint download terautentikasi.
+export function isPrivateFileKey(fileKey: string): boolean {
   return PRIVATE_FOLDER_PREFIXES.some(prefix => fileKey.startsWith(prefix))
     || fileKey.startsWith('uploads/account-exports/');
+}
+
+/** Prefix folder publik yang diserve langsung oleh nginx tanpa auth. */
+export const PUBLIC_FOLDER_PREFIXES = ['uploads/avatars/', 'uploads/headers/', 'uploads/showcase-images/'];
+
+export function isPublicFileKey(fileKey: string): boolean {
+  return PUBLIC_FOLDER_PREFIXES.some(prefix => fileKey.startsWith(prefix));
 }
 
 @Injectable()
@@ -191,6 +202,85 @@ export class UploadService {
     private redis: RedisService,
     private localStorage: LocalStorageService,
   ) {}
+
+  // ── Batch 1A (ST-002/03-#1): signed URL HMAC untuk file privat ──
+  // Menggantikan semantik presigned-URL R2: URL kedaluwarsa yang hanya bisa
+  // dibuat server-side setelah otorisasi. Secret dari STORAGE_URL_SECRET
+  // (opsional), fallback ke JWT_SECRET (wajib, ≥32 char).
+  private getUrlSigningSecret(): string {
+    const dedicated = this.configService.get<string>('STORAGE_URL_SECRET');
+    if (dedicated && dedicated.trim().length >= 16) return dedicated.trim();
+    const jwtSecret = this.configService.get<string>('jwt.secret') || this.configService.get<string>('JWT_SECRET');
+    if (!jwtSecret) {
+      throw new Error('URL signing secret unavailable: set STORAGE_URL_SECRET or JWT_SECRET');
+    }
+    return jwtSecret;
+  }
+
+  private buildSignedDownloadUrl(fileKey: string, expiresIn: number): string {
+    const exp = Math.floor(Date.now() / 1000) + Math.max(60, expiresIn);
+    const sig = createHmac('sha256', this.getUrlSigningSecret())
+      .update(`${fileKey}:${exp}`)
+      .digest('hex');
+    const publicBase = (this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads').replace(/\/+$/, '');
+    // Basis API = publicBase tanpa segmen /uploads terakhir.
+    const apiBase = publicBase.replace(/\/uploads\/?$/, '') || publicBase;
+    return `${apiBase}/v1/upload/s?key=${encodeURIComponent(fileKey)}&exp=${exp}&sig=${sig}`;
+  }
+
+  /** Verifikasi query signed download. Kembalikan fileKey bila valid. */
+  verifySignedDownload(key: string, exp: string, sig: string): string | null {
+    if (!isSafeFileKey(key) || !isPrivateFileKey(key)) return null;
+    const expNum = Number(exp);
+    if (!Number.isInteger(expNum) || expNum <= Math.floor(Date.now() / 1000)) return null;
+    if (!/^[0-9a-f]{64}$/.test(sig)) return null;
+    let expected: Buffer;
+    try {
+      expected = Buffer.from(
+        createHmac('sha256', this.getUrlSigningSecret()).update(`${key}:${expNum}`).digest('hex'),
+        'hex',
+      );
+    } catch {
+      return null;
+    }
+    const actual = Buffer.from(sig, 'hex');
+    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
+    return key;
+  }
+
+  /** Stream byte file privat untuk endpoint download terautentikasi. */
+  async getPrivateFileStream(fileKey: string): Promise<{ stream: Readable; contentType: string; size: number }> {
+    if (!isSafeFileKey(fileKey) || !isPrivateFileKey(fileKey)) {
+      throw new BadRequestException({ code: ErrorCodes.INVALID_FILE_TYPE, message: 'Invalid private file key' });
+    }
+    const size = await this.localStorage.getFileSize(fileKey);
+    if (size === null) {
+      throw new NotFoundException({ code: ErrorCodes.FILE_NOT_FOUND_OR_EXPIRED, message: 'File not found' });
+    }
+    let stream: Readable = this.localStorage.createReadStream(fileKey) as Readable;
+    // ST-019: export akun disimpan terenkripsi at-rest — dekripsi saat serve.
+    // Fallback: file lama (sebelum enkripsi) yang sudah berupa JSON diserve
+    // apa adanya agar masa transisi tidak merusak unduhan yang sedang berjalan.
+    if (fileKey.startsWith('uploads/account-exports/')) {
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream) chunks.push(chunk as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf-8');
+      let buf: Buffer;
+      try {
+        const decryptedB64 = await decryptAES(raw);
+        buf = Buffer.from(decryptedB64, 'base64');
+      } catch {
+        if (raw.trimStart().startsWith('{')) {
+          buf = Buffer.from(raw, 'utf-8');
+        } else {
+          throw new BadRequestException({ code: ErrorCodes.FILE_NOT_FOUND_OR_EXPIRED, message: 'Export file is unavailable or corrupted' });
+        }
+      }
+      stream = Readable.from([buf]);
+      return { stream, contentType: 'application/json', size: buf.length };
+    }
+    return { stream, contentType: this.localStorage.getContentType(fileKey), size };
+  }
 
   // ── Self-hosted storage (2026-09-26): R2 diganti local disk. ──
   // getS3Client(), getBucket(), getBucketForKey() dihapus.
@@ -563,10 +653,19 @@ export class UploadService {
     return (await this.localStorage.getFileSize(fileKey)) ?? 0;
   }
 
+  /**
+   * URL unduh untuk fileKey.
+   *
+   * Batch 1A (03-#1, ST-002): file PUBLIK → URL publik langsung (disserve nginx).
+   * File PRIVAT → signed URL HMAC ke `GET /v1/upload/s` dengan expiry sesuai
+   * `expiresIn`. Sebelumnya selalu mengembalikan URL publik permanen dan
+   * mengabaikan `expiresIn`.
+   */
   async generateDownloadUrl(fileKey: string, expiresIn = 300): Promise<string> {
     if (!isSafeFileKey(fileKey) || !this.isKnownStorageKey(fileKey)) throw new BadRequestException({ code: ErrorCodes.INVALID_FILE_TYPE, message: 'Invalid file key format' });
-    // Self-hosted: tidak ada signed URL. Kembalikan URL publik langsung;
-    // file privat tetap harus diakses lewat endpoint terautentikasi.
+    if (isPrivateFileKey(fileKey)) {
+      return this.buildSignedDownloadUrl(fileKey, expiresIn);
+    }
     return this.localStorage.getPublicUrl(fileKey);
   }
 
@@ -574,17 +673,22 @@ export class UploadService {
    * Stores a generated account export in local storage. This method is
    * intentionally not exposed by UploadController: users can request an
    * export through SettingsService, but cannot choose an arbitrary private key.
+   *
+   * Batch 1A (ST-019): konten dienkripsi AES-GCM at-rest. URL unduh adalah
+   * signed URL kedaluwarsa (bukan URL publik permanen), dan file dihapus
+   * otomatis oleh scheduler setelah 24 jam.
    */
   async uploadPrivateAccountExport(userId: string, content: Buffer): Promise<{ downloadUrl: string; expiresAt: Date }> {
     const fileKey = `uploads/account-exports/${userId}/${nanoid()}.json`;
     if (!isSafeFileKey(fileKey)) {
       throw new Error('Generated account export key failed storage safety validation');
     }
-    await this.localStorage.saveFile(fileKey, content);
+    const encrypted = await encryptAES(content.toString('base64'));
+    await this.localStorage.saveFile(fileKey, Buffer.from(encrypted, 'utf-8'));
 
     const expiresIn = 900;
     return {
-      downloadUrl: this.localStorage.getPublicUrl(fileKey),
+      downloadUrl: this.buildSignedDownloadUrl(fileKey, expiresIn),
       expiresAt: new Date(Date.now() + expiresIn * 1000),
     };
   }
@@ -653,9 +757,12 @@ export class UploadService {
     const redisKey = `confirmed_upload:${userId}:${fileKey}`;
     await this.redis.setNx(redisKey, '1', CONFIRMED_KEY_TTL_SECONDS);
 
-    // Self-hosted: semua file dapat URL publik via nginx. File privat
-    // (KYC/dokumen) tetap hanya diakses lewat endpoint terautentikasi.
-    const fileUrl = this.localStorage.getPublicUrl(fileKey);
+    // Batch 1A (ST-004): purpose PRIVAT (KYC/dokumen/bukti) mendapat signed URL
+    // kedaluwarsa, bukan URL publik permanen. Purpose publik (avatar/showcase)
+    // tetap mendapat URL publik via nginx.
+    const fileUrl = isPrivateFileKey(fileKey)
+      ? this.buildSignedDownloadUrl(fileKey, 900)
+      : this.localStorage.getPublicUrl(fileKey);
 
     return { fileKey, fileUrl };
   }
@@ -701,23 +808,4 @@ export class UploadService {
   }
 
   private static readonly PURPOSE_FOLDER_MAP: Record<UploadPurpose, string> = PURPOSE_FOLDER_MAP_INTERNAL;
-
-  // 18.1 Upload virus scan placeholder (ClamAV hook)
-  async scanFileForVirus(fileKey: string): Promise<{ clean: boolean; scannedAt: Date; engine: string }> {
-    // Placeholder: in production, integrate with ClamAV via clamdjs or HTTP service
-    // For now, we check file extension and log scan attempt
-    this.logger.log(`Virus scan requested for ${fileKey} - running placeholder scan`);
-    const suspiciousExtensions = ['.exe', '.bat', '.cmd', '.scr', '.pif'];
-    const lowerKey = fileKey.toLowerCase();
-    const isSuspicious = suspiciousExtensions.some(ext => lowerKey.endsWith(ext));
-    if (isSuspicious) {
-      this.logger.warn(`File ${fileKey} flagged as suspicious by extension`);
-      return { clean: false, scannedAt: new Date(), engine: 'placeholder-extension-check' };
-    }
-    // Simulate ClamAV scan via Redis flag for future integration
-    try {
-      await this.redis.setex(`virus_scan:${fileKey}`, 86400, JSON.stringify({ clean: true, scannedAt: new Date().toISOString() }));
-    } catch {}
-    return { clean: true, scannedAt: new Date(), engine: 'clamav-placeholder' };
-  }
 }

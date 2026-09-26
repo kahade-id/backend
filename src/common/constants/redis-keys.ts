@@ -12,6 +12,8 @@ export const OTP_PHONE_RATE = (phone: string, type: string): string =>
 
 export const TOKEN_BLACKLIST = (jti: string): string => `token_blacklist:${jti}`;
 export const ADMIN_TOKEN_BLACKLIST = (jti: string): string => `token_blacklist:admin:${jti}`;
+/** 03-#4: klaim atomik token sekali-pakai (SET NX) — terpisah dari blacklist. */
+export const TEMP_TOKEN_USED = (jti: string): string => `temp_token_used:${jti}`;
 
 export const UPLOAD_CONFIRMATION = (fileKey: string): string => `upload:${fileKey}`;
 
@@ -57,6 +59,10 @@ export const TOTP_USED_CODE = (userId: string): string => `totp_used:${userId}`;
 
 export const ADMIN_2FA_ATTEMPT_KEY = (tempTokenJti: string): string =>
   `admin_2fa_attempts:${tempTokenJti}`;
+
+/** 03-#8: secret MFA sementara selama proses enroll (TTL 10 menit). */
+export const ADMIN_MFA_SETUP = (adminId: string): string =>
+  `admin_mfa_setup:${adminId}`;
 
 export const OTP_EMAIL_RATE = (email: string, type: string): string =>
   `otp_email_rate:${email}:${type}`;

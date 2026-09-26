@@ -15,6 +15,7 @@ import * as path from 'path';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { MAX_LIMIT, RESERVED_USERNAMES } from '../../common/constants/app.constants';
 import { ReportFlagService } from '../../common/services/report-flag.service';
+import { LocalStorageService } from '../upload/local-storage.service';
 import { TOKEN_BLACKLIST, SESSION_REVOKED_KEY, TOTP_USED_CODE } from '../../common/constants/redis-keys';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { ReportUserDto } from './dto/report-user.dto';
@@ -37,9 +38,6 @@ const PROFILE_RECENT_RATINGS_LIMIT = 5;
 export class UsersService {
   private readonly logger = new Logger(UsersService.name);
 
-  private s3Client: unknown = null;
-  private s3Modules: Record<string, unknown> | null = null;
-
   constructor(
     private prisma: PrismaService,
     private redis: RedisService,
@@ -53,6 +51,9 @@ export class UsersService {
     private userAnalyticsService: UserAnalyticsService,
     // Section 6: agregasi laporan -> flag moderasi internal.
     private reportFlagService: ReportFlagService,
+    // Self-hosted storage (2026-09-26, SS-007/ST-007): avatar & cover kini
+    // disimpan di disk server, bukan R2.
+    private localStorage: LocalStorageService,
   ) {}
 
   async getMyProfile(userId: string): Promise<object> {
@@ -738,131 +739,46 @@ export class UsersService {
     return Array.from(ids);
   }
 
-  private async getS3Client(): Promise<{ s3: unknown; modules: Record<string, unknown> }> {
-    if (!this.s3Modules) {
-      const [s3Module, presignerModule] = await Promise.all([
-        import('@aws-sdk/client-s3'),
-        import('@aws-sdk/s3-request-presigner'),
-      ]);
-      this.s3Modules = { ...s3Module, getSignedUrl: presignerModule.getSignedUrl };
-    }
-
-    if (!this.s3Client) {
-      const accessKeyId = this.configService.get<string>('r2.accessKeyId');
-      const secretAccessKey = this.configService.get<string>('r2.secretAccessKey');
-      const endpointUrl = this.configService.get<string>('r2.endpointUrl');
-
-      if (!accessKeyId || !secretAccessKey) {
-        throw new Error('R2 credentials (R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY) are not configured. File upload is unavailable.');
-      }
-      if (!endpointUrl) {
-        throw new Error('R2 endpoint URL is not configured (R2_ACCOUNT_ID missing). File upload is unavailable.');
-      }
-
-      const S3ClientConstructor = this.s3Modules['S3Client'] as new (config: Record<string, unknown>) => unknown;
-      this.s3Client = new S3ClientConstructor({
-        region: 'auto',
-        endpoint: endpointUrl,
-        credentials: { accessKeyId, secretAccessKey },
-        forcePathStyle: true,
-      });
-    }
-
-    return { s3: this.s3Client, modules: this.s3Modules as Record<string, unknown> };
-  }
-
   // R2-F (audit): presigned PUTs cannot be size-capped by the browser, so the
   // interceptor limits only cover the direct-upload routes. The confirm endpoints
-  // therefore reject oversized stored objects via HeadObject before publishing the
-  // key, matching the direct-path caps (avatar 2 MB, header 5 MB).
+  // therefore reject oversized stored objects before publishing the key,
+  // matching the direct-path caps (avatar 2 MB, header 5 MB).
+  // Self-hosted (2026-09-26, SS-007/ST-007): verifikasi ke disk lokal via
+  // LocalStorageService — helper S3/R2 sudah dihapus.
   private static readonly MAX_AVATAR_BYTES = 2 * 1024 * 1024;
   private static readonly MAX_HEADER_BYTES = 5 * 1024 * 1024;
 
-  private async deleteR2ObjectQuietly(bucket: string, key: string): Promise<void> {
-    try {
-      const { s3, modules } = await this.getS3Client();
-      const DeleteObjectCommand = modules['DeleteObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-      const send = (s3 as { send: (cmd: unknown) => Promise<unknown> }).send.bind(s3);
-      await send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
-    } catch (err) {
-      this.logger.warn(`Failed to delete R2 object ${key}`, err);
-    }
-  }
-
-  private async verifyStoredImage(bucket: string, key: string, maxBytes: number, label: string): Promise<void> {
-    const { s3, modules } = await this.getS3Client();
-    const send = (s3 as { send: (cmd: unknown) => Promise<Record<string, unknown>> }).send.bind(s3);
-
-    const HeadObjectCommand = modules['HeadObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-    const head = await send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
-    const contentLength = typeof head?.ContentLength === 'number' ? head.ContentLength : undefined;
-    if (contentLength !== undefined && contentLength > maxBytes) {
-      await this.deleteR2ObjectQuietly(bucket, key);
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: `${label} exceeds the maximum allowed size of ${Math.floor(maxBytes / (1024 * 1024))} MB`,
-      });
-    }
-
-    const GetObjectCommand = modules['GetObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-    const response = await send(new GetObjectCommand({ Bucket: bucket, Key: key, Range: 'bytes=0-15' }));
-    const body = response?.Body as { transformToByteArray?: () => Promise<Uint8Array> } | undefined;
-    if (body?.transformToByteArray) {
-      const headerBytes = Buffer.from(await body.transformToByteArray());
-      if (!this.detectImageMimeType(headerBytes)) {
-        await this.deleteR2ObjectQuietly(bucket, key);
-        throw new BadRequestException({
-          code: ErrorCodes.VALIDATION_ERROR,
-          message: 'Uploaded file is not a valid image. Please upload a JPEG, PNG, or WebP image.',
-        });
-      }
-    }
-  }
-
-  private async replaceStoredMedia(bucket: string | undefined, previousUrl: string | null | undefined, newKey: string): Promise<void> {
-    if (!bucket || !previousUrl) return;
+  /**
+   * Hapus file media lama dari self-hosted disk (best-effort, quiet).
+   * Self-hosted (2026-09-26, SS-007/ST-007): R2 diganti LocalStorageService.
+   */
+  private async deleteStoredMediaQuietly(previousUrl: string | null | undefined, newKey: string): Promise<void> {
+    if (!previousUrl) return;
     const oldKey = this.extractKeyFromUrl(previousUrl);
     if (!oldKey || oldKey === newKey) return;
-    await this.deleteR2ObjectQuietly(bucket, oldKey);
-  }
-
-  async uploadAvatar(userId: string, contentType?: string): Promise<{ uploadUrl: string; avatarKey: string; expiresIn: number }> {
-    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
-    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
-
-    const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
-    const mimeType = contentType && ALLOWED_TYPES.includes(contentType) ? contentType : 'image/jpeg';
-    const ext = mimeType === 'image/png' ? 'png' : mimeType === 'image/webp' ? 'webp' : 'jpg';
-    const avatarKey = `avatars/${userId}/${nanoid(16)}.${ext}`;
-    const expiresIn = this.configService.get<number>('r2.presignExpires') ?? 300;
-
     try {
-      const bucket = this.configService.get<string>('r2.bucketPublic');
-      if (!bucket) {
-        throw new Error('R2_BUCKET_PUBLIC is not configured');
-      }
-
-      const { s3, modules } = await this.getS3Client();
-      const PutObjectCommand = modules['PutObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-
-      const command = new PutObjectCommand({
-        Bucket: bucket,
-        Key: avatarKey,
-        ContentType: mimeType,
-      });
-
-      const getSignedUrl = modules['getSignedUrl'] as (client: unknown, command: unknown, options: Record<string, unknown>) => Promise<string>;
-      const uploadUrl = await getSignedUrl(s3, command, { expiresIn });
-      return { uploadUrl, avatarKey, expiresIn };
+      await this.localStorage.deleteFile(oldKey);
     } catch (err) {
-      this.logger.error('R2 avatar presigned URL generation failed', err);
-      throw new BadRequestException({
-        code: ErrorCodes.UPLOAD_FAILED,
-        message: 'Failed to create avatar upload URL. Please check storage configuration.',
-      });
+      this.logger.warn(`Failed to delete old stored media ${oldKey}`, err);
     }
   }
 
+
+  /**
+   * @deprecated R2 dibuang (2026-09-26, SS-007/ST-007). Presigned URL tidak
+   * didukung lagi — gunakan POST /v1/users/me/avatar/direct.
+   */
+  async uploadAvatar(userId: string, contentType?: string): Promise<{ uploadUrl: string; avatarKey: string; expiresIn: number }> {
+    throw new BadRequestException({
+      code: 'DEPRECATED',
+      message: 'Presigned URL avatar upload is no longer supported. Use POST /v1/users/me/avatar/direct instead.',
+    });
+  }
+
+  /**
+   * Upload avatar langsung ke self-hosted disk (2026-09-26, SS-007/ST-007).
+   * R2 tidak dipakai lagi — tidak ada dependensi kredensial R2.
+   */
   async uploadAvatarDirect(userId: string, fileName: string, contentType: string, fileBuffer: Buffer): Promise<{ avatarUrl: string }> {
     const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true, avatarUrl: true } });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
@@ -894,50 +810,20 @@ export class UsersService {
     const ext = contentType === 'image/png' ? 'png' : contentType === 'image/webp' ? 'webp' : 'jpg';
     const avatarKey = `avatars/${userId}/${nanoid(16)}.${ext}`;
 
-    const bucket = this.configService.get<string>('r2.bucketPublic');
-    if (!bucket) {
-      throw new BadRequestException({
-        code: ErrorCodes.UPLOAD_FAILED,
-        message: 'R2_BUCKET_PUBLIC is not configured',
-      });
-    }
-
     try {
-      const { s3, modules } = await this.getS3Client();
-      const PutObjectCommand = modules['PutObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-      const command = new PutObjectCommand({
-        Bucket: bucket,
-        Key: avatarKey,
-        ContentType: contentType,
-        Body: fileBuffer,
-      });
-      const send = (s3 as { send: (cmd: unknown) => Promise<unknown> }).send.bind(s3);
-      await send(command);
+      await this.localStorage.saveFile(avatarKey, fileBuffer);
     } catch (err) {
-      this.logger.error('R2 direct avatar upload failed', err);
+      this.logger.error('Self-hosted avatar upload failed', err);
       throw new BadRequestException({
         code: ErrorCodes.UPLOAD_FAILED,
         message: 'Failed to upload avatar to storage. Please try again.',
       });
     }
 
-    const publicUrl = this.configService.get<string>('r2.publicUrl');
-    const avatarUrl = publicUrl ? `${publicUrl}/${avatarKey}` : `/uploads/${avatarKey}`;
+    const avatarUrl = this.localStorage.getPublicUrl(avatarKey);
 
-    if (user.avatarUrl) {
-      try {
-        const oldKey = this.extractKeyFromUrl(user.avatarUrl);
-        if (oldKey) {
-          const { s3, modules } = await this.getS3Client();
-          const DeleteObjectCommand = modules['DeleteObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-          const command = new DeleteObjectCommand({ Bucket: bucket, Key: oldKey });
-          const send = (s3 as { send: (cmd: unknown) => Promise<unknown> }).send.bind(s3);
-          await send(command);
-        }
-      } catch (err) {
-        this.logger.warn(`Failed to delete old avatar for user ${userId}`, err);
-      }
-    }
+    // Hapus avatar lama dari disk (best-effort) — dulu bocor di bucket R2 (R2-F).
+    await this.deleteStoredMediaQuietly(user.avatarUrl, avatarKey);
 
     await this.prisma.user.update({ where: { id: userId }, data: { avatarUrl } });
     this.invalidateUserOgCaches(user.username);
@@ -956,34 +842,32 @@ export class UsersService {
       });
     }
 
-    const bucket = this.configService.get<string>('r2.bucketPublic');
-
-    if (bucket) {
-      try {
-        await this.verifyStoredImage(bucket, avatarKey, UsersService.MAX_AVATAR_BYTES, 'Avatar');
-      } catch (err) {
-        if (err instanceof BadRequestException) throw err;
+    // Self-hosted (2026-09-26, SS-007/ST-007): verifikasi ke disk lokal, bukan R2.
+    try {
+      const size = await this.localStorage.getFileSize(avatarKey);
+      if (size === null) throw new Error('not found');
+      if (size > UsersService.MAX_AVATAR_BYTES) {
+        await this.localStorage.deleteFile(avatarKey);
         throw new BadRequestException({
           code: ErrorCodes.VALIDATION_ERROR,
-          message: 'Avatar file not found in storage. Please upload the file first.',
+          message: 'Avatar file exceeds maximum allowed size',
         });
       }
+    } catch (err) {
+      if (err instanceof BadRequestException) throw err;
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Avatar file not found in storage. Please upload the file first.',
+      });
     }
 
-    const publicUrl = this.configService.get<string>('r2.publicUrl');
-
-    const avatarUrl = publicUrl
-      ? `${publicUrl}/${avatarKey}`
-      : `/uploads/${avatarKey}`;
+    const avatarUrl = this.localStorage.getPublicUrl(avatarKey);
 
     await this.prisma.user.update({
       where: { id: userId },
       data: { avatarUrl },
     });
-    // R2-F (audit): the presigned confirm path never removed the previous avatar
-    // object (the direct path does), and the orphan-cleanup job only scans the
-    // `uploads/` prefix — replaced avatars leaked in the bucket indefinitely.
-    await this.replaceStoredMedia(bucket, user.avatarUrl, avatarKey);
+    await this.deleteStoredMediaQuietly(user.avatarUrl, avatarKey);
     this.invalidateUserOgCaches(user.username);
 
     return { avatarUrl };
@@ -992,19 +876,12 @@ export class UsersService {
   async deleteAvatar(userId: string): Promise<{ message: string }> {
     const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { username: true, avatarUrl: true } });
     if (user?.avatarUrl) {
-      const bucket = this.configService.get<string>('r2.bucketPublic');
-      if (bucket) {
+      const avatarKey = this.extractKeyFromUrl(user.avatarUrl);
+      if (avatarKey) {
         try {
-          const avatarKey = this.extractKeyFromUrl(user.avatarUrl);
-          if (avatarKey) {
-            const { s3, modules } = await this.getS3Client();
-            const DeleteObjectCommand = modules['DeleteObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-            const command = new DeleteObjectCommand({ Bucket: bucket, Key: avatarKey });
-            const send = (s3 as { send: (cmd: unknown) => Promise<unknown> }).send.bind(s3);
-            await send(command);
-          }
+          await this.localStorage.deleteFile(avatarKey);
         } catch (err) {
-          this.logger.warn(`Failed to delete old avatar from R2 for user ${userId}`, err);
+          this.logger.warn(`Failed to delete avatar file for user ${userId}`, err);
         }
       }
     }
@@ -1022,8 +899,20 @@ export class UsersService {
     return null;
   }
 
+  /**
+   * Ekstrak fileKey dari URL avatar/header.
+   * Mendukung: (1) URL self-hosted baru https://api.kahade.id/uploads/...,
+   * (2) URL R2 legacy (r2.publicUrl), (3) path relatif /uploads/....
+   */
   private extractKeyFromUrl(url: string): string | null {
     try {
+      // URL self-hosted baru → key "uploads/avatars/..." (uploads/ prefix
+      // di-strip LocalStorageService saat resolve path).
+      const storagePublicUrl = this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads';
+      if (url.startsWith(storagePublicUrl)) {
+        return url.slice(storagePublicUrl.length + 1);
+      }
+      // URL R2 legacy.
       const publicUrl = this.configService.get<string>('r2.publicUrl');
       if (publicUrl && url.startsWith(publicUrl)) {
         return url.slice(publicUrl.length + 1);
@@ -1802,13 +1691,13 @@ export class UsersService {
 
 
     if (dto.evidenceUrls?.length) {
-      const s3BucketPublic = this.configService.get<string>('r2.bucketPublic');
-      const s3BucketPrivate = this.configService.get<string>('r2.bucketPrivate');
-      const allowedBuckets = [s3BucketPublic, s3BucketPrivate].filter(Boolean) as string[];
-      if (allowedBuckets.length === 0) {
-        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Storage is not configured' });
-      }
+      // Self-hosted (2026-09-26, ST-007): storage utama adalah disk server.
+      // Bukti yang diunggah via POST /v1/upload/direct menghasilkan URL
+      // https://api.kahade.id/uploads/... — hostname inilah yang dipercaya.
+      // Hostname R2 legacy tetap diterima selama config R2 masih ada.
       const trustedHostnames: string[] = [];
+      const storagePublicUrl = this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads';
+      try { trustedHostnames.push(new URL(storagePublicUrl).hostname); } catch {}
       const endpointUrl = this.configService.get<string>('r2.endpointUrl');
       if (endpointUrl) {
         try { trustedHostnames.push(new URL(endpointUrl).hostname); } catch {}
@@ -1816,6 +1705,9 @@ export class UsersService {
       const publicUrl = this.configService.get<string>('r2.publicUrl');
       if (publicUrl) {
         try { trustedHostnames.push(new URL(publicUrl).hostname); } catch {}
+      }
+      if (trustedHostnames.length === 0) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Storage is not configured' });
       }
       for (const rawUrl of dto.evidenceUrls) {
         try {
@@ -2001,33 +1893,15 @@ export class UsersService {
 
   // ========== HEADER IMAGE ==========
 
+  /**
+   * @deprecated R2 dibuang (2026-09-26, SS-007/ST-007). Presigned URL tidak
+   * didukung lagi — gunakan POST /v1/users/me/header/direct.
+   */
   async uploadHeader(userId: string, contentType?: string): Promise<{ uploadUrl: string; headerKey: string; expiresIn: number }> {
-    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
-    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
-
-    const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
-    const mimeType = contentType && ALLOWED_TYPES.includes(contentType) ? contentType : 'image/jpeg';
-    const ext = mimeType === 'image/png' ? 'png' : mimeType === 'image/webp' ? 'webp' : 'jpg';
-    const headerKey = `headers/${userId}/${nanoid(16)}.${ext}`;
-    const expiresIn = this.configService.get<number>('r2.presignExpires') ?? 300;
-
-    try {
-      const bucket = this.configService.get<string>('r2.bucketPublic');
-      if (!bucket) throw new Error('R2_BUCKET_PUBLIC is not configured');
-
-      const { s3, modules } = await this.getS3Client();
-      const PutObjectCommand = modules['PutObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-      const command = new PutObjectCommand({ Bucket: bucket, Key: headerKey, ContentType: mimeType });
-      const getSignedUrl = modules['getSignedUrl'] as (client: unknown, command: unknown, options: Record<string, unknown>) => Promise<string>;
-      const uploadUrl = await getSignedUrl(s3, command, { expiresIn });
-      return { uploadUrl, headerKey, expiresIn };
-    } catch (err) {
-      this.logger.error('R2 header presigned URL generation failed', err);
-      throw new BadRequestException({
-        code: ErrorCodes.UPLOAD_FAILED,
-        message: 'Failed to create header upload URL. Please check storage configuration.',
-      });
-    }
+    throw new BadRequestException({
+      code: 'DEPRECATED',
+      message: 'Presigned URL header upload is no longer supported. Use POST /v1/users/me/header/direct instead.',
+    });
   }
 
   async confirmHeader(userId: string, headerKey: string): Promise<{ headerUrl: string }> {
@@ -2041,25 +1915,23 @@ export class UsersService {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid header key' });
     }
 
-    const bucket = this.configService.get<string>('r2.bucketPublic');
-
-    if (bucket) {
-      try {
-        await this.verifyStoredImage(bucket, headerKey, UsersService.MAX_HEADER_BYTES, 'Header');
-      } catch (err) {
-        if (err instanceof BadRequestException) throw err;
-        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Header file not found in storage. Please upload the file first.' });
+    // Self-hosted (2026-09-26): verifikasi ke disk lokal, bukan R2.
+    try {
+      const size = await this.localStorage.getFileSize(headerKey);
+      if (size === null) throw new Error('not found');
+      if (size > UsersService.MAX_HEADER_BYTES) {
+        await this.localStorage.deleteFile(headerKey);
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Header file exceeds maximum allowed size' });
       }
+    } catch (err) {
+      if (err instanceof BadRequestException) throw err;
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Header file not found in storage. Please upload the file first.' });
     }
 
-    const publicUrl = this.configService.get<string>('r2.publicUrl');
-    const headerUrl = publicUrl
-      ? `${publicUrl}/${headerKey}`
-      : `/uploads/${headerKey}`;
+    const headerUrl = this.localStorage.getPublicUrl(headerKey);
 
     await this.prisma.user.update({ where: { id: userId }, data: { headerUrl } });
-    // R2-F (audit): same replaced-object leak as the avatar confirm path.
-    await this.replaceStoredMedia(bucket, user.headerUrl, headerKey);
+    await this.deleteStoredMediaQuietly(user.headerUrl, headerKey);
     this.invalidateUserOgCaches(user.username);
     return { headerUrl };
   }
@@ -2095,50 +1967,21 @@ export class UsersService {
     const ext = contentType === 'image/png' ? 'png' : contentType === 'image/webp' ? 'webp' : 'jpg';
     const headerKey = `headers/${userId}/${nanoid(16)}.${ext}`;
 
-    const bucket = this.configService.get<string>('r2.bucketPublic');
-    if (!bucket) {
-      throw new BadRequestException({
-        code: ErrorCodes.UPLOAD_FAILED,
-        message: 'R2_BUCKET_PUBLIC is not configured',
-      });
-    }
-
+    // Self-hosted (2026-09-26, SS-007/ST-007): R2 diganti LocalStorageService.
     try {
-      const { s3, modules } = await this.getS3Client();
-      const PutObjectCommand = modules['PutObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-      const command = new PutObjectCommand({
-        Bucket: bucket,
-        Key: headerKey,
-        ContentType: contentType,
-        Body: fileBuffer,
-      });
-      const send = (s3 as { send: (cmd: unknown) => Promise<unknown> }).send.bind(s3);
-      await send(command);
+      await this.localStorage.saveFile(headerKey, fileBuffer);
     } catch (err) {
-      this.logger.error('R2 direct header upload failed', err);
+      this.logger.error('Self-hosted direct header upload failed', err);
       throw new BadRequestException({
         code: ErrorCodes.UPLOAD_FAILED,
         message: 'Failed to upload header to storage. Please try again.',
       });
     }
 
-    const publicUrl = this.configService.get<string>('r2.publicUrl');
-    const headerUrl = publicUrl ? `${publicUrl}/${headerKey}` : `/uploads/${headerKey}`;
+    const headerUrl = this.localStorage.getPublicUrl(headerKey);
 
-    if (user.headerUrl) {
-      try {
-        const oldKey = this.extractKeyFromUrl(user.headerUrl);
-        if (oldKey) {
-          const { s3, modules } = await this.getS3Client();
-          const DeleteObjectCommand = modules['DeleteObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-          const command = new DeleteObjectCommand({ Bucket: bucket, Key: oldKey });
-          const send = (s3 as { send: (cmd: unknown) => Promise<unknown> }).send.bind(s3);
-          await send(command);
-        }
-      } catch (err) {
-        this.logger.warn(`Failed to delete old header for user ${userId}`, err);
-      }
-    }
+    // Hapus header lama dari disk (best-effort).
+    await this.deleteStoredMediaQuietly(user.headerUrl, headerKey);
 
     await this.prisma.user.update({ where: { id: userId }, data: { headerUrl } });
     this.invalidateUserOgCaches(user.username);
@@ -2397,19 +2240,12 @@ export class UsersService {
   async deleteHeader(userId: string): Promise<{ message: string }> {
     const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { username: true, headerUrl: true } });
     if (user?.headerUrl) {
-      const bucket = this.configService.get<string>('r2.bucketPublic');
-      if (bucket) {
+      const headerKey = this.extractKeyFromUrl(user.headerUrl);
+      if (headerKey) {
         try {
-          const headerKey = this.extractKeyFromUrl(user.headerUrl);
-          if (headerKey) {
-            const { s3, modules } = await this.getS3Client();
-            const DeleteObjectCommand = modules['DeleteObjectCommand'] as new (input: Record<string, unknown>) => unknown;
-            const command = new DeleteObjectCommand({ Bucket: bucket, Key: headerKey });
-            const send = (s3 as { send: (cmd: unknown) => Promise<unknown> }).send.bind(s3);
-            await send(command);
-          }
+          await this.localStorage.deleteFile(headerKey);
         } catch (err) {
-          this.logger.warn(`Failed to delete old header from R2 for user ${userId}`, err);
+          this.logger.warn(`Failed to delete header file for user ${userId}`, err);
         }
       }
     }

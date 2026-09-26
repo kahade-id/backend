@@ -106,7 +106,11 @@ export class AutoEscalateDisputesService {
 
             // NOTIF-DSP-03: para pihak wajib tahu sengketanya dieskalasi otomatis.
             // Best-effort: kegagalan notifikasi tidak membatalkan eskalasi.
+            // DP-010: row notification SAJA tidak memicu push — emit wajib dipanggil
+            // (pola dispute-message.service.ts DSP-OFFLINE-01).
             const escalatedParties = [dispute.order.buyerId, dispute.order.sellerId];
+            const escalateTitle = 'Sengketa dieskalasi';
+            const escalateBody = `Sengketa ${dispute.disputeId} melewati batas waktu penanganan dan kini diprioritaskan ke tim mediator.`;
             await Promise.all(escalatedParties.map((partyId) =>
               this.prisma.notification.create({
                 data: {
@@ -114,10 +118,17 @@ export class AutoEscalateDisputesService {
                   userId: partyId,
                   type: NotificationType.DISPUTE_ESCALATED,
                   category: getCategoryForType(NotificationType.DISPUTE_ESCALATED),
-                  title: 'Sengketa dieskalasi',
-                  body: `Sengketa ${dispute.disputeId} melewati batas waktu penanganan dan kini diprioritaskan ke tim mediator.`,
+                  title: escalateTitle,
+                  body: escalateBody,
                   isRead: false,
                 },
+              }).then(() => {
+                this.prisma.emitNotificationCreated({
+                  userId: partyId,
+                  title: escalateTitle,
+                  body: escalateBody,
+                  data: { type: 'DISPUTE_ESCALATED', disputeId: dispute.disputeId },
+                });
               }).catch((err: unknown) => {
                 this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`);
               }),

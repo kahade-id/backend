@@ -199,7 +199,7 @@ export const ESCROW_RELEASE_HOLD_HOURS = POST_COMPLETION_DISPUTE_WINDOW_HOURS;
 
 export const MAX_ESCROW_BALANCE = 500_000_000;
 
-export const INVOICE_COMPANY_NAME = process.env.INVOICE_COMPANY_NAME || 'PT Kahade Digital Indonesia';
+export const INVOICE_COMPANY_NAME = process.env.INVOICE_COMPANY_NAME || 'PT Kawal Hak Dengan Aman';
 export const INVOICE_COMPANY_ADDRESS = process.env.INVOICE_COMPANY_ADDRESS || 'Jl. Jenderal Sudirman Kav. 52-53, Senayan, Kebayoran Baru, Jakarta Selatan 12190, Indonesia';
 
 export const MAX_REFERRALS = 100;

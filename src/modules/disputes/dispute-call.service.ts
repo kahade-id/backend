@@ -124,6 +124,10 @@ export class DisputeCallService {
       if (!call) {
         throw new NotFoundException({ code: ErrorCodes.DISPUTE_CALL_NOT_FOUND, message: 'No pending call request found' });
       }
+      // DP-016: samakan dengan acceptCall — pemohon tidak bisa me-reject permintaannya sendiri.
+      if (call.requestedById === userId) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Cannot reject your own call request' });
+      }
       const updated = await tx.disputeCall.updateMany({
         where: { id: callId, disputeId: dispute.id, status: DisputeCallStatus.REQUESTED },
         data: { status: DisputeCallStatus.REJECTED, endedAt: new Date() },

@@ -3,7 +3,7 @@ import { ApiPropertyOptional } from '@nestjs/swagger';
 import { DisputeCategory } from '@prisma/client';
 import { PaginationDto } from '../../../../common/dto/pagination.dto';
 
-const DISPUTE_STATUSES = ['OPEN', 'ASSIGNED', 'UNDER_REVIEW', 'WAITING_RESPONSE', 'ESCALATED', 'RESOLVED', 'CANCELLED'];
+const DISPUTE_STATUSES = ['OPEN', 'ASSIGNED', 'UNDER_REVIEW', 'WAITING_RESPONSE', 'ESCALATED', 'RESOLVED'];
 
 export class DisputeListQueryDto extends PaginationDto {
   @ApiPropertyOptional({ description: 'Filter by dispute status' })

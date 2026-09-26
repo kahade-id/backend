@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException, BadRequestException, ForbiddenException, ConflictException, Logger } from '@nestjs/common';
 import { randomInt } from 'crypto';
-import { Prisma, DisputeStatus, OrderStatus, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType, SubscriptionStatus } from '@prisma/client';
+import { Prisma, DisputeStatus, DisputeDecisionType, OrderStatus, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType, SubscriptionStatus } from '@prisma/client';
+import { Decimal } from '@prisma/client/runtime/library';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
@@ -290,6 +291,36 @@ export class MutualResolutionService {
       await tx.dispute.update({
         where: { id: dispute.id },
         data: { status: DisputeStatus.RESOLVED, resolvedAt: new Date() },
+      });
+
+      // DP-023: resolusi mutual WAJIB meninggalkan DisputeDecision (jejak audit
+      // keputusan) seperti jalur resolve admin. decidedBy = null karena pemutusnya
+      // kedua pihak, bukan admin (kolom nullable sejak migrasi batch 2A).
+      const existingDecision = await tx.disputeDecision.findUnique({ where: { disputeId: dispute.id } });
+      if (existingDecision) {
+        throw new ConflictException({ code: 'DISPUTE_ALREADY_RESOLVED', message: 'This dispute already has a decision' });
+      }
+      const mutualDecisionType = proposal.buyerPercent === 100
+        ? DisputeDecisionType.FULL_BUYER
+        : proposal.buyerPercent === 0
+          ? DisputeDecisionType.FULL_SELLER
+          : DisputeDecisionType.SPLIT;
+      await tx.disputeDecision.create({
+        data: {
+          disputeId: dispute.id,
+          decidedBy: null,
+          decisionType: mutualDecisionType,
+          decisionNotes: `Mutual resolution accepted by both parties (proposal ${proposal.id}): ` +
+            `${proposal.buyerPercent}% buyer / ${proposal.sellerPercent}% seller. ` +
+            `Proposed by ${proposal.proposedBy === dispute.order.buyerId ? 'buyer' : 'seller'}` +
+            `${responseNote ? `; response note: ${responseNote.trim().slice(0, 200)}` : ''}. ` +
+            `Buyer receives ${buyerAmount} sen, seller receives ${sellerAmount} sen.`,
+          buyerAmount,
+          sellerAmount,
+          buyerPercent: mutualDecisionType === DisputeDecisionType.SPLIT ? new Decimal(proposal.buyerPercent) : null,
+          sellerPercent: mutualDecisionType === DisputeDecisionType.SPLIT ? new Decimal(proposal.sellerPercent) : null,
+          isExecuted: true,
+        },
       });
 
       await tx.order.update({

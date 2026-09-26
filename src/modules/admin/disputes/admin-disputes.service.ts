@@ -107,7 +107,8 @@ export class AdminDisputesService {
   }
 
   async listDisputes(page = 1, limit = 20, status?: string, search?: string, category?: string): Promise<object> {
-    if (status !== undefined && !['OPEN', 'ASSIGNED', 'UNDER_REVIEW', 'WAITING_RESPONSE', 'ESCALATED', 'RESOLVED', 'CANCELLED'].includes(status)) {
+    // DP-013: 'CANCELLED' bukan nilai enum DisputeStatus — jangan izinkan di filter.
+    if (status !== undefined && !['OPEN', 'ASSIGNED', 'UNDER_REVIEW', 'WAITING_RESPONSE', 'ESCALATED', 'RESOLVED'].includes(status)) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid dispute status' });
     }
     if (category !== undefined && !Object.values(DisputeCategory).includes(category as DisputeCategory)) {
@@ -407,18 +408,25 @@ export class AdminDisputesService {
       });
 
       if (order.status === OrderStatus.DISPUTED) {
+        // DP-014: FULL_BUYER pra-completion = transaksi batal total (uang kembali ke
+        // buyer) → CANCELLED, bukan COMPLETED. Untuk sengketa pasca-completion
+        // (completedAt sudah terisi) transaksi memang pernah selesai — verdict adalah
+        // penyesuaian pasca-jual → tetap COMPLETED. FULL_SELLER & SPLIT → COMPLETED.
+        const isFullBuyerPreCompletion = dto.decision === 'FULL_BUYER' && !freshIsPostCompletionDispute;
+        const resolvedOrderStatus = isFullBuyerPreCompletion ? OrderStatus.CANCELLED : OrderStatus.COMPLETED;
         await tx.order.update({
           where: { id: order.id },
           data: {
-            status: OrderStatus.COMPLETED,
-            ...(order.completedAt ? {} : { completedAt: new Date() }),
+            status: resolvedOrderStatus,
+            ...(order.completedAt ? {} : isFullBuyerPreCompletion ? {} : { completedAt: new Date() }),
+            ...(isFullBuyerPreCompletion ? { cancelledAt: new Date() } : {}),
           },
         });
         await tx.orderStatusHistory.create({
           data: {
             orderId: order.id,
             fromStatus: OrderStatus.DISPUTED,
-            toStatus: OrderStatus.COMPLETED,
+            toStatus: resolvedOrderStatus,
             changedBy: adminId,
             changedByType: ActorType.ADMIN,
             reason: `Dispute resolved: ${dto.decision}${dto.decisionNotes ? ` — ${dto.decisionNotes}` : ''}`,
@@ -884,6 +892,34 @@ export class AdminDisputesService {
       } catch (error: unknown) {
         this.logger.warn(`dispute admin message realtime failed: ${error instanceof Error ? error.message : String(error)}`);
       }
+    }
+    // DP-022: pesan mediasi admin tidak boleh hanya realtime — pihak yang offline
+    // butuh notification row + push (pola dispute-message.service.ts DSP-OFFLINE-01).
+    // Pakai safeContent (sudah escapeHtml) agar tidak ada HTML mentah di notifikasi.
+    const mediationTitle = 'Pesan baru dari mediator';
+    const mediationPreview = safeContent.length > 120 ? safeContent.slice(0, 120) + '…' : safeContent;
+    for (const userId of recipientIds) {
+      this.prisma.notification
+        .create({
+          data: {
+            notifId: generateNotifId(),
+            userId,
+            type: NotificationType.DISPUTE_MESSAGE_RECEIVED,
+            category: getCategoryForType(NotificationType.DISPUTE_MESSAGE_RECEIVED),
+            title: mediationTitle,
+            body: mediationPreview || `Mediator mengirim pesan baru pada sengketa ${dispute.disputeId}.`,
+            isRead: false,
+          },
+        })
+        .then(() => {
+          this.prisma.emitNotificationCreated({
+            userId,
+            title: mediationTitle,
+            body: mediationPreview || `Mediator mengirim pesan baru pada sengketa ${dispute.disputeId}.`,
+            data: { type: 'DISPUTE_MESSAGE_RECEIVED', disputeId: dispute.disputeId },
+          });
+        })
+        .catch((err: unknown) => this.logger.warn(`silent-catch: admin mediation notification failed: ${err instanceof Error ? err.message : String(err)}`));
     }
     this.auditLog.logAdminAction({
       adminId,

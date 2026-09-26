@@ -5,7 +5,7 @@ import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.se
 import { UploadService } from '../upload/upload.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
-import { UserAuditAction, OrderStatus, DisputeStatus, DisputeInitiator, ActorType, NotificationType, WalletTransactionType, WalletTransactionStatus, DisputeEvidence, DisputeCategory, Prisma } from '@prisma/client';
+import { UserAuditAction, AuditAction, OrderStatus, DisputeStatus, DisputeInitiator, ActorType, NotificationType, WalletTransactionType, WalletTransactionStatus, DisputeEvidence, DisputeCategory, Prisma } from '@prisma/client';
 import { generateDisputeId, generateNotifId, generateWalletTxId } from '../../common/utils/id-generator.util';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import { toIdr } from '../../common/utils/currency.util';
@@ -229,6 +229,9 @@ export class DisputesService {
       throw new ForbiddenException({ code: ErrorCodes.NOT_DISPUTE_PARTICIPANT, message: 'You are not a participant in this dispute' });
     }
 
+    // DP-020: evidences di-take 50 — klien harus tahu total & apakah terpotong.
+    const evidenceTotal = await this.prisma.disputeEvidence.count({ where: { disputeId: dispute.id } });
+
     const EVIDENCE_URL_EXPIRY_SECONDS = 900;
     const signedEvidences = await Promise.all(
       (dispute.evidences ?? []).map(async (evidence) => {
@@ -254,6 +257,9 @@ export class DisputesService {
         ? { ...decision, buyerAmount: toIdr(decision.buyerAmount), sellerAmount: toIdr(decision.sellerAmount) }
         : decision,
       evidences: signedEvidences,
+      // DP-020: metadata paginasi bukti (take:50 di include di atas).
+      evidenceTotal,
+      evidenceHasMore: evidenceTotal > signedEvidences.length,
       order: {
         orderId: dispute.order.orderId,
         title: dispute.order.title,
@@ -487,6 +493,9 @@ export class DisputesService {
       `SUBMIT_EVIDENCE_NOTIFICATION disputeId=${dispute.disputeId}`,
     );
 
+    // DP-021: admin yang ditugaskan juga wajib tahu (bukan broadcast ke semua admin).
+    this.notifyAssignedAdmin(dispute.assignedAdminId, AuditAction.DISPUTE_EVIDENCE_SUBMITTED, dispute.id, dispute.disputeId, 'Bukti baru ditambahkan');
+
     return {
       evidence,
       fileResults,
@@ -568,11 +577,11 @@ export class DisputesService {
       }
     });
 
-    // SEC-031: audit log for evidence deletion. Schema has no DISPUTE_EVIDENCE_DELETED;
-    // DISPUTE_EVIDENCE_ADDED is the closest available action — description clarifies deletion.
+    // DP-019: pakai DISPUTE_EVIDENCE_DELETED — sebelumnya salah memakai
+    // DISPUTE_EVIDENCE_ADDED untuk penghapusan (forensik menyesatkan).
     this.auditLog.logUserAction({
       userId,
-      action: UserAuditAction.DISPUTE_EVIDENCE_ADDED,
+      action: UserAuditAction.DISPUTE_EVIDENCE_DELETED,
       entityType: 'DisputeEvidence',
       entityId: evidenceId,
       description: `User deleted evidence ${evidenceId} from dispute ${dispute.disputeId}`,
@@ -595,7 +604,7 @@ export class DisputesService {
     }
     const isClaimantBuyer = await this.prisma.dispute.findFirst({
       where: { OR: [{ id: disputeId }, { disputeId }] },
-      select: { order: { select: { buyerId: true, sellerId: true } }, disputeId: true },
+      select: { id: true, assignedAdminId: true, order: { select: { buyerId: true, sellerId: true } }, disputeId: true },
     });
     const claimResult = await this.withSerializableRetry(() => this.prisma.$transaction(async (tx) => {
       const dispute = await tx.dispute.findFirst({
@@ -690,6 +699,8 @@ export class DisputesService {
         () => this.prisma.emitNotificationCreated({ userId: claimCounterpartId, title: 'Klaim balasan dalam sengketa', body: `Klaim baru pada sengketa ${isClaimantBuyer.disputeId}`, data: { type: 'DISPUTE_CLAIM_SUBMITTED', disputeId } }),
         `SUBMIT_CLAIM_NOTIFICATION disputeId=${isClaimantBuyer.disputeId}`,
       );
+      // DP-021: admin yang ditugaskan juga wajib tahu.
+      this.notifyAssignedAdmin(isClaimantBuyer.assignedAdminId, AuditAction.DISPUTE_CLAIM_SUBMITTED, isClaimantBuyer.id, isClaimantBuyer.disputeId, 'Klaim baru diajukan');
     }
     return claimResult;
   }
@@ -989,6 +1000,33 @@ export class DisputesService {
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
   }
 
+  /**
+   * DP-021: notifikasi ke admin yang ditugaskan via adminAuditLog (mekanisme
+   * notifikasi admin di codebase ini — AdminUser tidak punya userId yang terhubung
+   * ke tabel notifikasi user). Best-effort: kegagalan tidak menggagalkan aksi utama.
+   */
+  private notifyAssignedAdmin(
+    assignedAdminId: string | null | undefined,
+    action: AuditAction,
+    disputeId: string,
+    disputePublicId: string,
+    eventLabel: string,
+  ): void {
+    if (!assignedAdminId) return;
+    this.prisma.adminAuditLog
+      .create({
+        data: {
+          adminId: assignedAdminId,
+          action,
+          targetType: 'Dispute',
+          targetId: disputeId,
+          description: `${eventLabel} pada sengketa ${disputePublicId} — perlu perhatian admin yang ditugaskan.`,
+          ipAddress: 'system',
+        },
+      })
+      .catch((err: unknown) => this.logger.warn(`silent-catch: assigned-admin notification failed: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
   async escalateDispute(disputeId: string, userId: string, reason?: string): Promise<Record<string, unknown>> {
     const dispute = await this.prisma.dispute.findFirst({
       where: { OR: [{ id: disputeId }, { disputeId }] },
@@ -1042,6 +1080,35 @@ export class DisputesService {
       description: `User manually escalated dispute ${dispute.disputeId}: ${reason?.slice(0, 200) ?? 'no reason'}`,
     });
 
+    // DP-011: kedua pihak wajib tahu sengketa dieskalasi. Post-commit best-effort
+    // (pola C-19): notifikasi gagal tidak membatalkan eskalasi yang sudah tersimpan.
+    // Row + emit (row saja tidak memicu push — lihat DP-010).
+    const escalateTitle = 'Sengketa dieskalasi';
+    const escalateBody = `Sengketa ${dispute.disputeId} telah dieskalasi dan diprioritaskan ke tim mediator.`;
+    for (const partyId of [dispute.order.buyerId, dispute.order.sellerId]) {
+      this.prisma.notification
+        .create({
+          data: {
+            notifId: generateNotifId(),
+            userId: partyId,
+            type: NotificationType.DISPUTE_ESCALATED,
+            category: getCategoryForType(NotificationType.DISPUTE_ESCALATED),
+            title: escalateTitle,
+            body: escalateBody,
+            isRead: false,
+          },
+        })
+        .then(() => {
+          this.prisma.emitNotificationCreated({
+            userId: partyId,
+            title: escalateTitle,
+            body: escalateBody,
+            data: { type: 'DISPUTE_ESCALATED', disputeId: dispute.disputeId },
+          });
+        })
+        .catch((err: unknown) => this.logger.warn(`silent-catch: manual escalation notification failed: ${err instanceof Error ? err.message : String(err)}`));
+    }
+
     // Notify admin via Redis alert
     await this.prisma.adminAuditLog.create({
       data: {
@@ -1052,7 +1119,7 @@ export class DisputesService {
         description: `Manual escalation by user ${userId} for dispute ${dispute.disputeId}: ${reason ?? ''}`,
         ipAddress: 'system',
       },
-    }).catch(() => {});
+    }).catch((err: unknown) => this.logger.error(`Manual escalation admin audit failed for dispute ${dispute.disputeId}: ${err instanceof Error ? err.message : String(err)}`));
 
     return { disputeId: updated.disputeId, status: updated.status, escalatedAt: new Date() };
   }

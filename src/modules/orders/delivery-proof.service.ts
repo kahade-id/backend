@@ -11,6 +11,7 @@ import { randomInt } from 'crypto';
 import {
   Prisma,
   UserAuditAction,
+  AuditAction,
   NotificationType,
   OrderStatus,
   OrderType,
@@ -610,6 +611,37 @@ export class DeliveryProofService {
           }),
         'REJECT_DELIVERY_ESCALATION_NOTIFICATION',
       );
+
+      // DP-024: admin juga wajib tahu ada sengketa otomatis. Mekanisme notifikasi
+      // admin di codebase ini adalah adminAuditLog (terlihat di dashboard admin
+      // "Recent Activity"); sengketa OPEN tanpa assignee juga muncul di antrean
+      // admin (listDisputes tidak memfilter assignee). Dialamatkan ke SUPER_ADMIN
+      // aktif pertama (fallback: admin aktif pertama) — pola cron auto-escalate.
+      this.runPostCommitBestEffort(async () => {
+        const targetAdmin = await this.prisma.adminUser.findFirst({
+          where: { role: 'SUPER_ADMIN', isActive: true },
+          orderBy: { createdAt: 'asc' },
+          select: { id: true },
+        }) ?? await this.prisma.adminUser.findFirst({
+          where: { isActive: true },
+          orderBy: { createdAt: 'asc' },
+          select: { id: true },
+        });
+        if (!targetAdmin) {
+          this.logger.warn('DP-024: no active admin found for auto-escalation audit entry');
+          return;
+        }
+        await this.prisma.adminAuditLog.create({
+          data: {
+            adminId: targetAdmin.id,
+            action: AuditAction.DISPUTE_ESCALATED,
+            targetType: 'Dispute',
+            targetId: order.id,
+            description: `Auto-escalated dispute for order ${order.orderId} after ${newRejectionTotal} delivery proof rejections. Last rejection note: ${normalizedNote.slice(0, 200)}`,
+            ipAddress: 'system',
+          },
+        });
+      }, 'REJECT_DELIVERY_ESCALATION_ADMIN_AUDIT');
 
       return {
         message: `Delivery rejected. Maximum rejections (${DeliveryProofService.MAX_REJECTION_COUNT}) reached — order has been automatically escalated to a dispute.`,

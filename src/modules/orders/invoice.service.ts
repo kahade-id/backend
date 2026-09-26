@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException, ForbiddenException, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
+import { INVOICE_COMPANY_NAME, INVOICE_COMPANY_ADDRESS } from '../../common/constants/app.constants';
 import { toIdr } from '../../common/utils/currency.util';
 import PDFDocument from 'pdfkit';
 
@@ -27,6 +28,12 @@ export class InvoiceService {
 
     if (order.status === 'WAITING_CONFIRMATION' || order.status === 'CANCELLED') {
       throw new ForbiddenException({ code: ErrorCodes.INVALID_ORDER_STATUS, message: 'Invoice not available for this status' });
+    }
+
+    // EO-012: invoice adalah dokumen pasca-bayar. Order WAITING_PAYMENT (paidAt null)
+    // tidak boleh menghasilkan invoice — tolak eksplisit, bukan proforma diam-diam.
+    if (!order.paidAt) {
+      throw new ForbiddenException({ code: ErrorCodes.INVALID_ORDER_STATUS, message: 'Invoice not available: order not paid yet' });
     }
 
     return {
@@ -66,8 +73,8 @@ export class InvoiceService {
         sellerReceiveAmount: toIdr(order.sellerReceiveAmount),
       },
       company: {
-        name: 'PT Kahade Digital Indonesia',
-        address: 'Jakarta, Indonesia',
+        name: INVOICE_COMPANY_NAME,
+        address: INVOICE_COMPANY_ADDRESS,
       },
     };
   }

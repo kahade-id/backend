@@ -493,6 +493,8 @@ enum AuditAction {
   DISPUTE_ASSIGNED
   DISPUTE_DECIDED
   DISPUTE_ESCALATED
+  DISPUTE_EVIDENCE_SUBMITTED
+  DISPUTE_CLAIM_SUBMITTED
   ADMIN_LOGIN
   ADMIN_LOGOUT
   ADMIN_ACTION
@@ -597,6 +599,7 @@ enum UserAuditAction {
   RATING_SUBMITTED
   // Evidence
   DISPUTE_EVIDENCE_ADDED
+  DISPUTE_EVIDENCE_DELETED
   // Order Link
   ORDER_LINK_CREATED
   ORDER_LINK_ACCEPTED
@@ -1914,8 +1917,9 @@ model DisputeDecision {
   disputeId String  @unique
   dispute   Dispute @relation(fields: [disputeId], references: [id], onDelete: Cascade)
 
-  decidedBy String
-  decider   AdminUser @relation("DisputeDecider", fields: [decidedBy], references: [id], onDelete: Restrict)
+  // DP-023: nullable — resolusi mutual diputuskan kedua pihak, bukan admin.
+  decidedBy String?
+  decider   AdminUser? @relation("DisputeDecider", fields: [decidedBy], references: [id], onDelete: Restrict)
 
   decisionType DisputeDecisionType
 

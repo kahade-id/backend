@@ -969,6 +969,7 @@ export class OrdersService {
   }
 
   async calculateFee(dto: { orderValue: number; feeResponsibility: FeeResponsibility; voucherCode?: string; role?: 'BUYER' | 'SELLER' }, userId: string): Promise<{
+    orderValue: number;
     feeRate: number;
     feeAmount: number;
     buyerFeeAmount: number;
@@ -1067,6 +1068,7 @@ export class OrdersService {
     }, feeConfig);
 
     return {
+      orderValue: dto.orderValue,
       feeRate: feeCalculation.feeRate,
       feeAmount: safeBigIntToNumber(feeCalculation.feeAmount / 100n),
       buyerFeeAmount: safeBigIntToNumber(feeCalculation.buyerFeeAmount / 100n),

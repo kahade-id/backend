@@ -80,6 +80,7 @@ export class OrdersController {
     @CurrentUser('sub') userId: string,
     @Body() dto: CalculateFeeDto,
   ): Promise<{
+    orderValue: number;
     feeRate: number;
     feeAmount: number;
     buyerFeeAmount: number;

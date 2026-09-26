@@ -217,6 +217,11 @@ export class UploadService {
       endpoint: endpointUrl,
       credentials: { accessKeyId, secretAccessKey },
       forcePathStyle: true,
+      // FIX 2026-09-26: AWS SDK v3 otomatis menambahkan checksum CRC32 ke
+      // presigned URL. Frontend tidak mengirim checksum yang cocok sehingga
+      // R2 menolak dengan SignatureDoesNotMatch/AccessDenied. Nonaktifkan
+      // checksum otomatis untuk presigned URL.
+      requestChecksumCalculation: 'WHEN_REQUIRED',
     });
 
     return this._s3Client;

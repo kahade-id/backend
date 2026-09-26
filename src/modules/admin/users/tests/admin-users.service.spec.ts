@@ -7,6 +7,7 @@ import { RedisService } from '../../../../redis/redis.service';
 import { AuditLogService } from '../../../../common/services/audit-log.service';
 import { WalletTxSerialService } from '../../../../common/services/wallet-tx-serial.service';
 import { OtpService } from '../../../auth/otp.service';
+import { VerificationBadgeService } from '../../../users/verification-badge.service';
 import { EMAIL_QUEUE } from '../../../queue/processors/email.processor';
 
 jest.mock('../../../../common/utils/pii.util', () => ({
@@ -29,6 +30,7 @@ const mockAudit = { logAdminAction: jest.fn() };
 const mockSerial = { next: jest.fn() };
 const mockOtp = { generate: jest.fn() };
 const mockEmailQueue = { add: jest.fn() };
+const mockVerificationBadge = { invalidate: jest.fn().mockResolvedValue(undefined) };
 
 describe('AdminUsersService — siklus hidup flaggedForReview (Section 6)', () => {
   let service: AdminUsersService;
@@ -52,6 +54,7 @@ describe('AdminUsersService — siklus hidup flaggedForReview (Section 6)', () =
         { provide: AuditLogService, useValue: mockAudit },
         { provide: WalletTxSerialService, useValue: mockSerial },
         { provide: OtpService, useValue: mockOtp },
+        { provide: VerificationBadgeService, useValue: mockVerificationBadge },
         { provide: `BullQueue_${EMAIL_QUEUE}`, useValue: mockEmailQueue },
       ],
     }).compile();
@@ -183,6 +186,131 @@ describe('AdminUsersService — siklus hidup flaggedForReview (Section 6)', () =
       expect(detail.flaggedForReview).toBe(true);
       expect(detail.flaggedForReviewAt).toEqual(FLAGGED_AT);
       expect(detail.reportsReceivedCount).toBe(4);
+    });
+  });
+
+  describe('verified tiers — gold & gray', () => {
+    const baseTarget = {
+      id: 'user-1',
+      userId: 'USR-1',
+      email: 'target@example.com',
+      isVip: false,
+      vipGrantedAt: null,
+      grayVerifiedRevokedAt: null,
+    };
+
+    beforeEach(() => {
+      mockPrisma.user.findFirst.mockResolvedValue({ ...baseTarget });
+      mockPrisma.user.update.mockImplementation(async (args: any) => ({ ...baseTarget, ...args.data }));
+    });
+
+    describe('grantGoldVerified', () => {
+      it('sets isVip + vipGrantedAt/vipGrantedBy and invalidates badge cache', async () => {
+        const res = await service.grantGoldVerified('user-1', ADMIN_ID, '1.2.3.4');
+        expect(res).toEqual({ message: expect.any(String) });
+        expect(mockPrisma.user.update).toHaveBeenCalledWith({
+          where: { id: 'user-1' },
+          data: { isVip: true, vipGrantedAt: expect.any(Date), vipGrantedBy: ADMIN_ID },
+        });
+        expect(mockVerificationBadge.invalidate).toHaveBeenCalledWith('user-1');
+        expect(mockAudit.logAdminAction).toHaveBeenCalledWith(
+          expect.objectContaining({ adminId: ADMIN_ID, targetType: 'User', targetId: 'user-1' }),
+        );
+      });
+
+      it('is idempotent when the user already holds gold', async () => {
+        mockPrisma.user.findFirst.mockResolvedValue({ ...baseTarget, isVip: true });
+        await expect(service.grantGoldVerified('user-1', ADMIN_ID)).resolves.toEqual({ message: expect.any(String) });
+        expect(mockPrisma.user.update).not.toHaveBeenCalled();
+        // Cache tetap di-invalidate agar konsisten.
+        expect(mockVerificationBadge.invalidate).toHaveBeenCalledWith('user-1');
+      });
+
+      it('throws NotFound for a missing user', async () => {
+        mockPrisma.user.findFirst.mockResolvedValue(null);
+        await expect(service.grantGoldVerified('nope', ADMIN_ID)).rejects.toThrow(NotFoundException);
+      });
+    });
+
+    describe('revokeGoldVerified', () => {
+      it('clears isVip but keeps vipGrantedAt for audit trail', async () => {
+        mockPrisma.user.findFirst.mockResolvedValue({
+          ...baseTarget,
+          isVip: true,
+          vipGrantedAt: new Date('2026-01-01T00:00:00.000Z'),
+        });
+        const res = await service.revokeGoldVerified('user-1', ADMIN_ID, '1.2.3.4');
+        expect(res).toEqual({ message: expect.any(String) });
+        expect(mockPrisma.user.update).toHaveBeenCalledWith({
+          where: { id: 'user-1' },
+          data: { isVip: false },
+        });
+        expect(mockVerificationBadge.invalidate).toHaveBeenCalledWith('user-1');
+      });
+
+      it('rejects when the user does not hold gold', async () => {
+        await expect(service.revokeGoldVerified('user-1', ADMIN_ID)).rejects.toThrow(BadRequestException);
+        expect(mockPrisma.user.update).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('revokeGrayVerified', () => {
+      it('sets revoke fields, audits, and invalidates badge cache', async () => {
+        const res = await service.revokeGrayVerified('user-1', 'Alasan pencabutan yang valid', ADMIN_ID, 'admin@kahade.id', '1.2.3.4');
+        expect(res).toEqual({ message: expect.any(String) });
+        expect(mockPrisma.user.update).toHaveBeenCalledWith({
+          where: { id: 'user-1' },
+          data: {
+            grayVerifiedRevokedAt: expect.any(Date),
+            grayVerifiedRevokedBy: ADMIN_ID,
+            grayVerifiedRevokeReason: 'Alasan pencabutan yang valid',
+          },
+        });
+        expect(mockVerificationBadge.invalidate).toHaveBeenCalledWith('user-1');
+        expect(mockAudit.logAdminAction).toHaveBeenCalledWith(
+          expect.objectContaining({
+            adminId: ADMIN_ID,
+            targetType: 'User',
+            targetId: 'user-1',
+            ipAddress: '1.2.3.4',
+          }),
+        );
+      });
+
+      it('rejects revoking your own gray tier (matched by email)', async () => {
+        mockPrisma.user.findFirst.mockResolvedValue({ ...baseTarget, email: 'Admin@Kahade.id' });
+        await expect(
+          service.revokeGrayVerified('user-1', 'Alasan pencabutan yang valid', ADMIN_ID, 'admin@kahade.id'),
+        ).rejects.toThrow(expect.objectContaining({ status: 403 }));
+        expect(mockPrisma.user.update).not.toHaveBeenCalled();
+      });
+
+      it('rejects double revoke with 409', async () => {
+        mockPrisma.user.findFirst.mockResolvedValue({ ...baseTarget, grayVerifiedRevokedAt: new Date() });
+        await expect(
+          service.revokeGrayVerified('user-1', 'Alasan pencabutan yang valid', ADMIN_ID, 'admin@kahade.id'),
+        ).rejects.toThrow(ConflictException);
+      });
+    });
+
+    describe('restoreGrayVerified', () => {
+      it('clears revoke fields and invalidates badge cache', async () => {
+        mockPrisma.user.findFirst.mockResolvedValue({
+          ...baseTarget,
+          grayVerifiedRevokedAt: new Date('2026-02-01T00:00:00.000Z'),
+        });
+        const res = await service.restoreGrayVerified('user-1', ADMIN_ID, '1.2.3.4');
+        expect(res).toEqual({ message: expect.any(String) });
+        expect(mockPrisma.user.update).toHaveBeenCalledWith({
+          where: { id: 'user-1' },
+          data: { grayVerifiedRevokedAt: null, grayVerifiedRevokedBy: null, grayVerifiedRevokeReason: null },
+        });
+        expect(mockVerificationBadge.invalidate).toHaveBeenCalledWith('user-1');
+      });
+
+      it('rejects when the tier is not revoked', async () => {
+        await expect(service.restoreGrayVerified('user-1', ADMIN_ID)).rejects.toThrow(BadRequestException);
+      });
     });
   });
 });

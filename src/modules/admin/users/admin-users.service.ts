@@ -15,6 +15,7 @@ import { toSen, toIdr } from '../../../common/utils/currency.util';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { OtpService } from '../../auth/otp.service';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { EMAIL_QUEUE, EmailJobData } from '../../queue/processors/email.processor';
 import { generateNotifId, generateWalletTxId } from '../../../common/utils/id-generator.util';
 import { parseJwtTtl } from '../../../common/utils/jwt.util';
@@ -33,6 +34,7 @@ export class AdminUsersService {
     private auditLog: AuditLogService,
     private walletTxSerial: WalletTxSerialService,
     private otpService: OtpService,
+    private verificationBadge: VerificationBadgeService,
     @InjectQueue(EMAIL_QUEUE) private readonly emailQueue: Queue<EmailJobData>,
   ) {
     this.accessTokenTtlSeconds = parseJwtTtl(
@@ -261,6 +263,183 @@ export class AdminUsersService {
     });
 
     return result;
+  }
+
+  /**
+   * Tier verified 3 tingkat (koreksi model 2026-09-26):
+   *  - Abu (FULLY_VERIFIED): OTOMATIS dari KYC APPROVED + email verified +
+   *    phone verified + alamat lengkap + Kahade Plus aktif. Bisa di-revoke
+   *    admin kapanpun via revokeGrayVerified, dan di-restore via
+   *    restoreGrayVerified.
+   *  - Bisnis (BUSINESS_VERIFIED): manual oleh admin via modul
+   *    business-verification (APPROVED).
+   *  - Emas (TRUSTED_BY_KAHADE): manual ke customer pilihan via grantGoldVerified
+   *    di bawah (reuse isVip/vipGrantedAt, tanpa field baru).
+   * Badge (model Badge/UserBadge) adalah domain TERPISAH untuk event/pencapaian.
+   */
+
+  /** Cari user aktif (by id atau userId publik). */
+  private async findActiveUserOrThrow(userId: string) {
+    const user = await this.prisma.user.findFirst({
+      where: { OR: [{ id: userId }, { userId }], deletedAt: null },
+      select: {
+        id: true, userId: true, email: true, isVip: true, vipGrantedAt: true,
+        grayVerifiedRevokedAt: true,
+      },
+    });
+    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    return user;
+  }
+
+  /**
+   * Grant tier EMAS (TRUSTED_BY_KAHADE) ke customer pilihan.
+   * Hanya SUPER_ADMIN. Idempoten: bila sudah isVip, tetap 200 tanpa duplikasi.
+   */
+  async grantGoldVerified(userId: string, adminId: string, ipAddress: string = 'internal'): Promise<{ message: string }> {
+    const user = await this.findActiveUserOrThrow(userId);
+    const now = new Date();
+
+    if (!user.isVip) {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { isVip: true, vipGrantedAt: now, vipGrantedBy: adminId },
+      });
+    }
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'User',
+      targetId: user.id,
+      description: `Admin granted GOLD verified tier (TRUSTED_BY_KAHADE) to user ${user.id}`,
+      before: { isVip: user.isVip },
+      after: { isVip: true, vipGrantedAt: now.toISOString(), vipGrantedBy: adminId },
+      ipAddress,
+    });
+
+    // Invalidate post-commit: badge TRUSTED_BY_KAHADE dihitung ulang dari isVip.
+    await this.verificationBadge.invalidate(user.id);
+
+    return { message: 'Tier emas (Dipercaya Kahade) berhasil diberikan.' };
+  }
+
+  /**
+   * Revoke tier EMAS. vipGrantedAt dipertahankan untuk jejak audit;
+   * yang menentukan badge hanya flag isVip.
+   * Hanya SUPER_ADMIN.
+   */
+  async revokeGoldVerified(userId: string, adminId: string, ipAddress: string = 'internal'): Promise<{ message: string }> {
+    const user = await this.findActiveUserOrThrow(userId);
+
+    if (!user.isVip) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'User does not hold the gold verified tier' });
+    }
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: { isVip: false },
+    });
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'User',
+      targetId: user.id,
+      description: `Admin revoked GOLD verified tier (TRUSTED_BY_KAHADE) from user ${user.id}`,
+      before: { isVip: true },
+      after: { isVip: false },
+      ipAddress,
+    });
+
+    await this.verificationBadge.invalidate(user.id);
+
+    return { message: 'Tier emas (Dipercaya Kahade) berhasil dicabut.' };
+  }
+
+  /**
+   * Revoke tier ABU (FULLY_VERIFIED) manual oleh admin.
+   * Syarat otomatis (KYC/email/HP/alamat/Kahade+) TIDAK diubah — hanya flag
+   * revoke yang di-set, sehingga badge hilang sampai di-restore.
+   * Admin tidak boleh me-revoke akunnya sendiri (dicek via email).
+   * Hanya SUPER_ADMIN + KYC_ADMIN.
+   */
+  async revokeGrayVerified(
+    userId: string,
+    reason: string,
+    adminId: string,
+    adminEmail: string,
+    ipAddress: string = 'internal',
+  ): Promise<{ message: string }> {
+    const user = await this.findActiveUserOrThrow(userId);
+
+    if (user.email != null && user.email.toLowerCase() === adminEmail.toLowerCase()) {
+      throw new ForbiddenException({ code: 'CANNOT_REVOKE_OWN_GRAY_TIER', message: 'Cannot revoke your own gray verified tier' });
+    }
+    if (user.grayVerifiedRevokedAt != null) {
+      throw new ConflictException({ code: 'GRAY_TIER_ALREADY_REVOKED', message: 'Gray verified tier is already revoked' });
+    }
+
+    const now = new Date();
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        grayVerifiedRevokedAt: now,
+        grayVerifiedRevokedBy: adminId,
+        grayVerifiedRevokeReason: reason,
+      },
+    });
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'User',
+      targetId: user.id,
+      description: `Admin revoked GRAY verified tier (FULLY_VERIFIED) from user ${user.id}. Reason: ${reason}`,
+      before: { grayVerifiedRevokedAt: null },
+      after: { grayVerifiedRevokedAt: now.toISOString(), grayVerifiedRevokedBy: adminId, reason },
+      ipAddress,
+    });
+
+    // Invalidate post-commit: badge FULLY_VERIFIED dihitung ulang.
+    await this.verificationBadge.invalidate(user.id);
+
+    return { message: 'Tier abu (Terverifikasi Penuh) berhasil dicabut.' };
+  }
+
+  /**
+   * Restore tier ABU yang sebelumnya di-revoke.
+   * Hanya SUPER_ADMIN + KYC_ADMIN.
+   */
+  async restoreGrayVerified(userId: string, adminId: string, ipAddress: string = 'internal'): Promise<{ message: string }> {
+    const user = await this.findActiveUserOrThrow(userId);
+
+    if (user.grayVerifiedRevokedAt == null) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Gray verified tier is not revoked' });
+    }
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        grayVerifiedRevokedAt: null,
+        grayVerifiedRevokedBy: null,
+        grayVerifiedRevokeReason: null,
+      },
+    });
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'User',
+      targetId: user.id,
+      description: `Admin restored GRAY verified tier (FULLY_VERIFIED) for user ${user.id}`,
+      before: { grayVerifiedRevokedAt: user.grayVerifiedRevokedAt?.toISOString() ?? null },
+      after: { grayVerifiedRevokedAt: null },
+      ipAddress,
+    });
+
+    await this.verificationBadge.invalidate(user.id);
+
+    return { message: 'Tier abu (Terverifikasi Penuh) berhasil dikembalikan.' };
   }
 
   /**

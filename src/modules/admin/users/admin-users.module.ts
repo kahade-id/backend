@@ -7,6 +7,7 @@ import { RedisModule } from '../../../redis/redis.module';
 import { AuditLogModule } from '../../../common/services/audit-log.module';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { AuthModule } from '../../auth/auth.module';
+import { VerificationBadgeModule } from '../../users/verification-badge.module';
 import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
 
 @Module({
@@ -15,6 +16,7 @@ import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
     ConfigModule,
     AuditLogModule,
     AuthModule,
+    VerificationBadgeModule,
     BullModule.registerQueue({
       name: EMAIL_QUEUE,
       settings: { stalledInterval: 30_000, maxStalledCount: 1 },

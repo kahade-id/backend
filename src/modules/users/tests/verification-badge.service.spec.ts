@@ -29,6 +29,7 @@ function baseUser(overrides: Partial<BadgeSourceUser> = {}): BadgeSourceUser {
     isVip: false,
     vipGrantedAt: null,
     address: null,
+    grayVerifiedRevokedAt: null,
     memberSince: new Date('2025-01-01T00:00:00.000Z'),
     deletedAt: null,
     ...overrides,
@@ -163,8 +164,14 @@ describe('VerificationBadgeService', () => {
       expect(badges[0].earnedAt).toEqual(new Date('2026-07-07T00:00:00.000Z'));
     });
 
-    it('FULLY_VERIFIED requires KYC + email + phone + non-empty address', () => {
-      // Tanpa alamat → tidak dapat FULLY_VERIFIED walau KYC+kontak lengkap.
+    it('FULLY_VERIFIED (tier abu) requires KYC + email + phone + address + active Kahade+ + not revoked', () => {
+      const plusActive = {
+        isKahadePlus: true,
+        subscriptionExpiresAt: new Date('2026-12-01T00:00:00.000Z'),
+        kahadePlusSince: new Date('2026-01-15T00:00:00.000Z'),
+      };
+
+      // Tanpa alamat → tidak dapat FULLY_VERIFIED walau KYC+kontak+Plus lengkap.
       const noAddress = service.computeBadges(
         baseUser({
           emailVerified: true,
@@ -174,6 +181,7 @@ describe('VerificationBadgeService', () => {
           kycStatus: KycStatus.APPROVED,
           kycApprovedAt: NOW,
           address: null,
+          ...plusActive,
         }),
         null,
         NOW,
@@ -187,11 +195,55 @@ describe('VerificationBadgeService', () => {
           phoneVerified: true,
           kycStatus: KycStatus.APPROVED,
           address: '   ',
+          ...plusActive,
         }),
         null,
         NOW,
       );
       expect(blankAddress.map((b) => b.type)).not.toContain('FULLY_VERIFIED');
+
+      // Tanpa Kahade+ aktif → tidak dapat FULLY_VERIFIED (syarat baru).
+      const noPlus = service.computeBadges(
+        baseUser({
+          emailVerified: true,
+          phoneVerified: true,
+          kycStatus: KycStatus.APPROVED,
+          address: 'Jl. Merdeka No. 1, Jakarta',
+        }),
+        null,
+        NOW,
+      );
+      expect(noPlus.map((b) => b.type)).not.toContain('FULLY_VERIFIED');
+
+      // Kahade+ kedaluwarsa → tidak dapat FULLY_VERIFIED.
+      const plusExpired = service.computeBadges(
+        baseUser({
+          emailVerified: true,
+          phoneVerified: true,
+          kycStatus: KycStatus.APPROVED,
+          address: 'Jl. Merdeka No. 1, Jakarta',
+          isKahadePlus: true,
+          subscriptionExpiresAt: new Date('2026-09-01T00:00:00.000Z'),
+        }),
+        null,
+        NOW,
+      );
+      expect(plusExpired.map((b) => b.type)).not.toContain('FULLY_VERIFIED');
+
+      // Di-revoke admin → tidak dapat FULLY_VERIFIED walau syarat otomatis lengkap.
+      const revoked = service.computeBadges(
+        baseUser({
+          emailVerified: true,
+          phoneVerified: true,
+          kycStatus: KycStatus.APPROVED,
+          address: 'Jl. Merdeka No. 1, Jakarta',
+          ...plusActive,
+          grayVerifiedRevokedAt: new Date('2026-09-20T00:00:00.000Z'),
+        }),
+        null,
+        NOW,
+      );
+      expect(revoked.map((b) => b.type)).not.toContain('FULLY_VERIFIED');
 
       // Lengkap semua → dapat FULLY_VERIFIED dengan earnedAt = yang paling belakang.
       const full = service.computeBadges(
@@ -203,6 +255,7 @@ describe('VerificationBadgeService', () => {
           kycStatus: KycStatus.APPROVED,
           kycApprovedAt: new Date('2026-03-01T00:00:00.000Z'),
           address: 'Jl. Merdeka No. 1, Jakarta',
+          ...plusActive,
         }),
         null,
         NOW,
@@ -210,6 +263,13 @@ describe('VerificationBadgeService', () => {
       const fv = full.find((b) => b.type === 'FULLY_VERIFIED');
       expect(fv).toBeDefined();
       expect(fv!.earnedAt).toEqual(new Date('2026-03-01T00:00:00.000Z'));
+    });
+
+    it('FULLY_VERIFIED description mentions the Kahade+ requirement', () => {
+      const catalog = service.getCatalog();
+      const fv = catalog.find((c) => c.type === 'FULLY_VERIFIED');
+      expect(fv).toBeDefined();
+      expect(fv!.description).toMatch(/Kahade\+/);
     });
 
     it('orders badges by display priority Full > KYC > Business > Kahade+ > Trusted > Contact', () => {

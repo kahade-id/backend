@@ -14,6 +14,7 @@ import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
 import { WalletAdjustDto } from './dto/wallet-adjust.dto';
+import { GrayRevokeDto } from './dto/gray-revoke.dto';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
 import { Idempotency } from '../../../common/decorators/idempotency.decorator';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
@@ -178,6 +179,76 @@ export class AdminUsersController {
   @ApiResponse({ status: 404, description: 'User not found.' })
   unbanUser(@Param('userId', ParseIdPipe) userId: string, @CurrentAdmin() admin: AdminJwtPayload, @Req() req: Request): Promise<object> {
     return this.service.unbanUser(userId, admin.sub, req.ip || 'unknown');
+  }
+
+  // Tier verified 3 tingkat (koreksi model 2026-09-26):
+  //  - Emas (TRUSTED_BY_KAHADE): manual ke customer pilihan — grant/revoke di bawah.
+  //  - Abu (FULLY_VERIFIED): otomatis, tapi bisa di-revoke/restore manual.
+  //  - Bisnis: via modul business-verification (bukan di controller ini).
+  // Badge (Badge/UserBadge) adalah domain terpisah untuk event/pencapaian.
+
+  @Post(':userId/verified/gold/grant')
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN')
+  @ApiOperation({ summary: 'Grant gold verified tier', description: 'Memberikan tier emas (Dipercaya Kahade) ke customer pilihan. Hanya SUPER_ADMIN.' })
+  @ApiResponse({ status: 200, description: 'Gold tier granted.' })
+  @ApiResponse({ status: 403, description: 'Insufficient admin role.' })
+  @ApiResponse({ status: 404, description: 'User not found.' })
+  grantGoldVerified(
+    @Param('userId', ParseIdPipe) userId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<{ message: string }> {
+    return this.service.grantGoldVerified(userId, admin.sub, req.ip || 'unknown');
+  }
+
+  @Post(':userId/verified/gold/revoke')
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN')
+  @ApiOperation({ summary: 'Revoke gold verified tier', description: 'Mencabut tier emas (Dipercaya Kahade). vipGrantedAt dipertahankan untuk audit. Hanya SUPER_ADMIN.' })
+  @ApiResponse({ status: 200, description: 'Gold tier revoked.' })
+  @ApiResponse({ status: 400, description: 'User does not hold the gold tier.' })
+  @ApiResponse({ status: 403, description: 'Insufficient admin role.' })
+  @ApiResponse({ status: 404, description: 'User not found.' })
+  revokeGoldVerified(
+    @Param('userId', ParseIdPipe) userId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<{ message: string }> {
+    return this.service.revokeGoldVerified(userId, admin.sub, req.ip || 'unknown');
+  }
+
+  @Post(':userId/verified/gray/revoke')
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN', 'KYC_ADMIN')
+  @ApiOperation({ summary: 'Revoke gray verified tier', description: 'Mencabut tier abu (Terverifikasi Penuh) manual. Syarat otomatis tidak diubah; badge hilang sampai di-restore. SUPER_ADMIN dan KYC_ADMIN.' })
+  @ApiResponse({ status: 200, description: 'Gray tier revoked.' })
+  @ApiResponse({ status: 403, description: 'Insufficient admin role, or cannot revoke own tier.' })
+  @ApiResponse({ status: 404, description: 'User not found.' })
+  @ApiResponse({ status: 409, description: 'Gray tier already revoked.' })
+  revokeGrayVerified(
+    @Param('userId', ParseIdPipe) userId: string,
+    @Body() dto: GrayRevokeDto,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<{ message: string }> {
+    return this.service.revokeGrayVerified(userId, dto.reason, admin.sub, admin.email, req.ip || 'unknown');
+  }
+
+  @Post(':userId/verified/gray/restore')
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN', 'KYC_ADMIN')
+  @ApiOperation({ summary: 'Restore gray verified tier', description: 'Mengembalikan tier abu (Terverifikasi Penuh) yang sebelumnya di-revoke. SUPER_ADMIN dan KYC_ADMIN.' })
+  @ApiResponse({ status: 200, description: 'Gray tier restored.' })
+  @ApiResponse({ status: 400, description: 'Gray tier is not revoked.' })
+  @ApiResponse({ status: 403, description: 'Insufficient admin role.' })
+  @ApiResponse({ status: 404, description: 'User not found.' })
+  restoreGrayVerified(
+    @Param('userId', ParseIdPipe) userId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<{ message: string }> {
+    return this.service.restoreGrayVerified(userId, admin.sub, req.ip || 'unknown');
   }
 
   // Section 6: menutup flag `flaggedForReview` setelah admin mereview laporan

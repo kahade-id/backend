@@ -82,6 +82,11 @@ export interface BadgeSourceUser {
   vipGrantedAt: Date | null;
   /** Alamat profil — syarat badge FULLY_VERIFIED (non-empty). */
   address: string | null;
+  /**
+   * Revoke manual tier abu oleh admin. Non-null = badge FULLY_VERIFIED
+   * dinonaktifkan sampai di-restore, walau syarat otomatis terpenuhi.
+   */
+  grayVerifiedRevokedAt: Date | null;
   memberSince: Date;
   deletedAt: Date | null;
 }
@@ -109,7 +114,7 @@ const BADGE_META: Record<
     label: 'Terverifikasi Penuh',
     shortLabel: 'Terverifikasi',
     description:
-      'Menyelesaikan seluruh verifikasi: identitas (KYC), email, nomor handphone, dan alamat.',
+      'Menyelesaikan seluruh verifikasi: identitas (KYC), email, nomor handphone, alamat lengkap, dan langganan Kahade+ aktif. Dapat dicabut admin kapanpun.',
     icon: 'seal-check',
   },
   KYC_VERIFIED: {
@@ -219,16 +224,21 @@ export class VerificationBadgeService {
       push('CONTACT_VERIFIED', latest(user.emailVerifiedAt, user.phoneVerifiedAt));
     }
 
-    // (f) Verifikasi penuh — KYC + email + HP + alamat terisi (tier abu-abu).
+    // (f) Verifikasi penuh — TIER ABU: KYC + email + HP + alamat terisi +
+    // Kahade+ aktif, DAN tidak sedang di-revoke manual oleh admin.
     // earnedAt = yang paling belakang, karena badge baru lengkap saat itu.
+    // Definisi "Kahade+ aktif" sama dengan badge KAHADE_PLUS (plusStillValid).
     if (
       user.kycStatus === KycStatus.APPROVED &&
       user.emailVerified &&
       user.phoneVerified &&
       user.address != null &&
-      user.address.trim().length > 0
+      user.address.trim().length > 0 &&
+      user.isKahadePlus &&
+      plusStillValid &&
+      user.grayVerifiedRevokedAt == null
     ) {
-      push('FULLY_VERIFIED', latest(user.kycApprovedAt, user.emailVerifiedAt, user.phoneVerifiedAt));
+      push('FULLY_VERIFIED', latest(user.kycApprovedAt, user.emailVerifiedAt, user.phoneVerifiedAt, user.kahadePlusSince));
     }
 
     // Urutan prioritas tampil sudah eksplisit; sort stabil agar UI bisa langsung
@@ -294,6 +304,7 @@ export class VerificationBadgeService {
         isVip: true,
         vipGrantedAt: true,
         address: true,
+        grayVerifiedRevokedAt: true,
         memberSince: true,
         deletedAt: true,
       },

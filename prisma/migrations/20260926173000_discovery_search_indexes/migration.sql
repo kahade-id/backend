@@ -35,8 +35,8 @@ CREATE INDEX IF NOT EXISTS idx_faq_items_fts_search
 -- (nullable BigInt); dua index kolom-tunggal memungkinkan bitmapOr.
 CREATE INDEX IF NOT EXISTS idx_user_showcases_price_min
   ON user_showcases ("priceMin")
-  WHERE "deletedAt" IS NULL AND "isActive" = true AND "isPublic" = true;
+  WHERE "deletedAt" IS NULL AND "isActive" = true AND "visibility" = 'PUBLIC';
 
 CREATE INDEX IF NOT EXISTS idx_user_showcases_price_max
   ON user_showcases ("priceMax")
-  WHERE "deletedAt" IS NULL AND "isActive" = true AND "isPublic" = true;
+  WHERE "deletedAt" IS NULL AND "isActive" = true AND "visibility" = 'PUBLIC';

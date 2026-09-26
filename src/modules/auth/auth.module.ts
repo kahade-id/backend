@@ -1,6 +1,7 @@
 import { Module, Global } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
 import { AuthController } from './auth.controller';
+import { LegacyFonnteWebhookController } from './legacy-fonnte-webhook.controller';
 import { AuthService } from './auth.service';
 import { TokenService } from './token.service';
 import { OtpService } from './otp.service';
@@ -18,7 +19,7 @@ import { AuditLogModule } from '../../common/services/audit-log.module';
     QueueModule,
     AuditLogModule,
   ],
-  controllers: [AuthController],
+  controllers: [AuthController, LegacyFonnteWebhookController],
   providers: [
     AuthService,
     TokenService,

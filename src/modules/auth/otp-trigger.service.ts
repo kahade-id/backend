@@ -252,7 +252,15 @@ export class OtpTriggerService {
 
   verifyWebhookSecret(provided?: string): boolean {
     const expected = this.config.get<string>('FONNTE_WEBHOOK_SECRET');
-    if (!expected || !provided) return false;
+    if (!expected) {
+      // Secret belum dikonfigurasi: izinkan dengan peringatan. Gate utama
+      // tetap pencocokan refCode (48-bit, TTL 10 mnt) + nomor pengirim.
+      this.logger.warn(
+        '[OTP-TRIGGER] FONNTE_WEBHOOK_SECRET belum diset — webhook berjalan tanpa verifikasi secret.',
+      );
+      return true;
+    }
+    if (!provided) return false;
     const a = Buffer.from(provided);
     const b = Buffer.from(expected);
     return a.length === b.length && timingSafeEqual(a, b);

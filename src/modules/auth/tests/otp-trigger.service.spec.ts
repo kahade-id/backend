@@ -98,11 +98,15 @@ describe('OtpTriggerService', () => {
       expect(service.verifyWebhookSecret('test-secret')).toBe(true);
     });
 
-    it('menolak secret salah, kosong, atau bila secret server belum diset', () => {
+    it('menolak secret salah atau kosong bila secret server diset', () => {
       expect(service.verifyWebhookSecret('wrong')).toBe(false);
       expect(service.verifyWebhookSecret(undefined)).toBe(false);
+    });
+
+    it('mengizinkan dengan peringatan bila secret server belum diset (fail-open terdokumentasi)', () => {
       mockConfig.get.mockReturnValue(undefined);
-      expect(service.verifyWebhookSecret('test-secret')).toBe(false);
+      expect(service.verifyWebhookSecret('test-secret')).toBe(true);
+      expect(service.verifyWebhookSecret(undefined)).toBe(true);
     });
   });
 

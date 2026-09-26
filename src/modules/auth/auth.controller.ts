@@ -196,15 +196,21 @@ export class AuthController {
 
   /**
    * Webhook pesan masuk Fonnte. Diproteksi shared secret (bukan JWT user).
+   * Secret dapat dikirim via header `x-fonnte-secret`, field body
+   * `webhookSecret`, atau query param `?webhookSecret=` (cara Fonnte
+   * menempelkan secret di URL webhook dashboard).
    * Selalu 200 — Fonnte me-retry bila respons non-2xx.
    */
   @Public()
   @Post('webhooks/fonnte')
   @HttpCode(HttpStatus.OK)
   async fonnteWebhook(@Body() body: Record<string, unknown>, @Req() req: Request): Promise<{ ok: true }> {
+    const q = req.query as Record<string, unknown> | undefined;
     const secret =
       (req.headers['x-fonnte-secret'] as string | undefined) ??
-      (typeof body.webhookSecret === 'string' ? body.webhookSecret : undefined);
+      (typeof body.webhookSecret === 'string' ? body.webhookSecret : undefined) ??
+      (typeof q?.webhookSecret === 'string' ? (q.webhookSecret as string) : undefined) ??
+      (typeof q?.secret === 'string' ? (q.secret as string) : undefined);
     if (!this.otpTriggerService.verifyWebhookSecret(secret)) {
       throw new UnauthorizedException({
         code: ErrorCodes.UNAUTHORIZED,

@@ -7,6 +7,8 @@ import { RedisService } from '../../../redis/redis.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { OgMetadataService } from '../og-metadata.service';
 import { VerificationBadgeService } from '../verification-badge.service';
+import { UserAnalyticsService } from '../user-analytics.service';
+import { LocalStorageService } from '../../upload/local-storage.service';
 import { ReportFlagService } from '../../../common/services/report-flag.service';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 
@@ -58,6 +60,7 @@ const mockPrisma: any = {
 };
 const mockRedis = { get: jest.fn(), set: jest.fn(), del: jest.fn(), setex: jest.fn() };
 const mockVerificationBadges = {
+  getSealTierMap: jest.fn().mockResolvedValue(new Map()),
   getBadges: jest.fn().mockResolvedValue([
     {
       type: 'KYC_VERIFIED',
@@ -95,6 +98,8 @@ describe('UsersService.getPublicProfile (Section 2 — Profile Core)', () => {
         { provide: AuditLogService, useValue: { logUserAction: jest.fn() } },
         { provide: OgMetadataService, useValue: { invalidateUserOgCache: jest.fn() } },
         { provide: VerificationBadgeService, useValue: mockVerificationBadges },
+        { provide: UserAnalyticsService, useValue: { calculateTrustScore: jest.fn().mockResolvedValue(0) } },
+        { provide: LocalStorageService, useValue: {} },
         // Section 6: agregasi laporan -> flag moderasi internal.
         { provide: ReportFlagService, useValue: { evaluateTarget: jest.fn(async () => ({ flaggedForReview: false, distinctReporters: 0 })) } },
       ],

@@ -197,9 +197,9 @@ export class SearchService {
 
     if (tsQuery) {
       const [rows, countResult] = await Promise.all([
-        this.prisma.$queryRaw<{ id: string; username: string | null; fullName: string; avatarUrl: string | null; rank: number }[]>`
+        this.prisma.$queryRaw<{ id: string; userId: string; username: string | null; fullName: string; avatarUrl: string | null; rank: number }[]>`
           SELECT
-            id, username, "fullName", "avatarUrl",
+            id, "userId", username, "fullName", "avatarUrl",
             ts_rank(
               to_tsvector('simple', coalesce(username, '') || ' ' || "fullName"),
               to_tsquery('simple', ${tsQuery})
@@ -238,7 +238,7 @@ export class SearchService {
               { fullName: { contains: escapeLikePattern(query), mode: 'insensitive' } },
             ],
           },
-          select: { id: true, username: true, fullName: true, avatarUrl: true },
+          select: { id: true, userId: true, username: true, fullName: true, avatarUrl: true },
           take,
         }),
         this.prisma.user.count({
@@ -257,11 +257,18 @@ export class SearchService {
 
     // R1 (audit 2026-09-26): sematkan sealTier di hasil pencarian user agar
     // frontend bisa render <VerifiedSeal> tanpa N+1 request badge.
+    // DC-009: response memakai `userId` PUBLIK (USR-XXXX) — selaras dengan
+    // GET /v1/users/search, /v1/users/discover, dan author di showcase feed.
+    // Kolom `id` internal hanya dipakai untuk lookup sealTier, tidak diekspos.
+    type SearchUserRow = { id: string; userId: string; username: string | null; fullName: string; avatarUrl: string | null };
     const sealMap = await this.verificationBadgeService.getSealTierMap(
-      (results as Array<{ id: string }>).map((r) => r.id),
+      (results as SearchUserRow[]).map((r) => r.id),
     );
-    const resultsWithSeal = (results as Array<{ id: string }>).map((r) => ({
-      ...r,
+    const resultsWithSeal = (results as SearchUserRow[]).map((r) => ({
+      userId: r.userId,
+      username: r.username,
+      fullName: r.fullName,
+      avatarUrl: r.avatarUrl,
       sealTier: sealMap.get(r.id) ?? null,
     }));
 
@@ -272,21 +279,64 @@ export class SearchService {
     const take = limit || this.LIMIT;
     const tsQuery = this.buildTsQuery(query);
 
+    // DC-003/DC-005 (audit Discovery 2026-09-26): hasil search order harus
+    // memakai `orderId` PUBLIK (ORD-...) — bukan `id` internal — agar cocok
+    // dengan `GET /v1/orders/:orderId` (pola daftar pesanan normal).
+    // DC-005: sertakan buyer/seller/myRole agar kartu pencarian bisa
+    // menampilkan lawan transaksi (sebelumnya "Identitas belum tersedia").
+    const toOrderResult = (r: {
+      orderId: string; title: string | null; status: unknown; orderValue: unknown;
+      createdAt: Date; buyerId: string;
+      buyerUserId: string | null; buyerUsername: string | null; buyerFullName: string | null; buyerAvatarUrl: string | null;
+      sellerUserId: string | null; sellerUsername: string | null; sellerFullName: string | null; sellerAvatarUrl: string | null;
+    }) => ({
+      orderId: r.orderId,
+      title: r.title,
+      status: r.status,
+      orderValue: this.senToIdr(r.orderValue),
+      createdAt: r.createdAt,
+      buyer: {
+        userId: r.buyerUserId,
+        username: r.buyerUsername,
+        fullName: r.buyerFullName,
+        avatarUrl: r.buyerAvatarUrl,
+      },
+      seller: {
+        userId: r.sellerUserId,
+        username: r.sellerUsername,
+        fullName: r.sellerFullName,
+        avatarUrl: r.sellerAvatarUrl,
+      },
+      myRole: r.buyerId === userId ? 'BUYER' : 'SELLER',
+    });
+
     if (tsQuery) {
       const [rows, countResult] = await Promise.all([
-        this.prisma.$queryRaw<object[]>`
+        this.prisma.$queryRaw<Array<{
+          orderId: string; title: string | null; status: string; orderValue: unknown;
+          createdAt: Date; buyerId: string; sellerId: string;
+          buyerUserId: string | null; buyerUsername: string | null; buyerFullName: string | null; buyerAvatarUrl: string | null;
+          sellerUserId: string | null; sellerUsername: string | null; sellerFullName: string | null; sellerAvatarUrl: string | null;
+        }>>`
           SELECT
-            id, title, status, "orderValue", "createdAt",
+            o."orderId", o.title, o.status, o."orderValue", o."createdAt",
+            o."buyerId", o."sellerId",
+            b."userId" AS "buyerUserId", b.username AS "buyerUsername",
+            b."fullName" AS "buyerFullName", b."avatarUrl" AS "buyerAvatarUrl",
+            s."userId" AS "sellerUserId", s.username AS "sellerUsername",
+            s."fullName" AS "sellerFullName", s."avatarUrl" AS "sellerAvatarUrl",
             ts_rank(
-              to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,'')),
+              to_tsvector('simple', COALESCE(o.title,'') || ' ' || COALESCE(o.description,'')),
               to_tsquery('simple', ${tsQuery})
             ) AS rank
-          FROM orders
-          WHERE ("buyerId" = ${userId} OR "sellerId" = ${userId})
-            AND "deletedAt" IS NULL
-            AND to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,''))
+          FROM orders o
+          JOIN users b ON b.id = o."buyerId"
+          JOIN users s ON s.id = o."sellerId"
+          WHERE (o."buyerId" = ${userId} OR o."sellerId" = ${userId})
+            AND o."deletedAt" IS NULL
+            AND to_tsvector('simple', COALESCE(o.title,'') || ' ' || COALESCE(o.description,''))
                 @@ to_tsquery('simple', ${tsQuery})
-          ORDER BY rank DESC, "createdAt" DESC
+          ORDER BY rank DESC, o."createdAt" DESC
           LIMIT ${take}
         `.catch(() => []),
         this.prisma.$queryRaw<{ count: bigint }[]>`
@@ -297,11 +347,7 @@ export class SearchService {
                 @@ to_tsquery('simple', ${tsQuery})
         `.catch(() => [{ count: BigInt(0) }]),
       ]);
-      // BUG #3: "orderValue" dari DB dalam sen — konversi ke IDR sesuai kontrak API.
-      const results = (rows as Array<Record<string, unknown>>).map((r) => ({
-        ...r,
-        orderValue: this.senToIdr(r.orderValue),
-      }));
+      const results = rows.map(toOrderResult);
       return { results, total: Number(countResult[0]?.count ?? 0) };
     }
 
@@ -313,15 +359,34 @@ export class SearchService {
     const [rows, total] = await Promise.all([
       this.prisma.order.findMany({
         where,
-        select: { id: true, title: true, status: true, orderValue: true, createdAt: true },
+        select: {
+          orderId: true, title: true, status: true, orderValue: true, createdAt: true,
+          buyerId: true,
+          buyer: { select: { userId: true, username: true, fullName: true, avatarUrl: true } },
+          seller: { select: { userId: true, username: true, fullName: true, avatarUrl: true } },
+        },
         take,
         orderBy: { createdAt: 'desc' },
       }),
       this.prisma.order.count({ where }),
     ]);
 
-    // BUG #3: orderValue dari DB dalam sen — konversi ke IDR sesuai kontrak API.
-    const orderResults = rows.map((r) => ({ ...r, orderValue: this.senToIdr(r.orderValue) }));
+    const orderResults = rows.map((r) => toOrderResult({
+      orderId: r.orderId,
+      title: r.title,
+      status: r.status,
+      orderValue: r.orderValue,
+      createdAt: r.createdAt,
+      buyerId: r.buyerId,
+      buyerUserId: r.buyer.userId,
+      buyerUsername: r.buyer.username,
+      buyerFullName: r.buyer.fullName,
+      buyerAvatarUrl: r.buyer.avatarUrl,
+      sellerUserId: r.seller.userId,
+      sellerUsername: r.seller.username,
+      sellerFullName: r.seller.fullName,
+      sellerAvatarUrl: r.seller.avatarUrl,
+    }));
     return { results: orderResults, total };
   }
 
@@ -341,7 +406,9 @@ export class SearchService {
     const [rows, total] = await Promise.all([
       this.prisma.walletTransaction.findMany({
         where,
-        select: { id: true, txId: true, type: true, amount: true, description: true, createdAt: true },
+        // DC-015: sertakan `status` — daftar wallet normal mengirimnya;
+        // tanpanya hasil pencarian tampil "Status belum tersedia".
+        select: { id: true, txId: true, type: true, amount: true, status: true, description: true, createdAt: true },
         take,
         orderBy: { createdAt: 'desc' },
       }),
@@ -354,6 +421,13 @@ export class SearchService {
   }
 
   private async searchShowcase(query: string, userId: string | undefined, limit?: number, location?: string): Promise<{ results: object[]; total: number }> {
+    // DC-019 (audit Discovery 2026-09-26): bentuk MINIMAL ini disengaja —
+    // hasil search showcase adalah ringkasan untuk navigasi, bukan kartu feed.
+    // Memperkaya dengan images/likeCount/author penuh = join berat di endpoint
+    // yang dioptimasi untuk latency. Kontrak: {id, title, description, userId,
+    // createdAt} dengan `userId` PUBLIK (USR-XXXX, selaras DC-009).
+    // Bila frontend kelak butuh kartu kaya dari search, tambahkan mode
+    // `detail=full` — jangan memperkaya default ini tanpa ukur dampak.
     const take = limit || this.LIMIT;
     const tsQuery = this.buildTsQuery(query);
     // T2 (audit Discovery 2026-09-26): paritas privasi dengan searchUsers —
@@ -363,38 +437,44 @@ export class SearchService {
     const blockedIdsArray = blockedIds.length > 0 ? blockedIds : ['__none__'];
     // Fragmen SQL mentah (bukan parameter) — Prisma mengutip string biasa
     // sebagai nilai, jadi harus dibungkus Prisma.raw.
-    const ownerVisibilitySql = Prisma.raw(`"userId" IN (SELECT id FROM users WHERE "isActive" = true AND "isBanned" = false AND "deletedAt" IS NULL AND "profileVisible" = true)`);
+    const ownerVisibilitySql = Prisma.raw(`sc."userId" IN (SELECT id FROM users WHERE "isActive" = true AND "isBanned" = false AND "deletedAt" IS NULL AND "profileVisible" = true)`);
     // Filter lokasi (opsional): batasi ke item yang owner-nya punya
     // users.address ILIKE %location% (case-insensitive). Nilai diikat sebagai
     // PARAMETER (Prisma.sql), bukan interpolasi string — dan pola LIKE
     // di-escape supaya `%`/`_`/`\` dari user diperlakukan literal.
     const locationFilter = (location ?? '').trim();
     const locationSql = locationFilter
-      ? Prisma.sql`AND "userId" IN (SELECT id FROM users WHERE address ILIKE '%' || ${escapeLikePattern(locationFilter)} || '%')`
+      ? Prisma.sql`AND sc."userId" IN (SELECT id FROM users WHERE address ILIKE '%' || ${escapeLikePattern(locationFilter)} || '%')`
       : Prisma.sql``;
     if (tsQuery) {
       try {
-        const rows = await this.prisma.$queryRaw<object[]>`
-          SELECT id, title, description, "userId", "createdAt",
-                 ts_rank(to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,'')), to_tsquery('simple', ${tsQuery})) AS rank
-          FROM user_showcases
-          WHERE "deletedAt" IS NULL AND "visibility" = 'PUBLIC' AND "isActive" = true
+        // DC-009: join users untuk `userId` PUBLIK (kolom user_showcases."userId"
+        // adalah FK internal cuid — jangan diekspos mentah).
+        const rows = await this.prisma.$queryRaw<Array<{ id: string; title: string | null; description: string | null; userId: string; createdAt: Date }>>`
+          SELECT sc.id, sc.title, sc.description, u."userId" AS "userId", sc."createdAt",
+                 ts_rank(to_tsvector('simple', COALESCE(sc.title,'') || ' ' || COALESCE(sc.description,'')), to_tsquery('simple', ${tsQuery})) AS rank
+          FROM user_showcases sc
+          JOIN users u ON u.id = sc."userId"
+          WHERE sc."deletedAt" IS NULL AND sc."visibility" = 'PUBLIC' AND sc."isActive" = true
             AND ${ownerVisibilitySql}
             ${locationSql}
-            AND "userId" NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
-            AND to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,'')) @@ to_tsquery('simple', ${tsQuery})
-          ORDER BY rank DESC, "createdAt" DESC
+            AND sc."userId" NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
+            AND to_tsvector('simple', COALESCE(sc.title,'') || ' ' || COALESCE(sc.description,'')) @@ to_tsquery('simple', ${tsQuery})
+          ORDER BY rank DESC, sc."createdAt" DESC
           LIMIT ${take}
         `;
         const countResult = await this.prisma.$queryRaw<{ count: bigint }[]>`
-          SELECT COUNT(*) as count FROM user_showcases
-          WHERE "deletedAt" IS NULL AND "visibility" = 'PUBLIC' AND "isActive" = true
+          SELECT COUNT(*) as count FROM user_showcases sc
+          WHERE sc."deletedAt" IS NULL AND sc."visibility" = 'PUBLIC' AND sc."isActive" = true
             AND ${ownerVisibilitySql}
             ${locationSql}
-            AND "userId" NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
-            AND to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,'')) @@ to_tsquery('simple', ${tsQuery})
+            AND sc."userId" NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
+            AND to_tsvector('simple', COALESCE(sc.title,'') || ' ' || COALESCE(sc.description,'')) @@ to_tsquery('simple', ${tsQuery})
         `.catch(() => [{ count: BigInt(0) }]);
-        return { results: rows as object[], total: Number(countResult[0]?.count ?? 0) };
+        return {
+          results: rows.map((r) => ({ id: r.id, title: r.title, description: r.description, userId: r.userId, createdAt: r.createdAt })),
+          total: Number(countResult[0]?.count ?? 0),
+        };
       } catch {}
     }
     try {
@@ -416,10 +496,14 @@ export class SearchService {
         ],
       } as any;
       const [rows, total] = await Promise.all([
-        this.prisma.userShowcase.findMany({ where, select: { id: true, title: true, description: true, userId: true, createdAt: true }, take, orderBy: { createdAt: 'desc' } }),
+        // DC-009: ambil userId PUBLIK via relasi user (bukan FK internal).
+        this.prisma.userShowcase.findMany({ where, select: { id: true, title: true, description: true, createdAt: true, user: { select: { userId: true } } }, take, orderBy: { createdAt: 'desc' } }),
         this.prisma.userShowcase.count({ where }),
       ]);
-      return { results: rows, total };
+      return {
+        results: rows.map((r) => ({ id: r.id, title: r.title, description: r.description, userId: r.user.userId, createdAt: r.createdAt })),
+        total,
+      };
     } catch {
       return { results: [], total: 0 };
     }

@@ -68,7 +68,8 @@ type ShowcaseRow = Prisma.UserShowcaseGetPayload<{
 
 type CommentRow = Prisma.ShowcaseCommentGetPayload<{
   include: {
-    user: { select: { userId: true; username: true; fullName: true; avatarUrl: true } };
+    // DC-010: id + kycStatus untuk badge author (sealTier/isKycVerified).
+    user: { select: { id: true; userId: true; username: true; fullName: true; avatarUrl: true; kycStatus: true } };
   };
 }>;
 
@@ -90,7 +91,8 @@ const SHOWCASE_INCLUDE = {
 } satisfies Prisma.UserShowcaseInclude;
 
 const COMMENT_INCLUDE = {
-  user: { select: { userId: true, username: true, fullName: true, avatarUrl: true } },
+  // DC-010: id + kycStatus untuk badge author komentar.
+  user: { select: { id: true, userId: true, username: true, fullName: true, avatarUrl: true, kycStatus: true } },
 } satisfies Prisma.ShowcaseCommentInclude;
 
 /** Versi payload cursor. Naikkan bila struktur cursor berubah supaya cursor lama
@@ -1282,10 +1284,19 @@ export class ShowcaseService {
       repliesByParent.set(rootId, rows);
     }
 
+    // DC-010: sealTier author komentar — satu batch query untuk semua
+    // author (roots + replies), bukan N+1.
+    const authorIds = new Set<string>();
+    for (const root of roots) {
+      authorIds.add((root as CommentRow).user.id);
+      for (const reply of repliesByParent.get(root.id) ?? []) authorIds.add(reply.user.id);
+    }
+    const sealTierMap = await this.verificationBadgeService.getSealTierMap(Array.from(authorIds));
+
     const data = roots.map((root) => ({
-      ...this.serializeComment(root as CommentRow),
+      ...this.serializeComment(root as CommentRow, sealTierMap),
       replyCount: replyCountByParent.get(root.id) ?? 0,
-      replies: (repliesByParent.get(root.id) ?? []).map((reply) => this.serializeComment(reply)),
+      replies: (repliesByParent.get(root.id) ?? []).map((reply) => this.serializeComment(reply, sealTierMap)),
     }));
 
     const totalPages = Math.ceil(total / safeLimit);
@@ -1300,7 +1311,7 @@ export class ShowcaseService {
     };
   }
 
-  private serializeComment(row: CommentRow): Record<string, unknown> {
+  private serializeComment(row: CommentRow, sealTierMap?: Map<string, string | null>): Record<string, unknown> {
     return {
       id: row.id,
       showcaseId: row.showcaseId,
@@ -1315,6 +1326,10 @@ export class ShowcaseService {
         username: row.user.username,
         fullName: row.user.fullName,
         avatarUrl: row.user.avatarUrl,
+        // DC-010: info badge author agar UI bisa render VerifiedSeal di
+        // komentar (konsisten dengan feed & profil).
+        sealTier: sealTierMap?.get(row.user.id) ?? null,
+        isKycVerified: row.user.kycStatus === 'APPROVED',
       },
     };
   }
@@ -1378,7 +1393,8 @@ export class ShowcaseService {
       return comment;
     })) as unknown as CommentRow;
 
-    return this.serializeComment(created);
+    const sealTierMap = await this.verificationBadgeService.getSealTierMap([created.user.id]);
+    return this.serializeComment(created, sealTierMap);
   }
 
   async updateComment(userId: string, commentId: string, dto: UpdateShowcaseCommentDto): Promise<object> {
@@ -1418,7 +1434,8 @@ export class ShowcaseService {
       data: { content },
       include: COMMENT_INCLUDE,
     })) as unknown as CommentRow;
-    return this.serializeComment(updated);
+    const sealTierMap = await this.verificationBadgeService.getSealTierMap([updated.user.id]);
+    return this.serializeComment(updated, sealTierMap);
   }
 
   async deleteComment(userId: string, commentId: string): Promise<{ message: string }> {
@@ -1542,7 +1559,8 @@ export class ShowcaseService {
       return comment;
     })) as unknown as CommentRow;
 
-    return this.serializeComment(updated);
+    const sealTierMap = await this.verificationBadgeService.getSealTierMap([updated.user.id]);
+    return this.serializeComment(updated, sealTierMap);
   }
 
   // ==================================================================
@@ -1592,7 +1610,8 @@ export class ShowcaseService {
       authorUsername: row.user.username ?? row.user.userId,
       authorFullName: row.user.fullName,
       shareUrl: this.buildShareUrl(row.id),
-      appUrl: `kahade-frontend://showcase/${encodeURIComponent(row.id)}`,
+      // FX-001: scheme "kahade" sesuai app.json frontend (bukan "kahade-frontend").
+      appUrl: `kahade://showcase/${encodeURIComponent(row.id)}`,
       // S-4: nilai SETELAH increment pada pemanggilan ini.
       shareCount: updated.shareCount,
     };

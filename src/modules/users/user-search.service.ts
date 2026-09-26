@@ -118,6 +118,21 @@ export class UserSearchService {
       users.map((u) => u.id),
     );
 
+    // DC-006 (audit Discovery 2026-09-26): status follow untuk viewer —
+    // satu query untuk semua hasil (bukan N+1). Tanpa ini tombol follow di
+    // tab Jelajahi selalu "Ikuti" dan state optimistis hilang saat refresh.
+    const followingSet = new Set<string>();
+    if (viewerId && users.length > 0) {
+      const follows = await this.prisma.follow.findMany({
+        where: {
+          followerId: viewerId,
+          followingId: { in: users.map((u) => u.id) },
+        },
+        select: { followingId: true },
+      });
+      for (const f of follows) followingSet.add(f.followingId);
+    }
+
     return {
       data: users.map(u => ({
         userId: u.userId,
@@ -134,6 +149,7 @@ export class UserSearchService {
         isVip: u.isVip,
         followersCount: u._count.followers,
         memberSince: u.createdAt,
+        following: followingSet.has(u.id),
       })),
       total,
       page: safePage,

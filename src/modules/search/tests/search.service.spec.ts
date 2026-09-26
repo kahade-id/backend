@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { SearchService } from '../search.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 
 const mockPrisma = {
   user: { findMany: jest.fn(), count: jest.fn() },
@@ -25,6 +26,11 @@ const mockRedis = {
   del: jest.fn().mockResolvedValue(0),
 };
 
+// DC-009/R1: SearchService butuh VerificationBadgeService (sealTier).
+const mockVerificationBadgeService = {
+  getSealTierMap: jest.fn().mockResolvedValue(new Map()),
+};
+
 describe('SearchService', () => {
   let service: SearchService;
 
@@ -37,6 +43,7 @@ describe('SearchService', () => {
         SearchService,
         { provide: PrismaService, useValue: mockPrisma },
         { provide: RedisService, useValue: mockRedis },
+        { provide: VerificationBadgeService, useValue: mockVerificationBadgeService },
       ],
     }).compile();
     service = module.get<SearchService>(SearchService);
@@ -152,6 +159,117 @@ describe('SearchService', () => {
         c[0].map((s: string) => s).join(' '),
       );
       expect(sqlTexts.some((t: string) => t.includes('"userId" NOT IN'))).toBe(true);
+    });
+  });
+
+  describe('discovery contracts (Batch 3C)', () => {
+    it('DC-003: searchOrders mengembalikan orderId publik (bukan id internal)', async () => {
+      // Cabang LIKE (tanpa tsQuery): mock findMany.
+      mockPrisma.order.findMany.mockResolvedValue([
+        {
+          orderId: 'ORD-20260101-000001-XXXX',
+          title: 'Kamera',
+          status: 'PENDING',
+          orderValue: BigInt(10000000), // 100.000 IDR dalam sen
+          createdAt: new Date(),
+          buyerId: 'u1',
+          buyer: { userId: 'USR-001', username: 'buyer1', fullName: 'Buyer Satu', avatarUrl: null },
+          seller: { userId: 'USR-002', username: 'seller1', fullName: 'Seller Satu', avatarUrl: null },
+        },
+      ]);
+      mockPrisma.order.count.mockResolvedValue(1);
+      // Paksa cabang LIKE dengan query yang tidak menghasilkan tsQuery valid
+      // (buildTsQuery butuh huruf/angka — '!!!' menghasilkan null).
+      const res = await service.search('u1', '!!!', ['orders']);
+      const orders = (res as any).orders;
+      expect(orders).toHaveLength(1);
+      // DC-003: harus ada orderId publik, TIDAK ada id internal.
+      expect(orders[0].orderId).toBe('ORD-20260101-000001-XXXX');
+      expect(orders[0].id).toBeUndefined();
+      // DC-005: buyer/seller/myRole harus ada.
+      expect(orders[0].buyer.userId).toBe('USR-001');
+      expect(orders[0].seller.userId).toBe('USR-002');
+      expect(orders[0].myRole).toBe('BUYER');
+      // orderValue dalam IDR (bukan sen).
+      expect(orders[0].orderValue).toBe(100000);
+    });
+
+    it('DC-005: myRole SELLER bila user adalah penjual', async () => {
+      mockPrisma.order.findMany.mockResolvedValue([
+        {
+          orderId: 'ORD-20260101-000002-XXXX',
+          title: 'Laptop',
+          status: 'PENDING',
+          orderValue: BigInt(50000000),
+          createdAt: new Date(),
+          buyerId: 'u9',
+          buyer: { userId: 'USR-009', username: 'buyer9', fullName: 'Buyer Sembilan', avatarUrl: null },
+          seller: { userId: 'USR-002', username: 'seller1', fullName: 'Seller Satu', avatarUrl: null },
+        },
+      ]);
+      mockPrisma.order.count.mockResolvedValue(1);
+      const res = await service.search('u1', '!!!', ['orders']);
+      const orders = (res as any).orders;
+      expect(orders[0].myRole).toBe('SELLER');
+    });
+
+    it('DC-009: searchUsers mengembalikan userId publik (bukan id internal)', async () => {
+      mockPrisma.user.findMany.mockResolvedValue([
+        { id: 'cuid-internal-1', userId: 'USR-001', username: 'budi', fullName: 'Budi Santoso', avatarUrl: null },
+      ]);
+      mockPrisma.user.count.mockResolvedValue(1);
+      mockVerificationBadgeService.getSealTierMap.mockResolvedValue(new Map([['cuid-internal-1', 'gold']]));
+      const res = await service.search('u1', '!!!', ['users']);
+      const users = (res as any).users;
+      expect(users).toHaveLength(1);
+      expect(users[0].userId).toBe('USR-001');
+      expect(users[0].id).toBeUndefined();
+      expect(users[0].sealTier).toBe('gold');
+    });
+
+    it('DC-015: searchTransactions menyertakan status', async () => {
+      mockPrisma.wallet.findUnique.mockResolvedValue({ id: 'w1' });
+      mockPrisma.walletTransaction.findMany.mockResolvedValue([
+        {
+          id: 'cuid-tx-1',
+          txId: 'WLT-20260101-000001',
+          type: 'TOPUP',
+          amount: BigInt(5000000),
+          status: 'COMPLETED',
+          description: 'Topup',
+          createdAt: new Date(),
+        },
+      ]);
+      mockPrisma.walletTransaction.count.mockResolvedValue(1);
+      const res = await service.search('u1', '!!!', ['transactions']);
+      const txs = (res as any).transactions;
+      expect(txs).toHaveLength(1);
+      expect(txs[0].status).toBe('COMPLETED');
+      expect(txs[0].txId).toBe('WLT-20260101-000001');
+    });
+
+    it('DC-019: searchShowcase mengembalikan userId publik via join', async () => {
+      // Cabang tsQuery: mock $queryRaw. Prisma memanggil $queryRaw sebagai
+      // tagged template — argumen pertama adalah TemplateStringsArray.
+      mockPrisma.$queryRaw.mockImplementation((sql: any) => {
+        const sqlStr = Array.isArray(sql) ? sql.join(' ') : String(sql);
+        if (sqlStr.includes('COUNT(*)')) return Promise.resolve([{ count: BigInt(1) }]);
+        if (sqlStr.includes('FROM user_showcases')) {
+          return Promise.resolve([
+            { id: 'sc1', title: 'Kamera', description: 'Desc', userId: 'USR-001', createdAt: new Date() },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+      const res = await service.search('u1', 'kamera', ['showcase']);
+      const items = (res as any).showcase;
+      expect(items).toHaveLength(1);
+      // DC-009: userId harus publik (dari JOIN users), bukan FK internal.
+      expect(items[0].userId).toBe('USR-001');
+      // DC-019: bentuk minimal tetap dipertahankan (ada id/title/description/userId/createdAt).
+      expect(items[0]).toEqual(
+        expect.objectContaining({ id: 'sc1', title: 'Kamera', userId: 'USR-001' }),
+      );
     });
   });
 });

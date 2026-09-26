@@ -17,7 +17,10 @@ function escapeHtml(value: unknown): string {
 }
 
 function appSchemeUrl(path: string): string {
-  return `kahade-frontend://${path.replace(/^\/+/, '')}`;
+  // FX-001 (audit Discovery 2026-09-26): scheme HARUS "kahade" — sesuai
+  // yang didaftarkan di frontend/app.json ("scheme": "kahade").
+  // "kahade-frontend" tidak terdaftar sehingga deep link tidak membuka aplikasi.
+  return `kahade://${path.replace(/^\/+/, '')}`;
 }
 
 const USERNAME_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9_-]|\.(?=[a-zA-Z0-9])){2,29}$/;

@@ -1,4 +1,4 @@
-import { Controller, Get, Query, UseGuards, BadRequestException } from '@nestjs/common';
+import { Controller, Get, Delete, Query, UseGuards, BadRequestException } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { SearchService } from './search.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -82,11 +82,24 @@ export class SearchController {
     return this.searchService.getSearchHistory(userId);
   }
 
-  @Get('history/clear')
+  @Delete('history')
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @ApiOperation({ summary: 'Clear search history' })
   async clearHistory(@CurrentUser('sub') userId: string): Promise<object> {
+    return this.searchService.clearSearchHistory(userId);
+  }
+
+  /**
+   * @deprecated DC-017 (audit Discovery 2026-09-26): GET untuk operasi mutasi
+   * melanggar semantik REST. Alias backward-compat untuk klien lama — gunakan
+   * `DELETE /v1/search/history`.
+   */
+  @Get('history/clear')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({ summary: '[DEPRECATED] Clear search history — use DELETE /v1/search/history' })
+  async clearHistoryLegacy(@CurrentUser('sub') userId: string): Promise<object> {
     return this.searchService.clearSearchHistory(userId);
   }
 }

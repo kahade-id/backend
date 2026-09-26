@@ -1,10 +1,16 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { UserSearchService } from '../user-search.service';
 import { PrismaService } from '../../../prisma/prisma.service';
+import { VerificationBadgeService } from '../verification-badge.service';
 
 const mockPrisma: any = {
   user: { findMany: jest.fn(), count: jest.fn() },
   blockList: { findMany: jest.fn() },
+  follow: { findMany: jest.fn() },
+};
+
+const mockVerificationBadgeService = {
+  getSealTierMap: jest.fn().mockResolvedValue(new Map()),
 };
 
 describe('UserSearchService', () => {
@@ -15,8 +21,14 @@ describe('UserSearchService', () => {
     mockPrisma.blockList.findMany.mockResolvedValue([]);
     mockPrisma.user.findMany.mockResolvedValue([]);
     mockPrisma.user.count.mockResolvedValue(0);
+    mockPrisma.follow.findMany.mockResolvedValue([]);
+    mockVerificationBadgeService.getSealTierMap.mockResolvedValue(new Map());
     const module: TestingModule = await Test.createTestingModule({
-      providers: [UserSearchService, { provide: PrismaService, useValue: mockPrisma }],
+      providers: [
+        UserSearchService,
+        { provide: PrismaService, useValue: mockPrisma },
+        { provide: VerificationBadgeService, useValue: mockVerificationBadgeService },
+      ],
     }).compile();
     service = module.get<UserSearchService>(UserSearchService);
   });
@@ -77,5 +89,46 @@ describe('UserSearchService', () => {
     expect(serialized).not.toContain('&');
     expect(serialized).toContain('budi');
     expect(serialized).toContain('santoso');
+  });
+
+  it('DC-006: menyertakan status following untuk viewer', async () => {
+    mockPrisma.user.findMany.mockResolvedValue([
+      {
+        id: 'cuid-1', userId: 'USR-001', username: 'a', fullName: 'A', avatarUrl: null, bio: 'b',
+        membershipRank: 'BRONZE', averageRating: 4.2, totalRatingCount: 3,
+        totalOrdersCompleted: 1, kycStatus: 'APPROVED', isVip: false, createdAt: new Date(),
+        _count: { followers: 7 },
+      },
+      {
+        id: 'cuid-2', userId: 'USR-002', username: 'b', fullName: 'B', avatarUrl: null, bio: 'b',
+        membershipRank: 'BRONZE', averageRating: 4.0, totalRatingCount: 1,
+        totalOrdersCompleted: 0, kycStatus: 'PENDING', isVip: false, createdAt: new Date(),
+        _count: { followers: 2 },
+      },
+    ]);
+    mockPrisma.user.count.mockResolvedValue(2);
+    // Viewer mengikuti cuid-1, tidak mengikuti cuid-2.
+    mockPrisma.follow.findMany.mockResolvedValue([{ followingId: 'cuid-1' }]);
+    const res: any = await service.searchUsers('', {}, 1, 10, 'viewer-1');
+    expect(res.data[0].following).toBe(true);
+    expect(res.data[1].following).toBe(false);
+    // Query follow memakai followerId=viewerId.
+    const followCall = mockPrisma.follow.findMany.mock.calls[0][0];
+    expect(followCall.where.followerId).toBe('viewer-1');
+  });
+
+  it('DC-006: following=false bila tanpa viewerId', async () => {
+    mockPrisma.user.findMany.mockResolvedValue([
+      {
+        id: 'cuid-1', userId: 'USR-001', username: 'a', fullName: 'A', avatarUrl: null, bio: 'b',
+        membershipRank: 'BRONZE', averageRating: 4.2, totalRatingCount: 3,
+        totalOrdersCompleted: 1, kycStatus: 'APPROVED', isVip: false, createdAt: new Date(),
+        _count: { followers: 7 },
+      },
+    ]);
+    mockPrisma.user.count.mockResolvedValue(1);
+    const res: any = await service.searchUsers('', {}, 1, 10);
+    expect(res.data[0].following).toBe(false);
+    expect(mockPrisma.follow.findMany).not.toHaveBeenCalled();
   });
 });

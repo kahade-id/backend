@@ -7,6 +7,8 @@ import { RedisService } from '../../../redis/redis.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { OgMetadataService } from '../og-metadata.service';
 import { VerificationBadgeService } from '../verification-badge.service';
+import { UserAnalyticsService } from '../user-analytics.service';
+import { LocalStorageService } from '../../upload/local-storage.service';
 import { ReportFlagService } from '../../../common/services/report-flag.service';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 
@@ -29,7 +31,7 @@ const mockRedis = { get: jest.fn(), set: jest.fn(), del: jest.fn(), setex: jest.
 const mockAudit = { logUserAction: jest.fn() };
 const mockConfig = { get: jest.fn() };
 const mockOg = { invalidateUserOgCache: jest.fn() };
-const mockVerificationBadges = { getBadges: jest.fn(), invalidate: jest.fn() };
+const mockVerificationBadges = { getBadges: jest.fn(), invalidate: jest.fn(), getSealTierMap: jest.fn().mockResolvedValue(new Map()) };
 
 function healthyOwner(overrides: Record<string, unknown> = {}) {
   return {
@@ -63,6 +65,8 @@ describe('UsersService — daftar rating publik (Section 5)', () => {
         { provide: AuditLogService, useValue: mockAudit },
         { provide: OgMetadataService, useValue: mockOg },
         { provide: VerificationBadgeService, useValue: mockVerificationBadges },
+        { provide: UserAnalyticsService, useValue: { calculateTrustScore: jest.fn().mockResolvedValue(0) } },
+        { provide: LocalStorageService, useValue: {} },
         // Section 6: agregasi laporan -> flag moderasi internal.
         { provide: ReportFlagService, useValue: { evaluateTarget: jest.fn(async () => ({ flaggedForReview: false, distinctReporters: 0 })) } },
       ],

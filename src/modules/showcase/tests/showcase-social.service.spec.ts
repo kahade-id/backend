@@ -173,7 +173,7 @@ describe('ShowcaseService — like & komentar', () => {
         { provide: UploadService, useValue: mockUpload },
         { provide: ConfigService, useValue: mockConfig },
         { provide: AuditLogService, useValue: { logUserAction: jest.fn(), logAdminAction: jest.fn() } },
-        { provide: VerificationBadgeService, useValue: { getBadges: jest.fn().mockResolvedValue([]) } },
+        { provide: VerificationBadgeService, useValue: { getBadges: jest.fn().mockResolvedValue([]), getSealTierMap: jest.fn().mockResolvedValue(new Map()) } },
         { provide: SubscriptionsService, useValue: mockSubscriptions },
       ],
     }).compile();

@@ -182,7 +182,7 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
         { provide: UploadService, useValue: mockUpload },
         { provide: ConfigService, useValue: mockConfig },
         { provide: AuditLogService, useValue: { logUserAction: jest.fn(), logAdminAction: jest.fn() } },
-        { provide: VerificationBadgeService, useValue: { getBadges: jest.fn().mockResolvedValue([]) } },
+        { provide: VerificationBadgeService, useValue: { getBadges: jest.fn().mockResolvedValue([]), getSealTierMap: jest.fn().mockResolvedValue(new Map()) } },
         { provide: SubscriptionsService, useValue: mockSubscriptions },
       ],
     }).compile();
@@ -667,7 +667,7 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
     it('builds the web share URL and the app deep link', async () => {
       const payload = (await service.getSharePayload(SHOWCASE_ID)) as any;
       expect(payload.shareUrl).toBe(`https://kahade.id/showcase/${SHOWCASE_ID}`);
-      expect(payload.appUrl).toBe(`kahade-frontend://showcase/${SHOWCASE_ID}`);
+      expect(payload.appUrl).toBe(`kahade://showcase/${SHOWCASE_ID}`);
       expect(payload).toMatchObject({ title: 'Ilustrasi karakter', authorUsername: 'seller', imageUrl: 'https://cdn.test/a.jpg' });
     });
 

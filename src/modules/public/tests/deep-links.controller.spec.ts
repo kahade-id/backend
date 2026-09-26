@@ -25,7 +25,7 @@ describe('DeepLinksController', () => {
     const html = String(response.send.mock.calls[0][0]);
     expect(response.status).toHaveBeenCalledWith(200);
     expect(html).toContain('Alice');
-    expect(html).toContain('kahade-frontend://u/alice');
+    expect(html).toContain('kahade://u/alice');
     expect(html).toContain('Buka di aplikasi Kahade');
   });
 
@@ -34,7 +34,7 @@ describe('DeepLinksController', () => {
     await controller.orderLink('token-1', response as never);
     const html = String(response.send.mock.calls[0][0]);
     expect(response.status).toHaveBeenCalledWith(200);
-    expect(html).toContain('kahade-frontend://o-l/token-1');
+    expect(html).toContain('kahade://o-l/token-1');
     expect(html).toContain('sudah kedaluwarsa');
   });
 
@@ -120,7 +120,7 @@ describe('DeepLinksController', () => {
       expect(html).toContain('Ilustrasi karakter');
       expect(html).toContain('Rp 150000 - Rp 350000');
       expect(html).toContain('@seller');
-      expect(html).toContain('kahade-frontend://showcase/cshowcase000000000000001');
+      expect(html).toContain('kahade://showcase/cshowcase000000000000001');
     });
 
     it('does not leak PRIVATE, deleted or blocked items', async () => {

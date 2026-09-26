@@ -1030,10 +1030,13 @@ model NotificationPreference {
   marketingPush  Boolean @default(false)
   marketingInApp Boolean @default(false)
 
-  quietHoursEnabled Boolean @default(false)
-  quietHoursStart   String? @default("22:00")
-  quietHoursEnd     String? @default("07:00")
-  language          String  @default("id")
+  quietHoursEnabled  Boolean @default(false)
+  quietHoursStart    String? @default("22:00")
+  quietHoursEnd      String? @default("07:00")
+  // CN-008: zona waktu untuk perhitungan quiet hours (default Asia/Jakarta
+  // mempertahankan perilaku lama). Diisi klien dari device timezone.
+  quietHoursTimezone String? @default("Asia/Jakarta")
+  language           String  @default("id")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1054,17 +1057,17 @@ model KycRequest {
   status KycStatus @default(PENDING)
 
   // Documents (URL signed, encrypted AES-256)
-  ktpPhotoUrl    String // URL encrypted ke S3 private
-  selfiePhotoUrl String // URL encrypted ke S3 private
-  ktpNumber      String // NIK, encrypted AES-256
+  ktpPhotoUrl     String // URL encrypted ke S3 private
+  selfiePhotoUrl  String // URL encrypted ke S3 private
+  ktpNumber       String // NIK, encrypted AES-256
   // 03-#6: jenis dokumen & bukti liveness — sebelumnya dihitung/divalidasi
   // di service tetapi tidak disimpan, sehingga admin tak bisa mengauditnya.
-  documentType   String? // KTP | PASSPORT (enum KycDocumentType di DTO)
+  documentType    String? // KTP | PASSPORT (enum KycDocumentType di DTO)
   livenessFileKey String? // file key liveness, encrypted AES-256
   // HMAC-SHA256 deterministik dari NIK — untuk cek duplikat lintas akun
   // AES non-deterministik (IV random) tidak bisa di-unique.
   // Hash ini TIDAK bisa di-decrypt ke NIK asli (one-way).
-  ktpNumberHash  String // HMAC-SHA256(NIK, HMAC_SECRET_KEY); active-state uniqueness is enforced by migration
+  ktpNumberHash   String // HMAC-SHA256(NIK, HMAC_SECRET_KEY); active-state uniqueness is enforced by migration
 
   // Review — FK ke AdminUser
   reviewedBy      String? // Admin user ID (FK ke admin_users.id)

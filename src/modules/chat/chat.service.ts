@@ -22,6 +22,7 @@ import {
 } from '../../common/constants/app.constants';
 import { createPaginatedResponse } from '../../common/dto/pagination.dto';
 import { VerificationBadgeService } from '../users/verification-badge.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { moderateFileName, moderateText, ModerationVerdict, ModerateOptions } from './chat-moderation.util';
 
 function sanitizeText(text: string): string {
@@ -287,6 +288,7 @@ export class ChatService {
     private realtime: RealtimeService,
     private configService: ConfigService,
     private verificationBadgeService: VerificationBadgeService,
+    private notificationsService: NotificationsService,
     @Optional() private uploadService?: UploadService,
   ) {}
 
@@ -312,7 +314,7 @@ export class ChatService {
         counterpart_user_id: string | null; counterpart_internal_id: string | null; counterpart_full_name: string | null;
         counterpart_username: string | null; counterpart_avatar_url: string | null;
         last_msg_id: string | null; last_msg_content: string | null; last_msg_type: string | null;
-        last_msg_sender_user_id: string | null; last_msg_created_at: Date | null;
+        last_msg_sender_user_id: string | null; last_msg_sender_internal_id: string | null; last_msg_created_at: Date | null;
         unread_count: bigint; pinned_count: bigint;
       }>>`
         SELECT
@@ -343,6 +345,7 @@ export class ChatService {
           lm.content AS last_msg_content,
           lm."messageType" AS last_msg_type,
           lm_sender."userId" AS last_msg_sender_user_id,
+          lm_sender.id AS last_msg_sender_internal_id,
           lm."createdAt" AS last_msg_created_at,
           COALESCE(uc.unread_count, 0) AS unread_count,
           COALESCE(pc.pinned_count, 0) AS pinned_count
@@ -480,6 +483,9 @@ export class ChatService {
               content: r.last_msg_content,
               messageType: r.last_msg_type,
               senderId: r.last_msg_sender_user_id ?? null,
+              // CN-001: penanda sudut pandang agar frontend bisa render prefix
+              // "Anda:" — bandingkan internal id (namespace yang sama dengan userId viewer).
+              fromUser: r.last_msg_sender_internal_id != null && r.last_msg_sender_internal_id === userId,
               createdAt: r.last_msg_created_at,
             }
           : null,
@@ -906,17 +912,26 @@ export class ChatService {
       data: { updatedAt: new Date() },
     });
 
-    const serialized = serializeMessage(message, { viewerId: userId });
+    // CN-004: serialisasi per penerima — fromUser & reactedByMe dihitung dari
+    // sudut pandang masing-masing viewer. Payload tunggal bersudut-pandang
+    // pengirim membuat penerima me-render pesan masuk sebagai pesan keluar.
+    const senderView = serializeMessage(message, { viewerId: userId });
+    const recipientView = recipientId ? serializeMessage(message, { viewerId: recipientId }) : null;
+    // Room broadcast memakai payload netral (tanpa viewerId) agar tidak
+    // menyesatkan; klien menentukan sudut pandang dari senderId.
+    const neutralView = serializeMessage(message, {});
 
-    this.emitChatEvent(room, 'chat.new_message', serialized);
-    if (recipientId) {
-      this.realtime.emitToUser(recipientId, 'chat.new_message', serialized);
+    this.emitChatEvent(room, 'chat.new_message', neutralView);
+    // Sinkron multi-perangkat pengirim.
+    this.realtime.emitToUser(userId, 'chat.new_message', senderView);
+    if (recipientId && recipientView) {
+      this.realtime.emitToUser(recipientId, 'chat.new_message', recipientView);
       // Preview notifikasi memakai teks PASCA-moderasi (content) agar hasil
       // redaksi (mis. nomor HP tersensor) tidak bocor lewat push.
       await this.notifyNewMessage(room, recipientId, userId, message.id, content || effectiveContent, userMessageType);
     }
 
-    return serialized;
+    return senderView;
   }
 
   private highestAction(verdict: ModerationVerdict): ChatModerationAction {
@@ -1129,6 +1144,11 @@ export class ChatService {
       ) {
         return;
       }
+      // CN-007: hormati preferensi chatInApp — user yang mematikan notifikasi
+      // chat tidak boleh tetap mendapat baris di inbox. Pipeline PUSH tetap
+      // harus berjalan (digate chatPush di push.service), jadi hanya
+      // `notification.create` yang dilewati, bukan `emitNotificationCreated`.
+      const inAppEnabled = await this.notificationsService.isInAppEnabled(recipientId, NotificationType.CHAT_NEW_MESSAGE);
       const author = await this.prisma.user.findUnique({
         where: { id: senderId },
         select: { fullName: true, username: true },
@@ -1141,21 +1161,25 @@ export class ChatService {
           : 'Sent media';
       // Setiap pesan yang tersimpan adalah event komunikasi yang berbeda. Kunci
       // dedupe lama (room+user per 60 detik) justru menahan pesan kedua.
-      const notification = await this.prisma.notification.create({
-        data: {
-          notifId: generateNotifId(), userId: recipientId,
-          type: NotificationType.CHAT_NEW_MESSAGE, category: getCategoryForType(NotificationType.CHAT_NEW_MESSAGE),
-          title: `Message from ${senderName}`, body: preview, isRead: false,
-          refType: 'CHAT_MESSAGE', refId: messageId,
-          actionUrl: `/chat/${encodeURIComponent(room.id)}`,
-        },
-        select: { notifId: true },
-      });
+      // CN-019: refType/refId menunjuk ke RUANG (bukan pesan) agar konsisten
+      // dengan actionUrl dan aman di-routing klien.
+      const notification = inAppEnabled
+        ? await this.prisma.notification.create({
+            data: {
+              notifId: generateNotifId(), userId: recipientId,
+              type: NotificationType.CHAT_NEW_MESSAGE, category: getCategoryForType(NotificationType.CHAT_NEW_MESSAGE),
+              title: `Message from ${senderName}`, body: preview, isRead: false,
+              refType: 'CHAT_ROOM', refId: room.id,
+              actionUrl: `/chat/${encodeURIComponent(room.id)}`,
+            },
+            select: { notifId: true },
+          })
+        : null;
       this.prisma.emitNotificationCreated({
         userId: recipientId,
         title: `Message from ${senderName}`,
         body: preview,
-        data: { type: 'CHAT_NEW', notificationType: NotificationType.CHAT_NEW_MESSAGE, notificationId: notification.notifId, chatRoomId: room.id, roomId: room.id },
+        data: { type: 'CHAT_NEW', notificationType: NotificationType.CHAT_NEW_MESSAGE, ...(notification ? { notificationId: notification.notifId } : {}), chatRoomId: room.id, roomId: room.id },
       });
     } catch (error) {
       // Penyimpanan pesan bersifat otoritatif. Gangguan notifikasi tidak boleh
@@ -1358,6 +1382,25 @@ export class ChatService {
       });
     }
 
+    // CN-002: membaca chat juga menandai notifikasi chat terkait sebagai dibaca,
+    // agar badge notifikasi (yang dihitung dari tabel notification) ikut padam.
+    // actionUrl adalah penanda room yang konsisten (lihat CN-019).
+    try {
+      await this.prisma.notification.updateMany({
+        where: {
+          userId,
+          type: NotificationType.CHAT_NEW_MESSAGE,
+          isRead: false,
+          deletedAt: null,
+          actionUrl: `/chat/${roomId}`,
+        },
+        data: { isRead: true, readAt: new Date() },
+      });
+    } catch (error) {
+      // Gangguan sinkronisasi badge tidak boleh menggagalkan markAsRead.
+      this.logger.warn(`Failed to sync chat notification read state for room ${roomId}: ${(error as Error).message}`);
+    }
+
     await this.prisma.chatRoomMember.upsert({
       where: { roomId_userId: { roomId, userId } },
       create: { roomId, userId, role: this.roleFor(room, userId), lastReadAt: new Date() },
@@ -1425,13 +1468,31 @@ export class ChatService {
       select: { emoji: true, userId: true, user: { select: { userId: true, fullName: true } } },
       orderBy: { createdAt: 'asc' },
     });
-    const payload = {
+    // CN-005: reactedByMe harus dihitung per penerima, bukan memakai sudut
+    // pandang aktor untuk semua peserta.
+    const actorPayload = {
       roomId: room.id,
       messageId,
       reactions: summarizeReactions(rows as unknown as RawReaction[], viewerId),
     };
-    this.emitChatEvent(room, 'chat.reaction_updated', payload);
-    return payload;
+    for (const participantId of room.participants) {
+      if (participantId === viewerId) {
+        this.realtime.emitToUser(participantId, 'chat.reaction_updated', actorPayload);
+      } else {
+        this.realtime.emitToUser(participantId, 'chat.reaction_updated', {
+          roomId: room.id,
+          messageId,
+          reactions: summarizeReactions(rows as unknown as RawReaction[], participantId),
+        });
+      }
+    }
+    // Room broadcast: payload netral agar tidak menyesatkan.
+    this.emitChatEvent(room, 'chat.reaction_updated', {
+      roomId: room.id,
+      messageId,
+      reactions: summarizeReactions(rows as unknown as RawReaction[], undefined),
+    });
+    return actorPayload;
   }
 
   // ============================================================
@@ -2140,6 +2201,21 @@ export class ChatService {
         readAt: now,
         markedCount,
       });
+      // CN-002: sinkronisasi badge notifikasi (lihat markAsRead).
+      try {
+        await this.prisma.notification.updateMany({
+          where: {
+            userId,
+            type: NotificationType.CHAT_NEW_MESSAGE,
+            isRead: false,
+            deletedAt: null,
+            actionUrl: `/chat/${roomId}`,
+          },
+          data: { isRead: true, readAt: new Date() },
+        });
+      } catch (error) {
+        this.logger.warn(`Failed to sync chat notification read state for room ${roomId}: ${(error as Error).message}`);
+      }
       await this.prisma.chatRoomMember.upsert({
         where: { roomId_userId: { roomId, userId } },
         create: { roomId, userId, role: this.roleFor(room, userId), lastReadAt: new Date() },

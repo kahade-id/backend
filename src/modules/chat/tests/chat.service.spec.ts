@@ -5,6 +5,7 @@ import { ChatService } from '../chat.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RealtimeService } from '../../realtime/realtime.service';
 import { NotificationsService } from '../../notifications/notifications.service';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 
 const mockPrisma = {
   chatRoom: {
@@ -54,7 +55,8 @@ const mockRealtime = {
   isUserOnline: jest.fn().mockResolvedValue(false),
   getLastSeen: jest.fn().mockResolvedValue(null),
 };
-const mockNotifications = { create: jest.fn() };
+const mockNotifications = { create: jest.fn(), isInAppEnabled: jest.fn().mockResolvedValue(true) };
+const mockVerificationBadge = { getSealTierMap: jest.fn().mockResolvedValue(new Map()) };
 const mockConfig = {
   get: jest.fn((k: string) => {
     const v: Record<string, unknown> = {
@@ -137,6 +139,7 @@ describe('ChatService', () => {
         { provide: PrismaService, useValue: mockPrisma },
         { provide: RealtimeService, useValue: mockRealtime },
         { provide: ConfigService, useValue: mockConfig },
+        { provide: VerificationBadgeService, useValue: mockVerificationBadge },
         { provide: NotificationsService, useValue: mockNotifications },
       ],
     }).compile();

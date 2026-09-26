@@ -5,6 +5,7 @@ import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pag
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { UpdatePreferencesDto } from './dto/update-preferences.dto';
 import { customAlphabet } from 'nanoid';
+import { getMinutesInTimezone, isMinutesInRange } from '../../common/utils/timezone.util';
 
 const generateDeviceId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 16);
 const NOTIFICATION_DEDUP_WINDOW_MS = 60_000;
@@ -12,9 +13,12 @@ const MAX_NOTIFICATION_PAGE = 10_000;
 
 const IN_APP_PREFERENCE_TYPES: ReadonlyArray<[keyof Pick<NotificationPreference, 'orderInApp' | 'walletInApp' | 'chatInApp' | 'disputeInApp' | 'rankingInApp' | 'marketingInApp'>, readonly NotificationType[]]> = [
   ['orderInApp', [NotificationType.ORDER_NEW, NotificationType.ORDER_ACCEPTED, NotificationType.ORDER_REJECTED, NotificationType.ORDER_CANCELLED_TIMEOUT, NotificationType.ORDER_CANCELLED, NotificationType.ORDER_PAYMENT_RECEIVED, NotificationType.ORDER_SHIPPED, NotificationType.ORDER_DEADLINE_REMINDER, NotificationType.ORDER_EXTENSION_REQUESTED, NotificationType.ORDER_EXTENSION_APPROVED, NotificationType.ORDER_EXTENSION_REJECTED, NotificationType.ORDER_COMPLETED, NotificationType.ORDER_AUTOCOMPLETED, NotificationType.ORDER_DELIVERED]],
-  ['walletInApp', [NotificationType.WALLET_TOPUP_SUCCESS, NotificationType.WALLET_TOPUP_FAILED, NotificationType.WALLET_WITHDRAW_SUCCESS, NotificationType.WALLET_WITHDRAW_FAILED, NotificationType.WALLET_FUNDS_RELEASED, NotificationType.WALLET_TRANSFER_SENT, NotificationType.WALLET_TRANSFER_RECEIVED]],
+  ['walletInApp', [NotificationType.WALLET_TOPUP_SUCCESS, NotificationType.WALLET_TOPUP_FAILED, NotificationType.WALLET_WITHDRAW_SUCCESS, NotificationType.WALLET_WITHDRAW_FAILED, NotificationType.WALLET_FUNDS_RELEASED, NotificationType.WALLET_TRANSFER_SENT, NotificationType.WALLET_TRANSFER_RECEIVED, NotificationType.WALLET_REFUND_RECEIVED]],
   ['chatInApp', [NotificationType.CHAT_NEW_MESSAGE]],
-  ['disputeInApp', [NotificationType.DISPUTE_SUBMITTED, NotificationType.DISPUTE_ADMIN_JOINED, NotificationType.DISPUTE_DECISION, NotificationType.DISPUTE_EVIDENCE_SUBMITTED, NotificationType.DISPUTE_CLAIM_SUBMITTED, NotificationType.DISPUTE_ESCALATED]],
+  // CN-006: daftar dispute dilengkapi — sebelumnya DISPUTE_MESSAGE_RECEIVED,
+  // DISPUTE_ESCALATION_SLA_WARNING/BREACHED tidak tertekan walau toggle mati
+  // (push memakai prefix-match sehingga konsisten, in-app tidak).
+  ['disputeInApp', [NotificationType.DISPUTE_SUBMITTED, NotificationType.DISPUTE_ADMIN_JOINED, NotificationType.DISPUTE_DECISION, NotificationType.DISPUTE_EVIDENCE_SUBMITTED, NotificationType.DISPUTE_CLAIM_SUBMITTED, NotificationType.DISPUTE_ESCALATED, NotificationType.DISPUTE_MESSAGE_RECEIVED, NotificationType.DISPUTE_ESCALATION_SLA_WARNING, NotificationType.DISPUTE_ESCALATION_SLA_BREACHED]],
   ['rankingInApp', [NotificationType.RATING_NEW, NotificationType.BADGE_AWARDED, NotificationType.RANK_UPGRADED, NotificationType.SUBSCRIPTION_ACTIVATED, NotificationType.SUBSCRIPTION_EXPIRY_REMINDER, NotificationType.SUBSCRIPTION_EXPIRED, NotificationType.SUBSCRIPTION_RENEWED, NotificationType.REFERRAL_REWARD_RECEIVED]],
   ['marketingInApp', [NotificationType.VOUCHER_ISSUED, NotificationType.CAMPAIGN_CASHBACK_CREDITED, NotificationType.TOPUP_BONUS_CREDITED]],
 ];
@@ -23,7 +27,7 @@ function criticalSecurityType(type: NotificationType): boolean {
   return type.startsWith('SECURITY_');
 }
 
-export type PublicNotification = Pick<Notification, 'notifId' | 'type' | 'category' | 'channel' | 'title' | 'body' | 'actionUrl' | 'isRead' | 'readAt' | 'createdAt' | 'expiresAt' | 'metadata'>;
+export type PublicNotification = Pick<Notification, 'notifId' | 'type' | 'category' | 'channel' | 'title' | 'body' | 'refType' | 'refId' | 'actionUrl' | 'isRead' | 'readAt' | 'createdAt' | 'expiresAt' | 'metadata'>;
 
 const PUBLIC_NOTIFICATION_SELECT = {
   notifId: true,
@@ -32,6 +36,9 @@ const PUBLIC_NOTIFICATION_SELECT = {
   channel: true,
   title: true,
   body: true,
+  // CN-019: referensi entitas diekspos agar klien bisa deep-link tanpa parsing actionUrl.
+  refType: true,
+  refId: true,
   actionUrl: true,
   isRead: true,
   readAt: true,
@@ -89,6 +96,22 @@ export class NotificationsService {
       .filter(([field]) => prefs[field] === false)
       .flatMap(([, types]) => types)
       .filter((type) => !criticalSecurityType(type));
+  }
+
+  /**
+   * CN-007: cek apakah notifikasi in-app untuk tipe tertentu diizinkan user.
+   * Dipakai pembuat notifikasi (mis. chat) SEBELUM menulis baris notification,
+   * agar toggle preferensi benar-benar menekan — bukan hanya menyembunyikan
+   * dari daftar.
+   */
+  async isInAppEnabled(userId: string, type: NotificationType): Promise<boolean> {
+    try {
+      if (criticalSecurityType(type)) return true;
+      const disabled = await this.disabledInAppTypes(userId);
+      return !disabled.includes(type);
+    } catch {
+      return true;
+    }
   }
 
   private async notificationVisibilityWhere(userId: string): Promise<Prisma.NotificationWhereInput> {
@@ -278,28 +301,16 @@ export class NotificationsService {
     return prefs;
   }
 
-  // 7.2 Quiet hours check (WIB) + 7.3 per-category push toggles + language
+  // 7.2 Quiet hours check (zona waktu per-user, CN-008) + 7.3 per-category push toggles + language
   async isInQuietHours(userId: string): Promise<boolean> {
     try {
       const prefs = await this.prisma.notificationPreference.findUnique({ where: { userId } }) as any;
       if (!prefs || !prefs.quietHoursEnabled) return false;
       const start = prefs.quietHoursStart || '22:00';
       const end = prefs.quietHoursEnd || '07:00';
-      const now = new Date();
-      // Convert to WIB (Asia/Jakarta UTC+7)
-      const wibHour = (now.getUTCHours() + 7) % 24;
-      const wibMinute = now.getUTCMinutes();
-      const currentMinutes = wibHour * 60 + wibMinute;
-      const [sh, sm] = start.split(':').map(Number);
-      const [eh, em] = end.split(':').map(Number);
-      const startMinutes = sh * 60 + sm;
-      const endMinutes = eh * 60 + em;
-      if (startMinutes <= endMinutes) {
-        return currentMinutes >= startMinutes && currentMinutes < endMinutes;
-      } else {
-        // Overnight range (e.g., 22:00-07:00)
-        return currentMinutes >= startMinutes || currentMinutes < endMinutes;
-      }
+      // CN-008: zona waktu dari preferensi user, bukan hardcode WIB.
+      const currentMinutes = getMinutesInTimezone(new Date(), prefs.quietHoursTimezone);
+      return isMinutesInRange(currentMinutes, start, end);
     } catch {
       return false;
     }

@@ -114,6 +114,11 @@ export class UpdatePreferencesDto {
   @Matches(/^([01]\d|2[0-3]):([0-5]\d)$/, { message: 'quietHoursEnd must be HH:mm' })
   quietHoursEnd?: string;
 
+  @ApiPropertyOptional({ description: 'IANA timezone for quiet hours (e.g. Asia/Jakarta)', example: 'Asia/Jakarta' })
+  @IsOptional()
+  @IsString()
+  quietHoursTimezone?: string;
+
   @ApiPropertyOptional({ description: 'Preferred language', enum: ['id', 'en'] })
   @IsOptional()
   @IsIn(['id', 'en'])

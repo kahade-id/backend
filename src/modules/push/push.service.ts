@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
 import { NotificationType } from '@prisma/client';
 import * as admin from 'firebase-admin';
+import { getMinutesInTimezone, isMinutesInRange } from '../../common/utils/timezone.util';
 
 const EXPO_PUSH_API_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_PUSH_BATCH_SIZE = 100;
@@ -182,8 +183,8 @@ export class PushService implements OnModuleInit {
   }
 
   /**
-   * Quiet hours check (WIB). Di-port dari NotificationsService agar berlaku
-   * di jalur pengiriman push yang sebenarnya.
+   * Quiet hours check (zona waktu per-user, CN-008). Di-port dari NotificationsService
+   * agar berlaku di jalur pengiriman push yang sebenarnya.
    */
   private async isInQuietHours(userId: string): Promise<boolean> {
     try {
@@ -191,20 +192,9 @@ export class PushService implements OnModuleInit {
       if (!prefs || !prefs.quietHoursEnabled) return false;
       const start = prefs.quietHoursStart || '22:00';
       const end = prefs.quietHoursEnd || '07:00';
-      const now = new Date();
-      // Convert to WIB (Asia/Jakarta UTC+7)
-      const wibHour = (now.getUTCHours() + 7) % 24;
-      const wibMinute = now.getUTCMinutes();
-      const currentMinutes = wibHour * 60 + wibMinute;
-      const [sh, sm] = String(start).split(':').map(Number);
-      const [eh, em] = String(end).split(':').map(Number);
-      const startMinutes = sh * 60 + sm;
-      const endMinutes = eh * 60 + em;
-      if (startMinutes <= endMinutes) {
-        return currentMinutes >= startMinutes && currentMinutes < endMinutes;
-      }
-      // Overnight range (e.g., 22:00-07:00)
-      return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+      // CN-008: zona waktu dari preferensi user, bukan hardcode WIB.
+      const currentMinutes = getMinutesInTimezone(new Date(), prefs.quietHoursTimezone);
+      return isMinutesInRange(currentMinutes, String(start), String(end));
     } catch {
       return false;
     }

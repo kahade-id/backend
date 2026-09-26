@@ -326,4 +326,102 @@ describe('NotificationsService', () => {
       await expect(service.unregisterDevice('u1', '')).rejects.toThrow(BadRequestException);
     });
   });
+
+  describe('Batch 4A: CN-006 toggle menekan tipe in-app', () => {
+    it('disputeInApp=false menyembunyikan DISPUTE_MESSAGE_RECEIVED & SLA warnings', async () => {
+      mockPrisma.notificationPreference.findUnique.mockResolvedValue({
+        userId: 'u1', disputeInApp: false,
+      });
+      mockPrisma.notification.findMany.mockResolvedValue([]);
+      mockPrisma.notification.count.mockResolvedValue(0);
+      await service.listNotifications('u1', 1, 20);
+      const where = mockPrisma.notification.findMany.mock.calls[0][0].where;
+      const notIn = where.AND.find((c: any) => c.type?.notIn)?.type.notIn ?? [];
+      expect(notIn).toContain(NotificationType.DISPUTE_MESSAGE_RECEIVED);
+      expect(notIn).toContain(NotificationType.DISPUTE_ESCALATION_SLA_WARNING);
+      expect(notIn).toContain(NotificationType.DISPUTE_ESCALATION_SLA_BREACHED);
+    });
+    it('walletInApp=false menyembunyikan WALLET_REFUND_RECEIVED', async () => {
+      mockPrisma.notificationPreference.findUnique.mockResolvedValue({
+        userId: 'u1', walletInApp: false,
+      });
+      mockPrisma.notification.findMany.mockResolvedValue([]);
+      mockPrisma.notification.count.mockResolvedValue(0);
+      await service.listNotifications('u1', 1, 20);
+      const where = mockPrisma.notification.findMany.mock.calls[0][0].where;
+      const notIn = where.AND.find((c: any) => c.type?.notIn)?.type.notIn ?? [];
+      expect(notIn).toContain(NotificationType.WALLET_REFUND_RECEIVED);
+    });
+  });
+
+  describe('Batch 4A: CN-007 isInAppEnabled', () => {
+    it('false bila tipe ada di daftar disabled', async () => {
+      mockPrisma.notificationPreference.findUnique.mockResolvedValue({ userId: 'u1', chatInApp: false });
+      expect(await service.isInAppEnabled('u1', NotificationType.CHAT_NEW_MESSAGE)).toBe(false);
+    });
+    it('true bila preferensi tidak dimatikan', async () => {
+      mockPrisma.notificationPreference.findUnique.mockResolvedValue({ userId: 'u1', chatInApp: true });
+      expect(await service.isInAppEnabled('u1', NotificationType.CHAT_NEW_MESSAGE)).toBe(true);
+    });
+    it('true bila tidak ada baris preferensi (default)', async () => {
+      mockPrisma.notificationPreference.findUnique.mockResolvedValue(null);
+      expect(await service.isInAppEnabled('u1', NotificationType.CHAT_NEW_MESSAGE)).toBe(true);
+    });
+  });
+
+  describe('Batch 4A: CN-008 quiet hours per-timezone', () => {
+    it('memakai quietHoursTimezone user, bukan hardcode WIB', async () => {
+      // 2026-09-26T14:00:00Z = 21:00 WIB (di luar 22:00-07:00) = 22:00 WITA (masuk)
+      const RealDate = Date;
+      const fixed = new RealDate('2026-09-26T14:00:00.000Z');
+      jest.spyOn(global, 'Date').mockImplementation(((...args: any[]) => {
+        return args.length === 0 ? fixed : new RealDate(...args as [any]);
+      }) as any);
+      try {
+        mockPrisma.notificationPreference.findUnique.mockResolvedValue({
+          userId: 'u1', quietHoursEnabled: true,
+          quietHoursStart: '22:00', quietHoursEnd: '07:00',
+          quietHoursTimezone: 'Asia/Makassar',
+        });
+        expect(await service.isInQuietHours('u1')).toBe(true);
+        mockPrisma.notificationPreference.findUnique.mockResolvedValue({
+          userId: 'u1', quietHoursEnabled: true,
+          quietHoursStart: '22:00', quietHoursEnd: '07:00',
+          quietHoursTimezone: 'Asia/Jakarta',
+        });
+        expect(await service.isInQuietHours('u1')).toBe(false);
+      } finally {
+        (global.Date as any).mockRestore();
+      }
+    });
+    it('fallback ke WIB bila timezone invalid', async () => {
+      const RealDate = Date;
+      const fixed = new RealDate('2026-09-26T14:00:00.000Z'); // 21:00 WIB
+      jest.spyOn(global, 'Date').mockImplementation(((...args: any[]) => {
+        return args.length === 0 ? fixed : new RealDate(...args as [any]);
+      }) as any);
+      try {
+        mockPrisma.notificationPreference.findUnique.mockResolvedValue({
+          userId: 'u1', quietHoursEnabled: true,
+          quietHoursStart: '22:00', quietHoursEnd: '07:00',
+          quietHoursTimezone: 'WIB-tidak-valid',
+        });
+        expect(await service.isInQuietHours('u1')).toBe(false);
+      } finally {
+        (global.Date as any).mockRestore();
+      }
+    });
+  });
+
+  describe('Batch 4A: CN-019 refType/refId diekspos', () => {
+    it('listNotifications select menyertakan refType & refId', async () => {
+      mockPrisma.notificationPreference.findUnique.mockResolvedValue(null);
+      mockPrisma.notification.findMany.mockResolvedValue([]);
+      mockPrisma.notification.count.mockResolvedValue(0);
+      await service.listNotifications('u1', 1, 20);
+      const select = mockPrisma.notification.findMany.mock.calls[0][0].select;
+      expect(select.refType).toBe(true);
+      expect(select.refId).toBe(true);
+    });
+  });
 });

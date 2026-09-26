@@ -241,6 +241,9 @@ function serializeMessage(msg: RawMessage, options: SerializeMessageOptions = {}
     attachments: msg.isDeleted ? [] : msg.attachments,
     replyToId: msg.replyToId ?? null,
     replyTo,
+    // R1 (2026-09-26): frontend butuh tahu apakah pesan dari user sendiri
+    // untuk menentukan arah bubble (outgoing/incoming).
+    fromUser: options.viewerId ? msg.sender?.id === options.viewerId : false,
     reactions: summarizeReactions(msg.reactions ?? [], options.viewerId),
     ...(options.includeDeletedContent && msg.isDeleted
       ? { deletedContent: (msg as RawMessage).deletedContent ?? null }
@@ -304,9 +307,9 @@ export class ChatService {
         is_archived: boolean; room_created_at: Date; room_updated_at: Date;
         member_archived: boolean | null; member_muted: boolean | null; member_muted_until: Date | null;
         order_id: string | null; order_title: string | null; order_status: string | null;
-        initiator_user_id: string | null; initiator_full_name: string | null;
+        initiator_user_id: string | null; initiator_internal_id: string | null; initiator_full_name: string | null;
         initiator_username: string | null; initiator_avatar_url: string | null;
-        counterpart_user_id: string | null; counterpart_full_name: string | null;
+        counterpart_user_id: string | null; counterpart_internal_id: string | null; counterpart_full_name: string | null;
         counterpart_username: string | null; counterpart_avatar_url: string | null;
         last_msg_id: string | null; last_msg_content: string | null; last_msg_type: string | null;
         last_msg_sender_user_id: string | null; last_msg_created_at: Date | null;
@@ -326,10 +329,12 @@ export class ChatService {
           o."orderId" AS order_id,
           o.title AS order_title,
           o.status AS order_status,
+          iu.id AS initiator_internal_id,
           iu."userId" AS initiator_user_id,
           iu."fullName" AS initiator_full_name,
           iu.username AS initiator_username,
           iu."avatarUrl" AS initiator_avatar_url,
+          cu.id AS counterpart_internal_id,
           cu."userId" AS counterpart_user_id,
           cu."fullName" AS counterpart_full_name,
           cu.username AS counterpart_username,
@@ -400,7 +405,7 @@ export class ChatService {
     const total = Number(countResult[0]?.count ?? 0);
 
     const otherUserIds = roomRows
-      .map((r) => (r.initiator_user_id === userId ? r.counterpart_user_id : r.initiator_user_id))
+      .map((r) => (r.initiator_internal_id === userId ? r.counterpart_internal_id : r.initiator_internal_id))
       .filter((id): id is string => typeof id === 'string' && id !== userId);
     const uniqueOtherIds = [...new Set(otherUserIds)];
     const onlineStatuses = await this.realtime.areUsersOnline(uniqueOtherIds);
@@ -411,7 +416,7 @@ export class ChatService {
     const sealTierMap = await this.verificationBadgeService.getSealTierMap(uniqueOtherIds);
 
     const mappedRooms = roomRows.map((r) => {
-      const isInitiator = r.initiator_user_id === userId;
+      const isInitiator = r.initiator_internal_id === userId;
       const other = isInitiator
         ? {
             userId: r.counterpart_user_id,
@@ -425,7 +430,7 @@ export class ChatService {
             username: r.initiator_username,
             avatarUrl: r.initiator_avatar_url,
           };
-      const otherInternalId = isInitiator ? r.counterpart_user_id : r.initiator_user_id;
+      const otherInternalId = isInitiator ? r.counterpart_internal_id : r.initiator_internal_id;
       const mutedUntil =
         r.member_muted === true && r.member_muted_until
           ? new Date(r.member_muted_until)

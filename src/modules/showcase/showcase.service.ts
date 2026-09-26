@@ -767,12 +767,12 @@ export class ShowcaseService {
     })) as unknown as ShowcaseRow[];
 
     const likedIds = await this.getLikedShowcaseIds(viewerId, items.map((item) => item.id));
-    const badgeMap = await this.getAuthorBadgeMap(items.map((item) => item.user.userId));
+    const badgeMap = await this.getAuthorBadgeMap(items.map((item) => item.user.id));
     return {
       items: items.map((item) =>
         this.serializeShowcase(item, {
           isLiked: likedIds.has(item.id),
-          authorBadges: badgeMap.get(item.user.userId) ?? [],
+          authorBadges: badgeMap.get(item.user.id) ?? [],
         }),
       ),
       total: items.length,
@@ -801,13 +801,13 @@ export class ShowcaseService {
     const shouldCountView = !(visible.isOwner && !visible.row.isActive);
     const counted = shouldCountView ? await this.recordView(showcaseId, viewerId, options.clientIp) : false;
     const likedIds = await this.getLikedShowcaseIds(viewerId, [showcaseId]);
-    const badgeMap = await this.getAuthorBadgeMap([visible.row.user.userId]);
+    const badgeMap = await this.getAuthorBadgeMap([visible.row.user.id]);
 
     return {
       ...this.serializeShowcase(visible.row, {
         isLiked: likedIds.has(showcaseId),
         isOwner: visible.isOwner,
-        authorBadges: badgeMap.get(visible.row.user.userId) ?? [],
+        authorBadges: badgeMap.get(visible.row.user.id) ?? [],
       }),
       // R-6: nilai di sini adalah row.viewCount + 1 (asumsi, bukan hasil baca
       // ulang setelah increment) — bisa sedikit basi bila dua viewer membaca
@@ -867,12 +867,12 @@ export class ShowcaseService {
       related.map((r) => r.id),
     );
     const badgeMap = await this.getAuthorBadgeMap(
-      related.map((r) => r.user.userId),
+      related.map((r) => r.user.id),
     );
     return related.map((r) =>
       this.serializeShowcase(r, {
         isLiked: likedIds.has(r.id),
-        authorBadges: badgeMap.get(r.user.userId) ?? [],
+        authorBadges: badgeMap.get(r.user.id) ?? [],
       }),
     );
   }
@@ -1051,13 +1051,13 @@ export class ShowcaseService {
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
     const likedIds = await this.getLikedShowcaseIds(viewerId, pageRows.map((row) => row.id));
     // S1: badge 3-tier author (satu batch, cached di Redis).
-    const badgeMap = await this.getAuthorBadgeMap(pageRows.map((row) => row.user.userId));
+    const badgeMap = await this.getAuthorBadgeMap(pageRows.map((row) => row.user.id));
 
     return {
       items: pageRows.map((row) =>
         this.serializeShowcase(row, {
           isLiked: likedIds.has(row.id),
-          authorBadges: badgeMap.get(row.user.userId) ?? [],
+          authorBadges: badgeMap.get(row.user.id) ?? [],
         }),
       ),
       sort,

@@ -18,6 +18,7 @@ export class SettingsController {
 
   @Get('blocked-users')
   @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @ApiOperation({ summary: 'List blocked users', deprecated: true, description: 'Deprecated: gunakan GET /v1/users/me/blocked.' })
   listBlockedUsers(
     @CurrentUser('sub') userId: string,
     @Query() pagination: PaginationDto,

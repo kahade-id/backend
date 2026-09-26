@@ -114,6 +114,7 @@ export class UsersController {
 
   @Put('me/avatar')
   @UseGuards(UserThrottleGuard)
+  @ApiOperation({ summary: 'Get presigned URL for avatar upload', deprecated: true, description: 'Deprecated: gunakan POST /v1/users/me/avatar/direct + /confirm.' })
   async uploadAvatar(
     @CurrentUser('sub') userId: string,
     @Body() dto: UploadAvatarDto,
@@ -156,7 +157,7 @@ export class UsersController {
 
   @Put('me/header')
   @UseGuards(UserThrottleGuard)
-  @ApiOperation({ summary: 'Get presigned URL for header image upload' })
+  @ApiOperation({ summary: 'Get presigned URL for header image upload', deprecated: true, description: 'Deprecated: gunakan POST /v1/users/me/header/direct + /confirm.' })
   async uploadHeader(
     @CurrentUser('sub') userId: string,
     @Body() dto: UploadAvatarDto,
@@ -234,7 +235,7 @@ export class UsersController {
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @UseGuards(UserThrottleGuard)
   @Get('me/devices')
-  @ApiOperation({ summary: 'List logged-in devices' })
+  @ApiOperation({ summary: 'List logged-in devices', deprecated: true, description: 'Deprecated: gunakan GET /v1/sessions.' })
   async getMyDevices(
     @CurrentUser('sub') userId: string,
     @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,

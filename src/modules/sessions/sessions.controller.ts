@@ -1,6 +1,6 @@
 import { Controller, Get, Delete, Param, Query, UseGuards, DefaultValuePipe, ParseIntPipe } from '@nestjs/common';
 import { ParseIdPipe } from '../../common/pipes/parse-id.pipe';
-import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
+import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { SessionsService } from './sessions.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -50,6 +50,7 @@ export class SessionsController {
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @UseGuards(UserThrottleGuard)
   @Get('devices')
+  @ApiOperation({ summary: 'List devices', deprecated: true, description: 'Deprecated: gunakan GET /v1/sessions.' })
   async getDevices(@CurrentUser('sub') userId: string): Promise<object> {
     return this.sessionsService.getDevices(userId);
   }

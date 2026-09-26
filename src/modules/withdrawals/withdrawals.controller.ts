@@ -62,8 +62,3 @@ export class WithdrawalsControllerBase {
 @ApiBearerAuth('access-token')
 @Controller('scheduled-withdrawals')
 export class ScheduledWithdrawalsController extends WithdrawalsControllerBase {}
-
-@ApiTags('withdrawals')
-@ApiBearerAuth('access-token')
-@Controller('withdrawals')
-export class WithdrawalsController extends WithdrawalsControllerBase {}

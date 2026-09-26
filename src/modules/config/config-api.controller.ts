@@ -13,7 +13,7 @@ export class ConfigApiController {
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Get('exchange-rates')
   @Header('Cache-Control', 'public, max-age=300, s-maxage=300')
-  @ApiOperation({ summary: 'Get current exchange rates' })
+  @ApiOperation({ summary: 'Get current exchange rates', deprecated: true, description: 'Deprecated: gunakan GET /v1/public/exchange-rates.' })
   async getExchangeRates(): Promise<Record<string, unknown>> {
     return this.publicService.getExchangeRates();
   }
@@ -28,7 +28,7 @@ export class AppApiController {
   @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Get('version')
   @Header('Cache-Control', 'public, max-age=300, s-maxage=300')
-  @ApiOperation({ summary: 'Get minimum and latest app version for force-update' })
+  @ApiOperation({ summary: 'Get minimum and latest app version for force-update', deprecated: true, description: 'Deprecated: gunakan GET /v1/public/app-version.' })
   getAppVersion(): Record<string, unknown> {
     return this.publicService.getAppVersion();
   }

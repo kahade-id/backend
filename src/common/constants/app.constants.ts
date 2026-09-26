@@ -44,6 +44,35 @@ export const MAX_BANK_ACCOUNTS = 5;
 
 export const DISPUTE_SLA_HOURS = 72;
 
+/**
+ * SLA tahap kedua: setelah sengketa di-ESCALATED (otomatis karena SLA breach
+ * atau manual oleh admin), admin punya 3x24 jam untuk memberi putusan.
+ * Warning dikirim ke kedua pihak 24 jam sebelum deadline.
+ */
+export const DISPUTE_ESCALATION_SLA_HOURS = 72;
+export const DISPUTE_ESCALATION_SLA_WARNING_HOURS = 24;
+
+/**
+ * Kebijakan platform fee saat putusan sengketa FULL_BUYER (transaksi batal
+ * total, dana kembali ke pembeli).
+ *
+ * Perilaku saat ini (false): platform MENAHAN fee — pembeli menerima
+ * `sellerReceiveAmount` (nilai order), bukan `buyerPayAmount` penuh.
+ * Lihat `AdminDisputesService.resolveDispute` (audit 2026-09-26).
+ *
+ * REKOMENDASI (audit deferred sengketa 2026-09-26): set `true` — fee ikut
+ * refund ke pembeli saat transaksi batal total. Alasan: (1) adil — pembeli
+ * tidak menerima apa pun dari transaksi yang gagal; (2) biaya sengketa yang
+ * berujung full refund biasanya kesalahan penjual/sistem, bukan pembeli;
+ * (3) mengurangi potensi keluhan "uang kembali tidak penuh".
+ *
+ * KEPUTUSAN PRODUK TERBUKA: JANGAN aktifkan (ubah ke `true`) tanpa
+ * persetujuan eksplisit product — ini mengubah aliran dana escrow.
+ * Saat `true`, pembeli menerima `buyerPayAmount` penuh dan platform tidak
+ * menahan fee untuk order tersebut.
+ */
+export const DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE = false;
+
 export const CHAT_MESSAGE_MAX_LENGTH = 2000;
 
 /**

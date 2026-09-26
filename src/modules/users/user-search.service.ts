@@ -3,10 +3,14 @@ import { MembershipRank, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { SEARCH_MAX_RESULTS } from '../../common/constants/app.constants';
 import { escapeLikePattern } from '../../common/utils/search.util';
+import { VerificationBadgeService } from './verification-badge.service';
 
 @Injectable()
 export class UserSearchService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private verificationBadgeService: VerificationBadgeService,
+  ) {}
 
   async searchUsers(query: string, filters: {
     minRating?: number;
@@ -89,6 +93,7 @@ export class UserSearchService {
         skip,
         take: safeLimit,
         select: {
+          id: true,
           userId: true,
           username: true,
           fullName: true,
@@ -107,6 +112,12 @@ export class UserSearchService {
       this.prisma.user.count({ where }),
     ]);
 
+    // R1 (audit 2026-09-26): sealTier disematkan agar <VerifiedSeal> bisa
+    // dirender di hasil discover tanpa N+1 request badge.
+    const sealTierMap = await this.verificationBadgeService.getSealTierMap(
+      users.map((u) => u.id),
+    );
+
     return {
       data: users.map(u => ({
         userId: u.userId,
@@ -119,6 +130,7 @@ export class UserSearchService {
         ratingCount: u.totalRatingCount,
         totalOrdersCompleted: u.totalOrdersCompleted,
         isKycVerified: u.kycStatus === 'APPROVED',
+        sealTier: sealTierMap.get(u.id) ?? null,
         isVip: u.isVip,
         followersCount: u._count.followers,
         memberSince: u.createdAt,

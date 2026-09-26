@@ -6,6 +6,7 @@ import { RedisService } from '../../../redis/redis.service';
 import { AuditAction, DisputeStatus, MembershipRank, NotificationType } from '@prisma/client';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
+import { DISPUTE_ESCALATION_SLA_HOURS } from '../../../common/constants/app.constants';
 
 const RANK_PRIORITY: Record<MembershipRank, number> = {
   BRONZE: 0,
@@ -79,6 +80,11 @@ export class AutoEscalateDisputesService {
 
       for (const dispute of breached) {
         try {
+          const escalationNow = new Date();
+          // SLA tahap kedua: 3x24 jam untuk admin memberi putusan pasca-eskalasi.
+          const escalationSlaDeadlineAt = new Date(
+            escalationNow.getTime() + DISPUTE_ESCALATION_SLA_HOURS * 60 * 60 * 1000,
+          );
           const updated = await this.prisma.dispute.updateMany({
             where: {
               id: dispute.id,
@@ -90,6 +96,8 @@ export class AutoEscalateDisputesService {
             data: {
               status: DisputeStatus.ESCALATED,
               isSlaBreached: true,
+              escalatedAt: escalationNow,
+              escalationSlaDeadlineAt,
             },
           });
           if (updated.count > 0) {

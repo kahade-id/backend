@@ -10,6 +10,7 @@ import { AdminFinanceModule } from './finance/admin-finance.module';
 import { AdminVouchersModule } from './vouchers/admin-vouchers.module';
 import { AdminSystemModule } from './system/admin-system.module';
 import { AdminReportsModule } from './reports/admin-reports.module';
+import { AdminShowcaseReportsModule } from './showcase-reports/admin-showcase-reports.module';
 import { AdminBadgesModule } from './badges/admin-badges.module';
 import { AdminSubscriptionsModule } from './subscriptions/admin-subscriptions.module';
 import { AdminRatingsModule } from './ratings/admin-ratings.module';
@@ -33,6 +34,7 @@ import { AdminChatModule } from './chat/admin-chat.module';
     AdminVouchersModule,
     AdminSystemModule,
     AdminReportsModule,
+    AdminShowcaseReportsModule,
     AdminBadgesModule,
     AdminSubscriptionsModule,
     AdminRatingsModule,

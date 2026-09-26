@@ -3,25 +3,33 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { escapeLikePattern } from '../../common/utils/search.util';
+import { VerificationBadgeService } from '../users/verification-badge.service';
 
 @Injectable()
 export class SearchService {
   private readonly LIMIT = 5;
 
-  constructor(private prisma: PrismaService, private redis: RedisService) {}
+  constructor(
+    private prisma: PrismaService,
+    private redis: RedisService,
+    private verificationBadgeService: VerificationBadgeService,
+  ) {}
 
-  async search(userId: string, query: string, types?: string[], limit?: number): Promise<object> {
+  async search(userId: string, query: string, types?: string[], limit?: number, location?: string): Promise<object> {
     const q = this.normalizeQuery(query);
     if (!q) return { users: [], orders: [], transactions: [], showcase: [], helpCenter: [], totals: { users: 0, orders: 0, transactions: 0, showcase: 0, helpCenter: 0 } };
 
     const effectiveLimit = Number.isSafeInteger(limit) ? Math.min(Math.max(limit as number, 1), 50) : this.LIMIT;
     const typeSet = types?.length ? new Set(types) : new Set(['users', 'orders', 'transactions', 'showcase', 'help-center']);
+    // Filter lokasi etalase (opsional): cocokkan free-text users.address milik
+    // owner — dinormalisasi di sini supaya searchShowcase menerima satu bentuk.
+    const locationFilter = (location ?? '').trim();
 
     const [users, orders, transactions, showcase, helpCenter] = await Promise.all([
       typeSet.has('users') ? this.searchUsers(q, userId, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
       typeSet.has('orders') ? this.searchOrders(userId, q, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
       typeSet.has('transactions') ? this.searchTransactions(userId, q, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
-      typeSet.has('showcase') ? this.searchShowcase(q, userId, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
+      typeSet.has('showcase') ? this.searchShowcase(q, userId, effectiveLimit, locationFilter) : Promise.resolve({ results: [], total: 0 }),
       typeSet.has('help-center') ? this.searchHelpCenter(q, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
     ]);
 
@@ -124,7 +132,7 @@ export class SearchService {
       SELECT title AS label, 'showcase' AS type
       FROM user_showcases
       WHERE "deletedAt" IS NULL
-        AND "isPublic" = true
+        AND "visibility" = 'PUBLIC'
         AND "isActive" = true
         -- T3 (audit Discovery 2026-09-26): paritas privasi dengan searchShowcase
         -- & getFeed — judul milik akun banned/nonaktif/privat tidak boleh bocor
@@ -231,7 +239,17 @@ export class SearchService {
       total = countResult;
     }
 
-    return { results, total };
+    // R1 (audit 2026-09-26): sematkan sealTier di hasil pencarian user agar
+    // frontend bisa render <VerifiedSeal> tanpa N+1 request badge.
+    const sealMap = await this.verificationBadgeService.getSealTierMap(
+      (results as Array<{ id: string }>).map((r) => r.id),
+    );
+    const resultsWithSeal = (results as Array<{ id: string }>).map((r) => ({
+      ...r,
+      sealTier: sealMap.get(r.id) ?? null,
+    }));
+
+    return { results: resultsWithSeal, total };
   }
 
   private async searchOrders(userId: string, query: string, limit?: number): Promise<{ results: object[]; total: number }> {
@@ -310,7 +328,7 @@ export class SearchService {
     return { results: rows, total };
   }
 
-  private async searchShowcase(query: string, userId: string | undefined, limit?: number): Promise<{ results: object[]; total: number }> {
+  private async searchShowcase(query: string, userId: string | undefined, limit?: number, location?: string): Promise<{ results: object[]; total: number }> {
     const take = limit || this.LIMIT;
     const tsQuery = this.buildTsQuery(query);
     // T2 (audit Discovery 2026-09-26): paritas privasi dengan searchUsers —
@@ -321,14 +339,23 @@ export class SearchService {
     // Fragmen SQL mentah (bukan parameter) — Prisma mengutip string biasa
     // sebagai nilai, jadi harus dibungkus Prisma.raw.
     const ownerVisibilitySql = Prisma.raw(`"userId" IN (SELECT id FROM users WHERE "isActive" = true AND "isBanned" = false AND "deletedAt" IS NULL AND "profileVisible" = true)`);
+    // Filter lokasi (opsional): batasi ke item yang owner-nya punya
+    // users.address ILIKE %location% (case-insensitive). Nilai diikat sebagai
+    // PARAMETER (Prisma.sql), bukan interpolasi string — dan pola LIKE
+    // di-escape supaya `%`/`_`/`\` dari user diperlakukan literal.
+    const locationFilter = (location ?? '').trim();
+    const locationSql = locationFilter
+      ? Prisma.sql`AND "userId" IN (SELECT id FROM users WHERE address ILIKE '%' || ${escapeLikePattern(locationFilter)} || '%')`
+      : Prisma.sql``;
     if (tsQuery) {
       try {
         const rows = await this.prisma.$queryRaw<object[]>`
           SELECT id, title, description, "userId", "createdAt",
                  ts_rank(to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,'')), to_tsquery('simple', ${tsQuery})) AS rank
           FROM user_showcases
-          WHERE "deletedAt" IS NULL AND "isPublic" = true AND "isActive" = true
+          WHERE "deletedAt" IS NULL AND "visibility" = 'PUBLIC' AND "isActive" = true
             AND ${ownerVisibilitySql}
+            ${locationSql}
             AND "userId" NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
             AND to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,'')) @@ to_tsquery('simple', ${tsQuery})
           ORDER BY rank DESC, "createdAt" DESC
@@ -336,8 +363,9 @@ export class SearchService {
         `;
         const countResult = await this.prisma.$queryRaw<{ count: bigint }[]>`
           SELECT COUNT(*) as count FROM user_showcases
-          WHERE "deletedAt" IS NULL AND "isPublic" = true AND "isActive" = true
+          WHERE "deletedAt" IS NULL AND "visibility" = 'PUBLIC' AND "isActive" = true
             AND ${ownerVisibilitySql}
+            ${locationSql}
             AND "userId" NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
             AND to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,'')) @@ to_tsquery('simple', ${tsQuery})
         `.catch(() => [{ count: BigInt(0) }]);
@@ -347,7 +375,7 @@ export class SearchService {
     try {
       const where = {
         deletedAt: null,
-        isPublic: true,
+        visibility: 'PUBLIC',
         isActive: true,
         user: {
           isActive: true,
@@ -355,6 +383,7 @@ export class SearchService {
           deletedAt: null,
           profileVisible: true,
           ...(blockedIds.length > 0 ? { id: { notIn: blockedIds } } : {}),
+          ...(locationFilter ? { address: { contains: escapeLikePattern(locationFilter), mode: 'insensitive' as const } } : {}),
         },
         OR: [
           { title: { contains: escapeLikePattern(query), mode: 'insensitive' as const } },

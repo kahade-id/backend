@@ -21,6 +21,7 @@ import {
   CHAT_VOICE_MIN_DURATION_SECONDS,
 } from '../../common/constants/app.constants';
 import { createPaginatedResponse } from '../../common/dto/pagination.dto';
+import { VerificationBadgeService } from '../users/verification-badge.service';
 import { moderateFileName, moderateText, ModerationVerdict, ModerateOptions } from './chat-moderation.util';
 
 function sanitizeText(text: string): string {
@@ -282,6 +283,7 @@ export class ChatService {
     private prisma: PrismaService,
     private realtime: RealtimeService,
     private configService: ConfigService,
+    private verificationBadgeService: VerificationBadgeService,
     @Optional() private uploadService?: UploadService,
   ) {}
 
@@ -404,6 +406,9 @@ export class ChatService {
     const onlineStatuses = await this.realtime.areUsersOnline(uniqueOtherIds);
     const privacySettings = await this.loadOnlineVisibility(uniqueOtherIds);
     const lastSeenByUser = await this.loadLastSeen(uniqueOtherIds, onlineStatuses, privacySettings);
+    // R1 (audit 2026-09-26): sealTier lawan bicara disematkan agar frontend
+    // bisa render <VerifiedSeal> di daftar & header chat tanpa N+1.
+    const sealTierMap = await this.verificationBadgeService.getSealTierMap(uniqueOtherIds);
 
     const mappedRooms = roomRows.map((r) => {
       const isInitiator = r.initiator_user_id === userId;
@@ -456,6 +461,7 @@ export class ChatService {
           fullName: other.fullName,
           username: other.username,
           avatarUrl: other.avatarUrl,
+          sealTier: otherInternalId ? (sealTierMap.get(otherInternalId) ?? null) : null,
           // Pengaturan privasi lawan bicara dihormati: bila dia menonaktifkan
           // status online, kita tidak pernah melaporkannya sedang online.
           isOnline: otherInternalId

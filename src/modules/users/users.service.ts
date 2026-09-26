@@ -581,6 +581,7 @@ export class UsersService {
     const sanitizedQuery = query.replace(/[<>&"']/g, '').trim();
 
     type UserRow = {
+      id: string;
       userId: string;
       username: string | null;
       fullName: string;
@@ -611,7 +612,7 @@ export class UsersService {
 
     const [users, countResult] = await Promise.all([
       this.prisma.$queryRaw<UserRow[]>`
-        SELECT "userId", username, "fullName", "avatarUrl", "membershipRank"
+        SELECT id, "userId", username, "fullName", "avatarUrl", "membershipRank"
         FROM users
         WHERE "isActive" = true
           AND "isBanned" = false
@@ -641,12 +642,19 @@ export class UsersService {
     ]);
 
     const total = Number(countResult[0]?.count ?? 0);
+    // R1 (audit 2026-09-26): sematkan sealTier agar frontend bisa render
+    // <VerifiedSeal> di hasil pencarian user tanpa N+1 request badge.
+    // getSealTierMap dikunci oleh id internal — id publik USR-XXXX tidak dipakai.
+    const sealTierMap = await this.verificationBadgeService.getSealTierMap(
+      users.map((u) => u.id),
+    );
     const mapped = users.map((u: UserRow) => ({
       userId: u.userId,
       username: u.username,
       fullName: u.fullName,
       avatarUrl: u.avatarUrl,
       membershipRank: u.membershipRank,
+      sealTier: sealTierMap.get(u.id) ?? null,
     }));
 
     return { users: mapped, total, page: safePage, limit: safeLimit };
@@ -1622,12 +1630,27 @@ export class UsersService {
       this.prisma.follow.findMany({
         where,
         skip, take: safeLimit, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
-        select: { createdAt: true, follower: { select: { username: true, fullName: true, avatarUrl: true, membershipRank: true } } },
+        select: { createdAt: true, follower: { select: { id: true, username: true, fullName: true, avatarUrl: true, membershipRank: true } } },
       }),
       this.prisma.follow.count({ where }),
     ]);
 
-    return { users: followers.map(f => ({ ...f.follower, followedAt: f.createdAt })), total, page: safePage, limit: safeLimit };
+    // R1 (audit 2026-09-26, lanjutan): sematkan sealTier agar frontend bisa
+    // render <VerifiedSeal> di daftar pengikut tanpa N+1 request badge.
+    const sealTierMap = await this.verificationBadgeService.getSealTierMap(
+      followers.map((f) => f.follower.id),
+    );
+
+    return {
+      users: followers.map((f) => {
+        // id internal hanya dipakai untuk sealTierMap — jangan dibocorkan.
+        const { id: _internalId, ...rest } = f.follower;
+        return { ...rest, sealTier: sealTierMap.get(f.follower.id) ?? null, followedAt: f.createdAt };
+      }),
+      total,
+      page: safePage,
+      limit: safeLimit,
+    };
   }
 
   async getFollowing(username: string, page: number, limit: number, viewerId?: string | null): Promise<object> {
@@ -1663,12 +1686,27 @@ export class UsersService {
       this.prisma.follow.findMany({
         where: followingWhere,
         skip, take: safeLimit, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
-        select: { createdAt: true, following: { select: { username: true, fullName: true, avatarUrl: true, membershipRank: true } } },
+        select: { createdAt: true, following: { select: { id: true, username: true, fullName: true, avatarUrl: true, membershipRank: true } } },
       }),
       this.prisma.follow.count({ where: followingWhere }),
     ]);
 
-    return { users: following.map(f => ({ ...f.following, followedAt: f.createdAt })), total, page: safePage, limit: safeLimit };
+    // R1 (audit 2026-09-26, lanjutan): sematkan sealTier agar frontend bisa
+    // render <VerifiedSeal> di daftar mengikuti tanpa N+1 request badge.
+    const sealTierMap = await this.verificationBadgeService.getSealTierMap(
+      following.map((f) => f.following.id),
+    );
+
+    return {
+      users: following.map((f) => {
+        // id internal hanya dipakai untuk sealTierMap — jangan dibocorkan.
+        const { id: _internalId, ...rest } = f.following;
+        return { ...rest, sealTier: sealTierMap.get(f.following.id) ?? null, followedAt: f.createdAt };
+      }),
+      total,
+      page: safePage,
+      limit: safeLimit,
+    };
   }
 
   // ========== BLOCK ==========

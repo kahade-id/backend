@@ -115,16 +115,12 @@ export class CancelOrderDto {
   note?: string;
 }
 
-export enum DisputeCategory {
-  ITEM_NOT_RECEIVED = 'ITEM_NOT_RECEIVED',
-  ITEM_NOT_AS_DESCRIBED = 'ITEM_NOT_AS_DESCRIBED',
-  DAMAGED_ITEM = 'DAMAGED_ITEM',
-  WRONG_ITEM = 'WRONG_ITEM',
-  SERVICE_NOT_RENDERED = 'SERVICE_NOT_RENDERED',
-  PAYMENT_ISSUE = 'PAYMENT_ISSUE',
-  FRAUD = 'FRAUD',
-  OTHER = 'OTHER',
-}
+// Re-export Prisma enum agar DTO dan schema.prisma tetap sinkron
+// (nilai identik dengan enum DisputeCategory di schema).
+// NOTE: `export ... from` tidak membuat binding lokal, jadi import dulu
+// agar decorator di bawah bisa memakai nama DisputeCategory.
+import { DisputeCategory } from '@prisma/client';
+export { DisputeCategory };
 
 export class SubmitDisputeDto {
   @ApiProperty({ description: 'Dispute category', enum: DisputeCategory })

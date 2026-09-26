@@ -357,7 +357,6 @@ export class AuthController {
       userId,
       dto.newPhoneNumber,
       dto.currentPassword,
-      dto.method,
       dto.mfaCode,
       ipAddress,
     );

@@ -4,7 +4,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { generateKycId } from '../../common/utils/id-generator.util';
-import { encryptKycNik, encryptKycKtp, encryptKycSelfie, hmacSHA256, argon2HashNik } from '../../common/utils/crypto.util';
+import { encryptKycNik, encryptKycKtp, encryptKycSelfie, decryptAES, hmacSHA256, argon2HashNik } from '../../common/utils/crypto.util';
 import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { UserAuditAction } from '@prisma/client';
@@ -263,6 +263,7 @@ export class KycService {
         attemptNumber: true,
         createdAt: true,
         reviewedAt: true,
+        ktpNumber: true,
       },
     });
 
@@ -273,9 +274,35 @@ export class KycService {
       };
     }
 
+    // NIK terenkripsi di-decrypt lalu di-mask untuk UX (mis. "3174••••••••1234").
+    // Hanya dikirim ke pemilik akun — tidak pernah full NIK ke client.
+    let nikMasked: string | null = null;
+    if (latestKyc.ktpNumber) {
+      try {
+        const nik = await decryptAES(latestKyc.ktpNumber);
+        nikMasked = nik.length > 8
+          ? `${nik.slice(0, 4)}••••••••${nik.slice(-4)}`
+          : '••••••••';
+      } catch {
+        nikMasked = null;
+      }
+    }
+
+    const { ktpNumber: _ktpNumber, ...safeKyc } = latestKyc;
+
+    // Nama lengkap dari profil untuk ditampilkan di kartu status KYC.
+    const owner = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { fullName: true },
+    });
+
     return {
       status: latestKyc.status,
-      latestRequest: latestKyc,
+      latestRequest: {
+        ...safeKyc,
+        nikMasked,
+        fullName: owner?.fullName ?? null,
+      },
     };
   }
 

@@ -183,6 +183,17 @@ enum DisputeDecisionType {
   SPLIT
 }
 
+enum DisputeCategory {
+  ITEM_NOT_RECEIVED
+  ITEM_NOT_AS_DESCRIBED
+  DAMAGED_ITEM
+  WRONG_ITEM
+  SERVICE_NOT_RENDERED
+  PAYMENT_ISSUE
+  FRAUD
+  OTHER
+}
+
 enum MembershipRank {
   BRONZE
   SILVER
@@ -237,6 +248,9 @@ enum NotificationType {
   ORDER_AUTOCOMPLETED
   DISPUTE_SUBMITTED
   DISPUTE_ADMIN_JOINED
+  DISPUTE_MESSAGE_RECEIVED
+  DISPUTE_ESCALATION_SLA_WARNING
+  DISPUTE_ESCALATION_SLA_BREACHED
   DISPUTE_DECISION
   DISPUTE_EVIDENCE_SUBMITTED
   DISPUTE_CLAIM_SUBMITTED
@@ -1201,6 +1215,11 @@ model Wallet {
   isLocked   Boolean   @default(false)
   lockedAt   DateTime?
   lockReason String?
+  // Kode stabil untuk alasan penguncian (i18n di klien/admin).
+  // `lockReason` tetap menyimpan detail operasional berbahasa Inggris
+  // (order id, nominal) untuk kebutuhan rekonsiliasi; tampilan ke manusia
+  // memakai kode ini, bukan teks mentah.
+  lockReasonCode String?
   lockedBy   String? // Admin ID (soft FK ke admin_users.id)
 
   version   Int       @default(0) // Optimistic locking
@@ -1765,6 +1784,15 @@ model Dispute {
   //   CHECK (sla_hours IS NULL OR sla_hours > 0);
   slaDeadlineAt DateTime?
   isSlaBreached Boolean   @default(false)
+
+  // SLA tahap kedua: setelah ESCALATED, admin punya 3x24 jam untuk putusan.
+  escalatedAt                 DateTime?
+  escalationSlaDeadlineAt     DateTime?
+  escalationSlaWarningSentAt  DateTime?
+  isEscalationSlaBreached     Boolean   @default(false)
+
+  // Kategori sengketa (diisi saat buka sengketa)
+  category DisputeCategory?
 
   adminNotes String? @db.Text
 
@@ -2588,6 +2616,7 @@ model OrderLink {
   orderValue           BigInt
   feeResponsibility    FeeResponsibility
   deliveryDeadlineDays Int
+  deliveryDeadlineAt   DateTime? // T3 (audit 2026-09-26): tanggal tenggat eksplisit pilihan creator link; diteruskan ke Order.deliveryDeadlineAt saat accept
   counterpartUsername  String?
 
   status       OrderLinkStatus @default(ACTIVE)

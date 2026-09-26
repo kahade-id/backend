@@ -2,6 +2,9 @@ import { Injectable, NotFoundException, ForbiddenException, BadRequestException,
 import { PrismaService } from '../../prisma/prisma.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { UploadService } from '../upload/upload.service';
+import { NotificationType } from '@prisma/client';
+import { randomUUID } from 'crypto';
+import { getCategoryForType } from '../notifications/notification-category.map';
 import * as ErrorCodes from '../../common/constants/error-codes';
 
 @Injectable()
@@ -161,6 +164,46 @@ export class DisputeMessageService {
       // The message and attachments are already durable; realtime delivery must not
       // turn a successful POST into a retry that could duplicate the message.
       this.logger.warn(`Dispute message realtime emit failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    // DSP-OFFLINE-01: jika lawan sedang offline, kirim notifikasi in-app + push.
+    // Push dikirim lewat emitNotificationCreated (hook PushService) — baris
+    // notification saja TIDAK memicu push (bug yang diperbaiki 2026-09-26:
+    // sebelumnya hanya row yang dibuat tanpa emit sehingga push tidak terkirim).
+    // Best-effort: kegagalan notifikasi tidak membatalkan pesan yang sudah tersimpan.
+    try {
+      const recipientOnline = await this.realtime.isUserOnline(recipientId);
+      if (!recipientOnline) {
+        const preview = sanitizedMessage.length > 120
+          ? sanitizedMessage.slice(0, 120) + '…'
+          : sanitizedMessage;
+        const notifTitle = 'Pesan baru dalam sengketa';
+        const notifBody = preview || `Anda menerima pesan baru pada sengketa ${dispute.disputeId}.`;
+        await this.prisma.notification.create({
+          data: {
+            notifId: randomUUID(),
+            userId: recipientId,
+            type: NotificationType.DISPUTE_MESSAGE_RECEIVED,
+            category: getCategoryForType(NotificationType.DISPUTE_MESSAGE_RECEIVED),
+            title: notifTitle,
+            body: notifBody,
+            actionUrl: `/dispute/${dispute.disputeId}`,
+            isRead: false,
+          },
+        });
+        this.prisma.emitNotificationCreated({
+          userId: recipientId,
+          title: notifTitle,
+          body: notifBody,
+          data: {
+            type: 'DISPUTE_MESSAGE_RECEIVED',
+            disputeId: dispute.disputeId,
+            actionUrl: `/dispute/${dispute.disputeId}`,
+          },
+        });
+      }
+    } catch (error) {
+      this.logger.warn(`Dispute offline notification failed: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     return created;

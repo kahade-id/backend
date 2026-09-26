@@ -543,6 +543,7 @@ export class DeliveryProofService {
                     orderId: order.id,
                     initiatorUserId: userId,
                     initiatedBy: DisputeInitiator.BUYER,
+                    category: 'OTHER',
                     buyerClaim: `Auto-escalated: delivery proof rejected ${newRejectionTotal} times. Last rejection: ${normalizedNote}`,
                     buyerClaimedAt: now,
                     status: DisputeStatus.OPEN,

@@ -4,6 +4,7 @@ export { PendingWithdrawCleanupService } from './pending-withdraw-cleanup.servic
 export { PendingTopupCleanupService } from './pending-topup-cleanup.service';
 export { AutoCompleteDeliveredOrdersService } from './auto-complete-orders.service';
 export { AutoEscalateDisputesService } from './auto-escalate-disputes.service';
+export { DisputeEscalationSlaService } from './dispute-escalation-sla.service';
 export { SubscriptionExpiryService } from './subscription-expiry.service';
 export { SubscriptionAutoResumeService } from './subscription-auto-resume.service';
 export { RedisHashCleanupService } from './redis-hash-cleanup.service';

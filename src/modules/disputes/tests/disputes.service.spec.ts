@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { Prisma, DisputeCategory } from '@prisma/client';
 import { DisputesService } from '../disputes.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
@@ -398,7 +398,7 @@ describe('DisputesService', () => {
       status: 'IN_DELIVERY', completedAt: null,
     };
     const createdDispute = { id: 'disp-1', disputeId: 'DSP-0001' };
-    const dto = { claim: 'item never arrived to buyer' };
+    const dto = { claim: 'item never arrived to buyer', category: DisputeCategory.ITEM_NOT_RECEIVED };
 
     const serializationFailure = () =>
       new Prisma.PrismaClientUnknownRequestError(

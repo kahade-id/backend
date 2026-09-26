@@ -12,7 +12,7 @@ import { KYC_THRESHOLD, CONFIRMATION_DEADLINE_DAYS_MAP, ORDER_MIN_VALUE, ORDER_M
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { ORDER_LINK_EXPIRY_HOURS } from '../../common/constants/app.constants';
 import { toIdr } from '../../common/utils/currency.util';
-import { formatWIBDate, toWIB } from '../../common/utils/date.util';
+import { formatWIBDate, toWIB, parseDateBoundaryWIB } from '../../common/utils/date.util';
 import { NotificationQueueService } from '../queue/notification-queue.service';
 
 @Injectable()
@@ -87,6 +87,30 @@ export class OrderLinksService {
     if (!Number.isSafeInteger(dto.deliveryDeadlineDays) || dto.deliveryDeadlineDays < DELIVERY_DEADLINE_DAYS_MIN || dto.deliveryDeadlineDays > DELIVERY_DEADLINE_DAYS_MAX) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Delivery deadline must be an integer between ${DELIVERY_DEADLINE_DAYS_MIN} and ${DELIVERY_DEADLINE_DAYS_MAX} days` });
     }
+
+    // T3 (audit 2026-09-26): tenggat boleh dipilih sebagai tanggal kalender, sama seperti
+    // createOrder — divalidasi dan disimpan di link, lalu diteruskan ke order saat accept.
+    // `parseDateBoundaryWIB(..., 'end')` mengartikan "2026-10-05" sebagai 23:59:59 WIB.
+    let explicitDeliveryDeadlineAt: Date | null = null;
+    if (dto.deliveryDeadlineAt !== undefined && dto.deliveryDeadlineAt !== null && String(dto.deliveryDeadlineAt).trim() !== '') {
+      const parsed = parseDateBoundaryWIB(String(dto.deliveryDeadlineAt).trim(), 'end');
+      if (!parsed) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'deliveryDeadlineAt must be a valid ISO 8601 date-time or YYYY-MM-DD calendar date',
+        });
+      }
+      const nowMs = Date.now();
+      const minMs = nowMs + 24 * 60 * 60 * 1000; // minimal besok
+      const maxMs = nowMs + DELIVERY_DEADLINE_DAYS_MAX * 24 * 60 * 60 * 1000;
+      if (parsed.getTime() < minMs || parsed.getTime() > maxMs) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: `deliveryDeadlineAt must be between tomorrow and ${DELIVERY_DEADLINE_DAYS_MAX} days from now`,
+        });
+      }
+      explicitDeliveryDeadlineAt = parsed;
+    }
     const normalizedCounterpartUsername = dto.counterpartUsername?.trim().toLowerCase();
     if (normalizedCounterpartUsername && (normalizedCounterpartUsername.length < 3 || normalizedCounterpartUsername.length > 50)) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Counterpart username must be between 3 and 50 characters' });
@@ -142,6 +166,7 @@ export class OrderLinksService {
         orderValue: BigInt(dto.orderValue) * 100n,
         feeResponsibility: dto.feeResponsibility,
         deliveryDeadlineDays: dto.deliveryDeadlineDays,
+        deliveryDeadlineAt: explicitDeliveryDeadlineAt,
         counterpartUsername: normalizedCounterpartUsername,
         expiresAt,
       },
@@ -376,6 +401,10 @@ export class OrderLinksService {
             feeRate: feeResult.feeRate,
             isKahadePlus: kahadePlusApplied,
             deliveryDeadlineDays: link.deliveryDeadlineDays,
+            // T3: tanggal eksplisit pilihan creator link — diteruskan mentah; konversi
+            // days→tanggal (bila basi/tidak ada) terjadi saat pembayaran via
+            // resolveDeliveryDeadlineAt, sama seperti jalur createOrder.
+            deliveryDeadlineAt: link.deliveryDeadlineAt,
             createdByBuyer: link.creatorRole === 'BUYER',
             status: 'WAITING_CONFIRMATION',
             orderLinkId: link.id,

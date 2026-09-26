@@ -6,6 +6,7 @@ import { WalletService } from './wallet.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { MidtransService } from '../payment/midtrans.service';
 import { OtpService } from '../auth/otp.service';
+import { OtpGatewayService } from '../auth/otp-gateway.service';
 import { WalletExportService } from './export.service';
 import { RedisModule } from '../../redis/redis.module';
 import { AuditLogModule } from '../../common/services/audit-log.module';
@@ -30,7 +31,7 @@ import { EMAIL_QUEUE } from '../queue/processors/email.processor';
     }),
   ],
   controllers: [WalletController],
-  providers: [WalletService, WalletTxSerialService, MidtransService, OtpService, WalletExportService],
+  providers: [WalletService, WalletTxSerialService, MidtransService, OtpService, OtpGatewayService, WalletExportService],
   exports: [WalletService, WalletTxSerialService, WalletExportService],
 })
 export class WalletModule {}

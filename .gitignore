@@ -22,3 +22,4 @@ coverage/
 # Local uploads and backups
 uploads/
 backups/
+openapi.json

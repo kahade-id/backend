@@ -50,7 +50,7 @@ describe('authentication OTP DTO validation', () => {
       currentPassword: 'Password123!@', newPassword: 'NewPassword123!@', confirmPassword: 'NewPassword123!@', mfaCode: '12ab56',
     }],
     [RequestPhoneChangeDto, {
-      newPhoneNumber: '+628123456789', method: 'WHATSAPP', currentPassword: 'Password123!@', mfaCode: '12ab56',
+      newPhoneNumber: '+628123456789', currentPassword: 'Password123!@', mfaCode: '12ab56',
     }],
     [CorrectEmailDto, {
       newEmail: 'new@example.com', password: 'Password123!@', mfaCode: '12ab56',
@@ -71,7 +71,7 @@ describe('authentication OTP DTO validation', () => {
       currentPassword: 'Password123!@', newPassword: 'NewPassword123!@', confirmPassword: 'NewPassword123!@', mfaCode: 'A1B2C3D4E5F6G7H8',
     }],
     [RequestPhoneChangeDto, {
-      newPhoneNumber: '+628123456789', method: 'WHATSAPP', currentPassword: 'Password123!@', mfaCode: '123456',
+      newPhoneNumber: '+628123456789', currentPassword: 'Password123!@', mfaCode: '123456',
     }],
     [CorrectEmailDto, {
       newEmail: 'new@example.com', password: 'Password123!@', mfaCode: 'A1B2C3D4E5F6G7H8',

@@ -84,4 +84,17 @@ export class ShowcaseFeedQueryDto {
   @Min(0)
   @Max(999999999999)
   maxPrice?: number;
+
+  @ApiPropertyOptional({
+    maxLength: SHOWCASE_SEARCH_MAX_LENGTH,
+    description:
+      'Filter lokasi: hanya item yang pemiliknya punya free-text alamat ' +
+      '(users.address) yang cocok case-insensitive dengan nilai ini. ' +
+      'Contoh: "Jakarta", "Bandung". Kosongkan untuk menonaktifkan.',
+  })
+  @IsOptional()
+  @IsString()
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
+  @MaxLength(SHOWCASE_SEARCH_MAX_LENGTH)
+  location?: string;
 }

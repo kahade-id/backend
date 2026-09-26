@@ -543,7 +543,7 @@ export class AdminUsersService {
       select: {
         id: true, availableBalance: true, escrowBalance: true, totalBalance: true,
         todayTopupAmount: true, todayWithdrawAmount: true,
-        isLocked: true, lockedAt: true, lockReason: true,
+        isLocked: true, lockedAt: true, lockReason: true, lockReasonCode: true,
         createdAt: true, updatedAt: true,
         transactions: {
           take: 10,

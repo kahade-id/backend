@@ -650,7 +650,6 @@ export class AuthService {
     userId: string,
     newPhoneNumber: string,
     currentPassword: string,
-    method: 'SMS' | 'WHATSAPP',
     mfaCode?: string,
     ipAddress?: string,
   ): Promise<{ message: string }> {
@@ -690,28 +689,25 @@ export class AuthService {
       });
     }
     await this.verifySensitiveMfa(userId, mfaCode);
-    if (!this.otpGateway.supportsMethod(method)) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message:
-          method === 'SMS'
-            ? 'SMS delivery is not configured. Please use WhatsApp instead.'
-            : 'WhatsApp delivery is not configured. Please use SMS instead.',
+    // OTP hanya via WhatsApp (kebijakan produk) — Fonnte tidak mendukung SMS.
+    if (!this.otpGateway.supportsMethod('WHATSAPP')) {
+      throw new ServiceUnavailableException({
+        code: 'OTP_DELIVERY_FAILED',
+        message: 'OTP delivery is temporarily unavailable. Please try again later.',
       });
     }
 
-    const otpMethod = method === 'WHATSAPP' ? ('WHATSAPP' as const) : ('SMS' as const);
     const otp = await this.otpService.generatePhoneOtp(
       normalizedPhone,
       OtpType.SENSITIVE_ACTION,
-      otpMethod,
+      'WHATSAPP',
       userId,
       { purpose: 'phone_change', userId, phoneHash },
       ipAddress,
     );
     let delivery: { success: boolean; error?: string };
     try {
-      delivery = await this.otpGateway.sendOtp(normalizedPhone, otp, method);
+      delivery = await this.otpGateway.sendOtp(normalizedPhone, otp, 'WHATSAPP');
     } catch {
       await this.otpService
         .invalidatePhoneOtps(normalizedPhone, OtpType.SENSITIVE_ACTION)

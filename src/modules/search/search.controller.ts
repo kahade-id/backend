@@ -36,6 +36,7 @@ export class SearchController {
     @Query('q', new ParseQueryStringPipe('q', 200)) query: string,
     @Query('types', new ParseQueryStringPipe('types', 100)) types?: string,
     @Query('limit') limitParam?: string,
+    @Query('location', new ParseQueryStringPipe('location', 100)) location?: string,
   ): Promise<object> {
     const q = (query || '').trim();
     if (q.length > 0 && q.length < 2) {
@@ -50,7 +51,10 @@ export class SearchController {
       }
       typeArray = Array.from(new Set(requestedTypes));
     }
-    return this.searchService.search(userId, q, typeArray, limit);
+    // Filter lokasi etalase (opsional): cocokkan free-text users.address milik
+    // owner (case-insensitive). Hanya dipakai untuk jenis `showcase`.
+    const locationFilter = (location ?? '').trim() || undefined;
+    return this.searchService.search(userId, q, typeArray, limit, locationFilter);
   }
 
   @Get('suggestions')

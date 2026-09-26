@@ -1,8 +1,9 @@
 import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger } from '@nestjs/common';
 import { Decimal } from '@prisma/client/runtime/library';
 import { randomBytes, randomInt } from 'crypto';
-import { Prisma, DisputeDecisionType, DisputeStatus, OrderStatus, ActorType, WalletTransactionType, WalletTransactionStatus, AuditAction, NotificationType, VoucherApplicability, VoucherType } from '@prisma/client';
+import { Prisma, DisputeDecisionType, DisputeCategory, DisputeStatus, OrderStatus, ActorType, WalletTransactionType, WalletTransactionStatus, AuditAction, NotificationType, VoucherApplicability, VoucherType } from '@prisma/client';
 import { getCategoryForType } from '../../notifications/notification-category.map';
+import { DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE } from '../../../common/constants/app.constants';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
@@ -104,15 +105,19 @@ export class AdminDisputesService {
     throw new Error(`${label}: unreachable`);
   }
 
-  async listDisputes(page = 1, limit = 20, status?: string, search?: string): Promise<object> {
+  async listDisputes(page = 1, limit = 20, status?: string, search?: string, category?: string): Promise<object> {
     if (status !== undefined && !['OPEN', 'ASSIGNED', 'UNDER_REVIEW', 'WAITING_RESPONSE', 'ESCALATED', 'RESOLVED', 'CANCELLED'].includes(status)) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid dispute status' });
+    }
+    if (category !== undefined && !Object.values(DisputeCategory).includes(category as DisputeCategory)) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid dispute category' });
     }
     const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
     const safeLimit = Number.isFinite(limit) ? Math.min(100, Math.max(1, Math.floor(limit))) : 20;
     const skip = (safePage - 1) * safeLimit;
     const where: Prisma.DisputeWhereInput = {};
     if (status) where.status = status as Prisma.EnumDisputeStatusFilter;
+    if (category) where.category = category as DisputeCategory;
     const normalizedSearch = search?.trim();
     if (normalizedSearch) {
       where.OR = [
@@ -246,10 +251,25 @@ export class AdminDisputesService {
     let sellerAmount: bigint;
     let platformRetainAmount: bigint;
 
+    // Kebijakan platform fee saat putusan FULL_BUYER (lihat
+    // DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE di app.constants.ts):
+    // - false (default, perilaku saat ini): platform menahan fee — pembeli
+    //   menerima sellerReceiveAmount (nilai order), fee tidak ikut refund.
+    // - true (rekomendasi, perlu keputusan produk): fee ikut refund — pembeli
+    //   menerima buyerPayAmount penuh (escrowedAmount) saat transaksi batal
+    //   total; platform tidak menahan fee untuk order ini.
+    // Catatan: untuk sengketa pasca-completion, platformFee selalu 0 sehingga
+    // kedua cabang identik.
     if (dto.decision === 'FULL_BUYER') {
-      buyerAmount = sellerReceiveAmount;
-      sellerAmount = BigInt(0);
-      platformRetainAmount = platformFee;
+      if (DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE) {
+        buyerAmount = escrowedAmount;
+        sellerAmount = BigInt(0);
+        platformRetainAmount = BigInt(0);
+      } else {
+        buyerAmount = sellerReceiveAmount;
+        sellerAmount = BigInt(0);
+        platformRetainAmount = platformFee;
+      }
     } else if (dto.decision === 'FULL_SELLER') {
       buyerAmount = BigInt(0);
       sellerAmount = sellerReceiveAmount;
@@ -561,7 +581,7 @@ export class AdminDisputesService {
         resolvedDisputeId: dispute.id,
         auditTargetId: dispute.disputeId,
         auditDescription: `Admin resolved dispute ${dispute.disputeId} with decision ${dto.decision}`,
-        auditAfter: { decision: dto.decision, buyerPercent: dto.buyerPercent, sellerPercent: dto.sellerPercent },
+        auditAfter: { decision: dto.decision, buyerPercent: dto.buyerPercent, sellerPercent: dto.sellerPercent, platformFeeRefundedToBuyer: dto.decision === 'FULL_BUYER' && DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE },
         apologyVouchers,
       };
     }), 'ADMIN_DISPUTE_RESOLVE_TX');

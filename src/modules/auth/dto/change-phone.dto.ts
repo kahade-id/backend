@@ -1,12 +1,12 @@
-import { IsIn, IsOptional, IsString, Matches, MaxLength, MinLength } from 'class-validator';
+import { IsOptional, IsString, Matches, MaxLength, MinLength } from 'class-validator';
 
 export class RequestPhoneChangeDto {
   @IsString()
   @MaxLength(20)
   newPhoneNumber!: string;
 
-  @IsIn(['SMS', 'WHATSAPP'])
-  method!: 'SMS' | 'WHATSAPP';
+  // OTP hanya via WhatsApp (kebijakan produk) — Fonnte tidak mendukung SMS.
+  // Field `method` sengaja dihapus: tidak ada pilihan metode lagi.
 
   @IsString()
   @MinLength(1)

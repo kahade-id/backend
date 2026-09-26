@@ -64,7 +64,9 @@ import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pag
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { MidtransService } from '../payment/midtrans.service';
 import { OtpService } from '../auth/otp.service';
-import { OtpType, UserAuditAction } from '@prisma/client';
+import { OtpGatewayService } from '../auth/otp-gateway.service';
+import { decryptPiiSafe } from '../../common/utils/pii.util';
+import { OtpType, OtpMethod, UserAuditAction } from '@prisma/client';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { EMAIL_QUEUE, EmailJobData } from '../queue/processors/email.processor';
@@ -90,7 +92,8 @@ interface WalletSummary {
   kycFreeLimit: number;
   hasPin: boolean;
   isLocked: boolean;
-  lockReason: string | null;
+  /** Kode i18n untuk alasan penguncian (bukan teks hardcode). */
+  lockReasonCode: string | null;
 }
 
 interface TransactionSummary {
@@ -109,6 +112,16 @@ interface TransactionSummary {
 // Three database attempts can each wait up to 15 seconds. Keep the mutex longer
 // than that retry window so confirm, resend, and cancel cannot interleave midway.
 const WITHDRAW_LIFECYCLE_LOCK_TTL_SECONDS = 90;
+
+/**
+ * Kode stabil alasan penguncian otomatis wallet (deferred audit #2).
+ * Disimpan di `Wallet.lockReasonCode`; klien/admin memetakannya ke i18n.
+ * `lockReason` (teks) tetap menyimpan detail operasional untuk rekonsiliasi.
+ */
+export const WALLET_AUTO_LOCK_REASONS = {
+  REVERSAL_VERSION_CONFLICT: 'REVERSAL_VERSION_CONFLICT',
+  REVERSAL_INSUFFICIENT_BALANCE: 'REVERSAL_INSUFFICIENT_BALANCE',
+} as const;
 
 @Injectable()
 export class WalletService implements OnModuleInit {
@@ -149,6 +162,7 @@ export class WalletService implements OnModuleInit {
     private auditLog: AuditLogService,
     private midtransService: MidtransService,
     private otpService: OtpService,
+    private otpGateway: OtpGatewayService,
     private realtime: RealtimeService,
     @InjectQueue(EMAIL_QUEUE) private readonly emailQueue: Queue<EmailJobData>,
   ) {
@@ -258,7 +272,10 @@ export class WalletService implements OnModuleInit {
       kycFreeLimit: WALLET_KYC_FREE_LIMIT,
       hasPin: wallet.walletPinHash !== null && wallet.walletPinHash !== '',
       isLocked: wallet.isLocked,
-      lockReason: wallet.isLocked ? 'Your wallet has been locked. Please contact support.' : null,
+      // Kode stabil dari DB bila ada (i18n di klien); fallback generik.
+      lockReasonCode: wallet.isLocked
+        ? (wallet.lockReasonCode ?? 'WALLET_LOCKED_CONTACT_SUPPORT')
+        : null,
     };
   }
 
@@ -1096,19 +1113,26 @@ export class WalletService implements OnModuleInit {
     const hasPin = wallet.walletPinHash !== null && wallet.walletPinHash !== '';
     const hashToCompare = hasPin ? wallet.walletPinHash! : this.getDummyPinHash();
     const pinDigest = hmacPinDigest(this.walletPinPepper, pin);
-    let pinValid = await bcryptCompare(pinDigest, hashToCompare);
+    // Hardening PIN oracle (deferred audit): KEDUA perbandingan bcrypt (digest
+    // baru + format legacy) SELALU dijalankan paralel, berapa pun hasilnya.
+    // Sebelumnya PIN valid hanya menempuh 1 ronde bcrypt sementara PIN salah
+    // menempuh 2 — perbedaan waktu respons yang bisa diukur membocorkan
+    // validitas PIN ke pengamat waktu. Sekarang semua jalur (valid, salah,
+    // belum-set PIN) menempuh jumlah ronde yang sama sehingga waktu
+    // responsnya seragam; status HTTP tetap satu-satunya sinyal hasil.
+    const [pinValid, legacyValid] = await Promise.all([
+      bcryptCompare(pinDigest, hashToCompare),
+      bcryptCompare(this.walletPinPepper + pin, hashToCompare),
+    ]);
 
-    if (!pinValid && hasPin) {
-      const legacyValid = await bcryptCompare(this.walletPinPepper + pin, hashToCompare);
-      if (legacyValid) {
-        pinValid = true;
-        const newDigest = hmacPinDigest(this.walletPinPepper, pin);
-        const rehashed = await bcryptHash(newDigest, getBcryptRounds());
-        await this.prisma.wallet.update({
-          where: { userId },
-          data: { walletPinHash: rehashed },
-        });
-      }
+    let valid = pinValid;
+    if (!valid && hasPin && legacyValid) {
+      valid = true;
+      const rehashed = await bcryptHash(pinDigest, getBcryptRounds());
+      await this.prisma.wallet.update({
+        where: { userId },
+        data: { walletPinHash: rehashed },
+      });
     }
 
     if (!hasPin) {
@@ -1138,7 +1162,7 @@ export class WalletService implements OnModuleInit {
       });
     }
 
-    if (!pinValid) {
+    if (!valid) {
       await this.incrementPinIpAttempts(ip);
       throw new UnauthorizedException({
         code: ErrorCodes.UNAUTHORIZED,
@@ -1147,6 +1171,28 @@ export class WalletService implements OnModuleInit {
     }
 
     await this.redis.del(pinAttemptKey, { throwOnError: true });
+  }
+
+  /**
+   * Menentukan kanal OTP untuk konfirmasi withdraw.
+   * Prioritas: email (jika ada) → WhatsApp (jika ada nomor HP).
+   * Konsisten dengan kebijakan OTP WA-only untuk user registrasi HP.
+   */
+  private async getWithdrawOtpChannel(user: {
+    email: string | null;
+    phoneNumber: string | null;
+  }): Promise<{ channel: 'email' | 'whatsapp'; identity: string }> {
+    if (user.email) {
+      return { channel: 'email', identity: user.email };
+    }
+    const phone = await decryptPiiSafe(user.phoneNumber);
+    if (phone) {
+      return { channel: 'whatsapp', identity: phone };
+    }
+    throw new BadRequestException({
+      code: 'OTP_CHANNEL_UNAVAILABLE',
+      message: 'Add an email address or phone number before requesting a withdrawal confirmation code.',
+    });
   }
 
   async withdraw(
@@ -1159,15 +1205,9 @@ export class WalletService implements OnModuleInit {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user)
       throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'User not found' });
-    // Withdrawal confirmation is delivered by email. Never create a pending
-    // reservation or use an empty-string OTP identity for a phone-only account:
-    // that would leave funds held without a deliverable confirmation factor.
-    if (!user.email) {
-      throw new BadRequestException({
-        code: 'EMAIL_NOT_CONFIGURED',
-        message: 'Add an email address before requesting a withdrawal confirmation code.',
-      });
-    }
+    // Kanal OTP withdraw: email jika ada, WhatsApp jika user HP-only.
+    // (K1: user registrasi HP-only sebelumnya mustahil withdraw.)
+    const otpChannel = await this.getWithdrawOtpChannel(user);
     if (
       !Number.isFinite(amount) ||
       !Number.isInteger(amount) ||
@@ -1429,30 +1469,53 @@ export class WalletService implements OnModuleInit {
 
     let otp: string;
     try {
-      await this.otpService.invalidateOtps(user.email ?? '', OtpType.WITHDRAW_CONFIRMATION);
-      otp = await this.otpService.generateOtp(
-        user.email ?? '',
-        OtpType.WITHDRAW_CONFIRMATION,
-        userId,
-        { walletTxId, amountSen: amountInSen.toString(), bankAccountId, timestamp: Date.now() },
-        ip,
-        this.withdrawOtpDigits,
-      );
-      await this.emailQueue.add(
-        'send',
-        {
-          to: user.email ?? '',
-          subject: 'Kahade - Withdrawal Confirmation Code',
-          templateName: 'withdrawal-otp',
-          templateContext: { otp },
-        },
-        {
-          attempts: 3,
-          backoff: { type: 'exponential', delay: 5000 },
-          removeOnComplete: true,
-          removeOnFail: 50,
-        },
-      );
+      const otpMetadata = {
+        walletTxId,
+        amountSen: amountInSen.toString(),
+        bankAccountId,
+        timestamp: Date.now(),
+        otpChannel: otpChannel.channel,
+      };
+      if (otpChannel.channel === 'whatsapp') {
+        await this.otpService.invalidatePhoneOtps(otpChannel.identity, OtpType.WITHDRAW_CONFIRMATION);
+        otp = await this.otpService.generatePhoneOtp(
+          otpChannel.identity,
+          OtpType.WITHDRAW_CONFIRMATION,
+          OtpMethod.WHATSAPP,
+          userId,
+          otpMetadata,
+          ip,
+        );
+        const delivery = await this.otpGateway.sendOtp(otpChannel.identity, otp, 'WHATSAPP');
+        if (!delivery.success) {
+          throw new Error(`WhatsApp OTP delivery failed: ${delivery.error ?? 'unknown'}`);
+        }
+      } else {
+        await this.otpService.invalidateOtps(otpChannel.identity, OtpType.WITHDRAW_CONFIRMATION);
+        otp = await this.otpService.generateOtp(
+          otpChannel.identity,
+          OtpType.WITHDRAW_CONFIRMATION,
+          userId,
+          otpMetadata,
+          ip,
+          this.withdrawOtpDigits,
+        );
+        await this.emailQueue.add(
+          'send',
+          {
+            to: otpChannel.identity,
+            subject: 'Kahade - Withdrawal Confirmation Code',
+            templateName: 'withdrawal-otp',
+            templateContext: { otp },
+          },
+          {
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 5000 },
+            removeOnComplete: true,
+            removeOnFail: 50,
+          },
+        );
+      }
     } catch (otpError) {
       this.logger.error(
         `WITHDRAW_OTP_SETUP_FAILED txId=${walletTxId}; compensating reservation`,
@@ -1491,6 +1554,7 @@ export class WalletService implements OnModuleInit {
       withdrawTxId: walletTxId,
       amount,
       bankAccount: { masked: `****${plainAccountNumber.slice(-4)}` },
+      otpChannel: otpChannel.channel,
       otpExpiredAt: new Date(
         Date.now() +
           (this.configService.get<number>('app.otpExpiresMinutes') ?? OTP_EXPIRES_MINUTES) *
@@ -3105,6 +3169,7 @@ export class WalletService implements OnModuleInit {
                     data: {
                       isLocked: true,
                       lockReason: `Auto-locked: post-settlement reversal version conflict — could not debit ${reversalAmount} (order: ${midtransOrderId})`,
+                      lockReasonCode: WALLET_AUTO_LOCK_REASONS.REVERSAL_VERSION_CONFLICT,
                       lockedAt: new Date(),
                       lockedBy: 'SYSTEM',
                     },
@@ -3179,6 +3244,7 @@ export class WalletService implements OnModuleInit {
                   data: {
                     isLocked: true,
                     lockReason: `Auto-locked: post-settlement reversal insufficient balance — could not debit ${reversalAmount} (order: ${midtransOrderId}). Manual reconciliation required.`,
+                    lockReasonCode: WALLET_AUTO_LOCK_REASONS.REVERSAL_INSUFFICIENT_BALANCE,
                     lockedAt: new Date(),
                     lockedBy: 'SYSTEM',
                   },
@@ -3263,12 +3329,7 @@ export class WalletService implements OnModuleInit {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user)
       throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'User not found' });
-    if (!user.email) {
-      throw new BadRequestException({
-        code: 'EMAIL_NOT_CONFIGURED',
-        message: 'Add an email address before confirming a withdrawal.',
-      });
-    }
+    const otpChannel = await this.getWithdrawOtpChannel(user);
 
     const wallet = await this.prisma.wallet.findUnique({ where: { userId } });
     if (!wallet)
@@ -3329,12 +3390,20 @@ export class WalletService implements OnModuleInit {
         });
       }
 
-      const otpResult = await this.otpService.verifyOtpWithMetadata(
-        user.email ?? '',
-        OtpType.WITHDRAW_CONFIRMATION,
-        otpCode,
-        { consume: false },
-      );
+      const otpResult =
+        otpChannel.channel === 'whatsapp'
+          ? await this.otpService.verifyPhoneOtpWithMetadata(
+              otpChannel.identity,
+              OtpType.WITHDRAW_CONFIRMATION,
+              otpCode,
+              { consume: false },
+            )
+          : await this.otpService.verifyOtpWithMetadata(
+              otpChannel.identity,
+              OtpType.WITHDRAW_CONFIRMATION,
+              otpCode,
+              { consume: false },
+            );
       if (!otpResult.valid) {
         throw new UnauthorizedException({
           code: ErrorCodes.OTP_INVALID,
@@ -3487,12 +3556,7 @@ export class WalletService implements OnModuleInit {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user)
       throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'User not found' });
-    if (!user.email) {
-      throw new BadRequestException({
-        code: 'EMAIL_NOT_CONFIGURED',
-        message: 'Add an email address before requesting a new withdrawal confirmation code.',
-      });
-    }
+    const otpChannel = await this.getWithdrawOtpChannel(user);
 
     const wallet = await this.prisma.wallet.findUnique({ where: { userId } });
     if (!wallet)
@@ -3547,36 +3611,54 @@ export class WalletService implements OnModuleInit {
       }
 
       try {
-        await this.otpService.invalidateOtps(user.email ?? '', OtpType.WITHDRAW_CONFIRMATION);
-        const otp = await this.otpService.generateOtp(
-          user.email ?? '',
-          OtpType.WITHDRAW_CONFIRMATION,
-          userId,
-          {
-            walletTxId: txId,
-            amountSen: walletTx.amount.toString(),
-            bankAccountId: walletTx.bankAccountId,
-            timestamp: Date.now(),
-          },
-          ipAddress,
-          this.withdrawOtpDigits,
-        );
+        const otpMetadata = {
+          walletTxId: txId,
+          amountSen: walletTx.amount.toString(),
+          bankAccountId: walletTx.bankAccountId,
+          timestamp: Date.now(),
+          otpChannel: otpChannel.channel,
+        };
+        if (otpChannel.channel === 'whatsapp') {
+          await this.otpService.invalidatePhoneOtps(otpChannel.identity, OtpType.WITHDRAW_CONFIRMATION);
+          const otp = await this.otpService.generatePhoneOtp(
+            otpChannel.identity,
+            OtpType.WITHDRAW_CONFIRMATION,
+            OtpMethod.WHATSAPP,
+            userId,
+            otpMetadata,
+            ipAddress,
+          );
+          const delivery = await this.otpGateway.sendOtp(otpChannel.identity, otp, 'WHATSAPP');
+          if (!delivery.success) {
+            throw new Error(`WhatsApp OTP delivery failed: ${delivery.error ?? 'unknown'}`);
+          }
+        } else {
+          await this.otpService.invalidateOtps(otpChannel.identity, OtpType.WITHDRAW_CONFIRMATION);
+          const otp = await this.otpService.generateOtp(
+            otpChannel.identity,
+            OtpType.WITHDRAW_CONFIRMATION,
+            userId,
+            otpMetadata,
+            ipAddress,
+            this.withdrawOtpDigits,
+          );
 
-        await this.emailQueue.add(
-          'send',
-          {
-            to: user.email ?? '',
-            subject: 'Kahade - Withdrawal Confirmation Code',
-            templateName: 'withdrawal-otp',
-            templateContext: { otp },
-          },
-          {
-            attempts: 3,
-            backoff: { type: 'exponential', delay: 5000 },
-            removeOnComplete: true,
-            removeOnFail: 50,
-          },
-        );
+          await this.emailQueue.add(
+            'send',
+            {
+              to: otpChannel.identity,
+              subject: 'Kahade - Withdrawal Confirmation Code',
+              templateName: 'withdrawal-otp',
+              templateContext: { otp },
+            },
+            {
+              attempts: 3,
+              backoff: { type: 'exponential', delay: 5000 },
+              removeOnComplete: true,
+              removeOnFail: 50,
+            },
+          );
+        }
 
         const refreshed = await this.prisma.walletTransaction.updateMany({
           where: {
@@ -3596,6 +3678,7 @@ export class WalletService implements OnModuleInit {
 
         return {
           message: 'OTP resent successfully',
+          otpChannel: otpChannel.channel,
           otpExpiredAt: new Date(
             Date.now() +
               (this.configService.get<number>('app.otpExpiresMinutes') ?? OTP_EXPIRES_MINUTES) *

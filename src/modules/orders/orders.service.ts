@@ -708,6 +708,8 @@ export class OrdersService {
       seller: { userId: string; username: string | null; fullName: string | null; avatarUrl: string | null };
       role: 'BUYER' | 'SELLER';
       createdAt: Date;
+      deliveryDeadlineAt: Date | null;
+      autoCompleteAt: Date | null;
     }[];
     total: number;
     page: number;
@@ -804,6 +806,8 @@ export class OrdersService {
         buyer: order.buyer, seller: order.seller,
         role: order.buyerId === userId ? 'BUYER' : 'SELLER',
         createdAt: order.createdAt,
+        deliveryDeadlineAt: order.deliveryDeadlineAt,
+        autoCompleteAt: order.status === OrderStatus.IN_DELIVERY && order.deliveryDeadlineAt ? order.deliveryDeadlineAt : null,
       })),
       total, page: safePage, limit: safeLimit,
     };
@@ -856,6 +860,10 @@ export class OrdersService {
         voucherDiscount: toIdr(order.voucherDiscount), isKahadePlus: order.isKahadePlus,
         feeRate: order.feeRate, deliveryDeadlineDays: order.deliveryDeadlineDays,
         deliveryDeadlineAt: order.deliveryDeadlineAt,
+        // T3 (audit 2026-09-26): kapan order IN_DELIVERY akan auto-complete oleh cron —
+        // sama dengan deliveryDeadlineAt selama status IN_DELIVERY, null selain itu.
+        // Field baca saja; tidak mengubah cron/state machine.
+        autoCompleteAt: order.status === OrderStatus.IN_DELIVERY && order.deliveryDeadlineAt ? order.deliveryDeadlineAt : null,
         paymentDeadlineAt: order.paymentDeadlineAt,
         confirmationDeadlineAt: order.confirmationDeadlineAt ?? null,
         processingDeadlineAt: order.processingDeadlineAt ?? null,

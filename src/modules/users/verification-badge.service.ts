@@ -5,6 +5,24 @@ import { RedisService } from '../../redis/redis.service';
 import { PROFILE_VERIFICATION_BADGES } from '../../common/constants/redis-keys';
 import * as ErrorCodes from '../../common/constants/error-codes';
 
+/** Tier seal untuk <VerifiedSeal> — disematkan di payload agar frontend
+ *  tidak perlu N+1 request badge per user. */
+export type SealTier = 'gold' | 'blue' | 'gray';
+
+/**
+ * Tentukan tier seal dari daftar tipe badge.
+ * Prioritas: emas (TRUSTED_BY_KAHADE) > biru (BUSINESS_VERIFIED) >
+ * abu (FULLY_VERIFIED). Sama dengan frontend getSealTier — jangan ubah
+ * satu sisi tanpa sisi lain.
+ */
+export function getSealTierFromTypes(types: Iterable<string>): SealTier | null {
+  const set = new Set(types);
+  if (set.has('TRUSTED_BY_KAHADE')) return 'gold';
+  if (set.has('BUSINESS_VERIFIED')) return 'blue';
+  if (set.has('FULLY_VERIFIED')) return 'gray';
+  return null;
+}
+
 /**
  * Section 1 — Verified Badge System.
  *
@@ -244,6 +262,26 @@ export class VerificationBadgeService {
     // Urutan prioritas tampil sudah eksplisit; sort stabil agar UI bisa langsung
     // render tanpa mengurutkan sendiri.
     return badges.sort((a, b) => a.priority - b.priority);
+  }
+
+  /**
+   * Batch seal tier untuk banyak user sekaligus (dipakai feed, search, chat).
+   * Memakai getBadges yang read-through Redis cache, jadi tidak N+1 ke DB
+   * bila cache hangat. Return Map userId -> tier (null bila tidak ada seal).
+   */
+  async getSealTierMap(userIds: string[]): Promise<Map<string, SealTier | null>> {
+    const unique = [...new Set(userIds.filter(Boolean))];
+    const entries = await Promise.all(
+      unique.map(async (userId): Promise<[string, SealTier | null]> => {
+        try {
+          const badges = await this.getBadges(userId);
+          return [userId, getSealTierFromTypes(badges.map((b) => b.type))];
+        } catch {
+          return [userId, null];
+        }
+      }),
+    );
+    return new Map(entries);
   }
 
   /**

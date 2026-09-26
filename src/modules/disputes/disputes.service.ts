@@ -5,12 +5,12 @@ import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.se
 import { UploadService } from '../upload/upload.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
-import { UserAuditAction, OrderStatus, DisputeStatus, DisputeInitiator, ActorType, NotificationType, WalletTransactionType, WalletTransactionStatus, DisputeEvidence, Prisma } from '@prisma/client';
+import { UserAuditAction, OrderStatus, DisputeStatus, DisputeInitiator, ActorType, NotificationType, WalletTransactionType, WalletTransactionStatus, DisputeEvidence, DisputeCategory, Prisma } from '@prisma/client';
 import { generateDisputeId, generateNotifId, generateWalletTxId } from '../../common/utils/id-generator.util';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import { toIdr } from '../../common/utils/currency.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { DISPUTE_SLA_HOURS, POST_COMPLETION_DISPUTE_WINDOW_HOURS } from '../../common/constants/app.constants';
+import { DISPUTE_SLA_HOURS, DISPUTE_ESCALATION_SLA_HOURS, POST_COMPLETION_DISPUTE_WINDOW_HOURS } from '../../common/constants/app.constants';
 import { SubmitEvidenceDto } from './dto/submit-evidence.dto';
 import { SubmitClaimDto } from './dto/submit-claim.dto';
 
@@ -688,7 +688,7 @@ export class DisputesService {
     return claimResult;
   }
 
-  async submitDispute(orderId: string, userId: string, dto: { claim: string; fileUrls?: string[]; fileTypes?: string[] }): Promise<{ disputeId: string; status: string }> {
+  async submitDispute(orderId: string, userId: string, dto: { claim: string; category: DisputeCategory; fileUrls?: string[]; fileTypes?: string[] }): Promise<{ disputeId: string; status: string }> {
     const normalizedClaim = dto.claim.trim();
     if (normalizedClaim.length < 20) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Claim must contain at least 20 non-whitespace characters' });
@@ -757,7 +757,7 @@ export class DisputesService {
     let lastError: unknown = null;
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        dispute = await this.runSubmitDisputeTx(order, userId, { claim: normalizedClaim, fileUrls: validatedFileUrls, fileTypes: validatedFileTypes }, disputeId, nextFreezeSerial);
+        dispute = await this.runSubmitDisputeTx(order, userId, { claim: normalizedClaim, category: dto.category, fileUrls: validatedFileUrls, fileTypes: validatedFileTypes }, disputeId, nextFreezeSerial);
         lastError = null;
         break;
       } catch (err: unknown) {
@@ -821,7 +821,7 @@ export class DisputesService {
   private async runSubmitDisputeTx(
     order: { id: string; orderId: string; buyerId: string; sellerId: string; status: OrderStatus },
     userId: string,
-    dto: { claim: string; fileUrls?: string[]; fileTypes?: string[] },
+    dto: { claim: string; category: DisputeCategory; fileUrls?: string[]; fileTypes?: string[] },
     disputeId: string,
     nextFreezeSerial: () => Promise<number>,
   ) {
@@ -859,6 +859,7 @@ export class DisputesService {
           orderId: order.id,
           initiatorUserId: userId,
           initiatedBy,
+          category: dto.category,
           buyerClaim: isBuyerInitiator ? dto.claim.trim() : undefined,
           sellerClaim: !isBuyerInitiator ? dto.claim.trim() : undefined,
           buyerClaimedAt: isBuyerInitiator ? now : undefined,
@@ -1006,12 +1007,20 @@ export class DisputesService {
     // could resurrect a dispute that an admin resolved between the read above and this
     // write (funds already released, dispute wrongly back to ESCALATED). updateMany
     // with the status predicate makes the concurrent-resolve case a clean 409 instead.
+    const escalationNow = new Date();
     const escalated = await this.prisma.dispute.updateMany({
       where: {
         id: dispute.id,
         status: { in: [DisputeStatus.OPEN, DisputeStatus.ASSIGNED, DisputeStatus.UNDER_REVIEW, DisputeStatus.WAITING_RESPONSE] },
       },
-      data: { status: DisputeStatus.ESCALATED, isSlaBreached: true },
+      data: {
+        status: DisputeStatus.ESCALATED,
+        isSlaBreached: true,
+        escalatedAt: escalationNow,
+        escalationSlaDeadlineAt: new Date(
+          escalationNow.getTime() + DISPUTE_ESCALATION_SLA_HOURS * 60 * 60 * 1000,
+        ),
+      },
     });
     if (escalated.count === 0) {
       throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'Dispute can no longer be escalated' });

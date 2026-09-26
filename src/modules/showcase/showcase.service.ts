@@ -24,7 +24,7 @@ import { CreateShowcaseCommentDto, UpdateShowcaseCommentDto } from './dto/showca
 import { ShowcaseFeedQueryDto, ShowcaseFeedSort } from './dto/showcase-feed-query.dto';
 import { ReportShowcaseDto } from './dto/report-showcase.dto';
 import { AuditLogService } from '../../common/services/audit-log.service';
-import { VerificationBadgeService } from '../users/verification-badge.service';
+import { VerificationBadgeService, getSealTierFromTypes } from '../users/verification-badge.service';
 
 /**
  * Section 3 — Showcase sebagai konten sosial + feed discover.
@@ -379,6 +379,9 @@ export class ShowcaseService {
         // di feed/detail. Sumber sama dengan profil (getBadges), bukan flag
         // terpisah — satukan definisi tier.
         badges: options.authorBadges ?? [],
+        // R1 (audit 2026-09-26): sealTier disematkan di payload agar frontend
+        // bisa render <VerifiedSeal> tanpa N+1 request badge per author.
+        sealTier: getSealTierFromTypes((options.authorBadges ?? []).map((b) => b.type)),
       },
       orderLink: {
         title: row.title.slice(0, 100),
@@ -793,7 +796,66 @@ export class ShowcaseService {
       // (updateMany) dan angka DB selalu benar; yang berpotensi tertinggal
       // hanya angka di respons ini.
       viewCount: counted ? visible.row.viewCount + 1 : visible.row.viewCount,
+      // Karya terkait: kategori sama dulu, lalu populer sebagai pengisi.
+      related: await this.getRelatedShowcase(visible.row, viewerId),
     };
+  }
+
+  /**
+   * Karya terkait untuk detail: item lain berkategori sama (maks 6),
+   * dilengkapi item populer bila kategori sama kurang dari 6.
+   * Hanya item PUBLIC + aktif + tidak dihapus + pemilik terlihat.
+   */
+  private async getRelatedShowcase(
+    row: ShowcaseRow,
+    viewerId?: string,
+  ): Promise<Array<Record<string, unknown>>> {
+    const RELATED_LIMIT = 6;
+    const excludedIds = await this.getViewerExcludedIds(viewerId);
+    const baseWhere: Prisma.UserShowcaseWhereInput = {
+      id: { not: row.id },
+      visibility: ShowcaseVisibility.PUBLIC,
+      isActive: true,
+      deletedAt: null,
+      user: this.visibleOwnerFilter(excludedIds),
+    };
+
+    const category = row.category?.trim().toLowerCase();
+    let related: ShowcaseRow[] = [];
+    if (category) {
+      related = await this.prisma.userShowcase.findMany({
+        where: { ...baseWhere, category },
+        include: SHOWCASE_INCLUDE,
+        orderBy: [{ likeCount: 'desc' }, { createdAt: 'desc' }],
+        take: RELATED_LIMIT,
+      });
+    }
+
+    // Pengisi: item populer lintas kategori bila kurang dari limit.
+    if (related.length < RELATED_LIMIT) {
+      const exclude = [row.id, ...related.map((r) => r.id)];
+      const filler = await this.prisma.userShowcase.findMany({
+        where: { ...baseWhere, id: { notIn: exclude } },
+        include: SHOWCASE_INCLUDE,
+        orderBy: [{ likeCount: 'desc' }, { createdAt: 'desc' }],
+        take: RELATED_LIMIT - related.length,
+      });
+      related = [...related, ...filler];
+    }
+
+    const likedIds = await this.getLikedShowcaseIds(
+      viewerId,
+      related.map((r) => r.id),
+    );
+    const badgeMap = await this.getAuthorBadgeMap(
+      related.map((r) => r.user.userId),
+    );
+    return related.map((r) =>
+      this.serializeShowcase(r, {
+        isLiked: likedIds.has(r.id),
+        authorBadges: badgeMap.get(r.user.userId) ?? [],
+      }),
+    );
   }
 
   private async recordView(showcaseId: string, viewerId?: string, clientIp?: string): Promise<boolean> {
@@ -901,6 +963,16 @@ export class ShowcaseService {
               ],
             };
       andClauses.push({ AND: [loOk, hiOk] });
+    }
+
+    // Filter lokasi: cocokkan free-text users.address milik owner
+    // (case-insensitive). escapeLikePattern: `%`, `_`, `\` dari user
+    // diperlakukan literal — bukan wildcard LIKE.
+    const location = query.location?.trim();
+    if (location) {
+      andClauses.push({
+        user: { address: { contains: escapeLikePattern(location), mode: 'insensitive' } },
+      });
     }
 
     // Keyset: "baris-baris setelah cursor" menurut urutan sort. Menggunakan

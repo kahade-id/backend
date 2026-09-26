@@ -231,6 +231,9 @@ export class AdminOrdersService {
       ? await this.walletTxSerialService.getNext()
       : null;
 
+    // SP-047: tandai bila referral reward dikreditkan agar cache leaderboard
+    // diinvalidasi setelah tx commit.
+    let referralRewardCredited = false;
     const forceCompleteCashback = await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const orderUpdated = await tx.order.updateMany({
         where: { id: order.id, status: { in: completableStatuses }, deletedAt: null },
@@ -308,8 +311,11 @@ export class AdminOrdersService {
             type: WalletTransactionType.ORDER_RELEASE,
             status: WalletTransactionStatus.SUCCESS,
             amount: order.buyerPayAmount,
-            balanceBefore: freshBuyerWallet.totalBalance,
-            balanceAfter: freshBuyerWallet.totalBalance - order.buyerPayAmount,
+            // EO-008: basis komponen saldo yang benar-benar bergerak — escrowBalance
+            // untuk sisi buyer (selaras completeOrder user & auto-complete).
+            // Delta (= ΔtotalBalance) tidak berubah → rekonsiliasi aman.
+            balanceBefore: freshBuyerWallet.escrowBalance,
+            balanceAfter: freshBuyerWallet.escrowBalance - order.buyerPayAmount,
             orderId: order.id,
             description: `Admin force-complete: escrow released for order ${order.orderId}`,
           },
@@ -339,8 +345,9 @@ export class AdminOrdersService {
             type: WalletTransactionType.ORDER_RELEASE,
             status: WalletTransactionStatus.SUCCESS,
             amount: order.sellerReceiveAmount,
-            balanceBefore: freshSellerWallet.totalBalance,
-            balanceAfter: freshSellerWallet.totalBalance + order.sellerReceiveAmount,
+            // EO-008: basis availableBalance untuk sisi seller (selaras completeOrder).
+            balanceBefore: freshSellerWallet.availableBalance,
+            balanceAfter: freshSellerWallet.availableBalance + order.sellerReceiveAmount,
             orderId: order.id,
             description: `Admin force-complete: payment received for order ${order.orderId}`,
           },
@@ -416,12 +423,18 @@ export class AdminOrdersService {
         }
       }
 
-      await this.referralService.createReferralRewardIfEligible(order.buyerId, order.feeAmount, order.id, tx);
-      await this.referralService.createReferralRewardIfEligible(order.sellerId, order.feeAmount, order.id, tx);
+      const buyerRewardCredited = await this.referralService.createReferralRewardIfEligible(order.buyerId, order.feeAmount, order.id, tx);
+      const sellerRewardCredited = await this.referralService.createReferralRewardIfEligible(order.sellerId, order.feeAmount, order.id, tx);
+      // SP-047: leaderboard cache diinvalidasi di bawah setelah tx commit.
+      referralRewardCredited = referralRewardCredited || buyerRewardCredited || sellerRewardCredited;
 
       await this.membershipRankService.checkAndUpdateMembershipRank(tx, order.buyerId);
       await this.membershipRankService.checkAndUpdateMembershipRank(tx, order.sellerId);
     }), 'ADMIN_FORCE_COMPLETE_TX');
+
+    if (referralRewardCredited) {
+      await this.referralService.invalidateLeaderboardCache();
+    }
 
     // R2-B (audit): forceComplete consumes the buyer's Plus fee-savings quota; the
     // `subscription_status:<userId>` cache (300 s, read by orders.service when quoting

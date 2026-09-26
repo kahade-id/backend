@@ -116,6 +116,19 @@ export class ReferralService {
     return this.refreshLeaderboard(safeLimit);
   }
 
+  /**
+   * SP-047: leaderboard di-cache 900 dtk — invalidasi saat reward dikreditkan
+   * agar peringkat langsung mencerminkan totalRewardEarned terbaru.
+   * Best-effort: kegagalan Redis tidak menggagalkan alur order.
+   */
+  async invalidateLeaderboardCache(): Promise<void> {
+    try {
+      await this.redis.delPattern('referral:leaderboard:*');
+    } catch (err: unknown) {
+      this.logger.warn(`Failed to invalidate referral leaderboard cache: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   async getOrCreateCode(userId: string): Promise<ReferralCode> {
     const existing = await this.prisma.referralCode.findUnique({ where: { userId } });
     if (existing) return existing;
@@ -416,19 +429,24 @@ export class ReferralService {
     return createPaginatedResponse(serialized, total, safePage, safeLimit);
   }
 
+  /**
+   * SP-047: mengembalikan true bila reward berhasil dikreditkan — pemanggil
+   * memakai ini untuk invalidasi cache leaderboard SETELAH transaksi commit
+   * (invalidasi di dalam tx berisiko di-repopulate cache basi sebelum commit).
+   */
   async createReferralRewardIfEligible(
     userId: string,
     feeAmount: bigint,
     orderId: string,
     tx: Prisma.TransactionClient,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const relation = await tx.referralRelation.findUnique({
       where: { refereeId: userId },
     });
 
-    if (!relation) return;
+    if (!relation) return false;
 
-    if (relation.isRewardActive) return;
+    if (relation.isRewardActive) return false;
 
     const order = await tx.order.findUnique({
       where: { id: orderId },
@@ -438,7 +456,7 @@ export class ReferralService {
       this.logger.warn(
         `Referral reward skipped for order ${orderId}: order status is ${order?.status ?? 'NOT_FOUND'}, expected COMPLETED`,
       );
-      return;
+      return false;
     }
 
     const [referrer, referee] = await Promise.all([
@@ -450,14 +468,14 @@ export class ReferralService {
       this.logger.log(
         `Referral reward skipped for order ${orderId}: referrer ${relation.referrerId} not KYC verified`,
       );
-      return;
+      return false;
     }
 
     if (!referee || referee.kycStatus !== KycStatus.APPROVED) {
       this.logger.log(
         `Referral reward skipped for order ${orderId}: referee ${relation.refereeId} not KYC verified`,
       );
-      return;
+      return false;
     }
 
     const referrerCompletedOrders = await tx.order.count({
@@ -472,7 +490,7 @@ export class ReferralService {
       this.logger.log(
         `Referral reward skipped for order ${orderId}: referrer ${relation.referrerId} has no completed transactions`,
       );
-      return;
+      return false;
     }
 
     const refereeCompletedOrders = await tx.order.count({
@@ -487,7 +505,7 @@ export class ReferralService {
       this.logger.log(
         `Referral reward skipped for order ${orderId}: referee ${relation.refereeId} has ${refereeCompletedOrders} completed transactions (expected exactly 1 — first transaction)`,
       );
-      return;
+      return false;
     }
 
     const walletCount = await tx.wallet.count({
@@ -497,7 +515,7 @@ export class ReferralService {
       this.logger.warn(
         `Referral reward skipped for order ${orderId}: both referral wallets are required before crediting either side`,
       );
-      return;
+      return false;
     }
 
     const rewardAmount = this.getRewardAmountForRank(referrer.membershipRank);
@@ -525,7 +543,7 @@ export class ReferralService {
       this.logger.warn(
         `Referral reward partially failed for order ${orderId}: referrer=${referrerCredited}, referee=${refereeCredited} — relation NOT activated`,
       );
-      return;
+      return false;
     }
 
     await tx.referralRelation.update({
@@ -541,6 +559,7 @@ export class ReferralService {
     this.logger.log(
       `Referral rewards Rp${toIdr(rewardAmount).toLocaleString('id-ID')} each credited to referrer ${relation.referrerId} and referee ${relation.refereeId} for order ${orderId}`,
     );
+    return true;
   }
 
   private async creditReward(

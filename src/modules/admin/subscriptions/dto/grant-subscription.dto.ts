@@ -1,4 +1,4 @@
-import { IsInt, IsOptional, IsString, MaxLength, Min, Matches } from 'class-validator';
+import { IsInt, IsOptional, IsString, Max, MaxLength, Min, Matches } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 /**
@@ -18,6 +18,8 @@ export class GrantSubscriptionDto {
   @ApiProperty({ description: 'Durasi subscription dalam hari' })
   @IsInt()
   @Min(1)
+  // SP-033: batasi durasi grant manual (fat-finger 100000 hari).
+  @Max(730, { message: 'durationDays maksimal 730 hari (2 tahun)' })
   durationDays!: number;
 
   @ApiPropertyOptional({ description: 'Alasan pemberian manual (audit)' })

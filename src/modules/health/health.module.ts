@@ -64,14 +64,18 @@ class CronHealthIndicator extends HealthIndicator {
   // previously wrote Redis heartbeats. New cron jobs must be added here and to
   // the scheduler smoke test before being considered operationally covered.
   private static readonly CRITICAL_CRONS = [
-    'auto-complete-orders', 'auto-escalate-disputes', 'data-cleanup',
-    'deadline-reminders', 'dlq-monitor', 'expire-dispute-calls',
-    'expire-unconfirmed-orders', 'expire-unpaid-orders', 'fraud-challenge-escalation',
+    'auto-complete-orders', 'auto-escalate-disputes', 'campaign-activation',
+    'data-cleanup', 'deadline-reminders', 'dispute-escalation-sla',
+    'dlq-monitor', 'dormant-winback-vouchers', 'expire-dispute-calls',
+    'expire-extension-requests', 'expire-unconfirmed-orders',
+    'expire-unpaid-orders', 'fraud-challenge-escalation',
     'notification-archival', 'orphaned-upload-cleanup', 'pending-topup-cleanup',
     'pending-withdraw-cleanup', 'process-scheduled-withdrawals', 'proof-expiry',
-    'redis-hash-cleanup', 'subscription-expiry', 'topup-counter-correction',
-    'wallet-daily-reset', 'webhook-inbox-retry', 'daily-reconciliation',
-    'withdrawal-reconciliation',
+    'redis-hash-cleanup', 'referral-leaderboard-refresh', 'refund-reconciliation',
+    'refund-request-retry', 'showcase-hard-delete', 'subscription-auto-resume',
+    'subscription-expiry', 'topup-counter-correction',
+    'unanswered-question-reminders', 'wallet-daily-reset', 'webhook-inbox-retry',
+    'daily-reconciliation', 'withdrawal-reconciliation',
   ];
 
   constructor(private redis: RedisService) {
@@ -289,9 +293,68 @@ class SmtpHealthIndicator extends HealthIndicator {
   }
 }
 
+/**
+ * CW-018: agregat alert operasional (ringkas, tanpa PII) yang sebelumnya hanya
+ * hidup di log/Redis tanpa permukaan termonitor:
+ * - cron_alert:dlq_depth / cron_alert:dlq_monitor_failed (dlq-monitor cron)
+ * - cron_alert:webhook_inbox_dead_letter / cron_alert:webhook_inbox_retry_failed (webhook-retry cron)
+ * - cron_alert:fraud_escalation (fraud-challenge-escalation cron, CW-011)
+ * - cron_alert:withdrawal_stuck (withdrawal-reconciliation cron, CW-012)
+ * Sehat = tidak ada kunci alert yang aktif.
+ */
 @Injectable()
-class WebhookInboxHealthIndicator extends HealthIndicator {
-  constructor(private prisma: PrismaService, private redis: RedisService) {
+class OpsAlertsHealthIndicator extends HealthIndicator {
+  constructor(private redis: RedisService) {
+    super();
+  }
+
+  private async readAlert(key: string): Promise<Record<string, unknown> | null> {
+    try {
+      const raw = await this.redis.get(key);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      // Hanya tampilkan ringkasan aman (angka + timestamp), tanpa PII.
+      const safe: Record<string, unknown> = {};
+      for (const field of ['raisedAt', 'alertAt', 'detectedAt', 'failedAt', 'count', 'totalDepth', 'waiting', 'failed']) {
+        if (parsed[field] !== undefined) safe[field] = parsed[field];
+      }
+      return safe;
+    } catch {
+      return null;
+    }
+  }
+
+  async isHealthy(key: string): Promise<HealthIndicatorResult> {
+    try {
+      const [dlqDepth, dlqMonitorFailed, webhookDeadLetter, webhookRetryFailed, fraudEscalation, withdrawalStuck] = await Promise.all([
+        this.readAlert('cron_alert:dlq_depth'),
+        this.readAlert('cron_alert:dlq_monitor_failed'),
+        this.readAlert('cron_alert:webhook_inbox_dead_letter'),
+        this.readAlert('cron_alert:webhook_inbox_retry_failed'),
+        this.readAlert('cron_alert:fraud_escalation'),
+        this.readAlert('cron_alert:withdrawal_stuck'),
+      ]);
+      const active = {
+        dlqDepth: dlqDepth !== null,
+        dlqMonitorFailed: dlqMonitorFailed !== null,
+        webhookDeadLetter: webhookDeadLetter !== null,
+        webhookRetryFailed: webhookRetryFailed !== null,
+        fraudEscalation: fraudEscalation !== null,
+        withdrawalStuck: withdrawalStuck !== null,
+      };
+      const healthy = Object.values(active).every((v) => !v);
+      return this.getStatus(key, healthy, {
+        ...active,
+        detail: { dlqDepth, dlqMonitorFailed, webhookDeadLetter, webhookRetryFailed, fraudEscalation, withdrawalStuck },
+      });
+    } catch {
+      return this.getStatus(key, false, { message: 'ops alerts health check unavailable' });
+    }
+  }
+}
+
+@Injectable()
+class WebhookInboxHealthIndicator extends HealthIndicator {  constructor(private prisma: PrismaService, private redis: RedisService) {
     super();
   }
 
@@ -349,6 +412,7 @@ export class HealthController {
     private r2Indicator: R2HealthIndicator,
     private smtpIndicator: SmtpHealthIndicator,
     private webhookInboxIndicator: WebhookInboxHealthIndicator,
+    private opsAlertsIndicator: OpsAlertsHealthIndicator,
     private prisma: PrismaService,
     private config: ConfigService,
     private redis: RedisService,
@@ -483,6 +547,15 @@ export class HealthController {
       (): Promise<HealthIndicatorResult> => this.cronIndicator.isHealthy('crons'),
     ]);
   }
+
+  @Get('alerts')
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @HealthCheck()
+  checkAlerts(): Promise<HealthCheckResult> {
+    return this.health.check([
+      (): Promise<HealthIndicatorResult> => this.opsAlertsIndicator.isHealthy('alerts'),
+    ]);
+  }
 }
 
 @Module({
@@ -496,6 +569,7 @@ export class HealthController {
     R2HealthIndicator,
     SmtpHealthIndicator,
     WebhookInboxHealthIndicator,
+    OpsAlertsHealthIndicator,
   ],
 })
 export class HealthModule {}

@@ -10,8 +10,8 @@ import { toIdr } from '../../../common/utils/currency.util';
 import { formatWIBDate } from '../../../common/utils/date.util';
 
 @Injectable()
-export class WeeklyReconciliationService {
-  private readonly logger = new Logger(WeeklyReconciliationService.name);
+export class DailyReconciliationService {
+  private readonly logger = new Logger(DailyReconciliationService.name);
 
   constructor(
     private redis: RedisService,
@@ -19,8 +19,11 @@ export class WeeklyReconciliationService {
     private reconciliationService: ReconciliationService,
   ) {}
 
-  // SCH-017/SCH-030: Runs at 03:00 WIB daily for wallet + escrow + fee reconciliation
-  @Cron('0 3 * * *', { name: 'daily-reconciliation', timeZone: 'Asia/Jakarta' })
+  // SCH-017/SCH-030: Runs at 03:30 WIB daily for wallet + escrow + fee reconciliation.
+  // CW-016: digeser dari 03:00 WIB agar tidak bertabrakan dengan data-cleanup
+  // (03:00 WIB) dan showcase-hard-delete (03:45 WIB) — tiga job berat DB
+  // dipisah untuk meratakan beban.
+  @Cron('30 3 * * *', { name: 'daily-reconciliation', timeZone: 'Asia/Jakarta' })
   async runDailyReconciliation(): Promise<void> {
     if (!(await ensureRedisAvailable(this.redis, 'daily-reconciliation'))) return;
 
@@ -298,7 +301,7 @@ export class WeeklyReconciliationService {
               // generic bucket. Semantic info preserved in description (`[SYSTEM ALERT]` prefix).
               action: AuditAction.ADMIN_ACTION,
               targetType: 'Reconciliation',
-              targetId: 'weekly-reconciliation',
+              targetId: 'daily-reconciliation',
               description: `[SYSTEM ALERT] ${title}: ${body}`,
               ipAddress: 'system',
             },

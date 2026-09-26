@@ -206,6 +206,22 @@ export class AdminVouchersService {
 
     const voucherId = `VCH-${code}`;
 
+    // SP-048: voucher personal tanpa user yang valid tidak bisa ditebus —
+    // validasi keberadaan user sebelum create (bukan FK di schema).
+    const assignedToUserId = dto.assignedToUserId?.trim() || null;
+    if (assignedToUserId) {
+      const assignee = await this.prisma.user.findUnique({
+        where: { id: assignedToUserId },
+        select: { id: true },
+      });
+      if (!assignee) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'assignedToUserId does not refer to an existing user',
+        });
+      }
+    }
+
     let voucher;
     try {
       voucher = await this.prisma.voucher.create({
@@ -224,7 +240,7 @@ export class AdminVouchersService {
           validUntil,
           minOrderValue: dto.minOrderValue ? toSen(dto.minOrderValue) : null,
           applicableTo: dto.applicableTo ?? 'ALL',
-          assignedToUserId: dto.assignedToUserId ?? null,
+          assignedToUserId,
           campaignId: dto.campaignId ?? null,
           createdBy: adminId,
         },

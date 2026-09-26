@@ -10,7 +10,7 @@ import { safeErrorMessage } from '../../../common/utils/background-reliability.u
 
 /**
  * Hard delete permanen untuk item showcase yang sudah di-soft-delete
- * lebih dari 30 hari. Berjalan sekali sehari jam 03:00 WIB.
+ * lebih dari 30 hari. Berjalan sekali sehari jam 03:45 WIB.
  *
  * Alur: user hapus etalase → deletedAt di-set (soft delete, bisa
  * dipulihkan 30 hari) → cron ini bersihkan file storage DULU lalu hard delete
@@ -28,8 +28,10 @@ export class ShowcaseHardDeleteService {
     private uploadService: UploadService,
   ) {}
 
-  // Berjalan jam 03:00 WIB (20:00 UTC hari sebelumnya) setiap hari.
-  @Cron('0 20 * * *', { name: 'showcase-hard-delete', timeZone: 'UTC' })
+  // Berjalan jam 03:45 WIB (20:45 UTC hari sebelumnya) setiap hari.
+  // CW-016: digeser dari 03:00 WIB agar tidak bertabrakan dengan data-cleanup
+  // (03:00 WIB) — kedua job berat, dipisah 45 menit untuk meratakan beban DB.
+  @Cron('45 20 * * *', { name: 'showcase-hard-delete', timeZone: 'UTC' })
   async hardDeleteExpiredShowcases(): Promise<void> {
     if (!(await ensureRedisAvailable(this.redis, 'showcase-hard-delete'))) return;
 

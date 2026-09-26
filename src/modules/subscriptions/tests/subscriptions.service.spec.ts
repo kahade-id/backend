@@ -14,6 +14,7 @@ import { SubscriptionPlan, SubscriptionStatus, KycStatus } from '@prisma/client'
 const mockPrisma = {
   subscription: {
     findFirst: jest.fn(),
+    findMany: jest.fn().mockResolvedValue([]),
     findUnique: jest.fn(),
     findUniqueOrThrow: jest.fn(),
     create: jest.fn(),

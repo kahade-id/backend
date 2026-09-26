@@ -7,6 +7,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
 import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
+import { rollbackOrderVoucherUsage } from '../../../common/utils/voucher-rollback.util';
 
 @Injectable()
 export class ExpireUnpaidOrdersService {
@@ -124,15 +125,9 @@ export class ExpireUnpaidOrdersService {
                 });
 
                 if (order.voucherId) {
-                  const deletedVoucherUsage = await tx.voucherUsage.deleteMany({
-                    where: { orderId: order.id, voucherId: order.voucherId },
-                  });
-                  if (deletedVoucherUsage.count > 0) {
-                    await tx.voucher.updateMany({
-                      where: { id: order.voucherId, currentUsage: { gt: 0 } },
-                      data: { currentUsage: { decrement: 1 } },
-                    });
-                  }
+                  // SP-034: rollback via helper bersama — kembalikan currentUsage DAN
+                  // campaign.currentRedemptions.
+                  await rollbackOrderVoucherUsage(tx, order.id, order.voucherId);
                 }
 
                 return true;

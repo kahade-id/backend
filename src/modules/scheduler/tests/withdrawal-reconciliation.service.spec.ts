@@ -20,6 +20,7 @@ describe('WithdrawalReconciliationService', () => {
     isHealthy: jest.fn(),
     setNx: jest.fn(),
     setex: jest.fn(),
+    del: jest.fn(),
     releaseLock: jest.fn(),
   };
   const midtrans = { getIrisPayoutStatus: jest.fn() };
@@ -30,6 +31,7 @@ describe('WithdrawalReconciliationService', () => {
     redis.isHealthy.mockResolvedValue(true);
     redis.setNx.mockResolvedValue(true);
     redis.setex.mockResolvedValue(true);
+    redis.del.mockResolvedValue(undefined);
     redis.releaseLock.mockResolvedValue(true);
     midtrans.getIrisPayoutStatus.mockResolvedValue({ status: 'not_found', referenceNo: 'WLT-1' });
   });
@@ -102,6 +104,8 @@ describe('WithdrawalReconciliationService', () => {
     expect(prisma.walletTransaction.updateMany).not.toHaveBeenCalled();
     expect(prisma.$transaction).not.toHaveBeenCalled();
     expect(redis.setex).toHaveBeenCalledWith('alert:withdrawal_payout_unknown:withdraw-1', 86400, expect.stringContaining('cancelled'));
+    // CW-012: alert agregat untuk kanal termonitor (/health/alerts + Sentry).
+    expect(redis.setex).toHaveBeenCalledWith('cron_alert:withdrawal_stuck', 86400, expect.stringContaining('"count":1'));
   });
 
   it('does not notify a failed withdrawal when the refund claim loses a concurrent status transition', async () => {

@@ -24,6 +24,8 @@ describe('DormantWinbackVoucherService', () => {
       isHealthy: jest.fn().mockResolvedValue(true),
       setNx: jest.fn().mockResolvedValue(true),
       releaseLock: jest.fn().mockResolvedValue(true),
+      // SP-042: campaign/winback issuance invalidates the public voucher cache.
+      delPattern: jest.fn().mockResolvedValue(undefined),
     };
     const notificationQueue = { enqueue: jest.fn().mockResolvedValue(undefined) };
     const module = await Test.createTestingModule({

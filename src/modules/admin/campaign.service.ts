@@ -308,14 +308,26 @@ export class CampaignService {
     if (!campaign) throw new NotFoundException({ code: ErrorCodes.CAMPAIGN_NOT_FOUND, message: 'Campaign not found' });
     if (campaign.status === 'ACTIVE') throw new BadRequestException({ code: ErrorCodes.CAMPAIGN_ACTIVE, message: 'Cannot delete an active campaign' });
 
-    await this.prisma.campaign.delete({ where: { campaignId } });
+    // CW-009: hapus campaign HARUS mencabut voucher yang sudah diterbitkan.
+    // Relasi onDelete: SetNull membuat campaignId voucher jadi NULL, dan
+    // voucher dengan campaignId NULL dianggap tersedia (buildActiveVoucherWhere)
+    // — tanpa ini, voucher "yatim" tetap bisa ditebus setelah campaign dihapus.
+    // Nonaktifkan dulu (idempoten), lalu hapus campaign — atomik.
+    const now = new Date();
+    const [deactivated] = await this.prisma.$transaction([
+      this.prisma.voucher.updateMany({
+        where: { campaignId: campaign.id, isActive: true },
+        data: { isActive: false, deactivatedBy: adminId, deactivatedAt: now },
+      }),
+      this.prisma.campaign.delete({ where: { campaignId } }),
+    ]);
 
     this.auditLog.logAdminAction({
       adminId,
       action: AuditAction.ADMIN_ACTION,
       targetType: 'Campaign',
       targetId: campaignId,
-      description: `Deleted campaign "${campaign.name}" (${campaignId})`,
+      description: `Deleted campaign "${campaign.name}" (${campaignId}); deactivated ${deactivated.count} issued voucher(s)`,
       ipAddress,
     });
 

@@ -30,6 +30,11 @@ export class CampaignActivationService {
       const result = await this.campaignService.activateDueCampaigns();
       if (result.activated > 0 || result.ended > 0 || result.issued > 0) {
         this.logger.log(`Campaign activation: activated=${result.activated} ended=${result.ended} issued=${result.issued}`);
+        // SP-042: campaign mengubah ketersediaan voucher publik — invalidasi
+        // cache daftar voucher (pola yang sama dengan admin-vouchers).
+        await this.redis.delPattern('public:vouchers:active:*').catch((err: unknown) =>
+          this.logger.warn(`Failed to invalidate public voucher cache after campaign activation: ${err instanceof Error ? err.message : String(err)}`),
+        );
       }
     } catch (error: unknown) {
       this.logger.error(`CampaignActivation FAILED: ${error instanceof Error ? error.message : String(error)}`, error instanceof Error ? error.stack : undefined);

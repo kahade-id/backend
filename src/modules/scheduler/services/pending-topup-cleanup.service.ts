@@ -11,7 +11,7 @@ import {
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { cronJitter } from '../../../common/utils/cron-jitter.util';
-import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
+import { alertMoneyCronSkippedRedisDown, ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { startOfDayWIB } from '../../../common/utils/date.util';
 import { MidtransService, isMidtransNotFoundError } from '../../payment/midtrans.service';
 import { WalletService } from '../../wallet/wallet.service';
@@ -34,11 +34,17 @@ export class PendingTopupCleanupService {
     );
   }
 
-  // SCH-017: Runs every hour to cleanup stale PENDING topup transactions
-  @Cron('0 * * * *', { name: 'pending-topup-cleanup' })
+  // SCH-017: Runs every hour to cleanup stale PENDING topup transactions.
+  // CW-016: digeser ke menit :07 agar tidak bertabrakan dengan
+  // auto-complete-orders (:00) — mengurangi lonjakan beban DB tiap awal jam.
+  @Cron('7 * * * *', { name: 'pending-topup-cleanup' })
   async cleanupStaleTopups(): Promise<void> {
     await cronJitter(20_000);
-    if (!(await ensureRedisAvailable(this.redis, 'pending-topup-cleanup'))) return;
+    if (!(await ensureRedisAvailable(this.redis, 'pending-topup-cleanup', {
+        // CW-014: job kritis-uang — skip karena Redis down harus termonitor,
+        // bukan senyap.
+        onRedisDown: () => alertMoneyCronSkippedRedisDown('pending-topup-cleanup'),
+      }))) return;
 
     const lockKey = 'cron_lock:pending_topup_cleanup';
     const lockTtl = 600;

@@ -7,7 +7,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { Prisma, AuditAction } from '@prisma/client';
+import { Prisma, AuditAction, WalletTransactionType, WalletTransactionStatus } from '@prisma/client';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { FinanceTransactionQueryDto } from './dto/finance-query.dto';
 import { WithdrawalApproveDto, WithdrawalRejectDto } from './dto/withdrawal-action.dto';
@@ -40,7 +40,7 @@ export class AdminFinanceService {
   ) {}
 
   async listTransactions(query: FinanceTransactionQueryDto): Promise<object> {
-    const { page = 1, limit = 20, type, status, startDate, endDate } = query;
+    const { page = 1, limit = 20, type, status, startDate, endDate, q } = query;
     const safePage = Number.isInteger(page) && page > 0 ? page : 1;
     const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 100) : 20;
 
@@ -85,6 +85,16 @@ export class AdminFinanceService {
       where.createdAt = {};
       if (startDate) where.createdAt.gte = start;
       if (endDate) where.createdAt.lte = end;
+    }
+
+    // WF-013: pencarian server-side — digabung AND dengan filter lain.
+    const search = (q ?? '').trim().slice(0, 100);
+    if (search) {
+      where.OR = [
+        { txId: { contains: search } },
+        { description: { contains: search, mode: 'insensitive' } },
+        { order: { orderId: { contains: search } } },
+      ];
     }
 
     const [transactions, total] = await Promise.all([
@@ -193,6 +203,12 @@ export class AdminFinanceService {
   async getFinancialSummary(): Promise<object> {
     // B-23 (audit-fix): use TZ-aware day/month boundaries instead of fixed
     // +07:00 offset arithmetic.
+    //
+    // WF-011 (dokumentasi): agregat fee platform (feeResult/feeToday/feeThisMonth)
+    // HANYA menghitung order berstatus COMPLETED. Bila belum ada order selesai
+    // (mis. order uji berstatus CANCELLED), kartu revenue memang menampilkan 0 —
+    // perilaku benar, bukan bug. Pertimbangkan label "belum ada order selesai"
+    // di UI admin bila kartu terlihat kosong.
     const todayStart = startOfDayWIB();
     const monthStart = toWIB().startOf('month').toDate();
 
@@ -205,6 +221,12 @@ export class AdminFinanceService {
       withdrawToday,
       escrowResult,
       pendingWithdrawResult,
+      // WF-002: revenue langganan Kahade+ sebelumnya tidak dihitung di ringkasan
+      // (hanya di endpoint getRevenue yang tak dipakai UI) — kartu "Revenue"
+      // mengecilkan pendapatan. Agregat aditif; field lama tidak diubah.
+      subRevenueAll,
+      subRevenueToday,
+      subRevenueThisMonth,
     ] = await Promise.all([
       this.prisma.walletTransaction.aggregate({
         where: { type: 'TOP_UP', status: 'SUCCESS' },
@@ -244,9 +266,28 @@ export class AdminFinanceService {
         _sum: { amount: true },
         _count: true,
       }),
+      // WF-002: pembayaran langganan sukses (basis createdAt, WIB day/month).
+      this.prisma.walletTransaction.aggregate({
+        where: { type: 'SUBSCRIPTION_PAYMENT', status: 'SUCCESS' },
+        _sum: { amount: true },
+        _count: true,
+      }),
+      this.prisma.walletTransaction.aggregate({
+        where: { type: 'SUBSCRIPTION_PAYMENT', status: 'SUCCESS', createdAt: { gte: todayStart } },
+        _sum: { amount: true },
+      }),
+      this.prisma.walletTransaction.aggregate({
+        where: { type: 'SUBSCRIPTION_PAYMENT', status: 'SUCCESS', createdAt: { gte: monthStart } },
+        _sum: { amount: true },
+      }),
     ]);
 
     // All BigInt amounts stored in sen — convert to IDR numbers for frontend display.
+    const subAll = toIdr(subRevenueAll._sum.amount ?? BigInt(0));
+    const subToday = toIdr(subRevenueToday._sum.amount ?? BigInt(0));
+    const subThisMonth = toIdr(subRevenueThisMonth._sum.amount ?? BigInt(0));
+    const feeTodayIdr = toIdr(feeToday._sum.feeAmount ?? BigInt(0));
+    const feeThisMonthIdr = toIdr(feeThisMonth._sum.feeAmount ?? BigInt(0));
     return {
       totalTopup: toIdr(topupResult._sum.amount ?? BigInt(0)),
       totalTopupCount: topupResult._count,
@@ -254,13 +295,108 @@ export class AdminFinanceService {
       totalWithdrawalCount: withdrawResult._count,
       totalFees: toIdr(feeResult._sum.feeAmount ?? BigInt(0)),
       totalFeeCount: feeResult._count,
-      totalPlatformFeeToday: toIdr(feeToday._sum.feeAmount ?? BigInt(0)),
-      totalPlatformFeeThisMonth: toIdr(feeThisMonth._sum.feeAmount ?? BigInt(0)),
+      totalPlatformFeeToday: feeTodayIdr,
+      totalPlatformFeeThisMonth: feeThisMonthIdr,
       totalWithdrawalsToday: toIdr(withdrawToday._sum.amount ?? BigInt(0)),
       totalEscrowBalance: toIdr(escrowResult._sum.escrowBalance ?? BigInt(0)),
       pendingWithdrawals: pendingWithdrawResult._count,
       pendingWithdrawalsAmount: toIdr(pendingWithdrawResult._sum.amount ?? BigInt(0)),
+      // WF-002: breakdown langganan + revenue gabungan (fee + langganan).
+      totalSubscriptionRevenue: subAll,
+      totalSubscriptionRevenueCount: subRevenueAll._count,
+      totalSubscriptionRevenueToday: subToday,
+      totalSubscriptionRevenueThisMonth: subThisMonth,
+      totalRevenueToday: feeTodayIdr + subToday,
+      totalRevenueThisMonth: feeThisMonthIdr + subThisMonth,
     };
+  }
+
+  /**
+   * CW-022: export CSV keuangan yang bisa dipakai rekonsiliasi — bukan cuma
+   * ringkasan kasar. Isi: (1) ringkasan agregat, (2) breakdown HARIAN
+   * (topup/withdrawal/fee + count) dalam rentang yang diminta. Semua angka
+   * agregat — tanpa PII. Nilai dikutip (CSV-safe) dan nested object
+   * di-flatten agar tidak ada sel JSON mentah.
+   */
+  async buildFinanceCsvExport(from: Date, to: Date): Promise<string> {
+    const summary = (await this.getFinancialSummary()) as Record<string, unknown>;
+
+    type DailyRow = { day: Date; total: bigint; cnt: bigint };
+    const [topupDaily, withdrawDaily, feeDaily] = await Promise.all([
+      this.prisma.$queryRaw<DailyRow[]>`
+        SELECT date_trunc('day', "createdAt")::date AS day,
+               COALESCE(SUM(amount), 0)::bigint AS total,
+               COUNT(*)::bigint AS cnt
+        FROM wallet_transactions
+        WHERE type = 'TOP_UP' AND status = 'SUCCESS'
+          AND "createdAt" >= ${from} AND "createdAt" <= ${to}
+        GROUP BY 1 ORDER BY 1`,
+      this.prisma.$queryRaw<DailyRow[]>`
+        SELECT date_trunc('day', "createdAt")::date AS day,
+               COALESCE(SUM(amount), 0)::bigint AS total,
+               COUNT(*)::bigint AS cnt
+        FROM wallet_transactions
+        WHERE type = 'WITHDRAW' AND status = 'SUCCESS'
+          AND "createdAt" >= ${from} AND "createdAt" <= ${to}
+        GROUP BY 1 ORDER BY 1`,
+      this.prisma.$queryRaw<DailyRow[]>`
+        SELECT date_trunc('day', "completedAt")::date AS day,
+               COALESCE(SUM("feeAmount"), 0)::bigint AS total,
+               COUNT(*)::bigint AS cnt
+        FROM orders
+        WHERE status = 'COMPLETED'
+          AND "completedAt" >= ${from} AND "completedAt" <= ${to}
+        GROUP BY 1 ORDER BY 1`,
+    ]);
+
+    const dayKey = (d: Date | string): string =>
+      d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10);
+    const toMap = (rows: DailyRow[]): Map<string, DailyRow> =>
+      new Map(rows.map((r) => [dayKey(r.day), r]));
+    const topupMap = toMap(topupDaily);
+    const withdrawMap = toMap(withdrawDaily);
+    const feeMap = toMap(feeDaily);
+    const allDays = [...new Set([...topupMap.keys(), ...withdrawMap.keys(), ...feeMap.keys()])].sort();
+
+    const csvCell = (v: unknown): string => {
+      const s = v === null || v === undefined ? '' : String(v);
+      return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const lines: string[] = [];
+    lines.push(`# finance export generated_at=${new Date().toISOString()} range=${dayKey(from)}..${dayKey(to)} (WIB)`);
+    lines.push('');
+    lines.push('[summary]');
+    lines.push('metric,value');
+    for (const [k, v] of Object.entries(summary)) {
+      // Flatten: tidak ada lagi sel JSON mentah (temuan CW-022).
+      if (v !== null && typeof v === 'object') {
+        for (const [sk, sv] of Object.entries(v as Record<string, unknown>)) {
+          lines.push(`${csvCell(`${k}.${sk}`)},${csvCell(sv)}`);
+        }
+      } else {
+        lines.push(`${csvCell(k)},${csvCell(v)}`);
+      }
+    }
+    lines.push('');
+    lines.push('[daily]');
+    lines.push('date,topup_idr,topup_count,withdrawal_idr,withdrawal_count,fee_idr,fee_count');
+    for (const day of allDays) {
+      const t = topupMap.get(day);
+      const w = withdrawMap.get(day);
+      const f = feeMap.get(day);
+      lines.push(
+        [
+          day,
+          t ? toIdr(t.total) : 0,
+          t ? Number(t.cnt) : 0,
+          w ? toIdr(w.total) : 0,
+          w ? Number(w.cnt) : 0,
+          f ? toIdr(f.total) : 0,
+          f ? Number(f.cnt) : 0,
+        ].map(csvCell).join(','),
+      );
+    }
+    return lines.join('\n') + '\n';
   }
 
   async listPendingWithdrawals(
@@ -564,6 +700,32 @@ export class AdminFinanceService {
             message: 'Wallet was modified concurrently, please retry',
           });
         }
+
+        // WF-012: tulis entri ledger kompensasi untuk refund penolakan — riwayat
+        // user sebelumnya hanya menunjukkan WITHDRAW FAILED tanpa baris kredit.
+        // Saldo TIDAK diubah di sini (sudah di-increment di atas); entri ini
+        // murni jejak audit. Tipe ADMIN_CREDIT = kredit yang diterbitkan admin
+        // (preseden: adjustWallet, insurance payout); tipe WITHDRAW_REFUND
+        // khusus butuh migrasi enum — dilaporkan, belum dikerjakan.
+        // Basis totalBalance selaras dengan baris WITHDRAW saat request.
+        const refundEntry = await ptx.walletTransaction.create({
+          data: {
+            txId: `${tx.txId ?? tx.id}-REFUND`,
+            walletId: tx.walletId,
+            type: WalletTransactionType.ADMIN_CREDIT,
+            status: WalletTransactionStatus.SUCCESS,
+            amount: tx.amount,
+            balanceBefore: freshWallet.totalBalance,
+            balanceAfter: freshWallet.totalBalance + tx.amount,
+            description: `Withdrawal refund — rejected by admin ${adminId}${adminNote ? `: ${adminNote}` : ''}`,
+            reversalTxId: tx.id,
+            completedAt: new Date(),
+          },
+        });
+        await ptx.walletTransaction.update({
+          where: { id: tx.id },
+          data: { reversalTxId: refundEntry.id },
+        });
 
         return ptx.walletTransaction.findUniqueOrThrow({ where: { id: tx.id } });
       },

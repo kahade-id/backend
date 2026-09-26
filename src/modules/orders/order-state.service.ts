@@ -8,6 +8,7 @@ import { RealtimeService } from '../realtime/realtime.service';
 import { MembershipRankService } from './membership-rank.service';
 import { OrderStatus, OrderCancelReason, ActorType, WalletTransactionType, WalletTransactionStatus, SubscriptionStatus, NotificationType, Prisma, VoucherType } from '@prisma/client';
 import { addDays, resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
+import { rollbackOrderVoucherUsage } from '../../common/utils/voucher-rollback.util';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
 import { creditCashbackIfEligible } from '../../common/utils/cashback-credit.util';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
@@ -309,15 +310,9 @@ export class OrderStateService {
       });
 
       if (order.voucherId) {
-        const deletedVoucherUsage = await tx.voucherUsage.deleteMany({
-          where: { orderId: order.id, voucherId: order.voucherId },
-        });
-        if (deletedVoucherUsage.count > 0) {
-          await tx.voucher.updateMany({
-            where: { id: order.voucherId, currentUsage: { gt: 0 } },
-            data: { currentUsage: { decrement: 1 } },
-          });
-        }
+        // SP-034: rollback via helper bersama — kembalikan currentUsage DAN
+        // campaign.currentRedemptions.
+        await rollbackOrderVoucherUsage(tx, order.id, order.voucherId);
       }
 
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }), 'REJECT_ORDER_TX');
@@ -455,6 +450,9 @@ export class OrderStateService {
       if (cashbackSerial === null) cashbackSerial = await this.getNextWalletTxSerial();
       return cashbackSerial;
     };
+    // SP-047: tandai bila referral reward dikreditkan agar cache leaderboard
+    // diinvalidasi SETELAH tx commit (di luar retry loop).
+    let referralRewardCredited = false;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -689,8 +687,9 @@ export class OrderStateService {
         }
       }
 
-      await this.referralService.createReferralRewardIfEligible(order.buyerId, order.feeAmount, order.id, tx);
-      await this.referralService.createReferralRewardIfEligible(order.sellerId, order.feeAmount, order.id, tx);
+      const buyerRewardCredited = await this.referralService.createReferralRewardIfEligible(order.buyerId, order.feeAmount, order.id, tx);
+      const sellerRewardCredited = await this.referralService.createReferralRewardIfEligible(order.sellerId, order.feeAmount, order.id, tx);
+      referralRewardCredited = referralRewardCredited || buyerRewardCredited || sellerRewardCredited;
 
       await this.membershipRankService.checkAndUpdateMembershipRank(tx, order.buyerId);
       await this.membershipRankService.checkAndUpdateMembershipRank(tx, order.sellerId);
@@ -710,6 +709,12 @@ export class OrderStateService {
       }
     }
     if (lastError) throw lastError;
+
+    // SP-047: reward referral mengubah totalRewardEarned → leaderboard cache
+    // (900 dtk) harus diinvalidasi setelah commit.
+    if (referralRewardCredited) {
+      await this.referralService.invalidateLeaderboardCache();
+    }
 
     // R2-B (audit): completeOrder consumes the Plus fee-savings quota (feeSavingsUsed)
     // inside the tx above. orders.service caches `subscription_status:<userId>` (which
@@ -805,15 +810,9 @@ export class OrderStateService {
       });
 
       if (order.voucherId) {
-        const deletedVoucherUsage = await tx.voucherUsage.deleteMany({
-          where: { orderId: order.id, voucherId: order.voucherId },
-        });
-        if (deletedVoucherUsage.count > 0) {
-          await tx.voucher.updateMany({
-            where: { id: order.voucherId, currentUsage: { gt: 0 } },
-            data: { currentUsage: { decrement: 1 } },
-          });
-        }
+        // SP-034: rollback via helper bersama — kembalikan currentUsage DAN
+        // campaign.currentRedemptions.
+        await rollbackOrderVoucherUsage(tx, order.id, order.voucherId);
       }
 
       await tx.user.update({
@@ -894,15 +893,9 @@ export class OrderStateService {
       }
 
       if (order.voucherId) {
-        const deletedVoucherUsage = await tx.voucherUsage.deleteMany({
-          where: { orderId: order.id, voucherId: order.voucherId },
-        });
-        if (deletedVoucherUsage.count > 0) {
-          await tx.voucher.updateMany({
-            where: { id: order.voucherId, currentUsage: { gt: 0 } },
-            data: { currentUsage: { decrement: 1 } },
-          });
-        }
+        // SP-034: rollback via helper bersama — kembalikan currentUsage DAN
+        // campaign.currentRedemptions.
+        await rollbackOrderVoucherUsage(tx, order.id, order.voucherId);
       }
 
       await tx.orderStatusHistory.create({

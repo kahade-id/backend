@@ -6,7 +6,7 @@ import { PaymentStatus, PaymentPurpose, OrderStatus, Prisma } from '@prisma/clie
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { cronJitter } from '../../../common/utils/cron-jitter.util';
-import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
+import { alertMoneyCronSkippedRedisDown, ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { MidtransService } from '../../payment/midtrans.service';
 import { OrderQrisPaymentService } from '../../payment/order-qris-payment.service';
 
@@ -53,7 +53,11 @@ export class RefundReconciliationService {
   @Cron('35 * * * *', { name: 'refund-reconciliation' })
   async reconcileStaleRefunds(): Promise<void> {
     await cronJitter(20_000);
-    if (!(await ensureRedisAvailable(this.redis, 'refund-reconciliation'))) return;
+    if (!(await ensureRedisAvailable(this.redis, 'refund-reconciliation', {
+        // CW-014: job kritis-uang — skip karena Redis down harus termonitor,
+        // bukan senyap.
+        onRedisDown: () => alertMoneyCronSkippedRedisDown('refund-reconciliation'),
+      }))) return;
 
     const lockKey = 'cron_lock:refund_reconciliation';
     const lockTtl = 600;
@@ -143,7 +147,11 @@ export class RefundReconciliationService {
   @Cron('45 * * * *', { name: 'refund-request-retry' })
   async retryUnclaimedRefunds(): Promise<void> {
     await cronJitter(20_000);
-    if (!(await ensureRedisAvailable(this.redis, 'refund-request-retry'))) return;
+    if (!(await ensureRedisAvailable(this.redis, 'refund-request-retry', {
+        // CW-014: job kritis-uang — skip karena Redis down harus termonitor,
+        // bukan senyap.
+        onRedisDown: () => alertMoneyCronSkippedRedisDown('refund-request-retry'),
+      }))) return;
 
     const lockKey = 'cron_lock:refund_request_retry';
     const lockToken = randomUUID();

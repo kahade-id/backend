@@ -127,12 +127,49 @@ export class AdminInsuranceClaimsService {
       return this.payClaim(claimId, note, adminId, ipAddress, claim);
     }
 
-    const updated = await this.prisma.insuranceClaim.update({
-      where: { id: claimId },
-      data: {
-        status: status as InsuranceClaimStatus,
-        ...(note !== undefined ? { note: note.trim() || null } : {}),
-      },
+    // CW-008/SP-018: keputusan APPROVED/REJECTED diberitahukan ke pengaju.
+    // Update status + notifikasi dalam satu transaksi agar tidak ada keputusan
+    // tanpa notifikasi. Guard transisi di atas membuat retry aman (tidak ada
+    // notifikasi ganda): APPROVED→APPROVED / REJECTED→REJECTED ditolak.
+    // Tipe khusus INSURANCE_CLAIM_* butuh migrasi enum — sementara pakai
+    // SYSTEM_ANNOUNCEMENT dengan judul/isi yang eksplisit.
+    const notifTitle =
+      status === 'APPROVED' ? 'Klaim asuransi disetujui' : 'Klaim asuransi ditolak';
+    const notifBody =
+      status === 'APPROVED'
+        ? `Klaim asuransi Anda (${claim.claimType}) telah disetujui admin. Pembayaran akan diproses ke wallet Anda.`
+        : `Klaim asuransi Anda (${claim.claimType}) ditolak admin.${note ? ` Alasan: ${note.trim()}` : ' Hubungi dukungan untuk informasi lebih lanjut.'}`;
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const updatedClaim = await tx.insuranceClaim.update({
+        where: { id: claimId },
+        data: {
+          status: status as InsuranceClaimStatus,
+          ...(note !== undefined ? { note: note.trim() || null } : {}),
+        },
+      });
+      const notifType = NotificationType.SYSTEM_ANNOUNCEMENT;
+      await tx.notification.create({
+        data: {
+          notifId: generateNotifId(),
+          userId: claim.userId,
+          type: notifType,
+          category: getCategoryForType(notifType),
+          title: notifTitle,
+          body: notifBody,
+          isRead: false,
+        },
+      });
+      return updatedClaim;
+    });
+
+    // SP-018 (lanjutan): dorong realtime/push seperti pola admin-support —
+    // emitNotificationCreated bersifat best-effort (error ditangkap di dalam).
+    this.prisma.emitNotificationCreated({
+      userId: claim.userId,
+      title: notifTitle,
+      body: notifBody,
+      data: { type: 'INSURANCE_CLAIM_UPDATE', claimId },
     });
 
     this.auditLog.logAdminAction({

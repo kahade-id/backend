@@ -2,11 +2,12 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { NotificationType, Prisma } from '@prisma/client';
 import { randomUUID } from 'crypto';
+import * as Sentry from '@sentry/nestjs';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { cronJitter } from '../../../common/utils/cron-jitter.util';
 import { MidtransService } from '../../payment/midtrans.service';
-import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
+import { alertMoneyCronSkippedRedisDown, ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { startOfDayWIB } from '../../../common/utils/date.util';
 import { NotificationQueueService } from '../../queue/notification-queue.service';
 
@@ -31,7 +32,11 @@ export class WithdrawalReconciliationService {
   @Cron('*/5 * * * *', { name: 'withdrawal-reconciliation', timeZone: 'Asia/Jakarta' })
   async reconcileProcessingWithdrawals(): Promise<void> {
     await cronJitter(15_000);
-    if (!(await ensureRedisAvailable(this.redis, 'withdrawal-reconciliation'))) return;
+    if (!(await ensureRedisAvailable(this.redis, 'withdrawal-reconciliation', {
+        // CW-014: job kritis-uang — skip karena Redis down harus termonitor,
+        // bukan senyap.
+        onRedisDown: () => alertMoneyCronSkippedRedisDown('withdrawal-reconciliation'),
+      }))) return;
 
     const lockKey = 'cron_lock:withdrawal_reconciliation';
     const lockToken = randomUUID();
@@ -120,6 +125,27 @@ export class WithdrawalReconciliationService {
       }
 
       this.logger.log(`Withdrawal reconciliation: ${resolved} resolved, ${timedOut} timed out`);
+
+      // CW-012: alert timeout sebelumnya hanya tersimpan di kunci Redis
+      // per-tx yang tidak dibaca siapa pun. Alihkan ke kanal termonitor:
+      // kunci alert agregat (diekspos di /health/alerts) + event Sentry.
+      // Tanpa PII — hanya hitungan.
+      if (timedOut > 0) {
+        await this.redis.setex('cron_alert:withdrawal_stuck', 86400, JSON.stringify({
+          detectedAt: new Date().toISOString(),
+          count: timedOut,
+        })).catch((error) => this.logger.warn(`Failed to write withdrawal stuck alert: ${error instanceof Error ? error.message : String(error)}`));
+        Sentry.withScope((scope) => {
+          scope.setTag('alert.kind', 'withdrawal_stuck');
+          scope.setExtra('timedOutCount', timedOut);
+          Sentry.captureMessage(
+            `WITHDRAWAL_STUCK: ${timedOut} withdrawal(s) PROCESSING >30min with unknown provider status; manual reconciliation required`,
+            'error',
+          );
+        });
+      } else {
+        await this.redis.del('cron_alert:withdrawal_stuck').catch(() => {});
+      }
     } finally {
       await this.redis.releaseLock(lockKey, lockToken).catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
     }

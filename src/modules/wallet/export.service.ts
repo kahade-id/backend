@@ -432,7 +432,8 @@ export class WalletExportService {
 
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { fullName: true, userId: true, email: true },
+      // WF-016: `email` tidak pernah dirender di template — jangan query PII yang tidak perlu.
+      select: { fullName: true, userId: true },
     });
 
     const formatCurrency = (amount: number) =>

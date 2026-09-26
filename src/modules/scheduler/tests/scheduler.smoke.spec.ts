@@ -35,7 +35,7 @@ import { SubscriptionExpiryService } from '../services/subscription-expiry.servi
 import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { TopupCounterCorrectionService } from '../services/topup-counter-correction.service';
 import { WalletDailyResetService } from '../services/wallet-daily-reset.service';
-import { WeeklyReconciliationService } from '../services/weekly-reconciliation.service';
+import { DailyReconciliationService } from '../services/daily-reconciliation.service';
 import { WithdrawalReconciliationService } from '../services/withdrawal-reconciliation.service';
 import { CampaignActivationService } from '../services/campaign-activation.service';
 import { DormantWinbackVoucherService } from '../services/dormant-winback-voucher.service';
@@ -291,8 +291,8 @@ describe('Scheduler services smoke', () => {
     await expect(svc.resetDailyLimits()).resolves.toBeUndefined();
   });
 
-  it('WeeklyReconciliationService — defined + skip', async () => {
-    const svc = await build<WeeklyReconciliationService>(WeeklyReconciliationService, [
+  it('DailyReconciliationService — defined + skip', async () => {
+    const svc = await build<DailyReconciliationService>(DailyReconciliationService, [
       { provide: ReconciliationService, useValue: { runReconciliation: jest.fn() } },
     ]);
     expect(svc).toBeDefined();

@@ -109,7 +109,14 @@ export class DormantWinbackVoucherService {
         if (users.length < DORMANT_BATCH_SIZE) break;
       }
 
-      if (issued > 0) this.logger.log(`Issued ${issued} dormant win-back voucher(s)`);
+      if (issued > 0) {
+        this.logger.log(`Issued ${issued} dormant win-back voucher(s)`);
+        // SP-042: voucher baru mengubah ketersediaan publik — invalidasi cache
+        // daftar voucher (pola yang sama dengan admin-vouchers).
+        await this.redis.delPattern('public:vouchers:active:*').catch((err: unknown) =>
+          this.logger.warn(`Failed to invalidate public voucher cache after winback issuance: ${err instanceof Error ? err.message : String(err)}`),
+        );
+      }
     } finally {
       await this.redis.releaseLock(lockKey, lockToken).catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
     }

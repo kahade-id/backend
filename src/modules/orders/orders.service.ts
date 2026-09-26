@@ -6,7 +6,7 @@ import { RealtimeService } from '../realtime/realtime.service';
 import { FeeCalculatorService } from './fee-calculator.service';
 import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, SubscriptionStatus, NotificationType, Prisma, Voucher, VoucherApplicability, VoucherType, CampaignStatus, ChatRoomType } from '@prisma/client';
 import { generateOrderId } from '../../common/utils/id-generator.util';
-import { toSen, toIdr } from '../../common/utils/currency.util';
+import { toSen, toIdr, percentToBpsBigInt } from '../../common/utils/currency.util';
 import { safeBigIntToNumber } from '../../common/utils/bigint.util';
 import { addDays, formatWIBDate, toWIB, parseDateBoundaryWIB } from '../../common/utils/date.util';
 import { ORDER_SERIAL, ORDER_AVG_DURATIONS_CACHE } from '../../common/constants/redis-keys';
@@ -174,7 +174,9 @@ export class OrdersService {
       ? orderValueSen
       : this.feeCalculator.getStandardFeeSen(orderValueSen, feeConfig);
     if (voucher.discountPercent != null) {
-      const percentBps = BigInt(Math.round(Number(voucher.discountPercent) * 100));
+      // SP-008: konversi persen eksak via basis poin (hindari float
+      // Number(Decimal) * 100 — presisi hilang untuk persen desimal).
+      const percentBps = percentToBpsBigInt(voucher.discountPercent);
       let amount = (benefitBaseSen * percentBps) / BigInt(10_000);
       if (voucher.maxDiscountAmount !== null && amount > voucher.maxDiscountAmount) {
         amount = voucher.maxDiscountAmount;

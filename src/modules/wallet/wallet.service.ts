@@ -23,6 +23,8 @@ import {
   NotificationType,
   Prisma,
   VoucherType,
+  VoucherApplicability,
+  OrderStatus,
   CampaignStatus,
 } from '@prisma/client';
 import { getCategoryForType } from '../notifications/notification-category.map';
@@ -690,6 +692,9 @@ export class WalletService implements OnModuleInit {
               minOrderValue: bigint | null;
               assignedToUserId: string | null;
               campaignId: string | null;
+              // SP-039: SELECT * sudah mengembalikan kolom ini — ketik agar
+              // bisa dicek audience-nya di bawah.
+              applicableTo: VoucherApplicability | null;
             }>>`
               SELECT * FROM "vouchers"
               WHERE "code" = ${normalizedVoucherCode}
@@ -717,6 +722,36 @@ export class WalletService implements OnModuleInit {
             }
             if (voucher.assignedToUserId && voucher.assignedToUserId !== userId) {
               throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is assigned to a different user' });
+            }
+            // SP-039: voucher topup juga terikat audience (sebelumnya hanya
+            // dicek di jalur order). BUYER_ONLY/SELLER_ONLY tidak relevan
+            // untuk topup (tanpa peran order) — yang dicek NEW_USER/DORMANT_USER.
+            if (
+              voucher.applicableTo === VoucherApplicability.NEW_USER ||
+              voucher.applicableTo === VoucherApplicability.DORMANT_USER
+            ) {
+              const topupUser = await tx.user.findUnique({
+                where: { id: userId },
+                select: { totalOrdersCompleted: true },
+              });
+              const completed = topupUser?.totalOrdersCompleted ?? 0;
+              if (voucher.applicableTo === VoucherApplicability.NEW_USER && completed > 0) {
+                throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is only available for new users' });
+              }
+              if (voucher.applicableTo === VoucherApplicability.DORMANT_USER) {
+                const dormantCutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+                const recentCompleted = await tx.order.count({
+                  where: {
+                    status: OrderStatus.COMPLETED,
+                    deletedAt: null,
+                    completedAt: { gte: dormantCutoff },
+                    OR: [{ buyerId: userId }, { sellerId: userId }],
+                  },
+                });
+                if (completed <= 0 || recentCompleted > 0) {
+                  throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'This voucher is only available for dormant users' });
+                }
+              }
             }
             if (voucher.minOrderValue !== null && amountInSen < voucher.minOrderValue) {
               throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'Top-up amount does not meet the minimum requirement for this voucher' });
@@ -1924,6 +1959,14 @@ export class WalletService implements OnModuleInit {
           message: `Transfer amount exceeds safe integer range for daily counter`,
         });
       }
+      // WF-015 (audit): increment di sini SENGAJA mendahului transaksi DB.
+      // Ini adalah reservasi limit ATOMIK — dua transfer konkuren tidak bisa
+      // sama-sama lolos cek limit (race overshoot). Memindah increment ke
+      // sesudah sukses justru membuka fail-open pada kontrol limit harian.
+      // Risiko tersisa: crash proses di antara incr dan decr → counter bocor
+      // (fail-closed, BUKAN kebocoran uang) dan sembuh sendiri saat TTL
+      // berakhir di akhir hari WIB. Semua jalur gagal tertangkap di bawah
+      // me-rollback via decrBy eksplisit.
       const newDailyTotal = await this.redis.incrBy(dailyKey, amountAsNumber);
       const ttlExists = await this.redis.ttl(dailyKey);
       if (ttlExists < 0) {
@@ -3587,6 +3630,82 @@ export class WalletService implements OnModuleInit {
     };
     this.paymentMethodsCache = { data: result, ts: now };
     return result;
+  }
+
+  /**
+   * WF-008: estimasi fee + total top-up KANONIS (server-side).
+   *
+   * Memakai `calculatePaymentFee` yang sama dengan jalur charge `topup()`
+   * sehingga total yang ditampilkan ke user = total yang ditagih gateway.
+   * Murni read-only: tidak membuat transaksi, tidak me-reserve apa pun.
+   * Validasi method & rentang nominal dicerminkan dari `topup()`.
+   */
+  estimateTopupFee(
+    amount: number,
+    method: string,
+  ): { amount: number; method: string; fee: number; total: number; currency: string } {
+    if (!Number.isSafeInteger(amount) || amount <= 0 || amount > Number.MAX_SAFE_INTEGER / 100) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Top-up amount must be a positive whole IDR amount within the supported range',
+      });
+    }
+    const paymentMethod = (
+      this.getPaymentMethods().methods as Array<{
+        id: string;
+        minAmount: number;
+        maxAmount: number;
+      }>
+    ).find(entry => entry.id === method);
+    if (!paymentMethod || method === PaymentMethod.KAHADE_WALLET) {
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_PAYMENT_METHOD,
+        message: 'Unsupported payment method',
+      });
+    }
+    if (amount < paymentMethod.minAmount || amount > paymentMethod.maxAmount) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: `Top-up amount for ${method} must be between Rp ${paymentMethod.minAmount.toLocaleString('id-ID')} and Rp ${paymentMethod.maxAmount.toLocaleString('id-ID')}`,
+      });
+    }
+    const fee = this.calculatePaymentFee(amount, method as PaymentMethod);
+    return { amount, method, fee, total: amount + fee, currency: 'IDR' };
+  }
+
+  /**
+   * FX-010: batas nominal EFEKTIF dompet (server-side, read-only).
+   *
+   * Klien selama ini memakai salinan statis (frontend `AMOUNT_LIMITS`) yang bisa
+   * drift dari konfigurasi server — contoh nyata: maksimum penarikan per
+   * transaksi efektif adalah `min(WALLET_DAILY_WITHDRAW_LIMIT,
+   * WALLET_MAX_WITHDRAW_PER_TX)` (default Rp 25jt), sementara DTO statis
+   * mengizinkan hingga Rp 50jt sehingga baru ditolak server dengan
+   * `ABOVE_MAXIMUM_WITHDRAW`. Endpoint ini mengembalikan constraint yang
+   * benar-benar mengikat (DTO statis ∩ guard env service), semuanya integer IDR.
+   * Murni read-only: tidak menyentuh saldo apa pun.
+   */
+  getWalletLimits(): {
+    withdraw: { minimum: number; maximum: number };
+    topup: { minimum: number; maximum: number };
+    transfer: { minimum: number; maximum: number };
+    currency: string;
+  } {
+    return {
+      withdraw: {
+        minimum: Math.max(WALLET_MIN_WITHDRAW, this.minWithdraw),
+        maximum: Math.min(WALLET_DAILY_WITHDRAW_LIMIT, this.maxWithdrawPerTx),
+      },
+      topup: {
+        minimum: 10000,
+        maximum: Math.min(WALLET_DAILY_TOPUP_LIMIT, this.dailyTopupLimit),
+      },
+      transfer: {
+        minimum: WALLET_MIN_TRANSFER,
+        maximum: WALLET_MAX_TRANSFER_PER_TX,
+      },
+      currency: 'IDR',
+    };
   }
 
   private async getHeldEscrowReleaseAmount(

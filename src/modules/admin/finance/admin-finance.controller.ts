@@ -192,12 +192,27 @@ export class AdminFinanceController {
   @Get('export/csv')
   @AdminRoles('SUPER_ADMIN', 'FINANCE_ADMIN')
   @ApiOperation({ summary: 'Export finance summary CSV (19.4)' })
-  async exportCsv(@Res() res: Response): Promise<void> {
-    const summary = await this.service.getFinancialSummary() as any;
-    const csvHeader = 'metric,value\n';
-    const csvRows = Object.entries(summary).map(([k, v]) => `${k},${typeof v === 'object' ? JSON.stringify(v) : v}`).join('\n');
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename=\"finance-export.csv\"');
-    res.send(csvHeader + csvRows);
+  async exportCsv(
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Res() res?: Response,
+  ): Promise<void> {
+    // CW-022: dukung rentang tanggal (default 30 hari terakhir, maks 365 hari).
+    const toDate = to ? parseDateBoundaryWIB(to, 'end') : new Date();
+    const fromDate = from ? parseDateBoundaryWIB(from, 'start') : new Date((toDate ?? new Date()).getTime() - 30 * 24 * 60 * 60 * 1000);
+    if (!fromDate || !toDate) {
+      throw new BadRequestException({ code: 'INVALID_DATE_FORMAT', message: 'from and to must be valid ISO date strings' });
+    }
+    if (fromDate > toDate) {
+      throw new BadRequestException({ code: 'INVALID_DATE_RANGE', message: 'from must be before or equal to to' });
+    }
+    const diffDays = Math.ceil((toDate.getTime() - fromDate.getTime()) / (1000 * 60 * 60 * 24));
+    if (diffDays > 365) {
+      throw new BadRequestException({ code: 'DATE_RANGE_TOO_LARGE', message: 'Export date range cannot exceed 365 days' });
+    }
+    const csv = await this.service.buildFinanceCsvExport(fromDate, toDate);
+    res!.setHeader('Content-Type', 'text/csv');
+    res!.setHeader('Content-Disposition', 'attachment; filename="finance-export.csv"');
+    res!.send(csv);
   }
 }

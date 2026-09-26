@@ -4,6 +4,7 @@ import { AuditLogService } from '../../../common/services/audit-log.service';
 import { NotificationQueueService } from '../../queue/notification-queue.service';
 import { CreateBadgeDto, UpdateBadgeDto } from './dto/create-badge.dto';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { AuditAction, NotificationType, Prisma } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 
@@ -15,6 +16,7 @@ export class AdminBadgesService {
     private prisma: PrismaService,
     private auditLog: AuditLogService,
     private notificationQueue: NotificationQueueService,
+    private verificationBadgeService: VerificationBadgeService,
   ) {}
 
   async listBadges(page: number, limit: number): Promise<object> {
@@ -227,6 +229,10 @@ export class AdminBadgesService {
       actionUrl: '/badges',
     }).catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
 
+    // CW-013: grant badge mengubah sumber kebenaran verification-badge —
+    // invalidate cache agar tidak basi hingga TTL habis.
+    await this.verificationBadgeService.invalidate(userId);
+
     return userBadge;
   }
 
@@ -254,6 +260,10 @@ export class AdminBadgesService {
       description: `Revoked badge "${userBadge.badge.name}" from user ${userId}`,
       ipAddress,
     });
+
+    // CW-013: revoke badge mengubah sumber kebenaran verification-badge —
+    // invalidate cache agar tidak basi hingga TTL habis.
+    await this.verificationBadgeService.invalidate(userId);
 
     return { message: 'Badge revoked successfully' };
   }

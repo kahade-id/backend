@@ -10,6 +10,7 @@ import { RedisService } from '../../../redis/redis.service';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { PLUS_FEE_WAIVER_QUOTA_IDR } from '../../../common/constants/app.constants';
 import { escapeLikePattern } from '../../../common/utils/search.util';
+import { getWibMonthStart } from '../../../common/utils/date.util';
 
 @Injectable()
 export class AdminSubscriptionsService {
@@ -130,20 +131,24 @@ export class AdminSubscriptionsService {
     }
 
     // Pemakaian kuota fee periode berjalan (Benefit 1 Kahade+).
+    // SP-027: penulis usage memakai AWAL BULAN KALENDER WIB
+    // (getWibMonthStart), bukan currentPeriodStart (awal periode billing) —
+    // baca dengan kunci yang sama agar angka admin = angka aktual.
     let currentPeriodUsage: Record<string, unknown> | null = null;
     if (subscription.currentPeriodStart) {
+      const monthStart = getWibMonthStart();
       const usage = await this.prisma.subscriptionUsage.findUnique({
         where: {
           subscriptionId_periodStart: {
             subscriptionId: subscription.id,
-            periodStart: subscription.currentPeriodStart,
+            periodStart: monthStart,
           },
         },
         select: { feeWaivedAmount: true, periodStart: true },
       });
       const waivedSen = usage?.feeWaivedAmount ?? BigInt(0);
       currentPeriodUsage = {
-        periodStart: subscription.currentPeriodStart,
+        periodStart: monthStart,
         periodEnd: subscription.currentPeriodEnd,
         feeWaivedAmount: toIdr(waivedSen),
         feeWaiverLimit: PLUS_FEE_WAIVER_QUOTA_IDR,

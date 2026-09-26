@@ -10,7 +10,8 @@ export class ExpireExtensionRequestsService {
   constructor(private prisma: PrismaService) {}
 
   // Run every 10 minutes
-  @Cron('*/10 * * * *')
+  // CW-017: beri nama agar terdaftar stabil di SchedulerRegistry/health.
+  @Cron('*/10 * * * *', { name: 'expire-extension-requests' })
   async handleExpireExtensionRequests(): Promise<void> {
     try {
       const now = new Date();

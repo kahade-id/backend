@@ -8,7 +8,7 @@ export { DisputeEscalationSlaService } from './dispute-escalation-sla.service';
 export { SubscriptionExpiryService } from './subscription-expiry.service';
 export { SubscriptionAutoResumeService } from './subscription-auto-resume.service';
 export { RedisHashCleanupService } from './redis-hash-cleanup.service';
-export { WeeklyReconciliationService } from './weekly-reconciliation.service';
+export { DailyReconciliationService } from './daily-reconciliation.service';
 export { WithdrawalReconciliationService } from './withdrawal-reconciliation.service';
 export { ExpireUnpaidOrdersService } from './expire-unpaid-orders.service';
 export { ExpireUnconfirmedOrdersService } from './expire-unconfirmed-orders.service';

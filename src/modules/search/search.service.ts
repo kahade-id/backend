@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
@@ -8,6 +8,7 @@ import { VerificationBadgeService } from '../users/verification-badge.service';
 
 @Injectable()
 export class SearchService {
+  private readonly logger = new Logger(SearchService.name);
   private readonly LIMIT = 5;
 
   /**
@@ -46,9 +47,15 @@ export class SearchService {
       typeSet.has('help-center') ? this.searchHelpCenter(q, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
     ]);
 
-    // Save search history async (best effort)
+    // Save search history async (best effort). DC-020: kegagalan TIDAK
+    // disamarkan — catat sebagai warn agar termonitor (tanpa PII: query
+    // tidak di-log, hanya userId internal + pesan error).
     if (q.length >= 2) {
-      this.saveSearchHistory(userId, q).catch(() => {});
+      this.saveSearchHistory(userId, q).catch((err: unknown) => {
+        this.logger.warn(
+          `saveSearchHistory failed for user ${userId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
     }
 
     return {

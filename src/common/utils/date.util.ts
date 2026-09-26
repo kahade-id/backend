@@ -31,6 +31,20 @@ export function endOfDayWIB(date?: Date): Date {
   return toWIB(date).endOf('day').toDate();
 }
 
+/**
+ * SP-027: awal bulan kalender berjalan dalam WIB (00:00:00 WIB tanggal 1),
+ * dikembalikan sebagai Date UTC. Kuota fee waiver Kahade+ direset tiap bulan
+ * kalender (bukan per periode billing) — dipakai penulis usage
+ * (SubscriptionsService.waiveFeeIfEligible) dan pembaca admin
+ * (AdminSubscriptionsService.getSubscriptionDetail) agar kuncinya identik.
+ */
+export function getWibMonthStart(now: Date = new Date()): Date {
+  const wibMs = now.getTime() + 7 * 60 * 60 * 1000;
+  const wib = new Date(wibMs);
+  const monthStartWibUtc = Date.UTC(wib.getUTCFullYear(), wib.getUTCMonth(), 1, 0, 0, 0, 0);
+  return new Date(monthStartWibUtc - 7 * 60 * 60 * 1000);
+}
+
 /** Returns a calendar date string (YYYY-MM-DD) in WIB for filenames and reports. */
 export function formatWIBDate(date: Date = new Date()): string {
   return toWIB(date).format('YYYY-MM-DD');

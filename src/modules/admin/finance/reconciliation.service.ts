@@ -265,6 +265,19 @@ export class ReconciliationService {
     };
   }
 
+  /**
+   * WF-014: KONVENSI BASIS LEDGER (jangan diubah sembarangan).
+   *
+   * `balanceBefore`/`balanceAfter` BOLEH memakai basis komponen mana pun
+   * (availableBalance / escrowBalance / totalBalance) ASALKAN
+   * `balanceAfter - balanceBefore` == perubahan totalBalance akibat transaksi
+   * (Δtotal = Δavailable + Δescrow). Semua tipe saat ini memenuhi ini.
+   *
+   * Pengecualian: transaksi yang hanya MEMINDAHKAN dana antar komponen tanpa
+   * mengubah total (mis. ORDER_LOCK: available → escrow) HARUS dikembalikan 0
+   * di sini — basis available-nya akan menghasilkan delta non-nol yang salah.
+   * Tipe baru dengan pola serupa wajib ditambahkan ke pengecualian ini.
+   */
   private computeTotalBalanceDelta(
     type: WalletTransactionType,
     balanceBefore: bigint,

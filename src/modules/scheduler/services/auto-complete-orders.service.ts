@@ -19,7 +19,7 @@ import { MembershipRankService } from '../../orders/membership-rank.service';
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
 import { creditCashbackIfEligible } from '../../../common/utils/cashback-credit.util';
-import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
+import { alertMoneyCronSkippedRedisDown, ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { toIdr } from '../../../common/utils/currency.util';
 import { AUTO_COMPLETE_GRACE_PERIOD_HOURS } from '../../../common/constants/app.constants';
 
@@ -56,7 +56,11 @@ export class AutoCompleteDeliveredOrdersService {
   // SCH-017: Runs every hour to auto-complete delivered orders past deadline
   @Cron('0 * * * *', { name: 'auto-complete-orders' })
   async autoComplete(): Promise<void> {
-    if (!(await ensureRedisAvailable(this.redis, 'auto-complete-orders'))) return;
+    if (!(await ensureRedisAvailable(this.redis, 'auto-complete-orders', {
+        // CW-014: job kritis-uang — skip karena Redis down harus termonitor,
+        // bukan senyap.
+        onRedisDown: () => alertMoneyCronSkippedRedisDown('auto-complete-orders'),
+      }))) return;
 
     const lockKey = 'cron_lock:auto_complete_orders';
     const lockToken = randomUUID();
@@ -402,18 +406,19 @@ export class AutoCompleteDeliveredOrdersService {
                       });
                     }
 
-                    await this.referralService.createReferralRewardIfEligible(
+                    const buyerRewardCredited = await this.referralService.createReferralRewardIfEligible(
                       order.buyerId,
                       order.feeAmount,
                       order.id,
                       tx,
                     );
-                    await this.referralService.createReferralRewardIfEligible(
+                    const sellerRewardCredited = await this.referralService.createReferralRewardIfEligible(
                       order.sellerId,
                       order.feeAmount,
                       order.id,
                       tx,
                     );
+                    const referralRewardCredited = buyerRewardCredited || sellerRewardCredited;
 
                     if (order.isKahadePlus && order.feeAmount > BigInt(0)) {
                       try {
@@ -500,7 +505,7 @@ export class AutoCompleteDeliveredOrdersService {
 
                     this.logger.log(`Auto-completed order ${order.orderId}`);
 
-                    return { completed: true as const, cashback: cashbackResult };
+                    return { completed: true as const, cashback: cashbackResult, referralRewardCredited };
                   },
                   { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
                 ),
@@ -539,6 +544,12 @@ export class AutoCompleteDeliveredOrdersService {
             }
 
             if (!outcome?.completed) continue;
+
+            // SP-047: reward referral mengubah totalRewardEarned — invalidasi
+            // leaderboard cache setelah tx commit.
+            if (outcome.referralRewardCredited) {
+              await this.referralService.invalidateLeaderboardCache();
+            }
 
             // Batch 1-money (EO-005): notifikasi cashback bila dikredit oleh helper.
             if (outcome.cashback?.credited && outcome.cashback.userId) {

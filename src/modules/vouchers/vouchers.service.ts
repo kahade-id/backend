@@ -4,9 +4,9 @@ import { RedisService } from '../../redis/redis.service';
 import { FeeCalculatorService } from '../orders/fee-calculator.service';
 import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { toIdr, toSen } from '../../common/utils/currency.util';
+import { toIdr, toSen, percentToBpsBigInt } from '../../common/utils/currency.util';
 import { ACTIVE_VOUCHERS_LIST } from '../../common/constants/redis-keys';
-import { OrderStatus, VoucherApplicability, VoucherType, Prisma, CampaignStatus } from '@prisma/client';
+import { OrderStatus, VoucherApplicability, VoucherType, Prisma, CampaignStatus, SubscriptionStatus } from '@prisma/client';
 
 const ACTIVE_VOUCHERS_TTL = 300;
 
@@ -198,10 +198,25 @@ export class VouchersService {
 
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { totalOrdersCompleted: true },
+      select: { totalOrdersCompleted: true, isKahadePlus: true },
     });
     if (!user) {
       throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    }
+
+    // SP-045: tentukan status Plus efektif (cerminan logika ringan di
+    // orders.service estimate) agar preview memakai fee aktual user.
+    let effectiveKahadePlus = false;
+    if (user.isKahadePlus) {
+      const activeSub = await this.prisma.subscription.findFirst({
+        where: {
+          userId,
+          status: { in: [SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELLED] },
+          currentPeriodEnd: { gt: new Date() },
+        },
+        select: { feeSavingsUsed: true, feeSavingsLimit: true },
+      });
+      effectiveKahadePlus = !!activeSub && activeSub.feeSavingsUsed < activeSub.feeSavingsLimit;
     }
 
     const now = new Date();
@@ -320,12 +335,27 @@ export class VouchersService {
       const benefitBaseSen = voucher.voucherType === VoucherType.WALLET_CASHBACK
         ? orderValueSen
         : this.feeCalculator.getStandardFeeSen(orderValueSen, feeConfig);
-      const percentBps = BigInt(Math.round(Number(voucher.discountPercent) * 100));
+      const percentBps = percentToBpsBigInt(voucher.discountPercent);
       benefitAmount = (benefitBaseSen * percentBps) / BigInt(10_000);
       if (voucher.maxDiscountAmount !== null && benefitAmount > voucher.maxDiscountAmount) {
         benefitAmount = voucher.maxDiscountAmount;
       }
       if (benefitAmount > benefitBaseSen) benefitAmount = benefitBaseSen;
+    }
+
+    // SP-045: untuk subscriber Plus, fee aktual < fee standar — cap preview
+    // fee-discount ke fee efektif (min(plusFee, standardFee)) agar tidak
+    // overstate. Cerminan calculateFee step 3 saat create order.
+    if (
+      benefitAmount !== null &&
+      orderValue != null &&
+      effectiveKahadePlus &&
+      (voucher.voucherType === VoucherType.FEE_DISCOUNT_FLAT ||
+        voucher.voucherType === VoucherType.FEE_DISCOUNT_PERCENT)
+    ) {
+      const feeConfig = await this.feeCalculator.getFeeConfig();
+      const effectiveFeeSen = this.feeCalculator.getEffectiveFeeSen(toSen(orderValue), true, feeConfig);
+      if (benefitAmount > effectiveFeeSen) benefitAmount = effectiveFeeSen;
     }
     const feeDiscountAmount = voucher.voucherType === VoucherType.FEE_DISCOUNT_FLAT || voucher.voucherType === VoucherType.FEE_DISCOUNT_PERCENT
       ? benefitAmount

@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
+import * as Sentry from '@sentry/nestjs';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
@@ -43,9 +44,28 @@ export class FraudChallengeEscalationService {
         take: 100,
       });
 
-      if (stalePayments.length === 0) return;
+      if (stalePayments.length === 0) {
+        // CW-011: tidak ada temuan basi — pastikan kunci alert agregat tidak
+        // tertinggal dari jalan sebelumnya agar /health/alerts kembali sehat.
+        await this.redis.del('cron_alert:fraud_escalation').catch(() => {});
+        return;
+      }
 
       this.logger.error(`FRAUD_ESCALATION: Found ${stalePayments.length} payment(s) flagged for review for >${FraudChallengeEscalationService.ESCALATION_THRESHOLD_HOURS}h — Sentry/ops alerting required`);
+
+      // CW-021: kirim event ke Sentry (no-op bila SENTRY_DSN tidak diset).
+      // Tanpa PII orang (nama/HP/email) — extras hanya berisi ID order
+      // internal + hitungan; detail operasional tetap di log server.
+      Sentry.withScope((scope) => {
+        scope.setTag('alert.kind', 'fraud_escalation');
+        scope.setExtra('staleCount', stalePayments.length);
+        scope.setExtra('thresholdHours', FraudChallengeEscalationService.ESCALATION_THRESHOLD_HOURS);
+        scope.setExtra('orderIds', stalePayments.map((p) => p.midtransOrderId));
+        Sentry.captureMessage(
+          `FRAUD_ESCALATION: ${stalePayments.length} payment(s) flagged for review >${FraudChallengeEscalationService.ESCALATION_THRESHOLD_HOURS}h`,
+          'error',
+        );
+      });
 
       for (const payment of stalePayments) {
         const escalationKey = `alert:fraud_escalation:${payment.midtransOrderId}`;
@@ -85,19 +105,19 @@ export class FraudChallengeEscalationService {
               },
             }).catch(() => {});
           }
-          // Also push to Redis list for admin dashboard to poll
-          await this.redis.getClient().lpush('admin_alerts:fraud_escalation', JSON.stringify({
-            midtransOrderId: payment.midtransOrderId,
-            userId: payment.userId,
-            amount: payment.amount.toString(),
-            fraudStatus: payment.fraudStatus,
-            escalatedAt: new Date().toISOString(),
-          })).catch(() => {});
-          await this.redis.getClient().ltrim('admin_alerts:fraud_escalation', 0, 99).catch(() => {});
         } catch (notifyErr) {
           this.logger.warn(`Failed to notify super admins for ${payment.midtransOrderId}: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`);
         }
       }
+
+      // CW-011: 'admin_alerts:fraud_escalation' (Redis list) tidak pernah
+      // dibaca siapa pun — diganti kunci alert agregat yang ditulis SEKALI per
+      // jalan dan diekspos di /health/alerts. Kanal termonitor lainnya:
+      // AdminAuditLog per super-admin (di atas) + event Sentry (CW-021).
+      await this.redis.setex('cron_alert:fraud_escalation', 86400, JSON.stringify({
+        raisedAt: new Date().toISOString(),
+        count: stalePayments.length,
+      })).catch(() => {});
 
       await this.redis.setex('cron_heartbeat:fraud_challenge_escalation', 86400, JSON.stringify({
         ranAt: new Date().toISOString(),

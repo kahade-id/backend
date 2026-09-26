@@ -32,10 +32,12 @@ import { WalletService } from '../wallet/wallet.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { VerificationBadgeService } from '../users/verification-badge.service';
 import { generateWalletTxId, generatePaymentTxId } from '../../common/utils/id-generator.util';
-import { FlashQrisService } from '../payment/flash-qris.service';
+import { FlashQrisService, FlashQrisPayment } from '../payment/flash-qris.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { toIdr, toSen } from '../../common/utils/currency.util';
+import { toIdr, toSen, percentToBpsBigInt } from '../../common/utils/currency.util';
+import { getWibMonthStart } from '../../common/utils/date.util';
 import { SUBSCRIPTION_PLANS_CACHE } from '../../common/constants/redis-keys';
+import { KAHADE_PLUS_BENEFITS, SubscriptionBenefit } from './subscription-benefits.constant';
 import {
   SUBSCRIPTION_MONTHLY_PRICE,
   SUBSCRIPTION_YEARLY_PRICE,
@@ -218,7 +220,9 @@ export class SubscriptionsService {
     if (campaign.discountValue !== null) {
       discountSen = campaign.discountValue;
     } else if (campaign.discountPercent !== null) {
-      const percentBps = BigInt(Math.round(Number(campaign.discountPercent) * 100));
+      // SP-008: konversi persen→bps eksak (string-based), bukan float
+      // Math.round(Number(x) * 100) yang bisa meleset 1 bps.
+      const percentBps = percentToBpsBigInt(campaign.discountPercent);
       discountSen = (priceSen * percentBps) / BigInt(10_000);
       if (campaign.maxDiscount !== null && discountSen > campaign.maxDiscount) discountSen = campaign.maxDiscount;
     }
@@ -316,6 +320,25 @@ export class SubscriptionsService {
   }
 
   /**
+   * EO-007: subscription yang berhak atas benefit Plus — ACTIVE, atau
+   * CANCELLED yang masih dalam masa berbayar (cancel-at-period-end,
+   * keputusan produk 2026-09-26). Selaras dengan eligibilitas tarif Plus di
+   * orders.service (estimate & create memakai [ACTIVE, CANCELLED]).
+   * Dipakai jalur waiver (waiveFeeIfEligible, estimateWaiverAmount,
+   * getFeeWaivedThisPeriod).
+   */
+  private findBenefitSubscription(userId: string): Promise<Subscription | null> {
+    return this.prisma.subscription.findFirst({
+      where: {
+        userId,
+        status: { in: [SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELLED] },
+        currentPeriodEnd: { gt: new Date() },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    });
+  }
+
+  /**
    * Benefit 2 — Centang Abu: true jika subscriber aktif DAN KYC lengkap
    * (kycStatus APPROVED + email terverifikasi + no HP terverifikasi +
    * alamat terisi). Sumber status: kolom denormalisasi di tabel users
@@ -368,10 +391,8 @@ export class SubscriptionsService {
    * paket YEARLY (bukan sekali per periode billing tahunan).
    */
   private getQuotaMonthStart(now: Date = new Date()): Date {
-    const wibMs = now.getTime() + 7 * 60 * 60 * 1000;
-    const wib = new Date(wibMs);
-    const monthStartWibUtc = Date.UTC(wib.getUTCFullYear(), wib.getUTCMonth(), 1, 0, 0, 0, 0);
-    return new Date(monthStartWibUtc - 7 * 60 * 60 * 1000);
+    // SP-027: delegasi ke util bersama agar kunci = pembaca admin.
+    return getWibMonthStart(now);
   }
 
   /**
@@ -400,7 +421,11 @@ export class SubscriptionsService {
     const subscription = await db.subscription.findFirst({
       where: {
         userId,
-        status: SubscriptionStatus.ACTIVE,
+        // EO-007: CANCELLED = cancel-at-period-end (keputusan produk 2026-09-26):
+        // user sudah membayar s/d currentPeriodEnd sehingga tetap berhak atas
+        // benefit Plus — selaras dengan eligibilitas tarif di orders.service
+        // (estimate & create memakai [ACTIVE, CANCELLED]).
+        status: { in: [SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELLED] },
         currentPeriodEnd: { gt: new Date() },
       },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
@@ -452,7 +477,7 @@ export class SubscriptionsService {
    * dalam sen. Periode kuota = bulan kalender, bukan periode billing.
    */
   async getFeeWaivedThisPeriod(userId: string): Promise<bigint> {
-    const subscription = await this.getSubscription(userId);
+    const subscription = await this.findBenefitSubscription(userId);
     if (!subscription) return BigInt(0);
     const usage = await this.prisma.subscriptionUsage.findUnique({
       where: {
@@ -478,7 +503,7 @@ export class SubscriptionsService {
    */
   async estimateWaiverAmount(userId: string, feeAmountSen: bigint): Promise<bigint> {
     if (feeAmountSen <= BigInt(0)) return BigInt(0);
-    const subscription = await this.getSubscription(userId);
+    const subscription = await this.findBenefitSubscription(userId);
     if (!subscription) return BigInt(0);
     const quotaSen = BigInt(
       this.configService.get<number>('app.plusFeeWaiverQuotaSen') ?? PLUS_FEE_WAIVER_QUOTA_SEN,
@@ -544,6 +569,9 @@ export class SubscriptionsService {
         message: 'Invalid subscription plan',
       });
     }
+
+    // CW-003: expire PENDING basi dulu agar tidak memblokir subscribe ulang.
+    await this.expireStalePendingSubscriptions(userId);
 
     // Kode promo gratis dari admin — dicek dulu sebelum campaign discount.
     const promoGrant = await this.resolvePromoCodeGrant(userId, options.promoCode);
@@ -787,6 +815,70 @@ export class SubscriptionsService {
    * 4. User scan & bayar → webhook Flash → activateQrisSubscription().
    * 5. Frontend polling GET /v1/subscriptions/qris-status/:id sebagai fallback.
    */
+  /**
+   * CW-003: subscription PENDING yang QR-nya sudah kedaluwarsa (atau gagal
+   * dibuat >1 jam lalu, mis. Flash down setelah row PENDING dibuat) tidak
+   * boleh memblokir subscribe ulang selamanya. Tandai EXPIRED dengan guard
+   * status PENDING (idempoten, aman di-retry) + paymentTx → FAILED.
+   * Tidak menggerakkan uang: pembayaran PENDING tidak pernah sukses.
+   */
+  private async expireStalePendingSubscriptions(userId: string): Promise<void> {
+    const now = new Date();
+    const staleCutoff = new Date(now.getTime() - 60 * 60 * 1000);
+    const stale = await this.prisma.subscription.findMany({
+      where: {
+        userId,
+        status: SubscriptionStatus.PENDING,
+        OR: [
+          { paymentTx: { expiredAt: { lt: now } } },
+          {
+            paymentTx: {
+              expiredAt: null,
+              flashTransactionId: null,
+              createdAt: { lt: staleCutoff },
+            },
+          },
+        ],
+      },
+      select: { id: true, paymentTxId: true },
+    });
+    for (const s of stale) {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.subscription.updateMany({
+          where: { id: s.id, status: SubscriptionStatus.PENDING },
+          data: { status: SubscriptionStatus.EXPIRED },
+        });
+        if (s.paymentTxId) {
+          await tx.paymentTransaction.updateMany({
+            where: { id: s.paymentTxId, status: PaymentStatus.PENDING },
+            data: { status: PaymentStatus.FAILED, failedAt: now },
+          });
+        }
+      });
+      this.logger.log(`Subscription PENDING basi ${s.id} di-expire agar user ${userId} bisa subscribe ulang`);
+    }
+  }
+
+  /**
+   * SP-003: gagalkan subscription QRIS yang masih PENDING (guard status) +
+   * paymentTx-nya → FAILED, agar user bisa langsung subscribe ulang tanpa
+   * menunggu cleanup PENDING basi (1 jam). Tidak menggerakkan uang:
+   * pembayaran PENDING tidak pernah sukses.
+   */
+  private async failPendingQrisSubscription(subscriptionId: string, paymentTxId: string): Promise<void> {
+    const now = new Date();
+    await this.prisma.$transaction(async (tx) => {
+      await tx.subscription.updateMany({
+        where: { id: subscriptionId, status: SubscriptionStatus.PENDING },
+        data: { status: SubscriptionStatus.EXPIRED },
+      });
+      await tx.paymentTransaction.updateMany({
+        where: { id: paymentTxId, status: PaymentStatus.PENDING },
+        data: { status: PaymentStatus.FAILED, failedAt: now },
+      });
+    });
+  }
+
   async subscribeQris(
     userId: string,
     plan: SubscriptionPlan,
@@ -801,12 +893,11 @@ export class SubscriptionsService {
         message: 'Invalid subscription plan',
       });
     }
-    if (!pin || !/^\d{6}$/.test(pin)) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: 'Wallet PIN is required for QRIS subscription payment',
-      });
-    }
+    // SP-032: validasi format PIN dipindah ke SETELAH cabang promo gratis —
+    // path gratis tidak boleh memaksa PIN (DTO: pin opsional; subscribe()
+    // sendiri hanya memverifikasi PIN bila effectivePrice > 0).
+    // CW-003: expire PENDING basi dulu agar tidak memblokir subscribe ulang.
+    await this.expireStalePendingSubscriptions(userId);
 
     const promoGrant = await this.resolvePromoCodeGrant(userId, promoCode);
     if (promoGrant) {
@@ -823,6 +914,13 @@ export class SubscriptionsService {
       return { subscription, qrString: '', expiredAt: new Date(), flashTransactionId: '' };
     }
 
+    // Di titik ini pembayaran QRIS pasti terjadi → PIN wajib & valid.
+    if (!pin || !/^\d{6}$/.test(pin)) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Wallet PIN is required for QRIS subscription payment',
+      });
+    }
     await this.walletService.verifyPin(userId, pin, ip);
 
     const durationDays = planInfo.durationDays;
@@ -896,15 +994,29 @@ export class SubscriptionsService {
     });
 
     // Buat QRIS di Flash (di luar transaksi DB).
-    const externalId = pending.paymentTx.midtransOrderId.slice(0, 16);
-    const qris = await this.flashQrisService.createQrisPayment({
-      externalId,
-      amountIdr,
-      description: `${planInfo.label} — Kahade+`,
-      fullname: user?.fullName ?? '',
-      email: user?.email ?? '',
-      phoneNumber: user?.phoneNumber ?? '',
-    });
+    // CW-004: Flash membatasi external_id 16 karakter. Potongan
+    // "SUBS-QRIS-<epoch>" sebelumnya bertabrakan untuk semua pembayaran
+    // dalam jendela ~2,78 jam. Pakai 16 karakter pertama paymentTx.id (cuid)
+    // — unik per pembayaran dan deterministik dari baris DB sehingga callback
+    // bisa dicocokkan ulang (CW-005).
+    const externalId = pending.paymentTx.id.slice(0, 16);
+    // SP-003: bila Flash gagal SETELAH baris PENDING dibuat (timeout/down),
+    // gagalkan baris PENDING-nya sekalian agar tidak mengunci subscribe ulang
+    // sampai cleanup basi (1 jam). Guard PENDING membuat retry aman.
+    let qris: FlashQrisPayment;
+    try {
+      qris = await this.flashQrisService.createQrisPayment({
+        externalId,
+        amountIdr,
+        description: `${planInfo.label} — Kahade+`,
+        fullname: user?.fullName ?? '',
+        email: user?.email ?? '',
+        phoneNumber: user?.phoneNumber ?? '',
+      });
+    } catch (err) {
+      await this.failPendingQrisSubscription(pending.sub.id, pending.paymentTx.id);
+      throw err;
+    }
 
     await this.prisma.paymentTransaction.update({
       where: { id: pending.paymentTx.id },
@@ -941,9 +1053,18 @@ export class SubscriptionsService {
    * tidak menduplikasi aktivasi/audit-log.
    */
   async activateQrisSubscription(flashTransactionId: string, externalId: string): Promise<void> {
+    // CW-005: cabang fallback via external_id yang lama
+    // ({ midtransOrderId: externalId }) tidak pernah cocok karena externalId
+    // adalah potongan 16 char sementara midtransOrderId full-length.
+    // Sekarang externalId = 16 char pertama paymentTx.id → fallback hidup via
+    // pencocokan prefix id. Guard string kosong: startsWith('') cocok semua.
+    const orConditions: Prisma.PaymentTransactionWhereInput[] = [{ flashTransactionId }];
+    if (externalId) {
+      orConditions.push({ id: { startsWith: externalId } });
+    }
     const paymentTx = await this.prisma.paymentTransaction.findFirst({
       where: {
-        OR: [{ flashTransactionId }, { midtransOrderId: externalId }],
+        OR: orConditions,
         provider: PaymentProvider.FLASH,
         purpose: PaymentPurpose.SUBSCRIPTION,
       },
@@ -1066,10 +1187,9 @@ export class SubscriptionsService {
       if (flashStatus === 'SUCCESS') {
         await this.activateQrisSubscription(subscription.paymentTx.flashTransactionId, '');
       } else if (flashStatus === 'FAILED') {
-        await this.prisma.paymentTransaction.update({
-          where: { id: subscription.paymentTx.id },
-          data: { status: PaymentStatus.FAILED, failedAt: new Date() },
-        });
+        // SP-003: payment FAILED → subscription PENDING ikut EXPIRED agar
+        // tidak mengunci user (guard PENDING di helper membuatnya idempoten).
+        await this.failPendingQrisSubscription(subscription.id, subscription.paymentTx.id);
       }
       const refreshed = await this.prisma.subscription.findUnique({ where: { id: subscription.id } });
       return {
@@ -1365,19 +1485,8 @@ export class SubscriptionsService {
     return {
       plan: subscription.plan,
       label: planInfo.label,
-      benefits: [
-        {
-          key: 'fee_savings',
-          label: 'Fee Savings',
-          description: 'Reduced platform fees on transactions',
-        },
-        {
-          key: 'priority_support',
-          label: 'Priority Support',
-          description: 'Faster customer support response',
-        },
-        { key: 'badge', label: 'Kahade Plus Badge', description: 'Exclusive profile badge' },
-      ],
+      // SP-010: benefit dari source of truth backend (bukan hardcode inline).
+      benefits: KAHADE_PLUS_BENEFITS,
       feeSavingsUsed: toIdr(subscription.feeSavingsUsed),
       feeSavingsLimit: toIdr(subscription.feeSavingsLimit),
       feeSavingsRemaining: toIdr(feeSavingsRemaining),
@@ -1565,6 +1674,8 @@ export class SubscriptionsService {
       price: number;
       durationDays: number;
       feeSavingsLimit: number;
+      // SP-010: source of truth benefit backend (aditif).
+      benefits: SubscriptionBenefit[];
     }>
   > {
     type PlanEntry = {
@@ -1573,6 +1684,7 @@ export class SubscriptionsService {
       price: number;
       durationDays: number;
       feeSavingsLimit: number;
+      benefits: SubscriptionBenefit[];
     };
     const cacheKey = `${SUBSCRIPTION_PLANS_CACHE}:plans`;
     const cached = await this.redis.get(cacheKey);
@@ -1590,6 +1702,9 @@ export class SubscriptionsService {
       price: toIdr(info.price),
       durationDays: info.durationDays,
       feeSavingsLimit,
+      // SP-010: source of truth benefit backend — aditif, frontend tidak
+      // perlu hardcode daftar benefit lagi.
+      benefits: KAHADE_PLUS_BENEFITS,
     }));
     await this.redis.setex(cacheKey, SUBSCRIPTION_PLANS_TTL, JSON.stringify(plans));
     return plans;

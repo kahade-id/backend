@@ -153,14 +153,16 @@ export class AdminUsersService {
     });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
 
-    // Fire-and-forget audit log — never block or fail the response
+    // Fire-and-forget audit log — never block or fail the response.
+    // CW-019: jangan simpan email (PII) di deskripsi audit log — userId
+    // publik sudah cukup untuk penelusuran.
     if (adminId) {
       this.auditLog.logAdminAction({
         adminId,
         action: AuditAction.ADMIN_ACTION,
         targetType: 'User',
         targetId: user.id,
-        description: `Admin viewed user detail for ${user.userId} (${user.email})`,
+        description: `Admin viewed user detail for ${user.userId}`,
         ipAddress: ipAddress ?? 'unknown',
       });
     }

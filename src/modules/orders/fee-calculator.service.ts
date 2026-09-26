@@ -263,6 +263,21 @@ export class FeeCalculatorService {
   }
 
   /**
+   * SP-045: fee yang benar-benar dibayar user SEBELUM voucher — untuk
+   * subscriber Plus = min(orderValue × plusRate, standardFee), selain itu =
+   * standardFee. Voucher fee-discount di-cap ke nilai ini baik saat preview
+   * (vouchers.validateVoucher) maupun saat create (calculateFee step 3).
+   */
+  getEffectiveFeeSen(orderValueSen: bigint, isKahadePlus: boolean, feeConfig?: FeeConfig): bigint {
+    if (orderValueSen <= BigInt(0)) return BigInt(0);
+    const standardFee = this.getStandardFeeSen(orderValueSen, feeConfig);
+    if (!isKahadePlus) return standardFee;
+    const plusRateBps = this.getFeeRateBps(true, feeConfig);
+    const plusFeeRaw = (orderValueSen * plusRateBps) / BigInt(10_000);
+    return plusFeeRaw < standardFee ? plusFeeRaw : standardFee;
+  }
+
+  /**
    * Calculates all fee amounts for an order.
    *
    * Pass the pre-fetched `feeConfig` from `getFeeConfig()` to use the Redis-cached fee

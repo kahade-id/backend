@@ -4,7 +4,7 @@ import { randomUUID } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { ScheduledWithdrawalService } from '../../withdrawals/scheduled-withdrawal.service';
-import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
+import { alertMoneyCronSkippedRedisDown, ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { cronJitter } from '../../../common/utils/cron-jitter.util';
 
 @Injectable()
@@ -21,7 +21,11 @@ export class ProcessScheduledWithdrawalsService {
   @Cron('0 6 * * *', { name: 'process-scheduled-withdrawals', timeZone: 'Asia/Jakarta' })
   async processAll(): Promise<void> {
     await cronJitter(10_000);
-    if (!(await ensureRedisAvailable(this.redis, 'process-scheduled-withdrawals'))) return;
+    if (!(await ensureRedisAvailable(this.redis, 'process-scheduled-withdrawals', {
+        // CW-014: job kritis-uang — skip karena Redis down harus termonitor,
+        // bukan senyap.
+        onRedisDown: () => alertMoneyCronSkippedRedisDown('process-scheduled-withdrawals'),
+      }))) return;
 
     const lockKey = 'cron_lock:process_scheduled_withdrawals';
     const lockToken = randomUUID();

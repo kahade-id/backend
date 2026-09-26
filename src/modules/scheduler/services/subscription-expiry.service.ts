@@ -16,6 +16,11 @@ import { VerificationBadgeService } from '../../users/verification-badge.service
 
 const PLAN_METADATA: Record<SubscriptionPlan, { durationDays: number; label: string }> = {
   MONTHLY: { durationDays: 30, label: 'Kahade Plus Monthly' },
+  // SP-030 DITUNDA: definisi "tahunan" (365 vs 366 vs anniversary kalender)
+  // adalah keputusan produk. Nilai 366 dipertahankan = perilaku produksi
+  // saat ini; JANGAN selaraskan ke 365 tanpa sign-off produk eksplisit.
+  // Catatan: SubscriptionsService.planPricing memakai 365 — inkonsistensi
+  // ini harus diselesaikan lewat satu konstanta bersama saat produk memutuskan.
   YEARLY: { durationDays: 366, label: 'Kahade Plus Yearly' },
 };
 
@@ -212,7 +217,8 @@ export class SubscriptionExpiryService {
   private async processExpiredSubscriptions(now: Date): Promise<void> {
     const expiredSubs = await this.prisma.subscription.findMany({
       where: {
-        status: { in: ['ACTIVE', 'CANCELLED'] },
+        // SP-012: pakai enum Prisma, bukan string mentah.
+        status: { in: [SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELLED] },
         currentPeriodEnd: { lt: now },
       },
       include: { user: { select: { id: true } } },

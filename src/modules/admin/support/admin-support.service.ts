@@ -41,7 +41,11 @@ export class AdminSupportService {
         where,
         skip,
         take: safeLimit,
-        orderBy: { createdAt: 'desc' },
+        // SP-022: urutkan berdasarkan aktivitas terakhir — balasan USER
+        // menyentuh updatedAt (support.service replyToTicket), sehingga tiket
+        // dengan balasan user terbaru muncul di atas sebagai sinyal ringan
+        // untuk admin tanpa perubahan schema.
+        orderBy: { updatedAt: 'desc' },
         include: {
           user: { select: { id: true, userId: true, username: true, fullName: true, email: true, avatarUrl: true } },
           _count: { select: { replies: true } },
@@ -53,7 +57,9 @@ export class AdminSupportService {
     const data = tickets.map((ticket) => {
       const { _count, attachments, ...rest } = ticket as typeof ticket & { _count: { replies: number }; attachments?: unknown };
       const attachmentCount = Array.isArray(attachments) ? attachments.length : 0;
-      return { ...rest, replyCount: _count.replies, attachmentCount };
+      // SP-021: admin UI membaca `isPriority` untuk badge di tab Umum —
+      // sediakan alias dari kolom DB `priority` (aditif).
+      return { ...rest, isPriority: ticket.priority, replyCount: _count.replies, attachmentCount };
     });
     return createPaginatedResponse(data, total, safePage, safeLimit);
   }
@@ -69,7 +75,14 @@ export class AdminSupportService {
     if (!ticket) throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Ticket not found' });
     return {
       ...ticket,
-      replies: (ticket.replies || []).map((reply) => ({ ...reply, isStaff: reply.senderType === SupportTicketSenderType.ADMIN || reply.senderType === SupportTicketSenderType.SYSTEM })),
+      // SP-020: admin UI membaca `isAdminReply` (tickets/[id]/page.tsx) —
+      // sediakan dengan nama itu; `isStaff` dipertahankan untuk kompatibilitas.
+      replies: (ticket.replies || []).map((reply) => {
+        const isAdminReply =
+          reply.senderType === SupportTicketSenderType.ADMIN ||
+          reply.senderType === SupportTicketSenderType.SYSTEM;
+        return { ...reply, isStaff: isAdminReply, isAdminReply };
+      }),
     };
   }
 
@@ -103,7 +116,8 @@ export class AdminSupportService {
       description: `Replied to support ticket ${ticketId}`,
       ipAddress,
     });
-    return { ...reply, isStaff: true };
+    // SP-020: samakan dengan getTicketDetail — admin UI membaca `isAdminReply`.
+    return { ...reply, isStaff: true, isAdminReply: true };
   }
 
   async updateStatus(ticketId: string, status: string, adminId: string, ipAddress: string): Promise<object> {

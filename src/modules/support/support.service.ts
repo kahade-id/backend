@@ -151,7 +151,7 @@ export class SupportService {
     if (!ticket) throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Ticket not found' });
     if (ticket.userId !== userId) throw new ForbiddenException({ code: ErrorCodes.FORBIDDEN, message: 'Not authorized' });
     if ((['CLOSED', 'RESOLVED'] as string[]).includes(ticket.status)) throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'Already closed' });
-    const updated = await this.prisma.supportTicket.update({ where: { id: ticketId }, data: { status: 'CLOSED' as any } });
+    const updated = await this.prisma.supportTicket.update({ where: { id: ticketId }, data: { status: SupportTicketStatus.CLOSED } });
     return { ticketId: updated.id, status: updated.status };
   }
 
@@ -160,7 +160,7 @@ export class SupportService {
     if (!ticket) throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Ticket not found' });
     if (ticket.userId !== userId) throw new ForbiddenException({ code: ErrorCodes.FORBIDDEN, message: 'Not authorized' });
     if (ticket.status !== 'CLOSED') throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'Only closed tickets can be reopened' });
-    const updated = await this.prisma.supportTicket.update({ where: { id: ticketId }, data: { status: 'OPEN' as any } });
+    const updated = await this.prisma.supportTicket.update({ where: { id: ticketId }, data: { status: SupportTicketStatus.OPEN } });
     return { ticketId: updated.id, status: updated.status };
   }
 
@@ -170,11 +170,17 @@ export class SupportService {
     if (ticket.userId !== userId) throw new ForbiddenException({ code: ErrorCodes.FORBIDDEN, message: 'Not authorized' });
     if (!['RESOLVED', 'CLOSED'].includes(ticket.status)) throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'Can only rate resolved/closed tickets' });
     if (rating < 1 || rating > 5) throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Rating 1-5' });
-    // Store rating in ticket metadata if column exists, else via separate table
-    try {
-      await (this.prisma as any).supportTicketRating?.create?.({ data: { ticketId, userId, rating, comment } });
-    } catch {}
-    const updated = await this.prisma.supportTicket.update({ where: { id: ticketId }, data: { rating, ratingComment: comment } as any }).catch(() => ticket);
-    return { ticketId, rating, comment, status: (updated as any).status ?? ticket.status };
+    // SP-025: rating tidak boleh ditimpa — tolak bila sudah ada. Kolom
+    // rating/ratingComment memang ada di schema SupportTicket (tidak ada
+    // model rating terpisah), jadi update langsung tanpa dynamic model
+    // opsional dan tanpa catch yang membungkam error.
+    if (ticket.rating !== null) {
+      throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'Ticket has already been rated' });
+    }
+    const updated = await this.prisma.supportTicket.update({
+      where: { id: ticketId },
+      data: { rating, ratingComment: comment ?? null },
+    });
+    return { ticketId, rating, comment, status: updated.status };
   }
 }

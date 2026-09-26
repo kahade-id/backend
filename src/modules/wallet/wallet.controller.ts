@@ -18,6 +18,7 @@ import { ResendWithdrawOtpDto } from './dto/resend-withdraw-otp.dto';
 import { SetPinDto, VerifyPinDto } from './dto/wallet-pin.dto';
 import { ExportCsvDto } from './dto/export-csv.dto';
 import { TransferDto } from './dto/transfer.dto';
+import { TopupFeeEstimateDto } from './dto/topup-fee-estimate.dto';
 import { formatWIBDate } from '../../common/utils/date.util';
 
 @ApiTags('wallet')
@@ -185,6 +186,27 @@ export class WalletController {
   @ApiOperation({ summary: 'List available payment methods with fees' })
   async getPaymentMethods(): Promise<object> {
     return this.walletService.getPaymentMethods();
+  }
+
+  @Get('topup/fee-estimate')
+  @ApiOperation({
+    summary: 'Canonical top-up fee + total estimate (server-side)',
+    description:
+      'WF-008: returns the fee and total computed with the same logic as the charge path, so the client no longer recomputes the payable total itself. Read-only.',
+  })
+  async estimateTopupFee(@Query() query: TopupFeeEstimateDto): Promise<object> {
+    return this.walletService.estimateTopupFee(query.amount, query.method);
+  }
+
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @Get('limits')
+  @ApiOperation({
+    summary: 'Effective wallet amount limits (server-side)',
+    description:
+      'FX-010: returns the per-transaction min/max the server actually enforces (DTO constraints ∩ env-configured guards), so the client no longer relies on a static copy that can drift. Read-only, authenticated.',
+  })
+  async getWalletLimits(): Promise<object> {
+    return this.walletService.getWalletLimits();
   }
 
   @Throttle({ default: { ttl: 60000, limit: 5 } })

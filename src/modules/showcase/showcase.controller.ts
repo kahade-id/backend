@@ -15,6 +15,7 @@ import { ParseIdPipe } from '../../common/pipes/parse-id.pipe';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 import { ShowcaseFeedQueryDto } from './dto/showcase-feed-query.dto';
 import { CreateShowcaseCommentDto, UpdateShowcaseCommentDto } from './dto/showcase-comment.dto';
+import { ReportShowcaseDto } from './dto/report-showcase.dto';
 
 class SetCommentHiddenDto {
   @ApiPropertyOptional({
@@ -242,8 +243,9 @@ export class ShowcaseController {
   async reportShowcase(
     @CurrentUser('sub') userId: string,
     @Param('showcaseId', ParseIdPipe) showcaseId: string,
-    @Body() dto: { reason: string; description?: string },
-  ): Promise<object> {
-    return this.showcaseService.reportShowcase(userId, showcaseId, dto.reason, dto.description);
+    @Body() dto: ReportShowcaseDto,
+    @Req() req: Request,
+  ): Promise<{ reported: true; reportId: string }> {
+    return this.showcaseService.reportShowcase(userId, showcaseId, dto, { ipAddress: req.ip });
   }
 }

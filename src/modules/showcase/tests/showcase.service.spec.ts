@@ -7,6 +7,7 @@ import { CreateShowcaseItemDto, UpdateShowcaseItemDto } from '../dto/showcase-it
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { UploadService } from '../../upload/upload.service';
+import { AuditLogService } from '../../../common/services/audit-log.service';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { SHOWCASE_MAX_IMAGES, SHOWCASE_MAX_ITEMS } from '../../../common/constants/app.constants';
 
@@ -172,6 +173,7 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
         { provide: RedisService, useValue: mockRedis },
         { provide: UploadService, useValue: mockUpload },
         { provide: ConfigService, useValue: mockConfig },
+        { provide: AuditLogService, useValue: { logUserAction: jest.fn(), logAdminAction: jest.fn() } },
       ],
     }).compile();
     service = module.get<ShowcaseService>(ShowcaseService);

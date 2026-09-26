@@ -20,6 +20,8 @@ import {
 import { CreateShowcaseItemDto, UpdateShowcaseItemDto } from './dto/showcase-item.dto';
 import { CreateShowcaseCommentDto, UpdateShowcaseCommentDto } from './dto/showcase-comment.dto';
 import { ShowcaseFeedQueryDto, ShowcaseFeedSort } from './dto/showcase-feed-query.dto';
+import { ReportShowcaseDto } from './dto/report-showcase.dto';
+import { AuditLogService } from '../../common/services/audit-log.service';
 
 /**
  * Section 3 — Showcase sebagai konten sosial + feed discover.
@@ -154,6 +156,7 @@ export class ShowcaseService {
     private readonly redis: RedisService,
     private readonly uploadService: UploadService,
     private readonly configService: ConfigService,
+    private readonly auditLog: AuditLogService,
   ) {}
 
   // ==================================================================
@@ -1252,31 +1255,81 @@ export class ShowcaseService {
     }
   }
 
-  async reportShowcase(userId: string, showcaseId: string, reason: string, description?: string): Promise<object> {
-    const showcase = await this.prisma.userShowcase.findUnique({ where: { id: showcaseId }, select: { id: true, userId: true } });
-    if (!showcase) throw new BadRequestException({ code: ErrorCodes.NOT_FOUND ?? 'NOT_FOUND', message: 'Showcase not found' });
-    if (showcase.userId === userId) throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Cannot report own showcase' });
+  /**
+   * Laporkan item showcase (Etalase) oleh user.
+   *
+   * Alur:
+   * 1. Visibility check via `findVisibleShowcase` — item PRIVATE/inactive/
+   *    milik akun banned tidak bisa dilaporkan (404).
+   * 2. Tolak laporan terhadap item sendiri (400).
+   * 3. Cegah duplikat: satu user hanya boleh melaporkan satu item sekali (409).
+   * 4. Simpan ke `showcase_reports` + catat ke user audit log (`SHOWCASE_REPORTED`).
+   *
+   * Validasi `reason`/`description` ditangani `ReportShowcaseDto` via ValidationPipe.
+   */
+  async reportShowcase(
+    userId: string,
+    showcaseId: string,
+    dto: ReportShowcaseDto,
+    opts?: { ipAddress?: string },
+  ): Promise<{ reported: true; reportId: string }> {
+    // 1. Visibility check — hanya item yang terlihat oleh pelapor yang bisa dilaporkan.
+    const visible = await this.findVisibleShowcase(showcaseId, userId);
+    if (!visible) {
+      throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
+    }
+    if (visible.row.userId === userId) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Cannot report own showcase' });
+    }
 
-    // Use UserReport as generic report table if ShowcaseReport doesn't exist, else create via prisma
+    // 2. Cegah duplikat.
+    const existing = await this.prisma.showcaseReport.findUnique({
+      where: { showcaseId_reporterId: { showcaseId, reporterId: userId } },
+      select: { id: true },
+    });
+    if (existing) {
+      throw new ConflictException({ code: ErrorCodes.SHOWCASE_ALREADY_REPORTED, message: 'Showcase already reported by this user' });
+    }
+
+    // 3. Simpan laporan. Unique constraint (showcaseId, reporterId) sebagai
+    // pertahanan kedua terhadap race condition.
+    let report: { id: string };
     try {
-      const report = await (this.prisma as any).showcaseReport?.create?.({
-        data: { showcaseId, reporterId: userId, reason, description: description?.slice(0, 1000) },
+      report = await this.prisma.showcaseReport.create({
+        data: {
+          showcaseId,
+          reporterId: userId,
+          reason: dto.reason,
+          description: dto.description ?? null,
+        },
+        select: { id: true },
       });
-      if (report) return { reported: true, reportId: report.id };
-    } catch {}
+    } catch (err) {
+      // P2002 = pelanggaran unique constraint (race: dua request paralel).
+      // Cek via properti `code` (bukan instanceof) agar robust terhadap
+      // varian error Prisma yang di-wrap.
+      if ((err as { code?: string })?.code === 'P2002') {
+        throw new ConflictException({ code: ErrorCodes.SHOWCASE_ALREADY_REPORTED, message: 'Showcase already reported by this user' });
+      }
+      this.logger.error(`Failed to create showcase report for ${showcaseId} by ${userId}: ${(err as Error).message}`);
+      throw err;
+    }
 
-    // Fallback: create entry in admin audit log + redis alert
-    await this.prisma.adminAuditLog.create({
-      data: {
-        adminId: (await this.prisma.adminUser.findFirst({ where: { role: 'SUPER_ADMIN' }, select: { id: true } }))?.id ?? userId,
-        action: 'SYSTEM_CONFIG_CHANGED' as any,
-        targetType: 'ShowcaseItem',
-        targetId: showcaseId,
-        description: `User ${userId} reported showcase ${showcaseId}: ${reason} ${description ?? ''}`,
-        ipAddress: 'system',
-      },
-    }).catch(() => {});
+    // 4. Audit trail sisi user — BUKAN adminAuditLog (pelapor adalah user biasa,
+    // bukan admin). Kegagalan audit tidak menggagalkan laporan yang sudah tersimpan.
+    try {
+      this.auditLog.logUserAction({
+        userId,
+        action: 'SHOWCASE_REPORTED',
+        entityType: 'ShowcaseItem',
+        entityId: showcaseId,
+        description: `User ${userId} reported showcase ${showcaseId}: ${dto.reason}`,
+        ipAddress: opts?.ipAddress,
+      });
+    } catch (err) {
+      this.logger.warn(`Failed to write audit log for showcase report ${report.id}: ${(err as Error).message}`);
+    }
 
-    return { reported: true, showcaseId, reason };
+    return { reported: true, reportId: report.id };
   }
 }

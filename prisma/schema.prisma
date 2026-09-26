@@ -573,6 +573,8 @@ enum UserAuditAction {
   // Device Trust
   DEVICE_TRUSTED
   DEVICE_UNTRUSTED
+  // Showcase
+  SHOWCASE_REPORTED
 }
 
 // ============================================================
@@ -766,6 +768,7 @@ model User {
   blockedByUsers          BlockList[]             @relation("BlockedUser")
   reportsSubmitted        UserReport[]            @relation("ReportSubmitter")
   reportsReceived         UserReport[]            @relation("ReportTarget")
+  showcaseReportsSubmitted ShowcaseReport[]       @relation("ShowcaseReportReporter")
   auditLogs               AuditLog[]
   paymentTransactions     PaymentTransaction[]
   initiatedDisputes       Dispute[]               @relation("DisputeInitiatorUser")
@@ -3004,6 +3007,7 @@ model UserShowcase {
   images   ShowcaseImage[]
   likes    ShowcaseLike[]
   comments ShowcaseComment[]
+  reports  ShowcaseReport[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -3015,6 +3019,34 @@ model UserShowcase {
   @@index([visibility, isActive, likeCount, id])
   @@index([category])
   @@map("user_showcases")
+}
+
+/// Laporan user terhadap item showcase (Etalase). Satu user hanya boleh
+/// melaporkan satu item sekali — duplikat dicegah via unique constraint
+/// (showcaseId, reporterId). Diproses oleh admin via antrean moderasi.
+model ShowcaseReport {
+  id         String       @id @default(cuid())
+  showcaseId String
+  showcase   UserShowcase @relation(fields: [showcaseId], references: [id], onDelete: Cascade)
+  reporterId String
+  reporter   User         @relation("ShowcaseReportReporter", fields: [reporterId], references: [id], onDelete: Cascade)
+
+  reason      String  @db.VarChar(100)
+  description String? @db.VarChar(1000)
+
+  status     ReportStatus @default(PENDING)
+  reviewedBy String? // Admin ID (soft FK ke admin_users.id)
+  reviewedAt DateTime?
+  resolution String?      @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([showcaseId, reporterId])
+  @@index([status])
+  @@index([showcaseId])
+  @@index([reporterId])
+  @@map("showcase_reports")
 }
 
 /// Visibilitas item showcase di feed discover / profil publik.

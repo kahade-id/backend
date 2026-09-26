@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { escapeLikePattern } from '../../common/utils/search.util';
@@ -20,7 +21,7 @@ export class SearchService {
       typeSet.has('users') ? this.searchUsers(q, userId, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
       typeSet.has('orders') ? this.searchOrders(userId, q, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
       typeSet.has('transactions') ? this.searchTransactions(userId, q, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
-      typeSet.has('showcase') ? this.searchShowcase(q, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
+      typeSet.has('showcase') ? this.searchShowcase(q, userId, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
       typeSet.has('help-center') ? this.searchHelpCenter(q, effectiveLimit) : Promise.resolve({ results: [], total: 0 }),
     ]);
 
@@ -42,12 +43,13 @@ export class SearchService {
         showcase: showcase.total,
         helpCenter: helpCenter.total,
       },
-      // 13.1 hint: if main results empty, suggest trying help-center
+      // S2 (audit Discovery 2026-09-26): hint berbahasa Indonesia — aplikasi
+      // Kahade berbahasa Indonesia dan frontend menampilkan hint ini apa adanya.
       ...(users.total === 0 && orders.total === 0 && transactions.total === 0 && showcase.total === 0 && helpCenter.total > 0
-        ? { hint: 'No results in users/orders/transactions/showcase, but found help articles — try help-center' }
+        ? { hint: 'Tidak ada hasil di pengguna, pesanan, mutasi, atau etalase — tapi ada artikel bantuan yang cocok' }
         : {}),
       ...(users.total === 0 && orders.total === 0 && transactions.total === 0 && showcase.total === 0 && helpCenter.total === 0
-        ? { hint: 'No results found — try searching in Help Center or check your spelling' }
+        ? { hint: 'Tidak ada hasil — coba periksa ejaan atau gunakan kata kunci lain' }
         : {}),
     };
   }
@@ -90,7 +92,10 @@ export class SearchService {
     if (!tsQuery) return { suggestions: [] };
 
     const effectiveLimit = Number.isSafeInteger(limit) ? Math.min(Math.max(limit as number, 1), 20) : 6;
-    const halfLimit = Math.max(Math.ceil(effectiveLimit / 2), 1);
+    // S1 (audit Discovery 2026-09-26): saran dibagi rata ke tiga sumber —
+    // sebelumnya hanya user + order, padahal konten yang paling sering dicari
+    // adalah judul karya/etalase.
+    const thirdLimit = Math.max(Math.ceil(effectiveLimit / 3), 1);
 
     const blockedIds = await this.getBlockedUserIds(userId);
     const blockedIdsArray = blockedIds.length > 0 ? blockedIds : ['__none__'];
@@ -98,7 +103,10 @@ export class SearchService {
     const users = await this.prisma.$queryRaw<{ label: string; type: string }[]>`
       SELECT "fullName" AS label, 'user' AS type
       FROM users
-      WHERE to_tsvector('simple', COALESCE("fullName",'') || ' ' || COALESCE("username",''))
+      -- T1 (audit Discovery 2026-09-26): urutan operan HARUS sama persis dengan
+      -- index GIN idx_users_fts_search (username dulu, baru fullName) — Postgres
+      -- hanya memakai expression index bila ekspresinya identik.
+      WHERE to_tsvector('simple', coalesce(username, '') || ' ' || "fullName")
             @@ to_tsquery('simple', ${tsQuery})
         AND "isActive" = true
         AND "isBanned" = false
@@ -106,10 +114,30 @@ export class SearchService {
         AND "profileVisible" = true
         AND id NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
       ORDER BY ts_rank(
-        to_tsvector('simple', COALESCE("fullName",'') || ' ' || COALESCE("username",'')),
+        to_tsvector('simple', coalesce(username, '') || ' ' || "fullName"),
         to_tsquery('simple', ${tsQuery})
       ) DESC, "fullName" ASC, id ASC
-      LIMIT ${halfLimit}
+      LIMIT ${thirdLimit}
+    `.catch(() => []);
+
+    const showcase = await this.prisma.$queryRaw<{ label: string; type: string }[]>`
+      SELECT title AS label, 'showcase' AS type
+      FROM user_showcases
+      WHERE "deletedAt" IS NULL
+        AND "isPublic" = true
+        AND "isActive" = true
+        -- T3 (audit Discovery 2026-09-26): paritas privasi dengan searchShowcase
+        -- & getFeed — judul milik akun banned/nonaktif/privat tidak boleh bocor
+        -- di autocomplete.
+        AND "userId" IN (SELECT id FROM users WHERE "isActive" = true AND "isBanned" = false AND "deletedAt" IS NULL AND "profileVisible" = true)
+        AND "userId" NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
+        AND to_tsvector('simple', COALESCE(title,''))
+            @@ to_tsquery('simple', ${tsQuery})
+      ORDER BY ts_rank(
+        to_tsvector('simple', COALESCE(title,'')),
+        to_tsquery('simple', ${tsQuery})
+      ) DESC, "createdAt" DESC, id ASC
+      LIMIT ${thirdLimit}
     `.catch(() => []);
 
     const orders = await this.prisma.$queryRaw<{ label: string; type: string }[]>`
@@ -120,10 +148,10 @@ export class SearchService {
         AND to_tsvector('simple', COALESCE(title,''))
             @@ to_tsquery('simple', ${tsQuery})
       ORDER BY "createdAt" DESC, id ASC
-      LIMIT ${halfLimit}
+      LIMIT ${thirdLimit}
     `.catch(() => []);
 
-    return { suggestions: [...users, ...orders].slice(0, effectiveLimit) };
+    return { suggestions: [...users, ...showcase, ...orders].slice(0, effectiveLimit) };
   }
 
   private async searchUsers(query: string, userId?: string, limit?: number): Promise<{ results: object[]; total: number }> {
@@ -149,11 +177,11 @@ export class SearchService {
           SELECT
             id, username, "fullName", "avatarUrl",
             ts_rank(
-              to_tsvector('simple', COALESCE("fullName",'') || ' ' || COALESCE("username",'')),
+              to_tsvector('simple', coalesce(username, '') || ' ' || "fullName"),
               to_tsquery('simple', ${tsQuery})
             ) AS rank
           FROM users
-          WHERE to_tsvector('simple', COALESCE("fullName",'') || ' ' || COALESCE("username",''))
+          WHERE to_tsvector('simple', coalesce(username, '') || ' ' || "fullName")
                 @@ to_tsquery('simple', ${tsQuery})
             AND "isActive" = true
             AND "isBanned" = false
@@ -165,7 +193,7 @@ export class SearchService {
         `.catch(() => []),
         this.prisma.$queryRaw<{ count: bigint }[]>`
           SELECT COUNT(*) AS count FROM users
-          WHERE to_tsvector('simple', COALESCE("fullName",'') || ' ' || COALESCE("username",''))
+          WHERE to_tsvector('simple', coalesce(username, '') || ' ' || "fullName")
                 @@ to_tsquery('simple', ${tsQuery})
             AND "isActive" = true
             AND "isBanned" = false
@@ -282,23 +310,35 @@ export class SearchService {
     return { results: rows, total };
   }
 
-  private async searchShowcase(query: string, limit?: number): Promise<{ results: object[]; total: number }> {
+  private async searchShowcase(query: string, userId: string | undefined, limit?: number): Promise<{ results: object[]; total: number }> {
     const take = limit || this.LIMIT;
     const tsQuery = this.buildTsQuery(query);
+    // T2 (audit Discovery 2026-09-26): paritas privasi dengan searchUsers —
+    // item milik akun yang diblokir / akun nonaktif / profil privat tidak
+    // boleh muncul di hasil pencarian (feed getFeed sudah menyaring ini).
+    const blockedIds = userId ? await this.getBlockedUserIds(userId) : [];
+    const blockedIdsArray = blockedIds.length > 0 ? blockedIds : ['__none__'];
+    // Fragmen SQL mentah (bukan parameter) — Prisma mengutip string biasa
+    // sebagai nilai, jadi harus dibungkus Prisma.raw.
+    const ownerVisibilitySql = Prisma.raw(`"userId" IN (SELECT id FROM users WHERE "isActive" = true AND "isBanned" = false AND "deletedAt" IS NULL AND "profileVisible" = true)`);
     if (tsQuery) {
       try {
         const rows = await this.prisma.$queryRaw<object[]>`
           SELECT id, title, description, "userId", "createdAt",
                  ts_rank(to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,'')), to_tsquery('simple', ${tsQuery})) AS rank
           FROM user_showcases
-          WHERE "deletedAt" IS NULL AND "isPublic" = true
+          WHERE "deletedAt" IS NULL AND "isPublic" = true AND "isActive" = true
+            AND ${ownerVisibilitySql}
+            AND "userId" NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
             AND to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,'')) @@ to_tsquery('simple', ${tsQuery})
           ORDER BY rank DESC, "createdAt" DESC
           LIMIT ${take}
         `;
         const countResult = await this.prisma.$queryRaw<{ count: bigint }[]>`
           SELECT COUNT(*) as count FROM user_showcases
-          WHERE "deletedAt" IS NULL AND "isPublic" = true
+          WHERE "deletedAt" IS NULL AND "isPublic" = true AND "isActive" = true
+            AND ${ownerVisibilitySql}
+            AND "userId" NOT IN (SELECT unnest(${blockedIdsArray}::text[]))
             AND to_tsvector('simple', COALESCE(title,'') || ' ' || COALESCE(description,'')) @@ to_tsquery('simple', ${tsQuery})
         `.catch(() => [{ count: BigInt(0) }]);
         return { results: rows as object[], total: Number(countResult[0]?.count ?? 0) };
@@ -308,6 +348,14 @@ export class SearchService {
       const where = {
         deletedAt: null,
         isPublic: true,
+        isActive: true,
+        user: {
+          isActive: true,
+          isBanned: false,
+          deletedAt: null,
+          profileVisible: true,
+          ...(blockedIds.length > 0 ? { id: { notIn: blockedIds } } : {}),
+        },
         OR: [
           { title: { contains: escapeLikePattern(query), mode: 'insensitive' as const } },
           { description: { contains: escapeLikePattern(query), mode: 'insensitive' as const } },

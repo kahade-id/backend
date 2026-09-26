@@ -185,6 +185,9 @@ export class OrderExtensionsService {
     const order = extension.order;
     if (orderId && order.orderId !== orderId) throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Extension request not found for this order' });
 
+    // S1 (audit 2026-09-26): jangan proses extension untuk order yang di-soft-delete.
+    if (order.deletedAt) throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
+
     if (order.buyerId !== responderId) throw new ForbiddenException({ code: ErrorCodes.FORBIDDEN, message: 'Only the buyer can approve or reject an extension request' });
 
     if (extension.status !== DeadlineExtensionStatus.PENDING) {

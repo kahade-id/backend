@@ -67,6 +67,18 @@ export function addDays(date: Date, days: number): Date {
   return dayjs(date).add(days, 'day').toDate();
 }
 
+/**
+ * T3 (audit 2026-09-26): tentukan deliveryDeadlineAt saat pembayaran.
+ * Tanggal eksplisit pilihan user (diset saat order dibuat) dihormati selama masih di
+ * masa depan; jika sudah basi (mis. pembayaran telat) atau tidak ada, dihitung dari
+ * jumlah hari seperti perilaku lama.
+ */
+export function resolveDeliveryDeadlineAt(explicit: Date | null | undefined, fallbackDays: number): Date {
+  const now = new Date();
+  if (explicit && explicit.getTime() > now.getTime()) return explicit;
+  return addDays(now, fallbackDays);
+}
+
 export function isExpired(date: Date): boolean {
   return dayjs(date).isBefore(dayjs());
 }

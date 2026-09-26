@@ -238,12 +238,16 @@ enum NotificationType {
   DISPUTE_SUBMITTED
   DISPUTE_ADMIN_JOINED
   DISPUTE_DECISION
+  DISPUTE_EVIDENCE_SUBMITTED
+  DISPUTE_CLAIM_SUBMITTED
+  DISPUTE_ESCALATED
   CHAT_NEW_MESSAGE
   WALLET_TOPUP_SUCCESS
   WALLET_TOPUP_FAILED
   WALLET_WITHDRAW_SUCCESS
   WALLET_WITHDRAW_FAILED
   WALLET_FUNDS_RELEASED
+  WALLET_REFUND_RECEIVED
   WALLET_TRANSFER_SENT
   WALLET_TRANSFER_RECEIVED
   KYC_APPROVED
@@ -3003,6 +3007,9 @@ model UserShowcase {
   likeCount    Int @default(0)
   commentCount Int @default(0)
   viewCount    Int @default(0)
+  /// Jumlah kali deep link share dibuka/dibagikan. Di-increment atomik saat
+  /// GET /v1/showcase/:id/share (pola atomic counter seperti likeCount).
+  shareCount   Int @default(0)
 
   images   ShowcaseImage[]
   likes    ShowcaseLike[]

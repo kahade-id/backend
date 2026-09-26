@@ -201,6 +201,8 @@ export class OrdersService {
       orderType: OrderType;
       orderValue: number;
       deliveryDeadlineDays: number;
+      // T3 (audit 2026-09-26): tanggal kalender eksplisit, opsional.
+      deliveryDeadlineAt?: string;
       feeResponsibility: FeeResponsibility;
       voucherCode?: string;
       attachments?: string[];
@@ -234,6 +236,34 @@ export class OrdersService {
         code: ErrorCodes.VALIDATION_ERROR,
         message: `Delivery deadline must be between ${DELIVERY_DEADLINE_DAYS_MIN} and ${DELIVERY_DEADLINE_DAYS_MAX} days`,
       });
+    }
+
+    // T3 (audit 2026-09-26): tenggat boleh dipilih sebagai tanggal kalender, bukan
+    // sekadar jumlah hari. Jika diberikan, tanggalnya yang dipakai (disimpan langsung
+    // sebagai deliveryDeadlineAt); deliveryDeadlineDays tetap dikirim sebagai fallback
+    // kompatibilitas bila tanggal sudah basi saat pembayaran terjadi.
+    //
+    // `parseDateBoundaryWIB(..., 'end')` mengartikan "2026-10-05" sebagai 23:59:59 WIB
+    // di tanggal itu — sesuai ekspektasi user yang memilih tanggal di kalender.
+    let explicitDeliveryDeadlineAt: Date | null = null;
+    if (dto.deliveryDeadlineAt !== undefined && dto.deliveryDeadlineAt !== null && String(dto.deliveryDeadlineAt).trim() !== '') {
+      const parsed = parseDateBoundaryWIB(String(dto.deliveryDeadlineAt).trim(), 'end');
+      if (!parsed) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'deliveryDeadlineAt must be a valid ISO 8601 date-time or YYYY-MM-DD calendar date',
+        });
+      }
+      const nowMs = Date.now();
+      const minMs = nowMs + 24 * 60 * 60 * 1000; // minimal besok
+      const maxMs = nowMs + DELIVERY_DEADLINE_DAYS_MAX * 24 * 60 * 60 * 1000;
+      if (parsed.getTime() < minMs || parsed.getTime() > maxMs) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: `deliveryDeadlineAt must be between tomorrow and ${DELIVERY_DEADLINE_DAYS_MAX} days from now`,
+        });
+      }
+      explicitDeliveryDeadlineAt = parsed;
     }
 
     const sanitizedTitle = (typeof dto.title === 'string' ? dto.title : '').replace(/[<>\"'&]/g, '').trim();
@@ -487,6 +517,8 @@ export class OrdersService {
               isKahadePlus: effectiveKahadePlus,
               feeRate: txFeeCalc.feeRate,
               deliveryDeadlineDays: dto.deliveryDeadlineDays,
+              // T3: tanggal eksplisit pilihan user — dipakai saat pembayaran bila masih di masa depan.
+              deliveryDeadlineAt: explicitDeliveryDeadlineAt,
               confirmationDeadlineAt,
               voucherDiscount: txFeeCalc.voucherDiscount,
               membershipRankDiscount: txFeeCalc.membershipRankDiscount,
@@ -1116,8 +1148,10 @@ export class OrdersService {
     let buyerId: string | undefined;
     let orderType: OrderType | undefined;
     await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      // T1 (audit 2026-09-26): AUDIT-16 tidak mencakup method ini — order yang di-soft-delete
+      // masih bisa di-"process" (dikirim). Filter deletedAt seperti path state lain.
       const order = await tx.order.findFirst({
-        where: { orderId, sellerId },
+        where: { orderId, sellerId, deletedAt: null },
       });
       if (!order) {
         const exists = await tx.order.findUnique({ where: { orderId }, select: { id: true } });
@@ -1167,7 +1201,8 @@ export class OrdersService {
     const validStatuses: OrderStatus[] = [OrderStatus.PROCESSING, OrderStatus.IN_DELIVERY];
 
     const result = await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      const order = await tx.order.findUnique({ where: { orderId } });
+      // T1 (audit 2026-09-26): lihat processOrder — order terhapus tidak boleh diubah pengirimannya.
+      const order = await tx.order.findFirst({ where: { orderId, deletedAt: null } });
       if (!order) throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
       if (order.sellerId !== sellerId) throw new ForbiddenException({ code: ErrorCodes.NOT_ORDER_PARTICIPANT, message: 'Not authorized' });
 

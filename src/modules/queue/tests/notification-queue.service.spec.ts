@@ -2,16 +2,19 @@ import { Test } from '@nestjs/testing';
 import { getQueueToken } from '@nestjs/bull';
 import { NotificationQueueService } from '../notification-queue.service';
 import { NOTIFICATION_QUEUE } from '../processors/notification.processor';
+import { RedisService } from '../../../redis/redis.service';
 
 describe('NotificationQueueService', () => {
   let svc: NotificationQueueService;
   const queue = { add: jest.fn(async () => undefined), addBulk: jest.fn(async () => undefined) };
+  const redis = { setNx: jest.fn(async () => true) };
   beforeEach(async () => {
     jest.resetAllMocks();
     const mod = await Test.createTestingModule({
       providers: [
         NotificationQueueService,
         { provide: getQueueToken(NOTIFICATION_QUEUE), useValue: queue },
+        { provide: RedisService, useValue: redis },
       ],
     }).compile();
     svc = mod.get(NotificationQueueService);
@@ -39,5 +42,30 @@ describe('NotificationQueueService', () => {
   it('does not throw when the broker is temporarily unavailable', async () => {
     queue.add.mockRejectedValueOnce(new Error('broker unavailable'));
     await expect(svc.enqueue({ userId: 'u1', type: 'ORDER_COMPLETED' as any, payload: { orderId: 'ORD-1' } } as any)).resolves.toBeUndefined();
+  });
+
+  it('mendup duplikat enqueue untuk event bisnis yang sama', async () => {
+    // Simulasi: setNx pertama berhasil (true), kedua gagal (false = duplikat).
+    redis.setNx
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+    const job = {
+      userId: 'u1',
+      type: 'ORDER_COMPLETED' as any,
+      title: 'T',
+      body: 'B',
+      pushData: { orderId: 'ORD-1' },
+    };
+    await svc.enqueue(job as any);
+    await svc.enqueue(job as any);
+    // Hanya 1 yang masuk queue; duplikat dilewati.
+    expect(queue.add).toHaveBeenCalledTimes(1);
+  });
+
+  it('tidak mendup event bisnis berbeda', async () => {
+    redis.setNx.mockResolvedValue(true);
+    await svc.enqueue({ userId: 'u1', type: 'ORDER_COMPLETED' as any, title: 'T', body: 'B', pushData: { orderId: 'ORD-1' } } as any);
+    await svc.enqueue({ userId: 'u1', type: 'ORDER_COMPLETED' as any, title: 'T', body: 'B', pushData: { orderId: 'ORD-2' } } as any);
+    expect(queue.add).toHaveBeenCalledTimes(2);
   });
 });

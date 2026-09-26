@@ -67,4 +67,15 @@ describe('UserSearchService', () => {
     expect(res.data[0].isKycVerified).toBe(true);
     expect(res.data[0].followersCount).toBe(7);
   });
+
+  it('matches every word for multi-word queries (T1)', async () => {
+    await service.searchUsers('budi santoso', {}, 1, 10);
+    const call = mockPrisma.user.findMany.mock.calls[0][0];
+    // AND per kata — bukan string literal "budi & santoso" yang tak pernah cocok.
+    expect(call.where.AND).toHaveLength(2);
+    const serialized = JSON.stringify(call.where.AND);
+    expect(serialized).not.toContain('&');
+    expect(serialized).toContain('budi');
+    expect(serialized).toContain('santoso');
+  });
 });

@@ -7,7 +7,7 @@ import { ReferralService } from '../referral/referral.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { MembershipRankService } from './membership-rank.service';
 import { OrderStatus, OrderCancelReason, ActorType, WalletTransactionType, WalletTransactionStatus, SubscriptionStatus, NotificationType, Prisma, VoucherType } from '@prisma/client';
-import { addDays } from '../../common/utils/date.util';
+import { addDays, resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { FeeCalculatorService } from './fee-calculator.service';
@@ -403,7 +403,8 @@ export class OrderStateService {
           status: OrderStatus.PROCESSING,
           paidAt: new Date(),
           processedAt: new Date(),
-          deliveryDeadlineAt: addDays(new Date(), order.deliveryDeadlineDays ?? 3),
+          // T3: hormati tanggal eksplisit pilihan user bila masih di masa depan.
+          deliveryDeadlineAt: resolveDeliveryDeadlineAt(order.deliveryDeadlineAt, order.deliveryDeadlineDays ?? 3),
         },
       });
       if (orderUpdated.count === 0) {
@@ -1047,6 +1048,15 @@ export class OrderStateService {
       for (const recipientId of [adminOrder.buyerId, adminOrder.sellerId]) {
         await this.notificationQueue.enqueue({ userId: recipientId, type: NotificationType.ORDER_CANCELLED, title: 'Order Cancelled by Admin', body: `Order "${adminOrder.title}" has been cancelled by an administrator.${reason ? ` Reason: ${reason}` : ''}`, pushData: { type: 'ORDER_CANCELLED', orderId } });
       }
+      // Buyer wajib tahu dananya kembali ke wallet — tanpa ini user panik
+      // mengira uang hangus.
+      await this.notificationQueue.enqueue({
+        userId: adminOrder.buyerId,
+        type: NotificationType.WALLET_REFUND_RECEIVED,
+        title: 'Refund Received',
+        body: `Refund for order "${adminOrder.title}" has been credited to your wallet.`,
+        pushData: { type: 'WALLET_REFUND_RECEIVED', orderId },
+      });
     }, 'ADMIN_CANCEL_ORDER_NOTIFICATION');
   }
 

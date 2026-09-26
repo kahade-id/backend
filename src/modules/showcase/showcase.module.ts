@@ -4,6 +4,7 @@ import { PrismaModule } from '../../prisma/prisma.module';
 import { RedisModule } from '../../redis/redis.module';
 import { UploadModule } from '../upload/upload.module';
 import { AuditLogModule } from '../../common/services/audit-log.module';
+import { VerificationBadgeModule } from '../users/verification-badge.module';
 import { ShowcaseController } from './showcase.controller';
 import { ShowcaseService } from './showcase.service';
 
@@ -17,7 +18,7 @@ import { ShowcaseService } from './showcase.service';
  * tanpa memindahkan route lama.
  */
 @Module({
-  imports: [ConfigModule, PrismaModule, RedisModule, UploadModule, AuditLogModule],
+  imports: [ConfigModule, PrismaModule, RedisModule, UploadModule, AuditLogModule, VerificationBadgeModule],
   controllers: [ShowcaseController],
   providers: [ShowcaseService],
   exports: [ShowcaseService],

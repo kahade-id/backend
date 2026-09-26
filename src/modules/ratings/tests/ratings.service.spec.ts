@@ -3,6 +3,7 @@ import { NotFoundException, BadRequestException, ForbiddenException } from '@nes
 import { Prisma } from '@prisma/client';
 import { RatingsService } from '../ratings.service';
 import { PrismaService } from '../../../prisma/prisma.service';
+import { RedisService } from '../../../redis/redis.service';
 
 const mockPrisma: any = {
   order: { findFirst: jest.fn() },
@@ -20,6 +21,8 @@ const mockPrisma: any = {
 
 describe('RatingsService', () => {
   let service: RatingsService;
+  // K1 (audit 2026-09-26): RatingsService kini memakai RedisService untuk toggleHelpful.
+  let mockRedis: { getPrefix: jest.Mock; getClient: jest.Mock; eval: jest.Mock };
 
   beforeEach(async () => {
     jest.resetAllMocks();
@@ -31,8 +34,19 @@ describe('RatingsService', () => {
     mockPrisma.user.update.mockResolvedValue({});
     mockPrisma.notification.create.mockResolvedValue({});
     mockPrisma.user.findUnique.mockResolvedValue({ fullName: 'Alice', username: 'alice' });
+    mockRedis = {
+      getPrefix: jest.fn().mockReturnValue('kahade:'),
+      getClient: jest.fn().mockReturnValue({ eval: jest.fn() }),
+      eval: jest.fn(),
+    };
+    // Arahkan getClient().eval ke mock eval agar mudah dikontrol per-test.
+    mockRedis.getClient.mockReturnValue({ eval: mockRedis.eval });
     const module: TestingModule = await Test.createTestingModule({
-      providers: [RatingsService, { provide: PrismaService, useValue: mockPrisma }],
+      providers: [
+        RatingsService,
+        { provide: PrismaService, useValue: mockPrisma },
+        { provide: RedisService, useValue: mockRedis },
+      ],
     }).compile();
     service = module.get<RatingsService>(RatingsService);
   });
@@ -238,6 +252,46 @@ describe('RatingsService', () => {
       await service.getMyRatings('u1', -4, 0);
       expect(mockPrisma.rating.findMany.mock.calls[0][0]).toMatchObject({ skip: 0, take: 20 });
       expect(mockPrisma.rating.findMany.mock.calls[1][0]).toMatchObject({ skip: 0, take: 20 });
+    });
+  });
+
+  describe('toggleHelpful (K1 audit 2026-09-26)', () => {
+    beforeEach(() => {
+      mockPrisma.rating.findUnique.mockResolvedValue({ id: 'r1', giverId: 'giver', isHidden: false });
+    });
+
+    it('throws NotFoundException for missing or hidden rating', async () => {
+      mockPrisma.rating.findUnique.mockResolvedValue(null);
+      await expect(service.toggleHelpful('u1', 'r1')).rejects.toThrow(NotFoundException);
+      mockPrisma.rating.findUnique.mockResolvedValue({ id: 'r1', giverId: 'g', isHidden: true });
+      await expect(service.toggleHelpful('u1', 'r1')).rejects.toThrow(NotFoundException);
+    });
+
+    it('throws BadRequestException when giver marks own rating', async () => {
+      await expect(service.toggleHelpful('giver', 'r1')).rejects.toThrow(BadRequestException);
+    });
+
+    it('persists the vote via Redis Lua toggle and returns the resulting state', async () => {
+      mockRedis.eval.mockResolvedValue([1, 3]);
+      const res = await service.toggleHelpful('u1', 'r1');
+      expect(res).toEqual({ helpful: true, helpfulCount: 3 });
+      // Toggle atomik: script Lua, bukan read-modify-write.
+      const [script, numkeys, votersKey, countKey, member] = mockRedis.eval.mock.calls[0];
+      expect(String(script)).toMatch(/SISMEMBER/);
+      expect(numkeys).toBe(2);
+      expect(votersKey).toBe('kahade:rating_helpful:voters:r1');
+      expect(countKey).toBe('kahade:rating_helpful:count:r1');
+      expect(member).toBe('u1');
+    });
+
+    it('maps a removal vote (Lua returns 0) to helpful:false', async () => {
+      mockRedis.eval.mockResolvedValue([0, 2]);
+      await expect(service.toggleHelpful('u1', 'r1')).resolves.toEqual({ helpful: false, helpfulCount: 2 });
+    });
+
+    it('throws BadRequestException (not a silent no-op) when Redis fails', async () => {
+      mockRedis.eval.mockRejectedValue(new Error('redis down'));
+      await expect(service.toggleHelpful('u1', 'r1')).rejects.toThrow(BadRequestException);
     });
   });
 });

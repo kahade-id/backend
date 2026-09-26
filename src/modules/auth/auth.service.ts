@@ -1602,6 +1602,18 @@ export class AuthService {
       });
     }
 
+    // Temp token sekali pakai: tolak replay dalam sisa masa berlaku token
+    // (konsisten dengan verify2faLogin yang mem-blacklist jti setelah sukses).
+    if (payload.jti) {
+      const alreadyConsumed = await this.redis.get(TOKEN_BLACKLIST(payload.jti)).catch(() => null);
+      if (alreadyConsumed) {
+        throw new UnauthorizedException({
+          code: ErrorCodes.TEMP_TOKEN_EXPIRED,
+          message: 'Reset token has already been used. Please request a new OTP.',
+        });
+      }
+    }
+
     const user = await this.prisma.user.findUnique({ where: { id: payload.sub } });
     if (!user || !user.isActive || user.isBanned) {
       throw new BadRequestException({
@@ -1689,6 +1701,25 @@ export class AuthService {
       );
     });
 
+    // Tandai temp token sudah dipakai agar tidak bisa di-replay selama sisa
+    // masa berlakunya (5 menit). Best-effort: reset yang sudah tersimpan di
+    // DB tidak boleh gagal hanya karena Redis tidak tersedia.
+    if (payload.jti) {
+      const tempTtlSeconds =
+        Math.max(
+          ((payload as TempTokenPayload & { exp?: number }).exp ?? 0) -
+            Math.floor(Date.now() / 1000),
+          1,
+        ) + 60;
+      await this.redis
+        .setex(TOKEN_BLACKLIST(payload.jti), tempTtlSeconds, '1', { throwOnError: true })
+        .catch((err: unknown) => {
+          this.logger.warn(
+            `[SECURITY] Password reset persisted but temp-token blacklist propagation failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+    }
+
     // Konfirmasi email hanya bila user punya email (registrasi baru tanpa email).
     if (user.email) {
       this.dispatchEmail({
@@ -1702,6 +1733,7 @@ export class AuthService {
       user.id,
       'Password Reset',
       'Your password was reset and every active session and trusted device was signed out. If this was not you, contact support immediately.',
+      NotificationType.SECURITY_PASSWORD_CHANGED,
     ).catch(() => undefined);
 
     this.auditLog.logUserAction({
@@ -1770,6 +1802,17 @@ export class AuthService {
       });
     }
 
+    // Temp token sekali pakai: tolak replay dalam sisa masa berlaku token.
+    if (payload.jti) {
+      const alreadyConsumed = await this.redis.get(TOKEN_BLACKLIST(payload.jti)).catch(() => null);
+      if (alreadyConsumed) {
+        throw new UnauthorizedException({
+          code: ErrorCodes.TEMP_TOKEN_EXPIRED,
+          message: 'Token migrasi sudah dipakai. Silakan masuk ulang.',
+        });
+      }
+    }
+
     const phoneNumber = normalizeIndonesianPhone(payload.phone);
     const phoneHash = hashPhoneNumber(phoneNumber);
 
@@ -1811,6 +1854,25 @@ export class AuthService {
         phoneVerifiedAt: new Date(),
       },
     });
+
+    // Tandai temp token sudah dipakai agar tidak bisa di-replay selama sisa
+    // masa berlakunya. Best-effort: migrasi yang sudah tersimpan tidak boleh
+    // gagal hanya karena Redis tidak tersedia.
+    if (payload.jti) {
+      const tempTtlSeconds =
+        Math.max(
+          ((payload as TempTokenPayload & { exp?: number }).exp ?? 0) -
+            Math.floor(Date.now() / 1000),
+          1,
+        ) + 60;
+      await this.redis
+        .setex(TOKEN_BLACKLIST(payload.jti), tempTtlSeconds, '1', { throwOnError: true })
+        .catch((err: unknown) => {
+          this.logger.warn(
+            `[SECURITY] Phone migration persisted but temp-token blacklist propagation failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+    }
 
     this.auditLog.logUserAction({
       userId: user.id,
@@ -2824,6 +2886,7 @@ export class AuthService {
       userId,
       'Password Changed',
       'Your password was changed and every active session was signed out. If this was not you, reset your password immediately.',
+      NotificationType.SECURITY_PASSWORD_CHANGED,
     ).catch(() => undefined);
     if (user.email) {
       this.dispatchEmail({
@@ -3010,6 +3073,7 @@ export class AuthService {
       userId,
       'Two-Factor Authentication Enabled',
       'Two-factor authentication was enabled and all active sessions were signed out.',
+      NotificationType.SECURITY_2FA_ENABLED,
     ).catch(() => undefined);
     const securityUser = await this.prisma.user.findUnique({
       where: { id: userId },
@@ -3212,6 +3276,7 @@ export class AuthService {
       userId,
       'Two-Factor Authentication Disabled',
       'Two-factor authentication was disabled and all active sessions were signed out. If this was not you, change your password immediately.',
+      NotificationType.SECURITY_2FA_DISABLED,
     ).catch(() => undefined);
     if (user.email) {
       this.dispatchEmail({
@@ -3720,18 +3785,19 @@ export class AuthService {
     userId: string,
     title: string,
     body: string,
+    type: NotificationType = NotificationType.SECURITY_NEW_LOGIN,
   ): Promise<void> {
     await this.prisma.notification.create({
       data: {
         notifId: generateNotifId(),
         userId,
-        type: NotificationType.SECURITY_NEW_LOGIN,
-        category: getCategoryForType(NotificationType.SECURITY_NEW_LOGIN),
+        type,
+        category: getCategoryForType(type),
         title,
         body,
       },
     });
-    this.prisma.emitNotificationCreated({ userId, title, body, data: { type: 'SECURITY_ALERT' } });
+    this.prisma.emitNotificationCreated({ userId, title, body, data: { type: 'SECURITY_ALERT', notificationType: type } });
   }
 
   private async notifyAccountLocked(

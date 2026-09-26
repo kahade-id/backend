@@ -90,6 +90,9 @@ export class AdminOrdersService {
       where.OR = [
         { orderId: { contains: searchTerm, mode: 'insensitive' } },
         { title: { contains: searchTerm, mode: 'insensitive' } },
+        // A3 (audit 2026-09-26): admin sering menerima keluhan berbasis nomor resi —
+        // schema sudah mengindeks trackingNumber untuk lookup ini.
+        { trackingNumber: { contains: searchTerm, mode: 'insensitive' } },
       ];
     }
     if (startDate && endDate) {

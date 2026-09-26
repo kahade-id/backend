@@ -16,6 +16,7 @@ import {
   SHOWCASE_MAX_IMAGES,
   SHOWCASE_MAX_ITEMS,
   SHOWCASE_REPLY_LIMIT,
+  SHOWCASE_SEARCH_MIN_LENGTH,
   SHOWCASE_VIEW_DEDUPE_TTL_SECONDS,
 } from '../../common/constants/app.constants';
 import { CreateShowcaseItemDto, UpdateShowcaseItemDto } from './dto/showcase-item.dto';
@@ -23,6 +24,7 @@ import { CreateShowcaseCommentDto, UpdateShowcaseCommentDto } from './dto/showca
 import { ShowcaseFeedQueryDto, ShowcaseFeedSort } from './dto/showcase-feed-query.dto';
 import { ReportShowcaseDto } from './dto/report-showcase.dto';
 import { AuditLogService } from '../../common/services/audit-log.service';
+import { VerificationBadgeService } from '../users/verification-badge.service';
 
 /**
  * Section 3 — Showcase sebagai konten sosial + feed discover.
@@ -33,7 +35,7 @@ import { AuditLogService } from '../../common/services/audit-log.service';
  *  - Block-list: viewer tidak pernah melihat item/komentar dari orang yang
  *    saling blokir dengannya (pola user-search.service.ts). Interaksi (like /
  *    komentar) ditolak 403 USER_BLOCKED, bukan disembunyikan diam-diam.
- *  - Counter denormalisasi (likeCount/commentCount/viewCount) selalu di-update
+ *  - Counter denormalisasi (likeCount/commentCount/viewCount/shareCount) selalu di-update
  *    dengan Prisma atomic increment di dalam transaksi yang sama dengan mutasi
  *    barisnya (pola TransactionTemplatesService.recordUsage), dan decrement
  *    diberi guard `gt/gte 0` supaya tidak pernah negatif.
@@ -158,6 +160,7 @@ export class ShowcaseService {
     private readonly uploadService: UploadService,
     private readonly configService: ConfigService,
     private readonly auditLog: AuditLogService,
+    private readonly verificationBadgeService: VerificationBadgeService,
   ) {}
 
   // ==================================================================
@@ -170,9 +173,13 @@ export class ShowcaseService {
    */
   private async getViewerExcludedIds(viewerId?: string): Promise<string[]> {
     if (!viewerId) return [];
+    // S5 (audit Discovery 2026-09-26): cap 1000 seperti getBlockedUserIds di
+    // modul search — block list adalah filter relevansi, bukan security
+    // boundary (visibleOwnerFilter yang menegakkan privasi).
     const blocks = await this.prisma.blockList.findMany({
       where: { OR: [{ blockerId: viewerId }, { blockedId: viewerId }] },
       select: { blockerId: true, blockedId: true },
+      take: 1000,
     });
     const ids = new Set<string>();
     for (const block of blocks) {
@@ -285,6 +292,28 @@ export class ShowcaseService {
   // ==================================================================
 
   /**
+   * S1 (audit 2026-09-26): ambil badge verifikasi untuk sekumpulan author
+   * sekaligus. `getBadges` di-cache di Redis per user, jadi ini murah —
+   * dipakai feed/detail supaya <VerifiedSeal> 3-tier konsisten dengan profil.
+   * Gagal ambil untuk satu user → badge kosong (fallback `verified` boolean
+   * di klien), bukan error.
+   */
+  private async getAuthorBadgeMap(userIds: string[]): Promise<Map<string, Array<{ type: string }>>> {
+    const unique = [...new Set(userIds.filter(Boolean))];
+    const entries = await Promise.all(
+      unique.map(async (userId): Promise<[string, Array<{ type: string }>]> => {
+        try {
+          const badges = await this.verificationBadgeService.getBadges(userId);
+          return [userId, badges.map((b) => ({ type: b.type }))];
+        } catch {
+          return [userId, []];
+        }
+      }),
+    );
+    return new Map(entries);
+  }
+
+  /**
    * Bentuk publik satu item showcase.
    *
    * `orderLink` berisi data siap pakai untuk membuat OrderLink dari item ini
@@ -293,7 +322,7 @@ export class ShowcaseService {
    */
   private serializeShowcase(
     row: ShowcaseRow,
-    options: { isLiked?: boolean; isOwner?: boolean } = {},
+    options: { isLiked?: boolean; isOwner?: boolean; authorBadges?: Array<{ type: string }> } = {},
   ): Record<string, unknown> {
     const images = row.images.map((image) => ({
       id: image.id,
@@ -332,6 +361,8 @@ export class ShowcaseService {
       likeCount: row.likeCount,
       commentCount: row.commentCount,
       viewCount: row.viewCount,
+      // S-4: berapa kali deep link share item ini dibuka.
+      shareCount: row.shareCount,
       isLiked: Boolean(options.isLiked),
       isOwner: Boolean(options.isOwner),
       createdAt: row.createdAt,
@@ -344,6 +375,10 @@ export class ShowcaseService {
         membershipRank: row.user.membershipRank,
         isKycVerified: row.user.kycStatus === 'APPROVED',
         isVip: row.user.isVip,
+        // S1 (audit 2026-09-26): badge verifikasi 3-tier untuk <VerifiedSeal>
+        // di feed/detail. Sumber sama dengan profil (getBadges), bukan flag
+        // terpisah — satukan definisi tier.
+        badges: options.authorBadges ?? [],
       },
       orderLink: {
         title: row.title.slice(0, 100),
@@ -455,13 +490,14 @@ export class ShowcaseService {
   async updateShowcaseItem(userId: string, itemId: string, dto: UpdateShowcaseItemDto): Promise<object> {
     const existing = await this.findOwnedShowcase(userId, itemId);
 
-    if (dto.title !== undefined) this.normalizeTitle(dto.title);
+    // R-2: pakai hasil normalizeTitle langsung (validasi + trim) supaya tidak
+    // ada dua sumber kebenaran untuk nilai title yang disimpan.
     const priceMin = dto.priceMin !== undefined ? dto.priceMin : toNumber(existing.priceMin) ?? undefined;
     const priceMax = dto.priceMax !== undefined ? dto.priceMax : toNumber(existing.priceMax) ?? undefined;
     this.assertPriceRange(priceMin, priceMax);
 
     const data: Prisma.UserShowcaseUpdateInput = {};
-    if (dto.title !== undefined) data.title = dto.title.trim();
+    if (dto.title !== undefined) data.title = this.normalizeTitle(dto.title);
     if (dto.description !== undefined) data.description = this.normalizeDescription(dto.description);
     if (dto.category !== undefined) data.category = this.normalizeCategory(dto.category);
     if (dto.visibility !== undefined) data.visibility = dto.visibility;
@@ -470,8 +506,19 @@ export class ShowcaseService {
     if (dto.isActive !== undefined) data.isActive = dto.isActive;
     if (dto.sortOrder !== undefined) data.sortOrder = dto.sortOrder;
 
-    // imageFileKeys yang diisi (termasuk array kosong) berarti "ganti semua gambar".
+    // R-3: samakan dengan create — item tidak boleh berakhir tanpa gambar sama
+    // sekali. Array kosong ditolak eksplisit dengan pesan yang jelas (bukan
+    // diartikan "hapus semua gambar"); penghapusan per gambar tetap lewat
+    // endpoint DELETE /users/me/showcase/images/:imageId.
     if (dto.imageFileKeys !== undefined) {
+      if (dto.imageFileKeys.length === 0) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message:
+            'imageFileKeys must contain at least 1 image: a showcase item cannot be left without images. ' +
+            'Remove individual images via DELETE /users/me/showcase/images/:imageId instead.',
+        });
+      }
       const imageFileKeys = await this.prepareImageKeys(userId, dto.imageFileKeys);
       const removedKeys = existing.images.map((image) => image.fileKey).filter((k): k is string => Boolean(k));
       data.images = {
@@ -698,8 +745,14 @@ export class ShowcaseService {
     })) as unknown as ShowcaseRow[];
 
     const likedIds = await this.getLikedShowcaseIds(viewerId, items.map((item) => item.id));
+    const badgeMap = await this.getAuthorBadgeMap(items.map((item) => item.user.userId));
     return {
-      items: items.map((item) => this.serializeShowcase(item, { isLiked: likedIds.has(item.id) })),
+      items: items.map((item) =>
+        this.serializeShowcase(item, {
+          isLiked: likedIds.has(item.id),
+          authorBadges: badgeMap.get(item.user.userId) ?? [],
+        }),
+      ),
       total: items.length,
     };
   }
@@ -721,16 +774,24 @@ export class ShowcaseService {
       throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
     }
 
-    const counted = await this.recordView(showcaseId, viewerId, options.clientIp);
+    // R-4: owner yang mem-preview item miliknya yang sedang nonaktif (isActive=false)
+    // tidak ikut menaikkan viewCount — angka view hanya untuk item yang tayang.
+    const shouldCountView = !(visible.isOwner && !visible.row.isActive);
+    const counted = shouldCountView ? await this.recordView(showcaseId, viewerId, options.clientIp) : false;
     const likedIds = await this.getLikedShowcaseIds(viewerId, [showcaseId]);
+    const badgeMap = await this.getAuthorBadgeMap([visible.row.user.userId]);
 
     return {
       ...this.serializeShowcase(visible.row, {
         isLiked: likedIds.has(showcaseId),
         isOwner: visible.isOwner,
+        authorBadges: badgeMap.get(visible.row.user.userId) ?? [],
       }),
-      // viewCount yang dikembalikan adalah nilai SETELAH increment bila view ini
-      // ikut dihitung, supaya UI tidak menampilkan angka yang tertinggal.
+      // R-6: nilai di sini adalah row.viewCount + 1 (asumsi, bukan hasil baca
+      // ulang setelah increment) — bisa sedikit basi bila dua viewer membaca
+      // bersamaan. Diterima sebagai minor: increment-nya sendiri tetap atomik
+      // (updateMany) dan angka DB selalu benar; yang berpotensi tertinggal
+      // hanya angka di respons ini.
       viewCount: counted ? visible.row.viewCount + 1 : visible.row.viewCount,
     };
   }
@@ -753,8 +814,10 @@ export class ShowcaseService {
       if (!isNew) return false;
     }
     // Atomic increment + scope id: pola TransactionTemplatesService.recordUsage.
+    // R2 (audit Discovery 2026-09-26): guard status — item yang ter-soft-delete
+    // / nonaktif di antara visibility-check dan increment tidak menambah counter.
     await this.prisma.userShowcase.updateMany({
-      where: { id: showcaseId },
+      where: { id: showcaseId, deletedAt: null, isActive: true },
       data: { viewCount: { increment: 1 } },
     });
     return true;
@@ -787,7 +850,10 @@ export class ShowcaseService {
     }
 
     const search = query.search?.trim();
-    if (search) {
+    // R-1: terapkan SHOWCASE_SEARCH_MIN_LENGTH — query lebih pendek dari 2
+    // karakter hanya menghasilkan noise, jadi diabaikan (feed tanpa filter
+    // search) alih-alih memindai title/deskripsi/username.
+    if (search && search.length >= SHOWCASE_SEARCH_MIN_LENGTH) {
       // escapeLikePattern: `%`, `_`, `\` dari user diperlakukan literal.
       const pattern = escapeLikePattern(search);
       andClauses.push({
@@ -801,23 +867,75 @@ export class ShowcaseService {
       });
     }
 
+    // D-02 (audit Discovery 2026-09-26): filter harga. Rentang efektif item =
+    // [COALESCE(priceMin, priceMax), COALESCE(priceMax, priceMin)]; item cocok
+    // bila rentangnya beririsan dengan [minPrice, maxPrice]. Item tanpa harga
+    // (keduanya null) disembunyikan saat filter harga aktif — tidak bisa
+    // dipastikan masuk bujet. Perbandingan `lte`/`gte` Prisma tidak cocok
+    // dengan NULL di SQL, jadi cabang "batas satunya null" ditulis eksplisit.
+    const minPrice = query.minPrice;
+    const maxPrice = query.maxPrice;
+    if (minPrice !== undefined && maxPrice !== undefined && minPrice > maxPrice) {
+      throw new BadRequestException({
+        code: ErrorCodes.SHOWCASE_INVALID_PRICE_RANGE,
+        message: 'minPrice tidak boleh lebih besar dari maxPrice',
+      });
+    }
+    if (minPrice !== undefined || maxPrice !== undefined) {
+      const loOk: Prisma.UserShowcaseWhereInput =
+        maxPrice === undefined
+          ? { OR: [{ priceMin: { not: null } }, { priceMax: { not: null } }] }
+          : {
+              OR: [
+                { priceMin: { lte: maxPrice } },
+                { AND: [{ priceMin: null }, { priceMax: { lte: maxPrice } }] },
+              ],
+            };
+      const hiOk: Prisma.UserShowcaseWhereInput =
+        minPrice === undefined
+          ? { OR: [{ priceMin: { not: null } }, { priceMax: { not: null } }] }
+          : {
+              OR: [
+                { priceMax: { gte: minPrice } },
+                { AND: [{ priceMax: null }, { priceMin: { gte: minPrice } }] },
+              ],
+            };
+      andClauses.push({ AND: [loOk, hiOk] });
+    }
+
     // Keyset: "baris-baris setelah cursor" menurut urutan sort. Menggunakan
     // tuple (sortKey..., id) sehingga hasilnya deterministik walau banyak baris
     // berbagi createdAt/likeCount yang sama.
     if (query.cursor) {
       const cursor = decodeFeedCursor(query.cursor);
       const cursorDate = new Date(cursor.t);
+      // T2 (audit Discovery 2026-09-26): cursor hanya menyimpan epoch-ms,
+      // sedangkan createdAt di DB bertipe timestamptz (presisi mikrodetik).
+      // Baris yang lahir dalam milidetik yang SAMA dengan baris terakhir
+      // halaman sebelumnya tetapi mikrodetiknya lebih kecil akan hilang
+      // permanen bila batasnya `createdAt < T`. Sertakan seluruh bucket
+      // [T, T+1ms) dengan tiebreak id — duplikat kecil yang mungkin muncul
+      // sudah di-dedupe di klien (mergeById/visibleItems), dan anchor
+      // (bucket, id) selalu maju sehingga tidak ada livelock halaman.
+      const cursorMsEnd = new Date(cursor.t + 1);
       if (sort === 'popular') {
         andClauses.push({
           OR: [
             { likeCount: { lt: cursor.l } },
             { likeCount: cursor.l, createdAt: { lt: cursorDate } },
-            { likeCount: cursor.l, createdAt: cursorDate, id: { lt: cursor.i } },
+            {
+              likeCount: cursor.l,
+              createdAt: { gte: cursorDate, lt: cursorMsEnd },
+              id: { lt: cursor.i },
+            },
           ],
         });
       } else {
         andClauses.push({
-          OR: [{ createdAt: { lt: cursorDate } }, { createdAt: cursorDate, id: { lt: cursor.i } }],
+          OR: [
+            { createdAt: { lt: cursorDate } },
+            { createdAt: { gte: cursorDate, lt: cursorMsEnd }, id: { lt: cursor.i } },
+          ],
         });
       }
     }
@@ -841,14 +959,62 @@ export class ShowcaseService {
     const hasMore = rows.length > limit;
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
     const likedIds = await this.getLikedShowcaseIds(viewerId, pageRows.map((row) => row.id));
+    // S1: badge 3-tier author (satu batch, cached di Redis).
+    const badgeMap = await this.getAuthorBadgeMap(pageRows.map((row) => row.user.userId));
 
     return {
-      items: pageRows.map((row) => this.serializeShowcase(row, { isLiked: likedIds.has(row.id) })),
+      items: pageRows.map((row) =>
+        this.serializeShowcase(row, {
+          isLiked: likedIds.has(row.id),
+          authorBadges: badgeMap.get(row.user.userId) ?? [],
+        }),
+      ),
       sort,
       limit,
       hasMore,
       nextCursor: hasMore && pageRows.length > 0 ? encodeFeedCursor(pageRows[pageRows.length - 1]) : null,
     };
+  }
+
+  /**
+   * D-01 (audit Discovery 2026-09-26): agregasi kategori yang benar-benar
+   * dipakai karya publik + aktif + tidak dihapus. Dipakai klien sebagai saran
+   * saat mengisi kategori (mengurangi fragmentasi ejaan teks bebas).
+   */
+  async getPopularCategories(limit: number): Promise<object> {
+    const take = Math.min(Math.max(Math.floor(limit) || 20, 1), 50);
+    // S1 (audit Discovery 2026-09-26): cache 5 menit — agregasi nyaris statis,
+    // sebelumnya groupBy mentah tiap request. Key mencakup `take` supaya
+    // limit berbeda tidak saling menimpa.
+    const cacheKey = `showcase:popular-categories:${take}`;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) return JSON.parse(cached) as object;
+    } catch {}
+    const groups = await this.prisma.userShowcase.groupBy({
+      by: ['category'],
+      where: {
+        visibility: ShowcaseVisibility.PUBLIC,
+        isActive: true,
+        deletedAt: null,
+        category: { not: null },
+        // S1: paritas dengan feed — hanya hitung item yang benar-benar bisa
+        // muncul di feed (pemilik sehat & publik).
+        user: { isActive: true, isBanned: false, deletedAt: null, profileVisible: true },
+      },
+      _count: { category: true },
+      orderBy: { _count: { category: 'desc' } },
+      take,
+    });
+    const result = {
+      categories: groups
+        .filter((g) => typeof g.category === 'string' && g.category.trim().length > 0)
+        .map((g) => ({ category: g.category as string, count: g._count.category })),
+    };
+    try {
+      await this.redis.set(cacheKey, JSON.stringify(result), 300);
+    } catch {}
+    return result;
   }
 
   // ==================================================================
@@ -894,6 +1060,9 @@ export class ShowcaseService {
     if (!visible) {
       throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
     }
+    // R-7: cek block yang sama seperti likeShowcase, demi konsistensi —
+    // user yang diblokir tidak boleh berinteraksi sama sekali dengan kontennya.
+    await this.assertNoBlockRelation(userId, visible.row.userId);
 
     await this.prisma.$transaction(async (tx) => {
       const deleted = await tx.showcaseLike.deleteMany({ where: { userId, showcaseId } });
@@ -949,10 +1118,13 @@ export class ShowcaseService {
     const skip = (safePage - 1) * safeLimit;
 
     const excludedIds = await this.getViewerExcludedIds(viewerId);
+    // R-5: konsisten dengan feed — komentar dari user yang memprivatkan
+    // profilnya tidak ikut tampil di item publik.
     const authorFilter: Prisma.UserWhereInput = {
       isActive: true,
       isBanned: false,
       deletedAt: null,
+      profileVisible: true,
       ...(excludedIds.length > 0 ? { id: { notIn: excludedIds } } : {}),
     };
     const where: Prisma.ShowcaseCommentWhereInput = {
@@ -997,16 +1169,26 @@ export class ShowcaseService {
       if (row.parentId) replyCountByParent.set(row.parentId, row._count._all);
     }
 
+    // S4 (audit Discovery 2026-09-26): query balasan dijalankan PARALEL
+    // (Promise.all), bukan sequential — sebelumnya N round-trip berurutan
+    // untuk N root (hingga 50). Semantik identik: take per root tetap
+    // SHOWCASE_REPLY_LIMIT dengan urutan yang sama.
     const repliesByParent = new Map<string, CommentRow[]>();
-    for (const root of roots) {
-      if ((replyCountByParent.get(root.id) ?? 0) === 0) continue;
-      const replies = (await this.prisma.showcaseComment.findMany({
-        where: { parentId: root.id, ...replyWhere },
-        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-        take: SHOWCASE_REPLY_LIMIT,
-        include: COMMENT_INCLUDE,
-      })) as unknown as CommentRow[];
-      repliesByParent.set(root.id, replies);
+    const rootsWithReplies = roots.filter((root) => (replyCountByParent.get(root.id) ?? 0) > 0);
+    const repliesResults = await Promise.all(
+      rootsWithReplies.map((root) =>
+        this.prisma.showcaseComment
+          .findMany({
+            where: { parentId: root.id, ...replyWhere },
+            orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+            take: SHOWCASE_REPLY_LIMIT,
+            include: COMMENT_INCLUDE,
+          })
+          .then((rows) => ({ rootId: root.id, rows: rows as unknown as CommentRow[] })),
+      ),
+    );
+    for (const { rootId, rows } of repliesResults) {
+      repliesByParent.set(rootId, rows);
     }
 
     const data = roots.map((root) => ({
@@ -1168,7 +1350,9 @@ export class ShowcaseService {
     if (existing.userId !== userId && !isShowcaseOwner) {
       throw new ForbiddenException({
         code: ErrorCodes.FORBIDDEN,
-        message: 'You can only delete your own comment',
+        // R-8: pesan lama menyesatkan — pemilik showcase juga boleh menghapus
+        // komentar di itemnya, bukan hanya penulis komentar.
+        message: 'You can only delete your own comment or comments on your showcase',
       });
     }
 
@@ -1279,6 +1463,13 @@ export class ShowcaseService {
    * profileVisible pemilik, dan relasi block — item yang tidak boleh terlihat
    * menghasilkan 404/403 yang sama seperti jalur baca lainnya, jadi halaman
    * share tidak bisa dipakai untuk mengintip konten privat.
+   *
+   * S-4: setiap pemanggilan yang lolos visibility check mencatat satu kejadian
+   * share via atomic increment `shareCount` (pola yang sama dengan viewCount,
+   * tapi tanpa dedupe — share memang dihitung per pembukaan deep link).
+   * Nilai aktual diambil dari hasil `update` supaya payload tidak memakai
+   * asumsi basi. Item yang tidak terlihat → 404 SEBELUM increment, jadi tidak
+   * ada share tercatat untuk konten yang tidak boleh diakses.
    */
   async getSharePayload(showcaseId: string, viewerId?: string): Promise<object> {
     const visible = await this.findVisibleShowcase(showcaseId, viewerId);
@@ -1286,6 +1477,11 @@ export class ShowcaseService {
       throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
     }
     const { row } = visible;
+    const updated = await this.prisma.userShowcase.update({
+      where: { id: row.id },
+      data: { shareCount: { increment: 1 } },
+      select: { shareCount: true },
+    });
     const coverImageUrl = row.images.length > 0 ? row.images[0].imageUrl : null;
     const priceMin = toNumber(row.priceMin);
     const priceMax = toNumber(row.priceMax);
@@ -1306,6 +1502,8 @@ export class ShowcaseService {
       authorFullName: row.user.fullName,
       shareUrl: this.buildShareUrl(row.id),
       appUrl: `kahade-frontend://showcase/${encodeURIComponent(row.id)}`,
+      // S-4: nilai SETELAH increment pada pemanggilan ini.
+      shareCount: updated.shareCount,
     };
   }
 

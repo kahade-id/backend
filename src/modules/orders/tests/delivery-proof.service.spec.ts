@@ -307,16 +307,21 @@ describe('DeliveryProofService', () => {
             orderPublicId: 'ORD-1',
           });
 
-        await expect(service.submitProof('ORD-1', 'seller', { description: 'sudah dikirim' })).resolves.toBeTruthy();
+        await expect(service.submitProof('ORD-1', 'seller', { description: 'sudah dikirim', fileUrls: ['uploads/delivery-proof/seller/proof.jpg'] })).resolves.toBeTruthy();
         expect(mockPrisma.$transaction).toHaveBeenCalledTimes(2);
       });
 
       it('does not notify the buyer when every attempt fails', async () => {
         mockPrisma.$transaction.mockRejectedValue(serializationFailure());
 
-        await expect(service.submitProof('ORD-1', 'seller', { description: 'sudah dikirim' })).rejects.toBeTruthy();
+        await expect(service.submitProof('ORD-1', 'seller', { description: 'sudah dikirim', fileUrls: ['uploads/delivery-proof/seller/proof.jpg'] })).rejects.toBeTruthy();
         expect(mockQueue.enqueue).not.toHaveBeenCalled();
         expect(mockPrisma.$transaction).toHaveBeenCalledTimes(3);
+      });
+
+      it('rejects a proof with no files and no links', async () => {
+        await expect(service.submitProof('ORD-1', 'seller', { description: 'Bukti pengiriman valid tanpa lampiran' })).rejects.toBeInstanceOf(BadRequestException);
+        expect(mockPrisma.$transaction).not.toHaveBeenCalled();
       });
     });
   });

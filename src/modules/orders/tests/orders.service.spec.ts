@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { OrdersService } from '../orders.service';
+import { CreateOrderDto } from '../dto/create-order.dto';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { FeeCalculatorService } from '../fee-calculator.service';
@@ -217,7 +218,8 @@ describe('OrdersService', () => {
   // ─── createOrder ───────────────────────────────────────────────────────────
 
   describe('createOrder', () => {
-    const dto = {
+    // T3: diketik sebagai CreateOrderDto agar deliveryDeadlineAt opsional bisa dipakai.
+    const dto: CreateOrderDto = {
       role: 'BUYER' as const,
       counterpartUsername: 'seller01',
       title: 'Test Order',
@@ -316,6 +318,45 @@ describe('OrdersService', () => {
     it('rejects non-integer order values before fee calculation', async () => {
       await expect(service.createOrder('user-db-1', { ...dto, orderValue: 100000.5 })).rejects.toThrow(BadRequestException);
       expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('rejects an invalid deliveryDeadlineAt before hitting the transaction (T3 audit 2026-09-26)', async () => {
+      await expect(service.createOrder('user-db-1', { ...dto, deliveryDeadlineAt: 'not-a-date' })).rejects.toThrow(BadRequestException);
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('rejects a deliveryDeadlineAt in the past and beyond the 14-day cap (T3 audit 2026-09-26)', async () => {
+      await expect(service.createOrder('user-db-1', { ...dto, deliveryDeadlineAt: new Date(Date.now() - 1000).toISOString() })).rejects.toThrow(BadRequestException);
+      const farFuture = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      await expect(service.createOrder('user-db-1', { ...dto, deliveryDeadlineAt: farFuture })).rejects.toThrow(BadRequestException);
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('stores an explicit calendar deliveryDeadlineAt on the order (T3 audit 2026-09-26)', async () => {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
+        mockPrisma.order.create.mockResolvedValue(mockOrder);
+        mockPrisma.chatRoom.create.mockResolvedValue({ id: 'chat-1' });
+        return fn(mockPrisma);
+      });
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+
+      // Tanggal kalender 9 hari dari sekarang (di dalam jendela 1–14 hari).
+      const picked = new Date(Date.now() + 9 * 24 * 60 * 60 * 1000);
+      const calendarDate = picked.toISOString().slice(0, 10);
+      await service.createOrder('user-db-1', { ...dto, deliveryDeadlineAt: calendarDate });
+
+      const createCall = mockPrisma.order.create.mock.calls[0][0].data;
+      // Tanggal kalender diartikan sebagai akhir hari WIB (T3).
+      expect(createCall.deliveryDeadlineAt).toEqual(new Date(`${calendarDate}T16:59:59.999Z`));
+      // deliveryDeadlineDays tetap dikirim sebagai fallback kompatibilitas.
+      expect(createCall.deliveryDeadlineDays).toBe(7);
     });
 
     it('should create order successfully without voucher', async () => {
@@ -961,6 +1002,7 @@ describe('OrdersService', () => {
     const shippingDto = { trackingNumber: 'JNE1234567', courierName: 'JNE' };
 
     it('should throw NotFoundException when order does not exist', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue(null);
       mockPrisma.order.findUnique.mockResolvedValue(null);
 
       await expect(
@@ -969,6 +1011,7 @@ describe('OrdersService', () => {
     });
 
     it('should throw ForbiddenException when user is not the seller', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue({ ...mockOrder, status: OrderStatus.PROCESSING, sellerId: 'user-db-2' });
       mockPrisma.order.findUnique.mockResolvedValue({ ...mockOrder, status: OrderStatus.PROCESSING, sellerId: 'user-db-2' });
 
       await expect(
@@ -977,6 +1020,11 @@ describe('OrdersService', () => {
     });
 
     it('should throw BadRequestException for invalid order status', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue({
+        ...mockOrder,
+        status: OrderStatus.COMPLETED,
+        sellerId: 'user-db-2',
+      });
       mockPrisma.order.findUnique.mockResolvedValue({
         ...mockOrder,
         status: OrderStatus.COMPLETED,
@@ -989,6 +1037,7 @@ describe('OrdersService', () => {
     });
 
     it('should update shipping info successfully for PROCESSING order', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue({ ...mockOrder, status: OrderStatus.PROCESSING, sellerId: 'user-db-2', id: 'order-internal-1' });
       mockPrisma.order.findUnique.mockResolvedValue({ ...mockOrder, status: OrderStatus.PROCESSING, sellerId: 'user-db-2', id: 'order-internal-1' });
       mockPrisma.order.update.mockResolvedValue({});
 
@@ -1000,12 +1049,22 @@ describe('OrdersService', () => {
     });
 
         it('should update shipping info successfully for IN_DELIVERY order', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue({ ...mockOrder, status: OrderStatus.IN_DELIVERY, sellerId: 'user-db-2', id: 'order-internal-1' });
       mockPrisma.order.findUnique.mockResolvedValue({ ...mockOrder, status: OrderStatus.IN_DELIVERY, sellerId: 'user-db-2', id: 'order-internal-1' });
       mockPrisma.order.update.mockResolvedValue({});
       const result = await service.updateShipping('ORD-20260101-001', 'user-db-2', shippingDto);
       expect(result).toHaveProperty('orderId');
     });
     it('should allow non-physical orders to save notes without tracking fields and record an audit event', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue({
+        ...mockOrder,
+        orderType: OrderType.SERVICE,
+        status: OrderStatus.PROCESSING,
+        sellerId: 'user-db-2',
+        trackingNumber: null,
+        courierName: null,
+        id: 'order-internal-1',
+      });
       mockPrisma.order.findUnique.mockResolvedValue({
         ...mockOrder,
         orderType: OrderType.SERVICE,
@@ -1020,6 +1079,18 @@ describe('OrdersService', () => {
       expect(mockPrisma.orderStatusHistory.create).toHaveBeenCalledWith(expect.objectContaining({
         data: expect.objectContaining({ fromStatus: OrderStatus.PROCESSING, toStatus: OrderStatus.PROCESSING, reason: 'SHIPPING_DETAILS_UPDATED' }),
       }));
+    });
+
+    it('excludes soft-deleted orders from the lookup (T1 audit 2026-09-26)', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue({ ...mockOrder, status: OrderStatus.PROCESSING, sellerId: 'user-db-2', id: 'order-internal-1' });
+      mockPrisma.order.findUnique.mockResolvedValue({ ...mockOrder, status: OrderStatus.PROCESSING, sellerId: 'user-db-2', id: 'order-internal-1' });
+      mockPrisma.order.update.mockResolvedValue({});
+
+      await service.updateShipping('ORD-20260101-001', 'user-db-2', shippingDto);
+
+      expect(mockPrisma.order.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ orderId: 'ORD-20260101-001', deletedAt: null }) }),
+      );
     });
   });
 

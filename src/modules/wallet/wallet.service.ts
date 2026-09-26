@@ -2778,7 +2778,10 @@ export class WalletService implements OnModuleInit {
 
     const topupNotifTitle = 'Top-up Successful';
     const topupNotifBody = `Top-up of Rp ${toIdr(paymentTx.amount).toLocaleString('id-ID')} has been credited to your wallet.`;
-    this.prisma.notification
+    // Await create SEBELUM emit: push memakai enrichPushData yang mencari
+    // baris notifikasi — emit duluan bisa menghasilkan push yatim tanpa
+    // notificationId/actionUrl bila insert belum commit.
+    await this.prisma.notification
       .create({
         data: {
           notifId: generateNotifId(),
@@ -2811,7 +2814,7 @@ export class WalletService implements OnModuleInit {
     if (topupBonusSen > BigInt(0)) {
       const bonusTitle = 'Top-up Bonus Credited';
       const bonusBody = `Bonus top-up Rp ${toIdr(topupBonusSen).toLocaleString('id-ID')} has been credited to your wallet.`;
-      this.prisma.notification
+      await this.prisma.notification
         .create({
           data: {
             notifId: generateNotifId(),
@@ -3866,7 +3869,7 @@ export class WalletService implements OnModuleInit {
       SELECT wfr.id, wfr."recipientId", wfr.label, wfr."createdAt",
              u.id as "userId2", u."fullName", u.username, u."avatarUrl", u."userId" as "recipientUserId"
       FROM wallet_favorite_recipients wfr
-      JOIN users u ON u.id = wfr."recipientId"
+      JOIN users u ON u.id = wfr."recipientId" AND u."deletedAt" IS NULL
       WHERE wfr."userId" = ${userId}
       ORDER BY wfr."createdAt" DESC
     `;
@@ -3890,9 +3893,11 @@ export class WalletService implements OnModuleInit {
     }
     const recipient = await this.prisma.user.findFirst({
       where: { OR: [{ id: recipientId }, { userId: recipientId }, { username: recipientId }], deletedAt: null },
-      select: { id: true },
+      select: { id: true, isActive: true, isBanned: true },
     });
     if (!recipient) throw new NotFoundException({ code: ErrorCodes.RECIPIENT_NOT_FOUND, message: 'Recipient not found' });
+    if (!recipient.isActive || recipient.isBanned)
+      throw new BadRequestException({ code: ErrorCodes.RECIPIENT_NOT_FOUND, message: 'Recipient account is not active' });
     if (recipient.id === userId) throw new BadRequestException({ code: ErrorCodes.CANNOT_TRANSFER_SELF, message: 'Cannot favorite yourself' });
 
     const safeLabel = label ? label.replace(/[\u0000-\u001F\u007F]/g, ' ').trim().slice(0, 50) : null;

@@ -3,7 +3,8 @@ import { Cron } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
-import { AuditAction, DisputeStatus, MembershipRank } from '@prisma/client';
+import { AuditAction, DisputeStatus, MembershipRank, NotificationType } from '@prisma/client';
+import { getCategoryForType } from '../../notifications/notification-category.map';
 import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 
 const RANK_PRIORITY: Record<MembershipRank, number> = {
@@ -56,6 +57,8 @@ export class AutoEscalateDisputesService {
           status: true,
           order: {
             select: {
+              buyerId: true,
+              sellerId: true,
               buyer: { select: { membershipRank: true } },
               seller: { select: { membershipRank: true } },
             },
@@ -92,6 +95,25 @@ export class AutoEscalateDisputesService {
           if (updated.count > 0) {
             escalatedInBatch += updated.count;
             this.logger.warn(`Dispute ${dispute.disputeId} escalated due to SLA breach.`);
+
+            // NOTIF-DSP-03: para pihak wajib tahu sengketanya dieskalasi otomatis.
+            // Best-effort: kegagalan notifikasi tidak membatalkan eskalasi.
+            const escalatedParties = [dispute.order.buyerId, dispute.order.sellerId];
+            await Promise.all(escalatedParties.map((partyId) =>
+              this.prisma.notification.create({
+                data: {
+                  notifId: randomUUID(),
+                  userId: partyId,
+                  type: NotificationType.DISPUTE_ESCALATED,
+                  category: getCategoryForType(NotificationType.DISPUTE_ESCALATED),
+                  title: 'Sengketa dieskalasi',
+                  body: `Sengketa ${dispute.disputeId} melewati batas waktu penanganan dan kini diprioritaskan ke tim mediator.`,
+                  isRead: false,
+                },
+              }).catch((err: unknown) => {
+                this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`);
+              }),
+            ));
 
             const systemAdmin = await this.prisma.adminUser.findFirst({
               where: { role: 'SUPER_ADMIN', isActive: true },

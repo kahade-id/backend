@@ -8,6 +8,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { UploadService } from '../../upload/upload.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { SHOWCASE_FEED_MAX_LIMIT } from '../../../common/constants/app.constants';
 
@@ -89,6 +90,7 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
         { provide: UploadService, useValue: mockUpload },
         { provide: ConfigService, useValue: mockConfig },
         { provide: AuditLogService, useValue: { logUserAction: jest.fn(), logAdminAction: jest.fn() } },
+        { provide: VerificationBadgeService, useValue: { getBadges: jest.fn().mockResolvedValue([]) } },
       ],
     }).compile();
     service = module.get<ShowcaseService>(ShowcaseService);
@@ -119,6 +121,8 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
       expect(mockPrisma.blockList.findMany).toHaveBeenCalledWith({
         where: { OR: [{ blockerId: VIEWER_ID }, { blockedId: VIEWER_ID }] },
         select: { blockerId: true, blockedId: true },
+        // S5 (audit Discovery 2026-09-26): cap 1000 seperti modul search.
+        take: 1000,
       });
       expect(lastQuery().where.user.id.notIn).toEqual(expect.arrayContaining([ENEMY_ID, 'enemy-2']));
     });
@@ -190,6 +194,90 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
     });
   });
 
+  describe('price filter (D-02)', () => {
+    const priceClause = () => {
+      const and = lastQuery().where.AND ?? [];
+      return and.find((c: any) => Array.isArray(c.AND));
+    };
+
+    it('menolak minPrice > maxPrice dengan 400', async () => {
+      await expect(
+        feed(service, undefined, { minPrice: 200000, maxPrice: 100000 }),
+      ).rejects.toMatchObject({
+        response: { code: ErrorCodes.SHOWCASE_INVALID_PRICE_RANGE },
+      });
+    });
+
+    it('menerapkan irisan rentang [minPrice, maxPrice]', async () => {
+      await feed(service, undefined, { minPrice: 50000, maxPrice: 150000 });
+      const clause = priceClause();
+      expect(clause).toBeDefined();
+      const [loOk, hiOk] = clause.AND;
+      expect(loOk).toEqual({
+        OR: [
+          { priceMin: { lte: 150000 } },
+          { AND: [{ priceMin: null }, { priceMax: { lte: 150000 } }] },
+        ],
+      });
+      expect(hiOk).toEqual({
+        OR: [
+          { priceMax: { gte: 50000 } },
+          { AND: [{ priceMax: null }, { priceMin: { gte: 50000 } }] },
+        ],
+      });
+    });
+
+    it('hanya minPrice: tetap mensyaratkan item berhaga', async () => {
+      await feed(service, undefined, { minPrice: 50000 });
+      const [loOk] = priceClause().AND;
+      expect(loOk).toEqual({
+        OR: [{ priceMin: { not: null } }, { priceMax: { not: null } }],
+      });
+    });
+
+    it('tanpa filter harga: tidak ada klausa harga', async () => {
+      await feed(service, undefined, {});
+      expect(priceClause()).toBeUndefined();
+    });
+  });
+
+  describe('getPopularCategories (D-01)', () => {
+    beforeEach(() => {
+      mockPrisma.userShowcase.groupBy = jest.fn().mockResolvedValue([]);
+    });
+
+    it('mengagregasi kategori publik/aktif dan membuang yang kosong', async () => {
+      mockPrisma.userShowcase.groupBy.mockResolvedValue([
+        { category: 'ilustrasi', _count: { category: 5 } },
+        { category: '   ', _count: { category: 2 } },
+        { category: 'fotografi', _count: { category: 3 } },
+      ]);
+      const result = (await service.getPopularCategories(20)) as any;
+      expect(mockPrisma.userShowcase.groupBy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          by: ['category'],
+          where: expect.objectContaining({
+            visibility: ShowcaseVisibility.PUBLIC,
+            isActive: true,
+            deletedAt: null,
+          }),
+          take: 20,
+        }),
+      );
+      expect(result.categories).toEqual([
+        { category: 'ilustrasi', count: 5 },
+        { category: 'fotografi', count: 3 },
+      ]);
+    });
+
+    it('menjepit limit ke 1..50', async () => {
+      await service.getPopularCategories(999);
+      expect(mockPrisma.userShowcase.groupBy).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 50 }),
+      );
+    });
+  });
+
   describe('sorting', () => {
     it('sorts latest-first with an { id } tiebreak by default', async () => {
       const result = (await feed(service, undefined, {})) as any;
@@ -231,7 +319,9 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
       const keyset = lastQuery().where.AND.find((c: any) => c.OR !== undefined);
       expect(keyset.OR).toEqual([
         { createdAt: { lt: new Date(t) } },
-        { createdAt: new Date(t), id: { lt: 'cshowcase000000000000042' } },
+        // T2 (audit Discovery 2026-09-26): bucket [T, T+1ms) + tiebreak id —
+        // baris dalam ms yang sama dengan boundary tidak hilang permanen.
+        { createdAt: { gte: new Date(t), lt: new Date(t + 1) }, id: { lt: 'cshowcase000000000000042' } },
       ]);
     });
 
@@ -242,7 +332,11 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
       expect(keyset.OR).toEqual([
         { likeCount: { lt: 42 } },
         { likeCount: 42, createdAt: { lt: new Date(t) } },
-        { likeCount: 42, createdAt: new Date(t), id: { lt: 'cshowcase000000000000042' } },
+        {
+          likeCount: 42,
+          createdAt: { gte: new Date(t), lt: new Date(t + 1) },
+          id: { lt: 'cshowcase000000000000042' },
+        },
       ]);
     });
 
@@ -314,7 +408,12 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
       const first = (await feed(service, undefined, { limit: 2 })) as any;
       await feed(service, undefined, { limit: 2, cursor: first.nextCursor });
       const keyset = lastQuery().where.AND.find((c: any) => c.OR !== undefined);
-      expect(keyset.OR[1]).toEqual({ createdAt: page[1].createdAt, id: { lt: page[1].id } });
+      const t = page[1].createdAt.getTime();
+      // T2 (audit Discovery 2026-09-26): bucket [T, T+1ms) + tiebreak id.
+      expect(keyset.OR[1]).toEqual({
+        createdAt: { gte: page[1].createdAt, lt: new Date(t + 1) },
+        id: { lt: page[1].id },
+      });
     });
 
     it(`clamps limit into 1..${SHOWCASE_FEED_MAX_LIMIT}`, async () => {

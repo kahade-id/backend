@@ -8,6 +8,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { UploadService } from '../../upload/upload.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { SHOWCASE_MAX_IMAGES, SHOWCASE_MAX_ITEMS } from '../../../common/constants/app.constants';
 
@@ -174,6 +175,7 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
         { provide: UploadService, useValue: mockUpload },
         { provide: ConfigService, useValue: mockConfig },
         { provide: AuditLogService, useValue: { logUserAction: jest.fn(), logAdminAction: jest.fn() } },
+        { provide: VerificationBadgeService, useValue: { getBadges: jest.fn().mockResolvedValue([]) } },
       ],
     }).compile();
     service = module.get<ShowcaseService>(ShowcaseService);
@@ -368,11 +370,11 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
       expect(mockUpload.cleanupFileKeys).toHaveBeenCalledWith(OWNER_ID, [FILE_KEY]);
     });
 
-    it('clears all images when imageFileKeys is an empty array', async () => {
-      await service.updateShowcaseItem(OWNER_ID, SHOWCASE_ID, { imageFileKeys: [] } as UpdateShowcaseItemDto);
-      const data = mockPrisma.userShowcase.update.mock.calls[0][0].data;
-      expect(data.images.deleteMany).toEqual({});
-      expect(data.images.create).toEqual([]);
+    it('rejects an empty imageFileKeys array (R3: item cannot be left without images)', async () => {
+      await expect(
+        service.updateShowcaseItem(OWNER_ID, SHOWCASE_ID, { imageFileKeys: [] } as UpdateShowcaseItemDto),
+      ).rejects.toThrow();
+      expect(mockPrisma.userShowcase.update).not.toHaveBeenCalled();
     });
 
     it('does not touch images when imageFileKeys is omitted', async () => {
@@ -383,9 +385,10 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
     });
 
     it('survives an R2 cleanup failure (storage cleanup must not fail the update)', async () => {
+      // R3: imageFileKeys: [] ditolak — pakai 1 key valid untuk uji cleanup.
       mockUpload.cleanupFileKeys.mockRejectedValue(new Error('r2 down'));
       await expect(
-        service.updateShowcaseItem(OWNER_ID, SHOWCASE_ID, { imageFileKeys: [] } as UpdateShowcaseItemDto),
+        service.updateShowcaseItem(OWNER_ID, SHOWCASE_ID, { imageFileKeys: [FILE_KEY] } as UpdateShowcaseItemDto),
       ).resolves.toBeDefined();
     });
   });
@@ -610,7 +613,9 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
     it('increments viewCount atomically and returns the post-increment value', async () => {
       const result = (await service.getShowcaseDetail(SHOWCASE_ID, VIEWER_ID)) as any;
       expect(mockPrisma.userShowcase.updateMany).toHaveBeenCalledWith({
-        where: { id: SHOWCASE_ID },
+        // R2 (audit Discovery 2026-09-26): guard status — tidak increment
+        // untuk item ter-soft-delete / nonaktif.
+        where: { id: SHOWCASE_ID, deletedAt: null, isActive: true },
         data: { viewCount: { increment: 1 } },
       });
       expect(result.viewCount).toBe(31);

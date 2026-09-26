@@ -141,6 +141,13 @@ export class PushService implements OnModuleInit {
     if (notificationType === 'REFERRAL_REWARD_RECEIVED') return 'rankingPush';
     if (notificationType.startsWith('KYC_')) return 'securityPush';
     if (notificationType.startsWith('SYSTEM_')) return 'securityPush';
+    // Marketing (default opt-in false): voucher, cashback, bonus topup.
+    // Tanpa pemetaan ini push promo terkirim walau user tidak pernah opt-in.
+    if (notificationType === 'VOUCHER_ISSUED') return 'marketingPush';
+    if (notificationType === 'CAMPAIGN_CASHBACK_CREDITED') return 'marketingPush';
+    if (notificationType === 'TOPUP_BONUS_CREDITED') return 'marketingPush';
+    // Nudge non-kritis: boleh dimatikan user via preferensi marketing.
+    if (notificationType === 'QUESTION_UNANSWERED_REMINDER') return 'marketingPush';
     return null;
   }
 
@@ -155,6 +162,10 @@ export class PushService implements OnModuleInit {
 
   private async shouldSendPush(userId: string, data?: Record<string, string>): Promise<boolean> {
     const notificationType = data?.notificationType ?? data?.type;
+    // Quiet hours: hanya notifikasi keamanan kritis yang lolos.
+    if (notificationType && await this.isInQuietHours(userId)) {
+      return notificationType.startsWith('SECURITY_');
+    }
     const prefField = this.getPushPrefFieldForType(notificationType);
     if (!prefField) return true;
 
@@ -166,6 +177,35 @@ export class PushService implements OnModuleInit {
       // The inbox remains durable and can be read when the app next refreshes.
       // Do not risk violating an opt-out merely because preference lookup is
       // temporarily unavailable.
+      return false;
+    }
+  }
+
+  /**
+   * Quiet hours check (WIB). Di-port dari NotificationsService agar berlaku
+   * di jalur pengiriman push yang sebenarnya.
+   */
+  private async isInQuietHours(userId: string): Promise<boolean> {
+    try {
+      const prefs = await this.prisma.notificationPreference.findUnique({ where: { userId } }) as any;
+      if (!prefs || !prefs.quietHoursEnabled) return false;
+      const start = prefs.quietHoursStart || '22:00';
+      const end = prefs.quietHoursEnd || '07:00';
+      const now = new Date();
+      // Convert to WIB (Asia/Jakarta UTC+7)
+      const wibHour = (now.getUTCHours() + 7) % 24;
+      const wibMinute = now.getUTCMinutes();
+      const currentMinutes = wibHour * 60 + wibMinute;
+      const [sh, sm] = String(start).split(':').map(Number);
+      const [eh, em] = String(end).split(':').map(Number);
+      const startMinutes = sh * 60 + sm;
+      const endMinutes = eh * 60 + em;
+      if (startMinutes <= endMinutes) {
+        return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+      }
+      // Overnight range (e.g., 22:00-07:00)
+      return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+    } catch {
       return false;
     }
   }

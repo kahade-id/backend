@@ -43,18 +43,23 @@ export class UserSearchService {
     if (query) {
       const sanitizedQuery = query.replace(/[<>&"']/g, '').trim();
       if (sanitizedQuery.length > 0) {
-        const tsQuery = sanitizedQuery
+        // T1 (audit Discovery 2026-09-26): tiap kata harus muncul (AND) di
+        // username ATAU fullName. Versi lama menggabung kata dengan ' & '
+        // lalu memakainya di LIKE `contains` — string literal seperti
+        // "budi & santoso" tidak pernah cocok di mana pun, sehingga pencarian
+        // user multi-kata selalu kosong di endpoint ini.
+        const words = sanitizedQuery
           .split(/\s+/)
-          .filter(w => w.length > 0)
-          .map(w => w.replace(/[^a-zA-Z0-9]/g, ''))
-          .filter(w => w.length > 0)
-          .join(' & ');
+          .map(w => w.replace(/[^\p{L}\p{N}]/gu, ''))
+          .filter(w => w.length > 0);
 
-        if (tsQuery.length > 0) {
-          where.OR = [
-            { username: { contains: escapeLikePattern(tsQuery), mode: 'insensitive' } },
-            { fullName: { contains: escapeLikePattern(tsQuery), mode: 'insensitive' } },
-          ];
+        if (words.length > 0) {
+          where.AND = words.map(w => ({
+            OR: [
+              { username: { contains: escapeLikePattern(w), mode: 'insensitive' } },
+              { fullName: { contains: escapeLikePattern(w), mode: 'insensitive' } },
+            ],
+          }));
         } else {
           where.OR = [
             { username: { startsWith: sanitizedQuery.toLowerCase(), mode: 'insensitive' } },

@@ -64,6 +64,17 @@ export class CreateOrderDto {
   @Max(DELIVERY_DEADLINE_DAYS_MAX)
   deliveryDeadlineDays!: number;
 
+  @ApiPropertyOptional({
+    description: 'Explicit delivery deadline as ISO 8601 date-time (e.g. "2026-10-05T16:59:59+07:00"). '
+      + 'When provided and valid (tomorrow … +14 days), it takes precedence over deliveryDeadlineDays '
+      + 'and is stored as the order\'s deliveryDeadlineAt. Lets the user pick a calendar date instead of a day count.',
+    example: '2026-10-05T16:59:59+07:00',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  deliveryDeadlineAt?: string;
+
   @ApiProperty({ enum: FeeResponsibility, description: 'Who pays the fee' })
   @IsEnum(FeeResponsibility, { message: 'feeResponsibility must be BUYER, SELLER, or SPLIT' })
   feeResponsibility!: FeeResponsibility;

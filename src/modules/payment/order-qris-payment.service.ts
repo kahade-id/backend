@@ -20,7 +20,7 @@ import * as ErrorCodes from '../../common/constants/error-codes';
 import { MAX_ESCROW_BALANCE } from '../../common/constants/app.constants';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { toIdr, toSen } from '../../common/utils/currency.util';
-import { addDays } from '../../common/utils/date.util';
+import { resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
 import { generatePaymentTxId, generateWalletTxId } from '../../common/utils/id-generator.util';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MidtransService } from './midtrans.service';
@@ -405,7 +405,8 @@ export class OrderQrisPaymentService {
             status: OrderStatus.PROCESSING,
             paidAt: new Date(),
             processedAt: new Date(),
-            deliveryDeadlineAt: addDays(new Date(), order.deliveryDeadlineDays ?? 3),
+            // T3: hormati tanggal eksplisit pilihan user bila masih di masa depan.
+            deliveryDeadlineAt: resolveDeliveryDeadlineAt(order.deliveryDeadlineAt, order.deliveryDeadlineDays ?? 3),
           },
         });
         if (orderUpdated.count !== 1) {

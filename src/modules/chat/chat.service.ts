@@ -759,6 +759,12 @@ export class ChatService {
       replyToId?: string;
       durationSeconds?: number;
       forwardedFromId?: string;
+      /**
+       * Internal: true bila lampiran disalin dari pesan yang sudah tersimpan
+       * dan tervalidasi di DB (forward). Cek ownership path dilewati karena
+       * file milik pengirim asli; cek trusted-host + MIME tetap berlaku.
+       */
+      skipAttachmentOwnershipCheck?: boolean;
     },
   ): Promise<object> {
     // Berlaku untuk SEMUA jalur pembuatan pesan (send, forward, inquiry):
@@ -794,7 +800,7 @@ export class ChatService {
     }
 
     if (dto.attachments?.length) {
-      this.validateAttachments(userId, dto.attachments);
+      this.validateAttachments(userId, dto.attachments, dto.skipAttachmentOwnershipCheck === true);
     }
 
     if (dto.replyToId) {
@@ -894,7 +900,9 @@ export class ChatService {
     this.emitChatEvent(room, 'chat.new_message', serialized);
     if (recipientId) {
       this.realtime.emitToUser(recipientId, 'chat.new_message', serialized);
-      await this.notifyNewMessage(room, recipientId, userId, message.id, effectiveContent, userMessageType);
+      // Preview notifikasi memakai teks PASCA-moderasi (content) agar hasil
+      // redaksi (mis. nomor HP tersensor) tidak bocor lewat push.
+      await this.notifyNewMessage(room, recipientId, userId, message.id, content || effectiveContent, userMessageType);
     }
 
     return serialized;
@@ -928,7 +936,7 @@ export class ChatService {
     }
   }
 
-  private validateAttachments(userId: string, attachments: NonNullable<SendMessageDto['attachments']>): void {
+  private validateAttachments(userId: string, attachments: NonNullable<SendMessageDto['attachments']>, skipOwnershipCheck = false): void {
     const trustedHostnames: string[] = [];
     const r2Endpoint = this.configService.get<string>('r2.endpointUrl');
     if (r2Endpoint) {
@@ -989,11 +997,15 @@ export class ChatService {
     for (const a of attachments) {
       if (a.fileUrl) {
         validateStorageUrl(a.fileUrl, 'Attachment file URL');
-        validateOwnership(a.fileUrl, 'Attachment file URL');
+        if (!skipOwnershipCheck) {
+          validateOwnership(a.fileUrl, 'Attachment file URL');
+        }
       }
       if (a.thumbnailUrl) {
         validateStorageUrl(a.thumbnailUrl, 'Attachment thumbnail URL');
-        validateOwnership(a.thumbnailUrl, 'Attachment thumbnail URL');
+        if (!skipOwnershipCheck) {
+          validateOwnership(a.thumbnailUrl, 'Attachment thumbnail URL');
+        }
       }
       if (a.mimeType && !ALLOWED_MIME_TYPES.has(a.mimeType.toLowerCase())) {
         throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `MIME type '${a.mimeType}' is not allowed` });
@@ -1010,6 +1022,18 @@ export class ChatService {
     messageType: UserChatMessageType,
   ): Promise<void> {
     try {
+      // Mute harus menekan notifikasi: user yang mem-mute room tidak boleh
+      // menerima push untuk pesan baru di room tersebut.
+      const membership = await this.prisma.chatRoomMember.findUnique({
+        where: { roomId_userId: { roomId: room.id, userId: recipientId } },
+        select: { isMuted: true, mutedUntil: true },
+      });
+      if (
+        membership?.isMuted === true &&
+        (!membership.mutedUntil || membership.mutedUntil.getTime() > Date.now())
+      ) {
+        return;
+      }
       const author = await this.prisma.user.findUnique({
         where: { id: senderId },
         select: { fullName: true, username: true },
@@ -1255,6 +1279,7 @@ export class ChatService {
 
   async addReaction(userId: string, roomId: string, messageId: string, emoji: string): Promise<object> {
     const room = await this.validateRoomAccess(userId, roomId);
+    await this.assertNotBlocked(userId, this.resolveCounterpart(room, userId));
     const normalized = this.normalizeEmoji(emoji);
 
     const message = await this.prisma.chatMessage.findFirst({
@@ -1277,6 +1302,7 @@ export class ChatService {
 
   async removeReaction(userId: string, roomId: string, messageId: string, emoji: string): Promise<object> {
     const room = await this.validateRoomAccess(userId, roomId);
+    await this.assertNotBlocked(userId, this.resolveCounterpart(room, userId));
     const normalized = this.normalizeEmoji(emoji);
 
     await this.prisma.chatMessageReaction.deleteMany({
@@ -1319,6 +1345,7 @@ export class ChatService {
 
   async pinMessage(userId: string, roomId: string, messageId: string, pinned: boolean): Promise<object> {
     const room = await this.validateRoomAccess(userId, roomId);
+    await this.assertNotBlocked(userId, this.resolveCounterpart(room, userId));
 
     const message = await this.prisma.chatMessage.findFirst({
       where: { id: messageId, roomId, isDeleted: false },
@@ -1394,6 +1421,15 @@ export class ChatService {
     }
 
     const sourceCounterpart = this.resolveCounterpart(room, userId);
+    // Counterpart sumber tidak boleh null: tanpa identitas lawan bicara yang
+    // jelas, pembatasan "forward hanya ke counterpart sama" tidak bisa
+    // ditegakkan dan data pribadi bisa bocor antar transaksi (room legacy).
+    if (!sourceCounterpart) {
+      throw new BadRequestException({
+        code: ErrorCodes.CHAT_FORWARD_NOT_ALLOWED,
+        message: 'Forwarding is not available for this conversation',
+      });
+    }
     const targets = [...new Set(targetRoomIds)].filter((id) => id !== roomId);
 
     if (targets.length === 0) {
@@ -1415,7 +1451,7 @@ export class ChatService {
        * seller B hanya karena keduanya pernah bertransaksi dengan user yang
        * sama — kebocoran data pribadi antar transaksi.
        */
-      if (sourceCounterpart && this.resolveCounterpart(targetRoom, userId) !== sourceCounterpart) {
+      if (this.resolveCounterpart(targetRoom, userId) !== sourceCounterpart) {
         skipped.push({ roomId: targetRoomId, reason: 'Counterpart is different — forwarding is only allowed between rooms with the same counterpart' });
         continue;
       }
@@ -1438,6 +1474,8 @@ export class ChatService {
           thumbnailUrl: a.thumbnailUrl ?? undefined,
         })),
         forwardedFromId: message.id,
+        // Lampiran disalin dari pesan sumber yang sudah tervalidasi di DB.
+        skipAttachmentOwnershipCheck: true,
       });
       forwarded.push({ roomId: targetRoomId, message: created });
     }
@@ -1954,6 +1992,7 @@ export class ChatService {
   // 16.1 typing indicator
   async sendTypingIndicator(userId: string, roomId: string, isTyping: boolean): Promise<{ sent: boolean }> {
     const room = await this.validateRoomAccess(userId, roomId);
+    await this.assertNotBlocked(userId, this.resolveCounterpart(room, userId));
     this.emitChatEvent(room, 'chat.typing', { roomId, userId, isTyping, at: new Date().toISOString() });
     return { sent: true };
   }
@@ -1978,16 +2017,36 @@ export class ChatService {
   }
 
   async markMessageAsRead(userId: string, roomId: string, messageId: string): Promise<object> {
-    await this.validateRoomAccess(userId, roomId);
+    const room = await this.validateRoomAccess(userId, roomId);
     const now = new Date().toISOString();
     const jsonPatch = JSON.stringify({ [userId]: now });
-    await this.prisma.$executeRaw(
+    const markedCount = await this.prisma.$executeRaw(
       Prisma.sql`
         UPDATE chat_messages
         SET \"readAt\" = COALESCE(\"readAt\", '{}'::jsonb) || ${jsonPatch}::jsonb
         WHERE id = ${messageId} AND \"roomId\" = ${roomId} AND \"isDeleted\" = false
+          AND (\"senderId\" IS NULL OR \"senderId\" != ${userId})
+          AND (
+            \"readAt\" IS NULL
+            OR NOT jsonb_exists(\"readAt\", ${userId})
+          )
       `,
     );
-    return { messageId, readAt: now, userId };
+    if (markedCount > 0) {
+      this.emitChatEvent(room, 'chat.read', {
+        roomId,
+        userId,
+        messageId,
+        readAt: now,
+        markedCount,
+      });
+      await this.prisma.chatRoomMember.upsert({
+        where: { roomId_userId: { roomId, userId } },
+        create: { roomId, userId, role: this.roleFor(room, userId), lastReadAt: new Date() },
+        update: { lastReadAt: new Date() },
+        select: { id: true },
+      }).catch(() => undefined);
+    }
+    return { messageId, readAt: now, userId, markedCount };
   }
 }

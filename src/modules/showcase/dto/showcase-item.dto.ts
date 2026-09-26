@@ -144,10 +144,17 @@ export class UpdateShowcaseItemDto {
 
   @ApiPropertyOptional({
     type: [String],
-    description: 'Bila diisi, seluruh gambar diganti dengan daftar key ini.',
+    description:
+      'Bila diisi, seluruh gambar diganti dengan daftar key ini. ' +
+      'Tidak boleh kosong — item harus punya minimal 1 gambar (sama seperti create).',
   })
   @IsOptional()
   @IsArray()
+  @ArrayMinSize(1, {
+    message:
+      'imageFileKeys must contain at least 1 image: a showcase item cannot be left without images. ' +
+      'Remove individual images via DELETE /users/me/showcase/images/:imageId instead.',
+  })
   @ArrayMaxSize(SHOWCASE_MAX_IMAGES)
   @ArrayUnique()
   @IsString({ each: true })

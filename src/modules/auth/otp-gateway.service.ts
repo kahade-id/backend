@@ -28,9 +28,10 @@ class MockOtpProvider implements OtpProviderAdapter {
     return true;
   }
 
-  send(phoneNumber: string, code: string, method: OtpDeliveryMethod): Promise<OtpDeliveryResult> {
+  send(phoneNumber: string, _code: string, method: OtpDeliveryMethod): Promise<OtpDeliveryResult> {
+    // Jangan pernah log kode OTP (bahkan di mock/dev) — kode adalah kredensial sekali pakai.
     this.logger.warn(
-      `[MOCK OTP GATEWAY] Phone: ${phoneNumber}, Code: ${code}, Method: ${method} ` +
+      `[MOCK OTP GATEWAY] Phone: ${phoneNumber}, Method: ${method} ` +
         `— set OTP_PROVIDER=fonnte|twilio with credentials to send real messages.`,
     );
     return Promise.resolve({

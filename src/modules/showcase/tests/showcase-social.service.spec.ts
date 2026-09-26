@@ -7,6 +7,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { UploadService } from '../../upload/upload.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { SHOWCASE_COMMENT_MAX_LENGTH, SHOWCASE_REPLY_LIMIT } from '../../../common/constants/app.constants';
 
@@ -165,6 +166,7 @@ describe('ShowcaseService — like & komentar', () => {
         { provide: UploadService, useValue: mockUpload },
         { provide: ConfigService, useValue: mockConfig },
         { provide: AuditLogService, useValue: { logUserAction: jest.fn(), logAdminAction: jest.fn() } },
+        { provide: VerificationBadgeService, useValue: { getBadges: jest.fn().mockResolvedValue([]) } },
       ],
     }).compile();
     service = module.get<ShowcaseService>(ShowcaseService);

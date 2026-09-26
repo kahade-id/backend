@@ -62,4 +62,26 @@ export class ShowcaseFeedQueryDto {
   @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
   @MaxLength(SHOWCASE_SEARCH_MAX_LENGTH)
   search?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Filter harga minimum (IDR). Item tanpa harga disembunyikan saat filter harga aktif. ' +
+      'Cocok bila rentang harga item beririsan dengan [minPrice, maxPrice].',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(999999999999)
+  minPrice?: number;
+
+  @ApiPropertyOptional({
+    description: 'Filter harga maksimum (IDR). Lihat minPrice.',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(999999999999)
+  maxPrice?: number;
 }

@@ -129,10 +129,15 @@ export class DisputesService {
       this.prisma.dispute.count({ where }),
     ]);
 
-    const serialized = disputes.map((d) => ({
-      ...d,
-      order: { ...d.order, orderValue: toIdr(d.order.orderValue) },
-    }));
+    // SEC-DSP-01: strip internal admin notes before serializing to dispute parties.
+    // `adminNotes` is an internal deliberation field and must never reach buyer/seller.
+    const serialized = disputes.map((d) => {
+      const { adminNotes: _adminNotes, ...safe } = d;
+      return {
+        ...safe,
+        order: { ...d.order, orderValue: toIdr(d.order.orderValue) },
+      };
+    });
     return createPaginatedResponse(serialized, total, safePage, safeLimit);
   }
 
@@ -238,7 +243,8 @@ export class DisputesService {
       }),
     );
 
-    const { orderId: _orderId, buyerId: _buyerId, sellerId: _sellerId, ...disputeFields } = dispute as Record<string, unknown>;
+    // SEC-DSP-01: strip internal admin notes — user-facing detail must not leak deliberation.
+    const { orderId: _orderId, buyerId: _buyerId, sellerId: _sellerId, adminNotes: _adminNotes, ...disputeFields } = dispute as Record<string, unknown>;
     return {
       ...disputeFields,
       evidences: signedEvidences,
@@ -454,6 +460,27 @@ export class DisputesService {
       throw err;
     }
 
+    // NOTIF-DSP-01: lawan sengketa wajib tahu ada bukti baru. Post-commit best-effort
+    // (pola C-19): notifikasi gagal tidak boleh membatalkan bukti yang sudah tersimpan.
+    const evidenceCounterpartId = userId === dispute.order.buyerId ? dispute.order.sellerId : dispute.order.buyerId;
+    this.prisma.notification
+      .create({
+        data: {
+          notifId: generateNotifId(),
+          userId: evidenceCounterpartId,
+          type: NotificationType.DISPUTE_EVIDENCE_SUBMITTED,
+          category: getCategoryForType(NotificationType.DISPUTE_EVIDENCE_SUBMITTED),
+          title: 'Bukti baru dalam sengketa',
+          body: `Pihak lawan menambahkan bukti baru pada sengketa ${dispute.disputeId}. Silakan periksa.`,
+          isRead: false,
+        },
+      })
+      .catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
+    this.runRealtimeBestEffort(
+      () => this.prisma.emitNotificationCreated({ userId: evidenceCounterpartId, title: 'Bukti baru dalam sengketa', body: `Bukti baru pada sengketa ${dispute.disputeId}`, data: { type: 'DISPUTE_EVIDENCE_SUBMITTED', disputeId: dispute.id } }),
+      `SUBMIT_EVIDENCE_NOTIFICATION disputeId=${dispute.disputeId}`,
+    );
+
     return {
       evidence,
       fileResults,
@@ -560,7 +587,11 @@ export class DisputesService {
     if (normalizedClaim.length < 20 || normalizedClaim.length > 5000) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Claim must contain 20–5000 non-whitespace characters' });
     }
-    return this.withSerializableRetry(() => this.prisma.$transaction(async (tx) => {
+    const isClaimantBuyer = await this.prisma.dispute.findFirst({
+      where: { OR: [{ id: disputeId }, { disputeId }] },
+      select: { order: { select: { buyerId: true, sellerId: true } }, disputeId: true },
+    });
+    const claimResult = await this.withSerializableRetry(() => this.prisma.$transaction(async (tx) => {
       const dispute = await tx.dispute.findFirst({
         where: { OR: [{ id: disputeId }, { disputeId }] },
         include: {
@@ -592,9 +623,9 @@ export class DisputesService {
         throw new ForbiddenException({ code: ErrorCodes.NOT_DISPUTE_PARTICIPANT, message: 'You are not a participant in this dispute' });
       }
 
-      const openForClaim: DisputeStatus[] = [DisputeStatus.OPEN, DisputeStatus.WAITING_RESPONSE];
+      const openForClaim: DisputeStatus[] = [DisputeStatus.OPEN, DisputeStatus.WAITING_RESPONSE, DisputeStatus.ASSIGNED, DisputeStatus.UNDER_REVIEW];
       if (!openForClaim.includes(freshDispute.status)) {
-        throw new BadRequestException({ code: 'DISPUTE_CLOSED_FOR_CLAIM', message: 'Claims can only be submitted when the dispute is OPEN or WAITING_RESPONSE' });
+        throw new BadRequestException({ code: 'DISPUTE_CLOSED_FOR_CLAIM', message: 'Claims can only be submitted when the dispute is OPEN, WAITING_RESPONSE, ASSIGNED, or UNDER_REVIEW' });
       }
 
       if (freshDispute.slaDeadlineAt && Date.now() >= freshDispute.slaDeadlineAt.getTime()) {
@@ -632,6 +663,29 @@ export class DisputesService {
 
       return updated!;
     }), 'SUBMIT_CLAIM_TX');
+
+    // NOTIF-DSP-02: lawan wajib tahu ada klaim balasan. Post-commit best-effort (C-19).
+    if (isClaimantBuyer) {
+      const claimCounterpartId = userId === isClaimantBuyer.order.buyerId ? isClaimantBuyer.order.sellerId : isClaimantBuyer.order.buyerId;
+      this.prisma.notification
+        .create({
+          data: {
+            notifId: generateNotifId(),
+            userId: claimCounterpartId,
+            type: NotificationType.DISPUTE_CLAIM_SUBMITTED,
+            category: getCategoryForType(NotificationType.DISPUTE_CLAIM_SUBMITTED),
+            title: 'Klaim balasan dalam sengketa',
+            body: `Pihak lawan mengajukan klaim pada sengketa ${isClaimantBuyer.disputeId}. Silakan periksa.`,
+            isRead: false,
+          },
+        })
+        .catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
+      this.runRealtimeBestEffort(
+        () => this.prisma.emitNotificationCreated({ userId: claimCounterpartId, title: 'Klaim balasan dalam sengketa', body: `Klaim baru pada sengketa ${isClaimantBuyer.disputeId}`, data: { type: 'DISPUTE_CLAIM_SUBMITTED', disputeId } }),
+        `SUBMIT_CLAIM_NOTIFICATION disputeId=${isClaimantBuyer.disputeId}`,
+      );
+    }
+    return claimResult;
   }
 
   async submitDispute(orderId: string, userId: string, dto: { claim: string; fileUrls?: string[]; fileTypes?: string[] }): Promise<{ disputeId: string; status: string }> {
@@ -948,10 +1002,21 @@ export class DisputesService {
       throw new BadRequestException({ code: ErrorCodes.RATE_LIMIT_EXCEEDED, message: 'Maximum escalation attempts reached for this dispute' });
     }
 
-    const updated = await this.prisma.dispute.update({
-      where: { id: dispute.id },
+    // SEC-DSP-02: predicate the write on an escalatable status. A plain `update` by id
+    // could resurrect a dispute that an admin resolved between the read above and this
+    // write (funds already released, dispute wrongly back to ESCALATED). updateMany
+    // with the status predicate makes the concurrent-resolve case a clean 409 instead.
+    const escalated = await this.prisma.dispute.updateMany({
+      where: {
+        id: dispute.id,
+        status: { in: [DisputeStatus.OPEN, DisputeStatus.ASSIGNED, DisputeStatus.UNDER_REVIEW, DisputeStatus.WAITING_RESPONSE] },
+      },
       data: { status: DisputeStatus.ESCALATED, isSlaBreached: true },
     });
+    if (escalated.count === 0) {
+      throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'Dispute can no longer be escalated' });
+    }
+    const updated = await this.prisma.dispute.findUniqueOrThrow({ where: { id: dispute.id } });
 
     // Log audit
     this.auditLog.logUserAction({

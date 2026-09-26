@@ -3,7 +3,6 @@ import {
   ConflictException,
   Injectable,
   Logger,
-  NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -132,28 +131,28 @@ export class OtpTriggerService {
       }
 
       // Prekondisi per purpose.
+      // Catatan anti-enumerasi: untuk REGISTER (nomor sudah terdaftar) dan
+      // FORGOT_PASSWORD (nomor tidak dikenal / akun nonaktif / terkunci),
+      // kembalikan payload "decoy" yang bentuknya identik dengan sukses.
+      // refCode decoy TIDAK disimpan di Redis sehingga polling status selalu
+      // EXPIRED dan webhook tidak akan pernah menyelesaikannya — penyerang
+      // tidak bisa membedakan nomor terdaftar vs tidak dari respons endpoint
+      // ini (konsisten dengan perlindungan enumerasi email di register()).
       let boundUserId: string | undefined;
       if (dto.purpose === OtpTriggerPurpose.REGISTER) {
         const existing = await this.findUserByPhone(phoneNumber, phoneHash);
         if (existing) {
-          throw new ConflictException({
-            code: ErrorCodes.VALIDATION_ERROR,
-            message: 'Nomor HP sudah terdaftar. Silakan masuk.',
-          });
+          return this.buildDecoyTriggerPayload();
         }
       } else if (dto.purpose === OtpTriggerPurpose.FORGOT_PASSWORD) {
         const user = await this.findUserByPhone(phoneNumber, phoneHash);
-        if (!user || !user.isActive || user.isBanned) {
-          throw new NotFoundException({
-            code: ErrorCodes.NOT_FOUND,
-            message: 'Nomor HP tidak terdaftar di Kahade.',
-          });
-        }
-        if (user.lockedUntil && user.lockedUntil > new Date()) {
-          throw new BadRequestException({
-            code: ErrorCodes.ACCOUNT_LOCKED,
-            message: 'Akun terkunci sementara. Coba lagi nanti.',
-          });
+        if (
+          !user ||
+          !user.isActive ||
+          user.isBanned ||
+          (user.lockedUntil && user.lockedUntil > new Date())
+        ) {
+          return this.buildDecoyTriggerPayload();
         }
         boundUserId = user.id;
       } else if (dto.purpose === OtpTriggerPurpose.MIGRATE_PHONE) {
@@ -194,7 +193,6 @@ export class OtpTriggerService {
         boundUserId = payload.sub;
       }
 
-      const refCode = await this.generateUniqueRefCode();
       const now = new Date();
       const expiresAt = new Date(now.getTime() + TRIGGER_TTL_SECONDS * 1000);
       const record: TriggerRecord = {
@@ -206,7 +204,9 @@ export class OtpTriggerService {
         createdAt: now.toISOString(),
         expiresAt: expiresAt.toISOString(),
       };
-      await this.redis.set(OTP_TRIGGER(refCode), JSON.stringify(record), TRIGGER_TTL_SECONDS);
+      // Klaim atomik (SET NX): dua request konkuren tidak bisa saling
+      // menimpa record trigger — pola check-then-set sebelumnya punya race.
+      const refCode = await this.claimUniqueRefCode(record);
 
       await this.locationService.logEvent({
         userId: boundUserId ?? null,
@@ -366,11 +366,41 @@ export class OtpTriggerService {
     });
   }
 
-  private async generateUniqueRefCode(): Promise<string> {
+  /**
+   * Payload "decoy" anti-enumerasi: bentuknya identik dengan respons sukses
+   * createTrigger, tetapi refCode-nya acak dan TIDAK disimpan di Redis.
+   * Polling status untuk kode ini selalu mengembalikan EXPIRED dan webhook
+   * tidak akan pernah menyelesaikannya, sehingga pemanggil tidak bisa
+   * membedakan nomor terdaftar vs tidak terdaftar dari endpoint ini.
+   */
+  private buildDecoyTriggerPayload(): TriggerPayload {
+    const refCode = randomBytes(REFCODE_BYTES).toString('hex').toUpperCase();
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + TRIGGER_TTL_SECONDS * 1000);
+    const triggerText = `KAHADE ${refCode}`;
+    return {
+      refCode,
+      triggerText,
+      whatsappUrl: `https://wa.me/${KAHADE_WA_NUMBER}?text=${encodeURIComponent(triggerText)}`,
+      expiresInSeconds: TRIGGER_TTL_SECONDS,
+      expiresAt: expiresAt.toISOString(),
+    };
+  }
+
+  /**
+   * Membuat refCode unik dan mengklaimnya secara atomik (SET NX) dalam
+   * satu langkah, sehingga dua request konkuren tidak bisa mendapatkan
+   * kode yang sama lalu saling menimpa record trigger.
+   */
+  private async claimUniqueRefCode(record: TriggerRecord): Promise<string> {
     for (let i = 0; i < 5; i++) {
       const code = randomBytes(REFCODE_BYTES).toString('hex').toUpperCase();
-      const exists = await this.redis.get(OTP_TRIGGER(code));
-      if (!exists) return code;
+      const claimed = await this.redis.setNx(
+        OTP_TRIGGER(code),
+        JSON.stringify(record),
+        TRIGGER_TTL_SECONDS,
+      );
+      if (claimed) return code;
     }
     throw new BadRequestException({
       code: ErrorCodes.TOO_MANY_REQUESTS,

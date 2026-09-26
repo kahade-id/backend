@@ -68,6 +68,27 @@ export class ShowcaseController {
   }
 
   // ------------------------------------------------------------------
+  // Kategori populer (dideklarasikan sebelum :showcaseId)
+  // ------------------------------------------------------------------
+
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Get('categories')
+  @ApiOperation({
+    summary: 'Daftar kategori populer beserta jumlah karya',
+    description:
+      'D-01 (audit Discovery 2026-09-26): kategori etalase adalah teks bebas, ' +
+      'jadi endpoint ini mengagregasi nilai yang benar-benar dipakai (publik, ' +
+      'aktif, tidak dihapus) supaya klien bisa menawarkan saran yang konsisten ' +
+      'dan menghindari fragmentasi ejaan.',
+  })
+  async getPopularCategories(@Query('limit') limitParam?: string): Promise<object> {
+    const parsed = limitParam === undefined || limitParam.trim() === '' ? 20 : Number(limitParam);
+    const limit = Number.isSafeInteger(parsed) ? Math.min(Math.max(parsed, 1), 50) : 20;
+    return this.showcaseService.getPopularCategories(limit);
+  }
+
+  // ------------------------------------------------------------------
   // Moderasi komentar (dideklarasikan sebelum :showcaseId)
   // ------------------------------------------------------------------
 

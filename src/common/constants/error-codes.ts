@@ -310,3 +310,4 @@ export const RECIPIENT_WALLET_LOCKED = 'RECIPIENT_WALLET_LOCKED';
 // client-facing code and lets the clients map it to a translated message.
 export const EMAIL_NOT_CONFIGURED = 'EMAIL_NOT_CONFIGURED';
 export const SHOWCASE_RESTORE_EXPIRED = 'SHOWCASE_RESTORE_EXPIRED';
+export const SHOWCASE_INVALID_PRICE_RANGE = 'SHOWCASE_INVALID_PRICE_RANGE';

@@ -15,11 +15,11 @@ export class SetPinDto {
   @Matches(/^\d{6}$/, { message: 'Current PIN must contain only digits' })
   currentPin?: string;
 
-  // Fixed: password is conditionally required when changing an existing PIN.
-  // Previously marked @IsOptional with @ApiProperty saying required — contradictory OpenAPI.
-  // Now properly modeled as optional in schema but enforced in service when currentPin exists,
-  // and documented accurately.
-  @ApiPropertyOptional({ description: 'Account password — required when changing an existing PIN, optional when setting first PIN' })
+  // Catatan: service (setPin) SELALU mewajibkan password — baik saat
+  // membuat PIN pertama maupun mengubah PIN yang sudah ada. Field ini
+  // dimodelkan opsional di schema agar klien lama tidak rusak, tetapi
+  // request tanpa password akan ditolak dengan 400.
+  @ApiPropertyOptional({ description: 'Account password — always required by the service (first PIN and PIN change)' })
   @ValidateIf((o) => !!o.currentPin)
   @IsString()
   @MinLength(1, { message: 'Password is required when changing an existing PIN' })

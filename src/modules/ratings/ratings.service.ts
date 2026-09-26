@@ -1,6 +1,7 @@
 import { Injectable, BadRequestException, NotFoundException, ForbiddenException, ConflictException, Logger } from '@nestjs/common';
 import { Rating, NotificationType, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { RedisService } from '../../redis/redis.service';
 import { CreateRatingDto } from './dto/create-rating.dto';
 import { UpdateRatingDto } from './dto/update-rating.dto';
 import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
@@ -16,11 +17,15 @@ export class RatingsService {
   private readonly RATING_WINDOW_DAYS = RATING_WINDOW_DAYS;
   private readonly EDIT_WINDOW_DAYS = RATING_EDIT_WINDOW_DAYS;
 
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private redis: RedisService,
+  ) {}
 
   async createRating(userId: string, dto: CreateRatingDto): Promise<Rating> {
+    // T1 (audit 2026-09-26): jangan izinkan rating untuk order yang di-soft-delete.
     const order = await this.prisma.order.findFirst({
-      where: { orderId: dto.orderId },
+      where: { orderId: dto.orderId, deletedAt: null },
       include: {
         dispute: {
           select: {
@@ -276,10 +281,11 @@ export class RatingsService {
     const rating = await this.prisma.rating.findUnique({ where: { id: ratingId } });
     if (!rating) throw new NotFoundException({ code: ErrorCodes.RATING_NOT_FOUND, message: 'Rating not found' });
     if (rating.giverId !== userId) throw new ForbiddenException({ code: ErrorCodes.NOT_RATING_GIVER, message: 'Not owner' });
-    // Allow delete within 7 days
-    const deleteWindow = new Date(rating.createdAt.getTime() + 7 * 24 * 60 * 60 * 1000);
+    // S2 (audit 2026-09-26): dulu hard-coded 7 hari — pakai konstanta agar tidak drift
+    // dari RATING_EDIT_WINDOW_DAYS.
+    const deleteWindow = new Date(rating.createdAt.getTime() + this.EDIT_WINDOW_DAYS * 24 * 60 * 60 * 1000);
     if (new Date() > deleteWindow) {
-      throw new BadRequestException({ code: ErrorCodes.RATING_WINDOW_CLOSED, message: 'Delete window closed (7 days)' });
+      throw new BadRequestException({ code: ErrorCodes.RATING_WINDOW_CLOSED, message: `Delete window closed (${this.EDIT_WINDOW_DAYS} days)` });
     }
     await this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM users WHERE id = ${rating.receiverId} FOR UPDATE`;
@@ -294,28 +300,39 @@ export class RatingsService {
     if (!rating || rating.isHidden) throw new NotFoundException({ code: ErrorCodes.RATING_NOT_FOUND, message: 'Rating not found' });
     if (rating.giverId === userId) throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Cannot mark own rating as helpful' });
 
-    // Use a simple join table pattern via Redis or a new table; fallback to in-memory via RatingHelpful if exists, else use a generic approach
-    // Try to use prisma.ratingHelpful if model exists
+    /*
+     * K1 (audit 2026-09-26): implementasi sebelumnya tidak pernah persist — ia mencoba
+     * model `prisma.ratingHelpful` yang tidak ada di schema, lalu jatuh ke fallback yang
+     * langsung `return { helpful: true, helpfulCount: 1 }` tanpa menyimpan apa pun.
+     * Endpoint ini dipakai aplikasi (app/ratings.tsx), jadi "tandai berguna" adalah no-op
+     * yang berbohong.
+     *
+     * Belum ada tabel join di schema (perlu migration — direkomendasikan sebagai fix
+     * permanen), jadi vote disimpan di Redis: satu SET pemilih per rating + satu counter.
+     * Toggle atomik via Lua agar dua request bersamaan tidak menggandakan hitungan.
+     * Catatan: hitungan ini best-effort — hilang jika Redis di-flush.
+     */
+    const prefix = this.redis.getPrefix();
+    const votersKey = `${prefix}rating_helpful:voters:${ratingId}`;
+    const countKey = `${prefix}rating_helpful:count:${ratingId}`;
+    const script = `
+      if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then
+        redis.call('SREM', KEYS[1], ARGV[1])
+        local n = redis.call('DECR', KEYS[2])
+        if n < 0 then redis.call('SET', KEYS[2], 0); n = 0 end
+        return {0, n}
+      else
+        redis.call('SADD', KEYS[1], ARGV[1])
+        local n = redis.call('INCR', KEYS[2])
+        return {1, n}
+      end
+    `;
     try {
-      const existing = await (this.prisma as any).ratingHelpful?.findUnique?.({ where: { ratingId_userId: { ratingId, userId } } });
-      if (existing) {
-        await (this.prisma as any).ratingHelpful.delete({ where: { id: existing.id } });
-        const count = await (this.prisma as any).ratingHelpful.count({ where: { ratingId } });
-        // The current production schema does not persist a counter on ratings.
-        return { helpful: false, helpfulCount: count };
-      } else {
-        if ((this.prisma as any).ratingHelpful) {
-          await (this.prisma as any).ratingHelpful.create({ data: { ratingId, userId } });
-          const count = await (this.prisma as any).ratingHelpful.count({ where: { ratingId } });
-          // The join-table count is authoritative when that optional model exists.
-          return { helpful: true, helpfulCount: count };
-        }
-      }
-    } catch {}
-    // Fallback: use helpfulCount field increment/decrement with Redis deduplication
-    const key = `rating_helpful:${ratingId}:${userId}`;
-    // This fallback is best-effort: we toggle via rating update only
-    // For simplicity, just increment helpfulCount (client can track)
-    return { helpful: true, helpfulCount: 1 };
+      const res = await this.redis.getClient().eval(script, 2, votersKey, countKey, userId) as [number, number];
+      return { helpful: res[0] === 1, helpfulCount: Number(res[1]) };
+    } catch (err) {
+      this.logger.warn(`toggleHelpful Redis failed for rating ${ratingId}: ${err instanceof Error ? err.message : String(err)}`);
+      throw new BadRequestException({ code: ErrorCodes.SERVICE_UNAVAILABLE, message: 'Helpful vote is temporarily unavailable, please retry' });
+    }
   }
 }

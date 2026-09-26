@@ -157,6 +157,12 @@ export class DeliveryProofService {
     const fileUrls = Array.isArray(dto.fileUrls) ? dto.fileUrls : [];
     this.validateFileKeys(fileUrls, userId);
     const linkUrls = Array.isArray(dto.linkUrls) ? dto.linkUrls : [];
+    if (fileUrls.length === 0 && linkUrls.length === 0) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Delivery proof must include at least one file or link',
+      });
+    }
     if (
       linkUrls.length > 5 ||
       linkUrls.some(
@@ -308,6 +314,7 @@ export class DeliveryProofService {
     const results = await Promise.all(
       proofs.map(async p => {
         let resolvedFileUrls: string[] = [];
+        let unresolvedFileCount = 0;
         if (p.fileUrls && (p.fileUrls as string[]).length > 0) {
           /*
            * C-08: sign each key independently and drop the ones that fail.
@@ -333,12 +340,16 @@ export class DeliveryProofService {
             ),
           );
           resolvedFileUrls = signed.filter((url): url is string => url !== null);
+          // S5 (audit 2026-09-26): beri tahu klien berapa file yang gagal di-sign agar
+          // buyer tidak mengambil keputusan dari bukti yang tidak lengkap tanpa sadar.
+          unresolvedFileCount = signed.length - resolvedFileUrls.length;
         }
 
         return {
           id: p.id,
           description: p.description,
           fileUrls: resolvedFileUrls,
+          unresolvedFileCount,
           linkUrls: p.linkUrls,
           status: p.status,
           reviewWindowEnd: p.reviewWindowEnd,

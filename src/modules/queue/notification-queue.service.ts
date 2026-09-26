@@ -2,6 +2,11 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { NOTIFICATION_QUEUE, NotificationJobData } from './processors/notification.processor';
+import { RedisService } from '../../redis/redis.service';
+
+// Jendela dedup enqueue: replay webhook / retry produsen dalam 5 menit
+// untuk event bisnis yang sama tidak boleh menghasilkan notif ganda.
+const ENQUEUE_DEDUP_TTL_SECONDS = 300;
 
 @Injectable()
 export class NotificationQueueService {
@@ -9,7 +14,22 @@ export class NotificationQueueService {
 
   constructor(
     @InjectQueue(NOTIFICATION_QUEUE) private readonly notificationQueue: Queue<NotificationJobData>,
+    private readonly redis: RedisService,
   ) {}
+
+  /**
+   * Kunci dedup deterministik dari (user, tipe, referensi bisnis).
+   * Null bila tidak ada referensi — enqueue tetap jalan tanpa dedup.
+   */
+  private dedupKey(data: NotificationJobData): string | null {
+    const pushData = data.pushData ?? {};
+    const ref =
+      pushData.orderId ?? pushData.roomId ?? pushData.chatRoomId ??
+      pushData.disputeId ?? pushData.transactionId ?? pushData.txId ??
+      data.actionUrl ?? null;
+    if (!ref || typeof ref !== 'string' || ref.length === 0) return null;
+    return `notif:dedup:${data.userId}:${data.type}:${ref}`;
+  }
 
   async enqueue(data: NotificationJobData): Promise<void> {
     const jobData: NotificationJobData = {
@@ -17,6 +37,14 @@ export class NotificationQueueService {
       language: data.language ?? 'id',
     };
     try {
+      const key = this.dedupKey(jobData);
+      if (key) {
+        const acquired = await this.redis.setNx(key, '1', ENQUEUE_DEDUP_TTL_SECONDS).catch(() => true);
+        if (!acquired) {
+          this.logger.debug(`Skipping duplicate notification enqueue type=${String(jobData.type)} userId=${jobData.userId}`);
+          return;
+        }
+      }
       await this.notificationQueue.add('send', jobData);
       return;
     } catch (error) {

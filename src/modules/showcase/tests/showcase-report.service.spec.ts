@@ -9,6 +9,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { UploadService } from '../../upload/upload.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
+import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { ReportShowcaseDto } from '../dto/report-showcase.dto';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 
@@ -109,6 +110,7 @@ describe('ShowcaseService — reportShowcase (K-1)', () => {
         { provide: UploadService, useValue: mockUpload },
         { provide: ConfigService, useValue: mockConfig },
         { provide: AuditLogService, useValue: mockAuditLog },
+        { provide: VerificationBadgeService, useValue: { getBadges: jest.fn().mockResolvedValue([]) } },
       ],
     }).compile();
     service = module.get<ShowcaseService>(ShowcaseService);

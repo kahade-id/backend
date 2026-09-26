@@ -100,7 +100,10 @@ export class SearchService {
   async clearSearchHistory(userId: string): Promise<{ cleared: boolean }> {
     const key = `search_history:${userId}`;
     try {
-      await this.redis.del(key);
+      // Pakai client mentah seperti save/get — JANGAN via this.redis.del()
+      // yang menambah prefix dan menghapus key yang salah.
+      const client = this.redis.getClient();
+      await client.del(key);
     } catch {}
     return { cleared: true };
   }

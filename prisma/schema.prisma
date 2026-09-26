@@ -805,6 +805,7 @@ model User {
   idempotencyRecords       IdempotencyRecord[]
   walletFavoriteRecipients WalletFavoriteRecipient[] @relation("WalletFavoriteOwner")
   walletFavoritedBy        WalletFavoriteRecipient[] @relation("WalletFavoriteRecipient")
+  feedbacks                Feedback[]
 
   //         — ketiga field ini sudah @unique, index dibuat otomatis. Redundan.
   @@index([kycStatus])
@@ -2923,6 +2924,26 @@ model SupportTicketReply {
 
   @@index([ticketId])
   @@map("support_ticket_replies")
+}
+
+// Feedback pengguna (G-001). Bisa dikirim guest (userId null) — auth opsional.
+// Dipakai halaman feedback aplikasi; bukan tiket support (tidak ada balasan).
+model Feedback {
+  id       String  @id @default(cuid())
+  userId   String?
+  user     User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+  category String  @db.VarChar(100)
+  message  String  @db.Text
+  contact  String? @db.VarChar(320)
+  rating   Int?
+  platform String  @default("app") @db.VarChar(32)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+  @@index([category, createdAt])
+  @@map("feedback")
 }
 
 model DisputeMessage {

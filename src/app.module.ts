@@ -48,6 +48,7 @@ import { WithdrawalsModule } from './modules/withdrawals/withdrawals.module';
 import { HelpCenterModule } from './modules/help-center/help-center.module';
 import { TransactionTemplatesModule } from './modules/transaction-templates/transaction-templates.module';
 import { SupportModule } from './modules/support/support.module';
+import { FeedbackModule } from './modules/feedback/feedback.module';
 import { ConfigApiModule } from './modules/config/config-api.module';
 import { SearchModule } from './modules/search/search.module';
 
@@ -159,6 +160,7 @@ const runtimeEnvFile = getRuntimeEnvFile();
     HelpCenterModule,
     TransactionTemplatesModule,
     SupportModule,
+    FeedbackModule,
     ConfigApiModule,
     SearchModule,
 

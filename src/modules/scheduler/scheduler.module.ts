@@ -55,9 +55,11 @@ import { RedisService } from '../../redis/redis.service';
 import { safeErrorMessage } from '../../common/utils/background-reliability.util';
 import { AuditLogModule } from '../../common/services/audit-log.module';
 import { CampaignService } from '../admin/campaign.service';
+import { UploadModule } from '../upload/upload.module';
+import { ShowcaseHardDeleteService } from './services/showcase-hard-delete.service';
 
 @Module({
-  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, AuditLogModule],
+  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, AuditLogModule, UploadModule],
   providers: [
     WalletDailyResetService,
     DataCleanupService,
@@ -75,6 +77,7 @@ import { CampaignService } from '../admin/campaign.service';
     ExpireDisputeCallsService,
     NotificationArchivalService,
     OrphanedUploadCleanupService,
+    ShowcaseHardDeleteService,
     ProcessScheduledWithdrawalsService,
     DlqMonitorService,
     TopupCounterCorrectionService,

@@ -309,3 +309,4 @@ export const RECIPIENT_WALLET_LOCKED = 'RECIPIENT_WALLET_LOCKED';
 // emit the string literal; exporting it here keeps it discoverable alongside every other
 // client-facing code and lets the clients map it to a translated message.
 export const EMAIL_NOT_CONFIGURED = 'EMAIL_NOT_CONFIGURED';
+export const SHOWCASE_RESTORE_EXPIRED = 'SHOWCASE_RESTORE_EXPIRED';

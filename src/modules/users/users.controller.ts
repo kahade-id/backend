@@ -490,12 +490,23 @@ export class UsersController {
 
   @Delete('me/showcase/:id')
   @UseGuards(UserThrottleGuard)
-  @ApiOperation({ summary: 'Delete a showcase item' })
+  @ApiOperation({ summary: 'Delete a showcase item (soft delete, restorable within 30 days)' })
   async deleteShowcaseItem(
     @CurrentUser('sub') userId: string,
     @Param('id', ParseIdPipe) itemId: string,
   ): Promise<{ message: string }> {
     return this.showcaseService.deleteShowcaseItem(userId, itemId);
+  }
+
+  @Post('me/showcase/:id/restore')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({ summary: 'Restore a soft-deleted showcase item (within 30 days)' })
+  async restoreShowcaseItem(
+    @CurrentUser('sub') userId: string,
+    @Param('id', ParseIdPipe) itemId: string,
+  ): Promise<{ message: string }> {
+    return this.showcaseService.restoreShowcaseItem(userId, itemId);
   }
 
   @Get('me/questions')

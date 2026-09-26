@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
-import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, GoneException, NotFoundException } from '@nestjs/common';
 import { ShowcaseVisibility } from '@prisma/client';
 import { ShowcaseService } from '../showcase.service';
 import { CreateShowcaseItemDto, UpdateShowcaseItemDto } from '../dto/showcase-item.dto';
@@ -193,8 +193,8 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
       expect(result.items.every((i: any) => i.isOwner)).toBe(true);
       expect(result.limits).toEqual({ maxItems: SHOWCASE_MAX_ITEMS, maxImagesPerItem: SHOWCASE_MAX_IMAGES });
       const where = mockPrisma.userShowcase.findMany.mock.calls[0][0].where;
-      // Tidak ada filter isActive/visibility di jalur owner.
-      expect(where).toEqual({ userId: OWNER_ID });
+      // Tidak ada filter isActive/visibility di jalur owner, tapi soft-deleted disaring.
+      expect(where).toEqual({ userId: OWNER_ID, deletedAt: null });
     });
 
     it('serializes BigInt prices to numbers and keeps a deprecated imageUrl alias', async () => {
@@ -342,7 +342,7 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
         response: { code: ErrorCodes.SHOWCASE_NOT_FOUND },
       });
       expect(mockPrisma.userShowcase.findFirst).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { id: SHOWCASE_ID, userId: VIEWER_ID } }),
+        expect.objectContaining({ where: { id: SHOWCASE_ID, userId: VIEWER_ID, deletedAt: null } }),
       );
     });
 
@@ -390,19 +390,57 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
     });
   });
 
-  describe('deleteShowcaseItem', () => {
-    it('deletes the item and cleans up its stored images', async () => {
+  describe('deleteShowcaseItem (soft delete)', () => {
+    it('soft deletes the item (sets deletedAt, does not hard delete)', async () => {
       await expect(service.deleteShowcaseItem(OWNER_ID, SHOWCASE_ID)).resolves.toEqual({
-        message: 'Showcase item deleted successfully',
+        message: 'Etalase dihapus. Dapat dipulihkan dalam 30 hari.',
       });
-      expect(mockPrisma.userShowcase.delete).toHaveBeenCalledWith({ where: { id: SHOWCASE_ID } });
-      expect(mockUpload.cleanupFileKeys).toHaveBeenCalledWith(OWNER_ID, [FILE_KEY]);
+      expect(mockPrisma.userShowcase.update).toHaveBeenCalledWith({
+        where: { id: SHOWCASE_ID },
+        data: { deletedAt: expect.any(Date) },
+      });
+      expect(mockPrisma.userShowcase.delete).not.toHaveBeenCalled();
+      // Gambar R2 TIDAK dihapus saat soft delete — dibersihkan saat hard delete.
+      expect(mockUpload.cleanupFileKeys).not.toHaveBeenCalled();
     });
 
     it('rejects deleting an item owned by someone else', async () => {
       dbRow = null;
       await expect(service.deleteShowcaseItem(VIEWER_ID, SHOWCASE_ID)).rejects.toThrow(NotFoundException);
-      expect(mockPrisma.userShowcase.delete).not.toHaveBeenCalled();
+      expect(mockPrisma.userShowcase.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects deleting an already-deleted item', async () => {
+      // findOwnedShowcase filter deletedAt: null → item yang sudah dihapus tidak ketemu.
+      dbRow = { ...showcaseRow(), deletedAt: new Date() };
+      mockPrisma.userShowcase.findFirst.mockResolvedValue(null);
+      await expect(service.deleteShowcaseItem(OWNER_ID, SHOWCASE_ID)).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('restoreShowcaseItem', () => {
+    it('restores a soft-deleted item within 30 days', async () => {
+      const deletedAt = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000); // 5 hari lalu
+      mockPrisma.userShowcase.findFirst.mockResolvedValue({ ...showcaseRow(), deletedAt });
+      await expect(service.restoreShowcaseItem(OWNER_ID, SHOWCASE_ID)).resolves.toEqual({
+        message: 'Etalase berhasil dipulihkan.',
+      });
+      expect(mockPrisma.userShowcase.update).toHaveBeenCalledWith({
+        where: { id: SHOWCASE_ID },
+        data: { deletedAt: null },
+      });
+    });
+
+    it('rejects restore after 30 days with 410', async () => {
+      const deletedAt = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000); // 31 hari lalu
+      mockPrisma.userShowcase.findFirst.mockResolvedValue({ ...showcaseRow(), deletedAt });
+      await expect(service.restoreShowcaseItem(OWNER_ID, SHOWCASE_ID)).rejects.toThrow(GoneException);
+      expect(mockPrisma.userShowcase.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects restore of non-deleted item', async () => {
+      mockPrisma.userShowcase.findFirst.mockResolvedValue(null);
+      await expect(service.restoreShowcaseItem(OWNER_ID, SHOWCASE_ID)).rejects.toThrow(NotFoundException);
     });
   });
 

@@ -1,4 +1,4 @@
-import { Injectable, Logger, BadRequestException, NotFoundException, ForbiddenException, ConflictException } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException, NotFoundException, ForbiddenException, ConflictException, GoneException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ContentHiddenReason, Prisma, ShowcaseVisibility } from '@prisma/client';
 import { createHash } from 'crypto';
@@ -233,6 +233,7 @@ export class ShowcaseService {
       where: {
         id: showcaseId,
         isActive: true,
+        deletedAt: null,
         // Dua cabang: (1) pemilik selalu boleh melihat itemnya sendiri, termasuk
         //     yang PRIVATE dan termasuk saat profilnya sedang tidak publik —
         //     kalau tidak, owner kehilangan preview item privatnya sendiri;
@@ -255,7 +256,22 @@ export class ShowcaseService {
   /** Ambil showcase milik `userId` untuk jalur tulis (CRUD owner). */
   private async findOwnedShowcase(userId: string, showcaseId: string) {
     const row = await this.prisma.userShowcase.findFirst({
-      where: { id: showcaseId, userId },
+      where: { id: showcaseId, userId, deletedAt: null },
+      include: { images: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } },
+    });
+    if (!row) {
+      throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
+    }
+    return row;
+  }
+
+  /**
+   * Ambil showcase milik `userId` yang sedang di-soft-delete (untuk restore).
+   * Item yang tidak dihapus atau sudah lewat 30 hari tidak ditemukan di sini.
+   */
+  private async findDeletedShowcase(userId: string, showcaseId: string) {
+    const row = await this.prisma.userShowcase.findFirst({
+      where: { id: showcaseId, userId, deletedAt: { not: null } },
       include: { images: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } },
     });
     if (!row) {
@@ -366,7 +382,7 @@ export class ShowcaseService {
 
   async getMyShowcase(userId: string): Promise<object> {
     const items = (await this.prisma.userShowcase.findMany({
-      where: { userId },
+      where: { userId, deletedAt: null },
       orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
       include: SHOWCASE_INCLUDE,
     })) as unknown as ShowcaseRow[];
@@ -395,7 +411,7 @@ export class ShowcaseService {
     try {
       const item = (await this.prisma.$transaction(
         async (tx) => {
-          const count = await tx.userShowcase.count({ where: { userId } });
+          const count = await tx.userShowcase.count({ where: { userId, deletedAt: null } });
           if (count >= SHOWCASE_MAX_ITEMS) {
             throw limitError();
           }
@@ -427,7 +443,7 @@ export class ShowcaseService {
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2034') {
         // Race pada cek batas: verifikasi ulang di luar transaksi.
-        const count = await this.prisma.userShowcase.count({ where: { userId } });
+        const count = await this.prisma.userShowcase.count({ where: { userId, deletedAt: null } });
         if (count >= SHOWCASE_MAX_ITEMS) {
           throw limitError();
         }
@@ -485,10 +501,36 @@ export class ShowcaseService {
 
   async deleteShowcaseItem(userId: string, itemId: string): Promise<{ message: string }> {
     const existing = await this.findOwnedShowcase(userId, itemId);
-    await this.prisma.userShowcase.delete({ where: { id: itemId } });
-    const removedKeys = existing.images.map((image) => image.fileKey).filter((k): k is string => Boolean(k));
-    this.scheduleImageCleanup(userId, removedKeys);
-    return { message: 'Showcase item deleted successfully' };
+    // Soft delete: item disembunyikan dari semua jalur baca, bisa dipulihkan
+    // dalam 30 hari. Hard delete otomatis oleh cron setelah 30 hari.
+    // Gambar di R2 TIDAK dihapus sekarang — dibersihkan saat hard delete.
+    await this.prisma.userShowcase.update({
+      where: { id: existing.id },
+      data: { deletedAt: new Date() },
+    });
+    // Invalidate badge/cache terkait bila ada (tidak ada cache khusus showcase).
+    return { message: 'Etalase dihapus. Dapat dipulihkan dalam 30 hari.' };
+  }
+
+  /**
+   * Pulihkan item yang di-soft-delete (dalam 30 hari).
+   * Setelah 30 hari → 410 GONE (sudah hard delete oleh cron).
+   */
+  async restoreShowcaseItem(userId: string, itemId: string): Promise<{ message: string }> {
+    const existing = await this.findDeletedShowcase(userId, itemId);
+    const deletedAt = existing.deletedAt as Date;
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+    if (Date.now() - deletedAt.getTime() > thirtyDaysMs) {
+      throw new GoneException({
+        code: ErrorCodes.SHOWCASE_RESTORE_EXPIRED,
+        message: 'Masa pemulihan 30 hari telah berakhir. Etalase sudah dihapus permanen.',
+      });
+    }
+    await this.prisma.userShowcase.update({
+      where: { id: existing.id },
+      data: { deletedAt: null },
+    });
+    return { message: 'Etalase berhasil dipulihkan.' };
   }
 
   // ==================================================================
@@ -647,6 +689,7 @@ export class ShowcaseService {
       where: {
         userId: user.id,
         isActive: true,
+        deletedAt: null,
         visibility: ShowcaseVisibility.PUBLIC,
         user: this.visibleOwnerFilter(excludedIds),
       },
@@ -731,6 +774,7 @@ export class ShowcaseService {
     const baseWhere: Prisma.UserShowcaseWhereInput = {
       visibility: ShowcaseVisibility.PUBLIC,
       isActive: true,
+      deletedAt: null,
       user: this.visibleOwnerFilter(excludedIds),
     };
 

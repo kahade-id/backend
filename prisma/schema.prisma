@@ -3012,6 +3012,10 @@ model UserShowcase {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  /// Soft delete: item dihapus user masuk ke sini. Bisa dipulihkan dalam
+  /// 30 hari; setelah itu hard delete otomatis via cron.
+  deletedAt DateTime?
+
   @@index([userId, isActive, sortOrder])
   // Feed discover: sort "latest" (createdAt) dan "popular" (likeCount). Kolom id
   // ikut di index karena dipakai sebagai tiebreak cursor pagination.

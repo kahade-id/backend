@@ -222,11 +222,14 @@ export class ReconciliationFindingsService {
       throw new NotFoundException({ code: 'NOT_FOUND', message: 'Reconciliation finding not found' });
     }
 
+    // ADM-228: temuan yang sudah RESOLVED/ACCEPTED boleh dibuka kembali ke
+    // INVESTIGATING (catatan wajib — divalidasi di bawah), agar salah tandai
+    // selesai tidak permanen. Reopen dicatat dengan aksi audit spesifik.
     const allowed: Record<ReconciliationFindingStatus, ReconciliationFindingStatus[]> = {
       NEW: ['INVESTIGATING', 'RESOLVED', 'ACCEPTED'],
       INVESTIGATING: ['RESOLVED', 'ACCEPTED'],
-      RESOLVED: [],
-      ACCEPTED: [],
+      RESOLVED: ['INVESTIGATING'],
+      ACCEPTED: ['INVESTIGATING'],
     };
     if (!allowed[row.status].includes(dto.status)) {
       throw new ConflictException({
@@ -251,12 +254,16 @@ export class ReconciliationFindingsService {
       },
     });
 
+    const isReopen = dto.status === 'INVESTIGATING' && (row.status === 'RESOLVED' || row.status === 'ACCEPTED');
+
     this.auditLog.logAdminAction({
       adminId,
-      action: AuditAction.RECONCILIATION_FINDING_ACKNOWLEDGED,
+      action: isReopen
+        ? AuditAction.RECONCILIATION_FINDING_REOPENED
+        : AuditAction.RECONCILIATION_FINDING_ACKNOWLEDGED,
       targetType: 'ReconciliationFinding',
       targetId: id,
-      description: `Finding ${id} acknowledged → ${dto.status}${dto.notes ? `: ${dto.notes.slice(0, 200)}` : ''}`,
+      description: `Finding ${id} ${isReopen ? 'reopened' : 'acknowledged'} → ${dto.status}${dto.notes ? `: ${dto.notes.slice(0, 200)}` : ''}`,
       before: { status: row.status },
       after: { status: dto.status },
       ipAddress,

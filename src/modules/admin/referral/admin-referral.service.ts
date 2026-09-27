@@ -35,7 +35,7 @@ export class AdminReferralService {
     };
   }
 
-  async listReferralCodes(page: number, limit: number, isActive?: string): Promise<object> {
+  async listReferralCodes(page: number, limit: number, isActive?: string, q?: string): Promise<object> {
     const safePage = Math.max(1, Number.isFinite(page) ? Math.trunc(page) : 1);
     const safeLimit = Math.min(100, Math.max(1, Number.isFinite(limit) ? Math.trunc(limit) : 20));
     const skip = (safePage - 1) * safeLimit;
@@ -45,6 +45,17 @@ export class AdminReferralService {
     const where: Prisma.ReferralCodeWhereInput = {};
     if (normalizedActive === 'true') where.isActive = true;
     if (normalizedActive === 'false') where.isActive = false;
+
+    // ADM-221: pencarian server-side — kode, username, atau nama pemilik.
+    const needle = typeof q === 'string' ? q.trim() : '';
+    if (needle) {
+      const insensitive = { contains: needle, mode: 'insensitive' as const };
+      where.OR = [
+        { code: insensitive },
+        { user: { username: insensitive } },
+        { user: { fullName: insensitive } },
+      ];
+    }
 
     const [codes, total] = await Promise.all([
       this.prisma.referralCode.findMany({

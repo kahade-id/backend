@@ -520,6 +520,8 @@ enum AuditAction {
   SYSTEM_CONFIG_CHANGED
   VOUCHER_CREATED
   VOUCHER_DEACTIVATED
+  // ADM-218 reaktivasi voucher (append-only; migrasi 20260927180000_recheck_reactivate_audit)
+  VOUCHER_REACTIVATED
   KYC_DOCUMENTS_ACCESSED
   // GAP-E1 KYC SLA & operasi antrean (G276–G300, append-only; migrasi 20260927050000_gap_e_admin_ops)
   SLA_CONFIG_UPDATED
@@ -532,7 +534,13 @@ enum AuditAction {
   // GAP-E rekonsiliasi keuangan (G326–G350, append-only; migrasi 20260927050000_gap_e_admin_ops)
   RECONCILIATION_FINDING_CREATED
   RECONCILIATION_FINDING_ACKNOWLEDGED
+  RECONCILIATION_FINDING_REOPENED
   MANUAL_LEDGER_CORRECTION
+  // ADM-205 dual control withdrawal (append-only; migrasi 20260927170000_withdrawal_dual_approval_audit)
+  WITHDRAWAL_APPROVED
+  WITHDRAWAL_REJECTED
+  // ADM-213 recheck manual withdrawal PROCESSING (append-only; migrasi 20260927180000_recheck_reactivate_audit)
+  WITHDRAWAL_RECHECKED
   // GAP-E siklus edit/hapus kampanye (G351–G375, append-only; migrasi 20260927050000_gap_e_admin_ops)
   CAMPAIGN_UPDATED
   CAMPAIGN_DELETED

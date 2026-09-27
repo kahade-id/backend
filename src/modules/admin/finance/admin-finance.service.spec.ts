@@ -7,10 +7,27 @@ jest.mock('../../../common/utils/crypto.util', () => ({
 }));
 
 describe('AdminFinanceService payout submission safety', () => {
+  // ADM-205: baris approval yang "tersimpan" — di-reset tiap test.
+  let approvalRows: { adminId: string }[];
   const prisma = {
     walletTransaction: {
       findFirst: jest.fn(),
       updateMany: jest.fn(),
+      update: jest.fn(),
+      findUnique: jest.fn(),
+      findUniqueOrThrow: jest.fn(),
+    },
+    // ADM-205: mock kuorum dual approval yang stateful — create() menambah
+    // adminId ke daftar, findMany() mengembalikan daftar saat ini.
+    adminAuditLog: {
+      findMany: jest.fn(async () => [...approvalRows]),
+      create: jest.fn(async (args: { data: { adminId: string } }) => {
+        approvalRows.push({ adminId: args.data.adminId });
+        return { id: 'audit-1' };
+      }),
+    },
+    systemConfig: {
+      findUnique: jest.fn(async () => null),
     },
     $transaction: jest.fn(),
   };
@@ -21,6 +38,9 @@ describe('AdminFinanceService payout submission safety', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    // ADM-205: default satu approval dari admin lain → kuorum tercapai saat
+    // admin-1 menyetujui (alur payout tereksekusi seperti sebelum dual control).
+    approvalRows = [{ adminId: 'admin-2' }];
     prisma.walletTransaction.findFirst.mockResolvedValue({
       id: 'withdraw-internal-1',
       txId: 'WLT-1',

@@ -11,6 +11,7 @@ import { VerificationBadgeService } from '../../users/verification-badge.service
 import { PLUS_FEE_WAIVER_QUOTA_IDR } from '../../../common/constants/app.constants';
 import { escapeLikePattern } from '../../../common/utils/search.util';
 import { getWibMonthStart } from '../../../common/utils/date.util';
+import { resolveUserInternalId } from '../common/resolve-user-id';
 
 @Injectable()
 export class AdminSubscriptionsService {
@@ -305,15 +306,17 @@ export class AdminSubscriptionsService {
    * (tanpa pembayaran). Dipakai untuk kompensasi / kemitraan / testing.
    */
   async grantSubscription(
-    userId: string,
+    rawUserId: string,
     plan: 'MONTHLY' | 'YEARLY',
     durationDays: number,
     reason: string | undefined,
     adminId: string,
     ipAddress: string,
   ): Promise<object> {
+    // ADM-202: terima ID publik (USR-…) maupun cuid internal.
+    const internalUserId = await resolveUserInternalId(this.prisma, rawUserId);
     const user = await this.prisma.user.findUnique({
-      where: { id: userId },
+      where: { id: internalUserId },
       select: { id: true, kahadePlusSince: true },
     });
     if (!user) {
@@ -326,7 +329,7 @@ export class AdminSubscriptionsService {
     const now = new Date();
     const existing = await this.prisma.subscription.findFirst({
       where: {
-        userId,
+        userId: internalUserId,
         status: { in: ['ACTIVE', 'CANCELLED', 'SUSPENDED', 'PAUSED'] },
         currentPeriodEnd: { gt: now },
       },
@@ -346,7 +349,7 @@ export class AdminSubscriptionsService {
       async tx => {
         const created = await tx.subscription.create({
           data: {
-            userId,
+            userId: internalUserId,
             plan,
             status: 'ACTIVE',
             price: BigInt(0),
@@ -359,7 +362,7 @@ export class AdminSubscriptionsService {
           },
         });
         await tx.user.update({
-          where: { id: userId },
+          where: { id: internalUserId },
           data: {
             isKahadePlus: true,
             subscriptionExpiresAt: periodEnd,
@@ -371,17 +374,17 @@ export class AdminSubscriptionsService {
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
 
-    await this.redis.del(`subscription_status:${userId}`).catch((err: unknown) =>
-      this.logger.warn(`Failed to invalidate subscription status cache for ${userId}: ${err instanceof Error ? err.message : String(err)}`),
+    await this.redis.del(`subscription_status:${internalUserId}`).catch((err: unknown) =>
+      this.logger.warn(`Failed to invalidate subscription status cache for ${internalUserId}: ${err instanceof Error ? err.message : String(err)}`),
     );
-    await this.verificationBadgeService.invalidate(userId);
+    await this.verificationBadgeService.invalidate(internalUserId);
 
     this.auditLog.logAdminAction({
       adminId,
       action: AuditAction.ADMIN_ACTION,
       targetType: 'Subscription',
       targetId: subscription.id,
-      description: `Granted ${plan} subscription (${durationDays} days) to user ${userId}. Reason: ${reason?.trim() || '-'}`,
+      description: `Granted ${plan} subscription (${durationDays} days) to user ${internalUserId}. Reason: ${reason?.trim() || '-'}`,
       ipAddress,
     });
 
@@ -424,10 +427,9 @@ export class AdminSubscriptionsService {
       }
     }
     if (input.assignedUserId) {
-      const user = await this.prisma.user.findUnique({ where: { id: input.assignedUserId }, select: { id: true } });
-      if (!user) {
-        throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User tidak ditemukan' });
-      }
+      // ADM-202 (pola sama): terima ID publik maupun cuid internal.
+      const assignedInternalId = await resolveUserInternalId(this.prisma, input.assignedUserId);
+      input = { ...input, assignedUserId: assignedInternalId };
     }
 
     try {

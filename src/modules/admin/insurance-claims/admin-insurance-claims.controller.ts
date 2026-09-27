@@ -11,6 +11,7 @@ import { AdminRole } from '@prisma/client';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
 import { Request } from 'express';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
+import { Idempotency } from '../../../common/decorators/idempotency.decorator';
 
 @ApiTags('admin-insurance-claims')
 @ApiBearerAuth('access-token')
@@ -29,9 +30,16 @@ export class AdminInsuranceClaimsController {
   }
 
   @Patch(':claimId')
+  @Idempotency()
   @UseGuards(UserThrottleGuard)
-  @ApiOperation({ summary: 'Ubah status klaim asuransi (APPROVED/REJECTED/PAID)' })
+  // ADM-208: reviewClaim (termasuk transisi PAID yang mengeksekusi payout
+  // nyata ke wallet) HANYA untuk role keuangan. Class-level mengizinkan
+  // CUSTOMER_SUPPORT untuk list (read/triage); method-level ini menimpa
+  // (getAllAndOverride: handler didahulukan) sehingga CS mendapat 403.
+  @AdminRoles(AdminRole.SUPER_ADMIN, AdminRole.FINANCE_ADMIN)
+  @ApiOperation({ summary: 'Ubah status klaim asuransi (APPROVED/REJECTED/PAID)', description: 'ADM-208: hanya SUPER_ADMIN / FINANCE_ADMIN. Transisi PAID mengeksekusi payout nyata.' })
   @ApiResponse({ status: 200, description: 'Status klaim diperbarui.' })
+  @ApiResponse({ status: 403, description: 'Role tidak diizinkan (CS tidak boleh me-review klaim).' })
   @ApiResponse({ status: 404, description: 'Klaim tidak ditemukan.' })
   reviewClaim(
     @Param('claimId', ParseIdPipe) claimId: string,

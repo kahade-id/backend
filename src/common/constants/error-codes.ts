@@ -92,6 +92,14 @@ export const DAILY_TOPUP_LIMIT_EXCEEDED = 'DAILY_TOPUP_LIMIT_EXCEEDED';
 export const DAILY_WITHDRAW_LIMIT_EXCEEDED = 'DAILY_WITHDRAW_LIMIT_EXCEEDED';
 export const BELOW_MINIMUM_WITHDRAW = 'BELOW_MINIMUM_WITHDRAW';
 export const PAYOUT_FAILED = 'PAYOUT_FAILED';
+// ADM-205 (dual control withdrawal): admin yang sama mencoba menyetujui dua kali.
+export const WITHDRAWAL_ALREADY_APPROVED = 'WITHDRAWAL_ALREADY_APPROVED';
+// ADM-213 (recheck manual): hanya withdrawal PROCESSING yang boleh dicek ulang.
+export const WITHDRAWAL_NOT_PROCESSING = 'WITHDRAWAL_NOT_PROCESSING';
+// ADM-206 (re-auth kata sandi admin server-side untuk koreksi ledger).
+export const REAUTH_PASSWORD_REQUIRED = 'REAUTH_PASSWORD_REQUIRED';
+export const REAUTH_INVALID_PASSWORD = 'REAUTH_INVALID_PASSWORD';
+export const REAUTH_TOO_MANY_ATTEMPTS = 'REAUTH_TOO_MANY_ATTEMPTS';
 export const KYC_REQUIRED = 'KYC_REQUIRED';
 export const KYC_REQUIRED_FOR_WITHDRAW = 'KYC_REQUIRED_FOR_WITHDRAW';
 

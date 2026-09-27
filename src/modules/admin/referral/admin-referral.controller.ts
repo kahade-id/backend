@@ -27,6 +27,6 @@ export class AdminReferralController {
   @ApiOperation({ summary: 'List all referral codes' })
   @ApiResponse({ status: 200, description: 'Referral codes list returned.' })
   listReferralCodes(@Query() query: ReferralCodeQueryDto): Promise<object> {
-    return this.service.listReferralCodes(query.page!, query.limit!, query.isActive);
+    return this.service.listReferralCodes(query.page!, query.limit!, query.isActive, query.q);
   }
 }

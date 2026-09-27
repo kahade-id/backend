@@ -373,6 +373,78 @@ export class AdminVouchersService {
     };
   }
 
+  /**
+   * ADM-218 — aktifkan kembali voucher yang dinonaktifkan.
+   *
+   * Semantik produk: `isActive` adalah flag lunak (deactivate tidak menghapus
+   * voucher), sehingga reaktivasi mengembalikan status pra-nonaktif — bukan
+   * keputusan produk baru. Fail-closed:
+   * - voucher tidak ada → 404
+   * - masih aktif → 400 (tidak ada yang berubah)
+   * - masa berlaku sudah lewat → 400 (aktif pun tak bisa dipakai; perpanjang
+   *   masa berlaku adalah keputusan produk terpisah)
+   */
+  async reactivateVoucher(voucherId: string, adminId: string, ipAddress: string): Promise<object> {
+    const voucher = await this.prisma.voucher.findFirst({
+      where: { OR: [{ id: voucherId }, { voucherId }] },
+    });
+
+    if (!voucher) {
+      throw new NotFoundException({
+        code: ErrorCodes.VOUCHER_NOT_FOUND,
+        message: 'Voucher not found',
+      });
+    }
+
+    if (voucher.isActive) {
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_STATUS,
+        message: 'Voucher is already active',
+      });
+    }
+
+    if (voucher.validUntil < new Date()) {
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_STATUS,
+        message: 'Voucher sudah kedaluwarsa — tidak dapat diaktifkan kembali',
+      });
+    }
+
+    const updatedResult = await this.prisma.voucher.updateMany({
+      where: { id: voucher.id, isActive: false },
+      data: {
+        isActive: true,
+        deactivatedBy: null,
+        deactivatedAt: null,
+      },
+    });
+    if (updatedResult.count === 0) {
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_STATUS,
+        message: 'Voucher is already active',
+      });
+    }
+    const updated = await this.prisma.voucher.findUniqueOrThrow({ where: { id: voucher.id } });
+
+    await this.invalidateVoucherListCache();
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.VOUCHER_REACTIVATED,
+      targetType: 'Voucher',
+      targetId: voucher.id,
+      description: `Reactivated voucher ${voucher.code}`,
+      ipAddress,
+    });
+
+    return {
+      ...updated,
+      discountAmount: updated.discountAmount ? toIdr(updated.discountAmount) : null,
+      maxDiscountAmount: updated.maxDiscountAmount ? toIdr(updated.maxDiscountAmount) : null,
+      minOrderValue: updated.minOrderValue ? toIdr(updated.minOrderValue) : null,
+    };
+  }
+
   private async invalidateVoucherListCache(): Promise<void> {
     // AUDIT-25: delPattern() used to swallow SCAN/DEL failures, so a voucher could stay
     // "revoked but still advertised" for the full cache TTL while every log claimed

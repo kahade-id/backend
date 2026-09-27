@@ -42,16 +42,17 @@ export class RequestCorrectionDto {
   @MaxLength(100)
   idempotencyKey!: string;
 
-  @ApiPropertyOptional({
+  @ApiProperty({
     description:
-      'FOLLOW-UP (belum diverifikasi server-side): token re-autentikasi admin. ' +
-      'UI wajib meminta kata sandi admin sebelum submit; verifikasi server-side ' +
-      'terhadap hash kata sandi admin belum tersedia dan dicatat sebagai tindak lanjut.',
+      'ADM-206: kata sandi admin saat ini untuk re-autentikasi. Diverifikasi ' +
+      'server-side terhadap hash bcrypt AdminUser (rate limit 5x salah / 15 mnt). ' +
+      'WAJIB diisi — menggantikan token palsu "password-confirm:provided". ' +
+      'Tidak pernah di-log.',
   })
-  @IsOptional()
   @IsString()
-  @MaxLength(500)
-  reauthToken?: string;
+  @IsNotEmpty()
+  @MaxLength(128)
+  reauthPassword!: string;
 }
 
 export class DecideCorrectionDto {
@@ -65,11 +66,15 @@ export class DecideCorrectionDto {
   @MaxLength(2000)
   notes?: string;
 
-  @ApiPropertyOptional({ description: 'FOLLOW-UP: token re-autentikasi admin (lihat RequestCorrectionDto)' })
-  @IsOptional()
+  @ApiProperty({
+    description:
+      'ADM-206: kata sandi admin saat ini untuk re-autentikasi (sama seperti RequestCorrectionDto). ' +
+      'WAJIB — keputusan APPROVE mengeksekusi mutasi saldo.',
+  })
   @IsString()
-  @MaxLength(500)
-  reauthToken?: string;
+  @IsNotEmpty()
+  @MaxLength(128)
+  reauthPassword!: string;
 }
 
 export class CorrectionsQueryDto extends PaginationDto {

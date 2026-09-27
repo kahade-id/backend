@@ -1,13 +1,26 @@
 import {
   Injectable,
   Logger,
+  HttpException,
+  HttpStatus,
   NotFoundException,
   ConflictException,
   ForbiddenException,
   BadRequestException,
   UnprocessableEntityException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
+import { bcryptCompare } from '../../../common/utils/crypto.util';
+import { RedisService } from '../../../redis/redis.service';
+import * as ErrorCodes from '../../../common/constants/error-codes';
+
+/** 429 lokal (pola otp.service.ts) — @nestjs/common versi ini tidak mengekspornya. */
+class TooManyRequestsException extends HttpException {
+  constructor(response: string | Record<string, unknown>) {
+    super(response, HttpStatus.TOO_MANY_REQUESTS);
+  }
+}
 
 /**
  * ID permintaan koreksi. Format `CORR-<uuid>` — lolos ParseIdPipe
@@ -61,14 +74,19 @@ import {
  * - Idempotency domain via `idempotencyKey`: replay payload sama →
  *   kembalikan request yang sama; payload beda → 409.
  * - Alasan + ticketRef WAJIB (validasi DTO).
- * - `reauthToken` diterima tetapi verifikasi server-side BELUM tersedia
- *   (tidak ada mekanisme re-auth admin yang ada) — dicatat sebagai
- *   follow-up; UI wajib meminta kata sandi admin sebelum submit.
+ * - `reauthPassword` WAJIB dan diverifikasi server-side terhadap hash bcrypt
+ *   AdminUser (ADM-206; rate limit 5x salah / 15 mnt via Redis). Kata sandi
+ *   tidak pernah di-log.
  */
 export const MAX_LEDGER_CORRECTION_IDR = 10_000_000;
 
 const TARGET_REQUEST = 'LedgerCorrectionRequest';
 const TARGET_DECISION = 'LedgerCorrectionDecision';
+
+// ADM-206: rate limit upaya re-auth password yang salah.
+const REAUTH_FAIL_KEY_PREFIX = 'reauth:fail:';
+const REAUTH_MAX_ATTEMPTS = 5;
+const REAUTH_LOCK_TTL_SECONDS = 900; // 15 menit
 
 export type CorrectionStatus = 'PENDING_APPROVAL' | 'APPROVED' | 'REJECTED';
 
@@ -117,7 +135,69 @@ export class LedgerCorrectionService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly walletTxSerial: WalletTxSerialService,
+    private readonly redis: RedisService,
   ) {}
+
+  /**
+   * ADM-206 — verifikasi server-side kata sandi admin (re-auth nyata).
+   * Menggantikan token palsu "password-confirm:provided" (ADM-206).
+   *
+   * - Membandingkan dengan hash bcrypt AdminUser (bukan string literal).
+   * - Rate limit: 5x salah dalam 15 menit → 429. Disimpan di Redis;
+   *   bila Redis down, endpoint tetap dilindungi UserThrottleGuard (10/mnt)
+   *   di controller — kegagalan verifikasi TIDAK PERNAH lolos diam-diam.
+   * - Kata sandi tidak pernah di-log (hanya hasil + IP).
+   */
+  private async verifyReauthPassword(adminId: string, password: unknown, ipAddress: string): Promise<void> {
+    if (typeof password !== 'string' || password.length === 0) {
+      throw new BadRequestException({
+        code: ErrorCodes.REAUTH_PASSWORD_REQUIRED,
+        message: 'Konfirmasi kata sandi admin wajib diisi',
+      });
+    }
+    const failKey = `${REAUTH_FAIL_KEY_PREFIX}${adminId}`;
+    let fails = 0;
+    try {
+      fails = Number(await this.redis.get(failKey)) || 0;
+    } catch {
+      // Redis down → lanjut; throttle HTTP di controller tetap berlaku.
+    }
+    if (fails >= REAUTH_MAX_ATTEMPTS) {
+      throw new TooManyRequestsException({
+        code: ErrorCodes.REAUTH_TOO_MANY_ATTEMPTS,
+        message: 'Terlalu banyak percobaan kata sandi salah — coba lagi dalam 15 menit',
+      });
+    }
+    const admin = await this.prisma.adminUser.findUnique({
+      where: { id: adminId },
+      select: { password: true, isActive: true, deletedAt: true },
+    });
+    let valid = false;
+    if (admin && admin.isActive && !admin.deletedAt && admin.password) {
+      try {
+        valid = await bcryptCompare(password, admin.password);
+      } catch {
+        valid = false;
+      }
+    }
+    if (!valid) {
+      try {
+        await this.redis.incrWithTtl(failKey, REAUTH_LOCK_TTL_SECONDS);
+      } catch {
+        // Abaikan — kegagalan tetap ditolak di bawah.
+      }
+      this.logger.warn(`Re-auth password GAGAL untuk admin ${adminId} dari IP ${ipAddress}`);
+      throw new UnauthorizedException({
+        code: ErrorCodes.REAUTH_INVALID_PASSWORD,
+        message: 'Kata sandi salah',
+      });
+    }
+    try {
+      await this.redis.del(failKey);
+    } catch {
+      // Abaikan.
+    }
+  }
 
   /** Guard murni (unit-testable): approver tidak boleh sama dengan requester. */
   static assertNotSelfApproval(requestedBy: string, approverId: string): void {
@@ -201,6 +281,9 @@ export class LedgerCorrectionService {
   async requestCorrection(adminId: string, dto: RequestCorrectionDto, ipAddress: string): Promise<CorrectionView> {
     LedgerCorrectionService.assertAmountWithinLimit(dto.amountIdr);
 
+    // ADM-206: re-auth kata sandi admin — verifikasi NYATA server-side.
+    await this.verifyReauthPassword(adminId, dto.reauthPassword, ipAddress);
+
     // ADM-201: terima ID publik (USR-…) maupun cuid internal — panel admin
     // menampilkan ID publik di mana-mana. Resolusi dilakukan SEBELUM cek
     // idempotency agar format berbeda untuk user yang sama tidak dianggap
@@ -245,10 +328,14 @@ export class LedgerCorrectionService {
       });
     }
 
-    if (dto.reauthToken) {
-      // FOLLOW-UP: tidak ada mekanisme verifikasi re-auth admin; token dicatat
-      // penerimaannya saja. Jangan log nilainya.
-      this.logger.warn('reauthToken supplied for correction request but server-side verification is not implemented (follow-up)');
+    // ADM-206: fail-closed untuk client lama yang masih mengirim token palsu
+    // "password-confirm:..." — kontrak kini reauthPassword (wajib, diverifikasi).
+    const legacyToken = (dto as unknown as Record<string, unknown>).reauthToken;
+    if (typeof legacyToken === 'string' && legacyToken.length > 0) {
+      throw new BadRequestException({
+        code: ErrorCodes.REAUTH_PASSWORD_REQUIRED,
+        message: 'Field reauthToken sudah tidak didukung — kirim reauthPassword (kata sandi admin)',
+      });
     }
 
     const requestId = newCorrectionId();
@@ -293,16 +380,25 @@ export class LedgerCorrectionService {
 
     LedgerCorrectionService.assertNotSelfApproval(req.requestedBy, approverId);
 
+    // ADM-206: re-auth kata sandi admin — verifikasi NYATA server-side.
+    // Keputusan APPROVE mengeksekusi mutasi saldo; REJECT pun butuh konfirmasi sadar.
+    await this.verifyReauthPassword(approverId, dto.reauthPassword, ipAddress);
+
+    // ADM-206: tolak token palsu warisan client lama (fail-closed).
+    const legacyToken = (dto as unknown as Record<string, unknown>).reauthToken;
+    if (typeof legacyToken === 'string' && legacyToken.length > 0) {
+      throw new BadRequestException({
+        code: ErrorCodes.REAUTH_PASSWORD_REQUIRED,
+        message: 'Field reauthToken sudah tidak didukung — kirim reauthPassword (kata sandi admin)',
+      });
+    }
+
     const existingDecision = await this.findDecisionRow(requestId);
     if (existingDecision) {
       throw new ConflictException({
         code: 'CORRECTION_ALREADY_DECIDED',
         message: 'Koreksi ini sudah diputuskan',
       });
-    }
-
-    if (dto.reauthToken) {
-      this.logger.warn('reauthToken supplied for correction decision but server-side verification is not implemented (follow-up)');
     }
 
     if (dto.decision === 'REJECT') {

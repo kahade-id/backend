@@ -12,6 +12,10 @@ import {
 import { ParseIdPipe } from '../../../common/pipes/parse-id.pipe';
 import { AuditAction } from '@prisma/client';
 
+jest.mock('../../../common/utils/crypto.util', () => ({
+  bcryptCompare: jest.fn(async (plain: string) => plain === 'password123'),
+}));
+
 const requestRow = (overrides: Record<string, unknown> = {}) => ({
   id: 'audit-1',
   adminId: 'admin-requester',
@@ -43,13 +47,21 @@ describe('LedgerCorrectionService — guard', () => {
     adminAuditLog: { findFirst: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn() },
     wallet: { findUnique: jest.fn() },
     user: { findFirst: jest.fn() },
+    adminUser: { findUnique: jest.fn() },
+  };
+  // ADM-206: mock re-auth password — 'password123' valid, lainnya tidak.
+  const redis = {
+    get: jest.fn(async () => null),
+    incrWithTtl: jest.fn(async () => 1),
+    del: jest.fn(async () => undefined),
   };
   const walletTxSerial = { getNext: jest.fn().mockResolvedValue(42) };
-  const service = () => new LedgerCorrectionService(prisma as never, walletTxSerial as never);
+  const service = () => new LedgerCorrectionService(prisma as never, walletTxSerial as never, redis as never);
 
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.user.findFirst.mockResolvedValue({ id: 'user-1' });
+    prisma.adminUser.findUnique.mockResolvedValue({ password: 'hashed', isActive: true, deletedAt: null });
   });
 
   it('menolak self-approve (approver = requester)', () => {
@@ -97,9 +109,16 @@ describe('LedgerCorrectionService — idempotency & dual approval', () => {
     adminAuditLog: { findFirst: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn() },
     wallet: { findUnique: jest.fn() },
     user: { findFirst: jest.fn() },
+    adminUser: { findUnique: jest.fn() },
+  };
+  // ADM-206: mock re-auth password — 'password123' valid, lainnya tidak.
+  const redis = {
+    get: jest.fn(async () => null),
+    incrWithTtl: jest.fn(async () => 1),
+    del: jest.fn(async () => undefined),
   };
   const walletTxSerial = { getNext: jest.fn().mockResolvedValue(42) };
-  const service = () => new LedgerCorrectionService(prisma as never, walletTxSerial as never);
+  const service = () => new LedgerCorrectionService(prisma as never, walletTxSerial as never, redis as never);
 
   // clearAllMocks TIDAK mengosongkan antrean mockResolvedValueOnce —
   // tanpa mockReset, hasil once dari test sebelumnya bocor ke test berikut.
@@ -107,6 +126,7 @@ describe('LedgerCorrectionService — idempotency & dual approval', () => {
     jest.clearAllMocks();
     prisma.adminAuditLog.findFirst.mockReset();
     prisma.user.findFirst.mockResolvedValue({ id: 'user-1' });
+    prisma.adminUser.findUnique.mockResolvedValue({ password: 'hashed', isActive: true, deletedAt: null });
   });
 
   const dto = {
@@ -116,6 +136,7 @@ describe('LedgerCorrectionService — idempotency & dual approval', () => {
     reason: 'Koreksi selisih hasil rekonsiliasi batch',
     ticketRef: 'TICKET-123',
     idempotencyKey: 'key-abc',
+    reauthPassword: 'password123',
   };
 
   it('replay idempotencyKey dengan payload sama mengembalikan request yang sama tanpa membuat baru', async () => {
@@ -160,7 +181,7 @@ describe('LedgerCorrectionService — idempotency & dual approval', () => {
       .mockResolvedValueOnce(requestRow()) // request row
       .mockResolvedValueOnce(null); // no decision yet
     await expect(
-      service().decideCorrection('req-1', 'admin-requester', { decision: 'APPROVE' }, '127.0.0.1'),
+      service().decideCorrection('req-1', 'admin-requester', { decision: 'APPROVE', reauthPassword: 'password123' }, '127.0.0.1'),
     ).rejects.toBeInstanceOf(ForbiddenException);
     expect(prisma.adminAuditLog.create).not.toHaveBeenCalled();
   });
@@ -170,7 +191,7 @@ describe('LedgerCorrectionService — idempotency & dual approval', () => {
       .mockResolvedValueOnce(requestRow()) // request row
       .mockResolvedValueOnce({ id: 'decision-1' }); // existing decision
     await expect(
-      service().decideCorrection('req-1', 'admin-other', { decision: 'APPROVE' }, '127.0.0.1'),
+      service().decideCorrection('req-1', 'admin-other', { decision: 'APPROVE', reauthPassword: 'password123' }, '127.0.0.1'),
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
@@ -185,7 +206,7 @@ describe('LedgerCorrectionService — idempotency & dual approval', () => {
     const view = await service().decideCorrection(
       'req-1',
       'admin-other',
-      { decision: 'REJECT', notes: 'data tidak valid' },
+      { decision: 'REJECT', notes: 'data tidak valid', reauthPassword: 'password123' },
       '127.0.0.1',
     );
     expect(view.status).toBe('REJECTED');
@@ -203,13 +224,22 @@ describe('LedgerCorrectionService — ADM-201 resolusi ID publik', () => {
     adminAuditLog: { findFirst: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn() },
     wallet: { findUnique: jest.fn() },
     user: { findFirst: jest.fn() },
+    adminUser: { findUnique: jest.fn() },
+  };
+  // ADM-206: mock re-auth password — 'password123' valid, lainnya tidak.
+  const redis = {
+    get: jest.fn(async () => null),
+    incrWithTtl: jest.fn(async () => 1),
+    del: jest.fn(async () => undefined),
   };
   const walletTxSerial = { getNext: jest.fn().mockResolvedValue(42) };
-  const service = () => new LedgerCorrectionService(prisma as never, walletTxSerial as never);
+  const service = () => new LedgerCorrectionService(prisma as never, walletTxSerial as never, redis as never);
 
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.adminAuditLog.findFirst.mockReset();
+    // ADM-206: re-auth password valid default.
+    prisma.adminUser.findUnique.mockResolvedValue({ password: 'hashed', isActive: true, deletedAt: null });
   });
 
   const dto = {
@@ -219,6 +249,7 @@ describe('LedgerCorrectionService — ADM-201 resolusi ID publik', () => {
     reason: 'Koreksi selisih hasil rekonsiliasi batch',
     ticketRef: 'TICKET-123',
     idempotencyKey: 'key-publik',
+    reauthPassword: 'password123',
   };
 
   it('ID publik USR-… diresolusi ke cuid internal sebelum cek wallet', async () => {
@@ -265,5 +296,92 @@ describe('LedgerCorrectionService — ADM-201 resolusi ID publik', () => {
       }),
     );
     expect(prisma.wallet.findUnique).not.toHaveBeenCalled();
+  });
+});
+
+describe('LedgerCorrectionService — ADM-206 re-auth password server-side', () => {
+  const prisma = {
+    adminAuditLog: { findFirst: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn() },
+    wallet: { findUnique: jest.fn() },
+    user: { findFirst: jest.fn() },
+    adminUser: { findUnique: jest.fn() },
+  };
+  const walletTxSerial = { getNext: jest.fn().mockResolvedValue(42) };
+  const redis = {
+    get: jest.fn(async () => null),
+    incrWithTtl: jest.fn(async () => 1),
+    del: jest.fn(async () => undefined),
+  };
+  const service = () => new LedgerCorrectionService(prisma as never, walletTxSerial as never, redis as never);
+
+  const dto = {
+    userId: 'user-1',
+    amountIdr: 50000,
+    type: 'CREDIT' as const,
+    reason: 'Koreksi selisih hasil rekonsiliasi batch',
+    ticketRef: 'TICKET-123',
+    idempotencyKey: 'key-reauth',
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    prisma.adminAuditLog.findFirst.mockReset();
+    prisma.user.findFirst.mockResolvedValue({ id: 'user-1' });
+    prisma.adminUser.findUnique.mockResolvedValue({ password: 'hashed', isActive: true, deletedAt: null });
+    prisma.wallet.findUnique.mockResolvedValue({ id: 'w-1', availableBalance: 10000000n, isLocked: false });
+    prisma.adminAuditLog.create.mockImplementation(({ data }: { data: Record<string, unknown> }) => ({
+      id: 'audit-r',
+      ...data,
+      targetId: 'req-r',
+    }));
+  });
+
+  it('kata sandi benar → request dibuat', async () => {
+    prisma.adminAuditLog.findFirst.mockResolvedValue(null);
+    const view = await service().requestCorrection('admin-1', { ...dto, reauthPassword: 'password123' }, '127.0.0.1');
+    expect(view.status).toBe('PENDING_APPROVAL');
+    expect(prisma.adminAuditLog.create).toHaveBeenCalled();
+  });
+
+  it('tanpa reauthPassword → 400 REAUTH_PASSWORD_REQUIRED (fail-closed)', async () => {
+    await expect(service().requestCorrection('admin-1', { ...dto } as never, '127.0.0.1')).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'REAUTH_PASSWORD_REQUIRED' }),
+    });
+    expect(prisma.adminAuditLog.create).not.toHaveBeenCalled();
+  });
+
+  it('kata sandi salah → 401 REAUTH_INVALID_PASSWORD + counter naik', async () => {
+    await expect(
+      service().requestCorrection('admin-1', { ...dto, reauthPassword: 'salah' }, '127.0.0.1'),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'REAUTH_INVALID_PASSWORD' }),
+    });
+    expect(redis.incrWithTtl).toHaveBeenCalledWith('reauth:fail:admin-1', 900);
+    expect(prisma.adminAuditLog.create).not.toHaveBeenCalled();
+  });
+
+  it('5x salah → 429 REAUTH_TOO_MANY_ATTEMPTS', async () => {
+    redis.get.mockResolvedValueOnce('5' as unknown as null);
+    await expect(
+      service().requestCorrection('admin-1', { ...dto, reauthPassword: 'password123' }, '127.0.0.1'),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'REAUTH_TOO_MANY_ATTEMPTS' }),
+    });
+    expect(prisma.adminAuditLog.create).not.toHaveBeenCalled();
+  });
+
+  it('token palsu warisan "password-confirm:..." → 400 (tidak lagi diterima)', async () => {
+    await expect(
+      service().requestCorrection('admin-1', { ...dto, reauthPassword: 'password123', reauthToken: 'password-confirm:provided' } as never, '127.0.0.1'),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'REAUTH_PASSWORD_REQUIRED' }),
+    });
+    expect(prisma.adminAuditLog.create).not.toHaveBeenCalled();
+  });
+
+  it('kata sandi benar → counter gagal di-reset', async () => {
+    prisma.adminAuditLog.findFirst.mockResolvedValue(null);
+    await service().requestCorrection('admin-1', { ...dto, reauthPassword: 'password123' }, '127.0.0.1');
+    expect(redis.del).toHaveBeenCalledWith('reauth:fail:admin-1');
   });
 });

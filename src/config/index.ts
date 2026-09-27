@@ -10,3 +10,4 @@ export * from './smtp.config';
 export * from './fcm.config';
 export * from './chat.config';
 export * from './webauthn.config';
+export * from './receipt.config';

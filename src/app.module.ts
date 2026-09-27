@@ -8,7 +8,7 @@ import { BullModule } from '@nestjs/bull';
 import { Logger as NestLogger } from '@nestjs/common';
 
 // Config
-import { appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, flashConfig, r2Config, smtpConfig, fcmConfig, chatConfig, webauthnConfig } from './config';
+import { appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, flashConfig, r2Config, smtpConfig, fcmConfig, chatConfig, webauthnConfig, receiptConfig } from './config';
 import { validateEnv } from './config/env.validation';
 import { initializeCrypto } from './common/utils/crypto.util';
 import { getRuntimeEnvFile } from './config/runtime-env-file';
@@ -54,6 +54,7 @@ import { SchedulerModule } from './modules/scheduler/scheduler.module';
 import { PushModule } from './modules/push/push.module';
 import { RealtimeModule } from './modules/realtime/realtime.module';
 import { WithdrawalsModule } from './modules/withdrawals/withdrawals.module';
+import { ReceiptsModule } from './modules/receipts/receipts.module';
 import { HelpCenterModule } from './modules/help-center/help-center.module';
 import { TransactionTemplatesModule } from './modules/transaction-templates/transaction-templates.module';
 import { SupportModule } from './modules/support/support.module';
@@ -84,7 +85,7 @@ const runtimeEnvFile = getRuntimeEnvFile();
     ConfigModule.forRoot({
       isGlobal: true,
       ...(runtimeEnvFile ? { envFilePath: runtimeEnvFile } : {}),
-      load: [appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, flashConfig, r2Config, smtpConfig, fcmConfig, chatConfig, webauthnConfig],
+      load: [appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, flashConfig, r2Config, smtpConfig, fcmConfig, chatConfig, webauthnConfig, receiptConfig],
       validate: validateEnv,
     }),
 
@@ -176,6 +177,7 @@ const runtimeEnvFile = getRuntimeEnvFile();
     PushModule,
     RealtimeModule,
     WithdrawalsModule,
+    ReceiptsModule,
     HelpCenterModule,
     TransactionTemplatesModule,
     SupportModule,

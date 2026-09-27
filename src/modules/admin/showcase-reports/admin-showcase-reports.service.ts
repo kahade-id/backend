@@ -659,6 +659,39 @@ export class AdminShowcaseReportsService {
   }
 
   // -------------------------------------------------------------------------
+  // ADM-324 — daftar admin aktif untuk picker assign + jumlah antrean.
+  // -------------------------------------------------------------------------
+  /**
+   * Kandidat assignee: admin aktif (isActive, tidak dihapus) berrole
+   * SUPER_ADMIN / CUSTOMER_SUPPORT, beserta jumlah assignment terbuka
+   * (unassignedAt IS NULL). Untuk picker assign di UI antrean prioritas.
+   */
+  async getAssignCandidates(): Promise<object> {
+    const rows = await this.prisma.$queryRaw<
+      Array<{ id: string; full_name: string; role: string; open_assignments: bigint }>
+    >(
+      Prisma.sql`SELECT a.id, a."fullName" AS full_name, a.role::text AS role,
+                        COUNT(ra.id)::bigint AS open_assignments
+                 FROM "AdminUser" a
+                 LEFT JOIN report_assignments ra
+                   ON ra."assigneeAdminId" = a.id AND ra."unassignedAt" IS NULL
+                 WHERE a.role::text IN ('SUPER_ADMIN', 'CUSTOMER_SUPPORT')
+                   AND a."isActive" = true
+                   AND a."deletedAt" IS NULL
+                 GROUP BY a.id
+                 ORDER BY open_assignments ASC, a."fullName" ASC`,
+    );
+    return {
+      candidates: rows.map((r) => ({
+        id: r.id,
+        fullName: r.full_name,
+        role: r.role,
+        openAssignments: Number(r.open_assignments),
+      })),
+    };
+  }
+
+  // -------------------------------------------------------------------------
   // SH-A-003 — restore item yang pernah di-takedown moderasi.
   // Kontrak: POST /v1/admin/showcase-reports/items/:id/restore-takedown
   // (SUPER_ADMIN only di controller). Audit-logged, set isActive=true,

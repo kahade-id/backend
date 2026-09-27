@@ -104,6 +104,18 @@ export class AdminShowcaseReportsController {
     return this.service.getMetrics();
   }
 
+  @Get('assign/candidates')
+  @ApiOperation({
+    summary: 'Kandidat assignee untuk picker (ADM-324)',
+    description:
+      'Admin aktif berrole SUPER_ADMIN/CUSTOMER_SUPPORT beserta jumlah ' +
+      'assignment terbuka — untuk picker assign di antrean prioritas.',
+  })
+  @ApiResponse({ status: 200, description: 'Candidates returned.' })
+  getAssignCandidates(): Promise<object> {
+    return this.service.getAssignCandidates();
+  }
+
   @Post('bulk-review')
   @UseGuards(UserThrottleGuard)
   @Idempotency()

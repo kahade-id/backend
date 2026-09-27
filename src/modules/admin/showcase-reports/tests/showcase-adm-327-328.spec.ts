@@ -90,6 +90,35 @@ describe('ADM-327 getMetrics', () => {
   });
 });
 
+describe('ADM-324 getAssignCandidates', () => {
+  it('mengembalikan kandidat dengan openAssignments sebagai number', async () => {
+    const prisma = makePrismaMock();
+    prisma.$queryRaw.mockResolvedValueOnce([
+      { id: 'a1', full_name: 'Admin Satu', role: 'SUPER_ADMIN', open_assignments: 2n },
+      { id: 'a2', full_name: 'Admin Dua', role: 'CUSTOMER_SUPPORT', open_assignments: 0n },
+    ]);
+    const { service } = makeService(prisma);
+    const res = (await service.getAssignCandidates()) as Record<string, unknown>;
+    expect(res.candidates).toEqual([
+      { id: 'a1', fullName: 'Admin Satu', role: 'SUPER_ADMIN', openAssignments: 2 },
+      { id: 'a2', fullName: 'Admin Dua', role: 'CUSTOMER_SUPPORT', openAssignments: 0 },
+    ]);
+  });
+
+  it('query memfilter role/isActive/deletedAt dan join assignment terbuka', async () => {
+    const prisma = makePrismaMock();
+    prisma.$queryRaw.mockResolvedValueOnce([]);
+    const { service } = makeService(prisma);
+    await service.getAssignCandidates();
+    const sql = String(prisma.$queryRaw.mock.calls[0][0].strings.join(' '));
+    expect(sql).toContain('SUPER_ADMIN');
+    expect(sql).toContain('CUSTOMER_SUPPORT');
+    expect(sql).toContain('isActive');
+    expect(sql).toContain('deletedAt');
+    expect(sql).toContain('unassignedAt');
+  });
+});
+
 describe('ADM-328 bulkReviewShowcaseReports', () => {
   it('confirm !== true → 400 BULK_CONFIRM_REQUIRED', async () => {
     const { service } = makeService(makePrismaMock());

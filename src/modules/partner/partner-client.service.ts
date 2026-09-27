@@ -120,12 +120,25 @@ export class PartnerClientService {
   async updateClient(id: string, dto: UpdatePartnerClientDto, adminId: string, ip: string): Promise<ApiClientRecord> {
     const existing = await this.p.apiClient.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException({ code: 'PARTNER_CLIENT_NOT_FOUND', message: 'Client tidak ditemukan' });
-    const client = await this.p.apiClient.update({ where: { id }, data: dto });
+    // ADM-313: reason hanya untuk audit trail — jangan diteruskan ke Prisma.
+    const { reason, ...data } = dto;
+    // ADM-313 (fail-closed): perubahan status WAJIB disertai alasan min. 10
+    // karakter. Validasi server-side — UI saja tidak cukup.
+    if (dto.status && dto.status !== existing.status) {
+      const trimmedReason = (reason ?? '').trim();
+      if (trimmedReason.length < 10) {
+        throw new BadRequestException({
+          code: 'PARTNER_STATUS_REASON_REQUIRED',
+          message: 'Perubahan status partner wajib disertai alasan (minimal 10 karakter)',
+        });
+      }
+    }
+    const client = await this.p.apiClient.update({ where: { id }, data });
     await this.audit(
       adminId,
       'CLIENT_UPDATED',
       id,
-      `Client "${client.orgName}" diperbarui`,
+      `Client "${client.orgName}" diperbarui${reason ? ` — alasan: ${reason}` : ''}`,
       ip,
       {
         before: { status: existing.status },

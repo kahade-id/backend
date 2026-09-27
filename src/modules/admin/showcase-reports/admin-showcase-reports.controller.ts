@@ -23,6 +23,7 @@ import { AddModerationNoteDto } from './dto/add-moderation-note.dto';
 import { AssignShowcaseReportDto } from './dto/assign-showcase-report.dto';
 import { RestrictShowcaseDto } from './dto/restrict-showcase.dto';
 import { DecideAppealDto } from './dto/decide-appeal.dto';
+import { BulkReviewShowcaseReportsDto } from './dto/bulk-review-showcase-reports.dto';
 import { ModerationQueueQueryDto } from './dto/moderation-queue-query.dto';
 import { ExportShowcaseReportsQueryDto } from './dto/export-showcase-reports-query.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
@@ -88,6 +89,47 @@ export class AdminShowcaseReportsController {
     @Query('limit') limit?: string,
   ): Promise<object> {
     return this.service.listPendingAppeals(Number(page) || 1, Number(limit) || 20);
+  }
+
+  @Get('metrics')
+  @ApiOperation({
+    summary: 'Ringkasan metrik moderasi showcase',
+    description:
+      'ADM-327 — agregat read-only: laporan open/under_review, takedown/' +
+      'restrict/reopen 30 hari, rata-rata waktu penyelesaian, distribusi ' +
+      'alasan, banding pending. Tanpa PII.',
+  })
+  @ApiResponse({ status: 200, description: 'Metrics returned.' })
+  getMetrics(): Promise<object> {
+    return this.service.getMetrics();
+  }
+
+  @Post('bulk-review')
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @ApiOperation({
+    summary: 'Bulk dismiss / under_review (ADM-328)',
+    description:
+      'Maks 50 laporan/request, confirm=true wajib, hasil parsial per item. ' +
+      'Hanya aksi non-destruktif (dismiss, under_review); takedown tidak ' +
+      'boleh bulk. Requires Idempotency-Key.',
+  })
+  @ApiResponse({ status: 200, description: 'Bulk result returned.' })
+  @ApiResponse({ status: 400, description: 'confirm tidak true / aksi tidak diizinkan.' })
+  bulkReview(
+    @Body() dto: BulkReviewShowcaseReportsDto,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.bulkReviewShowcaseReports(
+      admin.sub,
+      req.ip ?? '',
+      admin.role,
+      dto.ids,
+      dto.action,
+      dto.resolution?.trim() || undefined,
+      dto.confirm,
+    );
   }
 
   @Get('export')

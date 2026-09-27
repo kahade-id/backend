@@ -66,6 +66,15 @@ export class UpdatePartnerClientDto {
   @Max(10000000)
   @IsOptional()
   quotaPerDay?: number;
+
+  /**
+   * ADM-313 — alasan perubahan (wajib bila status berubah), HANYA untuk
+   * audit trail; tidak disimpan ke baris ApiClient.
+   */
+  @IsString()
+  @IsOptional()
+  @MaxLength(500)
+  reason?: string;
 }
 
 export class IssuePartnerKeyDto {

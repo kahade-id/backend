@@ -1,5 +1,6 @@
-import { Module, Global } from '@nestjs/common';
+import { Module, Global, forwardRef } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
+import { UsersModule } from '../users/users.module';
 import { AuthController } from './auth.controller';
 import { LegacyFonnteWebhookController } from './legacy-fonnte-webhook.controller';
 import { AuthService } from './auth.service';
@@ -21,6 +22,9 @@ import { AuditLogModule } from '../../common/services/audit-log.module';
     JwtModule.register({}),
     QueueModule,
     AuditLogModule,
+    // AccountDeletionService dipakai AuthController — forwardRef agar aman
+    // bila kelak ada siklus UsersModule <-> AuthModule.
+    forwardRef(() => UsersModule),
   ],
   controllers: [AuthController, LegacyFonnteWebhookController, PasskeyController],
   providers: [

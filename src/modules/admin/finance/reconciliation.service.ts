@@ -3,6 +3,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { WalletTransactionStatus, WalletTransactionType, WithdrawStatus } from '@prisma/client';
 import { toIdr } from '../../../common/utils/currency.util';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
+import { resolveUserInternalId } from '../common/resolve-user-id';
 
 export interface WalletDiscrepancy {
   walletId: string;
@@ -126,8 +127,10 @@ export class ReconciliationService {
   }
 
   async reconcileWalletBalance(userId: string): Promise<WalletDiscrepancy | null> {
+    // ADM-203: terima ID publik (USR-…) maupun cuid internal.
+    const internalUserId = await resolveUserInternalId(this.prisma, userId);
     const wallet = await this.prisma.wallet.findUnique({
-      where: { userId },
+      where: { userId: internalUserId },
       select: {
         id: true,
         userId: true,
@@ -198,8 +201,10 @@ export class ReconciliationService {
     from: string,
     to: string,
   ): Promise<AuditTrailResult> {
+    // ADM-204: terima ID publik (USR-…) maupun cuid internal.
+    const internalUserId = await resolveUserInternalId(this.prisma, userId);
     const wallet = await this.prisma.wallet.findUnique({
-      where: { userId },
+      where: { userId: internalUserId },
       select: { id: true },
     });
 
@@ -332,7 +337,7 @@ export class ReconciliationService {
     }
 
     return {
-      userId,
+      userId: internalUserId,
       from,
       to,
       openingTotalBalance: toIdr(openingTotalBalance),

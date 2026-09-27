@@ -29,6 +29,7 @@ import { toSen } from '../../../common/utils/currency.util';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
+import { resolveUserInternalId } from '../common/resolve-user-id';
 import {
   RequestCorrectionDto,
   DecideCorrectionDto,
@@ -200,12 +201,18 @@ export class LedgerCorrectionService {
   async requestCorrection(adminId: string, dto: RequestCorrectionDto, ipAddress: string): Promise<CorrectionView> {
     LedgerCorrectionService.assertAmountWithinLimit(dto.amountIdr);
 
+    // ADM-201: terima ID publik (USR-…) maupun cuid internal — panel admin
+    // menampilkan ID publik di mana-mana. Resolusi dilakukan SEBELUM cek
+    // idempotency agar format berbeda untuk user yang sama tidak dianggap
+    // payload berbeda.
+    const internalUserId = await resolveUserInternalId(this.prisma, dto.userId);
+
     // Idempotency domain: replay dengan kunci sama.
     const existing = await this.prisma.adminAuditLog.findFirst({ where: this.requestWhere(dto.idempotencyKey) });
     if (existing) {
       const prev = existing.after as unknown as RequestPayload;
       const samePayload =
-        prev.userId === dto.userId &&
+        prev.userId === internalUserId &&
         prev.amountIdr === dto.amountIdr &&
         prev.type === dto.type &&
         prev.reason === dto.reason &&
@@ -221,7 +228,7 @@ export class LedgerCorrectionService {
     }
 
     const wallet = await this.prisma.wallet.findUnique({
-      where: { userId: dto.userId },
+      where: { userId: internalUserId },
       select: { id: true, availableBalance: true, isLocked: true },
     });
     if (!wallet) {
@@ -246,7 +253,7 @@ export class LedgerCorrectionService {
 
     const requestId = newCorrectionId();
     const payload: RequestPayload = {
-      userId: dto.userId,
+      userId: internalUserId,
       amountSen: amountSen.toString(),
       amountIdr: dto.amountIdr,
       type: dto.type,
@@ -266,7 +273,7 @@ export class LedgerCorrectionService {
         action: AuditAction.MANUAL_LEDGER_CORRECTION,
         targetType: TARGET_REQUEST,
         targetId: requestId,
-        description: `Ledger correction requested (${dto.type} Rp${dto.amountIdr.toLocaleString('id-ID')}) for user ${dto.userId} — ticket ${dto.ticketRef}. Menunggu approval admin kedua.`,
+        description: `Ledger correction requested (${dto.type} Rp${dto.amountIdr.toLocaleString('id-ID')}) for user ${internalUserId} (input: ${dto.userId}) — ticket ${dto.ticketRef}. Menunggu approval admin kedua.`,
         after: payload as unknown as Prisma.InputJsonValue,
         ipAddress,
       },

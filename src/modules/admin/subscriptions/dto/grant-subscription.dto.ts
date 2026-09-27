@@ -5,7 +5,7 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
  * POST /v1/admin/subscriptions/grant — buat subscription ACTIVE manual.
  */
 export class GrantSubscriptionDto {
-  @ApiProperty({ description: 'ID user penerima subscription' })
+  @ApiProperty({ description: 'ID user penerima — boleh ID publik (USR-XXXXXXXX) atau cuid internal; diresolusi server-side' })
   @IsString()
   @MaxLength(64)
   userId!: string;

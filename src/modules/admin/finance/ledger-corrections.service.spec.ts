@@ -42,11 +42,15 @@ describe('LedgerCorrectionService — guard', () => {
   const prisma = {
     adminAuditLog: { findFirst: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn() },
     wallet: { findUnique: jest.fn() },
+    user: { findFirst: jest.fn() },
   };
   const walletTxSerial = { getNext: jest.fn().mockResolvedValue(42) };
   const service = () => new LedgerCorrectionService(prisma as never, walletTxSerial as never);
 
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    prisma.user.findFirst.mockResolvedValue({ id: 'user-1' });
+  });
 
   it('menolak self-approve (approver = requester)', () => {
     expect(() => LedgerCorrectionService.assertNotSelfApproval('admin-1', 'admin-1')).toThrow(ForbiddenException);
@@ -92,6 +96,7 @@ describe('LedgerCorrectionService — idempotency & dual approval', () => {
   const prisma = {
     adminAuditLog: { findFirst: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn() },
     wallet: { findUnique: jest.fn() },
+    user: { findFirst: jest.fn() },
   };
   const walletTxSerial = { getNext: jest.fn().mockResolvedValue(42) };
   const service = () => new LedgerCorrectionService(prisma as never, walletTxSerial as never);
@@ -101,6 +106,7 @@ describe('LedgerCorrectionService — idempotency & dual approval', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.adminAuditLog.findFirst.mockReset();
+    prisma.user.findFirst.mockResolvedValue({ id: 'user-1' });
   });
 
   const dto = {
@@ -189,5 +195,75 @@ describe('LedgerCorrectionService — idempotency & dual approval', () => {
         data: expect.objectContaining({ targetType: 'LedgerCorrectionDecision' }),
       }),
     );
+  });
+});
+
+describe('LedgerCorrectionService — ADM-201 resolusi ID publik', () => {
+  const prisma = {
+    adminAuditLog: { findFirst: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn() },
+    wallet: { findUnique: jest.fn() },
+    user: { findFirst: jest.fn() },
+  };
+  const walletTxSerial = { getNext: jest.fn().mockResolvedValue(42) };
+  const service = () => new LedgerCorrectionService(prisma as never, walletTxSerial as never);
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    prisma.adminAuditLog.findFirst.mockReset();
+  });
+
+  const dto = {
+    userId: 'USR-PUBLIK1',
+    amountIdr: 50000,
+    type: 'CREDIT' as const,
+    reason: 'Koreksi selisih hasil rekonsiliasi batch',
+    ticketRef: 'TICKET-123',
+    idempotencyKey: 'key-publik',
+  };
+
+  it('ID publik USR-… diresolusi ke cuid internal sebelum cek wallet', async () => {
+    prisma.adminAuditLog.findFirst.mockResolvedValue(null);
+    prisma.user.findFirst.mockResolvedValue({ id: 'clx-internal-1' });
+    prisma.wallet.findUnique.mockResolvedValue({ id: 'w-1', availableBalance: 10000000n, isLocked: false });
+    prisma.adminAuditLog.create.mockImplementation(({ data }: { data: Record<string, unknown> }) => ({
+      id: 'audit-9',
+      ...data,
+      targetId: 'req-9',
+    }));
+
+    await service().requestCorrection('admin-requester', dto, '127.0.0.1');
+
+    expect(prisma.wallet.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { userId: 'clx-internal-1' } }),
+    );
+    // Payload tersimpan memakai cuid internal (idempotency stabil antar format).
+    expect(prisma.adminAuditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          after: expect.objectContaining({ userId: 'clx-internal-1' }),
+        }),
+      }),
+    );
+  });
+
+  it('replay idempotency dengan format ID berbeda tetap dianggap payload sama', async () => {
+    prisma.user.findFirst.mockResolvedValue({ id: 'clx-internal-1' });
+    prisma.adminAuditLog.findFirst.mockResolvedValue(
+      requestRow({ after: { ...(requestRow().after as object), userId: 'clx-internal-1' } }),
+    );
+    const view = await service().requestCorrection('admin-requester', dto, '127.0.0.1');
+    expect(view.id).toBe('req-1');
+    expect(prisma.adminAuditLog.create).not.toHaveBeenCalled();
+  });
+
+  it('user tidak dikenal → 404 (fail closed)', async () => {
+    prisma.adminAuditLog.findFirst.mockResolvedValue(null);
+    prisma.user.findFirst.mockResolvedValue(null);
+    await expect(service().requestCorrection('admin-requester', dto, '127.0.0.1')).rejects.toThrow(
+      expect.objectContaining({
+        response: expect.objectContaining({ code: 'USER_NOT_FOUND' }),
+      }),
+    );
+    expect(prisma.wallet.findUnique).not.toHaveBeenCalled();
   });
 });

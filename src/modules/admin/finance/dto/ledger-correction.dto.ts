@@ -9,7 +9,7 @@ export const CORRECTION_DECISIONS = ['APPROVE', 'REJECT'] as const;
 export type CorrectionDecision = (typeof CORRECTION_DECISIONS)[number];
 
 export class RequestCorrectionDto {
-  @ApiProperty({ description: 'User ID (cuid) pemilik wallet yang dikoreksi' })
+  @ApiProperty({ description: 'ID user pemilik wallet — boleh ID publik (USR-XXXXXXXX) atau cuid internal; diresolusi server-side' })
   @IsString()
   @IsNotEmpty()
   userId!: string;

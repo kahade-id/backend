@@ -18,6 +18,15 @@ const SAFE_PUSH_DATA_KEYS = new Set([
   'ticketId', 'promoCode', 'code', 'scheduleId', 'entityId', 'entityType', 'broadcastId',
 ]);
 
+/**
+ * Item #24 — kategori expo-notifications untuk action button "Konfirmasi terima"
+ * di push order. Didefinisikan di frontend (`lib/order-confirm.ts`,
+ * `ORDER_ACTION_CATEGORY`); backend hanya meneruskannya sebagai field
+ * top-level `categoryId` pada payload Expo push. Field ini BUKAN bagian dari
+ * `data` (tidak melewati sanitizePushData).
+ */
+const ORDER_ACTION_CATEGORY_ID = 'kahade-order-actions';
+
 @Injectable()
 export class PushService implements OnModuleInit {
   private readonly logger = new Logger(PushService.name);
@@ -162,6 +171,20 @@ export class PushService implements OnModuleInit {
     return 'default';
   }
 
+  /**
+   * Item #24 — kembalikan categoryId untuk action button "Konfirmasi terima"
+   * hanya pada tipe order di mana pembeli boleh konfirmasi terima
+   * (status IN_DELIVERY/SHIPPED/DELIVERED × peran pembeli, cerminan
+   * `canReviewDelivery` di frontend). Konservatif: ORDER_SHIPPED dan
+   * ORDER_DELIVERED saja; tipe lain (termasuk order lain) tidak diubah.
+   */
+  private getOrderActionCategoryId(notificationType?: string): string | undefined {
+    if (notificationType === 'ORDER_SHIPPED' || notificationType === 'ORDER_DELIVERED') {
+      return ORDER_ACTION_CATEGORY_ID;
+    }
+    return undefined;
+  }
+
   private async shouldSendPush(userId: string, data?: Record<string, string>): Promise<boolean> {
     const notificationType = data?.notificationType ?? data?.type;
     // Quiet hours: hanya notifikasi keamanan kritis yang lolos.
@@ -212,6 +235,7 @@ export class PushService implements OnModuleInit {
     data?: Record<string, string>,
     channelId = 'default',
     deviceIdMap?: Map<string, string>,
+    categoryId?: string,
   ): Promise<void> {
     if (expoTokens.length === 0) return;
 
@@ -225,6 +249,9 @@ export class PushService implements OnModuleInit {
         sound: 'default' as const,
         priority: 'high' as const,
         channelId,
+        // Item #24: categoryId top-level (format Expo push). Hanya disertakan
+        // bila terdefinisi — tipe lain tidak tersentuh sama sekali.
+        ...(categoryId ? { categoryId } : {}),
       }));
 
       try {
@@ -327,9 +354,10 @@ export class PushService implements OnModuleInit {
 
       const pushData = this.sanitizePushData(data);
       const channelId = this.getAndroidChannelId(pushData.notificationType ?? pushData.type);
+      const categoryId = this.getOrderActionCategoryId(pushData.notificationType ?? pushData.type);
 
       if (expoTokens.length > 0) {
-        await this.sendViaExpo(expoTokens, title, body, pushData, channelId, expoDeviceMap);
+        await this.sendViaExpo(expoTokens, title, body, pushData, channelId, expoDeviceMap, categoryId);
       }
 
       if (fcmTokens.length > 0 && this.messaging) {

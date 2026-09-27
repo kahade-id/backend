@@ -215,6 +215,52 @@ describe('PushService', () => {
     });
   });
 
+  describe('sendToUser - order action categoryId (item #24)', () => {
+    const expoSetup = () => {
+      mockPrisma.notificationPreference.findUnique.mockResolvedValue({ orderPush: true, chatPush: true });
+      mockPrisma.userDevice.findMany.mockResolvedValue([
+        { id: 'd1', pushToken: 'ExpoPushToken[action]' },
+      ]);
+      const fetchMock = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ data: [{ status: 'ok' }] }) });
+      global.fetch = fetchMock as any;
+      return fetchMock;
+    };
+    const sentMessage = (fetchMock: jest.Mock) => JSON.parse(fetchMock.mock.calls[0][1].body)[0];
+
+    it.each(['ORDER_SHIPPED', 'ORDER_DELIVERED'])(
+      'includes categoryId kahade-order-actions for %s',
+      async (notificationType) => {
+        const fetchMock = expoSetup();
+        await service.sendToUser('u1', 'T', 'B', { notificationType, orderId: 'ORD-1' });
+        const sent = sentMessage(fetchMock);
+        expect(sent.categoryId).toBe('kahade-order-actions');
+        // Field existing tetap tak berubah: data tidak ikut categoryId.
+        expect(sent.data).toEqual({ notificationType, orderId: 'ORD-1' });
+      },
+    );
+
+    it('reads the legacy type key too', async () => {
+      const fetchMock = expoSetup();
+      await service.sendToUser('u1', 'T', 'B', { type: 'ORDER_DELIVERED', orderId: 'ORD-2' });
+      expect(sentMessage(fetchMock).categoryId).toBe('kahade-order-actions');
+    });
+
+    it.each(['ORDER_NEW', 'ORDER_PAYMENT_RECEIVED', 'ORDER_COMPLETED', 'CHAT_NEW_MESSAGE', 'WALLET_TOPUP_SUCCESS'])(
+      'does not include categoryId for %s',
+      async (notificationType) => {
+        const fetchMock = expoSetup();
+        await service.sendToUser('u1', 'T', 'B', { notificationType, orderId: 'ORD-1' });
+        expect(sentMessage(fetchMock).categoryId).toBeUndefined();
+      },
+    );
+
+    it('does not include categoryId when there is no type', async () => {
+      const fetchMock = expoSetup();
+      await service.sendToUser('u1', 'T', 'B', { orderId: 'ORD-1' });
+      expect(sentMessage(fetchMock).categoryId).toBeUndefined();
+    });
+  });
+
   describe('sendToMultipleUsers', () => {
     it('runs allSettled across users', async () => {
       mockPrisma.userDevice.findMany.mockResolvedValue([]);

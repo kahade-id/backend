@@ -1,4 +1,21 @@
+import { hmacSHA256 } from '../utils/crypto.util';
+
 export const IDEMPOTENCY_CACHE_KEY = (key: string): string => `idempotency:${key}`;
+
+/**
+ * SEC-303: Redis keys yang membawa identifier PII (nomor HP / email) WAJIB
+ * di-HMAC agar Redis tidak menyimpan PII dalam bentuk plaintext.
+ *
+ * Domain separation: konteks HMAC berbeda per key family, sehingga key HMAC
+ * dari satu family tidak bisa dipakai ulang di family lain. Identifier
+ * dinormalisasi (trim) sebelum di-HMAC agar penulisan konsisten.
+ *
+ * Migrasi: key lama berformat plaintext tidak dihapus manual — semua key ini
+ * ber-TTL pendek (cooldown 60 detik, rate limit ≤ 24 jam) sehingga expire
+ * dengan sendirinya; key baru dan lama tidak akan bertabrakan.
+ */
+const hmacIdentifier = (domain: string, identifier: string): string =>
+  hmacSHA256(`${domain}:${identifier.trim()}`);
 
 export const USER_SESSION = (sessionId: string): string => `session:${sessionId}`;
 export const USER_SESSIONS = (userId: string): string => `sessions:${userId}`;
@@ -6,9 +23,9 @@ export const USER_SESSIONS = (userId: string): string => `sessions:${userId}`;
 export const RATE_LIMIT = (key: string): string => `rate_limit:${key}`;
 
 export const OTP_COOLDOWN = (identifier: string, type: string): string =>
-  `otp_cooldown:${identifier}:${type}`;
+  `otp_cooldown:${hmacIdentifier('otp_cooldown', identifier)}:${type}`;
 export const OTP_PHONE_RATE = (phone: string, type: string): string =>
-  `otp_phone_rate:${phone}:${type}`;
+  `otp_phone_rate:${hmacIdentifier('otp_phone_rate', phone)}:${type}`;
 
 export const TOKEN_BLACKLIST = (jti: string): string => `token_blacklist:${jti}`;
 export const ADMIN_TOKEN_BLACKLIST = (jti: string): string => `token_blacklist:admin:${jti}`;
@@ -65,7 +82,7 @@ export const ADMIN_MFA_SETUP = (adminId: string): string =>
   `admin_mfa_setup:${adminId}`;
 
 export const OTP_EMAIL_RATE = (email: string, type: string): string =>
-  `otp_email_rate:${email}:${type}`;
+  `otp_email_rate:${hmacIdentifier('otp_email_rate', email)}:${type}`;
 
 export const BACKUP_CODE_USED = (twoFactorAuthId: string, codeHash: string): string =>
   `backup_code_used:${twoFactorAuthId}:${codeHash}`;
@@ -100,8 +117,9 @@ export const PROFILE_VERIFICATION_BADGES = (userId: string): string =>
 export const OTP_TRIGGER = (refCode: string): string => `otp_trigger:${refCode}`;
 export const OTP_TRIGGER_INBOX = (inboxId: string): string => `otp_trigger_inbox:${inboxId}`;
 export const OTP_TRIGGER_COOLDOWN = (phone: string, purpose: string): string =>
-  `otp_trigger_cooldown:${phone}:${purpose}`;
-export const OTP_TRIGGER_PHONE_RATE = (phone: string): string => `otp_trigger_phone_rate:${phone}`;
+  `otp_trigger_cooldown:${hmacIdentifier('otp_trigger_cooldown', phone)}:${purpose}`;
+export const OTP_TRIGGER_PHONE_RATE = (phone: string): string =>
+  `otp_trigger_phone_rate:${hmacIdentifier('otp_trigger_phone_rate', phone)}`;
 export const OTP_TRIGGER_IP_RATE = (ip: string): string => `otp_trigger_ip_rate:${ip}`;
 
 /** GAP-A: kunci purge penghapusan akun per-user (G056) — satu worker per user. */

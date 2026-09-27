@@ -68,6 +68,29 @@ describe('AdminQaModerationService (G450)', () => {
       expect(eventCall![0].values).toContain('HIDDEN');
     });
 
+    it('SEC-504: event moderasi juga dicatat di admin_audit_logs pusat dengan actorAdminId', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([targetRow()]);
+
+      await service.moderatorHide('admin-1', 'QUESTION', 'q1', 'SPAM', 'catatan internal');
+
+      const auditCall = prisma.$executeRaw.mock.calls.find((call: unknown[]) =>
+        String((call[0] as { sql?: unknown } | undefined)?.sql ?? call[0]).includes('admin_audit_logs'),
+      );
+      expect(auditCall).toBeDefined();
+      const values = auditCall![0].values as unknown[];
+      expect(values).toContain('admin-1'); // actorAdminId
+      expect(values).toContain('QA_MODERATION'); // targetType
+      expect(values).toContain('q1'); // targetId
+      const auditSql = String((auditCall![0] as { sql?: unknown }).sql ?? auditCall![0]);
+      expect(auditSql).toContain("'unknown'"); // ipAddress placeholder (service tidak menerima IP)
+      expect(auditSql).toContain('ADMIN_ACTION');
+      const description = values.find(
+        (v) => typeof v === 'string' && v.includes('HIDDEN'),
+      ) as string;
+      expect(description).toContain('QUESTION');
+      expect(description).toContain('SPAM');
+    });
+
     it('menolak reasonCode yang tidak dikenal', async () => {
       await expect(service.moderatorHide('admin-1', 'QUESTION', 'q1', 'BOGUS')).rejects.toBeInstanceOf(
         BadRequestException,

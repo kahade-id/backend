@@ -11,7 +11,7 @@ import { AdminRolesGuard } from '../../common/guards/admin-roles.guard';
 import { CourierService } from './courier.service';
 import {
   CreateBillDto,
-  BillLineDto,
+  AddBillLinesDto,
   DecideRefundDto,
   ToggleFlagDto,
   UpdateCatalogDto,
@@ -98,8 +98,10 @@ export class CourierAdminController {
   @Post('bills/:id/lines')
   @AdminRoles('SUPER_ADMIN', 'FINANCE_ADMIN')
   @ApiOperation({ summary: 'Tambah baris tagihan (per resi)' })
-  async addBillLines(@Param('id') id: string, @Body() body: { lines: BillLineDto[] }): Promise<unknown> {
-    return this.courierService.addBillLines(id, body.lines ?? []);
+  // SEC-204: DTO tervalidasi — billedAmount NaN/negatif dan lines non-array
+  // ditolak 400 oleh ValidationPipe sebelum menyentuh BigInt/rekonsiliasi.
+  async addBillLines(@Param('id') id: string, @Body() dto: AddBillLinesDto): Promise<unknown> {
+    return this.courierService.addBillLines(id, dto.lines);
   }
 
   @Post('bills/:id/reconcile')

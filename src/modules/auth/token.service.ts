@@ -36,7 +36,20 @@ export interface RefreshTokenPayload {
   iat?: number;
   iss?: string;
   aud?: string;
+  /**
+   * SEC-502: anchor umur absolut sesi admin (unix seconds). Diset saat
+   * issuance awal (login / 2FA / MFA-enable) dan diteruskan apa adanya saat
+   * rotation. Token admin tanpa anchor ini ditolak (fail-closed).
+   */
+  sessionStartedAt?: number;
 }
+
+/**
+ * SEC-502: umur absolut maksimum sesi admin — 24 jam sejak sessionStartedAt,
+ * tidak peduli berapa kali refresh token dirotasi. Setelah itu admin wajib
+ * login ulang.
+ */
+export const ADMIN_SESSION_ABSOLUTE_TTL_SECONDS = 24 * 60 * 60;
 
 export interface TempTokenPayload {
   sub: string;
@@ -122,10 +135,20 @@ export class TokenService {
     );
   }
 
-  signAdminRefreshToken(payload: { sub: string }): string {
+  /**
+   * Sign admin refresh token (JWT expiry 7 hari, tetapi SEC-502 memberlakukan
+   * umur absolut 24 jam via klaim sessionStartedAt — lihat refreshAdminToken).
+   * sessionStartedAt default = sekarang (issuance awal); rotation WAJIB
+   * meneruskan nilai lama dari token sebelumnya.
+   */
+  signAdminRefreshToken(payload: { sub: string; sessionStartedAt?: number }): string {
     const jti = nanoid();
+    const sessionStartedAt =
+      typeof payload.sessionStartedAt === 'number' && Number.isFinite(payload.sessionStartedAt)
+        ? payload.sessionStartedAt
+        : Math.floor(Date.now() / 1000);
     return this.jwtService.sign(
-      { ...payload, jti, iss: TOKEN_ISSUER, aud: ADMIN_REFRESH_TOKEN_AUDIENCE },
+      { ...payload, sessionStartedAt, jti, iss: TOKEN_ISSUER, aud: ADMIN_REFRESH_TOKEN_AUDIENCE },
       {
         secret: this.configService.get<string>('jwt.adminRefreshSecret'),
         expiresIn: this.configService.get('jwt.adminRefreshExpiresIn') ?? '7d',

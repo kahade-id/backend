@@ -54,7 +54,6 @@ describe('JwtAuthGuard database authorization defense-in-depth', () => {
     const config = {
       get: jest.fn((key: string) => {
         if (key === 'jwt.secret') return 'test-secret';
-        if (key === 'app.redisAuthFailOpen') return false;
         return undefined;
       }),
     };
@@ -123,6 +122,27 @@ describe('JwtAuthGuard database authorization defense-in-depth', () => {
       ServiceUnavailableException,
     );
   });
+
+  it('SEC-004: rute terproteksi fail-closed saat Redis down — fail-open dihapus total', async () => {
+    redis.get.mockRejectedValue(new Error('redis down'));
+    await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(
+      ServiceUnavailableException,
+    );
+  });
+
+  it('SEC-004: legacy REDIS_AUTH_FAIL_OPEN=true tidak bisa menurunkan guard', async () => {
+    // Variabel legacy masih bisa ada di .env lama (env.validation akan
+    // menolaknya saat boot), tapi guard tidak lagi membacanya sama sekali.
+    process.env.REDIS_AUTH_FAIL_OPEN = 'true';
+    try {
+      redis.get.mockRejectedValue(new Error('redis down'));
+      await expect(guard.canActivate(createContext(request))).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+    } finally {
+      delete process.env.REDIS_AUTH_FAIL_OPEN;
+    }
+  });
 });
 
 // ============================================================
@@ -139,7 +159,7 @@ describe('JwtAuthGuard optional auth on public routes (Section 6)', () => {
   let prisma: { userSession: { findUnique: jest.Mock }; user: { findUnique: jest.Mock } };
   let redisGet: jest.Mock;
   let verifyAsync: jest.Mock;
-  let buildGuard: (failOpen?: boolean) => JwtAuthGuard;
+  let buildGuard: () => JwtAuthGuard;
 
   const healthySession = () => ({
     userId: 'user-1',
@@ -169,7 +189,7 @@ describe('JwtAuthGuard optional auth on public routes (Section 6)', () => {
     // Reflector: rute ini @Public(), bukan rute admin.
     const reflector = { getAllAndOverride: jest.fn((key: string) => key === 'isPublic') };
 
-    buildGuard = (failOpen = false) =>
+    buildGuard = () =>
       new JwtAuthGuard(
         reflector as never,
         { verifyAsync } as never,
@@ -182,7 +202,6 @@ describe('JwtAuthGuard optional auth on public routes (Section 6)', () => {
         {
           get: jest.fn((key: string) => {
             if (key === 'jwt.secret') return 'test-secret';
-            if (key === 'app.redisAuthFailOpen') return failOpen;
             return undefined;
           }),
         } as never,
@@ -283,10 +302,10 @@ describe('JwtAuthGuard optional auth on public routes (Section 6)', () => {
     expect(request.user).toBeUndefined();
   });
 
-  it('stays available when Redis is unreachable and fail-open is disabled', async () => {
+  it('SEC-004: rute publik tetap anonim saat Redis down (fail-open dihapus; publik tidak butuh auth)', async () => {
     withBearer();
     redisGet.mockRejectedValue(new Error('redis down'));
-    const guard = buildGuard(false);
+    const guard = buildGuard();
     // Rute terproteksi akan 503 di sini; rute publik harus tetap 200 anonim.
     await expect(guard.canActivate(createContext(request))).resolves.toBe(true);
     expect(request.user).toBeUndefined();

@@ -1137,6 +1137,20 @@ export class AdminQaModerationService {
               ${reasonCode ? Prisma.sql`${reasonCode}::qa_moderation_reason` : Prisma.sql`NULL`},
               ${note ?? null}, NOW())
     `);
+    // SEC-504: setiap aksi moderasi Q&A juga dicatat di log audit admin
+    // pusat (admin_audit_logs) dalam transaction client yang SAMA — atomic
+    // dengan event moderasinya. IP belum tersedia di service ini ('unknown').
+    if (actorAdminId) {
+      const description =
+        `QA moderation ${action} on ${targetType} ${targetId}` +
+        (reasonCode ? ` (reason: ${reasonCode})` : '') +
+        (note ? ` — ${note.slice(0, 500)}` : '');
+      await db.$executeRaw(Prisma.sql`
+        INSERT INTO admin_audit_logs (id, admin_id, action, target_type, target_id, description, ip_address, created_at)
+        VALUES (gen_random_uuid()::text, ${actorAdminId}, 'ADMIN_ACTION'::"AuditAction",
+                ${'QA_MODERATION'}, ${targetId}, ${description}, 'unknown', NOW())
+      `);
+    }
   }
 
   /** G443 — notifikasi netral; tidak pernah menyebut pelapor. */

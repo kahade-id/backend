@@ -154,6 +154,20 @@ export class MilestonesService {
     return MilestoneActorType.ADMIN;
   }
 
+  /**
+   * SEC-102: aksi milestone (submit/accept) hanya sah bila order induk masih
+   * aktif (PROCESSING/IN_DELIVERY). Fail-closed: status lain — termasuk
+   * DISPUTED — ditolak agar dana/sengketa tidak bergerak via jalur milestone.
+   */
+  private assertOrderAllowsMilestoneAction(order: { status: OrderStatus }): void {
+    if (order.status !== OrderStatus.PROCESSING && order.status !== OrderStatus.IN_DELIVERY) {
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_ORDER_STATUS,
+        message: 'Aksi milestone hanya dapat dilakukan saat order berstatus PROCESSING atau IN_DELIVERY.',
+      });
+    }
+  }
+
   private async recordEvent(
     tx: Tx,
     milestoneId: string,
@@ -642,6 +656,8 @@ export class MilestonesService {
     if (sellerId !== milestone.order.sellerId) {
       throw new ForbiddenException({ code: 'FORBIDDEN', message: 'Hanya penjual yang dapat menyerahkan tahap.' });
     }
+    // SEC-102: order DISPUTED/non-aktif tidak boleh ada pergerakan milestone.
+    this.assertOrderAllowsMilestoneAction(milestone.order);
     if (milestone.status !== MilestoneStatus.AWAITING_ACTIVATION && milestone.status !== MilestoneStatus.REVISION_REQUESTED) {
       throw new BadRequestException({
         code: ErrorCodes.INVALID_ORDER_STATUS,
@@ -761,6 +777,8 @@ export class MilestonesService {
     if (buyerId !== milestone.order.buyerId) {
       throw new ForbiddenException({ code: 'FORBIDDEN', message: 'Hanya pembeli yang dapat menerima tahap.' });
     }
+    // SEC-102: order DISPUTED/non-aktif tidak boleh ada pencairan via milestone.
+    this.assertOrderAllowsMilestoneAction(milestone.order);
     if (milestone.status !== MilestoneStatus.SUBMITTED) {
       throw new BadRequestException({
         code: ErrorCodes.INVALID_ORDER_STATUS,

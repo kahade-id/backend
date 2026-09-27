@@ -18,6 +18,7 @@ import { DataCleanupService } from '../services/data-cleanup.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { OtpGatewayService } from '../../auth/otp-gateway.service';
+import { AccountDeletionService } from '../../users/account-deletion.service';
 import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
 
 jest.mock('../../../common/utils/pii.util', () => {
@@ -66,6 +67,11 @@ describe('DataCleanupService deletion WhatsApp reminders (GAP-A G058/G059)', () 
       { provide: RedisService, useValue: mockRedis },
       { provide: ConfigService, useValue: { get: jest.fn().mockReturnValue(undefined) } },
       { provide: getQueueToken(EMAIL_QUEUE), useValue: mockEmailQueue },
+      // SEC-001: re-check eligibilitas — mock selalu eligible di spec reminder ini.
+      {
+        provide: AccountDeletionService,
+        useValue: { getDeletionEligibility: jest.fn().mockResolvedValue({ eligible: true, blockers: [] }) },
+      },
     ];
     if (gateway !== undefined) {
       providers.push({ provide: OtpGatewayService, useValue: gateway });

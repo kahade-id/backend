@@ -7,6 +7,7 @@ import { RedisService } from '../../../redis/redis.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { bcryptCompare, decryptAES, encryptAES, sha256 } from '../../../common/utils/crypto.util';
 import { TokenService } from '../../auth/token.service';
+import { ADMIN_SESSION_ABSOLUTE_TTL_SECONDS } from '../../auth/token.service';
 import { ADMIN_TOKEN_BLACKLIST, ADMIN_REFRESH_BLACKLIST, ADMIN_2FA_ATTEMPT_KEY, ADMIN_MFA_SETUP, TOTP_USED_CODE } from '../../../common/constants/redis-keys';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 
@@ -92,11 +93,12 @@ export class AdminAuthService {
 
     const mfaRequired = await this.shouldEnforceAdminMfa();
     if (mfaRequired && !admin.isMfaEnabled) {
-      // 03-#8: jangan lock-out — kembalikan jalur enroll MFA via tempToken
-      // (scope admin_mfa_setup). Admin menyelesaikan setup di endpoint
-      // POST /v1/admin/auth/mfa/setup + /mfa/enable.
+      // SEC-501: admin tanpa MFA (termasuk admin pertama) TIDAK mendapat
+      // sesi penuh — diarahkan ke enrollment via tempToken (scope
+      // admin_mfa_setup). Admin menyelesaikan setup di endpoint
+      // POST /v1/admin/auth/mfa/setup + /mfa/enable (didukung admin web).
       const tempToken = this.tokenService.signTempToken({ sub: admin.id, scope: 'admin_mfa_setup' });
-      this.logger.warn(`Admin ${admin.email} logged in without MFA — MFA setup required (grace path)`);
+      this.logger.warn(`Admin ${admin.email} logged in without MFA — MFA setup required (enrollment path)`);
       return { requiresMfaSetup: true, tempToken };
     }
 
@@ -158,7 +160,11 @@ export class AdminAuthService {
       role: admin.role,
     });
 
-    const refreshToken = this.tokenService.signAdminRefreshToken({ sub: admin.id });
+    const refreshToken = this.tokenService.signAdminRefreshToken({
+      sub: admin.id,
+      // SEC-502: issuance awal menetapkan anchor umur absolut sesi.
+      sessionStartedAt: Math.floor(Date.now() / 1000),
+    });
 
     this.logger.log(`Admin login: ${admin.adminId} [${admin.role}] dari ${ipAddress}`);
 
@@ -271,7 +277,11 @@ export class AdminAuthService {
     const accessToken = this.tokenService.signAdminAccessToken({
       sub: admin.id, adminId: admin.adminId, email: admin.email, role: admin.role,
     });
-    const refreshToken = this.tokenService.signAdminRefreshToken({ sub: admin.id });
+    const refreshToken = this.tokenService.signAdminRefreshToken({
+      sub: admin.id,
+      // SEC-502: issuance awal menetapkan anchor umur absolut sesi.
+      sessionStartedAt: Math.floor(Date.now() / 1000),
+    });
     this.logger.log(`Admin 2FA login: ${admin.adminId} [${admin.role}] dari ${ipAddress}`);
 
     // GAP-E G393: catat sesi login admin (dapat di-revoke via management API).
@@ -410,6 +420,18 @@ export class AdminAuthService {
     try {
       const payload = this.tokenService.verifyAdminRefreshToken(refreshToken);
 
+      // SEC-502: umur absolut sesi admin — 24 jam sejak sessionStartedAt,
+      // tidak peduli berapa kali token dirotasi. Token lama (tanpa anchor),
+      // anchor invalid, atau umur ≥ 24 jam → tolak; admin wajib login ulang.
+      const anchor = payload.sessionStartedAt;
+      const anchorValid = typeof anchor === 'number' && Number.isFinite(anchor) && anchor > 0;
+      if (!anchorValid || Date.now() / 1000 - anchor >= ADMIN_SESSION_ABSOLUTE_TTL_SECONDS) {
+        throw new UnauthorizedException({
+          code: ErrorCodes.TOKEN_INVALID_OR_EXPIRED,
+          message: 'Admin session exceeded maximum lifetime — please log in again',
+        });
+      }
+
       // Check if this refresh token JTI has been blacklisted (e.g. after logout)
       if (payload.jti) {
         const isBlacklisted = await this.redis.get(ADMIN_REFRESH_BLACKLIST(payload.jti), { throwOnError: true });
@@ -472,7 +494,12 @@ export class AdminAuthService {
           role: admin.role,
         });
 
-        const newRefreshToken = this.tokenService.signAdminRefreshToken({ sub: admin.id });
+        // SEC-502: rotation meneruskan anchor umur absolut dari token lama —
+        // umur sesi tidak pernah di-reset oleh rotation.
+        const newRefreshToken = this.tokenService.signAdminRefreshToken({
+          sub: admin.id,
+          sessionStartedAt: payload.sessionStartedAt,
+        });
 
         // Blacklist the OLD refresh token JTI so it cannot be reused (rotation).
         // This is done AFTER issuing the new token to prevent a window where
@@ -617,7 +644,11 @@ export class AdminAuthService {
       email: admin.email,
       role: admin.role,
     });
-    const refreshToken = this.tokenService.signAdminRefreshToken({ sub: admin.id });
+    const refreshToken = this.tokenService.signAdminRefreshToken({
+      sub: admin.id,
+      // SEC-502: issuance awal menetapkan anchor umur absolut sesi.
+      sessionStartedAt: Math.floor(Date.now() / 1000),
+    });
 
     this.auditLogService.logAdminAction({
       adminId: admin.id,
@@ -721,23 +752,15 @@ export class AdminAuthService {
   }
 
   /**
-   * 03-#8: bootstrap guard — bila BELUM ADA admin dengan MFA aktif, lewati
-   * penegakan (dengan warning keras) agar deploy pertama tidak mengunci
-   * seluruh admin. Setelah ≥1 admin mengaktifkan MFA, penegakan penuh.
+   * SEC-501: penegakan MFA admin selalu aktif bila `admin_mfa_required=true`
+   * (default fail-closed). Bootstrap bypass DIHAPUS — admin pertama TANPA
+   * MFA tidak lagi memperoleh sesi penuh, melainkan diarahkan ke jalur
+   * enrollment aman (`requiresMfaSetup + tempToken` → POST
+   * /v1/admin/auth/mfa/setup + /mfa/enable, didukung admin web). Dengan
+   * demikian tidak ada jendela di mana sesi admin penuh bisa diperoleh
+   * tanpa MFA.
    */
   private async shouldEnforceAdminMfa(): Promise<boolean> {
-    const required = await this.isAdminMfaRequired();
-    if (!required) return false;
-    const mfaCount = await this.prisma.adminUser.count({
-      where: { isMfaEnabled: true, isActive: true, deletedAt: null },
-    });
-    if (mfaCount === 0) {
-      this.logger.error(
-        '[SECURITY] admin_mfa_required=true but no admin has MFA enabled — enforcement deferred (bootstrap). ' +
-          'Enroll MFA immediately via POST /v1/admin/auth/mfa/setup.',
-      );
-      return false;
-    }
-    return true;
+    return this.isAdminMfaRequired();
   }
 }

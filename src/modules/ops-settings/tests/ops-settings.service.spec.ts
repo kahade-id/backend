@@ -121,4 +121,49 @@ describe('OpsSettingsService', () => {
   it('menolak value kosong', async () => {
     await expect(service.set('FONNTE_API_TOKEN', '   ', 'admin1')).rejects.toThrow(/tidak boleh kosong/);
   });
+
+  it('SEC-201: set FONNTE_API_URL menolak URL non-HTTPS', async () => {
+    await expect(service.set('FONNTE_API_URL', 'http://api.fonnte.com/send', 'admin1')).rejects.toThrow(
+      /FONNTE_API_URL tidak valid/,
+    );
+    expect(store.has('FONNTE_API_URL')).toBe(false);
+  });
+
+  it('SEC-201: set FONNTE_API_URL menolak IP metadata cloud & private', async () => {
+    await expect(service.set('FONNTE_API_URL', 'https://169.254.169.254/latest/meta-data', 'admin1')).rejects.toThrow(
+      /FONNTE_API_URL tidak valid/,
+    );
+    await expect(service.set('FONNTE_API_URL', 'https://192.168.1.100/send', 'admin1')).rejects.toThrow(
+      /FONNTE_API_URL tidak valid/,
+    );
+    await expect(service.set('FONNTE_API_URL', 'https://10.0.0.5:8443/send', 'admin1')).rejects.toThrow(
+      /FONNTE_API_URL tidak valid/,
+    );
+    expect(store.has('FONNTE_API_URL')).toBe(false);
+  });
+
+  it('SEC-201: set FONNTE_API_URL menerima URL publik valid dan menyimpannya ternormalisasi', async () => {
+    const view = await service.set('FONNTE_API_URL', 'https://1.1.1.1/send', 'admin1');
+    expect(view.configured).toBe(true);
+    const raw = store.get('FONNTE_API_URL');
+    expect(raw.value).toBe('https://1.1.1.1/send');
+    expect(service.get('FONNTE_API_URL')).toBe('https://1.1.1.1/send');
+  });
+
+  it('SEC-201: testFonnteToken tidak mengikuti redirect (redirect: manual)', async () => {
+    const calls: Array<{ url: string; init: any }> = [];
+    const origFetch = global.fetch;
+    (global as any).fetch = jest.fn(async (url: string, init: any) => {
+      calls.push({ url, init });
+      return { ok: true, status: 200, text: async () => '{"status":true}' } as any;
+    });
+    try {
+      const result = await (service as any).testFonnteToken('tok-uji');
+      expect(result.ok).toBe(true);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].init.redirect).toBe('manual');
+    } finally {
+      (global as any).fetch = origFetch;
+    }
+  });
 });

@@ -129,6 +129,9 @@ class FonnteOtpProvider implements OtpProviderAdapter {
     try {
       res = await fetch(this.endpoint, {
         method: 'POST',
+        // SEC-201: jangan ikuti redirect — endpoint Fonnte yang tervalidasi
+        // tidak boleh dialihkan (anti-SSRF via open redirect).
+        redirect: 'manual',
         headers: {
           Authorization: token,
           'Content-Type': 'application/x-www-form-urlencoded',

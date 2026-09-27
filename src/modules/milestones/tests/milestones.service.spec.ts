@@ -238,6 +238,9 @@ describe('MilestonesService lifecycle (G200)', () => {
 
   async function fullSetup() {
     const { svc, prisma, db } = makeService();
+    // SEC-102: submit/accept hanya sah saat order PROCESSING/IN_DELIVERY —
+    // seed mencerminkan alur produksi: rencana dibuat saat WAITING_PAYMENT,
+    // lalu order dibayar (PROCESSING) sebelum tahap diserahkan/diterima.
     const order = seedOrder(db);
     await svc.createMilestones('order-1', 'seller-1', {
       milestones: [
@@ -245,6 +248,7 @@ describe('MilestonesService lifecycle (G200)', () => {
         { title: 'Tahap 2', amountIdr: 150000 },
       ],
     });
+    db.order.find((o) => o.id === 'order-1')!.status = 'PROCESSING';
     // Simulasikan escrow lock penuh (seperti payOrder): buyer escrow = buyerPayAmount.
     const buyerWallet = db.wallet.find((w) => w.userId === 'buyer-1')!;
     buyerWallet.availableBalance -= order.buyerPayAmount;
@@ -435,5 +439,47 @@ describe('MilestonesService lifecycle (G200)', () => {
     await svc.acceptMilestone(m1.id, 'buyer-1');
     expect(db.order.find((o) => o.id === 'order-1')!.status).toBe('IN_DELIVERY');
     expect(db.orderStatusHistory).toHaveLength(0);
+  });
+
+  it('SEC-102: submit ditolak saat order DISPUTED', async () => {
+    const { svc, db } = await fullSetup();
+    db.order.find((o) => o.id === 'order-1')!.status = 'DISPUTED';
+    const m1 = db.orderMilestone[0];
+    await expect(svc.submitMilestone(m1.id, 'seller-1')).rejects.toMatchObject({
+      message: expect.stringContaining('PROCESSING'),
+    });
+    expect(db.orderMilestone[0].status).toBe(MilestoneStatus.AWAITING_ACTIVATION);
+  });
+
+  it('SEC-102: accept ditolak saat order DISPUTED (dana tidak boleh cair)', async () => {
+    const { svc, db } = await fullSetup();
+    const m1 = db.orderMilestone[0];
+    await svc.submitMilestone(m1.id, 'seller-1');
+    db.order.find((o) => o.id === 'order-1')!.status = 'DISPUTED';
+    const sellerBefore = db.wallet.find((w) => w.userId === 'seller-1')!.availableBalance;
+    await expect(svc.acceptMilestone(m1.id, 'buyer-1')).rejects.toMatchObject({
+      message: expect.stringContaining('PROCESSING'),
+    });
+    expect(db.orderMilestone[0].status).toBe(MilestoneStatus.SUBMITTED);
+    expect(db.wallet.find((w) => w.userId === 'seller-1')!.availableBalance).toBe(sellerBefore);
+  });
+
+  it('SEC-102: submit ditolak untuk status non-aktif lain (CANCELLED/COMPLETED/WAITING_PAYMENT)', async () => {
+    for (const status of ['CANCELLED', 'COMPLETED', 'WAITING_PAYMENT']) {
+      const { svc, db } = await fullSetup();
+      db.order.find((o) => o.id === 'order-1')!.status = status;
+      const m1 = db.orderMilestone[0];
+      await expect(svc.submitMilestone(m1.id, 'seller-1')).rejects.toThrow();
+    }
+  });
+
+  it('SEC-102: submit/accept tetap boleh saat IN_DELIVERY', async () => {
+    const { svc, db } = await fullSetup();
+    db.order.find((o) => o.id === 'order-1')!.status = 'IN_DELIVERY';
+    const m1 = db.orderMilestone[0];
+    await svc.submitMilestone(m1.id, 'seller-1');
+    expect(db.orderMilestone[0].status).toBe(MilestoneStatus.SUBMITTED);
+    await svc.acceptMilestone(m1.id, 'buyer-1');
+    expect(db.orderMilestone.find((x) => x.id === m1.id)!.status).toBe(MilestoneStatus.RELEASED);
   });
 });

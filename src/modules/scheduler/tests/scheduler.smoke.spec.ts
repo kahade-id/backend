@@ -18,6 +18,7 @@ import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
 import { AutoCompleteDeliveredOrdersService } from '../services/auto-complete-orders.service';
 import { AutoEscalateDisputesService } from '../services/auto-escalate-disputes.service';
 import { DataCleanupService } from '../services/data-cleanup.service';
+import { AccountDeletionService } from '../../users/account-deletion.service';
 import { DeadlineReminderService } from '../services/deadline-reminder.service';
 import { DlqMonitorService } from '../services/dlq-monitor.service';
 import { ExpireDisputeCallsService } from '../services/expire-dispute-calls.service';
@@ -157,8 +158,10 @@ describe('Scheduler services smoke', () => {
 
   it('DataCleanupService — defined + skip', async () => {
     // GAP-A (G058/G059): DataCleanupService membutuhkan BullQueue_email.
+    // SEC-001: + AccountDeletionService (purge re-check dalam transaksi).
     const svc = await build<DataCleanupService>(DataCleanupService, [
       { provide: getQueueToken(EMAIL_QUEUE), useValue: {} },
+      { provide: AccountDeletionService, useValue: {} },
     ]);
     expect(svc).toBeDefined();
     await svc.onModuleInit();

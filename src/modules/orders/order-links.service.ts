@@ -166,6 +166,16 @@ export class OrderLinksService {
       showcaseId = item.id;
       // Snapshot = harga representatif item (rupiah integer): priceMin ?? priceMax ?? 0.
       priceSnapshot = BigInt(Math.max(0, Math.floor(Number(item.priceMin ?? item.priceMax ?? 0))));
+      // SEC-101: orderValue dari dto harus SAMA PERSIS dengan harga etalase
+      // (toleransi 0) — cegah manipulasi harga: link etalase tidak boleh
+      // dibuat dengan nominal berbeda dari harga yang tertera. Etalase tanpa
+      // harga (snapshot 0) otomatis gagal tertutup karena orderValue >= min > 0.
+      if (BigInt(dto.orderValue) !== priceSnapshot) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'Nilai order harus sama persis dengan harga etalase.',
+        });
+      }
     }
 
     const serial = await this.getNextLinkSerial();

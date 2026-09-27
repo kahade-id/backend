@@ -22,6 +22,7 @@ import {
   ConfirmReceiptDto,
   EscalateReturnDto,
   ListReturnsQueryDto,
+  ResolveReturnDto,
 } from './dto/returns.dto';
 
 @ApiTags('returns')
@@ -154,10 +155,12 @@ export class ReturnsController {
   async resolve(
     @CurrentUser('sub') userId: string,
     @Param('id') id: string,
-    @Body() body: { outcome?: 'REFUND' | 'EXCHANGE' | 'REPAIR'; note?: string },
+    // SEC-203: DTO tervalidasi — outcome tak dikenal ditolak 400 oleh
+    // ValidationPipe, tidak lagi jatuh diam-diam ke REPAIR.
+    @Body() dto: ResolveReturnDto,
     @Query('as') asRole?: string,
   ) {
     const role = asRole === 'buyer' ? 'BUYER' : 'SELLER';
-    return this.returnsService.resolveReturn(id, userId, role as 'BUYER' | 'SELLER', body.outcome, body.note);
+    return this.returnsService.resolveReturn(id, userId, role as 'BUYER' | 'SELLER', dto.outcome, dto.note);
   }
 }

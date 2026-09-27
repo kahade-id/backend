@@ -266,3 +266,22 @@ export class ListReturnsQueryDto {
   @Max(100)
   limit?: number;
 }
+
+/**
+ * SEC-203: DTO resolve retur — outcome divalidasi sebagai enum ketat.
+ * Sebelumnya body inline `{ outcome?: 'REFUND' | 'EXCHANGE' | 'REPAIR' }`
+ * lolos ValidationPipe sebagai tipe TS saja; nilai tak dikenal (mis.
+ * "FULL_REFUND") diam-diam jatuh ke penyelesaian REPAIR di service.
+ */
+export class ResolveReturnDto {
+  @IsOptional()
+  @IsIn(['REFUND', 'EXCHANGE', 'REPAIR'], {
+    message: 'Hasil penyelesaian harus salah satu dari: REFUND, EXCHANGE, REPAIR.',
+  })
+  outcome?: 'REFUND' | 'EXCHANGE' | 'REPAIR';
+
+  @IsOptional()
+  @IsString({ message: 'Catatan harus berupa teks.' })
+  @MaxLength(1000, { message: 'Catatan maksimal 1000 karakter.' })
+  note?: string;
+}

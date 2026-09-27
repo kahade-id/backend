@@ -285,7 +285,18 @@ export function validateEnv(env: Env): Env {
   // Auth blacklist/session checks and idempotency are security and escrow
   // invariants. A production deployment must never silently bypass either one
   // when Redis is unavailable.
-  for (const key of ['REDIS_AUTH_FAIL_OPEN', 'IDEMPOTENCY_FAIL_OPEN']) {
+  //
+  // SEC-004: REDIS_AUTH_FAIL_OPEN DIHAPUS dari codebase — guard auth selalu
+  // fail-closed. Variabel legacy ini ditolak eksplisit bila masih diset, agar
+  // konfigurasi lama tidak diabaikan diam-diam (operator harus menghapusnya).
+  if (env['REDIS_AUTH_FAIL_OPEN'] !== undefined) {
+    errors.push({
+      key: 'REDIS_AUTH_FAIL_OPEN',
+      message: 'REDIS_AUTH_FAIL_OPEN sudah dihapus — guard auth selalu fail-closed. Hapus variabel ini dari environment.',
+    })
+  }
+  {
+    const key = 'IDEMPOTENCY_FAIL_OPEN'
     const raw = env[key]
     if (raw !== undefined && !/^(true|false)$/i.test(raw.trim())) {
       errors.push({ key, message: `${key} must be exactly "true" or "false" when provided` })

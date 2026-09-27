@@ -1,4 +1,4 @@
-import { Module, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Module, Logger, OnModuleDestroy, forwardRef } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { PrismaModule } from '../../prisma/prisma.module';
 import { RedisModule } from '../../redis/redis.module';
@@ -68,9 +68,13 @@ import { UploadModule } from '../upload/upload.module';
 import { ShowcaseHardDeleteService } from './services/showcase-hard-delete.service';
 import { KycSlaMonitorService } from './services/kyc-sla-monitor.service';
 import { AdminFeedbackModule } from '../admin/feedback/admin-feedback.module';
+// SEC-001: DataCleanupService butuh AccountDeletionService untuk re-check
+// eligibilitas di dalam transaksi purge. forwardRef mengikuti pola
+// AuthModule (hindari siklus UsersModule <-> SchedulerModule).
+import { UsersModule } from '../users/users.module';
 
 @Module({
-  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, AdminShowcaseReportsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, AuditLogModule, UploadModule, AdminFeedbackModule, InventoryModule],
+  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, AdminShowcaseReportsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, AuditLogModule, UploadModule, AdminFeedbackModule, InventoryModule, forwardRef(() => UsersModule)],
   providers: [
     WalletDailyResetService,
     DataCleanupService,

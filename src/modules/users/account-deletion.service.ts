@@ -99,10 +99,19 @@ export class AccountDeletionService {
   // Eligibilitas penghapusan (G066/G070) — satu sumber kebenaran untuk
   // UI pra-konfirmasi dan penjagaan di requestAccountDeletion.
   // ─────────────────────────────────────────────────────────────────
-  async getDeletionEligibility(userId: string): Promise<{ eligible: boolean; blockers: DeletionBlocker[] }> {
+  /**
+   * SEC-001: `db` opsional memungkinkan pengecekan dijalankan di dalam
+   * transaksi purge (Serializable) — bukan snapshot basi di luar transaksi.
+   * Bila tidak diberikan, memakai PrismaService milik service ini.
+   */
+  async getDeletionEligibility(
+    userId: string,
+    db?: Pick<PrismaService, 'order' | 'walletTransaction' | 'wallet'>,
+  ): Promise<{ eligible: boolean; blockers: DeletionBlocker[] }> {
+    const prisma = db ?? this.prisma;
     const blockers: DeletionBlocker[] = [];
 
-    const disputedOrderCount = await this.prisma.order.count({
+    const disputedOrderCount = await prisma.order.count({
       where: {
         OR: [{ buyerId: userId }, { sellerId: userId }],
         status: 'DISPUTED',
@@ -115,7 +124,7 @@ export class AccountDeletionService {
       });
     }
 
-    const activeOrderCount = await this.prisma.order.count({
+    const activeOrderCount = await prisma.order.count({
       where: {
         OR: [{ buyerId: userId }, { sellerId: userId }],
         status: { notIn: ['COMPLETED', 'CANCELLED', 'DISPUTED'] },
@@ -128,7 +137,7 @@ export class AccountDeletionService {
       });
     }
 
-    const pendingWithdrawalCount = await this.prisma.walletTransaction.count({
+    const pendingWithdrawalCount = await prisma.walletTransaction.count({
       where: {
         type: 'WITHDRAW',
         withdrawStatus: { in: ['PENDING_OTP', 'PENDING_PROCESS', 'PROCESSING'] },
@@ -142,7 +151,7 @@ export class AccountDeletionService {
       });
     }
 
-    const wallet = await this.prisma.wallet.findUnique({ where: { userId } });
+    const wallet = await prisma.wallet.findUnique({ where: { userId } });
     if (wallet && (wallet.escrowBalance > BigInt(0) || wallet.availableBalance > BigInt(0) || wallet.totalBalance > BigInt(0))) {
       blockers.push({
         code: wallet.escrowBalance > BigInt(0) ? ErrorCodes.ESCROW_BALANCE_PRESENT : ErrorCodes.WALLET_BALANCE_PRESENT,

@@ -6,6 +6,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
 import { DeletionRequestStatus } from '@prisma/client';
+import { AccountDeletionService } from '../../users/account-deletion.service';
 
 /**
  * GAP-A (G075): uji purge worker & pengingat penghapusan akun.
@@ -34,10 +35,16 @@ describe('DataCleanupService deletion purge & reminders (GAP-A G051–G075)', ()
     get: jest.fn(),
   };
   const mockEmailQueue = { add: jest.fn().mockResolvedValue({}) };
+  // SEC-001: re-check eligibilitas di dalam transaksi purge.
+  const mockAccountDeletion = {
+    getDeletionEligibility: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
     mockPrisma.$transaction.mockImplementation(async (cb: any) => cb(mockPrisma));
+    // Default: eligible — perilaku purge normal untuk test lama.
+    mockAccountDeletion.getDeletionEligibility.mockResolvedValue({ eligible: true, blockers: [] });
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -46,6 +53,7 @@ describe('DataCleanupService deletion purge & reminders (GAP-A G051–G075)', ()
         { provide: RedisService, useValue: mockRedis },
         { provide: ConfigService, useValue: { get: jest.fn().mockReturnValue(undefined) } },
         { provide: getQueueToken(EMAIL_QUEUE), useValue: mockEmailQueue },
+        { provide: AccountDeletionService, useValue: mockAccountDeletion },
       ],
     }).compile();
     service = module.get<DataCleanupService>(DataCleanupService);
@@ -126,6 +134,50 @@ describe('DataCleanupService deletion purge & reminders (GAP-A G051–G075)', ()
 
       expect(purged).toBe(0);
       expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('SEC-001: memanggil getDeletionEligibility di dalam transaksi (tx dipakai)', async () => {
+      mockPrisma.accountDeletionRequest.findMany.mockResolvedValue([dueRequest]);
+      mockPrisma.accountDeletionRequest.findUnique.mockResolvedValue(dueRequest);
+      mockRedis.setNx.mockResolvedValue(true);
+
+      await (service as any).purgeDueDeletionRequests();
+
+      expect(mockAccountDeletion.getDeletionEligibility).toHaveBeenCalledWith('user-1', mockPrisma);
+    });
+
+    it('SEC-001: request TIDAK eligible → ON_HOLD otomatis + legalHoldReason, user TIDAK dianonimkan', async () => {
+      mockPrisma.accountDeletionRequest.findMany.mockResolvedValue([dueRequest]);
+      mockPrisma.accountDeletionRequest.findUnique.mockResolvedValue(dueRequest);
+      mockRedis.setNx.mockResolvedValue(true);
+      mockAccountDeletion.getDeletionEligibility.mockResolvedValue({
+        eligible: false,
+        blockers: [{ code: 'ACTIVE_ORDERS_PRESENT', message: 'Anda memiliki 1 sengketa yang sedang berjalan.' }],
+      });
+
+      const purged = await (service as any).purgeDueDeletionRequests();
+
+      expect(purged).toBe(0);
+      // Request ditahan, bukan di-purge.
+      expect(mockPrisma.accountDeletionRequest.update).toHaveBeenCalledWith({
+        where: { id: 'req-1' },
+        data: {
+          status: DeletionRequestStatus.ON_HOLD,
+          legalHoldReason: expect.stringContaining('sengketa'),
+        },
+      });
+      // Riwayat REQUESTED → ON_HOLD tercatat.
+      expect(mockPrisma.accountDeletionStatusHistory.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          requestId: 'req-1',
+          fromStatus: DeletionRequestStatus.REQUESTED,
+          toStatus: DeletionRequestStatus.ON_HOLD,
+          actorType: 'SYSTEM',
+        }),
+      });
+      // PII user TIDAK boleh dianonimkan saat ditahan.
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
+      expect(mockRedis.releaseLock).toHaveBeenCalled();
     });
   });
 

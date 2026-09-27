@@ -86,7 +86,8 @@ describe('SH-B-011 — showcase origin on OrderLink/Order', () => {
     mocks.mockPrisma.orderLink.create.mockImplementation(async (args: any) => ({ id: 'ol-1', linkId: 'KD-1', token: 'tok', expiresAt: new Date(), ...args.data }));
 
     const service = await buildService(mocks);
-    const result = (await service.createLink(CREATOR_ID, validDto({ showcaseId: ITEM_ID }))) as any;
+    // SEC-101: orderValue harus SAMA PERSIS dengan harga etalase (toleransi 0).
+    const result = (await service.createLink(CREATOR_ID, validDto({ showcaseId: ITEM_ID, orderValue: 150000 }))) as any;
 
     // Kepemilikan diverifikasi: item milik creator, belum dihapus.
     expect(mocks.mockPrisma.userShowcase.findFirst).toHaveBeenCalledWith(
@@ -100,23 +101,49 @@ describe('SH-B-011 — showcase origin on OrderLink/Order', () => {
     expect(result.priceSnapshot).toBe('150000');
   });
 
-  it('createLink falls back to priceMax when priceMin is null, and 0 when both are null', async () => {
+  it('createLink falls back to priceMax when priceMin is null, and rejects priceless showcases (fail-closed)', async () => {
     const service = await buildService(mocks);
     mocks.mockPrisma.userShowcase.findFirst.mockResolvedValue({ id: ITEM_ID, priceMin: null, priceMax: 99999n });
     mocks.mockPrisma.orderLink.create.mockImplementation(async (args: any) => ({ id: 'ol-1', linkId: 'KD-1', token: 'tok', expiresAt: new Date(), ...args.data }));
-    await service.createLink(CREATOR_ID, validDto({ showcaseId: ITEM_ID }));
+    // SEC-101: sama persis dengan snapshot (priceMax bila priceMin null).
+    await service.createLink(CREATOR_ID, validDto({ showcaseId: ITEM_ID, orderValue: 99999 }));
     expect(mocks.mockPrisma.orderLink.create).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ priceSnapshot: 99999n }) }),
     );
 
     jest.clearAllMocks();
     mockHealthyCreator(mocks);
+    // Etalase tanpa harga (snapshot 0) → orderValue valid apa pun mismatch → tolak tertutup.
     mocks.mockPrisma.userShowcase.findFirst.mockResolvedValue({ id: ITEM_ID, priceMin: null, priceMax: null });
     mocks.mockPrisma.orderLink.create.mockImplementation(async (args: any) => ({ id: 'ol-1', linkId: 'KD-1', token: 'tok', expiresAt: new Date(), ...args.data }));
-    await service.createLink(CREATOR_ID, validDto({ showcaseId: ITEM_ID }));
-    expect(mocks.mockPrisma.orderLink.create).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ priceSnapshot: 0n }) }),
-    );
+    await expect(
+      service.createLink(CREATOR_ID, validDto({ showcaseId: ITEM_ID, orderValue: 250000 })),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({ code: ErrorCodes.VALIDATION_ERROR }),
+    });
+    expect(mocks.mockPrisma.orderLink.create).not.toHaveBeenCalled();
+  });
+
+  it('SEC-101: createLink menolak orderValue yang berbeda dari harga etalase (manipulasi harga)', async () => {
+    mocks.mockPrisma.userShowcase.findFirst.mockResolvedValue({
+      id: ITEM_ID,
+      priceMin: 150000n,
+      priceMax: 350000n,
+    });
+    const service = await buildService(mocks);
+    // Lebih murah dari harga etalase.
+    await expect(
+      service.createLink(CREATOR_ID, validDto({ showcaseId: ITEM_ID, orderValue: 149999 })),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({ code: ErrorCodes.VALIDATION_ERROR }),
+    });
+    // Lebih mahal dari harga etalase.
+    await expect(
+      service.createLink(CREATOR_ID, validDto({ showcaseId: ITEM_ID, orderValue: 150001 })),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({ code: ErrorCodes.VALIDATION_ERROR }),
+    });
+    expect(mocks.mockPrisma.orderLink.create).not.toHaveBeenCalled();
   });
 
   it('createLink rejects a showcaseId that belongs to another user or is deleted', async () => {

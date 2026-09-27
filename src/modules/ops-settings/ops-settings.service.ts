@@ -8,6 +8,9 @@ import {
   maskSecret,
   type ManageableSettingDef,
 } from './ops-settings.registry';
+// SEC-201: validasi SSRF untuk FONNTE_API_URL sebelum disimpan — pola yang
+// sama dipakai webhook mitra (partner/ssrf.util.ts).
+import { validateWebhookUrl, WebhookUrlValidationError } from '../partner/ssrf.util';
 
 export interface OpsSettingView {
   key: string;
@@ -151,7 +154,20 @@ export class OpsSettingsService implements OnModuleInit, OnModuleDestroy {
     if (!trimmed) {
       throw new Error(`Nilai ${key} tidak boleh kosong.`);
     }
-    const stored = def.isSecret ? await encryptPii(trimmed) : trimmed;
+    // SEC-201: FONNTE_API_URL dipakai sebagai target fetch server-side —
+    // validasi anti-SSRF (HTTPS saja, tanpa kredensial, port 443, hostname
+    // tidak me-resolve ke IP private/reserved/metadata) + normalisasi
+    // sebelum disimpan. Gagal validasi → tolak, nilai lama dipertahankan.
+    let effectiveValue = trimmed;
+    if (key === 'FONNTE_API_URL') {
+      try {
+        effectiveValue = await validateWebhookUrl(trimmed);
+      } catch (err) {
+        const reason = err instanceof WebhookUrlValidationError ? err.message : String(err);
+        throw new Error(`FONNTE_API_URL tidak valid: ${reason}`);
+      }
+    }
+    const stored = def.isSecret ? await encryptPii(effectiveValue) : effectiveValue;
     const existing = await this.prisma.appSetting.findUnique({ where: { key } });
     const nextVersion = (existing?.version ?? 0) + 1;
     await this.prisma.appSetting.upsert({
@@ -171,7 +187,7 @@ export class OpsSettingsService implements OnModuleInit, OnModuleDestroy {
         key,
         action: 'SET',
         changedBy: adminId,
-        valueHint: def.isSecret ? maskSecret(trimmed) : trimmed.slice(0, 64),
+        valueHint: def.isSecret ? maskSecret(effectiveValue) : effectiveValue.slice(0, 64),
         success: true,
         detail: `version ${nextVersion}`,
       },
@@ -229,6 +245,8 @@ export class OpsSettingsService implements OnModuleInit, OnModuleDestroy {
     try {
       const res = await fetch('https://api.fonnte.com/get-devices', {
         method: 'POST',
+        // SEC-201: jangan ikuti redirect (anti-SSRF via open redirect).
+        redirect: 'manual',
         headers: { Authorization: token },
       });
       const text = await res.text();

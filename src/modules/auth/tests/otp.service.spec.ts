@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { OtpService } from '../otp.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
+import { initializeCrypto } from '../../../common/utils/crypto.util';
 
 const mockPrisma = {
   otpCode: {
@@ -35,6 +36,8 @@ describe('OtpService', () => {
   let service: OtpService;
 
   beforeEach(async () => {
+    // SEC-303: key Redis OTP kini di-HMAC — crypto harus diinisialisasi.
+    initializeCrypto({ aesSecretKey: 'test-aes-secret', hmacSecretKey: 'test-hmac-secret' });
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         OtpService,

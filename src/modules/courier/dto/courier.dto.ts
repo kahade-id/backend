@@ -18,6 +18,8 @@ import {
   Min,
   MinLength,
   ValidateNested,
+  ArrayMinSize,
+  ArrayMaxSize,
 } from 'class-validator';
 import { ShipmentMode, ShippingCostBearer } from '@prisma/client';
 
@@ -170,6 +172,21 @@ export class BillLineDto {
 
   @IsNumber() @Min(0)
   billedAmount!: number;
+}
+
+/**
+ * SEC-204: DTO tambah baris tagihan — validasi nested ketat.
+ * Sebelumnya controller memakai body inline `{ lines: BillLineDto[] }`
+ * sehingga decorator di BillLineDto tidak pernah dijalankan: NaN/negatif/
+ * non-array lolos ke BigInt(Math.round(...)) dan merusak rekonsiliasi.
+ */
+export class AddBillLinesDto {
+  @IsArray({ message: 'lines harus berupa array.' })
+  @ArrayMinSize(1, { message: 'Minimal satu baris tagihan.' })
+  @ArrayMaxSize(500, { message: 'Maksimal 500 baris per permintaan.' })
+  @ValidateNested({ each: true })
+  @Type(() => BillLineDto)
+  lines!: BillLineDto[];
 }
 
 export class RequestRefundDto {

@@ -108,5 +108,15 @@ describe('OtpGatewayService production safety', () => {
       await gateway.sendOtp('081234567890', '123456', 'WHATSAPP');
       expect((global.fetch as jest.Mock).mock.calls[1][1].headers.Authorization).toBe('token-kedua');
     });
+
+    it('SEC-201: pengiriman Fonnte tidak mengikuti redirect (redirect: manual)', async () => {
+      const gateway = new OtpGatewayService(
+        config({ NODE_ENV: 'production', OTP_PROVIDER: 'fonnte' }),
+        opsSettings({ FONNTE_API_TOKEN: 'token-x' }),
+      );
+      await gateway.sendOtp('081234567890', '123456', 'WHATSAPP');
+      const init = (global.fetch as jest.Mock).mock.calls[0][1];
+      expect(init.redirect).toBe('manual');
+    });
   });
 });

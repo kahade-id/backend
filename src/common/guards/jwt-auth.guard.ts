@@ -334,21 +334,12 @@ export class JwtAuthGuard implements CanActivate {
     }
   }
 
-  private isFailOpenEnabled(): boolean {
-    return this.configService.get<boolean>('app.redisAuthFailOpen') === true;
-  }
-
   private async checkBlacklist(payload: {
     jti?: string;
     sessionId?: string;
   }): Promise<'ok' | 'revoked' | 'session_revoked' | 'unavailable'> {
     if (await this.isCircuitOpen()) {
-      if (this.isFailOpenEnabled()) {
-        this.logger.warn(
-          'Redis circuit open — allowing cryptographically valid token (fail-open mode)',
-        );
-        return 'ok';
-      }
+      // SEC-004: fail-open DIHAPUS — circuit terbuka selalu menolak.
       this.logger.warn('Redis circuit open — rejecting request (fail-closed)');
       return 'unavailable';
     }
@@ -378,12 +369,7 @@ export class JwtAuthGuard implements CanActivate {
       return 'ok';
     } catch {
       await this.recordRedisFailure();
-      if (this.isFailOpenEnabled()) {
-        this.logger.warn(
-          'Redis unavailable — allowing cryptographically valid token (fail-open mode)',
-        );
-        return 'ok';
-      }
+      // SEC-004: fail-open DIHAPUS — Redis tidak tersedia selalu menolak.
       this.logger.warn('Redis unavailable — rejecting request (fail-closed)');
       return 'unavailable';
     }

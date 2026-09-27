@@ -135,21 +135,31 @@ describe('validateEnv', () => {
     expect(() => validateEnv(env)).not.toThrow();
   });
 
-  it.each(['REDIS_AUTH_FAIL_OPEN', 'IDEMPOTENCY_FAIL_OPEN'])('rejects %s=true in production', (key) => {
+  it('rejects IDEMPOTENCY_FAIL_OPEN=true in production', () => {
     const env: Record<string, string> = {
       ...baseEnv,
       NODE_ENV: 'production',
       CORS_ORIGINS: 'https://app.kahade.id',
       MIDTRANS_ALLOWED_CIDRS: '0.0.0.0/0',
-      [key]: 'true',
+      IDEMPOTENCY_FAIL_OPEN: 'true',
     };
-    expect(() => validateEnv(env)).toThrow(`${key} must be false in production`);
+    expect(() => validateEnv(env)).toThrow('IDEMPOTENCY_FAIL_OPEN must be false in production');
   });
 
-  it.each(['REDIS_AUTH_FAIL_OPEN', 'IDEMPOTENCY_FAIL_OPEN'])('rejects invalid boolean value for %s', (key) => {
-    const env: Record<string, string> = { ...baseEnv, [key]: 'enabled' };
-    expect(() => validateEnv(env)).toThrow(`${key} must be exactly "true" or "false"`);
+  it('rejects invalid boolean value for IDEMPOTENCY_FAIL_OPEN', () => {
+    const env: Record<string, string> = { ...baseEnv, IDEMPOTENCY_FAIL_OPEN: 'enabled' };
+    expect(() => validateEnv(env)).toThrow('IDEMPOTENCY_FAIL_OPEN must be exactly "true" or "false"');
   });
+
+  // SEC-004: REDIS_AUTH_FAIL_OPEN dihapus dari codebase — nilai apapun
+  // (termasuk 'false') ditolak eksplisit agar .env lama tidak diam-diam diabaikan.
+  it.each(['true', 'false', 'enabled'])(
+    'SEC-004: rejects legacy REDIS_AUTH_FAIL_OPEN=%s in any environment',
+    (value) => {
+      const env: Record<string, string> = { ...baseEnv, REDIS_AUTH_FAIL_OPEN: value };
+      expect(() => validateEnv(env)).toThrow('REDIS_AUTH_FAIL_OPEN sudah dihapus');
+    },
+  );
 
   it('accepts explicit false fail-open flags in production', () => {
     const env: Record<string, string> = {
@@ -160,7 +170,6 @@ describe('validateEnv', () => {
       R2_PUBLIC_URL: 'https://cdn.kahade.id',
       OTP_PROVIDER: 'fonnte',
       FONNTE_API_TOKEN: 'test-fonnte-token',
-      REDIS_AUTH_FAIL_OPEN: 'false',
       IDEMPOTENCY_FAIL_OPEN: 'false',
     };
     expect(() => validateEnv(env)).not.toThrow();
@@ -178,7 +187,6 @@ describe('validateEnv', () => {
       MIDTRANS_ALLOWED_CIDRS: '0.0.0.0/0',
       OTP_PROVIDER: 'fonnte',
       FONNTE_API_TOKEN: 'test-fonnte-token',
-      REDIS_AUTH_FAIL_OPEN: 'false',
       IDEMPOTENCY_FAIL_OPEN: 'false',
     };
     expect(() => validateEnv(env)).toThrow('CORS_ORIGINS');

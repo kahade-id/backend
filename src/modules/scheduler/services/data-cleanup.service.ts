@@ -24,6 +24,7 @@ import {
   generateDeletionReferenceCode,
   computePurgeAt,
   ACTIVE_DELETION_STATUSES,
+  AccountDeletionService,
 } from '../../users/account-deletion.service';
 
 @Injectable()
@@ -38,6 +39,8 @@ export class DataCleanupService implements OnModuleInit {
     private redis: RedisService,
     private configService: ConfigService,
     @InjectQueue(EMAIL_QUEUE) private readonly emailQueue: Queue<EmailJobData>,
+    // SEC-001: dipakai untuk re-check eligibilitas DI DALAM transaksi purge.
+    private readonly accountDeletion: AccountDeletionService,
     // GAP-A (G058/G059): @Optional — SchedulerModule tidak mengimpor AuthModule.
     @Optional() private readonly otpGateway?: OtpGatewayService,
   ) {
@@ -317,7 +320,7 @@ export class DataCleanupService implements OnModuleInit {
         continue;
       }
       try {
-        const done = await this.prisma.$transaction(
+        const outcome = await this.prisma.$transaction(
           async (tx) => {
             // G056: baca status terbaru — pembatalan/ON_HOLD detik terakhir menang.
             const current = await tx.accountDeletionRequest.findUnique({ where: { id: req.id } });
@@ -325,7 +328,39 @@ export class DataCleanupService implements OnModuleInit {
               current &&
               ACTIVE_DELETION_STATUSES.includes(current.status) &&
               current.purgeAt <= new Date();
-            if (!purgeable) return false;
+            if (!purgeable) return 'skipped' as const;
+
+            // SEC-001: re-check eligibilitas (dispute/order aktif/withdrawal
+            // tertunda/saldo) DI DALAM transaksi yang sama — bukan snapshot
+            // basi. Bila tidak eligible, request di-ON_HOLD otomatis (bukan
+            // di-purge) supaya tidak ada dana/sengketa yang terhapus.
+            const { eligible, blockers } = await this.accountDeletion.getDeletionEligibility(req.userId, tx);
+            if (!eligible) {
+              const holdReason =
+                'Otomatis ditahan saat purge — blocker terdeteksi: ' +
+                blockers.map((b) => b.message).join(' | ');
+              await tx.accountDeletionRequest.update({
+                where: { id: req.id },
+                data: {
+                  status: DeletionRequestStatus.ON_HOLD,
+                  legalHoldReason: holdReason.slice(0, 1000),
+                },
+              });
+              // G062: riwayat append-only.
+              await tx.accountDeletionStatusHistory.create({
+                data: {
+                  requestId: req.id,
+                  fromStatus: current.status,
+                  toStatus: DeletionRequestStatus.ON_HOLD,
+                  actorType: 'SYSTEM',
+                  reason: holdReason.slice(0, 1000),
+                },
+              });
+              this.logger.warn(
+                `[deletion] purge ditahan (ON_HOLD) untuk ${req.id}: ${blockers.map((b) => b.code).join(',')}`,
+              );
+              return 'held' as const;
+            }
 
             const purgedAt = new Date();
             await tx.accountDeletionRequest.update({
@@ -364,11 +399,11 @@ export class DataCleanupService implements OnModuleInit {
                 banReason: null,
               },
             });
-            return true;
+            return 'purged' as const;
           },
           { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
         );
-        if (done) purged += 1;
+        if (outcome === 'purged') purged += 1;
       } catch (err) {
         this.logger.error(`[deletion] purge failed for ${req.id}: ${err instanceof Error ? err.message : String(err)}`);
       } finally {

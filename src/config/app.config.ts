@@ -102,7 +102,8 @@ export const appConfig = registerAs('app', () => ({
   accountLockDurationMinutes: parseInt(process.env.ACCOUNT_LOCK_DURATION_MINUTES || '30', 10),
   accountLockMaxCycles: parseInt(process.env.ACCOUNT_LOCK_MAX_CYCLES || '5', 10),
   maxSessionsPerUser: parseInt(process.env.MAX_SESSIONS_PER_USER || '5', 10),
-  redisAuthFailOpen: process.env.REDIS_AUTH_FAIL_OPEN === 'true',
+  // SEC-004: REDIS_AUTH_FAIL_OPEN dihapus — guard auth selalu fail-closed
+  // bila Redis tidak tersedia. Variabel legacy ditolak di env.validation.ts.
   subscriptionMonthlyPrice: parseInt(process.env.SUBSCRIPTION_MONTHLY_PRICE || '99000', 10),
   // Spek Kahade+: plan tahunan memakai enum YEARLY (dulu ANNUAL). Env var lama
   // SUBSCRIPTION_ANNUAL_PRICE sengaja TIDAK dibaca lagi agar harga lama

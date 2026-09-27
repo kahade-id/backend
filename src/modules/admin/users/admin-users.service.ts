@@ -27,6 +27,7 @@ import { UploadService } from '../../upload/upload.service';
 import { LocalStorageService } from '../../upload/local-storage.service';
 import { encryptAES } from '../../../common/utils/crypto.util';
 import { applyUserMask, PII_UNMASKED_ROLES } from '../../../common/maskPiiByRole';
+import { walletTxDirection } from '../../../common/utils/wallet-direction.util';
 import { UserExportQueryDto } from './dto/user-export-query.dto';
 import { ModerationEventsQueryDto, ModerationEventType } from './dto/moderation-events-query.dto';
 
@@ -57,7 +58,12 @@ export class AdminUsersService {
   }
 
 
-  async listUsers(page = 1, limit = 20, search?: string, status?: string, sortBy?: string, sortOrder?: 'asc' | 'desc'): Promise<object> {
+  /**
+   * ADM-008: `adminRole` dipakai untuk penyamaran PII — hanya SUPER_ADMIN
+   * melihat email/nomor HP penuh; role lain (mis. CUSTOMER_SUPPORT) mendapat
+   * versi ter-mask, sesuai kebijakan `PII_UNMASKED_ROLES`.
+   */
+  async listUsers(page = 1, limit = 20, search?: string, status?: string, sortBy?: string, sortOrder?: 'asc' | 'desc', adminRole?: string): Promise<object> {
     const safeLimit = Math.min(limit, 100);
     const skip = (page - 1) * safeLimit;
     const where = this.buildUserWhere(search, status);
@@ -87,13 +93,17 @@ export class AdminUsersService {
       this.prisma.user.count({ where }),
     ]);
 
-    const serialized = users.map((u) => ({
-      ...u,
-      wallet: u.wallet ? {
-        totalBalance: toIdr(u.wallet.totalBalance),
-        availableBalance: toIdr(u.wallet.availableBalance),
-      } : null,
-    }));
+    const serialized = users.map((u) => {
+      const masked = applyUserMask(adminRole, { email: u.email, phoneNumber: null });
+      return {
+        ...u,
+        email: masked.email,
+        wallet: u.wallet ? {
+          totalBalance: toIdr(u.wallet.totalBalance),
+          availableBalance: toIdr(u.wallet.availableBalance),
+        } : null,
+      };
+    });
     return createPaginatedResponse(serialized, total, page, safeLimit);
   }
 
@@ -132,7 +142,11 @@ export class AdminUsersService {
     return where;
   }
 
-  async getUserDetail(userId: string, adminId?: string, ipAddress?: string): Promise<object> {
+  /**
+   * ADM-008: `adminRole` dipakai untuk penyamaran PII — hanya SUPER_ADMIN
+   * melihat email/nomor HP penuh (kebijakan `PII_UNMASKED_ROLES`).
+   */
+  async getUserDetail(userId: string, adminId?: string, ipAddress?: string, adminRole?: string): Promise<object> {
     const user = await this.prisma.user.findFirst({
       where: { OR: [{ id: userId }, { userId }], deletedAt: null },
       select: {
@@ -188,9 +202,15 @@ export class AdminUsersService {
 
     const { _count, phoneNumber, ...userData } = user;
     const decryptedPhone = await decryptPiiSafe(phoneNumber);
+    // ADM-008: terapkan masking PII sesuai role peminta (SUPER_ADMIN unmasked).
+    const maskedPii = applyUserMask(adminRole, {
+      email: userData.email,
+      phoneNumber: decryptedPhone,
+    });
     return {
       ...userData,
-      phoneNumber: decryptedPhone,
+      email: maskedPii.email,
+      phoneNumber: maskedPii.phoneNumber,
       followersCount: _count.followers,
       followingCount: _count.following,
       blockedUsersCount: _count.blockedUsers,
@@ -563,11 +583,19 @@ export class AdminUsersService {
     return createPaginatedResponse(serializedOrders, total, page, safeLimit);
   }
 
-  async getUserWallet(userId: string, adminId?: string, ipAddress?: string): Promise<object> {
+  /**
+   * ADM-013: transaksi wallet dipaginasi (page/limit opsional; default 10,
+   * maks 100). Ringkasan saldo tetap dari satu baris wallet — tidak ada
+   * migrasi, hanya memecah query transaksi.
+   */
+  async getUserWallet(userId: string, adminId?: string, ipAddress?: string, page: number = 1, limit: number = 10): Promise<object> {
     const id = await this.resolveUserId(userId);
     if (adminId) {
-      this.auditLog.logAdminAction({ adminId, action: AuditAction.ADMIN_ACTION, targetType: 'Wallet', targetId: id, description: 'Viewed user wallet details', ipAddress: ipAddress || 'unknown' });
+      this.auditLog.logAdminAction({ adminId, action: AuditAction.ADMIN_ACTION, targetType: 'Wallet', targetId: id, description: `Viewed user wallet details (page=${page})`, ipAddress: ipAddress || 'unknown' });
     }
+    const safePage = Math.max(1, page || 1);
+    const safeLimit = Math.min(Math.max(1, limit || 10), 100);
+    const skip = (safePage - 1) * safeLimit;
 
     const wallet = await this.prisma.wallet.findUnique({
       where: { userId: id },
@@ -576,19 +604,25 @@ export class AdminUsersService {
         todayTopupAmount: true, todayWithdrawAmount: true,
         isLocked: true, lockedAt: true, lockReason: true, lockReasonCode: true,
         createdAt: true, updatedAt: true,
-        transactions: {
-          take: 10,
-          orderBy: { createdAt: 'desc' },
-          select: {
-            id: true, txId: true, type: true, status: true,
-            amount: true, balanceBefore: true, balanceAfter: true,
-            description: true, createdAt: true,
-          },
-        },
       },
     });
 
     if (!wallet) throw new NotFoundException({ code: ErrorCodes.WALLET_NOT_FOUND, message: 'User wallet not found' });
+
+    const [transactions, txTotal] = await Promise.all([
+      this.prisma.walletTransaction.findMany({
+        where: { walletId: wallet.id },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: safeLimit,
+        select: {
+          id: true, txId: true, type: true, status: true,
+          amount: true, balanceBefore: true, balanceAfter: true,
+          description: true, createdAt: true,
+        },
+      }),
+      this.prisma.walletTransaction.count({ where: { walletId: wallet.id } }),
+    ]);
 
     return {
       ...wallet,
@@ -597,12 +631,20 @@ export class AdminUsersService {
       totalBalance: toIdr(wallet.totalBalance),
       todayTopupAmount: toIdr(wallet.todayTopupAmount),
       todayWithdrawAmount: toIdr(wallet.todayWithdrawAmount),
-      transactions: wallet.transactions.map((tx) => ({
+      transactions: transactions.map((tx) => ({
         ...tx,
+        // ADM-007: arah mutasi diturunkan dari `type` (amount selalu positif).
+        direction: walletTxDirection(tx.type),
         amount: toIdr(tx.amount),
         balanceBefore: toIdr(tx.balanceBefore),
         balanceAfter: toIdr(tx.balanceAfter),
       })),
+      transactionsMeta: {
+        page: safePage,
+        limit: safeLimit,
+        total: txTotal,
+        totalPages: Math.max(1, Math.ceil(txTotal / safeLimit)),
+      },
     };
   }
 
@@ -949,6 +991,10 @@ export class AdminUsersService {
 
     const canSeeInternalNotes = AdminUsersService.INTERNAL_NOTES_ALLOWED_ROLES.includes(requesterRole);
     const eventFilter = query.event;
+    // ADM-005: filter sumber event yang dikirim UI (sebelumnya diabaikan).
+    const kindFilter = query.kind;
+    const kindOk = (source: 'system' | 'admin'): boolean =>
+      !kindFilter || source === kindFilter;
     const actorFilter = query.actor;
     const from = query.from ? new Date(query.from) : undefined;
     const to = query.to ? new Date(query.to) : undefined;
@@ -1101,11 +1147,13 @@ export class AdminUsersService {
     }
 
     events.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-    const limited = events.slice(0, AdminUsersService.MODERATION_TIMELINE_LIMIT);
+    // ADM-005: filter sumber event (system/admin) — diterapkan setelah merge.
+    const kindFiltered = kindFilter ? events.filter((e) => kindOk(e.source)) : events;
+    const limited = kindFiltered.slice(0, AdminUsersService.MODERATION_TIMELINE_LIMIT);
     return {
       data: limited,
-      total: events.length,
-      hasMore: events.length > limited.length,
+      total: kindFiltered.length,
+      hasMore: kindFiltered.length > limited.length,
     };
   }
 

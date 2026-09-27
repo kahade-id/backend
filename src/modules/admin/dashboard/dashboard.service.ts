@@ -103,7 +103,10 @@ export class DashboardService {
   }
 
   private getDateRange(query: ChartQueryDto): { period: string; startDate: Date; endDate?: Date } {
-    const period = query.period ?? '30d';
+    // ADM-025: rentang kustom tanpa `period` eksplisit dilaporkan sebagai
+    // 'custom' (sebelumnya respons menyesatkan mengembalikan '30d').
+    const hasCustomRange = Boolean(query.startDate || query.endDate);
+    const period = query.period ?? (hasCustomRange ? 'custom' : '30d');
     const startDate = query.startDate
       ? parseDateBoundaryWIB(query.startDate, 'start')
       : this.getPeriodStartDate(period);

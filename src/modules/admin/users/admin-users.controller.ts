@@ -35,8 +35,11 @@ export class AdminUsersController {
   @Get()
   @ApiOperation({ summary: 'List users', description: 'Paginated list of all users with optional search and status filter.' })
   @ApiResponse({ status: 200, description: 'User list returned.' })
-  listUsers(@Query() query: UserListQueryDto): Promise<object> {
-    return this.service.listUsers(query.page!, query.limit!, query.search, query.status, query.sortBy, query.sortOrder);
+  listUsers(
+    @Query() query: UserListQueryDto,
+    @CurrentAdmin() admin: AdminJwtPayload,
+  ): Promise<object> {
+    return this.service.listUsers(query.page!, query.limit!, query.search, query.status, query.sortBy, query.sortOrder, admin.role);
   }
 
   @Get(':userId')
@@ -48,7 +51,7 @@ export class AdminUsersController {
     @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<object> {
-    return this.service.getUserDetail(userId, admin.sub, req.ip || 'unknown');
+    return this.service.getUserDetail(userId, admin.sub, req.ip || 'unknown', admin.role);
   }
 
   @Get(':userId/orders')
@@ -65,15 +68,16 @@ export class AdminUsersController {
   }
 
   @Get(':userId/wallet')
-  @ApiOperation({ summary: 'Get user wallet', description: 'Returns wallet details and recent transactions for a specific user.' })
+  @ApiOperation({ summary: 'Get user wallet', description: 'Returns wallet details with paginated transactions (page/limit; default 10, max 100).' })
   @ApiResponse({ status: 200, description: 'User wallet returned.' })
   @ApiResponse({ status: 404, description: 'User not found.' })
   getUserWallet(
     @Param('userId', ParseIdPipe) userId: string,
+    @Query() pagination: PaginationDto,
     @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<object> {
-    return this.service.getUserWallet(userId, admin.sub, req.ip || 'unknown');
+    return this.service.getUserWallet(userId, admin.sub, req.ip || 'unknown', pagination.page ?? 1, pagination.limit ?? 10);
   }
 
   @Get(':userId/sessions')

@@ -244,8 +244,11 @@ export class AdminManagementController {
   @UseGuards(UserThrottleGuard)
   @Idempotency()
   @ApiOperation({
-    summary: 'Ubah role admin (alasan wajib)',
-    description: 'Audit ADMIN_ROLE_CHANGED dengan before/after. Token lama dicabut.',
+    summary: 'Ubah role admin (alasan wajib) — DEPRECATED',
+    // ADM-022: duplikasi `PATCH :id/role` di bawah; PUT dipertahankan hanya
+    // untuk kompatibilitas dan ditandai deprecated di Swagger.
+    description: 'DEPRECATED: gunakan PATCH /v1/admin/management/:id/role (kontrak admin web). Audit ADMIN_ROLE_CHANGED dengan before/after. Token lama dicabut.',
+    deprecated: true,
   })
   @ApiResponse({ status: 200, description: 'Role changed.' })
   @ApiResponse({ status: 400, description: 'Role unchanged.' })

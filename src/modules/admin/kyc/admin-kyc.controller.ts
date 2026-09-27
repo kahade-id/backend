@@ -74,6 +74,17 @@ export class AdminKycController {
     return this.service.getAttention();
   }
 
+  @Get('reviewers')
+  @AdminRoles('SUPER_ADMIN', 'KYC_ADMIN')
+  @ApiOperation({
+    summary: 'Daftar reviewer KYC (ADM-004)',
+    description: 'Daftar admin KYC_ADMIN/SUPER_ADMIN aktif yang bisa ditugaskan sebagai reviewer. Hanya id + nama + role (tanpa email/PII). Boleh dibaca KYC_ADMIN.',
+  })
+  @ApiResponse({ status: 200, description: 'Reviewer list returned.' })
+  listReviewers(): Promise<object> {
+    return this.service.listReviewers();
+  }
+
   @Post('bulk/approve')
   @UseGuards(UserThrottleGuard)
   @AdminRoles('SUPER_ADMIN', 'KYC_ADMIN')

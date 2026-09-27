@@ -129,6 +129,80 @@ export class AdminKycService {
     if (query.assigned === 'unassigned') where.assignedReviewerId = null;
     else if (query.assigned) where.assignedReviewerId = query.assigned;
 
+    // ADM-015: pencarian teks — kycId atau identitas pemohon.
+    if (query.search?.trim()) {
+      const s = query.search.trim();
+      where.OR = [
+        { kycId: { contains: s, mode: 'insensitive' } },
+        {
+          user: {
+            OR: [
+              { email: { contains: s, mode: 'insensitive' } },
+              { fullName: { contains: s, mode: 'insensitive' } },
+              { userId: { contains: s, mode: 'insensitive' } },
+              { username: { contains: s, mode: 'insensitive' } },
+            ],
+          },
+        },
+      ];
+    }
+
+    // ADM-006: filter status SLA di sisi server — EKSAK, bukan aproksimasi.
+    // Aproksimasi umur via SQL dapat bertentangan dengan slaStatus() saat
+    // mode business-hours / jeda terakumulasi berlaku (baris bisa cocok
+    // filter padahal status tampilnya beda, atau sebaliknya). Maka saat
+    // `slaStatus` diminta: ambil kandidat dengan filter dasar, hitung status
+    // EKSAK via buildSlaView, filter di memori, total dari hasil filter,
+    // lalu paginasi. Konvensi disjoint (sama seperti tampilan baris):
+    //   PAUSED    <=> sla.paused === true
+    //   OK/MENDEKATI/BREACHED <=> sla.paused === false && sla.status === nilai
+    if (query.slaStatus) {
+      const slaWanted = query.slaStatus;
+      const selectFields = {
+        id: true,
+        kycId: true,
+        userId: true,
+        status: true,
+        rejectionReason: true,
+        attemptNumber: true,
+        createdAt: true,
+        reviewedAt: true,
+        reviewedBy: true,
+        slaStartedAt: true,
+        slaPausedAt: true,
+        slaPausedAccumMs: true,
+        slaBreachedAt: true,
+        assignedReviewerId: true,
+        user: { select: { userId: true, email: true, fullName: true } },
+        reviewer: { select: { adminId: true, fullName: true } },
+      } as const;
+      const candidates = await this.prisma.kycRequest.findMany({
+        where,
+        orderBy: { createdAt: 'asc' },
+        select: selectFields,
+      });
+      const slaConfig = await getEffectiveSlaConfig(this.prisma, 'KYC_PERSONAL');
+      const slaNow = new Date();
+      const matched = candidates.filter((r) => {
+        const view = this.buildSlaView(r, slaNow, slaConfig);
+        if (slaWanted === 'PAUSED') return view.paused === true;
+        if (view.paused === true) return false;
+        return view.status === slaWanted;
+      });
+      const total = matched.length;
+      const pageRows = matched.slice(skip, skip + safeLimit);
+      const reviewerIds = [...new Set(pageRows.map(r => r.assignedReviewerId).filter((v): v is string => !!v))];
+      const reviewerMap = await this.getAdminNameMap(reviewerIds);
+      const rows = pageRows.map(r => ({
+        ...r,
+        sla: this.buildSlaView(r, slaNow, slaConfig),
+        assignedReviewer: r.assignedReviewerId
+          ? (reviewerMap.get(r.assignedReviewerId) ?? { adminId: r.assignedReviewerId, fullName: null })
+          : null,
+      }));
+      return createPaginatedResponse(rows, total, safePage, safeLimit);
+    }
+
     const [requests, total] = await Promise.all([
       this.prisma.kycRequest.findMany({
         where,
@@ -1004,6 +1078,24 @@ export class AdminKycService {
         message: 'KYC request not found',
       });
     return request;
+  }
+
+  /**
+   * ADM-004: daftar reviewer yang dapat ditugaskan (KYC_ADMIN / SUPER_ADMIN
+   * aktif) — hanya id + nama + role, TANPA email/PII berlebih.
+   * Boleh dibaca KYC_ADMIN (role utama modul ini) maupun SUPER_ADMIN.
+   */
+  async listReviewers(): Promise<object> {
+    const reviewers = await this.prisma.adminUser.findMany({
+      where: {
+        isActive: true,
+        deletedAt: null,
+        role: { in: ['KYC_ADMIN', 'SUPER_ADMIN'] },
+      },
+      orderBy: { fullName: 'asc' },
+      select: { id: true, adminId: true, fullName: true, role: true },
+    });
+    return { data: reviewers, total: reviewers.length };
   }
 
   /**

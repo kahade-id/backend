@@ -17,8 +17,18 @@ export type ModerationEventType = (typeof MODERATION_EVENT_TYPES)[number];
 /**
  * GAP-E — query timeline moderasi pengguna.
  * Filter: jenis event, aktor (id admin), rentang waktu.
+ * ADM-005: `kind` memfilter sumber event (`system` = otomatis, `admin`).
  */
 export class ModerationEventsQueryDto {
+  @ApiPropertyOptional({
+    description: 'Filter sumber event: system (sinyal otomatis) atau admin.',
+    enum: ['system', 'admin'],
+  })
+  @IsOptional()
+  @IsString()
+  @IsIn(['system', 'admin'])
+  kind?: 'system' | 'admin';
+
   @ApiPropertyOptional({ description: 'Filter jenis event.', enum: MODERATION_EVENT_TYPES })
   @IsOptional()
   @IsString()

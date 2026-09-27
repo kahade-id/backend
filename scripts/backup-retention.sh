@@ -23,12 +23,17 @@ case "$latest_db" in
   *.sql.gz) gzip -t -- "$latest_db" ;;
   *.dump) pg_restore --list -- "$latest_db" >/dev/null ;;
   *.dump.gpg)
-    # SEC-306: backup terenkripsi — validasi dengan dekripsi ke pipe (tanpa
-    # menulis plaintext ke disk). Butuh KAHADE_BACKUP_PASSPHRASE_FILE.
+    # SEC-306: backup terenkripsi — validasi dengan dekripsi ke temp file 600
+    # lalu shred (pg_restore 18 butuh file seekable, tidak bisa baca dari pipe).
+    # Butuh KAHADE_BACKUP_PASSPHRASE_FILE.
     if [ -n "${KAHADE_BACKUP_PASSPHRASE_FILE:-}" ] && [ -f "$KAHADE_BACKUP_PASSPHRASE_FILE" ]; then
+      tmp_verify="$(mktemp /tmp/kahade-retention-verify-XXXXXX.dump)"
+      chmod 600 "$tmp_verify"
       gpg --batch --quiet --pinentry-mode loopback \
         --passphrase-file "$KAHADE_BACKUP_PASSPHRASE_FILE" \
-        --decrypt -- "$latest_db" 2>/dev/null | pg_restore --list - >/dev/null
+        --decrypt -- "$latest_db" 2>/dev/null > "$tmp_verify"
+      pg_restore --list -- "$tmp_verify" >/dev/null
+      shred -u "$tmp_verify"
     else
       echo 'WARNING: passphrase file tidak tersedia — lewati validasi integritas backup terenkripsi.' >&2
     fi

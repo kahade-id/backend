@@ -68,11 +68,16 @@ pg_dump -h "$PGHOST" -U "$PGUSER" -d "$PGDATABASE" \
 
 chmod 600 "$BACKUP_FILE"
 
-# Verifikasi cepat: header GPG valid & bisa didekripsi (tanpa menulis plaintext ke disk).
+# Verifikasi cepat: header GPG valid & bisa didekripsi.
+# Catatan: pg_restore 18 butuh file seekable (tidak bisa baca dari pipe stdin),
+# jadi dekripsi ke temp file 600 lalu shred setelah verifikasi.
+tmp_verify="$(mktemp /tmp/kahade-backup-verify-XXXXXX.dump)"
+chmod 600 "$tmp_verify"
 gpg --batch --quiet --pinentry-mode loopback \
   "${GPG_PASSPHRASE_ARGS[@]}" \
-  --decrypt "$BACKUP_FILE" 2>/dev/null \
-  | pg_restore --list - >/dev/null
+  --decrypt "$BACKUP_FILE" 2>/dev/null > "$tmp_verify"
+pg_restore --list "$tmp_verify" >/dev/null
+shred -u "$tmp_verify"
 
 # Retensi: serahkan ke backup-retention.sh bila ada, fallback pola lama.
 if [ -x "$(dirname "$0")/backup-retention.sh" ]; then

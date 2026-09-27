@@ -2,7 +2,7 @@ import { Controller, Get, Header } from '@nestjs/common';
 import { ApiTags, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { Public } from '../../common/decorators/public.decorator';
-import { PublicService } from './public.service';
+import { PublicService, PublicStats } from './public.service';
 
 @ApiTags('public')
 @Controller('public')
@@ -61,5 +61,14 @@ export class PublicController {
   @ApiOperation({ summary: 'Get minimum and latest app version for force-update' })
   getAppVersion(): Record<string, unknown> {
     return this.publicService.getAppVersion();
+  }
+
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @Get('stats')
+  @Header('Cache-Control', 'public, max-age=600, s-maxage=600')
+  @ApiOperation({ summary: 'Public aggregate platform statistics (Redis-cached 10 min, no PII)' })
+  async getPublicStats(): Promise<PublicStats> {
+    return this.publicService.getPublicStats();
   }
 }

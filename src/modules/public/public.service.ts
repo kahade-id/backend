@@ -6,6 +6,21 @@ import { SUBSCRIPTION_PLANS_CACHE } from '../../common/constants/redis-keys';
 
 const SUBSCRIPTION_PLANS_TTL = 300;
 
+/**
+ * Agregat statistik publik untuk landing page. Read-only dan tanpa PII:
+ * hanya COUNT / AVG. Tidak ada data individual user yang diekspos.
+ */
+export interface PublicStats {
+  /** Order escrow berstatus COMPLETED (dana sudah cair ke penjual). */
+  transactionsCount: number;
+  /** User aktif dan tidak di-ban. */
+  usersCount: number;
+  /** Kota unik (case-insensitive) dari kota asal/tujuan pengiriman. */
+  citiesCount: number;
+  /** Rata-rata bintang ulasan yang tampil, 1 desimal; null bila belum ada. */
+  ratingAvg: number | null;
+}
+
 function finiteNumber(value: unknown, fallback: number, minimum?: number): number {
   const parsed = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(parsed) && (minimum === undefined || parsed >= minimum) ? parsed : fallback;
@@ -25,6 +40,77 @@ export class PublicService {
   // dramatically reduces DB load from unauthenticated traffic.
   private readonly PUBLIC_CONFIGS_CACHE_KEY = 'public:system:configs';
   private readonly PUBLIC_CONFIGS_TTL_SECONDS = 300; // 5 minutes
+  private readonly PUBLIC_STATS_CACHE_KEY = 'public:stats:aggregate';
+  private readonly PUBLIC_STATS_TTL_SECONDS = 600; // 10 minutes
+
+  /**
+   * Agregat statistik publik. Di-cache 10 menit di Redis agar landing page
+   * tidak menghantam DB tiap load. Redis yang gagal = fall through ke DB;
+   * tulis cache yang gagal tidak menggagalkan response.
+   */
+  async getPublicStats(): Promise<PublicStats> {
+    let cached: string | null = null;
+    try {
+      cached = await this.redis.get(this.PUBLIC_STATS_CACHE_KEY);
+    } catch {
+      // Redis hanya optimisasi untuk path baca publik ini; lanjut ke DB.
+    }
+    if (cached) {
+      try {
+        return JSON.parse(cached) as PublicStats;
+      } catch {
+        // Cache korup — hitung ulang dari DB.
+      }
+    }
+
+    const [transactionsCount, usersCount, ratingAgg, originCities, destCities] =
+      await Promise.all([
+        this.prisma.order.count({ where: { status: 'COMPLETED' } }),
+        this.prisma.user.count({ where: { isActive: true, isBanned: false } }),
+        this.prisma.rating.aggregate({
+          _avg: { stars: true },
+          where: { isHidden: false },
+        }),
+        this.prisma.shipment.groupBy({
+          by: ['originCity'],
+          where: { originCity: { not: null } },
+        }),
+        this.prisma.shipment.groupBy({
+          by: ['destCity'],
+          where: { destCity: { not: null } },
+        }),
+      ]);
+
+    // Gabung kota asal + tujuan, case-insensitive, abaikan string kosong.
+    const cities = new Set<string>();
+    for (const row of originCities) {
+      const city = row.originCity?.trim().toLowerCase();
+      if (city) cities.add(city);
+    }
+    for (const row of destCities) {
+      const city = row.destCity?.trim().toLowerCase();
+      if (city) cities.add(city);
+    }
+
+    const avgStars = ratingAgg._avg.stars;
+    const result: PublicStats = {
+      transactionsCount,
+      usersCount,
+      citiesCount: cities.size,
+      ratingAvg: avgStars == null ? null : Math.round(avgStars * 10) / 10,
+    };
+
+    try {
+      await this.redis.setex(
+        this.PUBLIC_STATS_CACHE_KEY,
+        this.PUBLIC_STATS_TTL_SECONDS,
+        JSON.stringify(result),
+      );
+    } catch {
+      // Kegagalan tulis cache tidak boleh mengubah response publik yang sukses.
+    }
+    return result;
+  }
 
   async getPublicConfigs(): Promise<{ configs: Array<{ key: string; value: string; description: string | null; dataType: string; updatedAt: Date }> }> {
     let cached: string | null = null;

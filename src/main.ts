@@ -26,6 +26,8 @@ import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
 import { CorsIoAdapter } from './common/adapters/ws.adapter';
 import { PrismaService } from './prisma/prisma.service';
 import { RedisService } from './redis/redis.service';
+import { OpsSettingsService } from './modules/ops-settings/ops-settings.service';
+import { MaintenanceMiddleware } from './modules/ops-settings/maintenance.middleware';
 import { withTimeout } from './common/utils/background-reliability.util';
 
 const PLACEHOLDER_PATTERNS = ['change_me', 'EXAMPLE', '0123456789abcdef'];
@@ -222,6 +224,21 @@ async function bootstrap(): Promise<void> {
   });
   app.use(compression({ threshold: 5120 }));
   app.use(cookieParser());
+
+  // Item 9 (batch 2026-09-28): mode maintenance global — 503 + Retry-After
+  // untuk semua request non-admin bila MAINTENANCE_MODE=true di app_settings.
+  // OpsSettingsModule @Global() sehingga service bisa diambil dari app.
+  // Catatan smoke: di mode read-only-smoke, OpsSettingsCoreModule tetap
+  // terdaftar (lihat komentar modulnya), jadi get() aman dipanggil.
+  try {
+    const opsSettings = app.get(OpsSettingsService, { strict: false });
+    const maintenance = new MaintenanceMiddleware(opsSettings);
+    app.use((req: ExpressRequest, res: ExpressResponse, next: NextFunction) =>
+      maintenance.use(req, res, next),
+    );
+  } catch (err) {
+    logger.warn(`MaintenanceMiddleware tidak terpasang: ${err instanceof Error ? err.message : err}`);
+  }
 
   // CORS configuration
   // has spaces after commas (e.g. "https://kahade.id, https://app.kahade.id").

@@ -39,6 +39,7 @@ import {
   FeedbackGuestContactRedactionService,
   MilestoneReminderService,
   ModerationSlaService,
+  NotificationDigestService,
 } from './services';
 import { AdminFinanceModule } from '../admin/finance/admin-finance.module';
 import { WithdrawalsModule } from '../withdrawals/withdrawals.module';
@@ -110,6 +111,7 @@ import { UsersModule } from '../users/users.module';
     FeedbackGuestContactRedactionService,
     MilestoneReminderService, // GAP-C (G182)
     ModerationSlaService, // GAP-F (G419/G423): terdaftar sebagai provider agar cron SLA moderasi berjalan
+    NotificationDigestService, // Item 8 (batch 2026-09-28): cron digest notifikasi
     KycSlaMonitorService,
     CampaignService,
     WalletTxSerialService,

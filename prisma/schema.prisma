@@ -317,6 +317,9 @@ enum NotificationType {
   MODERATION_REPORT_UPDATE
   MODERATION_ITEM_TAKEDOWN
   MODERATION_APPEAL_DECIDED
+  // Item 8 (batch 2026-09-28): ringkasan digest notifikasi (follower baru,
+  // like etalase, update order). Append-only di akhir enum.
+  DIGEST_SUMMARY
 }
 
 enum SubscriptionPlan {
@@ -1196,6 +1199,12 @@ model NotificationPreference {
   // mempertahankan perilaku lama). Diisi klien dari device timezone.
   quietHoursTimezone String? @default("Asia/Jakarta")
   language           String  @default("id")
+
+  // Item 8 (batch 2026-09-28): frekuensi ringkasan notifikasi digest.
+  // 'off' = mati (default, perilaku lama), 'daily' = harian, 'weekly' = mingguan.
+  digestFrequency String @default("off")
+  // Kapan digest terakhir dikirim (dipakai cron untuk hitung jatuh tempo).
+  lastDigestSentAt DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

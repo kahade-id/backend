@@ -1,11 +1,11 @@
-import { Injectable, NotFoundException, ForbiddenException, BadRequestException, Logger, Optional } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { UploadService } from '../upload/upload.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { SendMessageDto, UserChatMessageType } from './dto/send-message.dto';
 import type { CreateInquiryDto } from './dto/create-inquiry.dto';
-import { ChatMessageType, ChatModerationAction, ChatModerationKind, ChatModerationSeverity, NotificationType, Prisma } from '@prisma/client';
+import { ChatMessageType, ChatModerationAction, ChatModerationKind, ChatModerationSeverity, NotificationType, OrderStatus, Prisma } from '@prisma/client';
 import { generateNotifId } from '../../common/utils/id-generator.util';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import * as path from 'path';
@@ -568,6 +568,48 @@ export class ChatService {
       data: { isMuted: muted, mutedUntil },
     });
     return { roomId, isMuted: muted, mutedUntil };
+  }
+
+  // ============================================================
+  // Item 7 (batch 2026-09-28) — Hapus room 1-by-1, TANPA bulk.
+  //
+  // Semantik hapus:
+  // - Room DM/INQUIRY tanpa transaksi (orderId NULL): HARD DELETE permanen
+  //   untuk kedua anggota — pesan & keanggotaan ikut terhapus (cascade).
+  //   Order yang pernah lahir dari inquiry ini TIDAK ikut terhapus
+  //   (FK SetNull), hanya konteks nego yang hilang.
+  // - Room ORDER (terikat transaksi): hanya boleh dihapus bila order sudah
+  //   terminal COMPLETED, dan itu pun SOFT DELETE (deletedAt) — riwayat
+  //   percakapan dipertahankan sebagai jejak audit transaksi keuangan.
+  //   Order berstatus selain COMPLETED (termasuk CANCELLED/DISPUTED) → 409
+  //   CHAT_ROOM_DELETE_ORDER_NOT_COMPLETED (fail closed).
+  //
+  // Auth: hanya anggota room (validateRoomAccess → 404 bila room tidak ada /
+  // sudah dihapus, 403 bila bukan anggota).
+  // ============================================================
+  async deleteRoom(userId: string, roomId: string): Promise<{ deleted: boolean; roomId: string; permanent: boolean }> {
+    const room = await this.validateRoomAccess(userId, roomId);
+
+    if (room.order) {
+      // Aturan keras: room transaksi hanya boleh dihapus bila order terminal COMPLETED.
+      if (room.order.status !== OrderStatus.COMPLETED) {
+        throw new ConflictException({
+          code: ErrorCodes.CHAT_ROOM_DELETE_ORDER_NOT_COMPLETED,
+          message: 'Room transaksi hanya dapat dihapus setelah order berstatus COMPLETED',
+        });
+      }
+      await this.prisma.chatRoom.update({
+        where: { id: roomId },
+        data: { deletedAt: new Date(), status: 'CLOSED' },
+      });
+      this.logger.log(`Chat room ${roomId} (order ${room.order.orderId}) soft-deleted oleh anggota ${userId}`);
+      return { deleted: true, roomId, permanent: false };
+    }
+
+    // DM/INQUIRY tanpa transaksi: hapus permanen (cascade ke pesan & member).
+    await this.prisma.chatRoom.delete({ where: { id: roomId } });
+    this.logger.log(`Chat room ${roomId} (tanpa transaksi) dihapus permanen oleh anggota ${userId}`);
+    return { deleted: true, roomId, permanent: true };
   }
 
   private roleFor(room: RoomContext, userId: string): 'BUYER' | 'SELLER' | 'INITIATOR' | 'COUNTERPART' {

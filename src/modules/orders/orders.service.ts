@@ -954,6 +954,14 @@ export class OrdersService {
         voucherDiscount: toIdr(order.voucherDiscount), isKahadePlus: order.isKahadePlus,
         feeRate: order.feeRate, deliveryDeadlineDays: order.deliveryDeadlineDays,
         deliveryDeadlineAt: order.deliveryDeadlineAt,
+        // Item 10 (batch 2026-09-28): alias untuk frontend. Policy tenggat kirim
+        // SUDAH ada di kode: deliveryDeadlineAt diset saat paidAt
+        // (= paidAt + deliveryDeadlineDays, 1-14 hari, CHECK constraint di DB).
+        // shippingDeadline = tenggat seller kirim; shippedBy = kapan seller
+        // benar-benar kirim (shippedAt). Keduanya nullable apa adanya —
+        // TIDAK ada policy baru yang diciptakan di sini.
+        shippingDeadline: order.deliveryDeadlineAt ?? null,
+        shippedBy: order.shippedAt ?? null,
         // T3 (audit 2026-09-26): kapan order IN_DELIVERY akan auto-complete oleh cron —
         // sama dengan deliveryDeadlineAt selama status IN_DELIVERY, null selain itu.
         // Field baca saja; tidak mengubah cron/state machine.

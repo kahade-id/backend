@@ -32,3 +32,4 @@ export { KycSlaMonitorService } from './kyc-sla-monitor.service';
 export { FeedbackGuestContactRedactionService } from './feedback-guest-contact-redaction.service';
 export { MilestoneReminderService } from './milestone-reminder.service';
 export { ModerationSlaService } from './moderation-sla.service';
+export { NotificationDigestService } from './notification-digest.service';

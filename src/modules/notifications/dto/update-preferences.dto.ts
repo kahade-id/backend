@@ -123,4 +123,12 @@ export class UpdatePreferencesDto {
   @IsOptional()
   @IsIn(['id', 'en'])
   language?: string;
+
+  @ApiPropertyOptional({
+    description: 'Ringkasan notifikasi digest: off (mati, default), daily (harian), weekly (mingguan). Item 8 batch 2026-09-28.',
+    enum: ['off', 'daily', 'weekly'],
+  })
+  @IsOptional()
+  @IsIn(['off', 'daily', 'weekly'])
+  digestFrequency?: 'off' | 'daily' | 'weekly';
 }

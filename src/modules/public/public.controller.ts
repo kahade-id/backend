@@ -71,4 +71,18 @@ export class PublicController {
   async getPublicStats(): Promise<PublicStats> {
     return this.publicService.getPublicStats();
   }
+
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Get('maintenance')
+  @Header('Cache-Control', 'no-store')
+  @ApiOperation({
+    summary: 'Cek status mode maintenance (splash check, tanpa auth)',
+    description:
+      'Item 9 batch 2026-09-28. Selalu bisa diakses — dikecualikan dari ' +
+      'MaintenanceMiddleware. Response: { enabled, message }.',
+  })
+  getMaintenanceStatus(): { enabled: boolean; message: string | null } {
+    return this.publicService.getMaintenanceStatus();
+  }
 }

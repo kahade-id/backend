@@ -316,6 +316,24 @@ export class ChatController {
     return this.chatService.setRoomMuted(userId, roomId, dto.muted !== false, dto.durationHours);
   }
 
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Delete('rooms/:roomId')
+  @ApiOperation({
+    summary: 'Delete a chat room (one by one, no bulk)',
+    description:
+      'Hapus 1-by-1, TANPA bulk. Hanya anggota room. ' +
+      'DM/INQUIRY tanpa transaksi: dihapus PERMANEN (hard delete — pesan & keanggotaan ikut terhapus). ' +
+      'Room ORDER (terikat transaksi): HANYA bila order sudah terminal COMPLETED, dan itu pun soft-delete ' +
+      '(riwayat percakapan dipertahankan untuk audit). Order belum COMPLETED → 409 CHAT_ROOM_DELETE_ORDER_NOT_COMPLETED.',
+  })
+  async deleteRoom(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+  ): Promise<object> {
+    return this.chatService.deleteRoom(userId, roomId);
+  }
+
   @Get('rooms/:roomId/presence')
   @ApiOperation({
     summary: 'Online / last-seen status of the counterpart',

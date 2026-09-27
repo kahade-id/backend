@@ -56,6 +56,25 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
     isSecret: false,
     testable: false,
   },
+  {
+    key: 'MAINTENANCE_MODE',
+    label: 'Mode Maintenance',
+    description:
+      'Bila "true", semua request non-admin dijawab 503 + header Retry-After ' +
+      '(admin panel tetap bisa diakses). Default: off (kosong/"false"). ' +
+      'Diubah via PUT /v1/admin/maintenance (toggle + pesan) atau panel ini.',
+    isSecret: false,
+    testable: false,
+  },
+  {
+    key: 'MAINTENANCE_MESSAGE',
+    label: 'Pesan Maintenance',
+    description:
+      'Pesan yang ditampilkan ke user saat mode maintenance aktif ' +
+      '(maks 500 karakter). Kosong = pesan default Bahasa Indonesia.',
+    isSecret: false,
+    testable: false,
+  },
 ];
 
 export const MANAGEABLE_SETTING_MAP: Map<string, ManageableSettingDef> = new Map(

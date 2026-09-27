@@ -1,5 +1,6 @@
 import { Global, Module } from '@nestjs/common';
 import { AdminOpsSettingsController } from './admin-ops-settings.controller';
+import { AdminMaintenanceController } from './admin-maintenance.controller';
 import { OpsSettingsCoreModule } from './ops-settings-core.module';
 
 /**
@@ -17,6 +18,6 @@ import { OpsSettingsCoreModule } from './ops-settings-core.module';
 @Global()
 @Module({
   imports: [OpsSettingsCoreModule],
-  controllers: [AdminOpsSettingsController],
+  controllers: [AdminOpsSettingsController, AdminMaintenanceController],
 })
 export class OpsSettingsModule {}

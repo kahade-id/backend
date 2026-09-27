@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
+import { OpsSettingsService } from '../ops-settings/ops-settings.service';
 import { SUBSCRIPTION_PLANS_CACHE } from '../../common/constants/redis-keys';
 
 const SUBSCRIPTION_PLANS_TTL = 300;
@@ -32,6 +33,7 @@ export class PublicService {
     private prisma: PrismaService,
     private redis: RedisService,
     private configService: ConfigService,
+    private opsSettings: OpsSettingsService,
   ) {}
 
   // Cache public configs in Redis (TTL 5min) to avoid per-request DB queries.
@@ -336,5 +338,17 @@ export class PublicService {
       // Cache write failure is non-fatal for the public plans response.
     }
     return result;
+  }
+
+  /**
+   * Item 9 (batch 2026-09-28) — Status maintenance untuk splash check.
+   * TANPA auth. Dibaca dari app_settings via OpsSettingsService (cache 60 dtk).
+   * Selalu bisa diakses — dikecualikan dari MaintenanceMiddleware.
+   */
+  getMaintenanceStatus(): { enabled: boolean; message: string | null } {
+    return {
+      enabled: this.opsSettings.get('MAINTENANCE_MODE')?.trim().toLowerCase() === 'true',
+      message: this.opsSettings.get('MAINTENANCE_MESSAGE')?.trim() || null,
+    };
   }
 }

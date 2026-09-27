@@ -21,6 +21,7 @@
 import { Module } from '@nestjs/common';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { QueueModule } from '../queue/queue.module';
+import { OpsSettingsCoreModule } from '../ops-settings/ops-settings-core.module';
 import { ObservabilityController } from './observability.controller';
 import { IncidentsController } from './incidents.controller';
 import { StatusController } from './status.controller';
@@ -34,7 +35,13 @@ import { DeliveryMetricsService } from './delivery-metrics.service';
 import { WsMetricsService } from './ws-metrics.service';
 
 @Module({
-  imports: [QueueModule],
+  // OpsSettingsCoreModule: DependenciesService & DeliveryMetricsService
+  // inject OpsSettingsService. Dipakai versi core (tanpa controller) agar
+  // graph smoke (ReadOnlySmokeModule → HealthModule → ObservabilityModule)
+  // tidak ikut menyeret AdminOpsSettingsController + guard JWT-nya.
+  // OpsSettingsModule (induk, @Global) tetap mengimpor core, jadi di
+  // produksi tidak ada perubahan perilaku — service tetap singleton.
+  imports: [QueueModule, OpsSettingsCoreModule],
   controllers: [ObservabilityController, IncidentsController, StatusController],
   providers: [
     MetricsService,

@@ -5,6 +5,7 @@ import { validateEnv } from '../config/env.validation';
 import { PrismaModule } from '../prisma/prisma.module';
 import { RedisModule } from '../redis/redis.module';
 import { HealthModule } from '../modules/health/health.module';
+import { SmokeInfraModule } from './smoke-infra.module';
 import { getSmokeEnvFile } from './bootstrap-mode';
 
 const smokeEnvFile = getSmokeEnvFile();
@@ -15,6 +16,8 @@ const smokeEnvFile = getSmokeEnvFile();
  * Do not add feature modules here. In particular, queue, scheduler, payment,
  * notification, websocket, and transaction modules can enqueue work or mutate
  * production state merely by booting with shared infrastructure credentials.
+ * SmokeInfraModule adalah pengecualian yang disengaja: hanya JwtModule
+ * (tanpa koneksi/kerja terjadwal/mutasi) agar guard admin ter-resolve.
  */
 @Module({
   imports: [
@@ -26,6 +29,7 @@ const smokeEnvFile = getSmokeEnvFile();
     }),
     PrismaModule,
     RedisModule,
+    SmokeInfraModule,
     HealthModule,
   ],
 })

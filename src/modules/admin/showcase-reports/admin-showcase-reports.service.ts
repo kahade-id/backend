@@ -4,12 +4,13 @@ import {
   NotFoundException,
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
-import { AuditAction, Prisma, ReportStatus, NotificationType, UserAuditAction } from '@prisma/client';
+import { AuditAction, Prisma, ReportStatus, NotificationType, UserAuditAction, AdminRole } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
 import { getCategoryForType } from '../../notifications/notification-category.map';
@@ -457,6 +458,10 @@ export class AdminShowcaseReportsService {
 
   // -------------------------------------------------------------------------
   // Review awal (dipertahankan) — kini lewat transition() + event + snapshot.
+  // ADM-302: takedown permanen = SUPER_ADMIN only (server-side). Guard
+  // class-level membolehkan CUSTOMER_SUPPORT untuk aksi lain; aksi takedown
+  // dicek eksplisit di sini karena `action` ada di body (bukan di route).
+  // ADM-320: catatan resolusi wajib (min. 10 karakter) khusus takedown.
   // -------------------------------------------------------------------------
   async reviewShowcaseReport(
     reportId: string,
@@ -464,7 +469,21 @@ export class AdminShowcaseReportsService {
     resolution: string | undefined,
     adminId: string,
     ipAddress: string,
+    adminRole?: AdminRole,
   ): Promise<{ message: string; reportId: string; status: ReportStatus }> {
+    if (action === 'takedown' && adminRole !== AdminRole.SUPER_ADMIN) {
+      throw new ForbiddenException({
+        code: 'TAKEDOWN_FORBIDDEN_ROLE',
+        message: 'Takedown permanen hanya untuk SUPER_ADMIN',
+      });
+    }
+    const trimmedResolutionForTakedown = action === 'takedown' ? (resolution?.trim() ?? '') : undefined;
+    if (action === 'takedown' && trimmedResolutionForTakedown!.length < 10) {
+      throw new BadRequestException({
+        code: 'RESOLUTION_REQUIRED_TAKEDOWN',
+        message: 'Catatan resolusi takedown wajib diisi (minimal 10 karakter)',
+      });
+    }
     const report = await this.prisma.showcaseReport.findUnique({
       where: { id: reportId },
       include: { showcase: { select: { id: true, title: true, isActive: true, userId: true } } },

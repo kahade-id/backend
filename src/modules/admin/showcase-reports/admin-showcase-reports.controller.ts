@@ -180,7 +180,7 @@ export class AdminShowcaseReportsController {
   @ApiOperation({
     summary: 'Review a showcase report',
     description:
-      'Moderate a showcase report. Actions: dismiss (→ DISMISSED), takedown (deactivate the item and → RESOLVED_ACTION_TAKEN), no_action (→ RESOLVED_NO_ACTION), under_review (→ UNDER_REVIEW). Final statuses cannot be re-processed. Requires Idempotency-Key.',
+      'Moderate a showcase report. Actions: dismiss (→ DISMISSED), takedown (deactivate the item and → RESOLVED_ACTION_TAKEN, SUPER_ADMIN ONLY — enforced server-side, see ADM-302), no_action (→ RESOLVED_NO_ACTION), under_review (→ UNDER_REVIEW). Final statuses cannot be re-processed. Requires Idempotency-Key.',
   })
   @ApiResponse({ status: 200, description: 'Showcase report reviewed.' })
   @ApiResponse({ status: 400, description: 'Report already resolved/dismissed, or item already inactive.' })
@@ -191,7 +191,7 @@ export class AdminShowcaseReportsController {
     @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<object> {
-    return this.service.reviewShowcaseReport(reportId, dto.action, dto.resolution, admin.sub, req.ip ?? '');
+    return this.service.reviewShowcaseReport(reportId, dto.action, dto.resolution, admin.sub, req.ip ?? '', admin.role);
   }
 
   @UseGuards(UserThrottleGuard)

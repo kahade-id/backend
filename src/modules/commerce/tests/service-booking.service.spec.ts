@@ -3,28 +3,29 @@ import { ServiceBookingService } from '../services/service-booking.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { ProductType, SlotBookingStatus } from '@prisma/client';
 
-const mockPrisma = {
-  userShowcase: { findFirst: jest.fn() },
-  serviceSlot: { create: jest.fn(), findMany: jest.fn(), count: jest.fn(), findFirst: jest.fn(), update: jest.fn() },
-  serviceSlotBooking: { findFirst: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn(), update: jest.fn() },
-  $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => fn({ ...mockPrisma.serviceSlotBooking })),
+const mockTx: Record<string, any> = {
+  serviceSlot: { updateMany: jest.fn(), update: jest.fn() },
+  serviceSlotBooking: { upsert: jest.fn(), update: jest.fn() },
 };
 
-const slotRow = {
-  id: 'slot1',
-  showcaseId: 's1',
-  capacity: 2,
-  startAt: new Date(Date.now() + 86400000),
-  isActive: true,
-  showcase: { userId: 'seller-1', productType: ProductType.JASA },
+const mockPrisma: Record<string, any> = {
+  userShowcase: { findFirst: jest.fn() },
+  serviceSlot: { create: jest.fn(), findMany: jest.fn(), count: jest.fn(), findFirst: jest.fn(), update: jest.fn() },
+  serviceSlotBooking: { findFirst: jest.fn(), findUnique: jest.fn(), findMany: jest.fn(), count: jest.fn() },
+  $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
 };
+
+const tomorrow = new Date(Date.now() + 86400000);
+const slotDateStr = tomorrow.toISOString().slice(0, 10);
+
+const jasaShowcase = { id: 's1', productType: ProductType.JASA };
 
 describe('ServiceBookingService', () => {
   let service: ServiceBookingService;
 
   beforeEach(async () => {
     jest.resetAllMocks();
-    mockPrisma.$transaction.mockImplementation((fn: (tx: unknown) => Promise<unknown>) => fn({ ...mockPrisma.serviceSlotBooking }));
+    mockPrisma.$transaction.mockImplementation((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx));
     const module: TestingModule = await Test.createTestingModule({
       providers: [ServiceBookingService, { provide: PrismaService, useValue: mockPrisma }],
     }).compile();
@@ -32,40 +33,54 @@ describe('ServiceBookingService', () => {
   });
 
   it('menolak slot untuk produk non-JASA', async () => {
-    mockPrisma.userShowcase.findFirst.mockResolvedValue({ id: 's1', userId: 'seller-1', productType: ProductType.FISIK });
+    mockPrisma.userShowcase.findFirst.mockResolvedValue({ id: 's1', productType: ProductType.FISIK });
     await expect(
-      service.createSlot('seller-1', { showcaseId: 's1', startAt: new Date(Date.now() + 3600000).toISOString(), endAt: new Date(Date.now() + 7200000).toISOString() } as never),
+      service.createSlot('seller-1', { showcaseId: 's1', slotDate: slotDateStr, startTime: '09:00', endTime: '10:00' } as never),
     ).rejects.toThrow('bertipe JASA');
   });
 
-  it('menolak startAt di masa lalu', async () => {
-    mockPrisma.userShowcase.findFirst.mockResolvedValue({ id: 's1', userId: 'seller-1', productType: ProductType.JASA });
+  it('menolak slotDate di masa lalu', async () => {
+    mockPrisma.userShowcase.findFirst.mockResolvedValue(jasaShowcase);
     await expect(
-      service.createSlot('seller-1', { showcaseId: 's1', startAt: new Date(Date.now() - 1000).toISOString(), endAt: new Date(Date.now() + 3600000).toISOString() } as never),
-    ).rejects.toThrow('masa depan');
+      service.createSlot('seller-1', { showcaseId: 's1', slotDate: '2020-01-01', startTime: '09:00', endTime: '10:00' } as never),
+    ).rejects.toThrow('masa lalu');
   });
 
-  it('menolak booking ganda user yang sama (active)', async () => {
-    mockPrisma.serviceSlot.findFirst.mockResolvedValue(slotRow);
-    mockPrisma.serviceSlotBooking.findFirst.mockResolvedValue({ id: 'b1' });
-    mockPrisma.serviceSlotBooking.count.mockResolvedValue(0);
-    await expect(service.bookSlot('buyer-1', 'slot1')).rejects.toThrow('sudah memesan');
+  it('menolak rentang jam tidak valid', async () => {
+    mockPrisma.userShowcase.findFirst.mockResolvedValue(jasaShowcase);
+    await expect(
+      service.createSlot('seller-1', { showcaseId: 's1', slotDate: slotDateStr, startTime: '10:00', endTime: '09:00' } as never),
+    ).rejects.toThrow('Rentang jam tidak valid');
+  });
+
+  it('menolak booking ganda user yang sama (BOOKED)', async () => {
+    mockPrisma.serviceSlot.findFirst.mockResolvedValue({ id: 'slot1', sellerId: 'seller-1', capacity: 2, bookedCount: 0 });
+    mockPrisma.serviceSlotBooking.findUnique.mockResolvedValue({ id: 'b1', status: SlotBookingStatus.BOOKED });
+    await expect(service.bookSlot('buyer-1', 'slot1')).rejects.toThrow('sudah booking');
   });
 
   it('menolak booking saat kapasitas penuh', async () => {
-    mockPrisma.serviceSlot.findFirst.mockResolvedValue(slotRow);
-    mockPrisma.serviceSlotBooking.findFirst.mockResolvedValue(null);
-    mockPrisma.serviceSlotBooking.count.mockResolvedValue(2); // capacity 2
+    mockPrisma.serviceSlot.findFirst.mockResolvedValue({ id: 'slot1', sellerId: 'seller-1', capacity: 2, bookedCount: 2 });
+    mockPrisma.serviceSlotBooking.findUnique.mockResolvedValue(null);
+    mockTx.serviceSlot.updateMany.mockResolvedValue({ count: 0 });
     await expect(service.bookSlot('buyer-1', 'slot1')).rejects.toThrow('penuh');
   });
 
+  it('menolak booking oleh seller sendiri', async () => {
+    mockPrisma.serviceSlot.findFirst.mockResolvedValue({ id: 'slot1', sellerId: 'seller-1', capacity: 2, bookedCount: 0 });
+    await expect(service.bookSlot('seller-1', 'slot1')).rejects.toThrow('tidak bisa booking slot sendiri');
+  });
+
   it('berhasil booking bila masih ada slot', async () => {
-    mockPrisma.serviceSlot.findFirst.mockResolvedValue(slotRow);
-    mockPrisma.serviceSlotBooking.findFirst.mockResolvedValue(null);
-    mockPrisma.serviceSlotBooking.count.mockResolvedValue(1);
-    mockPrisma.serviceSlotBooking.create.mockResolvedValue({ id: 'b2', status: SlotBookingStatus.BOOKED });
+    mockPrisma.serviceSlot.findFirst.mockResolvedValue({ id: 'slot1', sellerId: 'seller-1', capacity: 2, bookedCount: 1 });
+    mockPrisma.serviceSlotBooking.findUnique.mockResolvedValue(null);
+    mockTx.serviceSlot.updateMany.mockResolvedValue({ count: 1 });
+    mockTx.serviceSlotBooking.upsert.mockResolvedValue({ id: 'b2', slotId: 'slot1', status: SlotBookingStatus.BOOKED });
     const res = await service.bookSlot('buyer-1', 'slot1');
     expect(res.status).toBe(SlotBookingStatus.BOOKED);
+    expect(mockTx.serviceSlot.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ bookedCount: { lt: 2 } }) }),
+    );
   });
 
   it('batal booking hanya oleh pemilik', async () => {

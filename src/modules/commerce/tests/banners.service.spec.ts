@@ -3,7 +3,14 @@ import { BannersService } from '../services/banners.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 
 const mockPrisma = {
-  banner: { create: jest.fn(), findMany: jest.fn(), count: jest.fn(), updateMany: jest.fn(), delete: jest.fn() },
+  banner: {
+    create: jest.fn(),
+    findMany: jest.fn(),
+    findUnique: jest.fn(),
+    update: jest.fn(),
+    delete: jest.fn(),
+    count: jest.fn(),
+  },
 };
 
 const baseDto = {
@@ -28,7 +35,8 @@ describe('BannersService', () => {
   it('menolak endsAt <= startsAt', async () => {
     await expect(
       service.createBanner('admin-1', { ...baseDto, endsAt: baseDto.startsAt } as never),
-    ).rejects.toThrow('harus setelah startsAt');
+    ).rejects.toThrow('setelah awal tayang');
+    expect(mockPrisma.banner.create).not.toHaveBeenCalled();
   });
 
   it('getActiveBanners hanya isActive + dalam rentang tayang', async () => {
@@ -42,7 +50,13 @@ describe('BannersService', () => {
   });
 
   it('update banner hilang → 404', async () => {
-    mockPrisma.banner.updateMany.mockResolvedValue({ count: 0 });
+    mockPrisma.banner.findUnique.mockResolvedValue(null);
     await expect(service.updateBanner('nope', { title: 'x' } as never)).rejects.toThrow('tidak ditemukan');
+  });
+
+  it('delete banner hilang → 404', async () => {
+    mockPrisma.banner.findUnique.mockResolvedValue(null);
+    await expect(service.deleteBanner('nope')).rejects.toThrow('tidak ditemukan');
+    expect(mockPrisma.banner.delete).not.toHaveBeenCalled();
   });
 });

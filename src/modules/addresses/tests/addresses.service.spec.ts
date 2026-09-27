@@ -3,7 +3,7 @@ import { AddressesService } from '../addresses.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AddressLabel } from '@prisma/client';
 
-const mockPrisma = {
+const mockPrisma: Record<string, any> = {
   address: {
     findFirst: jest.fn(),
     findMany: jest.fn(),

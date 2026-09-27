@@ -7,6 +7,10 @@ import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/
 import { OrderStateService } from '../../orders/order-state.service';
 import { CreatePatunganGroupDto, JoinPatunganDto } from '../dto/commerce.dto';
 
+/** Union penuh agar `.includes(status)` menerima semua nilai enum. */
+const PAID_ORDER_STATUSES: OrderStatus[] = [OrderStatus.PROCESSING, OrderStatus.IN_DELIVERY, OrderStatus.COMPLETED];
+const CANCELLABLE_ORDER_STATUSES: OrderStatus[] = [OrderStatus.WAITING_CONFIRMATION, OrderStatus.WAITING_PAYMENT];
+
 /** Masa sanggah peserta setelah host inisiasi cair: 24 jam. */
 export const PATUNGAN_CONTEST_HOURS = 24;
 
@@ -200,7 +204,7 @@ export class PatunganService {
     if (order.orderValue !== participant.amount) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Nilai order harus sama persis dengan nominal patungan' });
     }
-    if (![OrderStatus.PROCESSING, OrderStatus.IN_DELIVERY, OrderStatus.COMPLETED].includes(order.status)) {
+    if (!PAID_ORDER_STATUSES.includes(order.status)) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Order belum dibayar' });
     }
     const updated = await this.prisma.$transaction(async (tx) => {
@@ -291,15 +295,20 @@ export class PatunganService {
     hostId: string,
   ): Promise<void> {
     for (const p of participants) {
-      if (p.status !== PatunganParticipantStatus.PAID || !p.orderId) {
-        if (p.status === PatunganParticipantStatus.PENDING) {
-          await this.prisma.patunganParticipant.update({ where: { id: p.id }, data: { status: PatunganParticipantStatus.REFUNDED } });
-        }
+      if (p.status === PatunganParticipantStatus.PENDING) {
+        await this.prisma.patunganParticipant.update({ where: { id: p.id }, data: { status: PatunganParticipantStatus.REFUNDED } });
+        continue;
+      }
+      if (p.status !== PatunganParticipantStatus.PAID) continue;
+      if (!p.orderId) {
+        // Data inkonsisten (PAID tanpa order): fail closed — tandai
+        // REFUND_REQUIRED agar ops menindaklanjuti manual, jangan diam.
+        await this.prisma.patunganParticipant.update({ where: { id: p.id }, data: { status: PatunganParticipantStatus.REFUND_REQUIRED } });
         continue;
       }
       const order = await this.prisma.order.findUnique({ where: { id: p.orderId }, select: { orderId: true, status: true } });
       let refunded = false;
-      if (order && [OrderStatus.WAITING_CONFIRMATION, OrderStatus.WAITING_PAYMENT].includes(order.status)) {
+      if (order && CANCELLABLE_ORDER_STATUSES.includes(order.status)) {
         try {
           await this.orderStateService.cancelOrder(order.orderId, hostId, 'OTHER', 'Patungan gagal: target tidak tercapai — auto-refund');
           refunded = true;

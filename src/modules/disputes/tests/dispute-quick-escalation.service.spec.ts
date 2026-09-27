@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { DisputeQuickEscalationService } from '../dispute-quick-escalation.service';
-import { PrismaService } from '../../prisma/prisma.service';
+import { PrismaService } from '../../../prisma/prisma.service';
 import { DisputeStatus } from '@prisma/client';
 
 const mockPrisma = {

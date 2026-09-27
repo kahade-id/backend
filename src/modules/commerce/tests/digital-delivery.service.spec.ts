@@ -26,7 +26,7 @@ describe('DigitalDeliveryService', () => {
     mockPrisma.userShowcase.findFirst.mockResolvedValue({ ...showcaseRow, productType: ProductType.FISIK });
     await expect(
       service.createAsset('seller-1', { showcaseId: 's1', assetType: DigitalAssetType.LINK, payload: 'https://x.id/f' } as never),
-    ).rejects.toThrow('harus bertipe DIGITAL');
+    ).rejects.toThrow('bertipe DIGITAL');
   });
 
   it('menolak LINK bukan URL', async () => {

@@ -13,6 +13,16 @@ import {
   LinkJastipOrderDto,
 } from '../dto/commerce.dto';
 
+/** Union penuh agar `.includes(status)` menerima semua nilai enum. */
+const EDITABLE_TRIP_STATUSES: JastipTripStatus[] = [JastipTripStatus.DRAFT, JastipTripStatus.OPEN];
+const CLOSED_TRIP_STATUSES: JastipTripStatus[] = [JastipTripStatus.CANCELLED, JastipTripStatus.COMPLETED];
+const PAID_ORDER_STATUSES: OrderStatus[] = [OrderStatus.PROCESSING, OrderStatus.IN_DELIVERY, OrderStatus.COMPLETED];
+const CANCELLABLE_ORDER_STATUSES: OrderStatus[] = [OrderStatus.WAITING_CONFIRMATION, OrderStatus.WAITING_PAYMENT];
+const PREPAID_PARTICIPANT_STATUSES: JastipParticipantStatus[] = [
+  JastipParticipantStatus.JOINED,
+  JastipParticipantStatus.PRICE_LOCKED,
+];
+
 /**
  * BE-COMMERCE (2026-10-01) — item 13: pre-order / jastip.
  *
@@ -71,7 +81,7 @@ export class JastipService {
 
   async addItem(hostId: string, tripId: string, dto: AddJastipItemDto) {
     const trip = await this.assertHostTrip(hostId, tripId);
-    if (![JastipTripStatus.DRAFT, JastipTripStatus.OPEN].includes(trip.status)) {
+    if (!EDITABLE_TRIP_STATUSES.includes(trip.status)) {
       throw new BadRequestException({ code: ErrorCodes.JASTIP_TRIP_NOT_OPEN, message: 'Trip sudah ditutup' });
     }
     return this.prisma.jastipItem.create({
@@ -217,7 +227,7 @@ export class JastipService {
         message: 'Nilai order harus sama persis dengan total harga terkunci',
       });
     }
-    if (![OrderStatus.PROCESSING, OrderStatus.IN_DELIVERY, OrderStatus.COMPLETED].includes(order.status)) {
+    if (!PAID_ORDER_STATUSES.includes(order.status)) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Order belum dibayar' });
     }
     return this.prisma.jastipParticipant.update({
@@ -234,19 +244,26 @@ export class JastipService {
    */
   async failTrip(hostId: string, tripId: string, reason?: string) {
     const trip = await this.assertHostTrip(hostId, tripId);
-    if ([JastipTripStatus.CANCELLED, JastipTripStatus.COMPLETED].includes(trip.status)) {
+    if (CLOSED_TRIP_STATUSES.includes(trip.status)) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Trip sudah selesai/dibatalkan' });
     }
     await this.prisma.jastipTrip.update({ where: { id: trip.id }, data: { status: JastipTripStatus.CANCELLED } });
 
     const results: Array<{ participantId: string; outcome: string }> = [];
     for (const p of trip.participants) {
-      if (p.status === JastipParticipantStatus.PAID && p.orderId) {
+      if (p.status === JastipParticipantStatus.PAID) {
+        if (!p.orderId) {
+          // Data inkonsisten (PAID tanpa order): fail closed — tandai
+          // REFUND_REQUIRED agar ops menindaklanjuti manual, jangan diam.
+          await this.prisma.jastipParticipant.update({ where: { id: p.id }, data: { status: JastipParticipantStatus.REFUND_REQUIRED } });
+          results.push({ participantId: p.id, outcome: 'REFUND_REQUIRED' });
+          continue;
+        }
         const order = await this.prisma.order.findUnique({
           where: { id: p.orderId },
           select: { orderId: true, status: true },
         });
-        if (order && [OrderStatus.WAITING_CONFIRMATION, OrderStatus.WAITING_PAYMENT].includes(order.status)) {
+        if (order && CANCELLABLE_ORDER_STATUSES.includes(order.status)) {
           try {
             await this.orderStateService.cancelOrder(order.orderId, hostId, 'OTHER', `Jastip gagal: ${reason ?? 'host tidak mendapatkan barang'}`.slice(0, 200));
             await this.prisma.jastipParticipant.update({ where: { id: p.id }, data: { status: JastipParticipantStatus.REFUNDED } });
@@ -258,7 +275,7 @@ export class JastipService {
         }
         await this.prisma.jastipParticipant.update({ where: { id: p.id }, data: { status: JastipParticipantStatus.REFUND_REQUIRED } });
         results.push({ participantId: p.id, outcome: 'REFUND_REQUIRED' });
-      } else if ([JastipParticipantStatus.JOINED, JastipParticipantStatus.PRICE_LOCKED].includes(p.status)) {
+      } else if (PREPAID_PARTICIPANT_STATUSES.includes(p.status)) {
         await this.prisma.jastipParticipant.update({ where: { id: p.id }, data: { status: JastipParticipantStatus.CANCELLED } });
         results.push({ participantId: p.id, outcome: 'CANCELLED' });
       }

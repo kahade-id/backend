@@ -79,7 +79,6 @@ export class SellerVouchersService {
         sellerId,
       },
     });
-    void now;
     return this.serialize(row as unknown as Record<string, unknown>);
   }
 

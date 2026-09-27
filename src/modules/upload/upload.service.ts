@@ -285,6 +285,22 @@ export class UploadService {
     private videoProcessing: VideoProcessingService,
   ) {}
 
+  // ── Batas video etalase resmi (keputusan user 2026-09-28): 100MB / 180 detik.
+  // Khusus SHOWCASE_VIDEO, pelanggaran batas ukuran memakai kode
+  // VIDEO_TOO_LARGE + pesan Indonesia; purpose lain tidak berubah.
+  private throwFileTooLarge(purpose: UploadPurpose | undefined, maxSize: number): never {
+    if (purpose === UploadPurpose.SHOWCASE_VIDEO) {
+      throw new BadRequestException({
+        code: ErrorCodes.VIDEO_TOO_LARGE,
+        message: `Ukuran video melebihi batas maksimal ${Math.round(maxSize / 1024 / 1024)} MB. Maksimal 100 MB / 180 detik.`,
+      });
+    }
+    throw new BadRequestException({
+      code: ErrorCodes.FILE_TOO_LARGE,
+      message: `File exceeds maximum allowed size of ${Math.round(maxSize / 1024 / 1024)} MB`,
+    });
+  }
+
   // ── Batch 1A (ST-002/03-#1): signed URL HMAC untuk file privat ──
   // Menggantikan semantik presigned-URL R2: URL kedaluwarsa yang hanya bisa
   // dibuat server-side setelah otorisasi. Secret dari STORAGE_URL_SECRET
@@ -479,10 +495,7 @@ export class UploadService {
       const maxSize = MAX_FILE_SIZE[detectedPurpose];
       if (contentLength !== undefined && contentLength > maxSize) {
         await this.redis.del(redisKey);
-        throw new BadRequestException({
-          code: ErrorCodes.FILE_TOO_LARGE,
-          message: `File exceeds maximum allowed size of ${Math.round(maxSize / 1024 / 1024)} MB for this upload type`,
-        });
+        this.throwFileTooLarge(detectedPurpose, maxSize);
       }
 
       try {
@@ -724,8 +737,12 @@ export class UploadService {
       }
 
       const contentLength = await this.localStorage.getFileSize(fileKey);
-      if (contentLength === null || contentLength < MIN_FILE_SIZE || contentLength > maxSize) {
+      if (contentLength === null || contentLength < MIN_FILE_SIZE) {
         throw new BadRequestException({ code: ErrorCodes.FILE_TOO_LARGE, message: `${label} file size is outside the allowed range` });
+      }
+      // Batas video etalase resmi (keputusan user 2026-09-28): 100MB / 180 detik.
+      if (contentLength > maxSize) {
+        this.throwFileTooLarge(purpose, maxSize);
       }
       // Content type dideteksi dari bytes saat confirm — local storage tidak
       // menyimpan ContentType terpisah, jadi skip check ContentType di sini.
@@ -887,10 +904,7 @@ export class UploadService {
 
     const maxSize = MAX_FILE_SIZE[purpose];
     if (fileBuffer.length > maxSize) {
-      throw new BadRequestException({
-        code: ErrorCodes.FILE_TOO_LARGE,
-        message: `File exceeds maximum allowed size of ${Math.round(maxSize / 1024 / 1024)} MB`,
-      });
+      this.throwFileTooLarge(purpose, maxSize);
     }
 
     const header = fileBuffer.subarray(0, MIME_HEADER_BYTES);
@@ -1005,7 +1019,7 @@ export class UploadService {
       await discardVideo();
       throw new BadRequestException({
         code: ErrorCodes.VIDEO_TOO_LONG,
-        message: `Video duration exceeds the maximum of ${SHOWCASE_VIDEO_MAX_DURATION_SEC} seconds`,
+        message: `Durasi video melebihi batas maksimal ${SHOWCASE_VIDEO_MAX_DURATION_SEC} detik. Maksimal 100 MB / 180 detik.`,
       });
     }
     if (probe.durationSec < SHOWCASE_VIDEO_MIN_DURATION_SEC) {

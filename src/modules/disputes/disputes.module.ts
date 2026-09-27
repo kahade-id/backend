@@ -4,7 +4,9 @@ import { RedisModule } from '../../redis/redis.module';
 import { UploadModule } from '../upload/upload.module';
 import { OrdersModule } from '../orders/orders.module';
 import { DisputesController } from './disputes.controller';
+import { DisputeQuickEscalationController } from './dispute-quick-escalation.controller';
 import { DisputesService } from './disputes.service';
+import { DisputeQuickEscalationService } from './dispute-quick-escalation.service';
 import { DisputeMessageService } from './dispute-message.service';
 import { DisputeCallService } from './dispute-call.service';
 import { MutualResolutionService } from './mutual-resolution.service';
@@ -13,8 +15,8 @@ import { AuditLogModule } from '../../common/services/audit-log.module';
 
 @Module({
   imports: [PrismaModule, RedisModule, UploadModule, AuditLogModule, forwardRef(() => OrdersModule)],
-  controllers: [DisputesController],
-  providers: [DisputesService, DisputeMessageService, DisputeCallService, MutualResolutionService, WalletTxSerialService],
+  controllers: [DisputesController, DisputeQuickEscalationController],
+  providers: [DisputesService, DisputeQuickEscalationService, DisputeMessageService, DisputeCallService, MutualResolutionService, WalletTxSerialService],
   exports: [DisputesService],
 })
 export class DisputesModule {}

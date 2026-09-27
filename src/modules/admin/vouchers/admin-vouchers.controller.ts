@@ -11,6 +11,7 @@ import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
+import { Idempotency } from '../../../common/decorators/idempotency.decorator';
 
 @ApiTags('admin-vouchers')
 @ApiBearerAuth('access-token')
@@ -38,7 +39,8 @@ export class AdminVouchersController {
 
   @Post()
   @UseGuards(UserThrottleGuard)
-  @ApiOperation({ summary: 'Create new voucher' })
+  @Idempotency()
+  @ApiOperation({ summary: 'Create new voucher', description: 'ADM-219: requires Idempotency-Key — double submit tidak membuat voucher ganda.' })
   @ApiResponse({ status: 201, description: 'Voucher created.' })
   createVoucher(
     @Body() dto: CreateVoucherDto,
@@ -50,8 +52,9 @@ export class AdminVouchersController {
 
   @Post(':voucherId/deactivate')
   @UseGuards(UserThrottleGuard)
+  @Idempotency()
   @HttpCode(200)
-  @ApiOperation({ summary: 'Deactivate voucher' })
+  @ApiOperation({ summary: 'Deactivate voucher', description: 'ADM-219: requires Idempotency-Key.' })
   @ApiResponse({ status: 200, description: 'Voucher deactivated.' })
   @ApiResponse({ status: 404, description: 'Voucher not found.' })
   deactivateVoucher(
@@ -60,5 +63,21 @@ export class AdminVouchersController {
     @Req() req: Request,
   ): Promise<object> {
     return this.service.deactivateVoucher(voucherId, adminId, req.ip ?? 'unknown');
+  }
+
+  @Post(':voucherId/reactivate')
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Reactivate voucher', description: 'ADM-218: mengaktifkan kembali voucher yang dinonaktifkan (flag lunak). Fail-closed bila voucher masih aktif atau sudah kedaluwarsa. Requires Idempotency-Key.' })
+  @ApiResponse({ status: 200, description: 'Voucher reactivated.' })
+  @ApiResponse({ status: 404, description: 'Voucher not found.' })
+  @ApiResponse({ status: 400, description: 'Voucher already active or expired.' })
+  reactivateVoucher(
+    @Param('voucherId', ParseIdPipe) voucherId: string,
+    @CurrentAdmin('sub') adminId: string,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.reactivateVoucher(voucherId, adminId, req.ip ?? 'unknown');
   }
 }

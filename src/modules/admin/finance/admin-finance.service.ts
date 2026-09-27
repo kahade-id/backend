@@ -1252,6 +1252,145 @@ export class AdminFinanceService {
     };
   }
 
+  /**
+   * ADM-213 — pengecekan ulang manual SATU withdrawal PROCESSING ke provider.
+   *
+   * BUKAN retry payout: metode ini TIDAK PERNAH memanggil createIrisPayout.
+   * Ia hanya menanyakan status payout ke Midtrans Iris lalu menerapkan
+   * transisi aman yang sama dengan reconciler otomatis
+   * (WithdrawalReconciliationService — jaga tetap sinkron):
+   * - completed/processed → SUCCESS (uang terbukti keluar via provider)
+   * - failed/rejected    → FAILED + refund ke wallet pengguna
+   * - selain itu (queued/processing/not_found/unknown, atau provider tidak
+   *   terjangkau) → tetap PROCESSING, TANPA mutasi uang (fail closed).
+   */
+  async recheckWithdrawal(txId: string, adminId: string, ipAddress: string): Promise<object> {
+    const tx = await this.prisma.walletTransaction.findFirst({
+      where: { txId, type: 'WITHDRAW' },
+      select: {
+        id: true,
+        txId: true,
+        amount: true,
+        walletId: true,
+        withdrawStatus: true,
+        description: true,
+        createdAt: true,
+      },
+    });
+    if (!tx) {
+      throw new NotFoundException({
+        code: ErrorCodes.NOT_FOUND,
+        message: 'Withdrawal not found',
+      });
+    }
+    if (tx.withdrawStatus !== 'PROCESSING') {
+      throw new ConflictException({
+        code: ErrorCodes.WITHDRAWAL_NOT_PROCESSING,
+        message: `Hanya withdrawal berstatus PROCESSING yang dapat dicek ulang (saat ini: ${tx.withdrawStatus})`,
+      });
+    }
+
+    // Hanya query status — tidak ada pengiriman payout baru di jalur ini.
+    const iris = await this.midtransService.getIrisPayoutStatus(tx.txId);
+    const providerStatus = iris.status;
+    let outcome: 'CONFIRMED' | 'FAILED_REFUNDED' | 'STILL_PROCESSING' | 'UNKNOWN';
+    let changed = false;
+
+    if (['completed', 'processed'].includes(providerStatus)) {
+      const claimed = await this.prisma.walletTransaction.updateMany({
+        where: { id: tx.id, withdrawStatus: 'PROCESSING' },
+        data: {
+          withdrawStatus: 'SUCCESS',
+          status: 'SUCCESS',
+          description: `Payout confirmed via manual recheck by admin ${adminId}`,
+        },
+      });
+      changed = claimed.count > 0;
+      outcome = 'CONFIRMED';
+    } else if (['failed', 'rejected'].includes(providerStatus)) {
+      changed = await this.refundProcessingWithdrawal(tx.id, tx.txId, tx.walletId, tx.amount, tx.createdAt);
+      outcome = 'FAILED_REFUNDED';
+    } else {
+      outcome = providerStatus === 'not_found' ? 'UNKNOWN' : 'STILL_PROCESSING';
+    }
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.WITHDRAWAL_RECHECKED,
+      targetType: 'WalletTransaction',
+      targetId: tx.id,
+      description:
+        `Manual recheck withdrawal ${tx.txId}: provider=${providerStatus} outcome=${outcome}` +
+        (changed ? '' : ' (no state change)'),
+      ipAddress,
+    });
+
+    // AW-018: status withdrawal memengaruhi summary dashboard.
+    await this.dashboard.invalidateSummaryCache();
+
+    return {
+      txId: tx.txId,
+      providerStatus,
+      outcome,
+      changed,
+    };
+  }
+
+  /**
+   * Kembaran WithdrawalReconciliationService.refundFailedWithdrawal — refund
+   * untuk payout yang provider nyatakan gagal. Jaga tetap sinkron dengan
+   * reconciler otomatis. Transaksi serializable + optimistic claim agar
+   * refund tidak ganda bila cron dan admin recheck berjalan bersamaan.
+   */
+  private async refundProcessingWithdrawal(
+    id: string,
+    txId: string,
+    walletId: string,
+    amount: bigint,
+    createdAt: Date,
+  ): Promise<boolean> {
+    return this.prisma.$transaction(
+      async (ptx: Prisma.TransactionClient) => {
+        const claimResult = await ptx.walletTransaction.updateMany({
+          where: { id, withdrawStatus: 'PROCESSING' },
+          data: {
+            withdrawStatus: 'FAILED',
+            status: 'FAILED',
+            description: 'Payout failed — refunded via manual recheck',
+          },
+        });
+        if (claimResult.count === 0) {
+          this.logger.warn(`Withdrawal ${txId} already transitioned from PROCESSING, skipping manual refund`);
+          return false;
+        }
+        const currentWallet = await ptx.wallet.findUnique({ where: { id: walletId } });
+        if (!currentWallet) {
+          throw new Error(`Wallet ${walletId} not found while refunding withdrawal ${txId}`);
+        }
+        const todayStart = startOfDayWIB();
+        const isToday = createdAt >= todayStart;
+        const withdrawRollback =
+          isToday && currentWallet.todayWithdrawAmount >= amount
+            ? { decrement: amount }
+            : undefined;
+        const walletUpdateResult = await ptx.wallet.updateMany({
+          where: { id: walletId, version: currentWallet.version },
+          data: {
+            availableBalance: { increment: amount },
+            totalBalance: { increment: amount },
+            ...(withdrawRollback !== undefined ? { todayWithdrawAmount: withdrawRollback } : {}),
+            version: { increment: 1 },
+          },
+        });
+        if (walletUpdateResult.count === 0) {
+          throw new Error(`OCC conflict refunding withdrawal ${txId} — will retry`);
+        }
+        return true;
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
+  }
+
   logReconciliation(adminId: string, userId: string, clean: boolean, ipAddress: string): void {
     this.auditLog.logAdminAction({
       adminId,
@@ -1299,24 +1438,31 @@ export class AdminFinanceService {
         _sum: { amount: true },
         _count: true,
       }),
+      // ADM-217: bucket bulan memakai batas WIB, bukan UTC. Semantik:
+      // "completedAt" adalah timestamptz; `AT TIME ZONE 'Asia/Jakarta'`
+      // mengubahnya ke wall-clock Jakarta, DATE_TRUNC memotong ke awal bulan
+      // Jakarta, lalu `AT TIME ZONE 'Asia/Jakarta'` mengembalikannya menjadi
+      // timestamptz (instan yang sama) agar tipe kolom & serialisasi JSON
+      // tidak berubah. Tanpa ini, transaksi 1 Sep 00:30 WIB (= 31 Agu 17:30
+      // UTC) salah masuk bucket Agustus.
       this.prisma.$queryRaw<Array<{ month: Date; total: bigint; count: bigint; source: string }>>`
-        SELECT DATE_TRUNC('month', "completedAt") as month,
+        SELECT DATE_TRUNC('month', "completedAt" AT TIME ZONE 'Asia/Jakarta') AT TIME ZONE 'Asia/Jakarta' as month,
                COALESCE(SUM("feeAmount"), 0)::bigint as total,
                COUNT(*)::bigint as count,
                'fee'::text as source
         FROM orders
         WHERE status = 'COMPLETED'
           AND "completedAt" IS NOT NULL
-        GROUP BY DATE_TRUNC('month', "completedAt")
+        GROUP BY DATE_TRUNC('month', "completedAt" AT TIME ZONE 'Asia/Jakarta')
         UNION ALL
-        SELECT DATE_TRUNC('month', "createdAt") as month,
+        SELECT DATE_TRUNC('month', "createdAt" AT TIME ZONE 'Asia/Jakarta') AT TIME ZONE 'Asia/Jakarta' as month,
                COALESCE(SUM(amount), 0)::bigint as total,
                COUNT(*)::bigint as count,
                'subscription'::text as source
         FROM wallet_transactions
         WHERE type = 'SUBSCRIPTION_PAYMENT'
           AND status = 'SUCCESS'
-        GROUP BY DATE_TRUNC('month', "createdAt")
+        GROUP BY DATE_TRUNC('month', "createdAt" AT TIME ZONE 'Asia/Jakarta')
         ORDER BY month DESC, source ASC
         LIMIT 48
       `,

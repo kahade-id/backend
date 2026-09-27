@@ -102,6 +102,20 @@ export class AdminFinanceController {
     return this.service.rejectWithdrawal(txId, dto, adminId, req.ip || 'unknown');
   }
 
+  // ADM-213: recheck manual — query status provider, BUKAN retry payout.
+  // network-retry / double-tap must not re-query-spam the provider nor mutate twice.
+  @Post('withdrawals/:txId/recheck')
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({ summary: 'Recheck PROCESSING withdrawal against payout provider', description: 'ADM-213: queries Midtrans Iris payout status for ONE stuck PROCESSING withdrawal and applies the same safe transitions as the automated reconciler (completed/processed -> SUCCESS, failed/rejected -> FAILED + refund; otherwise stays PROCESSING, no money mutation). NEVER submits a new payout. Requires Idempotency-Key.' })
+  @ApiResponse({ status: 200, description: 'Recheck result (providerStatus + outcome).' })
+  @ApiResponse({ status: 404, description: 'Transaction not found.' })
+  @ApiResponse({ status: 409, description: 'Withdrawal is not PROCESSING.' })
+  recheckWithdrawal(@Param('txId', ParseIdPipe) txId: string, @CurrentAdmin('sub') adminId: string, @Req() req: Request): Promise<object> {
+    return this.service.recheckWithdrawal(txId, adminId, req.ip || 'unknown');
+  }
+
   @Get('escrow-summary')
   @ApiOperation({ summary: 'Active escrow totals', description: 'Returns aggregated escrow balance totals across all wallets.' })
   @ApiResponse({ status: 200, description: 'Escrow summary returned.' })

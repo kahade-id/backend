@@ -152,6 +152,57 @@ describe('ProfileQAService', () => {
       await expect(service.getProfileQuestions('private-user', 1, 20)).rejects.toThrow(NotFoundException);
       expect(mockPrisma.profileQuestion.findMany).not.toHaveBeenCalled();
     });
+
+    // PRF-001: visibilitas pertanyaan yang belum dijawab.
+    const visibleReceiver = { id: 'receiver-1', profileVisible: true, isActive: true, isBanned: false, deletedAt: null };
+
+    it('owner sees unanswered questions (no answeredAt filter)', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(visibleReceiver);
+      mockPrisma.profileQuestion.findMany.mockResolvedValue([]);
+      mockPrisma.profileQuestion.count.mockResolvedValue(0);
+      await service.getProfileQuestions('owner-name', 1, 20, 'recent', 'receiver-1');
+      const where = mockPrisma.profileQuestion.findMany.mock.calls[0][0].where;
+      expect(where.answeredAt).toBeUndefined();
+      expect(where.OR).toBeUndefined();
+    });
+
+    it('asker sees own unanswered questions via OR clause', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(visibleReceiver);
+      mockPrisma.profileQuestion.findMany.mockResolvedValue([]);
+      mockPrisma.profileQuestion.count.mockResolvedValue(0);
+      await service.getProfileQuestions('owner-name', 1, 20, 'recent', 'asker-9');
+      const where = mockPrisma.profileQuestion.findMany.mock.calls[0][0].where;
+      expect(where.OR).toEqual([{ answeredAt: { not: null } }, { askerId: 'asker-9' }]);
+    });
+
+    it('stranger sees answered plus own questions via OR clause', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(visibleReceiver);
+      mockPrisma.profileQuestion.findMany.mockResolvedValue([]);
+      mockPrisma.profileQuestion.count.mockResolvedValue(0);
+      await service.getProfileQuestions('owner-name', 1, 20, 'recent', 'stranger-3');
+      const where = mockPrisma.profileQuestion.findMany.mock.calls[0][0].where;
+      expect(where.OR).toEqual([{ answeredAt: { not: null } }, { askerId: 'stranger-3' }]);
+    });
+
+    it('anonymous viewer sees only answered questions', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(visibleReceiver);
+      mockPrisma.profileQuestion.findMany.mockResolvedValue([]);
+      mockPrisma.profileQuestion.count.mockResolvedValue(0);
+      await service.getProfileQuestions('owner-name', 1, 20, 'recent', null);
+      const where = mockPrisma.profileQuestion.findMany.mock.calls[0][0].where;
+      expect(where.answeredAt).toEqual({ not: null });
+      expect(where.OR).toBeUndefined();
+    });
+
+    it('response includes askerId for ownership checks', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(visibleReceiver);
+      mockPrisma.profileQuestion.findMany.mockResolvedValue([
+        { id: 'q1', question: 'halo?', answer: null, answeredAt: null, askerId: 'asker-9', asker: { username: 'penanya' }, createdAt: new Date(), comments: [], _count: { comments: 0 }, upvoteCount: 0 },
+      ]);
+      mockPrisma.profileQuestion.count.mockResolvedValue(1);
+      const res = await service.getProfileQuestions('owner-name', 1, 20, 'recent', 'receiver-1');
+      expect(res.questions[0].askerId).toBe('asker-9');
+    });
   });
 
   describe('getComments', () => {

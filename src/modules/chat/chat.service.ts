@@ -700,6 +700,93 @@ export class ChatService {
   }
 
   // ============================================================
+  // PRF-002 — DM get-or-create tanpa pesan pertama
+  // ============================================================
+
+  /**
+   * Buka (atau pakai ulang) room DM dengan user lain — tanpa pesan pertama.
+   * Dipakai tombol "Kirim Pesan" di profil (perilaku WhatsApp).
+   *
+   * Room bertipe INQUIRY seperti jalur nego pra-transaksi, supaya taksonomi
+   * room tidak berubah dan tidak perlu migrasi. Bedanya dengan
+   * `createInquiry`: tidak ada pesan pertama yang wajib diisi dan tidak ada
+   * moderasi pesan — room boleh kosong sampai salah satu pihak mengirim.
+   */
+  async getOrCreateDm(userId: string, username: string): Promise<object> {
+    const normalized = username.toLowerCase();
+    const counterpart = await this.prisma.user.findUnique({
+      where: { username: normalized },
+      select: { id: true, isActive: true, isBanned: true },
+    });
+    if (!counterpart || !counterpart.isActive || counterpart.isBanned) {
+      throw new NotFoundException({
+        code: ErrorCodes.CHAT_COUNTERPART_NOT_FOUND,
+        message: 'User not found or unavailable',
+      });
+    }
+    if (counterpart.id === userId) {
+      throw new BadRequestException({
+        code: ErrorCodes.CHAT_INQUIRY_SELF,
+        message: 'You cannot open a conversation with yourself',
+      });
+    }
+
+    await this.assertNotBlocked(userId, counterpart.id);
+
+    // Pasangan disimpan dalam urutan kanonik agar partial unique index
+    // (`chat_rooms_inquiry_pair_key`) benar-benar mencegah room ganda.
+    const [initiatorId, counterpartId] = [userId, counterpart.id].sort();
+
+    let room = await this.prisma.chatRoom.findFirst({
+      where: { type: 'INQUIRY', initiatorId, counterpartId, deletedAt: null },
+      select: { id: true, status: true },
+    });
+
+    if (!room) {
+      // Batasi pembuatan room baru (anti-spam), sama seperti inquiry.
+      const activeCount = await this.prisma.chatRoom.count({
+        where: {
+          type: 'INQUIRY',
+          deletedAt: null,
+          status: 'ACTIVE',
+          OR: [{ initiatorId: userId }, { counterpartId: userId }],
+        },
+      });
+      if (activeCount >= CHAT_INQUIRY_MAX_ACTIVE_PER_USER) {
+        throw new BadRequestException({
+          code: ErrorCodes.CHAT_INQUIRY_LIMIT_REACHED,
+          message: `You cannot open more than ${CHAT_INQUIRY_MAX_ACTIVE_PER_USER} active conversations`,
+        });
+      }
+      room = await this.prisma.chatRoom.create({
+        data: {
+          type: 'INQUIRY',
+          status: 'ACTIVE',
+          initiatorId,
+          counterpartId,
+          members: {
+            create: [
+              { userId: initiatorId, role: 'INITIATOR' },
+              { userId: counterpartId, role: 'COUNTERPART' },
+            ],
+          },
+        },
+        select: { id: true, status: true },
+      });
+    }
+
+    return {
+      room: {
+        id: room.id,
+        type: 'INQUIRY',
+        status: room.status,
+        initiatorId,
+        counterpartId,
+      },
+    };
+  }
+
+  // ============================================================
   // Messages
   // ============================================================
 
@@ -1967,11 +2054,27 @@ export class ChatService {
    *
    * Pesan terhapus otomatis tersembunyi dari kueri Prisma biasa (middleware
    * soft delete), jadi butuh kueri khusus dengan `deletedAt` eksplisit.
+   *
+   * PRF-002: HANYA room transaksi (tipe ORDER) yang boleh dibaca admin —
+   * room DM pribadi (INQUIRY) tidak boleh dimasuki admin, sesuai kebijakan
+   * privasi. Jalur dispute sudah me-resolve room via orderId sehingga selalu
+   * ORDER.
    */
   async getRoomMessagesForAdmin(
     roomId: string,
     options: { limit?: number; cursor?: string; includeDeleted?: boolean } = {},
   ): Promise<object> {
+    const room = await this.prisma.chatRoom.findUnique({
+      where: { id: roomId },
+      select: { type: true },
+    });
+    if (!room || room.type !== 'ORDER') {
+      throw new ForbiddenException({
+        code: ErrorCodes.FORBIDDEN,
+        message: 'Admin can only read transaction (ORDER) chat rooms',
+      });
+    }
+
     const safeLimit = Math.min(Math.max(1, options.limit ?? 50), 100);
     const includeDeleted = options.includeDeleted === true;
 

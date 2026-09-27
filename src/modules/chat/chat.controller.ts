@@ -16,6 +16,7 @@ import { AddReactionDto } from './dto/reaction.dto';
 import { ForwardMessageDto } from './dto/forward-message.dto';
 import { ArchiveRoomDto, MuteRoomDto } from './dto/room-state.dto';
 import { CreateInquiryDto } from './dto/create-inquiry.dto';
+import { CreateDmDto } from './dto/create-dm.dto';
 import { PhoneVerifiedGuard } from '../../common/guards/phone-verified.guard';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import {
@@ -73,6 +74,23 @@ export class ChatController {
     @Body() dto: CreateInquiryDto,
   ): Promise<object> {
     return this.chatService.createInquiry(userId, dto);
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Post('dm')
+  @ApiOperation({
+    summary: 'Open or reuse a DM room',
+    description:
+      'Get-or-create a direct conversation room with another user by username, without ' +
+      'requiring a first message (WhatsApp-like "Kirim Pesan" from a profile). Reuses the ' +
+      'existing INQUIRY room when one exists; otherwise creates an empty one.',
+  })
+  async getOrCreateDm(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: CreateDmDto,
+  ): Promise<object> {
+    return this.chatService.getOrCreateDm(userId, dto.username);
   }
 
   @Get('search')

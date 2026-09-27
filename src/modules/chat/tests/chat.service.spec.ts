@@ -717,6 +717,7 @@ describe('ChatService', () => {
 
   describe('getRoomMessagesForAdmin', () => {
     it('INCLUDES deleted content for dispute resolvers', async () => {
+      mockPrisma.chatRoom.findUnique.mockResolvedValue({ id: 'room-1', type: 'ORDER' });
       mockPrisma.chatMessage.findMany.mockResolvedValue([
         messageFixture({ id: 'msg-1', isDeleted: true, content: null, deletedContent: 'isi asli yang dihapus' }),
       ]);
@@ -724,6 +725,12 @@ describe('ChatService', () => {
         messages: { deletedContent?: string }[];
       };
       expect(result.messages[0].deletedContent).toBe('isi asli yang dihapus');
+    });
+
+    it('PRF-002: REJECTS reading a private DM (INQUIRY) room as admin', async () => {
+      mockPrisma.chatRoom.findUnique.mockResolvedValue({ id: 'room-dm-1', type: 'INQUIRY' });
+      await expect(service.getRoomMessagesForAdmin('room-dm-1')).rejects.toThrow(ForbiddenException);
+      expect(mockPrisma.chatMessage.findMany).not.toHaveBeenCalled();
     });
 
     it('HIDES deleted content from the participant-facing serializer', async () => {
@@ -858,4 +865,82 @@ describe('ChatService', () => {
   });
 
   void BadRequestException;
+});
+
+describe('ChatService.getOrCreateDm (PRF-002)', () => {
+  let service: ChatService;
+
+  beforeEach(async () => {
+    jest.resetAllMocks();
+    mockPrisma.blockList.findFirst.mockResolvedValue(null);
+    mockPrisma.chatRoom.count.mockResolvedValue(0);
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        ChatService,
+        { provide: PrismaService, useValue: mockPrisma },
+        { provide: RealtimeService, useValue: mockRealtime },
+        { provide: ConfigService, useValue: mockConfig },
+        { provide: VerificationBadgeService, useValue: mockVerificationBadge },
+        { provide: NotificationsService, useValue: mockNotifications },
+      ],
+    }).compile();
+    service = module.get<ChatService>(ChatService);
+  });
+
+  const activeUser = { id: 'user-b', isActive: true, isBanned: false };
+
+  it('reuses the existing INQUIRY room without creating a new one', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(activeUser);
+    mockPrisma.chatRoom.findFirst.mockResolvedValue({ id: 'room-x', status: 'ACTIVE' });
+    const res = await service.getOrCreateDm('user-a', 'PenjualHebat') as any;
+    expect(mockPrisma.user.findUnique).toHaveBeenCalledWith({
+      where: { username: 'penjualhebat' },
+      select: { id: true, isActive: true, isBanned: true },
+    });
+    expect(mockPrisma.chatRoom.create).not.toHaveBeenCalled();
+    expect(res.room.id).toBe('room-x');
+    expect(res.room.type).toBe('INQUIRY');
+  });
+
+  it('creates a room with canonical pair ordering when none exists', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(activeUser);
+    mockPrisma.chatRoom.findFirst.mockResolvedValue(null);
+    mockPrisma.chatRoom.create.mockResolvedValue({ id: 'room-new', status: 'ACTIVE' });
+    const res = await service.getOrCreateDm('user-a', 'penjual') as any;
+    expect(mockPrisma.chatRoom.create).toHaveBeenCalled();
+    const data = mockPrisma.chatRoom.create.mock.calls[0][0].data;
+    // 'user-a' < 'user-b' → initiatorId harus yang lebih kecil (kanonik).
+    expect(data.initiatorId).toBe('user-a');
+    expect(data.counterpartId).toBe('user-b');
+    expect(data.type).toBe('INQUIRY');
+    expect(res.room.id).toBe('room-new');
+  });
+
+  it('rejects opening a DM with yourself', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-a', isActive: true, isBanned: false });
+    await expect(service.getOrCreateDm('user-a', 'saya-sendiri')).rejects.toThrow(BadRequestException);
+    expect(mockPrisma.chatRoom.create).not.toHaveBeenCalled();
+  });
+
+  it('throws NotFound for unknown or banned counterpart', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(null);
+    await expect(service.getOrCreateDm('user-a', 'hantu')).rejects.toThrow(NotFoundException);
+    mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-b', isActive: true, isBanned: true });
+    await expect(service.getOrCreateDm('user-a', 'banned')).rejects.toThrow(NotFoundException);
+  });
+
+  it('rejects when a block relation exists', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(activeUser);
+    mockPrisma.blockList.findFirst.mockResolvedValue({ id: 'block-1' });
+    await expect(service.getOrCreateDm('user-a', 'penjual')).rejects.toThrow(ForbiddenException);
+    expect(mockPrisma.chatRoom.create).not.toHaveBeenCalled();
+  });
+
+  it('enforces the active-conversation limit on create', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(activeUser);
+    mockPrisma.chatRoom.findFirst.mockResolvedValue(null);
+    mockPrisma.chatRoom.count.mockResolvedValue(30);
+    await expect(service.getOrCreateDm('user-a', 'penjual')).rejects.toThrow(BadRequestException);
+    expect(mockPrisma.chatRoom.create).not.toHaveBeenCalled();
+  });
 });

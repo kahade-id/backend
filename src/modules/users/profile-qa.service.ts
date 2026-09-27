@@ -40,7 +40,7 @@ interface CommentResponse { id: string; content: string; parentId: string | null
 interface PaginatedQuestions {
   questions: Array<{
     id: string; content: string; answer: string | null; answeredAt: Date | null;
-    askerUsername: string | null; asker: UserSummary | null; createdAt: Date;
+    askerId: string; askerUsername: string | null; asker: UserSummary | null; createdAt: Date;
     comments?: Array<{ id: string; content: string; parentId: string | null; createdAt: Date; author: UserSummary }>;
     commentCount: number; isPublic?: boolean; receiver?: UserSummary | null;
     // Section 4: upvote
@@ -212,11 +212,22 @@ export class ProfileQAService {
     const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 50) : 20;
     const skip = (safePage - 1) * safeLimit;
+    // PRF-001: pertanyaan yang belum dijawab tetap terlihat oleh pemilik
+    // profil dan oleh penanyanya sendiri. Sebelumnya filter `answeredAt`
+    // mutlak membuat pertanyaan "hilang" dari tab Utas sampai dijawab —
+    // penanya mengira kirimnya gagal. Publik lain tetap hanya melihat
+    // yang sudah dijawab (by design).
+    const isOwner = viewerId === user.id;
+    const answerVisibility = isOwner
+      ? {}
+      : viewerId
+        ? { OR: [{ answeredAt: { not: null } }, { askerId: viewerId }] }
+        : { answeredAt: { not: null } };
     const publicQuestionWhere = {
       receiverId: user.id,
       isPublic: true,
       isHidden: false,
-      answeredAt: { not: null },
+      ...answerVisibility,
       asker: { isActive: true, isBanned: false, deletedAt: null, profileVisible: true },
     };
     const orderBy =
@@ -251,6 +262,7 @@ export class ProfileQAService {
         content: q.question,
         answer: q.answer,
         answeredAt: q.answeredAt,
+        askerId: q.askerId,
         askerUsername: q.asker?.username ?? null,
         asker: q.asker,
         createdAt: q.createdAt,
@@ -319,6 +331,7 @@ export class ProfileQAService {
         answer: q.answer,
         answeredAt: q.answeredAt,
         isPublic: q.isPublic,
+        askerId: q.askerId,
         askerUsername: q.asker?.username ?? null,
         asker: q.asker,
         receiver: q.receiver,

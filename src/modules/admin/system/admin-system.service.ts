@@ -32,6 +32,10 @@ const FINANCIAL_CONFIG_KEYS = [
   'payment_fee',
   'escrow_fee',
   'fee_savings_limit',
+  // ADM-205 review fix (2026-09-27): threshold dual-approval withdrawal adalah
+  // parameter keamanan maker-checker — perubahannya wajib lewat alur
+  // pending-approval dua admin (isFinancialConfig memakai substring match).
+  'dual_approval',
 ];
 
 @Injectable()

@@ -766,6 +766,7 @@ export class AuthService {
     userId: string,
     newPhoneNumber: string,
     code: string,
+    opts?: { location?: LocationDto | null; ipAddress?: string; deviceId?: string },
   ): Promise<{ message: string }> {
     const normalizedPhone = this.normalizePhoneNumber(newPhoneNumber);
     const phoneHash = hashPhoneNumber(normalizedPhone);
@@ -873,6 +874,18 @@ export class AuthService {
         templateContext: {},
       }).catch(() => undefined);
     }
+
+    // Lokasi presisi: event 'phone_change' sudah didefinisikan di
+    // AuthLocationService namun belum pernah dicatat — catat di sini
+    // (tidak double: tidak ada di ActionLocationType).
+    await this.locationService.logEvent({
+      userId,
+      event: 'phone_change',
+      location: opts?.location ?? null,
+      ipAddress: opts?.ipAddress ?? undefined,
+      deviceId: opts?.deviceId,
+    });
+
     return { message: 'Phone number updated. Please log in again on your devices.' };
   }
 

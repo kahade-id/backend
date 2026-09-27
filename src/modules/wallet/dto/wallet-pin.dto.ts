@@ -1,5 +1,7 @@
-import { IsString, IsOptional, Length, Matches, MinLength, ValidateIf } from 'class-validator';
+import { IsString, IsOptional, Length, Matches, MinLength, ValidateIf, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { LocationDto } from '../../auth/dto/location.dto';
 
 export class SetPinDto {
   @ApiProperty({ description: 'New wallet PIN (6 digits)', minLength: 6, maxLength: 6 })
@@ -25,6 +27,12 @@ export class SetPinDto {
   @MinLength(1, { message: 'Password is required when changing an existing PIN' })
   @IsOptional()
   password?: string;
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)', type: () => LocationDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LocationDto)
+  deviceLocation?: LocationDto | null;
 }
 
 export class VerifyPinDto {

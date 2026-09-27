@@ -7,10 +7,12 @@ import {
   Max,
   MinLength,
   MaxLength,
+  ValidateNested,
 } from 'class-validator';
-import { Transform } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { FeeResponsibility, OrderType } from '@prisma/client';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { LocationDto } from '../../auth/dto/location.dto';
 import {
   ORDER_MIN_VALUE,
   ORDER_MAX_VALUE,
@@ -96,4 +98,10 @@ export class CreateOrderDto {
   @IsString()
   @MaxLength(100)
   inquiryRoomId?: string;
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)', type: () => LocationDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LocationDto)
+  deviceLocation?: LocationDto | null;
 }

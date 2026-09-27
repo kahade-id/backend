@@ -1,10 +1,11 @@
 import {
   IsString, IsOptional, IsEnum, IsArray, IsNumber, IsInt,
-  Min, Max, MinLength, MaxLength, ArrayMaxSize, IsIn,
+  Min, Max, MinLength, MaxLength, ArrayMaxSize, IsIn, ValidateNested,
 } from 'class-validator';
-import { Transform } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { FeeResponsibility } from '@prisma/client';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { LocationDto } from '../../auth/dto/location.dto';
 import { ORDER_MIN_VALUE, ORDER_MAX_VALUE } from '../../../common/constants/app.constants';
 
 function sanitizeText(value: unknown): unknown {
@@ -113,6 +114,12 @@ export class CancelOrderDto {
   @MaxLength(500)
   @Transform(({ value }: { value: unknown }) => sanitizeText(value))
   note?: string;
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)', type: () => LocationDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LocationDto)
+  deviceLocation?: LocationDto | null;
 }
 
 // Re-export Prisma enum agar DTO dan schema.prisma tetap sinkron
@@ -146,6 +153,12 @@ export class SubmitDisputeDto {
   @ArrayMaxSize(10)
   @IsIn(['image/jpeg', 'image/png', 'image/webp', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm'], { each: true, message: 'Invalid file type. Allowed: image/jpeg, image/png, image/webp, application/pdf, video/mp4, video/quicktime, video/webm' })
   fileTypes?: string[];
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)', type: () => LocationDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LocationDto)
+  deviceLocation?: LocationDto | null;
 }
 
 export class ValidateCounterpartDto {
@@ -162,4 +175,24 @@ export class PayOrderDto {
   @MinLength(6)
   @MaxLength(6)
   pin!: string;
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)', type: () => LocationDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LocationDto)
+  deviceLocation?: LocationDto | null;
+}
+
+/**
+ * Body opsional untuk POST :orderId/complete (konfirmasi terima barang).
+ * Endpoint sebelumnya tanpa body — DTO semua-opsional agar klien lama
+ * tanpa body tetap lolos validasi (ValidationPipe mengubah body kosong
+ * menjadi {}).
+ */
+export class ConfirmReceiptDto {
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)', type: () => LocationDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LocationDto)
+  deviceLocation?: LocationDto | null;
 }

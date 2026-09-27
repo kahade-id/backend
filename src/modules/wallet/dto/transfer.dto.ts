@@ -9,9 +9,11 @@ import {
   Length,
   IsOptional,
   MaxLength,
+  ValidateNested,
 } from 'class-validator';
-import { Transform } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { LocationDto } from '../../auth/dto/location.dto';
 import {
   WALLET_MIN_TRANSFER,
   WALLET_MAX_TRANSFER_PER_TX,
@@ -59,4 +61,10 @@ export class TransferDto {
   @IsString()
   @MaxLength(200, { message: 'Note must be at most 200 characters' })
   note?: string;
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)', type: () => LocationDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LocationDto)
+  deviceLocation?: LocationDto | null;
 }

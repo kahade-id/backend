@@ -1,8 +1,9 @@
 import {
-  Controller, Get, Put, Patch, Delete, Post, Body, Query, Param, Headers,
+  Controller, Get, Put, Patch, Delete, Post, Body, Query, Param, Headers, Req,
   ParseIntPipe, DefaultValuePipe, BadRequestException, UseGuards,
   UseInterceptors, UploadedFile,
 } from '@nestjs/common';
+import { Request } from 'express';
 import { ParseIdPipe } from '../../common/pipes/parse-id.pipe';
 import { ParseUsernamePipe } from '../../common/pipes/parse-username.pipe';
 import { ClampLimitPipe } from '../../common/pipes/clamp-limit.pipe';
@@ -34,6 +35,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
 import { Public } from '../../common/decorators/public.decorator';
 import { UpdateProfileDto } from './dto/update-profile.dto';
+import { extractLocationContext } from '../action-location/action-location.util';
 import { ConfirmAvatarDto } from './dto/confirm-avatar.dto';
 import { ReportUserDto } from './dto/report-user.dto';
 import { UpdateLinksDto } from './dto/update-links.dto';
@@ -233,9 +235,11 @@ export class UsersController {
     @CurrentUser('sub') userId: string,
     @CurrentUser('jti') accessTokenJti: string,
     @Body() dto: RequestAccountDeletionDto,
+    @Req() req: Request,
     @Headers('x-idempotency-key') idempotencyKey?: string,
   ): Promise<DeletionRequestResult> {
-    return this.usersService.requestAccountDeletion(userId, accessTokenJti, dto.password, dto.reason, dto.mfaCode, dto.otpCode, idempotencyKey);
+    const ctx = extractLocationContext(req, dto);
+    return this.usersService.requestAccountDeletion(userId, accessTokenJti, dto.password, dto.reason, dto.mfaCode, dto.otpCode, idempotencyKey, ctx);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 10 } })

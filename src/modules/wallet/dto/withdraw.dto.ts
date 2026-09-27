@@ -1,6 +1,7 @@
-import { IsNumber, IsInt, Min, Max, IsString, IsNotEmpty, Matches, Length } from 'class-validator';
-import { Transform } from 'class-transformer';
-import { ApiProperty } from '@nestjs/swagger';
+import { IsNumber, IsInt, Min, Max, IsString, IsNotEmpty, IsOptional, Matches, Length, ValidateNested } from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { LocationDto } from '../../auth/dto/location.dto';
 import { WALLET_MIN_WITHDRAW, WALLET_DAILY_WITHDRAW_LIMIT } from '../../../common/constants/app.constants';
 import { IsValidId } from '../../../common/decorators/is-valid-id.decorator';
 
@@ -30,4 +31,10 @@ export class WithdrawDto {
   @Length(6, 6, { message: 'Wallet PIN must be exactly 6 digits' })
   @Matches(/^\d{6}$/, { message: 'Wallet PIN must consist of 6 numeric digits' })
   pin!: string;
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)', type: () => LocationDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LocationDto)
+  deviceLocation?: LocationDto | null;
 }

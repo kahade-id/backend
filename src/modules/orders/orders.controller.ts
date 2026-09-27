@@ -35,8 +35,10 @@ import {
   SubmitDisputeDto,
   ValidateCounterpartDto,
   PayOrderDto,
+  ConfirmReceiptDto,
 } from './dto/order-actions.dto';
 import { ConfirmDeliveryDto, SubmitDeliveryProofDto, RejectDeliveryDto } from './dto/delivery-proof.dto';
+import { extractLocationContext } from '../action-location/action-location.util';
 
 @ApiTags('orders')
 @ApiBearerAuth('access-token')
@@ -126,6 +128,7 @@ export class OrdersController {
   async createOrder(
     @CurrentUser('sub') userId: string,
     @Body() dto: CreateOrderDto,
+    @Req() req: Request,
   ): Promise<{
     orderId: string;
     status: string;
@@ -142,7 +145,7 @@ export class OrdersController {
     };
     confirmationDeadlineAt: Date | null;
   }> {
-    return this.ordersService.createOrder(userId, dto);
+    return this.ordersService.createOrder(userId, dto, extractLocationContext(req, dto));
   }
 
   @Get()
@@ -204,7 +207,7 @@ export class OrdersController {
     @Body() dto: PayOrderDto,
     @Req() req: Request,
   ): Promise<PayOrderResult> {
-    return this.orderStateService.handlePayOrder(orderId, userId, dto.pin, req.ip);
+    return this.orderStateService.handlePayOrder(orderId, userId, dto.pin, req.ip, extractLocationContext(req, dto));
   }
 
   @UseGuards(UserThrottleGuard)
@@ -257,8 +260,10 @@ export class OrdersController {
   async completeOrder(
     @CurrentUser('sub') userId: string,
     @Param('orderId', ParseIdPipe) orderId: string,
+    @Body() dto: ConfirmReceiptDto,
+    @Req() req: Request,
   ): Promise<CompleteOrderResult> {
-    return this.orderStateService.handleCompleteOrder(orderId, userId);
+    return this.orderStateService.handleCompleteOrder(orderId, userId, extractLocationContext(req, dto));
   }
 
   @UseGuards(UserThrottleGuard)
@@ -270,8 +275,9 @@ export class OrdersController {
     @CurrentUser('sub') userId: string,
     @Param('orderId', ParseIdPipe) orderId: string,
     @Body() dto: CancelOrderDto,
+    @Req() req: Request,
   ): Promise<CancelOrderResult> {
-    return this.orderStateService.handleCancelOrder(orderId, userId, dto.reason, dto.note);
+    return this.orderStateService.handleCancelOrder(orderId, userId, dto.reason, dto.note, extractLocationContext(req, dto));
   }
 
   @UseGuards(UserThrottleGuard)
@@ -317,8 +323,9 @@ export class OrdersController {
     @CurrentUser('sub') userId: string,
     @Param('orderId', ParseIdPipe) orderId: string,
     @Body() dto: SubmitDisputeDto,
+    @Req() req: Request,
   ): Promise<object> {
-    return this.disputesService.submitDispute(orderId, userId, dto);
+    return this.disputesService.submitDispute(orderId, userId, dto, extractLocationContext(req, dto));
   }
 
   @Get(':orderId/history')

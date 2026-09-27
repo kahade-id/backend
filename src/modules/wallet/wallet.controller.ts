@@ -18,6 +18,7 @@ import { ResendWithdrawOtpDto } from './dto/resend-withdraw-otp.dto';
 import { SetPinDto, VerifyPinDto } from './dto/wallet-pin.dto';
 import { ExportCsvDto } from './dto/export-csv.dto';
 import { TransferDto } from './dto/transfer.dto';
+import { extractLocationContext } from '../action-location/action-location.util';
 import { TopupFeeEstimateDto } from './dto/topup-fee-estimate.dto';
 import { formatWIBDate } from '../../common/utils/date.util';
 
@@ -58,8 +59,8 @@ export class WalletController {
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 900000, limit: 10 } })
   @Idempotency()
-  async topup(@CurrentUser('sub') userId: string, @Body() dto: TopupDto): Promise<object> {
-    return this.walletService.topup(userId, dto.amount, dto.method, dto.cardToken, dto.voucherCode);
+  async topup(@CurrentUser('sub') userId: string, @Body() dto: TopupDto, @Req() req: Request): Promise<object> {
+    return this.walletService.topup(userId, dto.amount, dto.method, dto.cardToken, dto.voucherCode, extractLocationContext(req, dto));
   }
 
   @Post('withdraw')
@@ -67,7 +68,7 @@ export class WalletController {
   @Throttle({ default: { ttl: 900000, limit: 5 } })
   @Idempotency()
   async withdraw(@CurrentUser('sub') userId: string, @Body() dto: WithdrawDto, @Req() req: Request): Promise<object> {
-    return this.walletService.withdraw(userId, dto.amount, dto.bankAccountId, dto.pin, req.ip);
+    return this.walletService.withdraw(userId, dto.amount, dto.bankAccountId, dto.pin, req.ip, extractLocationContext(req, dto));
   }
 
   @Post('transfer')
@@ -76,7 +77,7 @@ export class WalletController {
   @Idempotency()
   @ApiOperation({ summary: 'Transfer funds to another KYC-verified user' })
   async transfer(@CurrentUser('sub') userId: string, @Body() dto: TransferDto, @Req() req: Request): Promise<object> {
-    return this.walletService.transfer(userId, dto.recipientId, dto.amount, dto.pin, dto.note, req.ip);
+    return this.walletService.transfer(userId, dto.recipientId, dto.amount, dto.pin, dto.note, req.ip, extractLocationContext(req, dto));
   }
 
   @Get('transfer/lookup')
@@ -165,7 +166,7 @@ export class WalletController {
     @Body() dto: SetPinDto,
     @Req() req: Request,
   ): Promise<{ message: string }> {
-    return this.walletService.setPin(userId, dto.pin, dto.currentPin, dto.password, req.ip);
+    return this.walletService.setPin(userId, dto.pin, dto.currentPin, dto.password, req.ip, extractLocationContext(req, dto));
   }
 
   @Post('verify-pin')

@@ -1,4 +1,5 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger, Optional } from '@nestjs/common';
+import { ActionLocationService, type ActionLocationContext } from '../action-location/action-location.service';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
@@ -63,6 +64,9 @@ export class UsersService {
     private localStorage: LocalStorageService,
     // GAP-A: status & pembatalan penghapusan akun (request row, OTP, cancel).
     private accountDeletionService: AccountDeletionService,
+    // Lokasi presisi aksi sensitif — @Optional() agar unit test lama yang
+    // tidak menyediakan provider tetap lolos.
+    @Optional() private actionLocationService?: ActionLocationService,
   ) {}
 
   async getMyProfile(userId: string): Promise<object> {
@@ -986,6 +990,7 @@ export class UsersService {
     mfaCode?: string,
     otpCode?: string,
     idempotencyKey?: string,
+    ctx?: ActionLocationContext,
   ): Promise<DeletionRequestResult> {
     // G072: idempoten — kunci duplikat atau request aktif yang sudah ada
     // mengembalikan request yang sama (tanpa membuat duplikat / tanpa
@@ -1222,6 +1227,17 @@ export class UsersService {
     // menggagalkan request yang sudah ter-commit).
     await this.accountDeletionService.notifyRequestCreated(userId, requestResult).catch((err) => {
       this.logger.warn(`[deletion] notifyRequestCreated failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+
+    // Lokasi presisi tiap aksi sensitif — best-effort, tidak pernah throw.
+    await this.actionLocationService?.logAction({
+      userId,
+      actionType: 'ACCOUNT_DELETE',
+      referenceType: 'ACCOUNT_DELETION',
+      referenceId: requestResult.referenceCode,
+      location: ctx?.location,
+      ipAddress: ctx?.ipAddress,
+      deviceId: ctx?.deviceId,
     });
 
     return requestResult;

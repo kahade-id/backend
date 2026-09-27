@@ -1,4 +1,5 @@
-import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, Logger, Optional } from '@nestjs/common';
+import { ActionLocationService, type ActionLocationContext } from '../action-location/action-location.service';
 import { randomInt } from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
@@ -55,6 +56,9 @@ export class DisputesService {
     private serialService: WalletTxSerialService,
     private uploadService: UploadService,
     private auditLog: AuditLogService,
+    // Lokasi presisi aksi sensitif — @Optional() agar unit test lama yang
+    // tidak menyediakan provider tetap lolos.
+    @Optional() private actionLocationService?: ActionLocationService,
   ) {}
 
   // C-18: same predicate as `mutual-resolution.service.ts:521` and `order-state.service.ts:582`.
@@ -705,7 +709,7 @@ export class DisputesService {
     return claimResult;
   }
 
-  async submitDispute(orderId: string, userId: string, dto: { claim: string; category: DisputeCategory; fileUrls?: string[]; fileTypes?: string[] }): Promise<{ disputeId: string; status: string }> {
+  async submitDispute(orderId: string, userId: string, dto: { claim: string; category: DisputeCategory; fileUrls?: string[]; fileTypes?: string[] }, ctx?: ActionLocationContext): Promise<{ disputeId: string; status: string }> {
     const normalizedClaim = dto.claim.trim();
     if (normalizedClaim.length < 20) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Claim must contain at least 20 non-whitespace characters' });
@@ -832,6 +836,18 @@ export class DisputesService {
     this.runRealtimeBestEffort(() => this.prisma.emitNotificationCreated({ userId: counterpartId, title: 'Dispute Filed', body: `Dispute filed for order ${order.orderId}`, data: { type: 'DISPUTE_SUBMITTED', disputeId: createdDispute.id } }), `SUBMIT_DISPUTE_NOTIFICATION orderId=${order.orderId}`);
 
     this.logger.log(`Dispute created: disputeId=${createdDispute.disputeId}, orderId=${orderId}, initiator=${userId}`);
+
+    // Lokasi presisi tiap aksi sensitif — best-effort, tidak pernah throw.
+    await this.actionLocationService?.logAction({
+      userId,
+      actionType: 'DISPUTE_OPEN',
+      referenceType: 'DISPUTE',
+      referenceId: createdDispute.disputeId,
+      location: ctx?.location,
+      ipAddress: ctx?.ipAddress,
+      deviceId: ctx?.deviceId,
+    });
+
     return { disputeId: createdDispute.disputeId, status: 'OPEN' };
   }
 
@@ -1027,7 +1043,7 @@ export class DisputesService {
       .catch((err: unknown) => this.logger.warn(`silent-catch: assigned-admin notification failed: ${err instanceof Error ? err.message : String(err)}`));
   }
 
-  async escalateDispute(disputeId: string, userId: string, reason?: string): Promise<Record<string, unknown>> {
+  async escalateDispute(disputeId: string, userId: string, reason?: string, ctx?: ActionLocationContext): Promise<Record<string, unknown>> {
     const dispute = await this.prisma.dispute.findFirst({
       where: { OR: [{ id: disputeId }, { disputeId }] },
       include: { order: { select: { buyerId: true, sellerId: true } } },
@@ -1120,6 +1136,18 @@ export class DisputesService {
         ipAddress: 'system',
       },
     }).catch((err: unknown) => this.logger.error(`Manual escalation admin audit failed for dispute ${dispute.disputeId}: ${err instanceof Error ? err.message : String(err)}`));
+
+    // Eskalasi = fungsi "banding" bagi user — catat lokasi presisi.
+    // Best-effort, tidak pernah throw.
+    await this.actionLocationService?.logAction({
+      userId,
+      actionType: 'DISPUTE_APPEAL',
+      referenceType: 'DISPUTE',
+      referenceId: dispute.disputeId,
+      location: ctx?.location,
+      ipAddress: ctx?.ipAddress,
+      deviceId: ctx?.deviceId,
+    });
 
     return { disputeId: updated.disputeId, status: updated.status, escalatedAt: new Date() };
   }

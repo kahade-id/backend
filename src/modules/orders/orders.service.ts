@@ -1,6 +1,7 @@
-import { Injectable, BadRequestException, NotFoundException, ForbiddenException, ConflictException, Logger } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, ForbiddenException, ConflictException, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
+import { ActionLocationService, type ActionLocationContext } from '../action-location/action-location.service';
 import { RedisService } from '../../redis/redis.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { FeeCalculatorService } from './fee-calculator.service';
@@ -65,6 +66,10 @@ export class OrdersService {
     private configService: ConfigService,
     private notificationQueue: NotificationQueueService,
     private subscriptionsService: SubscriptionsService,
+    // Lokasi presisi aksi sensitif — @Optional() agar unit test lama yang
+    // tidak menyediakan provider tetap lolos; di produksi modul global
+    // ActionLocationModule selalu menyediakannya.
+    @Optional() private actionLocationService?: ActionLocationService,
   ) {
     this.configuredMinOrderValue = this.configService.get<number>('app.orderMinValue') ?? ORDER_MIN_VALUE;
     this.configuredMaxOrderValue = this.configService.get<number>('app.orderMaxValue') ?? ORDER_MAX_VALUE;
@@ -217,6 +222,7 @@ export class OrdersService {
       attachments?: string[];
       inquiryRoomId?: string;
     },
+    ctx?: ActionLocationContext,
   ): Promise<{
     orderId: string;
     status: OrderStatus;
@@ -233,10 +239,21 @@ export class OrdersService {
     };
     confirmationDeadlineAt: Date | null;
   }> {
-    return withSpan('order.create', () => this.createOrderTx(userId, dto), {
+    const result = await withSpan('order.create', () => this.createOrderTx(userId, dto), {
       orderType: dto.orderType,
       currency: 'IDR',
     });
+    // Lokasi presisi tiap aksi sensitif — best-effort, tidak pernah throw.
+    await this.actionLocationService?.logAction({
+      userId,
+      actionType: 'ORDER_CREATE',
+      referenceType: 'ORDER',
+      referenceId: result.orderId,
+      location: ctx?.location,
+      ipAddress: ctx?.ipAddress,
+      deviceId: ctx?.deviceId,
+    });
+    return result;
   }
 
   private async createOrderTx(

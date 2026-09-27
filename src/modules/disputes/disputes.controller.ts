@@ -1,4 +1,5 @@
-import { Controller, Get, Post, Delete, Body, Param, Query, UseGuards, HttpCode } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Body, Param, Query, UseGuards, HttpCode, Req } from '@nestjs/common';
+import { Request } from 'express';
 import { ParseIdPipe } from '../../common/pipes/parse-id.pipe';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
@@ -15,6 +16,8 @@ import { PaginationDto, PaginatedResponse } from '../../common/dto/pagination.dt
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import { SubmitEvidenceDto, ALLOWED_EVIDENCE_MIME_TYPES } from './dto/submit-evidence.dto';
 import { SubmitClaimDto } from './dto/submit-claim.dto';
+import { EscalateDisputeDto } from './dto/escalate-dispute.dto';
+import { extractLocationContext } from '../action-location/action-location.util';
 
 class DisputeMessageAttachmentDto {
   @IsString()
@@ -337,8 +340,9 @@ export class DisputesController {
   async escalateDispute(
     @CurrentUser('sub') userId: string,
     @Param('disputeId', ParseIdPipe) disputeId: string,
-    @Body() dto: { reason?: string },
+    @Body() dto: EscalateDisputeDto,
+    @Req() req: Request,
   ): Promise<object> {
-    return this.disputesService.escalateDispute(disputeId, userId, dto.reason);
+    return this.disputesService.escalateDispute(disputeId, userId, dto.reason, extractLocationContext(req, dto));
   }
 }

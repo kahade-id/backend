@@ -1,4 +1,7 @@
-import { IsOptional, IsString, Matches, MaxLength, MinLength } from 'class-validator';
+import { IsOptional, IsString, Matches, MaxLength, MinLength, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { LocationDto } from './location.dto';
 
 export class RequestPhoneChangeDto {
   @IsString()
@@ -30,4 +33,10 @@ export class ConfirmPhoneChangeDto {
   @IsString()
   @Matches(/^\d{6}$/)
   code!: string;
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)', type: () => LocationDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LocationDto)
+  deviceLocation?: LocationDto | null;
 }

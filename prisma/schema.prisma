@@ -740,6 +740,7 @@ model User {
   // ada) tetap NULL — badge tetap tampil, earnedAt-nya fallback ke memberSince.
   phoneVerifiedAt  DateTime?
   authLocationLogs AuthLocationLog[]
+  actionLocations  ActionLocation[]
   dateOfBirth      DateTime?         @db.Date
   gender           Gender?
   address          String?           @db.VarChar(500)
@@ -1088,6 +1089,60 @@ model AuthLocationLog {
 }
 
 // ============================================================
+// ACTION LOCATIONS — lokasi presisi saat aksi sensitif non-auth
+// (order, wallet, dispute, hapus akun). Dipakai untuk security
+// log & deteksi lokasi baru. Best-effort: kegagalan tulis log
+// TIDAK boleh menggagalkan aksi utama.
+// - latitude/longitude NULL + locationDenied=true bila user
+//   menolak izin GPS (fallback IP via kolom ipAddress).
+// - referenceType/referenceId menautkan log ke entitas bisnis
+//   ('ORDER'/'WALLET_TX'/'DISPUTE'/'ACCOUNT_DELETION' + id publik).
+// - phone_change / email_change / password_reset / password_change
+//   TIDAK di sini — sudah dicakup auth_location_logs via
+//   AuthLocationService (satu tempat, tanpa double-log).
+// ============================================================
+
+enum ActionLocationType {
+  ORDER_CREATE
+  ORDER_PAY
+  ORDER_CONFIRM_RECEIPT
+  ORDER_CANCEL
+  WALLET_TOPUP
+  WALLET_WITHDRAW
+  WALLET_TRANSFER
+  WALLET_PIN_CHANGE
+  DISPUTE_OPEN
+  DISPUTE_APPEAL
+  ACCOUNT_DELETE
+}
+
+model ActionLocation {
+  id             String             @id @default(cuid())
+  userId         String
+  user           User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  actionType     ActionLocationType
+  referenceType  String? // ORDER | WALLET_TX | DISPUTE | ACCOUNT_DELETION
+  referenceId    String? // id publik entitas (orderId / txId / disputeId / referenceCode)
+  latitude       Float?
+  longitude      Float?
+  accuracy       Float? // meter, bila dilaporkan client
+  source         String? // gps | network | fused | ip
+  locationDenied Boolean            @default(false)
+  ipAddress      String?
+  deviceId       String?
+
+  // Heuristik impossible-travel: jarak > 500 km dalam < 2 jam dari
+  // log terakhir user yang sama. Murni penanda untuk review.
+  suspicious Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([referenceType, referenceId])
+  @@map("action_locations")
+}
+
+// ============================================================
 // NOTIFICATION PREFERENCES
 // ============================================================
 
@@ -1166,7 +1221,7 @@ model KycRequest {
   // GAP-E: reviewer yang ditugaskan — terpisah dari reviewedBy
   // (admin yang memutuskan). Menugaskan tidak mengubah status pengajuan.
   // Kolom DB: kyc_requests.assigned_reviewer_id (migrasi 20260927050000_gap_e_admin_ops).
-  assignedReviewerId String? @map("assigned_reviewer_id")
+  assignedReviewerId String?               @map("assigned_reviewer_id")
   assignedReviewer   AdminUser?            @relation("KycAssignee", fields: [assignedReviewerId], references: [id], onDelete: SetNull)
   assignments        KycReviewAssignment[]
 
@@ -1310,7 +1365,7 @@ model BusinessVerification {
   // (admin yang memutuskan). Menugaskan tidak mengubah status pengajuan.
   // Kolom DB: business_verifications.assigned_reviewer_id
   // (migrasi 20260927050000_gap_e_admin_ops).
-  assignedReviewerId String? @map("assigned_reviewer_id")
+  assignedReviewerId String?    @map("assigned_reviewer_id")
   assignedReviewer   AdminUser? @relation("BusinessVerificationAssignee", fields: [assignedReviewerId], references: [id], onDelete: SetNull)
 
   // Metadata
@@ -3469,13 +3524,13 @@ model UserShowcase {
   /// GET /v1/showcase/:id/share (pola atomic counter seperti likeCount).
   shareCount   Int @default(0)
 
-  images   ShowcaseImage[]
-  likes    ShowcaseLike[]
-  comments ShowcaseComment[]
-  reports  ShowcaseReport[]
+  images     ShowcaseImage[]
+  likes      ShowcaseLike[]
+  comments   ShowcaseComment[]
+  reports    ShowcaseReport[]
   // SH-B-011: back-relation asal etalase (nullable di sisi Order/OrderLink).
-  orders    Order[]     @relation("OrderShowcase")
-  orderLinks OrderLink[] @relation("OrderLinkShowcase")
+  orders     Order[]           @relation("OrderShowcase")
+  orderLinks OrderLink[]       @relation("OrderLinkShowcase")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

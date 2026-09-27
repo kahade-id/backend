@@ -569,8 +569,13 @@ export class AuthController {
   async confirmPhoneChange(
     @CurrentUser('sub') userId: string,
     @Body() dto: ConfirmPhoneChangeDto,
+    @Req() req: Request,
   ): Promise<{ message: string }> {
-    return this.authService.confirmPhoneChange(userId, dto.newPhoneNumber, dto.code);
+    const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
+    return this.authService.confirmPhoneChange(userId, dto.newPhoneNumber, dto.code, {
+      location: dto.deviceLocation ?? null,
+      ipAddress,
+    });
   }
 
   @Throttle({ default: { ttl: 3600000, limit: 5 } })

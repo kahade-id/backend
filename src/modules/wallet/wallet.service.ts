@@ -8,8 +8,10 @@ import {
   UnauthorizedException,
   ServiceUnavailableException,
   OnModuleInit,
+  Optional,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { ActionLocationService, type ActionLocationContext } from '../action-location/action-location.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { RealtimeService } from '../realtime/realtime.service';
@@ -167,6 +169,9 @@ export class WalletService implements OnModuleInit {
     private otpGateway: OtpGatewayService,
     private realtime: RealtimeService,
     @InjectQueue(EMAIL_QUEUE) private readonly emailQueue: Queue<EmailJobData>,
+    // Lokasi presisi aksi sensitif — @Optional() agar unit test lama yang
+    // tidak menyediakan provider tetap lolos.
+    @Optional() private actionLocationService?: ActionLocationService,
   ) {
     this.dailyTopupLimit =
       this.configService.get<number>('app.walletDailyTopupLimit') ?? WALLET_DAILY_TOPUP_LIMIT;
@@ -519,6 +524,7 @@ export class WalletService implements OnModuleInit {
     method: PaymentMethod,
     cardToken?: string,
     voucherCode?: string,
+    ctx?: ActionLocationContext,
   ): Promise<Record<string, unknown>> {
     if (
       !Number.isFinite(amount) ||
@@ -1068,7 +1074,7 @@ export class WalletService implements OnModuleInit {
         description: `User initiated topup of ${amount} via ${method}`,
       });
 
-      return {
+      const topupResult = {
         paymentTxId: result.paymentTxId,
         transactionId: chargeResult.transactionId,
         method,
@@ -1093,6 +1099,19 @@ export class WalletService implements OnModuleInit {
           ? new Date(chargeResult.expiryTime)
           : new Date(Date.now() + topupExpiryMs),
       };
+
+      // Lokasi presisi tiap aksi sensitif — best-effort, tidak pernah throw.
+      await this.actionLocationService?.logAction({
+        userId,
+        actionType: 'WALLET_TOPUP',
+        referenceType: 'WALLET_TX',
+        referenceId: result.paymentTxId,
+        location: ctx?.location,
+        ipAddress: ctx?.ipAddress,
+        deviceId: ctx?.deviceId,
+      });
+
+      return topupResult;
     } finally {
       await this.redis
         .releaseLock(lockKey, lockToken)
@@ -1255,6 +1274,7 @@ export class WalletService implements OnModuleInit {
     bankAccountId: string,
     pin: string,
     ip?: string,
+    ctx?: ActionLocationContext,
   ): Promise<Record<string, unknown>> {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user)
@@ -1578,7 +1598,7 @@ export class WalletService implements OnModuleInit {
       description: `User requested withdrawal of ${amount} to bank account ${bankAccountId}`,
     });
 
-    return {
+    const withdrawResult = {
       withdrawTxId: walletTxId,
       amount,
       bankAccount: { masked: `****${plainAccountNumber.slice(-4)}` },
@@ -1590,6 +1610,19 @@ export class WalletService implements OnModuleInit {
             1000,
       ),
     };
+
+    // Lokasi presisi tiap aksi sensitif — best-effort, tidak pernah throw.
+    await this.actionLocationService?.logAction({
+      userId,
+      actionType: 'WALLET_WITHDRAW',
+      referenceType: 'WALLET_TX',
+      referenceId: walletTxId,
+      location: ctx?.location,
+      ipAddress: ctx?.ipAddress ?? ip,
+      deviceId: ctx?.deviceId,
+    });
+
+    return withdrawResult;
   }
 
   async cancelPendingWithdrawal(userId: string, txId: string): Promise<{ message: string }> {
@@ -1754,6 +1787,7 @@ export class WalletService implements OnModuleInit {
     pin: string,
     note?: string,
     ip?: string,
+    ctx?: ActionLocationContext,
   ): Promise<Record<string, unknown>> {
     if (senderId === recipientId) {
       throw new BadRequestException({
@@ -2312,7 +2346,7 @@ export class WalletService implements OnModuleInit {
       }
     }
 
-    return {
+    const transferResult = {
       message: 'Transfer successful',
       txId: sentTxId!,
       amount,
@@ -2322,6 +2356,19 @@ export class WalletService implements OnModuleInit {
         username: recipient.username,
       },
     };
+
+    // Lokasi presisi tiap aksi sensitif — best-effort, tidak pernah throw.
+    await this.actionLocationService?.logAction({
+      userId: senderId,
+      actionType: 'WALLET_TRANSFER',
+      referenceType: 'WALLET_TX',
+      referenceId: sentTxId!,
+      location: ctx?.location,
+      ipAddress: ctx?.ipAddress ?? ip,
+      deviceId: ctx?.deviceId,
+    });
+
+    return transferResult;
   }
 
   async lookupTransferRecipient(
@@ -3537,6 +3584,7 @@ export class WalletService implements OnModuleInit {
     currentPin?: string,
     password?: string,
     ip?: string,
+    ctx?: ActionLocationContext,
   ): Promise<{ message: string }> {
     this.validatePinPolicy(pin);
     const wallet = await this.prisma.wallet.findUnique({ where: { userId } });
@@ -3583,6 +3631,19 @@ export class WalletService implements OnModuleInit {
       where: { userId },
       data: { walletPinHash: hashedPin },
     });
+
+    // Lokasi presisi tiap aksi sensitif — best-effort, tidak pernah throw.
+    // Mencakup set PIN pertama DAN change PIN (kontrak WALLET_PIN_CHANGE).
+    await this.actionLocationService?.logAction({
+      userId,
+      actionType: 'WALLET_PIN_CHANGE',
+      referenceType: 'WALLET',
+      referenceId: userId,
+      location: ctx?.location,
+      ipAddress: ctx?.ipAddress ?? ip,
+      deviceId: ctx?.deviceId,
+    });
+
     return {
       message: hasExistingPin
         ? 'Wallet PIN has been changed successfully'

@@ -43,6 +43,7 @@ import { SubscriptionsModule } from './modules/subscriptions/subscriptions.modul
 import { InsuranceModule } from './modules/insurance/insurance.module';
 import { SettingsModule } from './modules/settings/settings.module';
 import { OpsSettingsModule } from './modules/ops-settings/ops-settings.module';
+import { ActionLocationModule } from './modules/action-location/action-location.module';
 import { UploadModule } from './modules/upload/upload.module';
 import { PublicModule } from './modules/public/public.module';
 import { BadgesModule } from './modules/badges/badges.module';
@@ -164,6 +165,7 @@ const runtimeEnvFile = getRuntimeEnvFile();
     InsuranceModule,
     SettingsModule,
     OpsSettingsModule,
+    ActionLocationModule,
     UploadModule,
     PublicModule,
     BadgesModule,

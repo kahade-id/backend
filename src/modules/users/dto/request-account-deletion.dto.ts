@@ -1,5 +1,7 @@
-import { IsString, IsOptional, MinLength, MaxLength, Matches } from 'class-validator';
+import { IsString, IsOptional, MinLength, MaxLength, Matches, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { LocationDto } from '../../auth/dto/location.dto';
 
 export class RequestAccountDeletionDto {
   // G071: opsional di DTO — akun dengan password TETAP wajib password (service
@@ -29,4 +31,10 @@ export class RequestAccountDeletionDto {
   @MaxLength(10)
   @Matches(/^\d{4,10}$/, { message: 'otpCode must be a numeric verification code' })
   otpCode?: string;
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)', type: () => LocationDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LocationDto)
+  deviceLocation?: LocationDto | null;
 }

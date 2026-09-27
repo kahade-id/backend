@@ -1,7 +1,8 @@
-import { IsNumber, IsInt, Min, Max, IsEnum, IsOptional, IsString, Length, Matches, MaxLength } from 'class-validator';
-import { Transform } from 'class-transformer';
+import { IsNumber, IsInt, Min, Max, IsEnum, IsOptional, IsString, Length, Matches, MaxLength, ValidateNested } from 'class-validator';
+import { Transform, Type } from 'class-transformer';
 import { PaymentMethod } from '@prisma/client';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { LocationDto } from '../../auth/dto/location.dto';
 import { WALLET_DAILY_TOPUP_LIMIT } from '../../../common/constants/app.constants';
 
 const TOPUP_PAYMENT_METHODS = Object.values(PaymentMethod).filter(
@@ -52,4 +53,10 @@ export class TopupDto {
   @Length(6, 6, { message: 'Wallet PIN must be exactly 6 digits' })
   @Matches(/^\d{6}$/, { message: 'Wallet PIN must consist of 6 numeric digits' })
   pin?: string;
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)', type: () => LocationDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LocationDto)
+  deviceLocation?: LocationDto | null;
 }

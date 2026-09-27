@@ -25,6 +25,7 @@ import { activateMilestonesForOrderTx } from '../milestones/milestone-activation
 // no-op untuk order tanpa order lines katalog. Tidak mengubah perilaku order existing.
 import { Optional } from '@nestjs/common';
 import { InventoryService } from '../inventory/inventory.service';
+import { ActionLocationService, type ActionLocationContext } from '../action-location/action-location.service';
 
 const VALID_CANCEL_REASONS = [
   'CHANGED_MIND',
@@ -83,6 +84,8 @@ export class OrderStateService {
     private notificationQueue: NotificationQueueService,
     // GAP-D (G256/G257): @Optional() — aman bila InventoryModule belum ter-import.
     @Optional() private inventoryService?: InventoryService,
+    // Lokasi presisi aksi sensitif — @Optional() mengikuti pola inventory di atas.
+    @Optional() private actionLocationService?: ActionLocationService,
   ) {}
 
   private validateTransition(from: OrderStatus, to: OrderStatus): void {
@@ -168,7 +171,7 @@ export class OrderStateService {
     return { orderId, status: newStatus };
   }
 
-  async handlePayOrder(orderId: string, userId: string, pin?: string, ip?: string): Promise<PayOrderResult> {
+  async handlePayOrder(orderId: string, userId: string, pin?: string, ip?: string, ctx?: ActionLocationContext): Promise<PayOrderResult> {
     if (!pin) {
       throw new BadRequestException({
         code: ErrorCodes.UNAUTHORIZED,
@@ -178,6 +181,17 @@ export class OrderStateService {
     await this.walletService.verifyPin(userId, pin, ip);
     const { walletTxId } = await this.payOrder(orderId, userId);
     this.runRealtimeBestEffort(() => this.realtime.emitToOrder(orderId, 'order.status_changed', { orderId, status: 'PROCESSING' }), 'PAY_ORDER_STATUS');
+
+    // Lokasi presisi tiap aksi sensitif — best-effort, tidak pernah throw.
+    await this.actionLocationService?.logAction({
+      userId,
+      actionType: 'ORDER_PAY',
+      referenceType: 'ORDER',
+      referenceId: orderId,
+      location: ctx?.location,
+      ipAddress: ctx?.ipAddress ?? ip,
+      deviceId: ctx?.deviceId,
+    });
 
     this.runPostCommitBestEffort(async () => {
       const order = await this.prisma.order.findUnique({ where: { orderId }, select: { sellerId: true, title: true } });
@@ -192,8 +206,21 @@ export class OrderStateService {
    * G479: span bisnis order.complete — membungkus handleCompleteOrderTx.
    * Atribut span hanya yang aman (tanpa judul order / nama user).
    */
-  async handleCompleteOrder(orderId: string, userId: string): Promise<CompleteOrderResult> {
-    return withSpan('order.complete', () => this.handleCompleteOrderTx(orderId, userId), {
+  async handleCompleteOrder(orderId: string, userId: string, ctx?: ActionLocationContext): Promise<CompleteOrderResult> {
+    return withSpan('order.complete', async () => {
+      const result = await this.handleCompleteOrderTx(orderId, userId);
+      // Lokasi presisi tiap aksi sensitif — best-effort, tidak pernah throw.
+      await this.actionLocationService?.logAction({
+        userId,
+        actionType: 'ORDER_CONFIRM_RECEIPT',
+        referenceType: 'ORDER',
+        referenceId: orderId,
+        location: ctx?.location,
+        ipAddress: ctx?.ipAddress,
+        deviceId: ctx?.deviceId,
+      });
+      return result;
+    }, {
       currency: 'IDR',
     });
   }
@@ -234,7 +261,7 @@ export class OrderStateService {
     return { orderId, status: 'COMPLETED' };
   }
 
-  async handleCancelOrder(orderId: string, userId: string, reason: string, note?: string): Promise<CancelOrderResult> {
+  async handleCancelOrder(orderId: string, userId: string, reason: string, note?: string, ctx?: ActionLocationContext): Promise<CancelOrderResult> {
     const normalizedReason = reason.trim().toUpperCase();
     if (!VALID_CANCEL_REASONS.includes(normalizedReason as typeof VALID_CANCEL_REASONS[number])) {
       throw new BadRequestException({
@@ -244,6 +271,17 @@ export class OrderStateService {
     }
     await this.cancelOrder(orderId, userId, normalizedReason, note);
     this.runRealtimeBestEffort(() => this.realtime.emitToOrder(orderId, 'order.status_changed', { orderId, status: 'CANCELLED' }), 'CANCEL_ORDER_STATUS');
+
+    // Lokasi presisi tiap aksi sensitif — best-effort, tidak pernah throw.
+    await this.actionLocationService?.logAction({
+      userId,
+      actionType: 'ORDER_CANCEL',
+      referenceType: 'ORDER',
+      referenceId: orderId,
+      location: ctx?.location,
+      ipAddress: ctx?.ipAddress,
+      deviceId: ctx?.deviceId,
+    });
 
     this.runPostCommitBestEffort(async () => {
       const order = await this.prisma.order.findUnique({ where: { orderId }, select: { buyerId: true, sellerId: true, title: true } });

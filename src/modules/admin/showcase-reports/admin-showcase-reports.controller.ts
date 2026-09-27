@@ -23,6 +23,7 @@ import { AddModerationNoteDto } from './dto/add-moderation-note.dto';
 import { AssignShowcaseReportDto } from './dto/assign-showcase-report.dto';
 import { RestrictShowcaseDto } from './dto/restrict-showcase.dto';
 import { DecideAppealDto } from './dto/decide-appeal.dto';
+import { BulkReviewShowcaseReportsDto } from './dto/bulk-review-showcase-reports.dto';
 import { ModerationQueueQueryDto } from './dto/moderation-queue-query.dto';
 import { ExportShowcaseReportsQueryDto } from './dto/export-showcase-reports-query.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
@@ -88,6 +89,59 @@ export class AdminShowcaseReportsController {
     @Query('limit') limit?: string,
   ): Promise<object> {
     return this.service.listPendingAppeals(Number(page) || 1, Number(limit) || 20);
+  }
+
+  @Get('metrics')
+  @ApiOperation({
+    summary: 'Ringkasan metrik moderasi showcase',
+    description:
+      'ADM-327 — agregat read-only: laporan open/under_review, takedown/' +
+      'restrict/reopen 30 hari, rata-rata waktu penyelesaian, distribusi ' +
+      'alasan, banding pending. Tanpa PII.',
+  })
+  @ApiResponse({ status: 200, description: 'Metrics returned.' })
+  getMetrics(): Promise<object> {
+    return this.service.getMetrics();
+  }
+
+  @Get('assign/candidates')
+  @ApiOperation({
+    summary: 'Kandidat assignee untuk picker (ADM-324)',
+    description:
+      'Admin aktif berrole SUPER_ADMIN/CUSTOMER_SUPPORT beserta jumlah ' +
+      'assignment terbuka — untuk picker assign di antrean prioritas.',
+  })
+  @ApiResponse({ status: 200, description: 'Candidates returned.' })
+  getAssignCandidates(): Promise<object> {
+    return this.service.getAssignCandidates();
+  }
+
+  @Post('bulk-review')
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @ApiOperation({
+    summary: 'Bulk dismiss / under_review (ADM-328)',
+    description:
+      'Maks 50 laporan/request, confirm=true wajib, hasil parsial per item. ' +
+      'Hanya aksi non-destruktif (dismiss, under_review); takedown tidak ' +
+      'boleh bulk. Requires Idempotency-Key.',
+  })
+  @ApiResponse({ status: 200, description: 'Bulk result returned.' })
+  @ApiResponse({ status: 400, description: 'confirm tidak true / aksi tidak diizinkan.' })
+  bulkReview(
+    @Body() dto: BulkReviewShowcaseReportsDto,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.bulkReviewShowcaseReports(
+      admin.sub,
+      req.ip ?? '',
+      admin.role,
+      dto.ids,
+      dto.action,
+      dto.resolution?.trim() || undefined,
+      dto.confirm,
+    );
   }
 
   @Get('export')
@@ -180,7 +234,7 @@ export class AdminShowcaseReportsController {
   @ApiOperation({
     summary: 'Review a showcase report',
     description:
-      'Moderate a showcase report. Actions: dismiss (→ DISMISSED), takedown (deactivate the item and → RESOLVED_ACTION_TAKEN), no_action (→ RESOLVED_NO_ACTION), under_review (→ UNDER_REVIEW). Final statuses cannot be re-processed. Requires Idempotency-Key.',
+      'Moderate a showcase report. Actions: dismiss (→ DISMISSED), takedown (deactivate the item and → RESOLVED_ACTION_TAKEN, SUPER_ADMIN ONLY — enforced server-side, see ADM-302), no_action (→ RESOLVED_NO_ACTION), under_review (→ UNDER_REVIEW). Final statuses cannot be re-processed. Requires Idempotency-Key.',
   })
   @ApiResponse({ status: 200, description: 'Showcase report reviewed.' })
   @ApiResponse({ status: 400, description: 'Report already resolved/dismissed, or item already inactive.' })
@@ -191,7 +245,7 @@ export class AdminShowcaseReportsController {
     @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<object> {
-    return this.service.reviewShowcaseReport(reportId, dto.action, dto.resolution, admin.sub, req.ip ?? '');
+    return this.service.reviewShowcaseReport(reportId, dto.action, dto.resolution, admin.sub, req.ip ?? '', admin.role);
   }
 
   @UseGuards(UserThrottleGuard)

@@ -4,12 +4,13 @@ import {
   NotFoundException,
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
-import { AuditAction, Prisma, ReportStatus, NotificationType, UserAuditAction } from '@prisma/client';
+import { AuditAction, Prisma, ReportStatus, NotificationType, UserAuditAction, AdminRole } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
 import { getCategoryForType } from '../../notifications/notification-category.map';
@@ -457,6 +458,10 @@ export class AdminShowcaseReportsService {
 
   // -------------------------------------------------------------------------
   // Review awal (dipertahankan) — kini lewat transition() + event + snapshot.
+  // ADM-302: takedown permanen = SUPER_ADMIN only (server-side). Guard
+  // class-level membolehkan CUSTOMER_SUPPORT untuk aksi lain; aksi takedown
+  // dicek eksplisit di sini karena `action` ada di body (bukan di route).
+  // ADM-320: catatan resolusi wajib (min. 10 karakter) khusus takedown.
   // -------------------------------------------------------------------------
   async reviewShowcaseReport(
     reportId: string,
@@ -464,7 +469,21 @@ export class AdminShowcaseReportsService {
     resolution: string | undefined,
     adminId: string,
     ipAddress: string,
+    adminRole?: AdminRole,
   ): Promise<{ message: string; reportId: string; status: ReportStatus }> {
+    if (action === 'takedown' && adminRole !== AdminRole.SUPER_ADMIN) {
+      throw new ForbiddenException({
+        code: 'TAKEDOWN_FORBIDDEN_ROLE',
+        message: 'Takedown permanen hanya untuk SUPER_ADMIN',
+      });
+    }
+    const trimmedResolutionForTakedown = action === 'takedown' ? (resolution?.trim() ?? '') : undefined;
+    if (action === 'takedown' && trimmedResolutionForTakedown!.length < 10) {
+      throw new BadRequestException({
+        code: 'RESOLUTION_REQUIRED_TAKEDOWN',
+        message: 'Catatan resolusi takedown wajib diisi (minimal 10 karakter)',
+      });
+    }
     const report = await this.prisma.showcaseReport.findUnique({
       where: { id: reportId },
       include: { showcase: { select: { id: true, title: true, isActive: true, userId: true } } },
@@ -597,6 +616,79 @@ export class AdminShowcaseReportsService {
         });
       }
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // ADM-328 — bulk dismiss / under_review (maks 50, confirm wajib, hasil
+  // parsial). Hanya dua aksi non-destruktif; takedown tidak boleh bulk
+  // (fail-closed). Setiap item lewat jalur reviewShowcaseReport yang sama
+  // (state machine + event + audit + notifikasi).
+  // -------------------------------------------------------------------------
+  async bulkReviewShowcaseReports(
+    adminId: string,
+    ipAddress: string,
+    adminRole: AdminRole | undefined,
+    ids: string[],
+    action: 'dismiss' | 'under_review',
+    resolution: string | undefined,
+    confirm: boolean,
+  ): Promise<object> {
+    if (confirm !== true) {
+      throw new BadRequestException({
+        code: 'BULK_CONFIRM_REQUIRED',
+        message: 'Bulk review membutuhkan konfirmasi eksplisit (confirm: true)',
+      });
+    }
+    const uniqueIds = [...new Set(ids)].slice(0, 50);
+    const results: Array<{ id: string; ok: boolean; status?: string; error?: string }> = [];
+    for (const id of uniqueIds) {
+      try {
+        const res = await this.reviewShowcaseReport(id, action, resolution, adminId, ipAddress, adminRole);
+        results.push({ id, ok: true, status: res.status });
+      } catch (err) {
+        results.push({ id, ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    return {
+      action,
+      total: uniqueIds.length,
+      succeeded: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      results,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // ADM-324 — daftar admin aktif untuk picker assign + jumlah antrean.
+  // -------------------------------------------------------------------------
+  /**
+   * Kandidat assignee: admin aktif (isActive, tidak dihapus) berrole
+   * SUPER_ADMIN / CUSTOMER_SUPPORT, beserta jumlah assignment terbuka
+   * (unassignedAt IS NULL). Untuk picker assign di UI antrean prioritas.
+   */
+  async getAssignCandidates(): Promise<object> {
+    const rows = await this.prisma.$queryRaw<
+      Array<{ id: string; full_name: string; role: string; open_assignments: bigint }>
+    >(
+      Prisma.sql`SELECT a.id, a."fullName" AS full_name, a.role::text AS role,
+                        COUNT(ra.id)::bigint AS open_assignments
+                 FROM "AdminUser" a
+                 LEFT JOIN report_assignments ra
+                   ON ra."assigneeAdminId" = a.id AND ra."unassignedAt" IS NULL
+                 WHERE a.role::text IN ('SUPER_ADMIN', 'CUSTOMER_SUPPORT')
+                   AND a."isActive" = true
+                   AND a."deletedAt" IS NULL
+                 GROUP BY a.id
+                 ORDER BY open_assignments ASC, a."fullName" ASC`,
+    );
+    return {
+      candidates: rows.map((r) => ({
+        id: r.id,
+        fullName: r.full_name,
+        role: r.role,
+        openAssignments: Number(r.open_assignments),
+      })),
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -1237,6 +1329,64 @@ export class AdminShowcaseReportsService {
     const byId = new Map(reports.map((r) => [r.id, r]));
     const data = appeals.map((a) => ({ ...a, report: byId.get(a.reportId) ?? null }));
     return createPaginatedResponse(data, total, safePage, safeLimit);
+  }
+
+  // -------------------------------------------------------------------------
+  // ADM-327 — ringkasan moderasi showcase (read-only, agregat).
+  // -------------------------------------------------------------------------
+  /**
+   * Metrik agregat moderasi etalase: laporan open/under_review, jumlah
+   * takedown/restrict/reopen 30 hari, rata-rata waktu penyelesaian,
+   * distribusi alasan, banding pending. Tanpa PII.
+   */
+  async getMetrics(): Promise<object> {
+    const [statusRows, actionRows, avgRows, reasonRows, appealRows] = await Promise.all([
+      this.prisma.$queryRaw<Array<{ open_reports: bigint; under_review: bigint }>>(
+        Prisma.sql`SELECT COUNT(*) FILTER (WHERE status::text = 'PENDING')::bigint AS open_reports,
+                          COUNT(*) FILTER (WHERE status::text = 'UNDER_REVIEW')::bigint AS under_review
+                   FROM showcase_reports`,
+      ),
+      this.prisma.$queryRaw<Array<{ action: string; count: bigint }>>(
+        Prisma.sql`SELECT action::text AS action, COUNT(*)::bigint AS count
+                   FROM report_moderation_events
+                   WHERE created_at >= NOW() - INTERVAL '30 days'
+                     AND action::text IN ('TAKEDOWN', 'RESTRICTED', 'REOPENED', 'DISMISSED')
+                   GROUP BY action`,
+      ),
+      this.prisma.$queryRaw<Array<{ avg_seconds: number | null; resolved_count: bigint }>>(
+        Prisma.sql`SELECT AVG(EXTRACT(EPOCH FROM (reviewed_at - created_at))) AS avg_seconds,
+                          COUNT(*)::bigint AS resolved_count
+                   FROM showcase_reports
+                   WHERE reviewed_at IS NOT NULL AND reviewed_at >= NOW() - INTERVAL '30 days'`,
+      ),
+      this.prisma.$queryRaw<Array<{ reason: string; count: bigint }>>(
+        Prisma.sql`SELECT reason, COUNT(*)::bigint AS count
+                   FROM showcase_reports
+                   WHERE status::text IN ('PENDING', 'UNDER_REVIEW')
+                   GROUP BY reason
+                   ORDER BY count DESC`,
+      ),
+      this.prisma.$queryRaw<Array<{ pending_appeals: bigint }>>(
+        Prisma.sql`SELECT COUNT(*)::bigint AS pending_appeals
+                   FROM report_appeals
+                   WHERE status::text = 'PENDING'`,
+      ),
+    ]);
+    const actions: Record<string, number> = {};
+    for (const r of actionRows) actions[r.action] = Number(r.count);
+    const avgSeconds = avgRows[0]?.avg_seconds != null ? Number(avgRows[0].avg_seconds) : null;
+    return {
+      openReports: Number(statusRows[0]?.open_reports ?? 0),
+      underReview: Number(statusRows[0]?.under_review ?? 0),
+      resolvedLast30d: Number(avgRows[0]?.resolved_count ?? 0),
+      avgResolutionHours: avgSeconds != null ? Math.round((avgSeconds / 3600) * 10) / 10 : null,
+      takedownsLast30d: actions['TAKEDOWN'] ?? 0,
+      restrictsLast30d: actions['RESTRICTED'] ?? 0,
+      reopensLast30d: actions['REOPENED'] ?? 0,
+      dismissedLast30d: actions['DISMISSED'] ?? 0,
+      pendingAppeals: Number(appealRows[0]?.pending_appeals ?? 0),
+      reasonDistribution: reasonRows.map((r) => ({ reason: r.reason, count: Number(r.count) })),
+    };
   }
 
   // -------------------------------------------------------------------------

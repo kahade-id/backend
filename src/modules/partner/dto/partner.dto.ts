@@ -66,6 +66,15 @@ export class UpdatePartnerClientDto {
   @Max(10000000)
   @IsOptional()
   quotaPerDay?: number;
+
+  /**
+   * ADM-313 — alasan perubahan (wajib bila status berubah), HANYA untuk
+   * audit trail; tidak disimpan ke baris ApiClient.
+   */
+  @IsString()
+  @IsOptional()
+  @MaxLength(500)
+  reason?: string;
 }
 
 export class IssuePartnerKeyDto {
@@ -90,6 +99,29 @@ export class RevokePartnerKeyDto {
   @IsNotEmpty()
   @MaxLength(280)
   reason!: string;
+}
+
+/**
+ * ADM-306 — rotasi: semua field opsional; nilai yang tidak diisi diwarisi
+ * dari kunci lama (semantik rotasi: kunci baru = salinan kunci lama).
+ * Client admin memanggil rotate TANPA body.
+ */
+export class RotatePartnerKeyDto {
+  @IsString()
+  @IsOptional()
+  @MaxLength(80)
+  name?: string;
+
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(16)
+  @IsIn(PARTNER_SCOPES as unknown as string[], { each: true })
+  @IsOptional()
+  scopes?: string[];
+
+  @IsISO8601()
+  @IsOptional()
+  expiresAt?: string;
 }
 
 export class CreateWebhookEndpointDto {

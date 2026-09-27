@@ -448,7 +448,11 @@ export class PartnerWebhookService {
     const { secretEnc: _s, challengeToken: _c, ...rest } = e;
     void _s;
     void _c;
-    return rest;
+    // ADM-310: turunkan status eksplisit untuk admin UI:
+    // DISABLED bila nonaktif (belum terverifikasi atau sengaja dinonaktifkan),
+    // ACTIVE bila terverifikasi & aktif, CHALLENGED bila tantangan terkirim.
+    const status = !e.isActive ? 'DISABLED' : e.verifiedAt ? 'ACTIVE' : e.challengeIssuedAt ? 'CHALLENGED' : 'DISABLED';
+    return { ...rest, status };
   }
 
   /** Used by the processor: fetch endpoint + decrypted secret. */

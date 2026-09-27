@@ -7,6 +7,7 @@
  * seperti PII (nomor HP, email, NIK 16 digit) agar tidak bocor ke publik.
  */
 import {
+  BadRequestException,
   Body, Controller, Get, Param, Patch, Post, Query, UseGuards,
 } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
@@ -31,7 +32,7 @@ const PII_PATTERNS = [
 function assertNoPii(text: string, field: string): void {
   for (const re of PII_PATTERNS) {
     if (re.test(text)) {
-      throw new Error(`${field} terdeteksi mengandung data pribadi — tulis ulang tanpa nomor HP/email/NIK`);
+      throw new BadRequestException({ code: 'INCIDENT_PII_DETECTED', message: `${field} terdeteksi mengandung data pribadi — tulis ulang tanpa nomor HP/email/NIK` });
     }
   }
 }
@@ -70,8 +71,11 @@ export class IncidentsController {
   async create(
     @Body() body: { title: string; description: string; severity: string; component: string },
   ) {
-    if (!body.title?.trim() || !body.description?.trim()) throw new Error('title & description wajib diisi');
-    if (!(SEVERITIES as readonly string[]).includes(body.severity)) throw new Error('severity tidak valid');
+    if (!body.title?.trim() || !body.description?.trim())
+      // ADM-303: fail-closed 400 dengan kode, bukan Error mentah (→ 500).
+      throw new BadRequestException({ code: 'INCIDENT_TITLE_DESCRIPTION_REQUIRED', message: 'title & description wajib diisi' });
+    if (!(SEVERITIES as readonly string[]).includes(body.severity))
+      throw new BadRequestException({ code: 'INCIDENT_SEVERITY_INVALID', message: 'severity tidak valid' });
     assertNoPii(body.title, 'title');
     assertNoPii(body.description, 'description');
     return this.model.create({
@@ -101,11 +105,14 @@ export class IncidentsController {
       data.description = body.description.trim();
     }
     if (body.severity !== undefined) {
-      if (!(SEVERITIES as readonly string[]).includes(body.severity)) throw new Error('severity tidak valid');
+      // ADM-303: fail-closed 400, bukan Error mentah (→ 500).
+      if (!(SEVERITIES as readonly string[]).includes(body.severity))
+        throw new BadRequestException({ code: 'INCIDENT_SEVERITY_INVALID', message: 'severity tidak valid' });
       data.severity = body.severity;
     }
     if (body.status !== undefined) {
-      if (!(STATUSES as readonly string[]).includes(body.status)) throw new Error('status tidak valid');
+      if (!(STATUSES as readonly string[]).includes(body.status))
+        throw new BadRequestException({ code: 'INCIDENT_STATUS_INVALID', message: 'status tidak valid' });
       data.status = body.status;
       if (body.status === 'RESOLVED') data.resolvedAt = new Date();
     }

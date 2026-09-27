@@ -70,12 +70,16 @@ export class PartnerUsageService {
     const todayCalls = rows
       .filter((r) => (r['date'] as Date).getTime() === today.getTime())
       .reduce((n, r) => n + Number(r['count'] ?? 0), 0);
+    // ADM-326: errorRatePct eksplisit (persen, 1 desimal) agar admin tidak
+    // perlu menebak dari totals.errors/totals.calls.
+    const errorRatePct = totals.calls > 0 ? Math.round((totals.errors / totals.calls) * 1000) / 10 : 0;
     return {
       clientId,
       orgName: client['orgName'],
       quotaPerDay: client['quotaPerDay'],
       todayCalls,
       quotaUsedPct: client['quotaPerDay'] ? Math.round((todayCalls / Number(client['quotaPerDay'])) * 100) : 0,
+      errorRatePct,
       totals,
       byEndpoint: rows,
     };

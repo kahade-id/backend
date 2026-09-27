@@ -9,15 +9,15 @@ END $$;
 
 -- G012: tabel relasi provider-subject yang stabil
 CREATE TABLE IF NOT EXISTS "social_accounts" (
-  "id" "TEXT" NOT NULL,
-  "userId" "TEXT" NOT NULL,
+  "id" TEXT NOT NULL,
+  "userId" TEXT NOT NULL,
   "provider" "SocialProvider" NOT NULL,
-  "providerSub" "TEXT" NOT NULL,
-  "email" "TEXT",
+  "providerSub" TEXT NOT NULL,
+  "email" TEXT,
   "linkedAt" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "lastUsedAt" TIMESTAMPTZ(6),
   "consentAt" TIMESTAMPTZ(6),
-  "consentTextVersion" "TEXT",
+  "consentTextVersion" TEXT,
   CONSTRAINT "social_accounts_pkey" PRIMARY KEY ("id")
 );
 CREATE UNIQUE INDEX IF NOT EXISTS "social_accounts_provider_providerSub_key" ON "social_accounts"("provider", "providerSub");

@@ -7,7 +7,7 @@ import { Readable } from 'stream';
 import { PhoneVerifiedGuard } from '../../common/guards/phone-verified.guard';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import { Public } from '../../common/decorators/public.decorator';
-import { isPrivateFileKey } from './upload.service';
+import { isPrivateFileKey, isSafeFileKey } from './upload.service';
 
 interface MulterFile {
   fieldname: string;
@@ -167,6 +167,11 @@ export class UploadController {
   ): Promise<StreamableFile> {
     if (!key || typeof key !== 'string') {
       throw new BadRequestException({ code: 'VALIDATION_ERROR', message: 'Missing file key' });
+    }
+    // SH-S-004: validasi BENTUK key dulu (fail-closed, 400 terkontrol) sebelum
+    // parsing segmen — mencegah pola traversal/key aneh mencapai logika akses.
+    if (!isSafeFileKey(key)) {
+      throw new BadRequestException({ code: 'VALIDATION_ERROR', message: 'Invalid file key format' });
     }
     // Kepemilikan: segmen userId pada key harus sama dengan peminta.
     const segments = key.split('/');

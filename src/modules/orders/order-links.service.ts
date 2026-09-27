@@ -147,6 +147,27 @@ export class OrderLinksService {
       if (blockedRelation) throw new ForbiddenException({ code: ErrorCodes.USER_BLOCKED, message: 'Cannot create an order link with a blocked user' });
     }
 
+    // SH-B-011: bila link berasal dari etalase — verifikasi kepemilikan item
+    // dan catat priceSnapshot dari data server (rupiah integer), bukan dari
+    // input client. Item soft-deleted / bukan milik user → tolak.
+    let showcaseId: string | undefined;
+    let priceSnapshot: bigint | undefined;
+    if (dto.showcaseId) {
+      const item = await this.prisma.userShowcase.findFirst({
+        where: { id: dto.showcaseId, userId, deletedAt: null },
+        select: { id: true, priceMin: true, priceMax: true },
+      });
+      if (!item) {
+        throw new BadRequestException({
+          code: ErrorCodes.SHOWCASE_NOT_FOUND,
+          message: 'Showcase item not found or does not belong to you',
+        });
+      }
+      showcaseId = item.id;
+      // Snapshot = harga representatif item (rupiah integer): priceMin ?? priceMax ?? 0.
+      priceSnapshot = BigInt(Math.max(0, Math.floor(Number(item.priceMin ?? item.priceMax ?? 0))));
+    }
+
     const serial = await this.getNextLinkSerial();
     const linkId = generateOrderLinkId(serial);
     const token = generateOrderLinkToken();
@@ -169,6 +190,7 @@ export class OrderLinksService {
         deliveryDeadlineAt: explicitDeliveryDeadlineAt,
         counterpartUsername: normalizedCounterpartUsername,
         expiresAt,
+        ...(showcaseId ? { showcaseId, priceSnapshot } : {}),
       },
     });
 
@@ -177,6 +199,7 @@ export class OrderLinksService {
       token: link.token,
       expiresAt: link.expiresAt,
       shareUrl: this.getShareUrl(link.token),
+      ...(showcaseId ? { showcaseId, priceSnapshot: priceSnapshot!.toString() } : {}),
     };
   }
 
@@ -227,6 +250,9 @@ export class OrderLinksService {
       counterpartUsername: link.counterpartUsername,
       expiresAt: link.expiresAt,
       status: link.status,
+      // SH-B-011: asal etalase (bila link dibuat dari item etalase).
+      showcaseId: link.showcaseId,
+      priceSnapshot: link.priceSnapshot != null ? Number(link.priceSnapshot) : null,
     };
   }
 
@@ -408,6 +434,9 @@ export class OrderLinksService {
             createdByBuyer: link.creatorRole === 'BUYER',
             status: 'WAITING_CONFIRMATION',
             orderLinkId: link.id,
+            // SH-B-011: asal etalase disalin dari link ke order (pencatatan saja).
+            showcaseId: link.showcaseId ?? undefined,
+            priceSnapshot: link.priceSnapshot ?? undefined,
             confirmationDeadlineAt: toWIB().add(CONFIRMATION_DEADLINE_DAYS_MAP[link.orderType] ?? 3, 'day').toDate(),
           },
         });

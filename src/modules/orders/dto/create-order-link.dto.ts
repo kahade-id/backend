@@ -63,4 +63,16 @@ export class CreateOrderLinkDto {
   @IsString()
   @MaxLength(50)
   counterpartUsername?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'SH-B-011: id item etalase milik pembuat link. Bila diisi, harus item milik sendiri ' +
+      'yang belum dihapus; backend mencatat priceSnapshot (harga etalase saat link dibuat, rupiah). ' +
+      'Tanpa ini, link tidak terhubung ke etalase mana pun.',
+    maxLength: 64,
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  showcaseId?: string;
 }

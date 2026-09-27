@@ -98,10 +98,11 @@ const mockPrisma: any = {
     updateMany: jest.fn(),
     delete: jest.fn(),
   },
-  showcaseImage: { findMany: jest.fn(), findFirst: jest.fn(), createMany: jest.fn(), updateMany: jest.fn(), delete: jest.fn() },
+  showcaseImage: { findMany: jest.fn(), findFirst: jest.fn(), count: jest.fn(), createMany: jest.fn(), updateMany: jest.fn(), delete: jest.fn() },
   showcaseLike: { findMany: jest.fn(), create: jest.fn(), deleteMany: jest.fn() },
   showcaseComment: { findMany: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn(), count: jest.fn(), create: jest.fn(), update: jest.fn(), delete: jest.fn() },
   $transaction: jest.fn(),
+  $executeRaw: jest.fn().mockResolvedValue(1),
 };
 
 const mockRedis = { setNx: jest.fn(), get: jest.fn(), set: jest.fn(), del: jest.fn() };
@@ -110,6 +111,7 @@ const mockUpload = {
   buildPublicUrl: jest.fn((key: string) => `https://cdn.test/${key}`),
   cleanupFileKeys: jest.fn().mockResolvedValue({ deleted: 1, errors: [] }),
   uploadDirect: jest.fn(),
+  consumeUploadConfirmations: jest.fn().mockResolvedValue(undefined),
 };
 const mockConfig = { get: jest.fn((key: string) => (key === 'app.publicWebBaseUrl' ? 'https://kahade.id' : undefined)) };
 
@@ -614,8 +616,10 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
       const where = mockPrisma.userShowcase.findFirst.mock.calls[0][0].where;
       expect(where.OR).toHaveLength(2);
       expect(where.OR[0]).toEqual({ userId: VIEWER_ID });
+      // SH-B-001: cabang publik mensyaratkan isActive=true (cabang owner tidak).
       expect(where.OR[1]).toEqual({
         visibility: ShowcaseVisibility.PUBLIC,
+        isActive: true,
         user: expect.objectContaining({ isActive: true, isBanned: false, deletedAt: null, profileVisible: true }),
       });
     });

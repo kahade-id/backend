@@ -224,6 +224,38 @@ export class AdminShowcaseReportsController {
     );
   }
 
+  // -------------------------------------------------------------------------
+  // SH-A-003 — restore item yang pernah di-takedown moderasi.
+  // Kontrak exact: POST /v1/admin/showcase-reports/items/:id/restore-takedown,
+  // SUPER_ADMIN only, audit-logged, set isActive=true, catat event RESTORED,
+  // response 200 { ok: true, item } (bentuk item = GET detail existing).
+  // Item yang dinonaktifkan owner (bukan takedown moderasi) → 400.
+  // -------------------------------------------------------------------------
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @AdminRoles(AdminRole.SUPER_ADMIN)
+  @Post('items/:id/restore-takedown')
+  @ApiOperation({
+    summary: 'Restore a moderation-taken-down showcase item',
+    description:
+      'SH-A-003 — mengaktifkan kembali item etalase yang pernah di-takedown ' +
+      'moderasi (isActive=false → true) + mencatat moderation event RESTORED. ' +
+      'Hanya untuk item yang terbukti pernah di-takedown (ada event TAKEDOWN); ' +
+      'item yang dinonaktifkan owner sendiri ditolak 400. Hanya SUPER_ADMIN. ' +
+      'Requires Idempotency-Key.',
+  })
+  @ApiResponse({ status: 200, description: 'Takedown restored. Returns { ok: true, item }.' })
+  @ApiResponse({ status: 400, description: 'Item already active, deleted, or was not taken down by moderation.' })
+  @ApiResponse({ status: 403, description: 'Only SUPER_ADMIN can restore takedowns.' })
+  @ApiResponse({ status: 404, description: 'Showcase item not found.' })
+  restoreTakedown(
+    @Param('id', ParseIdPipe) itemId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<{ ok: true; item: object }> {
+    return this.service.restoreTakedownItem(admin.sub, itemId, req.ip ?? '');
+  }
+
   @UseGuards(UserThrottleGuard)
   @Post(':reportId/notes')
   @ApiOperation({

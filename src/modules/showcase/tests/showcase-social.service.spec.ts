@@ -117,10 +117,11 @@ const mockPrisma: any = {
     delete: jest.fn(),
   },
   $transaction: jest.fn(),
+  $executeRaw: jest.fn().mockResolvedValue(1),
 };
 
 const mockRedis = { setNx: jest.fn() };
-const mockUpload = { verifyUserFileKeys: jest.fn(), buildPublicUrl: jest.fn(), cleanupFileKeys: jest.fn(), uploadDirect: jest.fn() };
+const mockUpload = { verifyUserFileKeys: jest.fn(), buildPublicUrl: jest.fn(), cleanupFileKeys: jest.fn(), uploadDirect: jest.fn(), consumeUploadConfirmations: jest.fn().mockResolvedValue(undefined) };
 const mockConfig = { get: jest.fn() };
 
 /** Error Prisma P2002 (unique constraint) — dipakai untuk menguji like ganda. */
@@ -187,14 +188,15 @@ describe('ShowcaseService — like & komentar', () => {
   // ------------------------------------------------------------------
   describe('likeShowcase', () => {
     it('creates the like and bumps likeCount inside one transaction', async () => {
+      // SH-B-010: bump memakai updateMany ber-guard status; angka dibaca ulang.
+      mockPrisma.userShowcase.findUnique.mockResolvedValue({ likeCount: 5 });
       const result = await service.likeShowcase(VIEWER_ID, SHOWCASE_ID);
       expect(result).toEqual({ liked: true, likeCount: 5 });
       expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
       expect(mockPrisma.showcaseLike.create).toHaveBeenCalledWith({ data: { userId: VIEWER_ID, showcaseId: SHOWCASE_ID } });
-      expect(mockPrisma.userShowcase.update).toHaveBeenCalledWith({
-        where: { id: SHOWCASE_ID },
+      expect(mockPrisma.userShowcase.updateMany).toHaveBeenCalledWith({
+        where: { id: SHOWCASE_ID, deletedAt: null, isActive: true },
         data: { likeCount: { increment: 1 } },
-        select: { likeCount: true },
       });
     });
 
@@ -291,8 +293,9 @@ describe('ShowcaseService — like & komentar', () => {
       expect(mockPrisma.showcaseComment.create).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ showcaseId: SHOWCASE_ID, userId: VIEWER_ID, parentId: null, content: 'Masih tersedia?' }) }),
       );
-      expect(mockPrisma.userShowcase.update).toHaveBeenCalledWith({
-        where: { id: SHOWCASE_ID },
+      // SH-B-009: bump memakai updateMany ber-guard status (deletedAt/isActive).
+      expect(mockPrisma.userShowcase.updateMany).toHaveBeenCalledWith({
+        where: { id: SHOWCASE_ID, deletedAt: null, isActive: true },
         data: { commentCount: { increment: 1 } },
       });
     });

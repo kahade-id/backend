@@ -1,11 +1,12 @@
 import {
   ArrayMaxSize, ArrayMinSize, ArrayUnique, IsArray, IsBoolean, IsEnum, IsInt,
-  IsOptional, IsString, MaxLength, Min,
+  IsOptional, IsString, Max, MaxLength, Min,
 } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { ShowcaseVisibility } from '@prisma/client';
 import {
+  ORDER_MAX_VALUE,
   SHOWCASE_CATEGORY_MAX_LENGTH,
   SHOWCASE_DESCRIPTION_HTML_MAX_LENGTH,
   SHOWCASE_DESCRIPTION_MAX_LENGTH,
@@ -65,18 +66,22 @@ export class CreateShowcaseItemDto {
   @IsEnum(ShowcaseVisibility)
   visibility?: ShowcaseVisibility;
 
-  @ApiPropertyOptional({ minimum: 0, description: 'Harga minimum (Rupiah, bilangan bulat).' })
+  // SH-B-003: batas atas = ORDER_MAX_VALUE (Rp 1 miliar). Tanpa ini, nilai >
+  // 2^53 kehilangan presisi saat toNumber() di serializer (uang rupiah!).
+  @ApiPropertyOptional({ minimum: 0, maximum: ORDER_MAX_VALUE, description: 'Harga minimum (Rupiah, bilangan bulat).' })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(0)
+  @Max(ORDER_MAX_VALUE)
   priceMin?: number;
 
-  @ApiPropertyOptional({ minimum: 0, description: 'Harga maksimum (Rupiah, bilangan bulat).' })
+  @ApiPropertyOptional({ minimum: 0, maximum: ORDER_MAX_VALUE, description: 'Harga maksimum (Rupiah, bilangan bulat).' })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(0)
+  @Max(ORDER_MAX_VALUE)
   priceMax?: number;
 
   @ApiPropertyOptional({ minimum: 0, description: 'Urutan tampil di etalase profil.' })
@@ -139,18 +144,21 @@ export class UpdateShowcaseItemDto {
   @IsEnum(ShowcaseVisibility)
   visibility?: ShowcaseVisibility;
 
-  @ApiPropertyOptional({ minimum: 0 })
+  // SH-B-003: selaras dengan create — batas atas ORDER_MAX_VALUE.
+  @ApiPropertyOptional({ minimum: 0, maximum: ORDER_MAX_VALUE })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(0)
+  @Max(ORDER_MAX_VALUE)
   priceMin?: number;
 
-  @ApiPropertyOptional({ minimum: 0 })
+  @ApiPropertyOptional({ minimum: 0, maximum: ORDER_MAX_VALUE })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(0)
+  @Max(ORDER_MAX_VALUE)
   priceMax?: number;
 
   @ApiPropertyOptional()

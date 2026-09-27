@@ -15,6 +15,7 @@ import { generateNotifId } from '../../../common/utils/id-generator.util';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { ShowcaseReportAction } from './dto/review-showcase-report.dto';
 import { AppealDecision } from './dto/decide-appeal.dto';
+import { UploadService } from '../../upload/upload.service';
 import {
   moderationDb,
   ModerationPrisma,
@@ -45,6 +46,33 @@ import {
 
 const MAX_ADMIN_PAGE = 100_000;
 
+/**
+ * SH-A-003: bentuk item admin yang dipakai di endpoint moderasi etalase.
+ * SAMA PERSIS dengan select `showcase` di getShowcaseReportDetail — endpoint
+ * restore-takedown mengembalikan item dalam bentuk ini agar konsisten dengan
+ * GET detail existing.
+ */
+const ADMIN_MODERATION_ITEM_SELECT = {
+  id: true,
+  title: true,
+  description: true,
+  category: true,
+  isActive: true,
+  visibility: true,
+  priceMin: true,
+  priceMax: true,
+  likeCount: true,
+  commentCount: true,
+  createdAt: true,
+  images: {
+    select: { id: true, imageUrl: true, sortOrder: true },
+    orderBy: { sortOrder: 'asc' },
+  },
+  user: {
+    select: { id: true, username: true, fullName: true, avatarUrl: true },
+  },
+} as const;
+
 /** Status final: aksi moderasi ditolak (idempotency guard). */
 const FINAL_STATUSES: ReportStatus[] = MOD_FINAL_STATUSES;
 
@@ -70,6 +98,7 @@ export class AdminShowcaseReportsService {
   constructor(
     private prisma: PrismaService,
     private auditLog: AuditLogService,
+    private uploadService: UploadService,
   ) {
     // Cast terkontrol ke delegate model moderasi baru (lihat moderation-prisma.types.ts).
     this.mod = moderationDb(prisma);
@@ -353,27 +382,9 @@ export class AdminShowcaseReportsService {
     const report = await this.prisma.showcaseReport.findUnique({
       where: { id: reportId },
       include: {
+        // SH-A-003: select dishare via ADMIN_MODERATION_ITEM_SELECT.
         showcase: {
-          select: {
-            id: true,
-            title: true,
-            description: true,
-            category: true,
-            isActive: true,
-            visibility: true,
-            priceMin: true,
-            priceMax: true,
-            likeCount: true,
-            commentCount: true,
-            createdAt: true,
-            images: {
-              select: { id: true, imageUrl: true, sortOrder: true },
-              orderBy: { sortOrder: 'asc' },
-            },
-            user: {
-              select: { id: true, username: true, fullName: true, avatarUrl: true },
-            },
-          },
+          select: ADMIN_MODERATION_ITEM_SELECT,
         },
         reporter: {
           select: { id: true, username: true, fullName: true, avatarUrl: true },
@@ -586,6 +597,124 @@ export class AdminShowcaseReportsService {
         });
       }
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // SH-A-003 — restore item yang pernah di-takedown moderasi.
+  // Kontrak: POST /v1/admin/showcase-reports/items/:id/restore-takedown
+  // (SUPER_ADMIN only di controller). Audit-logged, set isActive=true,
+  // catat moderation event RESTORED, response 200 { ok: true, item } dengan
+  // bentuk item SAMA dengan GET detail existing (ADMIN_MODERATION_ITEM_SELECT).
+  //
+  // Guard penting: HANYA item yang terbukti pernah di-takedown moderasi
+  // (ada event TAKEDOWN pada laporannya) yang boleh di-restore. Item yang
+  // dinonaktifkan sendiri oleh owner → SHOWCASE_NOT_TAKEN_DOWN (fail-closed:
+  // endpoint ini bukan jalan pintas "aktifkan item").
+  // -------------------------------------------------------------------------
+  async restoreTakedownItem(
+    adminId: string,
+    itemId: string,
+    ipAddress: string,
+  ): Promise<{ ok: true; item: object }> {
+    const item = await this.prisma.userShowcase.findUnique({
+      where: { id: itemId },
+      select: { id: true, title: true, isActive: true, deletedAt: true, userId: true },
+    });
+    if (!item) {
+      throw new NotFoundException({
+        code: ErrorCodes.SHOWCASE_NOT_FOUND,
+        message: 'Showcase item not found',
+      });
+    }
+    if (item.deletedAt) {
+      throw new BadRequestException({
+        code: ErrorCodes.SHOWCASE_NOT_FOUND,
+        message: 'Showcase item is deleted; its owner must restore it before takedown restore',
+      });
+    }
+    if (item.isActive) {
+      throw new BadRequestException({
+        code: ErrorCodes.SHOWCASE_ALREADY_ACTIVE,
+        message: 'Showcase item is already active; nothing to restore',
+      });
+    }
+
+    // Bukti takedown moderasi: event TAKEDOWN terbaru pada laporan item ini.
+    // Tanpa ini → kemungkinan besar item dinonaktifkan owner sendiri.
+    // SH-A-003 (proof hardening): TAKEDOWN lama yang SUDAH di-restore tidak
+    // boleh dipakai ulang. Skenario berbahaya: takedown → restore → owner
+    // menonaktifkan item sendiri → admin memakai event TAKEDOWN lama untuk
+    // mengaktifkan lagi (jalan pintas). Karena itu, TAKEDOWN terbaru harus
+    // BELUM memiliki RESTORED setelahnya (fail-closed).
+    const takedownEvent = await this.safeRead(
+      this.mod.reportModerationEvent.findFirst({
+        where: { action: 'TAKEDOWN', report: { showcaseId: itemId } },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, reportId: true, createdAt: true },
+      }),
+      null,
+      'restore-takedown-event-check',
+    );
+    if (!takedownEvent) {
+      throw new BadRequestException({
+        code: ErrorCodes.SHOWCASE_NOT_TAKEN_DOWN,
+        message: 'Item was not taken down by moderation (it may have been deactivated by its owner); restore-takedown is not allowed',
+      });
+    }
+    const restoredAfterTakedown = await this.safeRead(
+      this.mod.reportModerationEvent.findFirst({
+        where: {
+          action: 'RESTORED',
+          report: { showcaseId: itemId },
+          createdAt: { gt: takedownEvent.createdAt },
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true },
+      }),
+      null,
+      'restore-takedown-restored-check',
+    );
+    if (restoredAfterTakedown) {
+      throw new BadRequestException({
+        code: ErrorCodes.SHOWCASE_NOT_TAKEN_DOWN,
+        message: 'The latest takedown of this item was already restored; a newer takedown by moderation is required before restore-takedown',
+      });
+    }
+
+    // SH-A-003 (atomicity): isActive=true + event RESTORED ditulis dalam SATU
+    // transaksi — event RESTORED wajib tercatat (bukan best-effort). Bila
+    // transaksi gagal, item tetap nonaktif dan tidak ada event setengah jadi.
+    await this.prisma.$transaction(async (tx) => {
+      await tx.userShowcase.update({
+        where: { id: itemId },
+        data: { isActive: true },
+      });
+      await (tx as unknown as PrismaService & ModerationPrisma).reportModerationEvent.create({
+        data: {
+          reportId: takedownEvent.reportId,
+          actorAdminId: adminId,
+          action: 'RESTORED',
+          stateFrom: null,
+          stateTo: null,
+          reasonCode: null,
+          note: `Takedown restored by SUPER_ADMIN ${adminId}`,
+          metadata: { takedownEventId: takedownEvent.id, showcaseId: itemId },
+        },
+      });
+    });
+
+    this.logAction(
+      adminId,
+      takedownEvent.reportId,
+      `Restored takedown of showcase item ${itemId} ("${item.title}") via report ${takedownEvent.reportId}`,
+      ipAddress,
+    );
+
+    const restored = await this.prisma.userShowcase.findUnique({
+      where: { id: itemId },
+      select: ADMIN_MODERATION_ITEM_SELECT,
+    });
+    return { ok: true, item: restored ?? {} };
   }
 
   // -------------------------------------------------------------------------
@@ -1558,7 +1687,7 @@ export class AdminShowcaseReportsService {
   async fileAppeal(
     userId: string,
     showcaseId: string,
-    input: { reason: string; newEvidence: unknown },
+    input: { reason: string; evidenceFileKeys: string[] },
     ipAddress: string,
   ): Promise<{ message: string; appealId: string; reportId: string }> {
     const item = await this.prisma.userShowcase.findFirst({
@@ -1585,19 +1714,20 @@ export class AdminShowcaseReportsService {
         message: `Alasan banding maksimal ${APPEAL_REASON_MAX_LENGTH} karakter`,
       });
     }
-    const evidence = input.newEvidence;
-    const evidenceEmpty =
-      evidence === null ||
-      evidence === undefined ||
-      (typeof evidence === 'string' && evidence.trim().length === 0) ||
-      (Array.isArray(evidence) && evidence.length === 0) ||
-      (typeof evidence === 'object' && !Array.isArray(evidence) && Object.keys(evidence as Record<string, unknown>).length === 0);
-    if (evidenceEmpty) {
+    // SH-S-005: bukti = daftar FILE KEY terverifikasi (report-evidence), BUKAN
+    // JSON bebas. verifyEvidenceFileKeys menegakkan: bentuk key aman (anti
+    // traversal), prefix uploads/report-evidence/<userId>/, konfirmasi upload,
+    // file ada di storage, ukuran, dan meng-consume konfirmasi one-time.
+    // DTO sudah menjamin min. 1 key; verifikasi ini menjamin key-nya asli.
+    const evidenceFileKeys = Array.isArray(input.evidenceFileKeys) ? input.evidenceFileKeys : [];
+    if (evidenceFileKeys.length === 0) {
       throw new BadRequestException({
         code: ErrorCodes.APPEAL_EVIDENCE_REQUIRED,
         message: 'Bukti baru wajib dilampirkan saat mengajukan banding',
       });
     }
+    await this.uploadService.verifyEvidenceFileKeys(userId, evidenceFileKeys, 'report-evidence');
+    const evidence: Record<string, unknown> = { fileKeys: evidenceFileKeys };
 
     // Harus ada enforcement final (takedown/restrict) atas item ini.
     const enforcement = await this.safeRead(
@@ -1651,7 +1781,7 @@ export class AdminShowcaseReportsService {
         appellantType: 'OWNER',
         appellantUserId: userId,
         reason,
-        newEvidence: evidence as Record<string, unknown>,
+        newEvidence: evidence,
         status: 'PENDING',
       },
     });

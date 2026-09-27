@@ -9,6 +9,7 @@ import { UploadPurpose } from '../upload/dto/presigned-url.dto';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { escapeLikePattern } from '../../common/utils/search.util';
 import { sanitizeShowcaseHtml } from '../../common/utils/sanitize-html.util';
+import { isBotUserAgent } from '../../common/utils/bot-detection.util';
 import {
   ORDER_MAX_VALUE,
   ORDER_MIN_VALUE,
@@ -18,6 +19,7 @@ import {
   SHOWCASE_MAX_ITEMS,
   SHOWCASE_REPLY_LIMIT,
   SHOWCASE_SEARCH_MIN_LENGTH,
+  SHOWCASE_SHARE_DEDUPE_TTL_SECONDS,
   SHOWCASE_VIEW_DEDUPE_TTL_SECONDS,
 } from '../../common/constants/app.constants';
 import { SubscriptionsService } from '../subscriptions/subscriptions.service';
@@ -235,9 +237,11 @@ export class ShowcaseService {
    * Ambil showcase untuk konsumsi PUBLIK. Mengembalikan null (bukan melempar)
    * bila tidak boleh terlihat, supaya pemanggil bisa memutuskan 404-nya.
    *
-   * Aturan: item harus isActive; visibility PRIVATE hanya untuk pemiliknya;
-   * pemilik harus aktif/tidak banned/belum dihapus/profil publik; dan tidak ada
-   * relasi block dengan viewer.
+   * Aturan: item harus belum dihapus; pemilik selalu boleh melihat itemnya
+   * sendiri (termasuk yang isActive=false / PRIVATE — SH-B-001: owner preview
+   * item nonaktif tidak boleh 404); selain pemilik, item harus PUBLIC +
+   * isActive + pemiliknya akun aktif/tidak banned/belum terhapus/profil
+   * publik, dan tidak ada relasi block dengan viewer.
    */
   private async findVisibleShowcase(
     showcaseId: string,
@@ -247,17 +251,16 @@ export class ShowcaseService {
     const row = (await this.prisma.userShowcase.findFirst({
       where: {
         id: showcaseId,
-        isActive: true,
         deletedAt: null,
         // Dua cabang: (1) pemilik selalu boleh melihat itemnya sendiri, termasuk
-        //     yang PRIVATE dan termasuk saat profilnya sedang tidak publik —
-        //     kalau tidak, owner kehilangan preview item privatnya sendiri;
-        //     (2) selain pemilik, item harus PUBLIC dan pemiliknya harus akun
-        //     aktif, tidak banned, belum terhapus, profil publik, dan tidak
-        //     terlibat relasi block dengan viewer.
+        //     yang PRIVATE dan yang sedang nonaktif (isActive=false) — kalau
+        //     tidak, owner kehilangan preview itemnya sendiri;
+        //     (2) selain pemilik, item harus PUBLIC + isActive dan pemiliknya
+        //     harus akun aktif, tidak banned, belum terhapus, profil publik,
+        //     dan tidak terlibat relasi block dengan viewer.
         OR: [
           { userId: viewerId ?? SELF_BRANCH_NEVER_MATCHES },
-          { visibility: ShowcaseVisibility.PUBLIC, user: this.visibleOwnerFilter(excludedIds) },
+          { visibility: ShowcaseVisibility.PUBLIC, isActive: true, user: this.visibleOwnerFilter(excludedIds) },
         ],
       },
       include: SHOWCASE_INCLUDE,
@@ -582,7 +585,10 @@ export class ShowcaseService {
             'Remove individual images via DELETE /users/me/showcase/images/:imageId instead.',
         });
       }
-      const imageFileKeys = await this.prepareImageKeys(userId, dto.imageFileKeys);
+      // SH-B-007: validasi dulu TANPA consume; konfirmasi one-time baru
+      // di-consume SETELAH update DB sukses — bila update gagal, file tidak
+      // yatim dan user tidak perlu upload ulang.
+      const imageFileKeys = await this.prepareImageKeys(userId, dto.imageFileKeys, { consume: false });
       const removedKeys = existing.images.map((image) => image.fileKey).filter((k): k is string => Boolean(k));
       data.images = {
         deleteMany: {},
@@ -605,6 +611,13 @@ export class ShowcaseService {
       data,
       include: SHOWCASE_INCLUDE,
     })) as unknown as ShowcaseRow;
+
+    // SH-B-007: consume SETELAH update sukses. Bila consume gagal di sini
+    // (sangat jarang — balapan double-submit), item sudah benar di DB;
+    // key yang tersisa kedaluwarsa sendiri via TTL konfirmasi.
+    if (dto.imageFileKeys !== undefined && dto.imageFileKeys.length > 0) {
+      await this.uploadService.consumeUploadConfirmations(userId, dto.imageFileKeys);
+    }
 
     return this.serializeShowcase(item, { isOwner: true });
   }
@@ -636,9 +649,24 @@ export class ShowcaseService {
         message: 'Masa pemulihan 30 hari telah berakhir. Etalase sudah dihapus permanen.',
       });
     }
-    await this.prisma.userShowcase.update({
-      where: { id: existing.id },
-      data: { deletedAt: null },
+    // SH-B-008: restore tidak boleh mendorong owner melewati SHOWCASE_MAX_ITEMS
+    // (skenario: hapus 1 → buat 1 baru → restore yang lama = 21 item).
+    // Count + update dalam SATU transaksi dengan lock pada baris aktif user —
+    // dua restore paralel tidak bisa sama-sama membaca count=N-1 lalu
+    // sama-sama restore (yang satu menunggu lock, lalu melihat count=N).
+    await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM "user_showcases" WHERE "userId" = ${userId} AND "deletedAt" IS NULL FOR UPDATE`;
+      const activeCount = await tx.userShowcase.count({ where: { userId, deletedAt: null } });
+      if (activeCount >= SHOWCASE_MAX_ITEMS) {
+        throw new BadRequestException({
+          code: ErrorCodes.SHOWCASE_ITEM_LIMIT_REACHED,
+          message: `Maximum ${SHOWCASE_MAX_ITEMS} showcase items allowed. Delete one of your active items before restoring this one.`,
+        });
+      }
+      await tx.userShowcase.update({
+        where: { id: existing.id },
+        data: { deletedAt: null },
+      });
     });
     return { message: 'Etalase berhasil dipulihkan.' };
   }
@@ -652,10 +680,15 @@ export class ShowcaseService {
    * `verifyUserFileKeys` menegakkan: bentuk key, kepemilikan (folder = userId),
    * konfirmasi /upload/confirm, ukuran tersimpan, dan content type tersimpan —
    * setara `verifyStoredImage` pada alur avatar/header.
+   *
+   * SH-B-007: `opts.consume=false` hanya memvalidasi TANPA meng-consume
+   * konfirmasi one-time — pemanggil wajib memanggil
+   * `uploadService.consumeUploadConfirmations()` SETELAH mutasi DB sukses.
    */
   private async prepareImageKeys(
     userId: string,
     fileKeys: string[] | undefined,
+    opts: { consume?: boolean } = {},
   ): Promise<{ fileKey: string; imageUrl: string }[]> {
     if (!fileKeys || fileKeys.length === 0) return [];
     // Benefit 7 Kahade+: batas gambar berbasis subscription (18 aktif / 8 biasa).
@@ -669,7 +702,7 @@ export class ShowcaseService {
     }
     await this.uploadService.verifyUserFileKeys(userId, fileKeys, UploadPurpose.SHOWCASE_IMAGE, {
       maxFiles: maxImages,
-      consume: true,
+      consume: opts.consume ?? true,
       label: 'Showcase image',
     });
     return fileKeys.map((fileKey) => ({ fileKey, imageUrl: this.uploadService.buildPublicUrl(fileKey) }));
@@ -690,26 +723,50 @@ export class ShowcaseService {
   async attachImages(userId: string, itemId: string, fileKeys: string[]): Promise<object> {
     const existing = await this.findOwnedShowcase(userId, itemId);
     const maxImages = await this.subscriptionsService.getMaxShowcaseImages(userId);
+    // Pre-check cepat (UX): ditolak SEBELUM konfirmasi upload di-consume,
+    // supaya user tidak perlu upload ulang. BUKAN otoritas akhir (TOCTOU).
     if (existing.images.length + fileKeys.length > maxImages) {
       throw new BadRequestException({
         code: ErrorCodes.SHOWCASE_IMAGE_LIMIT_REACHED,
         message: `Maximum ${maxImages} images per showcase item`,
       });
     }
-    const prepared = await this.prepareImageKeys(userId, fileKeys);
+    // SH-B-006: validasi dulu TANPA consume (pola sama seperti SH-B-007);
+    // konfirmasi one-time baru di-consume SETELAH transaksi sukses — bila
+    // cek otoritatif di dalam transaksi gagal (balapan), file tidak yatim
+    // dan user tidak perlu upload ulang.
+    const prepared = await this.prepareImageKeys(userId, fileKeys, { consume: false });
     if (prepared.length === 0) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'fileKeys must not be empty' });
     }
 
     const nextSortOrder = existing.images.reduce((max, image) => Math.max(max, image.sortOrder), -1) + 1;
-    const created = await this.prisma.showcaseImage.createMany({
-      data: prepared.map((image, index) => ({
-        showcaseId: itemId,
-        imageUrl: image.imageUrl,
-        fileKey: image.fileKey,
-        sortOrder: nextSortOrder + index,
-      })),
+    // SH-B-006: cek batas + createMany dalam SATU transaksi dengan row lock
+    // (SELECT ... FOR UPDATE) pada item — dua request paralel tidak bisa
+    // sama-sama lolos cek lalu totalnya melewati maxImages (TOCTOU).
+    const created = await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM "user_showcases" WHERE id = ${itemId} FOR UPDATE`;
+      const currentCount = await tx.showcaseImage.count({ where: { showcaseId: itemId } });
+      if (currentCount + prepared.length > maxImages) {
+        throw new BadRequestException({
+          code: ErrorCodes.SHOWCASE_IMAGE_LIMIT_REACHED,
+          message: `Maximum ${maxImages} images per showcase item`,
+        });
+      }
+      return tx.showcaseImage.createMany({
+        data: prepared.map((image, index) => ({
+          showcaseId: itemId,
+          imageUrl: image.imageUrl,
+          fileKey: image.fileKey,
+          sortOrder: nextSortOrder + index,
+        })),
+      });
     });
+
+    // SH-B-006: consume SETELAH createMany sukses. Bila consume gagal
+    // (sangat jarang — balapan double-submit), baris gambar sudah benar di
+    // DB; key yang tersisa kedaluwarsa sendiri via TTL konfirmasi.
+    await this.uploadService.consumeUploadConfirmations(userId, fileKeys);
 
     return { added: created.count, images: await this.listImages(itemId) };
   }
@@ -722,7 +779,24 @@ export class ShowcaseService {
     if (!image) {
       throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase image not found' });
     }
-    await this.prisma.showcaseImage.delete({ where: { id: imageId } });
+    // SH-B-002: item wajib punya ≥1 gambar (invarian create/update). Hitung +
+    // hapus dalam satu transaksi dengan row lock (SELECT ... FOR UPDATE) pada
+    // item — dua request delete paralel tidak bisa sama-sama membaca count=2
+    // lalu sama-sama menghapus (yang satu menunggu lock, lalu melihat count=1
+    // dan ditolak). Lock juga menahan balapan dengan updateShowcaseItem yang
+    // mengganti seluruh daftar gambar.
+    await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM "user_showcases" WHERE id = ${image.showcaseId} FOR UPDATE`;
+      const remaining = await tx.showcaseImage.count({ where: { showcaseId: image.showcaseId } });
+      if (remaining <= 1) {
+        throw new BadRequestException({
+          code: ErrorCodes.SHOWCASE_IMAGE_MIN_ONE,
+          message:
+            'A showcase item must keep at least 1 image. Replace the image via update, or delete the whole item instead.',
+        });
+      }
+      await tx.showcaseImage.delete({ where: { id: imageId } });
+    });
     if (image.fileKey) this.scheduleImageCleanup(userId, [image.fileKey]);
     return { message: 'Showcase image deleted successfully' };
   }
@@ -841,8 +915,10 @@ export class ShowcaseService {
       throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
     }
 
-    // R-4: owner yang mem-preview item miliknya yang sedang nonaktif (isActive=false)
-    // tidak ikut menaikkan viewCount — angka view hanya untuk item yang tayang.
+    // SH-B-001 (fix): owner BOLEH mem-preview item miliknya yang sedang
+    // nonaktif (isActive=false) — findVisibleShowcase tidak lagi memfilter
+    // isActive untuk cabang owner. Preview semacam itu tidak ikut menaikkan
+    // viewCount — angka view hanya untuk item yang tayang.
     const shouldCountView = !(visible.isOwner && !visible.row.isActive);
     const counted = shouldCountView ? await this.recordView(showcaseId, viewerId, options.clientIp) : false;
     const likedIds = await this.getLikedShowcaseIds(viewerId, [showcaseId]);
@@ -932,11 +1008,20 @@ export class ShowcaseService {
     // tidak bisa di-dedupe — lebih baik sedikit over-count daripada kehilangan
     // sinyal popularitas sama sekali.
     if (viewerKey) {
-      const isNew = await this.redis.setNx(
-        `showcase:view:${showcaseId}:${viewerKey}`,
-        '1',
-        SHOWCASE_VIEW_DEDUPE_TTL_SECONDS,
-      );
+      let isNew: boolean;
+      try {
+        isNew = await this.redis.setNx(
+          `showcase:view:${showcaseId}:${viewerKey}`,
+          '1',
+          SHOWCASE_VIEW_DEDUPE_TTL_SECONDS,
+        );
+      } catch {
+        // SH-B-005/SH-S-008: Redis down TIDAK boleh membuat GET :showcaseId
+        // me-return 500. View adalah metrik non-kritis → fail-open: hitung
+        // tanpa dedupe sebagai degradasi.
+        this.logger.warn(`recordView: Redis unavailable for showcase=${showcaseId}; counting view without dedupe`);
+        isNew = true;
+      }
       if (!isNew) return false;
     }
     // Atomic increment + scope id: pola TransactionTemplatesService.recordUsage.
@@ -1167,11 +1252,24 @@ export class ShowcaseService {
     try {
       const updated = await this.prisma.$transaction(async (tx) => {
         await tx.showcaseLike.create({ data: { userId, showcaseId } });
-        return tx.userShowcase.update({
-          where: { id: showcaseId },
+        // SH-B-010: guard status seperti recordView — item yang ter-soft-delete /
+        // nonaktif di antara visibility-check dan commit TIDAK menaikkan counter.
+        const bumped = await tx.userShowcase.updateMany({
+          where: { id: showcaseId, deletedAt: null, isActive: true },
           data: { likeCount: { increment: 1 } },
+        });
+        if (bumped.count === 0) {
+          // Item hilang/di-takedown di tengah jalan → rollback like.
+          throw new NotFoundException({
+            code: ErrorCodes.SHOWCASE_NOT_FOUND,
+            message: 'Showcase item is no longer available',
+          });
+        }
+        const row = await tx.userShowcase.findUnique({
+          where: { id: showcaseId },
           select: { likeCount: true },
         });
+        return { likeCount: row?.likeCount ?? 0 };
       });
       return { liked: true, likeCount: updated.likeCount };
     } catch (err) {
@@ -1429,10 +1527,19 @@ export class ShowcaseService {
         data: { showcaseId, userId, parentId, content },
         include: COMMENT_INCLUDE,
       });
-      await tx.userShowcase.update({
-        where: { id: showcaseId },
+      // SH-B-009: guard status seperti recordView — item yang ter-soft-delete /
+      // nonaktif di antara visibility-check dan commit TIDAK menaikkan counter.
+      const bumped = await tx.userShowcase.updateMany({
+        where: { id: showcaseId, deletedAt: null, isActive: true },
         data: { commentCount: { increment: 1 } },
       });
+      if (bumped.count === 0) {
+        // Item hilang/di-takedown di tengah jalan → rollback pembuatan komentar.
+        throw new NotFoundException({
+          code: ErrorCodes.SHOWCASE_NOT_FOUND,
+          message: 'Showcase item is no longer available',
+        });
+      }
       return comment;
     })) as unknown as CommentRow;
 
@@ -1657,13 +1764,50 @@ export class ShowcaseService {
    * Mencatat satu kejadian share nyata: deep link dibuka atau user
    * menyelesaikan share sheet. Increment atomik; item yang tidak visible
    * → 404 sebelum increment (tidak ada share tercatat untuk konten privat).
-   * Idempotent per pemanggilan — pemanggil (deep-link page / share sheet)
-   * yang bertanggung jawab memanggil tepat sekali per aksi nyata.
+   *
+   * SH-B-004/SH-S-002 (anti-inflasi shareCount):
+   *  - bot/crawler (UA) tidak menaikkan counter — dikembalikan apa adanya;
+   *  - dedupe per (viewer, item) 24 jam via Redis SET NX (pola recordView);
+   *  - endpoint tetap @Public(): frontend memanggilnya anonim (auth: "none"),
+   *    jadi auth TIDAK diwajibkan agar kontrak existing tidak rusak.
+   *    Untuk anonim dipakai hash IP seperti recordView.
+   * Redis down → fail-open (tetap hitung, tanpa dedupe): share adalah metrik
+   * non-kritis, jangan gagalkan aksi user.
    */
-  async recordShareOpen(showcaseId: string, viewerId?: string): Promise<{ shareCount: number }> {
+  async recordShareOpen(
+    showcaseId: string,
+    viewerId?: string,
+    options: { clientIp?: string; userAgent?: string } = {},
+  ): Promise<{ shareCount: number }> {
     const visible = await this.findVisibleShowcase(showcaseId, viewerId);
     if (!visible) {
       throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
+    }
+    // Bot (preview OG/unfurl) bukan share nyata.
+    if (isBotUserAgent(options.userAgent)) {
+      return { shareCount: visible.row.shareCount };
+    }
+    const viewerKey = viewerId
+      ? `u:${viewerId}`
+      : options.clientIp
+        ? `ip:${createHash('sha256').update(options.clientIp).digest('hex').slice(0, 32)}`
+        : null;
+    if (viewerKey) {
+      let isNew: boolean;
+      try {
+        isNew = await this.redis.setNx(
+          `showcase:share:${visible.row.id}:${viewerKey}`,
+          '1',
+          SHOWCASE_SHARE_DEDUPE_TTL_SECONDS,
+        );
+      } catch {
+        // Redis down → hitung tanpa dedupe (degradasi), bukan 500.
+        this.logger.warn(`recordShareOpen: Redis unavailable for showcase=${visible.row.id}; counting share without dedupe`);
+        isNew = true;
+      }
+      if (!isNew) {
+        return { shareCount: visible.row.shareCount };
+      }
     }
     const updated = await this.prisma.userShowcase.update({
       where: { id: visible.row.id },
@@ -1700,6 +1844,16 @@ export class ShowcaseService {
         code: ErrorCodes.VALIDATION_ERROR,
         message: 'priceMin must not exceed priceMax',
       });
+    }
+    // SH-B-003 (lapis kedua): DTO sudah punya @Max(ORDER_MAX_VALUE), tapi jalur
+    // internal/pemanggil langsung service tetap dijaga di sini.
+    for (const [label, value] of [['priceMin', priceMin], ['priceMax', priceMax]] as const) {
+      if (value !== undefined && (value < 0 || value > ORDER_MAX_VALUE)) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: `${label} must be between 0 and ${ORDER_MAX_VALUE}`,
+        });
+      }
     }
   }
 

@@ -8,7 +8,7 @@ describe('DeepLinksController', () => {
   let controller: DeepLinksController;
   let response: { status: jest.Mock; type: jest.Mock; set: jest.Mock; send: jest.Mock };
   // SS-005: req minimal untuk deteksi bot (user-agent).
-  const humanReq = { get: jest.fn().mockReturnValue('Mozilla/5.0 (Linux; Android 14)') };
+  const humanReq = { get: jest.fn().mockReturnValue('Mozilla/5.0 (Linux; Android 14)'), ip: '203.0.113.10' };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -150,7 +150,13 @@ describe('DeepLinksController', () => {
       });
 
       await controller.showcase('cshowcase000000000000001', humanReq as never, response as never);
-      expect(showcaseService.recordShareOpen).toHaveBeenCalledWith('cshowcase000000000000001');
+      // SH-B-004: controller meneruskan UA + IP ke recordShareOpen sebagai
+      // lapis kedua (defense-in-depth; controller tetap skip bot di hulu).
+      expect(showcaseService.recordShareOpen).toHaveBeenCalledWith(
+        'cshowcase000000000000001',
+        undefined,
+        expect.objectContaining({ userAgent: expect.any(String), clientIp: expect.any(String) }),
+      );
 
       jest.clearAllMocks();
       const botReq = { get: jest.fn().mockReturnValue('facebookexternalhit/1.1') };

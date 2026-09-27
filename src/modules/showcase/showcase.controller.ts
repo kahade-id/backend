@@ -179,13 +179,19 @@ export class ShowcaseController {
     description:
       'SS-005: mencatat SATU kejadian share nyata (user menyelesaikan share sheet). ' +
       'GET :showcaseId/share hanya mengembalikan metadata tanpa menaikkan counter. ' +
-      'Item PRIVATE/tidak visible ditolak 404 sebelum increment.',
+      'Item PRIVATE/tidak visible ditolak 404 sebelum increment. ' +
+      'SH-B-004: share di-dedupe per viewer+item (24 jam); user-agent bot/crawler tidak menaikkan counter. ' +
+      'Endpoint tetap publik (frontend memanggil anonim) — anonim di-dedupe per IP.',
   })
   async recordShare(
     @Param('showcaseId', ParseIdPipe) showcaseId: string,
     @CurrentUser('sub') viewerId: string | null,
+    @Req() req: Request,
   ): Promise<{ shareCount: number }> {
-    return this.showcaseService.recordShareOpen(showcaseId, viewerId ?? undefined);
+    return this.showcaseService.recordShareOpen(showcaseId, viewerId ?? undefined, {
+      clientIp: req.ip,
+      userAgent: req.get('user-agent') ?? undefined,
+    });
   }
 
   @Public()

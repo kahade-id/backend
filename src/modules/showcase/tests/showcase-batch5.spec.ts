@@ -74,10 +74,11 @@ const mockPrisma: any = {
   showcaseLike: { findMany: jest.fn(), create: jest.fn(), deleteMany: jest.fn() },
   showcaseComment: { findMany: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn(), count: jest.fn(), groupBy: jest.fn(), create: jest.fn(), update: jest.fn(), delete: jest.fn() },
   $transaction: jest.fn(),
+  $executeRaw: jest.fn().mockResolvedValue(1),
 };
 
 const mockRedis = { setNx: jest.fn() };
-const mockUpload = { verifyUserFileKeys: jest.fn(), buildPublicUrl: jest.fn(), cleanupFileKeys: jest.fn(), uploadDirect: jest.fn() };
+const mockUpload = { verifyUserFileKeys: jest.fn(), buildPublicUrl: jest.fn(), cleanupFileKeys: jest.fn(), uploadDirect: jest.fn(), consumeUploadConfirmations: jest.fn().mockResolvedValue(undefined) };
 const mockConfig = { get: jest.fn() };
 const mockSubscriptions = {
   isActive: jest.fn().mockResolvedValue(false),
@@ -159,6 +160,8 @@ describe('ShowcaseService — audit Batch 5', () => {
     });
 
     it('recordShareOpen menaikkan counter atomik setelah validasi visibilitas', async () => {
+      // SH-B-004: dedupe per viewer+item — pemanggilan pertama lolos.
+      mockRedis.setNx.mockResolvedValue(true);
       const result = await service.recordShareOpen(SHOWCASE_ID, VIEWER_ID);
       expect(result).toEqual({ shareCount: 4 });
       expect(mockPrisma.userShowcase.update).toHaveBeenCalledWith({
@@ -166,6 +169,20 @@ describe('ShowcaseService — audit Batch 5', () => {
         data: { shareCount: { increment: 1 } },
         select: { shareCount: true },
       });
+      // Dedupe key memakai scope share tersendiri + identitas viewer.
+      expect(mockRedis.setNx).toHaveBeenCalledWith(
+        expect.stringContaining(`showcase:share:${SHOWCASE_ID}:`),
+        '1',
+        expect.any(Number),
+      );
+    });
+
+    it('recordShareOpen mendupe share berulang dari viewer yang sama (tanpa increment kedua)', async () => {
+      mockRedis.setNx.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+      await service.recordShareOpen(SHOWCASE_ID, VIEWER_ID);
+      const second = await service.recordShareOpen(SHOWCASE_ID, VIEWER_ID);
+      expect(second).toEqual({ shareCount: 3 });
+      expect(mockPrisma.userShowcase.update).toHaveBeenCalledTimes(1);
     });
 
     it('recordShareOpen menolak item milik akun ter-ban (404)', async () => {

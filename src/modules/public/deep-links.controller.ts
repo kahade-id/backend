@@ -6,6 +6,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { UsersService } from '../users/users.service';
 import { OrderLinksService } from '../orders/order-links.service';
 import { ShowcaseService } from '../showcase/showcase.service';
+import { isBotUserAgent } from '../../common/utils/bot-detection.util';
 
 function escapeHtml(value: unknown): string {
   return String(value ?? '')
@@ -25,16 +26,6 @@ function appSchemeUrl(path: string): string {
 
 const USERNAME_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9_-]|\.(?=[a-zA-Z0-9])){2,29}$/;
 const PUBLIC_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
-
-/**
- * SS-005: pola User-Agent crawler/bot umum. Pembukaan halaman deep link oleh
- * bot (preview OG, indexer) BUKAN aksi share nyata → tidak menaikkan counter.
- */
-const BOT_UA_RE = /bot|crawl|spider|slurp|mediapartners|baidu|yandex|facebookexternalhit|twitterbot|linkedinbot|embedly|quora|pinterest|slackbot|discordbot|telegrambot|whatsapp|google-inspection-tool/i;
-function isBotUserAgent(req: Request): boolean {
-  const ua = req.get('user-agent') ?? '';
-  return BOT_UA_RE.test(ua);
-}
 
 function page({ title, description, appUrl, detail }: { title: string; description: string; appUrl: string; detail: string }): string {
   const safeTitle = escapeHtml(title);
@@ -168,8 +159,15 @@ export class DeepLinksController {
       detail = `${String(record.description ?? 'Item showcase Kahade')}\nHarga: ${String(record.priceLabel ?? '—')}\nOleh: @${String(record.authorUsername ?? 'pengguna Kahade')}`;
       // SS-005: pembukaan deep link oleh manusia = aksi share nyata → catat.
       // Bot/crawler (preview OG) dilewati agar tidak menggembungkan counter.
-      if (!isBotUserAgent(req)) {
-        await this.showcaseService.recordShareOpen(safeId).catch(() => undefined);
+      // SH-B-004: UA juga diteruskan ke recordShareOpen sebagai lapis kedua,
+      // dan IP client diteruskan agar dedupe anonim berfungsi (hash IP).
+      if (!isBotUserAgent(req.get('user-agent'))) {
+        await this.showcaseService
+          .recordShareOpen(safeId, undefined, {
+            userAgent: req.get('user-agent') ?? undefined,
+            clientIp: req.ip,
+          })
+          .catch(() => undefined);
       }
     } catch {
       detail = 'Konten ini privat, sudah dihapus, atau tidak tersedia. Buka aplikasi untuk melihat status terbaru.';

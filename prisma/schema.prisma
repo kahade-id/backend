@@ -1645,6 +1645,13 @@ model Order {
   orderLinkId String?
   orderLink   OrderLink? @relation(fields: [orderLinkId], references: [id], onDelete: SetNull)
 
+  // SH-B-011 (audit etalase 2026-09-27): asal etalase — kolom nullable
+  // additive-only. priceSnapshot = harga etalase (RUPIAH integer) saat
+  // link/order dibuat; HANYA pencatatan, tidak memengaruhi escrow/wallet.
+  showcaseId    String?
+  showcase      UserShowcase? @relation("OrderShowcase", fields: [showcaseId], references: [id], onDelete: SetNull)
+  priceSnapshot BigInt?
+
   // Relations
   statusHistories     OrderStatusHistory[]
   chatRoom            ChatRoom?
@@ -1679,6 +1686,7 @@ model Order {
   @@index([status, confirmationDeadlineAt]) // confirmation timeout scheduler
   @@index([status, processingDeadlineAt]) // processing timeout scheduler
   @@index([orderLinkId])
+  @@index([showcaseId]) // SH-B-011: analitik konversi etalase → order
   @@map("orders")
 }
 
@@ -2964,12 +2972,20 @@ model OrderLink {
 
   orders Order[]
 
+  // SH-B-011 (audit etalase 2026-09-27): asal etalase — kolom nullable
+  // additive-only. priceSnapshot = harga etalase (RUPIAH integer) saat link
+  // dibuat; HANYA pencatatan, tidak memengaruhi escrow/wallet.
+  showcaseId    String?
+  showcase      UserShowcase? @relation("OrderLinkShowcase", fields: [showcaseId], references: [id], onDelete: SetNull)
+  priceSnapshot BigInt?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([creatorId])
   @@index([status])
   @@index([status, expiresAt])
+  @@index([showcaseId]) // SH-B-011: analitik konversi etalase → order
   @@map("order_links")
 }
 
@@ -3457,6 +3473,9 @@ model UserShowcase {
   likes    ShowcaseLike[]
   comments ShowcaseComment[]
   reports  ShowcaseReport[]
+  // SH-B-011: back-relation asal etalase (nullable di sisi Order/OrderLink).
+  orders    Order[]     @relation("OrderShowcase")
+  orderLinks OrderLink[] @relation("OrderLinkShowcase")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

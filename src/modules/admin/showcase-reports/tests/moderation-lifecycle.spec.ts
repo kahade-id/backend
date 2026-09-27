@@ -87,11 +87,17 @@ function makeService(prisma: Record<string, unknown>) {
     logAdminAction: jest.fn(),
     logUserAction: jest.fn(),
   };
+  // SH-S-005: service kini menerima UploadService untuk verifikasi bukti appeal.
+  const uploadService = {
+    verifyEvidenceFileKeys: jest.fn().mockResolvedValue(['k1']),
+    buildPublicUrl: jest.fn(),
+  };
   const service = new AdminShowcaseReportsService(
     prisma as never,
     auditLog as never,
+    uploadService as never,
   );
-  return { service, auditLog };
+  return { service, auditLog, uploadService };
 }
 
 function baseReport(overrides: Record<string, unknown> = {}) {

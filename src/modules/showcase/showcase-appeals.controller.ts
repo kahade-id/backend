@@ -37,10 +37,12 @@ export class ShowcaseAppealsController {
     summary: 'File an appeal against a moderation takedown/restriction',
     description:
       'G404 — pemilik item mengajukan banding atas takedown/pembatasan. ' +
-      'Alasan (min. 20 karakter) + bukti baru WAJIB. Requires Idempotency-Key.',
+      'Alasan (min. 20 karakter) + bukti baru WAJIB. Bukti berupa file key terverifikasi ' +
+      '(report-evidence) — diverifikasi kepemilikan + konfirmasi upload oleh backend. ' +
+      'Requires Idempotency-Key.',
   })
   @ApiResponse({ status: 201, description: 'Appeal filed.' })
-  @ApiResponse({ status: 400, description: 'Nothing to appeal, or reason/evidence missing.' })
+  @ApiResponse({ status: 400, description: 'Nothing to appeal, or reason/evidence missing/invalid.' })
   @ApiResponse({ status: 404, description: 'Showcase item not found.' })
   @ApiResponse({ status: 409, description: 'A pending appeal already exists for this item.' })
   async fileAppeal(
@@ -52,7 +54,7 @@ export class ShowcaseAppealsController {
     return this.moderation.fileAppeal(
       userId,
       showcaseId,
-      { reason: dto.reason, newEvidence: dto.newEvidence },
+      { reason: dto.reason, evidenceFileKeys: dto.evidenceFileKeys },
       req.ip ?? '',
     );
   }

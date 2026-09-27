@@ -183,6 +183,8 @@ export const SHOWCASE_FEED_DEFAULT_LIMIT = 20;
 export const SHOWCASE_FEED_MAX_LIMIT = 50;
 /** Satu view dihitung sekali per (viewer, showcase) dalam window ini. */
 export const SHOWCASE_VIEW_DEDUPE_TTL_SECONDS = 3600;
+/** SH-B-004: satu share nyata dihitung sekali per (viewer, showcase) dalam window ini. */
+export const SHOWCASE_SHARE_DEDUPE_TTL_SECONDS = 86400;
 export const SHOWCASE_SEARCH_MIN_LENGTH = 2;
 export const SHOWCASE_SEARCH_MAX_LENGTH = 100;
 

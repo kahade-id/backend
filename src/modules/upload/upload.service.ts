@@ -38,6 +38,31 @@ const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
 
 const MIN_FILE_SIZE = 1024;
 
+// SH-S-001 (audit etalase 2026-09-27, P0 stored XSS): ekstensi file yang
+// TERSIMPAN wajib diturunkan dari MIME yang terdeteksi via magic-byte
+// (allowlist di bawah), BUKAN dari filename kiriman user. Sebelumnya
+// `promo.html` ber-header JPEG valid lolos dan diserve nginx sebagai
+// text/html di origin api.kahade.id → stored XSS. MIME di sini SELALU cocok
+// dengan detectedMime (uploadDirectTx menolak bila tidak), jadi map ini
+// harus mencakup semua MIME yang dikenal detectMimeFromBytes; MIME tanpa
+// entri → upload ditolak (fail-closed).
+const DETECTED_MIME_TO_EXTENSION: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+  'image/heic': '.heic',
+  'image/heif': '.heif',
+  'image/avif': '.avif',
+  'application/pdf': '.pdf',
+  'video/mp4': '.mp4',
+  'video/quicktime': '.mov',
+  'video/webm': '.webm',
+  'audio/mpeg': '.mp3',
+  'audio/wav': '.wav',
+  'audio/ogg': '.ogg',
+  'audio/mp4': '.m4a',
+};
+
 const MAX_FILE_SIZE: Record<UploadPurpose, number> = {
   [UploadPurpose.KYC_KTP]: 5 * 1024 * 1024,
   [UploadPurpose.KYC_SELFIE]: 5 * 1024 * 1024,
@@ -128,7 +153,9 @@ const FILE_KEY_PATTERN = /^uploads\/[a-z-]+\/[a-zA-Z0-9_-]+\/[\w.-]+$/;
 // `verifyEvidenceFileKeys*()` only asserted `segments[2] === userId`, so a key
 // such as `uploads/dispute-evidence/<myId>/../../kyc-ktp/<victimId>/ktp.jpg`
 // passed their ownership test and was handed straight to R2.
-function isSafeFileKey(fileKey: unknown): fileKey is string {
+// SH-S-004: diekspor agar upload.controller (downloadOwnFile) bisa memakainya
+// sebagai validasi bentuk key baris-pertama (400 terkontrol, bukan 500).
+export function isSafeFileKey(fileKey: unknown): fileKey is string {
   if (typeof fileKey !== 'string') return false;
   if (fileKey.length === 0 || fileKey.length > 512) return false;
   if (fileKey.includes('..') || fileKey.includes('//') || fileKey.includes('\\') || fileKey.includes('%')) return false;
@@ -669,6 +696,25 @@ export class UploadService {
     return this.localStorage.getPublicUrl(fileKey);
   }
 
+  /**
+   * SH-B-007: konsumsi konfirmasi upload one-time TANPA validasi ulang.
+   * Dipakai pemanggil yang sudah memvalidasi via `verifyUserFileKeys(...,
+   * { consume: false })` dan baru boleh meng-consume SETELAH mutasi DB-nya
+   * sukses — supaya kegagalan DB tidak membuat file yatim / user upload ulang.
+   * Idempotent-safe: bila key sudah ter-consume (balapan), melempar 409.
+   */
+  async consumeUploadConfirmations(userId: string, fileKeys: string[]): Promise<void> {
+    for (const fileKey of fileKeys) {
+      const consumed = await this.redis.consumeOnce(`confirmed_upload:${userId}:${fileKey}`, { throwOnError: true });
+      if (!consumed) {
+        throw new ConflictException({
+          code: ErrorCodes.UPLOAD_NOT_CONFIRMED,
+          message: 'File confirmation has already been consumed or expired',
+        });
+      }
+    }
+  }
+
   async getFileSize(fileKey: string): Promise<number> {
     if (!isSafeFileKey(fileKey) || !this.isKnownStorageKey(fileKey)) throw new BadRequestException({ code: ErrorCodes.INVALID_FILE_TYPE, message: 'Invalid file key format' });
     return (await this.localStorage.getFileSize(fileKey)) ?? 0;
@@ -798,10 +844,24 @@ export class UploadService {
     }
 
     const sanitizedFileName = sanitizeStoredFileName(fileName);
+    // SH-S-001: buang ekstensi asli dari filename user SEPENUHNYA, ganti dengan
+    // ekstensi dari MIME terdeteksi. `promo.html` ber-magic JPEG tersimpan
+    // sebagai `.jpg` — nginx tidak akan pernah menyajikannya sebagai text/html.
+    const detectedExtension = DETECTED_MIME_TO_EXTENSION[detectedMime];
+    if (!detectedExtension) {
+      throw new BadRequestException({
+        code: ErrorCodes.MIME_TYPE_MISMATCH,
+        message: `Detected file type ${detectedMime} has no safe stored extension`,
+      });
+    }
+    const baseName = sanitizedFileName.includes('.')
+      ? sanitizedFileName.slice(0, sanitizedFileName.lastIndexOf('.'))
+      : sanitizedFileName;
+    const storedFileName = `${baseName || 'file'}${detectedExtension}`;
     const timestamp = Date.now();
     const randomSuffix = nanoid();
     const folder = UploadService.PURPOSE_FOLDER_MAP[purpose];
-    const fileKey = `uploads/${folder}/${userId}/${timestamp}-${randomSuffix}-${sanitizedFileName}`;
+    const fileKey = `uploads/${folder}/${userId}/${timestamp}-${randomSuffix}-${storedFileName}`;
 
     try {
       await this.localStorage.saveFile(fileKey, fileBuffer);

@@ -42,6 +42,17 @@ export class HttpExceptionFilter implements ExceptionFilter {
     if (requestId) {
       errorBody.requestId = requestId;
     }
+    // ADM-426: 429 selalu membawa Retry-After (header + body) agar klien
+    // bisa menampilkan countdown. Nilai dari guard via `retryAfter` (detik).
+    if (status === HttpStatus.TOO_MANY_REQUESTS) {
+      const retryAfter =
+        typeof exceptionResponse === 'object' && exceptionResponse !== null
+          ? Number((exceptionResponse as Record<string, unknown>).retryAfter)
+          : NaN;
+      const seconds = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.ceil(retryAfter) : 60;
+      response.setHeader('Retry-After', String(seconds));
+      errorBody.retryAfter = seconds;
+    }
 
     response.status(status).json({
       success: false,

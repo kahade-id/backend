@@ -8,6 +8,7 @@ import { AdminRoute } from '../../../common/decorators/public.decorator';
 import { ParseDateQueryPipe, ParseEnumQueryPipe } from '../../../common/pipes/parse-query-string.pipe';
 import { ClampLimitPipe } from '../../../common/pipes/clamp-limit.pipe';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
+import { withCsvExportWatermark } from '../../../common/utils/csv-watermark.util';
 import { Request, Response } from 'express';
 
 function parseOptionalDate(value: string | undefined, field: string): Date | undefined {
@@ -120,6 +121,7 @@ export class AdminAnalyticsController {
     const csvRows = Object.entries(overview).map(([k, v]) => `${k},${typeof v === 'object' ? JSON.stringify(v).replace(/,/g, ';') : v}`).join('\n');
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', 'attachment; filename=\"analytics-export.csv\"');
-    res.send(csvHeader + csvRows);
+    // ADM-429: watermark pengekspor di baris awal CSV untuk keterlacakan kebocoran.
+    res.send(withCsvExportWatermark(csvHeader + csvRows, adminId ?? 'unknown', 'admin/analytics/export'));
   }
 }

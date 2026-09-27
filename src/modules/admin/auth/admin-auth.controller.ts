@@ -30,9 +30,12 @@ export class AdminAuthController {
   }
 
   private setRefreshCookie(res: Response, token: string): void {
+    // ADM-423: `secure` hanya di production — hardcoded `secure: true` merusak
+    // alur refresh saat dev lokal via HTTP.
+    const isProduction = this.configService.get<string>('app.nodeEnv') === 'production';
     res.cookie(ADMIN_REFRESH_COOKIE, token, {
       httpOnly: true,
-      secure: true,
+      secure: isProduction,
       sameSite: 'strict',
       path: this.getRefreshCookiePath(),
       maxAge: 7 * 24 * 60 * 60 * 1000,
@@ -138,6 +141,32 @@ export class AdminAuthController {
     const refreshToken: string | undefined = req.cookies?.[ADMIN_REFRESH_COOKIE];
     this.clearRefreshCookie(res);
     return this.adminAuthService.logout(admin.sub, admin.jti, req.ip || 'unknown', refreshToken);
+  }
+
+  // ADM-420: self-service "keluar dari semua perangkat". Bisa diakses semua role
+  // (tanpa @AdminRoles — hanya JwtAdminGuard; AdminRolesGuard fail-closed bila
+  // dipasang tanpa metadata). Mencabut SEMUA sesi milik sendiri termasuk sesi
+  // saat ini — klien wajib redirect ke /login setelah 200.
+  @UseGuards(JwtAdminGuard, UserThrottleGuard)
+  @ApiBearerAuth('access-token')
+  @Post('sessions/revoke-all')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Cabut semua sesi milik sendiri',
+    description:
+      'Self-service: mencabut seluruh sesi login admin pemanggil (semua perangkat), ' +
+      'termasuk sesi yang dipakai memanggil endpoint ini. Token akses & refresh ikut mati. ' +
+      'Klien wajib mengarahkan ke /login setelah respons 200.',
+  })
+  @ApiResponse({ status: 200, description: 'All own sessions revoked; re-login required.' })
+  @ApiResponse({ status: 401, description: 'Invalid token.' })
+  async revokeAllOwnSessions(
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ message: string; revokedCount: number }> {
+    this.clearRefreshCookie(res);
+    return this.adminAuthService.revokeAllOwnSessions(admin.sub, req.ip || 'unknown');
   }
 
   @UseGuards(JwtAdminGuard)

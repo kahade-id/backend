@@ -7,6 +7,7 @@ import { UpdateAdminDto } from './dto/update-admin.dto';
 import { SuspendAdminDto } from './dto/suspend-admin.dto';
 import { ChangeAdminRoleDto } from './dto/change-admin-role.dto';
 import { CreateEmergencyGrantDto } from './dto/emergency-grant.dto';
+import { EMERGENCY_GRANT_SCOPE_NAMES, isKnownEmergencyGrantScope } from '../../../common/constants/emergency-grant-scopes';
 import { CreateHandoffDto, HandoffQueryDto } from './dto/create-handoff.dto';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditAction } from '@prisma/client';
@@ -14,10 +15,14 @@ import * as ErrorCodes from '../../../common/constants/error-codes';
 import { bcryptHash } from '../../../common/utils/crypto.util';
 import { BCRYPT_ROUNDS_ADMIN } from '../../../common/constants/app.constants';
 import { escapeLikePattern } from '../../../common/utils/search.util';
-// jwt.config clamps admin access tokens to at most two hours.
-// Keep revocation markers alive for that full bound so a revoked token cannot
-// become usable merely because the marker expired before the token.
-const ADMIN_ACCESS_TOKEN_TTL_SECONDS = 2 * 60 * 60;
+import { ADMIN_SESSION_ABSOLUTE_TTL_SECONDS } from '../../auth/token.service';
+// ADM-420: epoch `admin_revoked:` harus hidup minimal sepanjang umur maksimum
+// kredensial admin yang masih bisa dihormati. Refresh token dibatasi umur
+// absolut sesi 24 jam (SEC-502); marker 2 jam membuka jendela 2–24 jam di mana
+// refresh token curian dapat menerbitkan access token baru setelah marker
+// kedaluwarsa (fail-open). Batas atas 2 jam dari jwt.config hanya untuk access
+// token — bukan untuk refresh.
+const ADMIN_REVOKED_MARKER_TTL_SECONDS = ADMIN_SESSION_ABSOLUTE_TTL_SECONDS;
 const MAX_ADMIN_PAGE = 100_000;
 
 @Injectable()
@@ -240,7 +245,7 @@ export class AdminManagementService {
     if (accessStateChanged) {
       await this.redis.setex(
         `admin_revoked:${targetId}`,
-        ADMIN_ACCESS_TOKEN_TTL_SECONDS,
+        ADMIN_REVOKED_MARKER_TTL_SECONDS,
         String(Math.floor(Date.now() / 1000)),
         { throwOnError: true },
       );
@@ -268,7 +273,7 @@ export class AdminManagementService {
     });
     await this.redis.setex(
       `admin_revoked:${targetId}`,
-      ADMIN_ACCESS_TOKEN_TTL_SECONDS,
+      ADMIN_REVOKED_MARKER_TTL_SECONDS,
       String(Math.floor(Date.now() / 1000)),
       { throwOnError: true },
     );
@@ -301,7 +306,7 @@ export class AdminManagementService {
     });
     await this.redis.setex(
       `admin_revoked:${targetId}`,
-      ADMIN_ACCESS_TOKEN_TTL_SECONDS,
+      ADMIN_REVOKED_MARKER_TTL_SECONDS,
       String(Math.floor(Date.now() / 1000)),
       { throwOnError: true },
     );
@@ -342,7 +347,7 @@ export class AdminManagementService {
 
     await this.redis.setex(
       `admin_revoked:${targetId}`,
-      ADMIN_ACCESS_TOKEN_TTL_SECONDS,
+      ADMIN_REVOKED_MARKER_TTL_SECONDS,
       String(Math.floor(Date.now() / 1000)),
       { throwOnError: true },
     );
@@ -367,7 +372,7 @@ export class AdminManagementService {
   private async revokeAdminTokens(adminId: string): Promise<void> {
     await this.redis.setex(
       `admin_revoked:${adminId}`,
-      ADMIN_ACCESS_TOKEN_TTL_SECONDS,
+      ADMIN_REVOKED_MARKER_TTL_SECONDS,
       String(Math.floor(Date.now() / 1000)),
       { throwOnError: true },
     );
@@ -564,6 +569,15 @@ export class AdminManagementService {
     }
     if (!target.isActive) {
       throw new BadRequestException({ code: ErrorCodes.ACCOUNT_INACTIVE, message: 'Target admin is not active' });
+    }
+
+    // ADM-402 (defense in depth, di samping @IsIn pada DTO): scope di luar allowlist
+    // ditolak — grant tanpa scope valid tidak boleh memberi kesan akses terbatas.
+    if (!isKnownEmergencyGrantScope(dto.scope)) {
+      throw new BadRequestException({
+        code: ErrorCodes.EMERGENCY_GRANT_UNKNOWN_SCOPE,
+        message: `Unknown emergency grant scope "${dto.scope}". Allowed: ${EMERGENCY_GRANT_SCOPE_NAMES.join(', ')}`,
+      });
     }
 
     const existing = await this.prisma.emergencyAccessGrant.findFirst({

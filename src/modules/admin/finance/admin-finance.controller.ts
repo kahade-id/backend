@@ -230,6 +230,7 @@ export class AdminFinanceController {
   async exportCsv(
     @Query('from') from?: string,
     @Query('to') to?: string,
+    @CurrentAdmin('sub') adminId?: string,
     @Res() res?: Response,
   ): Promise<void> {
     // CW-022: dukung rentang tanggal (default 30 hari terakhir, maks 365 hari).
@@ -245,7 +246,7 @@ export class AdminFinanceController {
     if (diffDays > 365) {
       throw new BadRequestException({ code: 'DATE_RANGE_TOO_LARGE', message: 'Export date range cannot exceed 365 days' });
     }
-    const csv = await this.service.buildFinanceCsvExport(fromDate, toDate);
+    const csv = await this.service.buildFinanceCsvExport(fromDate, toDate, adminId ?? 'unknown');
     res!.setHeader('Content-Type', 'text/csv');
     res!.setHeader('Content-Disposition', 'attachment; filename="finance-export.csv"');
     res!.send(csv);
@@ -369,7 +370,7 @@ export class AdminFinanceController {
     @Req() req: Request,
     @Res() res?: Response,
   ): Promise<void> {
-    const csv = await this.service.buildFindingsCsvExport();
+    const csv = await this.service.buildFindingsCsvExport(adminId);
     this.service.logReconciliation(adminId, 'findings-export', true, req.ip || 'unknown');
     res!.setHeader('Content-Type', 'text/csv');
     res!.setHeader('Content-Disposition', 'attachment; filename="reconciliation-findings.csv"');

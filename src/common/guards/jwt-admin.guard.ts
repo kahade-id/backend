@@ -13,6 +13,10 @@ import { Request } from 'express';
 import { RedisService } from '../../redis/redis.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ADMIN_TOKEN_BLACKLIST } from '../constants/redis-keys';
+import {
+  getEmergencyGrantScopeDef,
+  isKnownEmergencyGrantScope,
+} from '../constants/emergency-grant-scopes';
 import * as ErrorCodes from '../constants/error-codes';
 
 // All admin tokens are signed with aud:'kahade-admin-api' and iss:'kahade-auth'.
@@ -105,7 +109,18 @@ export class JwtAdminGuard implements CanActivate {
       }
 
       if (payload.scope) {
-        const allowedPaths = this.getAllowedPathsForScope(payload.scope);
+        // ADM-402: scope tak dikenal → tolak (fail-closed). Scope yang dikenal
+        // dibatasi ke prefix path allowlist-nya; tidak pernah memperluas akses role.
+        if (!isKnownEmergencyGrantScope(payload.scope)) {
+          this.logger.warn(
+            `Admin token with unknown scope "${payload.scope}" rejected (sub=${payload.sub})`,
+          );
+          throw new ForbiddenException({
+            code: ErrorCodes.INSUFFICIENT_TOKEN_SCOPE,
+            message: 'Token scope insufficient for this endpoint',
+          });
+        }
+        const allowedPrefixes = this.getAllowedPathsForScope(payload.scope);
         const rawPath = (request.originalUrl || request.url || '')
           .split('?')[0]
           .replace(/\/+$/, '');
@@ -113,7 +128,7 @@ export class JwtAdminGuard implements CanActivate {
         const normalizedPath = rawPath.startsWith(apiPrefix)
           ? rawPath.slice(apiPrefix.length)
           : rawPath;
-        const isAllowed = allowedPaths.some(path => normalizedPath === path);
+        const isAllowed = this.isPathAllowedByScope(normalizedPath, allowedPrefixes);
         if (!isAllowed) {
           throw new ForbiddenException({
             code: ErrorCodes.INSUFFICIENT_TOKEN_SCOPE,
@@ -146,15 +161,36 @@ export class JwtAdminGuard implements CanActivate {
     }
   }
 
-  private getAllowedPathsForScope(scope: string): string[] {
-    const scopePaths: Record<string, string[]> = {
-      mfa_setup: ['/admin/auth/2fa/setup'],
-      mfa_confirm: ['/admin/auth/2fa/confirm'],
-      change_password_required: ['/admin/auth/change-password'],
-      admin_2fa_verify: ['/admin/auth/2fa/verify'],
-      '2fa_verify': ['/admin/auth/2fa/verify'],
-    };
-    return scopePaths[scope] || [];
+  /**
+   * ADM-402/ADM-418 — Penegakan scope token admin (fail-closed).
+   *
+   * Hanya kosakata scope emergency grant yang dikenal (`USERS`, `KYC`, `FINANCE`,
+   * `DISPUTES`, `ALL` — lihat `emergency-grant-scopes.ts`) yang dipetakan ke prefix
+   * path yang diizinkan. Scope tak dikenal → daftar kosong → token ditolak di semua
+   * endpoint (403). Scope `ALL` = tanpa batasan path (setara token tanpa scope).
+   *
+   * Catatan ADM-418: entri lama (`mfa_setup`, `mfa_confirm`, `change_password_required`,
+   * `2fa_verify`) DIHAPUS karena mati — tidak ada token beraudien `kahade-admin-api`
+   * yang pernah membawa scope tersebut (token sementara MFA memakai audien terpisah
+   * dan tidak melewati guard ini). Scope hanya bisa mempersempit, tidak memperluas:
+   * `AdminRolesGuard` tetap berjalan setelah guard ini.
+   */
+  private getAllowedPathsForScope(scope: string): string[] | null {
+    const def = getEmergencyGrantScopeDef(scope);
+    if (!def) return []; // scope tak dikenal → tolak di mana pun (fail-closed)
+    if (def.unrestricted) return null; // 'ALL' → tanpa batasan path
+    return def.allowedPathPrefixes;
+  }
+
+  /**
+   * ADM-402: cocokkan path ternormalisasi terhadap prefix yang diizinkan.
+   * `allowedPrefixes === null` berarti tanpa batasan (scope ALL).
+   */
+  private isPathAllowedByScope(normalizedPath: string, allowedPrefixes: string[] | null): boolean {
+    if (allowedPrefixes === null) return true;
+    return allowedPrefixes.some(
+      (prefix) => normalizedPath === prefix || normalizedPath.startsWith(prefix + '/'),
+    );
   }
 
   private extractTokenFromHeader(request: Request): string | undefined {

@@ -1,7 +1,7 @@
 import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { OrderStatus, AuditAction, Prisma, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType } from '@prisma/client';
+import { OrderStatus, AuditAction, Prisma, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType, DisputeStatus } from '@prisma/client';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditLogService } from '../../../common/services/audit-log.service';
@@ -149,13 +149,29 @@ export class AdminOrdersService {
     return serializeOrder(order as unknown as Record<string, unknown>);
   }
 
-  async forceCancel(orderId: string, adminId: string, dto: ForceActionDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: OrderStatus }> {
+  // ADM-404: DISPUTE_ADMIN hanya boleh force-cancel order yang memiliki dispute AKTIF.
+  // SUPER_ADMIN tidak dibatasi. Reason wajib (ForceActionDto, min 10 karakter) dan
+  // aksi diaudit sebagai ORDER_FORCE_CANCEL.
+  async forceCancel(orderId: string, adminId: string, adminRole: string, dto: ForceActionDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: OrderStatus }> {
     const order = await this.prisma.order.findFirst({
       where: { OR: [{ id: orderId }, { orderId }], deletedAt: null },
     });
 
     if (!order) {
       throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
+    }
+
+    if (adminRole !== 'SUPER_ADMIN') {
+      const activeDispute = await this.prisma.dispute.findFirst({
+        where: { orderId: order.id, status: { not: DisputeStatus.RESOLVED } },
+        select: { id: true },
+      });
+      if (!activeDispute) {
+        throw new ForbiddenException({
+          code: ErrorCodes.INSUFFICIENT_ADMIN_ROLE,
+          message: 'Force-cancel di luar konteks sengketa memerlukan SUPER_ADMIN. DISPUTE_ADMIN hanya boleh force-cancel order dengan dispute aktif.',
+        });
+      }
     }
 
     await this.orderStateService.adminCancelOrder(

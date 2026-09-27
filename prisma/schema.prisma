@@ -536,11 +536,20 @@ enum AuditAction {
   RECONCILIATION_FINDING_ACKNOWLEDGED
   RECONCILIATION_FINDING_REOPENED
   MANUAL_LEDGER_CORRECTION
-  // ADM-205 dual control withdrawal (append-only; migrasi 20260927170000_withdrawal_dual_approval_audit)
+  // ADM-205/ADM-406 dual control withdrawal (append-only; migrasi
+  // 20260927170000_withdrawal_dual_approval_audit dan 20260927173000_audit_action_withdrawal_codes)
   WITHDRAWAL_APPROVED
   WITHDRAWAL_REJECTED
   // ADM-213 recheck manual withdrawal PROCESSING (append-only; migrasi 20260927180000_recheck_reactivate_audit)
   WITHDRAWAL_RECHECKED
+  // ADM-406/ADM-430 (2026-09-27, append-only): kode spesifik menggantikan
+  // ADMIN_ACTION generik di admin-finance.service & admin-users.service agar
+  // filter action= di /admin/activity-log bisa menjawab "siapa menyetujui apa".
+  WITHDRAWAL_PAYOUT_UNCONFIRMED
+  BANK_ACCOUNT_NUMBER_ACCESSED
+  FINANCE_TRANSACTION_VIEWED
+  WALLET_RECONCILED
+  AUDIT_LOG_VIEWED
   // GAP-E siklus edit/hapus kampanye (G351–G375, append-only; migrasi 20260927050000_gap_e_admin_ops)
   CAMPAIGN_UPDATED
   CAMPAIGN_DELETED

@@ -98,6 +98,19 @@ export const CHAT_VOICE_MIN_DURATION_SECONDS = 1;
 export const CHAT_INQUIRY_MAX_ACTIVE_PER_USER = 30;
 export const CHAT_INQUIRY_SUBJECT_MAX_LENGTH = 200;
 export const CHAT_INQUIRY_FIRST_MESSAGE_MAX_LENGTH = 1000;
+// Batch 43 BE-CHAT: pesan sementara — TTL minimum 5 detik, maksimum 7 hari.
+export const CHAT_EPHEMERAL_TTL_MIN_SECONDS = 5;
+export const CHAT_EPHEMERAL_TTL_MAX_SECONDS = 7 * 24 * 60 * 60;
+// Batch 43 BE-CHAT: jeda penghapusan pesan sekali-lihat setelah dibaca.
+export const CHAT_VIEW_ONCE_GRACE_SECONDS = 30;
+// Batch 43 BE-CHAT: export chat dibatasi 5000 pesan per permintaan.
+export const CHAT_EXPORT_MAX_MESSAGES = 5000;
+// Batch 43 BE-CHAT: polling — 2..10 opsi, pertanyaan maks 300 karakter.
+export const CHAT_POLL_MIN_OPTIONS = 2;
+export const CHAT_POLL_MAX_OPTIONS = 10;
+export const CHAT_POLL_QUESTION_MAX_LENGTH = 300;
+// Batch 43 BE-CHAT: template balasan "/" — maks 50 template per user.
+export const CHAT_MAX_REPLY_TEMPLATES_PER_USER = 50;
 
 export const TYPING_SERVER_AUTO_STOP_MS = 4000;
 /**

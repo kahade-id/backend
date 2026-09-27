@@ -7,9 +7,12 @@ import {
   ValidateNested,
   MaxLength,
   IsInt,
+  IsNumber,
+  IsBoolean,
   Min,
   Max,
   ArrayMaxSize,
+  ArrayMinSize,
   Matches,
 } from 'class-validator';
 import {
@@ -27,6 +30,12 @@ export enum UserChatMessageType {
   VIDEO = 'VIDEO',
   /** Voice note — wajib lampiran audio + durationSeconds. */
   VOICE = 'VOICE',
+  /** Batch 43 BE-CHAT: pesan lokasi {lat, lng, label?}. */
+  LOCATION = 'LOCATION',
+  /** Batch 43 BE-CHAT: kartu produk {showcaseId} + snapshot saat kirim. */
+  PRODUCT_CARD = 'PRODUCT_CARD',
+  /** Batch 43 BE-CHAT: kartu order {orderId} + snapshot saat kirim. */
+  ORDER_CARD = 'ORDER_CARD',
 }
 
 const ALLOWED_CHAT_MIME_TYPES = [
@@ -51,6 +60,27 @@ const ALLOWED_CHAT_MIME_TYPES = [
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   'text/plain',
 ] as const;
+
+/** Batch 43 BE-CHAT: koordinat untuk pesan LOCATION. */
+export class ChatLocationDto {
+  @ApiProperty({ description: 'Lintang (-90..90)', minimum: -90, maximum: 90 })
+  @IsNumber()
+  @Min(-90)
+  @Max(90)
+  lat!: number;
+
+  @ApiProperty({ description: 'Bujur (-180..180)', minimum: -180, maximum: 180 })
+  @IsNumber()
+  @Min(-180)
+  @Max(180)
+  lng!: number;
+
+  @ApiPropertyOptional({ description: 'Label lokasi', maxLength: 200 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  label?: string;
+}
 
 export class ChatAttachmentDto {
   @ApiProperty({ description: 'File name', maxLength: 255 })
@@ -135,4 +165,41 @@ export class SendMessageDto {
   @IsString()
   @MaxLength(500)
   caption?: string;
+
+  @ApiPropertyOptional({ description: 'Lokasi untuk pesan LOCATION', type: ChatLocationDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => ChatLocationDto)
+  location?: ChatLocationDto;
+
+  @ApiPropertyOptional({ description: 'ID etalase untuk pesan PRODUCT_CARD' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  showcaseId?: string;
+
+  @ApiPropertyOptional({ description: 'ID order (cuid) untuk pesan ORDER_CARD' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  orderId?: string;
+
+  @ApiPropertyOptional({
+    description: 'TTL pesan sementara dalam detik (5–604800). Pesan dihapus permanen setelah kedaluwarsa.',
+    minimum: 5,
+    maximum: 604800,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(5)
+  @Max(604800)
+  ephemeralTtlSeconds?: number;
+
+  @ApiPropertyOptional({
+    description: 'Pesan sekali lihat — hilang setelah dibaca lawan bicara.',
+    default: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  viewOnce?: boolean;
 }

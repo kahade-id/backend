@@ -419,6 +419,10 @@ enum ChatMessageType {
   FILE
   SYSTEM
   VOICE
+  // Batch 43 BE-CHAT: pesan lokasi, kartu produk, kartu order.
+  LOCATION
+  PRODUCT_CARD
+  ORDER_CARD
 }
 
 // ORDER  : percakapan yang melekat pada satu order (1 room per order).
@@ -875,6 +879,12 @@ model User {
   chatMessageEdits         ChatMessageEdit[]
   chatPinnedMessages       ChatMessage[]           @relation("ChatMessagePinnedBy")
   chatModerationEvents     ChatModerationEvent[]
+  // Batch 43 BE-CHAT: relasi balik fitur chat baru.
+  chatStarredMessages      ChatStarredMessage[]
+  chatPollsCreated         ChatPoll[]
+  chatPollVotes            ChatPollVote[]
+  chatPinnedRooms          ChatPinnedRoom[]
+  chatReplyTemplates       ChatReplyTemplate[]
   ratingsGiven             Rating[]                @relation("RatingGiver")
   ratingsReceived          Rating[]                @relation("RatingReceiver")
   notifications            Notification[]
@@ -1867,6 +1877,10 @@ model ChatRoom {
   members          ChatRoomMember[]
   moderationEvents ChatModerationEvent[]
   spawnedOrders    Order[]               @relation("OrderSourceInquiry")
+  // Batch 43 BE-CHAT: relasi balik fitur chat baru.
+  starredMessages ChatStarredMessage[]
+  polls           ChatPoll[]
+  pinnedBy        ChatPinnedRoom[]
 
   @@index([type, initiatorId])
   @@index([type, counterpartId])
@@ -1915,6 +1929,22 @@ model ChatMessage {
 
   readAt Json?
 
+  // Batch 43 BE-CHAT: pesan sementara & sekali lihat.
+  // ephemeralTtlSeconds = TTL dalam detik; expiresAt dihitung saat pesan dikirim.
+  // Worker purge menghapus permanen pesan yang kedaluwarsa (melewati order DISPUTED
+  // demi menjaga bukti sengketa).
+  ephemeralTtlSeconds Int?
+  expiresAt           DateTime?
+  viewOnce            Boolean   @default(false)
+  viewOnceViewedAt    DateTime?
+  // Batch 43 BE-CHAT: pesan lokasi (messageType LOCATION).
+  locationLat   Float?
+  locationLng   Float?
+  locationLabel String? @db.VarChar(200)
+  // Batch 43 BE-CHAT: snapshot kartu produk/order saat pesan dikirim
+  // (messageType PRODUCT_CARD / ORDER_CARD). JSON agar tidak jadi FK kaku.
+  cardSnapshot Json?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1925,6 +1955,7 @@ model ChatMessage {
   attachments ChatAttachment[]
   reactions   ChatMessageReaction[]
   editHistory ChatMessageEdit[]
+  starredBy   ChatStarredMessage[]
 
   @@index([roomId])
   @@index([roomId, createdAt]) // cursor-based pagination (ORDER BY createdAt DESC)
@@ -2046,6 +2077,101 @@ model ChatAttachment {
   @@index([messageId])
   @@index([createdAt]) // sort attachments by date for attachment history queries
   @@map("chat_attachments")
+}
+
+// ============================================================
+// Batch 43 BE-CHAT: pesan berbintang, polling, pin room, template balasan
+// ============================================================
+
+// Pesan berbintang — per user per room (bookmark pribadi, tersinkron backend).
+model ChatStarredMessage {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  messageId String
+  message   ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  roomId String
+  room   ChatRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, messageId])
+  @@index([userId, roomId])
+  @@map("chat_starred_messages")
+}
+
+// Polling/voting di dalam room chat (mis. koordinasi patungan/jastip).
+model ChatPoll {
+  id       String   @id @default(cuid())
+  roomId   String
+  room     ChatRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  question String   @db.VarChar(300)
+  // Array string opsi (JSONB). Panjang divalidasi di service (2–10 opsi).
+  options       Json
+  allowMultiple Boolean   @default(false)
+  deadline      DateTime?
+  isClosed      Boolean   @default(false)
+
+  createdById String
+  createdBy   User   @relation(fields: [createdById], references: [id], onDelete: Cascade)
+
+  createdAt DateTime       @default(now())
+  votes     ChatPollVote[]
+
+  @@index([roomId, createdAt])
+  @@map("chat_polls")
+}
+
+model ChatPollVote {
+  id     String   @id @default(cuid())
+  pollId String
+  poll   ChatPoll @relation(fields: [pollId], references: [id], onDelete: Cascade)
+  userId String
+  user   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Indeks opsi yang dipilih (0-based ke ChatPoll.options).
+  optionIndex Int
+
+  createdAt DateTime @default(now())
+
+  @@unique([pollId, userId, optionIndex])
+  @@index([pollId])
+  @@map("chat_poll_votes")
+}
+
+// Pin room tersinkron backend — urutan arsip cepat per user, sinkron antar device.
+model ChatPinnedRoom {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roomId String
+  room   ChatRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  // Urutan tampil (kecil = paling atas).
+  position Int @default(0)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, roomId])
+  @@index([userId, position])
+  @@map("chat_pinned_rooms")
+}
+
+// Template balasan cepat "/" — per user, tersinkron antar device.
+model ChatReplyTemplate {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Shortcut tanpa "/" (mis. "salam" untuk "/salam"). Unik per user.
+  shortcut String @db.VarChar(32)
+  text     String @db.VarChar(500)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, shortcut])
+  @@index([userId])
+  @@map("chat_reply_templates")
 }
 
 // ============================================================
@@ -4125,6 +4251,15 @@ enum QaCommentPolicy {
   DISABLED
 }
 
+// Batch 43 BE-CHAT: kebijakan siapa yang boleh membuka DM ke user ini.
+// EVERYONE = siapa pun; FOLLOWING = hanya yang di-follow user ini;
+// NONE = tidak ada (DM baru ditolak; percakapan lama tetap bisa dipakai).
+enum DmPolicy {
+  EVERYONE
+  FOLLOWING
+  NONE
+}
+
 enum ConsentType {
   MARKETING_PUSH
   MARKETING_EMAIL
@@ -4167,6 +4302,10 @@ model PrivacySetting {
   hiddenStats               String[]              @default([])
   // G083: izinkan profil diindeks mesin pencari.
   searchEngineIndex         Boolean               @default(true)
+  // Batch 43 BE-CHAT: sembunyikan centang baca (read receipt) dari lawan bicara.
+  hideReadReceipts          Boolean               @default(false)
+  // Batch 43 BE-CHAT: kebijakan DM (ditegakkan saat pembuatan DM baru).
+  dmPolicy                  DmPolicy              @default(EVERYONE)
   createdAt                 DateTime              @default(now())
   updatedAt                 DateTime              @updatedAt
 

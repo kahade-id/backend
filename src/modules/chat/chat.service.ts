@@ -1,16 +1,32 @@
-import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, Logger, Optional } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, Logger, Optional, Inject, forwardRef, OnModuleInit, HttpException, HttpStatus } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { UploadService } from '../upload/upload.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { SendMessageDto, UserChatMessageType } from './dto/send-message.dto';
 import type { CreateInquiryDto } from './dto/create-inquiry.dto';
-import { ChatMessageType, ChatModerationAction, ChatModerationKind, ChatModerationSeverity, NotificationType, OrderStatus, Prisma } from '@prisma/client';
+import type { UpdateChatPrivacyDto } from './dto/chat-privacy.dto';
+import type { CreatePollDto } from './dto/poll.dto';
+import type { CreateReplyTemplateDto, UpdateReplyTemplateDto } from './dto/reply-template.dto';
+import type { CreateOrderFromChatDto } from './dto/create-order-from-chat.dto';
+import type { ReportRoomDto } from './dto/room-report-pin.dto';
+import { ChatMessageType, ChatModerationAction, ChatModerationKind, ChatModerationSeverity, DmPolicy, NotificationType, OrderStatus, Prisma, ReportCategory } from '@prisma/client';
+import { OrdersService } from '../orders/orders.service';
+import { TranslationService } from './translation/translation.service';
+import { ChatOrderHooks, ChatOrderEventKind, ChatOrderEventData } from './chat-order-hooks';
 import { generateNotifId } from '../../common/utils/id-generator.util';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import * as path from 'path';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import {
+  CHAT_EPHEMERAL_TTL_MIN_SECONDS,
+  CHAT_EPHEMERAL_TTL_MAX_SECONDS,
+  CHAT_VIEW_ONCE_GRACE_SECONDS,
+  CHAT_EXPORT_MAX_MESSAGES,
+  CHAT_POLL_MIN_OPTIONS,
+  CHAT_POLL_MAX_OPTIONS,
+  CHAT_POLL_QUESTION_MAX_LENGTH,
+  CHAT_MAX_REPLY_TEMPLATES_PER_USER,
   CHAT_INQUIRY_MAX_ACTIVE_PER_USER,
   CHAT_MAX_PINNED_PER_ROOM,
   CHAT_MESSAGE_MAX_LENGTH,
@@ -46,6 +62,15 @@ const MESSAGE_SELECT = {
   durationSeconds: true,
   forwardedFromId: true,
   readAt: true,
+  // Batch 43 BE-CHAT: pesan sementara/sekali-lihat, lokasi, kartu.
+  ephemeralTtlSeconds: true,
+  expiresAt: true,
+  viewOnce: true,
+  viewOnceViewedAt: true,
+  locationLat: true,
+  locationLng: true,
+  locationLabel: true,
+  cardSnapshot: true,
   createdAt: true,
   updatedAt: true,
   replyToId: true,
@@ -132,6 +157,15 @@ type RawMessage = {
   durationSeconds: number | null;
   forwardedFromId: string | null;
   readAt: unknown;
+  // Batch 43 BE-CHAT.
+  ephemeralTtlSeconds: number | null;
+  expiresAt: Date | null;
+  viewOnce: boolean;
+  viewOnceViewedAt: Date | null;
+  locationLat: number | null;
+  locationLng: number | null;
+  locationLabel: string | null;
+  cardSnapshot: unknown;
   createdAt: Date;
   updatedAt: Date;
   replyToId?: string | null;
@@ -175,6 +209,32 @@ export interface SerializeMessageOptions {
    * hilang begitu saja dari bukti.
    */
   includeDeletedContent?: boolean;
+  /**
+   * Batch 43 BE-CHAT: id user yang mengaktifkan hideReadReceipts. Entri
+   * readAt milik mereka disembunyikan dari viewer lain (kecuali dirinya
+   * sendiri) — "centang baca tidak dikirim ke lawan bicara".
+   */
+  hiddenReaders?: Set<string>;
+}
+
+/**
+ * Batch 43 BE-CHAT: saring blob readAt agar pembaca yang menyembunyikan
+ * centang baca tidak terlihat oleh viewer lain.
+ */
+export function filterReadAtForViewer(
+  readAt: unknown,
+  viewerId: string | null | undefined,
+  hiddenReaders?: Set<string>,
+): unknown {
+  if (!readAt || typeof readAt !== 'object' || !hiddenReaders || hiddenReaders.size === 0) {
+    return readAt;
+  }
+  const out: Record<string, unknown> = {};
+  for (const [readerId, value] of Object.entries(readAt as Record<string, unknown>)) {
+    if (hiddenReaders.has(readerId) && readerId !== viewerId) continue;
+    out[readerId] = value;
+  }
+  return out;
 }
 
 function summarizeReactions(reactions: RawReaction[], viewerId?: string | null): ReactionSummaryEntry[] {
@@ -236,7 +296,17 @@ function serializeMessage(msg: RawMessage, options: SerializeMessageOptions = {}
     durationSeconds: msg.durationSeconds ?? null,
     forwardedFromId: msg.forwardedFromId ?? null,
     forwardedFrom,
-    readAt: msg.readAt,
+    readAt: filterReadAtForViewer(msg.readAt, options.viewerId, options.hiddenReaders),
+    // Batch 43 BE-CHAT: pesan sementara/sekali-lihat, lokasi, kartu.
+    ephemeralTtlSeconds: msg.ephemeralTtlSeconds ?? null,
+    expiresAt: msg.expiresAt ?? null,
+    viewOnce: msg.viewOnce ?? false,
+    viewOnceViewedAt: msg.viewOnceViewedAt ?? null,
+    location:
+      msg.messageType === 'LOCATION' && msg.locationLat != null && msg.locationLng != null
+        ? { lat: msg.locationLat, lng: msg.locationLng, label: msg.locationLabel ?? null }
+        : null,
+    card: (msg.cardSnapshot as Record<string, unknown> | null) ?? null,
     createdAt: msg.createdAt,
     updatedAt: msg.updatedAt,
     attachments: msg.isDeleted ? [] : msg.attachments,
@@ -281,7 +351,7 @@ export interface RoomListOptions {
 }
 
 @Injectable()
-export class ChatService {
+export class ChatService implements OnModuleInit {
   private readonly logger = new Logger(ChatService.name);
   constructor(
     private prisma: PrismaService,
@@ -290,7 +360,20 @@ export class ChatService {
     private verificationBadgeService: VerificationBadgeService,
     private notificationsService: NotificationsService,
     @Optional() private uploadService?: UploadService,
+    // Batch 43 BE-CHAT: buat order escrow dari chat — forwardRef agar tidak
+    // circular dengan OrdersModule; @Optional supaya chat tetap jalan bila
+    // OrdersService tidak ter-resolve (fail closed di createOrderFromChat).
+    @Inject(forwardRef(() => OrdersService)) @Optional() private ordersService?: OrdersService,
+    // @Optional: test lama & konteks tanpa provider tetap jalan; translate
+    // fail-closed 501 bila tidak ada.
+    @Optional() private translationService?: TranslationService,
   ) {}
+
+  async onModuleInit(): Promise<void> {
+    // Batch 43 BE-CHAT: daftarkan handler pesan sistem untuk event order
+    // (bayar diterima, resi diupload, dikirim, dana cair) + arsip otomatis.
+    ChatOrderHooks.register((orderId, kind, data) => this.handleOrderEvent(orderId, kind, data));
+  }
 
   // ============================================================
   // Rooms
@@ -704,6 +787,9 @@ export class ChatService {
     });
 
     if (!room) {
+      // Batch 43 BE-CHAT: tegakkan kebijakan DM pemilik lawan bicara — hanya
+      // saat room BARU dibuat (percakapan lama tidak diputus).
+      await this.assertDmAllowed(userId, dto.counterpartId);
       room = await this.prisma.chatRoom.create({
         data: {
           type: 'INQUIRY',
@@ -800,6 +886,8 @@ export class ChatService {
           message: `You cannot open more than ${CHAT_INQUIRY_MAX_ACTIVE_PER_USER} active conversations`,
         });
       }
+      // Batch 43 BE-CHAT: tegakkan kebijakan DM (lihat createInquiry).
+      await this.assertDmAllowed(userId, counterpart.id);
       room = await this.prisma.chatRoom.create({
         data: {
           type: 'INQUIRY',
@@ -833,7 +921,7 @@ export class ChatService {
   // ============================================================
 
   async getMessages(userId: string, roomId: string, cursor?: string, limit: number = 50, excludeIds?: string[]): Promise<object> {
-    await this.validateRoomAccess(userId, roomId);
+    const room = await this.validateRoomAccess(userId, roomId);
 
     const safeLimit = Math.min(Math.max(1, limit), 100);
 
@@ -863,6 +951,39 @@ export class ChatService {
     const hasMore = newestFirst.length === safeLimit;
     const nextCursor = hasMore && messages.length > 0 ? messages[0].id : null;
 
+    // Batch 43 BE-CHAT: sembunyikan entri readAt milik user yang mengaktifkan
+    // hideReadReceipts dari viewer lain.
+    const hiddenReaders = await this.loadHiddenReadReceiptUserIds(
+      messages.flatMap((m) => Object.keys((m.readAt as Record<string, unknown> | null) ?? {})),
+    );
+
+    // Batch 43 BE-CHAT: pesan sekali-lihat dikonsumsi saat dibaca lawan bicara.
+    // Setelah dikonsumsi, pesan diberi masa tenggang singkat lalu dihapus
+    // permanen oleh worker purge.
+    const consumedViewOnce: string[] = [];
+    const now = new Date();
+    for (const message of messages) {
+      if (
+        message.viewOnce &&
+        !message.viewOnceViewedAt &&
+        !message.isDeleted &&
+        message.sender?.id &&
+        message.sender.id !== userId
+      ) {
+        consumedViewOnce.push(message.id);
+      }
+    }
+    if (consumedViewOnce.length > 0) {
+      const graceUntil = new Date(now.getTime() + CHAT_VIEW_ONCE_GRACE_SECONDS * 1000);
+      await this.prisma.chatMessage.updateMany({
+        where: { id: { in: consumedViewOnce }, viewOnceViewedAt: null },
+        data: { viewOnceViewedAt: now, expiresAt: graceUntil },
+      });
+      for (const messageId of consumedViewOnce) {
+        this.emitChatEvent(room, 'chat.message_view_once_consumed', { roomId, messageId, viewerId: userId });
+      }
+    }
+
     const responseMessages = await Promise.all(messages.map(async (message) => ({
       ...message,
       attachments: await Promise.all(message.attachments.map(async (attachment) => ({
@@ -873,7 +994,7 @@ export class ChatService {
     })));
 
     return {
-      messages: responseMessages.map((m) => serializeMessage(m, { viewerId: userId })),
+      messages: responseMessages.map((m) => serializeMessage(m, { viewerId: userId, hiddenReaders })),
       nextCursor,
       hasMore,
     };
@@ -905,6 +1026,12 @@ export class ChatService {
       replyToId?: string;
       durationSeconds?: number;
       forwardedFromId?: string;
+      // Batch 43 BE-CHAT: pesan lokasi / kartu / sementara / sekali lihat.
+      location?: SendMessageDto['location'];
+      showcaseId?: string;
+      orderId?: string;
+      ephemeralTtlSeconds?: number;
+      viewOnce?: boolean;
       /**
        * Internal: true bila lampiran disalin dari pesan yang sudah tersimpan
        * dan tervalidasi di DB (forward). Cek ownership path dilewati karena
@@ -937,13 +1064,59 @@ export class ChatService {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Message content must not exceed ${CHAT_MESSAGE_MAX_LENGTH} characters` });
     }
 
-    if (userMessageType !== UserChatMessageType.TEXT && (!dto.attachments || dto.attachments.length === 0)) {
+    // Batch 43 BE-CHAT: tipe non-media baru (lokasi/kartu) tidak butuh lampiran.
+    const isCardOrLocationType =
+      userMessageType === UserChatMessageType.LOCATION ||
+      userMessageType === UserChatMessageType.PRODUCT_CARD ||
+      userMessageType === UserChatMessageType.ORDER_CARD;
+
+    if (userMessageType !== UserChatMessageType.TEXT && !isCardOrLocationType && (!dto.attachments || dto.attachments.length === 0)) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Media messages must include at least one attachment' });
     }
 
     if (userMessageType === UserChatMessageType.VOICE) {
       this.validateVoiceNote(dto);
     }
+
+    // Batch 43 BE-CHAT: validasi pesan lokasi.
+    let locationData: { lat: number; lng: number; label: string | null } | null = null;
+    if (userMessageType === UserChatMessageType.LOCATION) {
+      locationData = this.validateLocationMessage(dto.location);
+    }
+
+    // Batch 43 BE-CHAT: validasi kartu produk/order + snapshot saat kirim.
+    let cardSnapshot: Record<string, unknown> | null = null;
+    if (userMessageType === UserChatMessageType.PRODUCT_CARD) {
+      cardSnapshot = await this.buildProductCardSnapshot(dto.showcaseId, room, userId);
+    } else if (userMessageType === UserChatMessageType.ORDER_CARD) {
+      cardSnapshot = await this.buildOrderCardSnapshot(dto.orderId, userId);
+    }
+
+    // Batch 43 BE-CHAT: pesan sementara/sekali-lihat.
+    // Fail closed untuk bukti sengketa: tidak boleh dipakai saat order DISPUTED.
+    const ephemeralTtlSeconds = dto.ephemeralTtlSeconds ?? null;
+    const viewOnce = dto.viewOnce === true;
+    if (ephemeralTtlSeconds != null || viewOnce) {
+      await this.assertNotDisputeLocked(room);
+      if (ephemeralTtlSeconds != null) {
+        if (
+          !Number.isInteger(ephemeralTtlSeconds) ||
+          ephemeralTtlSeconds < CHAT_EPHEMERAL_TTL_MIN_SECONDS ||
+          ephemeralTtlSeconds > CHAT_EPHEMERAL_TTL_MAX_SECONDS
+        ) {
+          throw new BadRequestException({
+            code: ErrorCodes.VALIDATION_ERROR,
+            message: `ephemeralTtlSeconds must be between ${CHAT_EPHEMERAL_TTL_MIN_SECONDS} and ${CHAT_EPHEMERAL_TTL_MAX_SECONDS} seconds`,
+          });
+        }
+      }
+    }
+    const expiresAt =
+      ephemeralTtlSeconds != null
+        ? new Date(Date.now() + ephemeralTtlSeconds * 1000)
+        : viewOnce
+          ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // backstop: 30 hari bila tak pernah dibaca
+          : null;
 
     if (dto.attachments?.length) {
       this.validateAttachments(userId, dto.attachments, dto.skipAttachmentOwnershipCheck === true);
@@ -969,9 +1142,13 @@ export class ChatService {
      * ditindaklanjuti. Detektor juga memindai nama file lampiran, karena
      * "bukti-transfer-0812xxxx.pdf" adalah cara yang sama umumnya untuk
      * menyelundupkan kontak.
+     *
+     * Batch 43 BE-CHAT: label lokasi dimoderasi seperti konten teks (jalur
+     * yang sama untuk menyelundupkan kontak).
      */
-    const verdict = effectiveContent
-      ? moderateText(effectiveContent, { maxAction: this.circumventionAction() })
+    const moderationTarget = effectiveContent ?? locationData?.label ?? null;
+    const verdict = moderationTarget
+      ? moderateText(moderationTarget, { maxAction: this.circumventionAction() })
       : null;
 
     if (verdict?.blocked) {
@@ -989,6 +1166,9 @@ export class ChatService {
     }
 
     const content = verdict && effectiveContent ? sanitizeText(verdict.text.trim()) : null;
+    if (locationData && verdict && locationData.label) {
+      locationData = { ...locationData, label: sanitizeText(verdict.text.trim()).slice(0, 200) || null };
+    }
     const attachmentNames = new Map<string, string>();
     if (dto.attachments?.length) {
       for (const attachment of dto.attachments) {
@@ -1012,6 +1192,14 @@ export class ChatService {
         moderationAction: verdict && verdict.matches.length > 0 ? this.highestAction(verdict) : null,
         moderationSeverity: verdict?.maxSeverity ?? null,
         moderationKind: verdict?.kinds?.[0] ?? null,
+        // Batch 43 BE-CHAT.
+        ephemeralTtlSeconds,
+        expiresAt,
+        viewOnce,
+        locationLat: locationData?.lat ?? null,
+        locationLng: locationData?.lng ?? null,
+        locationLabel: locationData?.label ?? null,
+        cardSnapshot: (cardSnapshot ?? undefined) as Prisma.InputJsonValue | undefined,
         attachments: dto.attachments?.length
           ? {
               create: dto.attachments.map((a) => ({
@@ -1503,12 +1691,17 @@ export class ChatService {
     );
 
     if (markedCount > 0) {
-      this.emitChatEvent(room, 'chat.read', {
-        roomId,
-        userId,
-        readAt: now,
-        markedCount,
-      });
+      // Batch 43 BE-CHAT: bila pembaca mengaktifkan hideReadReceipts, centang
+      // baca TIDAK dikirim ke lawan bicara (hanya sinkron multi-device milik
+      // pembaca sendiri). Status baca internal (lastReadAt, badge notifikasi)
+      // tetap diperbarui.
+      const hideReceipts = await this.isHideReadReceiptsEnabled(userId);
+      const payload = { roomId, userId, readAt: now, markedCount };
+      if (hideReceipts) {
+        this.realtime.emitToUser(userId, 'chat.read', payload);
+      } else {
+        this.emitChatEvent(room, 'chat.read', payload);
+      }
     }
 
     // CN-002: membaca chat juga menandai notifikasi chat terkait sebagai dibaca,
@@ -2312,13 +2505,21 @@ export class ChatService {
       orderBy: { createdAt: 'desc' },
       take: 100,
     });
+    // Batch 43 BE-CHAT: pembaca yang menyembunyikan centang baca tidak
+    // dimunculkan ke viewer lain.
+    const hiddenReaders = await this.loadHiddenReadReceiptUserIds(
+      messages.flatMap((m) => Object.keys((m.readAt as Record<string, unknown> | null) ?? {})),
+    );
     return {
       roomId,
-      receipts: messages.map(m => ({
-        messageId: m.id,
-        readAt: m.readAt,
-        isRead: !!(m.readAt && typeof m.readAt === 'object' && Object.keys(m.readAt as any).length > 0),
-      })),
+      receipts: messages.map(m => {
+        const readAt = filterReadAtForViewer(m.readAt, userId, hiddenReaders) as Record<string, unknown> | null;
+        return {
+          messageId: m.id,
+          readAt,
+          isRead: !!(readAt && typeof readAt === 'object' && Object.keys(readAt).length > 0),
+        };
+      }),
     };
   }
 
@@ -2339,13 +2540,14 @@ export class ChatService {
       `,
     );
     if (markedCount > 0) {
-      this.emitChatEvent(room, 'chat.read', {
-        roomId,
-        userId,
-        messageId,
-        readAt: now,
-        markedCount,
-      });
+      // Batch 43 BE-CHAT: hormati hideReadReceipts (lihat markAsRead).
+      const hideReceipts = await this.isHideReadReceiptsEnabled(userId);
+      const payload = { roomId, userId, messageId, readAt: now, markedCount };
+      if (hideReceipts) {
+        this.realtime.emitToUser(userId, 'chat.read', payload);
+      } else {
+        this.emitChatEvent(room, 'chat.read', payload);
+      }
       // CN-002: sinkronisasi badge notifikasi (lihat markAsRead).
       try {
         await this.prisma.notification.updateMany({
@@ -2369,5 +2571,1009 @@ export class ChatService {
       }).catch(() => undefined);
     }
     return { messageId, readAt: now, userId, markedCount };
+  }
+
+  // ============================================================
+  // Batch 43 BE-CHAT — privasi chat (hideReadReceipts + dmPolicy)
+  // ============================================================
+
+  async getChatPrivacy(userId: string): Promise<{ hideReadReceipts: boolean; dmPolicy: DmPolicy }> {
+    const setting = await this.prisma.privacySetting.findUnique({
+      where: { userId },
+      select: { hideReadReceipts: true, dmPolicy: true },
+    });
+    return {
+      hideReadReceipts: setting?.hideReadReceipts ?? false,
+      dmPolicy: setting?.dmPolicy ?? ('EVERYONE' as DmPolicy),
+    };
+  }
+
+  async updateChatPrivacy(userId: string, dto: UpdateChatPrivacyDto): Promise<{ hideReadReceipts: boolean; dmPolicy: DmPolicy }> {
+    const updated = await this.prisma.privacySetting.upsert({
+      where: { userId },
+      create: {
+        userId,
+        hideReadReceipts: dto.hideReadReceipts ?? false,
+        dmPolicy: dto.dmPolicy ?? ('EVERYONE' as DmPolicy),
+      },
+      update: {
+        ...(dto.hideReadReceipts !== undefined ? { hideReadReceipts: dto.hideReadReceipts } : {}),
+        ...(dto.dmPolicy !== undefined ? { dmPolicy: dto.dmPolicy } : {}),
+      },
+      select: { hideReadReceipts: true, dmPolicy: true },
+    });
+    return updated;
+  }
+
+  private async isHideReadReceiptsEnabled(userId: string): Promise<boolean> {
+    const setting = await this.prisma.privacySetting.findUnique({
+      where: { userId },
+      select: { hideReadReceipts: true },
+    });
+    return setting?.hideReadReceipts === true;
+  }
+
+  private async loadHiddenReadReceiptUserIds(userIds: string[]): Promise<Set<string>> {
+    const unique = [...new Set(userIds.filter((id) => typeof id === 'string' && id.length > 0))];
+    if (unique.length === 0) return new Set();
+    const rows = await this.prisma.privacySetting.findMany({
+      where: { userId: { in: unique }, hideReadReceipts: true },
+      select: { userId: true },
+    });
+    return new Set(rows.map((r) => r.userId));
+  }
+
+  /**
+   * Tegakkan kebijakan DM milik target. Dipanggil HANYA saat room baru dibuat
+   * (createInquiry / getOrCreateDm) — percakapan yang sudah ada tidak diputus.
+   * FOLLOWING = pengirim harus di-follow oleh target ("orang yang saya follow
+   * boleh DM saya").
+   */
+  private async assertDmAllowed(senderId: string, targetId: string): Promise<void> {
+    const setting = await this.prisma.privacySetting.findUnique({
+      where: { userId: targetId },
+      select: { dmPolicy: true },
+    });
+    const policy = setting?.dmPolicy ?? ('EVERYONE' as DmPolicy);
+    if (policy === ('NONE' as DmPolicy)) {
+      throw new ForbiddenException({
+        code: ErrorCodes.CHAT_DM_NOT_ALLOWED,
+        message: 'This user does not accept new direct messages',
+      });
+    }
+    if (policy === ('FOLLOWING' as DmPolicy)) {
+      const followsBack = await this.prisma.follow.findUnique({
+        where: { followerId_followingId: { followerId: targetId, followingId: senderId } },
+        select: { id: true },
+      });
+      if (!followsBack) {
+        throw new ForbiddenException({
+          code: ErrorCodes.CHAT_DM_NOT_ALLOWED,
+          message: 'This user only accepts direct messages from people they follow',
+        });
+      }
+    }
+  }
+
+  // ============================================================
+  // Batch 43 BE-CHAT — terjemahan pesan
+  // ============================================================
+
+  async translateMessage(userId: string, messageId: string, targetLang: string): Promise<object> {
+    const message = await this.prisma.chatMessage.findUnique({
+      where: { id: messageId },
+      select: { id: true, roomId: true, content: true, isDeleted: true, messageType: true },
+    });
+    if (!message || message.isDeleted) {
+      throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Message not found' });
+    }
+    await this.validateRoomAccess(userId, message.roomId);
+    const text = (message.content ?? '').trim();
+    if (!text) {
+      throw new BadRequestException({
+        code: ErrorCodes.CHAT_MESSAGE_NOT_TRANSLATABLE,
+        message: 'Only text messages can be translated',
+      });
+    }
+    // Fail closed 501 bila provider belum dikonfigurasi (atau service tak ada).
+    if (!this.translationService) {
+      throw new HttpException(
+        { code: ErrorCodes.TRANSLATION_NOT_CONFIGURED, message: 'Translation provider is not configured' },
+        HttpStatus.NOT_IMPLEMENTED,
+      );
+    }
+    const result = await this.translationService.translate(text, targetLang.toLowerCase());
+    return {
+      messageId: message.id,
+      targetLang: targetLang.toLowerCase(),
+      translatedText: result.translatedText,
+      sourceLang: result.sourceLang ?? null,
+    };
+  }
+
+  // ============================================================
+  // Batch 43 BE-CHAT — export chat (hanya anggota room)
+  // ============================================================
+
+  async exportRoom(userId: string, roomId: string, format: 'txt' | 'json'): Promise<{ format: string; filename: string; content: unknown }> {
+    const room = await this.validateRoomAccess(userId, roomId);
+    const messages = await this.prisma.chatMessage.findMany({
+      where: { roomId, isDeleted: false },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: CHAT_EXPORT_MAX_MESSAGES + 1,
+      select: {
+        id: true,
+        messageType: true,
+        content: true,
+        locationLabel: true,
+        createdAt: true,
+        sender: { select: { fullName: true } },
+      },
+    });
+    if (messages.length > CHAT_EXPORT_MAX_MESSAGES) {
+      throw new BadRequestException({
+        code: ErrorCodes.CHAT_EXPORT_TOO_LARGE,
+        message: `Chat export is limited to ${CHAT_EXPORT_MAX_MESSAGES} messages`,
+      });
+    }
+    const dateFmt = new Intl.DateTimeFormat('id-ID', {
+      timeZone: 'Asia/Jakarta',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    });
+    const filename = `chat-export-${roomId}.${format}`;
+    if (format === 'json') {
+      return {
+        format,
+        filename,
+        content: {
+          roomId,
+          roomType: room.type,
+          exportedAt: new Date().toISOString(),
+          messageCount: messages.length,
+          messages: messages.map((m) => ({
+            id: m.id,
+            sentAt: m.createdAt,
+            senderName: m.sender?.fullName ?? 'Sistem',
+            messageType: m.messageType,
+            content: m.content ?? m.locationLabel ?? `[${m.messageType}]`,
+          })),
+        },
+      };
+    }
+    const lines = [
+      'Kahade — Ekspor Chat',
+      `Room: ${roomId} (${room.type})`,
+      `Diekspor: ${dateFmt.format(new Date())} WIB`,
+      `Jumlah pesan: ${messages.length}`,
+      '='.repeat(48),
+    ];
+    for (const m of messages) {
+      const when = dateFmt.format(new Date(m.createdAt));
+      const who = m.sender?.fullName ?? 'Sistem';
+      const body = m.content ?? m.locationLabel ?? `[${m.messageType}]`;
+      lines.push(`[${when}] ${who}: ${body}`);
+    }
+    return { format, filename, content: lines.join('\n') };
+  }
+
+  // ============================================================
+  // Batch 43 BE-CHAT — pesan berbintang (per user per room)
+  // ============================================================
+
+  async starMessage(userId: string, roomId: string, messageId: string): Promise<{ starred: boolean }> {
+    await this.validateRoomAccess(userId, roomId);
+    const message = await this.prisma.chatMessage.findFirst({
+      where: { id: messageId, roomId, isDeleted: false },
+      select: { id: true },
+    });
+    if (!message) {
+      throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Message not found' });
+    }
+    await this.prisma.chatStarredMessage.upsert({
+      where: { userId_messageId: { userId, messageId } },
+      create: { userId, messageId, roomId },
+      update: {},
+      select: { id: true },
+    });
+    return { starred: true };
+  }
+
+  async unstarMessage(userId: string, roomId: string, messageId: string): Promise<{ starred: boolean }> {
+    await this.validateRoomAccess(userId, roomId);
+    await this.prisma.chatStarredMessage.deleteMany({ where: { userId, messageId, roomId } });
+    return { starred: false };
+  }
+
+  async listStarredMessages(userId: string, roomId: string): Promise<object> {
+    await this.validateRoomAccess(userId, roomId);
+    const stars = await this.prisma.chatStarredMessage.findMany({
+      where: { userId, roomId, message: { isDeleted: false } },
+      orderBy: { createdAt: 'desc' },
+      select: { createdAt: true, message: { select: MESSAGE_SELECT } },
+    });
+    const hiddenReaders = await this.loadHiddenReadReceiptUserIds(
+      stars.flatMap((s) => Object.keys((((s.message as unknown as RawMessage).readAt as Record<string, unknown> | null) ?? {}))),
+    );
+    return {
+      roomId,
+      messages: stars.map((s) => ({
+        starredAt: s.createdAt,
+        message: serializeMessage(s.message as unknown as RawMessage, { viewerId: userId, hiddenReaders }),
+      })),
+    };
+  }
+
+  // ============================================================
+  // Batch 43 BE-CHAT — chat dengan diri sendiri
+  // ============================================================
+
+  /**
+   * Get-or-create room "pesan tersimpan" (chat dengan diri sendiri).
+   * Memakai tipe INQUIRY dengan initiatorId = counterpartId = userId agar
+   * taksonomi room tidak berubah; frontend mengenali via isSelf.
+   */
+  async getOrCreateSelfRoom(userId: string): Promise<object> {
+    let room = await this.prisma.chatRoom.findFirst({
+      where: { type: 'INQUIRY', initiatorId: userId, counterpartId: userId, deletedAt: null },
+      select: { id: true, status: true },
+    });
+    if (!room) {
+      room = await this.prisma.chatRoom.create({
+        data: {
+          type: 'INQUIRY',
+          status: 'ACTIVE',
+          initiatorId: userId,
+          counterpartId: userId,
+          members: { create: [{ userId, role: 'INITIATOR' }] },
+        },
+        select: { id: true, status: true },
+      });
+    }
+    return {
+      room: {
+        id: room.id,
+        type: 'INQUIRY',
+        status: room.status,
+        isSelf: true,
+      },
+    };
+  }
+
+  // ============================================================
+  // Batch 43 BE-CHAT — validasi lokasi & snapshot kartu
+  // ============================================================
+
+  private validateLocationMessage(location: SendMessageDto['location']): { lat: number; lng: number; label: string | null } {
+    if (!location || typeof location.lat !== 'number' || typeof location.lng !== 'number') {
+      throw new BadRequestException({
+        code: ErrorCodes.CHAT_LOCATION_INVALID,
+        message: 'Location messages require { lat, lng }',
+      });
+    }
+    if (!Number.isFinite(location.lat) || location.lat < -90 || location.lat > 90 ||
+        !Number.isFinite(location.lng) || location.lng < -180 || location.lng > 180) {
+      throw new BadRequestException({
+        code: ErrorCodes.CHAT_LOCATION_INVALID,
+        message: 'Invalid coordinates: lat must be -90..90, lng must be -180..180',
+      });
+    }
+    return {
+      lat: location.lat,
+      lng: location.lng,
+      label: location.label?.trim().slice(0, 200) || null,
+    };
+  }
+
+  /**
+   * Snapshot kartu produk saat pesan dikirim — harga/judul/gambar dibekukan
+   * supaya tidak berubah bila etalase diedit kemudian.
+   */
+  private async buildProductCardSnapshot(
+    showcaseId: string | undefined,
+    room: RoomContext,
+    userId: string,
+  ): Promise<Record<string, unknown>> {
+    if (!showcaseId) {
+      throw new BadRequestException({ code: ErrorCodes.CHAT_CARD_INVALID, message: 'PRODUCT_CARD requires showcaseId' });
+    }
+    const showcase = await this.prisma.userShowcase.findUnique({
+      where: { id: showcaseId },
+      select: {
+        id: true, userId: true, title: true, priceMin: true, priceMax: true,
+        isActive: true, visibility: true,
+        images: { select: { imageUrl: true }, orderBy: { sortOrder: 'asc' }, take: 1 },
+        user: { select: { username: true, fullName: true } },
+      },
+    });
+    if (!showcase || !showcase.isActive) {
+      throw new NotFoundException({ code: ErrorCodes.CHAT_CARD_INVALID, message: 'Showcase not found or inactive' });
+    }
+    const participantIds = [room.initiatorId, room.counterpartId, userId].filter(Boolean) as string[];
+    const isOwner = showcase.userId === userId;
+    const isParticipantOwned = participantIds.includes(showcase.userId);
+    if (showcase.visibility !== 'PUBLIC' && !isOwner && !isParticipantOwned) {
+      throw new ForbiddenException({ code: ErrorCodes.CHAT_CARD_INVALID, message: 'Showcase is not visible to this chat' });
+    }
+    return {
+      kind: 'PRODUCT_CARD',
+      showcaseId: showcase.id,
+      title: showcase.title,
+      priceMin: showcase.priceMin?.toString() ?? null,
+      priceMax: showcase.priceMax?.toString() ?? null,
+      imageUrl: showcase.images[0]?.imageUrl ?? null,
+      sellerUsername: showcase.user.username,
+      sellerName: showcase.user.fullName,
+      snapshotAt: new Date().toISOString(),
+    };
+  }
+
+  private async buildOrderCardSnapshot(orderId: string | undefined, userId: string): Promise<Record<string, unknown>> {
+    if (!orderId) {
+      throw new BadRequestException({ code: ErrorCodes.CHAT_CARD_INVALID, message: 'ORDER_CARD requires orderId' });
+    }
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true, orderId: true, title: true, status: true, orderValue: true,
+        buyerId: true, sellerId: true, deletedAt: true,
+        buyer: { select: { username: true } },
+        seller: { select: { username: true } },
+      },
+    });
+    if (!order || order.deletedAt) {
+      throw new NotFoundException({ code: ErrorCodes.CHAT_CARD_INVALID, message: 'Order not found' });
+    }
+    if (order.buyerId !== userId && order.sellerId !== userId) {
+      throw new ForbiddenException({ code: ErrorCodes.CHAT_CARD_INVALID, message: 'You are not a participant of this order' });
+    }
+    return {
+      kind: 'ORDER_CARD',
+      orderId: order.id,
+      orderCode: order.orderId,
+      title: order.title,
+      status: order.status,
+      orderValue: order.orderValue.toString(),
+      buyerUsername: order.buyer.username,
+      sellerUsername: order.seller.username,
+      snapshotAt: new Date().toISOString(),
+    };
+  }
+
+  // ============================================================
+  // Batch 43 BE-CHAT — polling/voting
+  // ============================================================
+
+  async createPoll(userId: string, roomId: string, dto: CreatePollDto): Promise<object> {
+    const room = await this.validateRoomAccess(userId, roomId);
+    await this.assertNotBlocked(userId, this.resolveCounterpart(room, userId));
+    const question = dto.question.trim();
+    if (question.length === 0) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Poll question must not be empty' });
+    }
+    const options = [...new Set(dto.options.map((o) => o.trim()).filter((o) => o.length > 0))];
+    if (options.length < CHAT_POLL_MIN_OPTIONS) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: `Poll must have at least ${CHAT_POLL_MIN_OPTIONS} unique non-empty options`,
+      });
+    }
+    let deadline: Date | null = null;
+    if (dto.deadline) {
+      deadline = new Date(dto.deadline);
+      if (Number.isNaN(deadline.getTime()) || deadline.getTime() <= Date.now()) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Poll deadline must be a future date-time' });
+      }
+    }
+    const poll = await this.prisma.chatPoll.create({
+      data: {
+        roomId,
+        question: question.slice(0, CHAT_POLL_QUESTION_MAX_LENGTH),
+        options,
+        allowMultiple: dto.allowMultiple === true,
+        deadline,
+        createdById: userId,
+      },
+      select: { id: true },
+    });
+    this.emitChatEvent(room, 'chat.poll_created', { roomId, pollId: poll.id, question });
+    return this.getPoll(userId, roomId, poll.id);
+  }
+
+  async listPolls(userId: string, roomId: string): Promise<object> {
+    await this.validateRoomAccess(userId, roomId);
+    const polls = await this.prisma.chatPoll.findMany({
+      where: { roomId },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    });
+    const items = await Promise.all(polls.map((p) => this.serializePoll(p.id, userId)));
+    return { roomId, polls: items };
+  }
+
+  async getPoll(userId: string, roomId: string, pollId: string): Promise<object> {
+    await this.validateRoomAccess(userId, roomId);
+    const poll = await this.prisma.chatPoll.findFirst({
+      where: { id: pollId, roomId },
+      select: { id: true },
+    });
+    if (!poll) {
+      throw new NotFoundException({ code: ErrorCodes.CHAT_POLL_NOT_FOUND, message: 'Poll not found' });
+    }
+    return this.serializePoll(pollId, userId);
+  }
+
+  private async serializePoll(pollId: string, viewerId: string): Promise<object> {
+    const poll = await this.prisma.chatPoll.findUnique({
+      where: { id: pollId },
+      select: {
+        id: true, roomId: true, question: true, options: true,
+        allowMultiple: true, deadline: true, isClosed: true, createdAt: true,
+        createdBy: { select: { userId: true, fullName: true } },
+        votes: { select: { userId: true, optionIndex: true } },
+      },
+    });
+    if (!poll) {
+      throw new NotFoundException({ code: ErrorCodes.CHAT_POLL_NOT_FOUND, message: 'Poll not found' });
+    }
+    const options = (poll.options as string[]) ?? [];
+    const counts = new Array(options.length).fill(0) as number[];
+    const myVotes: number[] = [];
+    const voters = new Set<string>();
+    for (const vote of poll.votes) {
+      if (vote.optionIndex >= 0 && vote.optionIndex < counts.length) counts[vote.optionIndex] += 1;
+      voters.add(vote.userId);
+      if (vote.userId === viewerId && !myVotes.includes(vote.optionIndex)) myVotes.push(vote.optionIndex);
+    }
+    return {
+      id: poll.id,
+      roomId: poll.roomId,
+      question: poll.question,
+      options: options.map((text, index) => ({ index, text, votes: counts[index] ?? 0 })),
+      totalVotes: voters.size,
+      allowMultiple: poll.allowMultiple,
+      deadline: poll.deadline,
+      isClosed: poll.isClosed || (poll.deadline != null && poll.deadline.getTime() <= Date.now()),
+      myVotes: myVotes.sort((a, b) => a - b),
+      createdBy: { userId: poll.createdBy.userId, fullName: poll.createdBy.fullName },
+      createdAt: poll.createdAt,
+    };
+  }
+
+  async votePoll(userId: string, roomId: string, pollId: string, optionIndexes: number[]): Promise<object> {
+    const room = await this.validateRoomAccess(userId, roomId);
+    await this.assertNotBlocked(userId, this.resolveCounterpart(room, userId));
+    const poll = await this.prisma.chatPoll.findFirst({
+      where: { id: pollId, roomId },
+      select: { id: true, options: true, allowMultiple: true, deadline: true, isClosed: true },
+    });
+    if (!poll) {
+      throw new NotFoundException({ code: ErrorCodes.CHAT_POLL_NOT_FOUND, message: 'Poll not found' });
+    }
+    if (poll.isClosed) {
+      throw new BadRequestException({ code: ErrorCodes.CHAT_POLL_CLOSED, message: 'This poll is closed' });
+    }
+    if (poll.deadline && poll.deadline.getTime() <= Date.now()) {
+      throw new BadRequestException({ code: ErrorCodes.CHAT_POLL_DEADLINE_PASSED, message: 'Voting deadline has passed' });
+    }
+    const options = (poll.options as string[]) ?? [];
+    const unique = [...new Set(optionIndexes)];
+    for (const index of unique) {
+      if (!Number.isInteger(index) || index < 0 || index >= options.length) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid option index' });
+      }
+    }
+    if (!poll.allowMultiple && unique.length > 1) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'This poll allows only one choice' });
+    }
+    // Single-choice: ganti pilihan lama. Multi-choice: tambah (idempoten).
+    if (!poll.allowMultiple) {
+      await this.prisma.chatPollVote.deleteMany({ where: { pollId, userId } });
+    }
+    if (unique.length > 0) {
+      await this.prisma.chatPollVote.createMany({
+        data: unique.map((optionIndex) => ({ pollId, userId, optionIndex })),
+        skipDuplicates: true,
+      });
+    }
+    const result = await this.serializePoll(pollId, userId);
+    this.emitChatEvent(room, 'chat.poll_updated', { roomId, pollId, voterId: userId });
+    return result;
+  }
+
+  async closePoll(userId: string, roomId: string, pollId: string): Promise<object> {
+    const room = await this.validateRoomAccess(userId, roomId);
+    const poll = await this.prisma.chatPoll.findFirst({
+      where: { id: pollId, roomId },
+      select: { id: true, createdById: true },
+    });
+    if (!poll) {
+      throw new NotFoundException({ code: ErrorCodes.CHAT_POLL_NOT_FOUND, message: 'Poll not found' });
+    }
+    if (poll.createdById !== userId) {
+      throw new ForbiddenException({ code: ErrorCodes.FORBIDDEN, message: 'Only the poll creator can close it' });
+    }
+    await this.prisma.chatPoll.update({ where: { id: pollId }, data: { isClosed: true } });
+    this.emitChatEvent(room, 'chat.poll_closed', { roomId, pollId });
+    return this.serializePoll(pollId, userId);
+  }
+
+  // ============================================================
+  // Batch 43 BE-CHAT — pin room tersinkron backend
+  // ============================================================
+
+  async listPinnedChatRooms(userId: string): Promise<object> {
+    const pins = await this.prisma.chatPinnedRoom.findMany({
+      where: { userId, room: { deletedAt: null } },
+      orderBy: [{ position: 'asc' }, { createdAt: 'asc' }],
+      select: {
+        roomId: true,
+        position: true,
+        createdAt: true,
+        room: { select: { id: true, type: true, subject: true } },
+      },
+    });
+    return {
+      pinnedRooms: pins.map((p) => ({
+        roomId: p.roomId,
+        position: p.position,
+        pinnedAt: p.createdAt,
+        room: p.room,
+      })),
+    };
+  }
+
+  async pinChatRoom(userId: string, roomId: string, position?: number): Promise<object> {
+    await this.validateRoomAccess(userId, roomId);
+    const safePosition = position == null ? await this.nextPinnedRoomPosition(userId) : Math.max(0, Math.min(100000, Math.floor(position)));
+    const pin = await this.prisma.chatPinnedRoom.upsert({
+      where: { userId_roomId: { userId, roomId } },
+      create: { userId, roomId, position: safePosition },
+      update: { position: safePosition },
+      select: { roomId: true, position: true },
+    });
+    this.realtime.emitToUser(userId, 'chat.room_pinned', pin);
+    return pin;
+  }
+
+  async unpinChatRoom(userId: string, roomId: string): Promise<{ unpinned: boolean }> {
+    await this.prisma.chatPinnedRoom.deleteMany({ where: { userId, roomId } });
+    this.realtime.emitToUser(userId, 'chat.room_unpinned', { roomId });
+    return { unpinned: true };
+  }
+
+  private async nextPinnedRoomPosition(userId: string): Promise<number> {
+    const last = await this.prisma.chatPinnedRoom.findFirst({
+      where: { userId },
+      orderBy: { position: 'desc' },
+      select: { position: true },
+    });
+    return (last?.position ?? -1) + 1;
+  }
+
+  // ============================================================
+  // Batch 43 BE-CHAT — template balasan "/"
+  // ============================================================
+
+  async listReplyTemplates(userId: string): Promise<object> {
+    const templates = await this.prisma.chatReplyTemplate.findMany({
+      where: { userId },
+      orderBy: { shortcut: 'asc' },
+      select: { id: true, shortcut: true, text: true, createdAt: true, updatedAt: true },
+    });
+    return { templates };
+  }
+
+  async createReplyTemplate(userId: string, dto: CreateReplyTemplateDto): Promise<object> {
+    const shortcut = dto.shortcut.trim().toLowerCase();
+    const count = await this.prisma.chatReplyTemplate.count({ where: { userId } });
+    if (count >= CHAT_MAX_REPLY_TEMPLATES_PER_USER) {
+      throw new BadRequestException({
+        code: ErrorCodes.CHAT_TEMPLATE_LIMIT_REACHED,
+        message: `You can have at most ${CHAT_MAX_REPLY_TEMPLATES_PER_USER} reply templates`,
+      });
+    }
+    const existing = await this.prisma.chatReplyTemplate.findUnique({
+      where: { userId_shortcut: { userId, shortcut } },
+      select: { id: true },
+    });
+    if (existing) {
+      throw new ConflictException({ code: ErrorCodes.CHAT_TEMPLATE_SHORTCUT_TAKEN, message: 'Shortcut already exists' });
+    }
+    const template = await this.prisma.chatReplyTemplate.create({
+      data: { userId, shortcut, text: dto.text.trim() },
+      select: { id: true, shortcut: true, text: true, createdAt: true, updatedAt: true },
+    });
+    return { template };
+  }
+
+  async updateReplyTemplate(userId: string, templateId: string, dto: UpdateReplyTemplateDto): Promise<object> {
+    const template = await this.prisma.chatReplyTemplate.findFirst({
+      where: { id: templateId, userId },
+      select: { id: true },
+    });
+    if (!template) {
+      throw new NotFoundException({ code: ErrorCodes.CHAT_TEMPLATE_NOT_FOUND, message: 'Reply template not found' });
+    }
+    const shortcut = dto.shortcut?.trim().toLowerCase();
+    if (shortcut) {
+      const clash = await this.prisma.chatReplyTemplate.findFirst({
+        where: { userId, shortcut, id: { not: templateId } },
+        select: { id: true },
+      });
+      if (clash) {
+        throw new ConflictException({ code: ErrorCodes.CHAT_TEMPLATE_SHORTCUT_TAKEN, message: 'Shortcut already exists' });
+      }
+    }
+    const updated = await this.prisma.chatReplyTemplate.update({
+      where: { id: templateId },
+      data: {
+        ...(shortcut ? { shortcut } : {}),
+        ...(dto.text !== undefined ? { text: dto.text.trim() } : {}),
+      },
+      select: { id: true, shortcut: true, text: true, createdAt: true, updatedAt: true },
+    });
+    return { template: updated };
+  }
+
+  async deleteReplyTemplate(userId: string, templateId: string): Promise<{ deleted: boolean }> {
+    const result = await this.prisma.chatReplyTemplate.deleteMany({ where: { id: templateId, userId } });
+    if (result.count === 0) {
+      throw new NotFoundException({ code: ErrorCodes.CHAT_TEMPLATE_NOT_FOUND, message: 'Reply template not found' });
+    }
+    return { deleted: true };
+  }
+
+  // ============================================================
+  // Batch 43 BE-CHAT — pesan sistem otomatis dari event order
+  // ============================================================
+
+  /**
+   * Handler yang didaftarkan ke ChatOrderHooks (lihat onModuleInit).
+   * Dipanggil best-effort dari modul orders SETELAH transisi status berhasil:
+   * bayar diterima, resi diupload, dikirim, dana cair. Kegagalan di sini tidak
+   * pernah menggagalkan alur order (emit memakai fire-and-forget + catch).
+   */
+  async handleOrderEvent(orderId: string, kind: ChatOrderEventKind, data?: ChatOrderEventData): Promise<void> {
+    try {
+      const room = await this.prisma.chatRoom.findUnique({
+        where: { orderId },
+        select: { id: true, initiatorId: true, counterpartId: true, type: true, status: true },
+      });
+      if (!room) return; // Order tanpa room chat (bukan dari chat) — lewati.
+
+      const content = this.systemMessageForOrderEvent(kind, data);
+      if (!content) return;
+      const context = await this.loadRoomContextForSystem(room.id);
+      if (!context) return;
+
+      const message = await this.prisma.chatMessage.create({
+        data: { roomId: room.id, senderId: null, messageType: 'SYSTEM', content },
+        select: MESSAGE_SELECT,
+      });
+      await this.prisma.chatRoom.update({ where: { id: room.id }, data: { updatedAt: new Date() } });
+
+      const payload = serializeMessage(message as unknown as RawMessage, {});
+      this.emitChatEvent(context, 'chat.new_message', payload);
+      for (const participantId of context.participants) {
+        this.realtime.emitToUser(participantId, 'chat.new_message', payload);
+      }
+
+      // Transaksi selesai → arsipkan room untuk kedua pihak (otomatis).
+      if (kind === 'ORDER_COMPLETED') {
+        await this.archiveRoomForOrderCompletion(room.id, context.participants);
+      }
+    } catch (error) {
+      this.logger.warn(`handleOrderEvent failed (${kind} ${orderId}): ${(error as Error)?.message ?? error}`);
+    }
+  }
+
+  private systemMessageForOrderEvent(kind: ChatOrderEventKind, data?: ChatOrderEventData): string | null {
+    switch (kind) {
+      case 'ORDER_PAID':
+        return '✅ Pembayaran diterima dan dikunci di escrow Kahade. Penjual dapat mulai memproses pesanan.';
+      case 'ORDER_TRACKING_UPDATED': {
+        const courier = data?.courierName?.trim();
+        const tracking = data?.trackingNumber?.trim();
+        if (!tracking && !courier) return null;
+        return `📦 Nomor resi diperbarui: ${[courier, tracking].filter(Boolean).join(' ')}.`;
+      }
+      case 'ORDER_SHIPPED': {
+        const courier = data?.courierName?.trim();
+        const tracking = data?.trackingNumber?.trim();
+        return `🚚 Pesanan telah dikirim${courier ? ` via ${courier}` : ''}${tracking ? ` (resi: ${tracking})` : ''}.`;
+      }
+      case 'ORDER_COMPLETED':
+        return '🎉 Transaksi selesai — dana telah dicairkan ke penjual. Terima kasih telah bertransaksi di Kahade!';
+      default:
+        return null;
+    }
+  }
+
+  private async loadRoomContextForSystem(roomId: string): Promise<RoomContext | null> {
+    const room = await this.prisma.chatRoom.findUnique({
+      where: { id: roomId, deletedAt: null },
+      select: {
+        id: true, type: true, status: true, subject: true,
+        initiatorId: true, counterpartId: true,
+        order: {
+          select: {
+            id: true, orderId: true, status: true, completedAt: true, cancelledAt: true,
+            buyerId: true, sellerId: true,
+          },
+        },
+      },
+    });
+    if (!room) return null;
+    const participants = [room.initiatorId, room.counterpartId].filter(
+      (id): id is string => typeof id === 'string' && id.length > 0,
+    );
+    const effectiveParticipants =
+      participants.length === 2 ? participants : [room.order?.buyerId, room.order?.sellerId].filter(Boolean) as string[];
+    return {
+      id: room.id,
+      type: room.type,
+      status: room.status,
+      subject: room.subject,
+      initiatorId: room.initiatorId,
+      counterpartId: room.counterpartId,
+      participants: effectiveParticipants,
+      order: room.order
+        ? {
+            id: room.order.id, orderId: room.order.orderId, status: room.order.status,
+            completedAt: room.order.completedAt, cancelledAt: room.order.cancelledAt,
+            buyerId: room.order.buyerId, sellerId: room.order.sellerId,
+          }
+        : null,
+    };
+  }
+
+  private async archiveRoomForOrderCompletion(roomId: string, participantIds: string[]): Promise<void> {
+    const now = new Date();
+    for (const participantId of participantIds) {
+      await this.prisma.chatRoomMember.upsert({
+        where: { roomId_userId: { roomId, userId: participantId } },
+        create: { roomId, userId: participantId, role: 'BUYER', isArchived: true, archivedAt: now },
+        update: { isArchived: true, archivedAt: now },
+        select: { id: true },
+      }).catch(() => undefined);
+    }
+    // Mirror global bila kedua pihak mengarsipkan (pola mirrorArchiveState).
+    await this.mirrorArchiveState(roomId).catch(() => undefined);
+    this.logger.log(`Auto-archived chat room ${roomId} after order completion`);
+  }
+
+  // ============================================================
+  // Batch 43 BE-CHAT — blokir & laporkan dari menu room
+  // ============================================================
+
+  /**
+   * Blokir lawan bicara langsung dari menu room. Target = counterpart room
+   * (otomatis, tanpa perlu tahu userId-nya). Cerminan UsersService.blockUser
+   * (buat baris block + hapus follow dua arah) tanpa mengimpor UsersModule.
+   */
+  async blockCounterpartFromRoom(userId: string, roomId: string): Promise<{ message: string }> {
+    const room = await this.validateRoomAccess(userId, roomId);
+    const targetId = this.resolveCounterpart(room, userId);
+    if (!targetId || targetId === userId) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Cannot block in a self chat' });
+    }
+    const existing = await this.prisma.blockList.findUnique({
+      where: { blockerId_blockedId: { blockerId: userId, blockedId: targetId } },
+      select: { id: true },
+    });
+    if (existing) {
+      throw new ConflictException({ code: 'USER_ALREADY_BLOCKED', message: 'User is already blocked' });
+    }
+    await this.prisma.$transaction([
+      this.prisma.blockList.create({ data: { blockerId: userId, blockedId: targetId } }),
+      this.prisma.follow.deleteMany({
+        where: { OR: [{ followerId: userId, followingId: targetId }, { followerId: targetId, followingId: userId }] },
+      }),
+    ]);
+    return { message: 'User blocked successfully' };
+  }
+
+  /**
+   * Laporkan lawan bicara dari menu room. relatedOrderId diisi otomatis bila
+   * room terikat order; relatedMessageId opsional untuk konteks admin.
+   */
+  async reportCounterpartFromRoom(userId: string, roomId: string, dto: ReportRoomDto): Promise<{ message: string; reportId: string }> {
+    const room = await this.validateRoomAccess(userId, roomId);
+    const targetId = this.resolveCounterpart(room, userId);
+    if (!targetId || targetId === userId) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Cannot report in a self chat' });
+    }
+    if (dto.evidenceUrls?.length) {
+      this.validateReportEvidenceUrls(dto.evidenceUrls);
+    }
+    let relatedMessageId: string | null = null;
+    if (dto.relatedMessageId) {
+      const relatedMessage = await this.prisma.chatMessage.findFirst({
+        where: { id: dto.relatedMessageId, roomId },
+        select: { id: true },
+      });
+      if (!relatedMessage) {
+        throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Related message not found in this room' });
+      }
+      relatedMessageId = relatedMessage.id;
+    }
+    const report = await this.prisma.userReport.create({
+      data: {
+        reporterId: userId,
+        targetId,
+        category: dto.category as ReportCategory,
+        description: dto.description.trim(),
+        evidenceUrls: dto.evidenceUrls ?? [],
+        relatedOrderId: room.order?.id ?? null,
+        relatedMessageId,
+      },
+      select: { id: true },
+    });
+    return { message: 'Report submitted', reportId: report.id };
+  }
+
+  private validateReportEvidenceUrls(urls: string[]): void {
+    const trustedHostnames: string[] = [];
+    const storagePublicUrl = this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads';
+    try { trustedHostnames.push(new URL(storagePublicUrl).hostname); } catch { /* abaikan */ }
+    const r2Endpoint = this.configService.get<string>('r2.endpointUrl');
+    if (r2Endpoint) { try { trustedHostnames.push(new URL(r2Endpoint).hostname); } catch { /* abaikan */ } }
+    const r2PublicUrl = this.configService.get<string>('r2.publicUrl');
+    if (r2PublicUrl) { try { trustedHostnames.push(new URL(r2PublicUrl).hostname); } catch { /* abaikan */ } }
+    if (trustedHostnames.length === 0) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Storage is not configured' });
+    }
+    for (const rawUrl of urls) {
+      try {
+        const parsed = new URL(rawUrl);
+        if (parsed.protocol !== 'https:') throw new Error('not https');
+        const isTrusted = trustedHostnames.some((h) => parsed.hostname === h || parsed.hostname.endsWith(`.${h}`));
+        if (!isTrusted) throw new Error('domain mismatch');
+      } catch {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Evidence URL must be from platform storage' });
+      }
+    }
+  }
+
+  // ============================================================
+  // Batch 43 BE-CHAT — buat transaksi escrow dari chat
+  // ============================================================
+
+  /**
+   * Buat order escrow 1-by-1 dari room chat negosiasi (INQUIRY).
+   *
+   * Uang HANYA lewat escrow: seluruh logika finansial (fee, voucher, KYC,
+   * validasi nilai) didelegasikan ke OrdersService.createOrder — tidak ada
+   * logika uang baru di sini. Jalur wallet-to-wallet langsung DILARANG KERAS
+   * (keputusan user) dan tidak diimplementasikan.
+   */
+  async createOrderFromChat(userId: string, roomId: string, dto: CreateOrderFromChatDto): Promise<object> {
+    const room = await this.validateRoomAccess(userId, roomId);
+    if (room.type !== 'INQUIRY') {
+      throw new BadRequestException({
+        code: ErrorCodes.CHAT_ORDER_FROM_CHAT_INVALID,
+        message: 'Orders can only be created from negotiation (INQUIRY) chats',
+      });
+    }
+    const counterpartId = this.resolveCounterpart(room, userId);
+    if (!counterpartId || counterpartId === userId) {
+      throw new BadRequestException({
+        code: ErrorCodes.CHAT_ORDER_FROM_CHAT_INVALID,
+        message: 'Cannot create an order from a self chat',
+      });
+    }
+    if (!this.ordersService) {
+      throw new HttpException(
+        { code: 'SERVICE_UNAVAILABLE', message: 'Order service is unavailable' },
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
+    }
+
+    // Tentukan penjual/pembeli + judul/deskripsi/nilai dasar.
+    let sellerId: string;
+    let title: string;
+    let description: string;
+    let basePriceRupiah: number | null = null;
+
+    if (dto.showcaseId) {
+      const showcase = await this.prisma.userShowcase.findUnique({
+        where: { id: dto.showcaseId },
+        select: { id: true, userId: true, title: true, description: true, priceMin: true, priceMax: true, isActive: true },
+      });
+      if (!showcase || !showcase.isActive) {
+        throw new NotFoundException({ code: ErrorCodes.CHAT_ORDER_FROM_CHAT_INVALID, message: 'Showcase not found or inactive' });
+      }
+      if (showcase.userId !== userId && showcase.userId !== counterpartId) {
+        throw new ForbiddenException({
+          code: ErrorCodes.CHAT_ORDER_FROM_CHAT_INVALID,
+          message: 'Showcase does not belong to a participant of this chat',
+        });
+      }
+      sellerId = showcase.userId;
+      title = showcase.title;
+      description = (showcase.description?.trim() || showcase.title).slice(0, 500);
+      const priceMin = showcase.priceMin != null ? Number(showcase.priceMin) : null;
+      const priceMax = showcase.priceMax != null ? Number(showcase.priceMax) : null;
+      basePriceRupiah = dto.hargaSepakat ?? priceMin ?? priceMax;
+    } else {
+      if (!dto.title?.trim() || !dto.description?.trim()) {
+        throw new BadRequestException({
+          code: ErrorCodes.CHAT_ORDER_FROM_CHAT_INVALID,
+          message: 'title and description are required when showcaseId is not provided',
+        });
+      }
+      const role = dto.role ?? 'BUYER';
+      sellerId = role === 'SELLER' ? userId : counterpartId;
+      title = dto.title.trim();
+      description = dto.description.trim();
+      basePriceRupiah = dto.hargaSepakat ?? null;
+    }
+
+    if (basePriceRupiah == null || !Number.isSafeInteger(basePriceRupiah) || basePriceRupiah < 1) {
+      throw new BadRequestException({
+        code: ErrorCodes.CHAT_ORDER_FROM_CHAT_INVALID,
+        message: 'hargaSepakat (atau harga etalase) wajib diisi sebagai nilai rupiah yang valid',
+      });
+    }
+    const qty = dto.qty ?? 1;
+    const orderValue = basePriceRupiah * qty; // derivasi input; logika fee tetap di OrdersService
+    if (!Number.isSafeInteger(orderValue) || orderValue < 1) {
+      throw new BadRequestException({ code: ErrorCodes.CHAT_ORDER_FROM_CHAT_INVALID, message: 'Invalid total order value' });
+    }
+
+    const buyerId = sellerId === userId ? counterpartId : userId;
+    const counterpartUserId = buyerId === userId ? sellerId : userId;
+    const counterpart = await this.prisma.user.findUnique({
+      where: { id: counterpartUserId },
+      select: { username: true, isActive: true, isBanned: true },
+    });
+    if (!counterpart || !counterpart.isActive || counterpart.isBanned || !counterpart.username) {
+      throw new NotFoundException({ code: ErrorCodes.CHAT_COUNTERPART_NOT_FOUND, message: 'Counterpart not found or unavailable' });
+    }
+    await this.assertNotBlocked(userId, counterpartId);
+
+    // Delegasi penuh ke OrdersService: fee, voucher, KYC, escrow — tanpa
+    // perubahan logika uang. inquiryRoomId menautkan order ke room ini.
+    const result = await this.ordersService.createOrder(userId, {
+      role: buyerId === userId ? 'BUYER' : 'SELLER',
+      counterpartUsername: counterpart.username,
+      title,
+      description,
+      orderType: (dto.orderType ?? 'PHYSICAL_GOODS') as 'PHYSICAL_GOODS' | 'DIGITAL_GOODS' | 'SERVICE' | 'OTHER',
+      orderValue,
+      deliveryDeadlineDays: dto.deliveryDeadlineDays ?? 3,
+      feeResponsibility: (dto.feeResponsibility ?? 'BUYER') as 'BUYER' | 'SELLER' | 'SPLIT',
+      inquiryRoomId: roomId,
+    });
+
+    // Pesan sistem di room sebagai jejak (best-effort).
+    try {
+      const context = await this.loadRoomContextForSystem(roomId);
+      if (context) {
+        const sysMessage = await this.prisma.chatMessage.create({
+          data: {
+            roomId,
+            senderId: null,
+            messageType: 'SYSTEM',
+            content: `🧾 Order ${result.orderId} dibuat dari chat ini — dana akan dikunci di escrow setelah pembayaran.`,
+          },
+          select: MESSAGE_SELECT,
+        });
+        this.emitChatEvent(context, 'chat.new_message', serializeMessage(sysMessage as unknown as RawMessage, {}));
+      }
+    } catch (error) {
+      this.logger.warn(`Order-from-chat system message failed for room ${roomId}: ${(error as Error)?.message ?? error}`);
+    }
+
+    return {
+      order: {
+        orderId: result.orderId,
+        status: result.status,
+        feeCalculation: result.feeCalculation,
+        confirmationDeadlineAt: result.confirmationDeadlineAt,
+      },
+      roomId,
+    };
   }
 }

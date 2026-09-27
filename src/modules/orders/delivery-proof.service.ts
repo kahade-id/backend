@@ -31,6 +31,9 @@ import {
   DELIVERY_REVIEW_WINDOW_DAYS,
   DISPUTE_SLA_HOURS,
 } from '../../common/constants/app.constants';
+// Batch 43 BE-CHAT: pesan sistem "dikirim" di room order (best-effort,
+// via registry statis — tanpa circular DI ke modul chat).
+import { ChatOrderHooks } from '../chat/chat-order-hooks';
 
 const DELIVERY_PROOF_KEY_PREFIX = 'uploads/delivery-proof/';
 
@@ -288,6 +291,18 @@ export class DeliveryProofService {
         }),
       'SUBMIT_PROOF_NOTIFICATION',
     );
+
+    // Batch 43 BE-CHAT: pesan sistem "diklik tombol kirim / dikirim" di room order.
+    this.runPostCommitBestEffort(async () => {
+      const order = await this.prisma.order.findUnique({
+        where: { orderId: result.orderPublicId },
+        select: { courierName: true, trackingNumber: true },
+      });
+      ChatOrderHooks.emit(result.orderPublicId, 'ORDER_SHIPPED', {
+        courierName: order?.courierName ?? null,
+        trackingNumber: order?.trackingNumber ?? null,
+      });
+    }, 'CHAT_ORDER_SHIPPED_SYSTEM_MSG');
 
     return {
       proofId: result.proof.id,

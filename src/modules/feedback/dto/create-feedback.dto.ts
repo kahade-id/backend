@@ -1,6 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
+  IsBoolean,
   IsInt,
   IsNotEmpty,
   IsOptional,
@@ -47,4 +48,27 @@ export class CreateFeedbackDto {
   @IsString()
   @MaxLength(32)
   platform?: string;
+
+  @ApiPropertyOptional({
+    description: 'Persetujuan pengirim untuk dihubungi admin (wajib true agar admin boleh menghubungi)',
+    default: false,
+  })
+  @IsOptional()
+  @Transform(({ value }) => {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      const v = value.toLowerCase();
+      if (v === 'true' || v === '1') return true;
+      if (v === 'false' || v === '0') return false;
+    }
+    return value;
+  })
+  @IsBoolean()
+  contactConsent?: boolean;
+
+  @ApiPropertyOptional({ description: 'Versi aplikasi pengirim', maxLength: 32 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(32)
+  appVersion?: string;
 }

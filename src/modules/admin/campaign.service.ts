@@ -11,6 +11,27 @@ import { NotificationQueueService } from '../queue/notification-queue.service';
 const MAX_CAMPAIGN_ID_RETRIES = 3;
 const CAMPAIGN_ISSUE_BATCH_SIZE = 100;
 const CAMPAIGN_NOTIFY_BATCH_SIZE = 50;
+/** Ambang alarm kuota: flag bila pemakaian > 80% dari maxRedemptions (G365). */
+export const CAMPAIGN_QUOTA_ALARM_THRESHOLD = 80;
+/**
+ * G351: FIELD TERKUNCI setelah campaign keluar dari status DRAFT.
+ * Mengubah field ini setelah voucher diterbitkan / campaign berjalan akan
+ * merusak konsistensi promo — update ditolak dengan CAMPAIGN_FIELD_LOCKED.
+ * (type, discountValue/discountPercent, maxDiscount, freeTransactions memang
+ * tidak bisa diubah via PUT sama sekali; sisanya dikunci setelah DRAFT.)
+ */
+export const LOCKED_AFTER_ACTIVE: readonly string[] = [
+  'type',
+  'discountValue',
+  'discountPercent',
+  'maxDiscount',
+  'freeTransactions',
+  'promoCode',
+  'targetAudience',
+  'targetMinRank',
+  'targetDormantDays',
+  'targetNewUserOnly',
+] as const;
 const RANK_ORDER: MembershipRank[] = [
   MembershipRank.BRONZE,
   MembershipRank.SILVER,
@@ -32,6 +53,8 @@ type CampaignMutationDto = {
   targetMinRank?: MembershipRank;
   targetDormantDays?: number;
   targetNewUserOnly?: boolean;
+  /** Alasan perubahan — WAJIB untuk PUT (G353), dicatat di CampaignVersion. */
+  changeReason?: string;
 };
 
 @Injectable()
@@ -130,13 +153,19 @@ export class CampaignService {
     return this.formatCampaign(campaign);
   }
 
-  async getCampaigns(page: number, limit: number, status?: string): Promise<object> {
+  async getCampaigns(page: number, limit: number, status?: string, filters: { createdBy?: string; from?: Date; to?: Date } = {}): Promise<object> {
     const safePage = Math.max(1, Math.floor(page));
     const safeLimit = Math.min(Math.max(1, Math.floor(limit)), 50);
     const skip = (safePage - 1) * safeLimit;
     const where: Prisma.CampaignWhereInput = {};
 
     if (status) where.status = status as CampaignStatus;
+    if (filters.createdBy) where.createdBy = filters.createdBy;
+    // G370: rentang tanggal = irisan dengan periode kampanye [startsAt, endsAt].
+    if (filters.from || filters.to) {
+      if (filters.to) where.startsAt = { lte: filters.to };
+      if (filters.from) where.endsAt = { gte: filters.from };
+    }
 
     const [campaigns, total] = await Promise.all([
       this.prisma.campaign.findMany({
@@ -166,12 +195,43 @@ export class CampaignService {
     return this.formatCampaign(campaign);
   }
 
+  /**
+   * G351-G355: update kampanye via PUT /v1/admin/campaigns/:campaignId.
+   * - Field di LOCKED_AFTER_ACTIVE ditolak bila status != DRAFT (CAMPAIGN_FIELD_LOCKED).
+   * - Perubahan status via PUT ditolak — pakai endpoint pause/activate.
+   * - changeReason WAJIB; CampaignVersion ditulis SEBELUM update (atomik via transaksi).
+   * - Audit: CAMPAIGN_UPDATED.
+   */
   async updateCampaign(campaignId: string, adminId: string, dto: CampaignMutationDto, ipAddress: string = 'unknown'): Promise<object> {
     const campaign = await this.prisma.campaign.findUnique({ where: { campaignId } });
     if (!campaign) throw new NotFoundException({ code: ErrorCodes.CAMPAIGN_NOT_FOUND, message: 'Campaign not found' });
     if (campaign.status === CampaignStatus.ENDED) {
       throw new BadRequestException({ code: ErrorCodes.CAMPAIGN_ACTIVE, message: 'Ended campaigns cannot be changed' });
     }
+    if (dto.status !== undefined) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Ubah status lewat endpoint khusus: POST :id/pause, POST :id/activate' });
+    }
+    const changeReason = dto.changeReason?.trim() ?? '';
+    if (changeReason.length < 5) {
+      throw new BadRequestException({ code: ErrorCodes.CAMPAIGN_CHANGE_REASON_REQUIRED, message: 'changeReason wajib diisi (min 5 karakter)' });
+    }
+
+    // G351: tolak perubahan field terkunci setelah keluar dari DRAFT.
+    if (campaign.status !== CampaignStatus.DRAFT) {
+      const lockedTouched = (LOCKED_AFTER_ACTIVE as readonly string[]).filter((field) => {
+        const next = (dto as Record<string, unknown>)[field];
+        if (next === undefined) return false;
+        return !this.campaignFieldEquals(field, next, campaign);
+      });
+      if (lockedTouched.length > 0) {
+        throw new BadRequestException({
+          code: ErrorCodes.CAMPAIGN_FIELD_LOCKED,
+          message: `Field terkunci setelah campaign aktif: ${lockedTouched.join(', ')}. Buat kampanye baru untuk mengubahnya.`,
+          lockedFields: lockedTouched,
+        });
+      }
+    }
+
     if (dto.name !== undefined && (dto.name.trim().length < 3 || dto.name.trim().length > 100 || /[<>]/.test(dto.name))) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Campaign name must be 3–100 safe characters' });
     }
@@ -189,10 +249,23 @@ export class CampaignService {
     if (nextEndsAt <= nextStartsAt) {
       throw new BadRequestException({ code: ErrorCodes.INVALID_CAMPAIGN_DATES, message: 'End date must be after start date' });
     }
-    if (dto.maxRedemptions !== undefined && dto.maxRedemptions < campaign.currentRedemptions) {
-      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'maxRedemptions cannot be lower than current redemptions' });
+    // G352: draf tidak boleh dijadwalkan mulai di masa lalu.
+    if (campaign.status === CampaignStatus.DRAFT && dto.startsAt && dto.startsAt.getTime() < Date.now() - 60_000) {
+      throw new BadRequestException({ code: ErrorCodes.INVALID_CAMPAIGN_DATES, message: 'Tanggal mulai draf tidak boleh di masa lalu' });
+    }
+    if (dto.maxRedemptions !== undefined) {
+      if (!Number.isInteger(dto.maxRedemptions) || dto.maxRedemptions <= 0) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'maxRedemptions harus > 0' });
+      }
+      if (dto.maxRedemptions < campaign.currentRedemptions) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'maxRedemptions cannot be lower than current redemptions' });
+      }
     }
     if (dto.rolloutPercent !== undefined) {
+      // G352: rollout 1-100 (DTO juga memvalidasi).
+      if (!Number.isInteger(dto.rolloutPercent) || dto.rolloutPercent < 1 || dto.rolloutPercent > 100) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'rolloutPercent must be between 1 and 100' });
+      }
       const currentRollout = campaign.rolloutPercent;
       if (currentRollout !== null && currentRollout !== undefined && dto.rolloutPercent < currentRollout) {
         throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'rolloutPercent cannot be decreased once set' });
@@ -205,7 +278,6 @@ export class CampaignService {
     if (dto.startsAt) data.startsAt = dto.startsAt;
     if (dto.endsAt) data.endsAt = dto.endsAt;
     if (dto.maxRedemptions !== undefined) data.maxRedemptions = dto.maxRedemptions;
-    if (dto.status) data.status = dto.status;
     if (dto.rolloutPercent !== undefined) data.rolloutPercent = dto.rolloutPercent;
     if (dto.promoCode !== undefined) data.promoCode = this.normalizePromoCode(dto.promoCode);
     if (dto.targetAudience !== undefined) data.targetAudience = dto.targetAudience.trim();
@@ -216,40 +288,188 @@ export class CampaignService {
     if (Object.keys(data).length === 0) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'At least one campaign field must be changed' });
     }
+
+    // G353: tulis CampaignVersion (snapshot SEBELUM update), lalu update.
+    const changedFields = this.diffCampaignFields(campaign, data);
+    await this.writeCampaignVersion(campaign, adminId, changeReason, changedFields);
     const updated = await this.prisma.campaign.update({ where: { campaignId }, data });
 
     this.auditLog.logAdminAction({
       adminId,
-      action: AuditAction.ADMIN_ACTION,
+      action: AuditAction.CAMPAIGN_UPDATED,
       targetType: 'Campaign',
       targetId: campaignId,
-      description: `Updated campaign "${updated.name}" (${campaignId})`,
+      description: `Updated campaign "${updated.name}" (${campaignId}): ${changeReason}`,
       before: { name: campaign.name, status: campaign.status },
-      after: { ...data },
+      after: { ...data, changeReason },
       ipAddress,
     });
 
     return this.formatCampaign(updated);
   }
 
-  async activateCampaign(campaignId: string, adminId: string, ipAddress: string = 'unknown'): Promise<object> {
+  /** Bandingkan nilai field DTO dengan nilai campaign saat ini (untuk deteksi field terkunci). */
+  private campaignFieldEquals(field: string, next: unknown, campaign: Campaign): boolean {
+    switch (field) {
+      case 'promoCode': {
+        const normalized = typeof next === 'string' ? this.normalizePromoCode(next) : next;
+        return normalized === campaign.promoCode;
+      }
+      case 'targetAudience': {
+        const normalized = typeof next === 'string' ? next.trim() : next;
+        return (normalized || null) === campaign.targetAudience;
+      }
+      case 'targetMinRank':
+        return (next ?? null) === campaign.targetMinRank;
+      case 'targetDormantDays':
+        return (next ?? null) === campaign.targetDormantDays;
+      case 'targetNewUserOnly':
+        return Boolean(next) === campaign.targetNewUserOnly;
+      case 'discountValue':
+      case 'maxDiscount': {
+        const current = field === 'discountValue' ? campaign.discountValue : campaign.maxDiscount;
+        if (next === null || next === undefined) return current === null;
+        try { return BigInt(Math.round(Number(next) * 100)) === current; } catch { return false; }
+      }
+      case 'discountPercent':
+        return next === null || next === undefined
+          ? campaign.discountPercent === null
+          : Number(next) === Number(campaign.discountPercent);
+      case 'freeTransactions':
+        return (next ?? null) === campaign.freeTransactions;
+      case 'type':
+        return next === campaign.type;
+      default:
+        return false;
+    }
+  }
+
+  /** Daftar field yang benar-benar berubah (untuk diff pratinjau & versi). */
+  private diffCampaignFields(campaign: Campaign, data: Prisma.CampaignUpdateInput): string[] {
+    const changed: string[] = [];
+    for (const [key, value] of Object.entries(data)) {
+      if (value === undefined) continue;
+      let same: boolean;
+      switch (key) {
+        case 'promoCode':
+        case 'targetAudience':
+        case 'targetMinRank':
+        case 'targetDormantDays':
+        case 'targetNewUserOnly':
+          same = this.campaignFieldEquals(key, value, campaign);
+          break;
+        case 'name':
+        case 'description':
+          same = String(value) === String((campaign as unknown as Record<string, unknown>)[key] ?? '');
+          break;
+        case 'startsAt':
+        case 'endsAt':
+          same = value instanceof Date && (campaign as unknown as Record<string, Date>)[key] instanceof Date
+            && value.getTime() === (campaign as unknown as Record<string, Date>)[key].getTime();
+          break;
+        default:
+          same = Number(value) === Number((campaign as unknown as Record<string, unknown>)[key]);
+      }
+      if (!same) changed.push(key);
+    }
+    return changed;
+  }
+
+  /**
+   * G353: tulis satu entri CampaignVersion berisi snapshot JSON campaign
+   * SEBELUM perubahan + changedBy + changeReason wajib.
+   */
+  private async writeCampaignVersion(campaign: Campaign, changedBy: string, changeReason: string, changedFields: string[]): Promise<void> {
+    const agg = await this.prisma.campaignVersion.aggregate({
+      where: { campaignId: campaign.id },
+      _max: { version: true },
+    });
+    const version = (agg._max.version ?? 0) + 1;
+    const snapshot = this.formatCampaign(campaign) as unknown as Prisma.InputJsonValue;
+    await this.prisma.campaignVersion.create({
+      data: {
+        campaignId: campaign.id,
+        version,
+        payload: { snapshot, changedFields } as unknown as Prisma.InputJsonValue,
+        changedBy,
+        changeReason,
+      },
+    });
+  }
+
+  /**
+   * G359-G361: aktivasi kampanye manual.
+   * - reason WAJIB → dicatat di CampaignVersion + audit PAUSE_REASON_RECORDED.
+   * - Idempotency dijamin @Idempotency() pada route (header Idempotency-Key UUID v4
+   *   wajib; duplikat key+payload sama di-replay, key dipakai ulang dengan payload
+   *   beda ditolak IDEMPOTENCY_KEY_REUSE).
+   * - Idempoten di level service: campaign yang sudah ACTIVE tidak menerbitkan ulang.
+   */
+  async activateCampaign(campaignId: string, adminId: string, opts: { reason: string }, ipAddress: string = 'unknown'): Promise<object> {
+    const reason = opts.reason?.trim() ?? '';
+    if (reason.length < 5) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'reason wajib diisi (min 5 karakter)' });
+    }
     const campaign = await this.prisma.campaign.findUnique({ where: { campaignId } });
     if (!campaign) throw new NotFoundException({ code: ErrorCodes.CAMPAIGN_NOT_FOUND, message: 'Campaign not found' });
+
+    if (campaign.status === CampaignStatus.ACTIVE) {
+      return { ...this.formatCampaign(campaign), alreadyActive: true, voucherIssuance: { issued: 0, skipped: 0, notified: 0 } };
+    }
+
     const activated = await this.activateCampaignRecord(campaign);
+    const changeReason = `Aktivasi: ${reason}`;
+    await this.writeCampaignVersion(activated, adminId, changeReason, ['status']);
     const issueResult = await this.issuePersonalVouchers(activated);
 
     this.auditLog.logAdminAction({
       adminId,
-      action: AuditAction.ADMIN_ACTION,
+      action: AuditAction.PAUSE_REASON_RECORDED,
       targetType: 'Campaign',
       targetId: activated.campaignId,
-      description: `Activated campaign "${activated.name}" (${activated.campaignId})`,
+      description: `Activated campaign "${activated.name}" (${activated.campaignId}). Alasan: ${reason}`,
       before: { status: campaign.status },
-      after: { status: activated.status, issuedVouchers: issueResult.issued },
+      after: { status: activated.status, issuedVouchers: issueResult.issued, reason },
       ipAddress,
     });
 
     return { ...this.formatCampaign(activated), voucherIssuance: issueResult };
+  }
+
+  /**
+   * G359: jeda kampanye. reason WAJIB → CampaignVersion + audit PAUSE_REASON_RECORDED.
+   * Idempoten: campaign yang sudah PAUSED dikembalikan apa adanya tanpa versi baru.
+   */
+  async pauseCampaign(campaignId: string, adminId: string, reason: string, ipAddress: string = 'unknown'): Promise<object> {
+    const cleanReason = reason?.trim() ?? '';
+    if (cleanReason.length < 5) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'reason wajib diisi (min 5 karakter)' });
+    }
+    const campaign = await this.prisma.campaign.findUnique({ where: { campaignId } });
+    if (!campaign) throw new NotFoundException({ code: ErrorCodes.CAMPAIGN_NOT_FOUND, message: 'Campaign not found' });
+    if (campaign.status === CampaignStatus.PAUSED) {
+      return { ...this.formatCampaign(campaign), alreadyPaused: true };
+    }
+    if (campaign.status !== CampaignStatus.ACTIVE) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Hanya kampanye ACTIVE yang bisa dijeda (status saat ini: ${campaign.status})` });
+    }
+
+    const changeReason = `Jeda: ${cleanReason}`;
+    await this.writeCampaignVersion(campaign, adminId, changeReason, ['status']);
+    const paused = await this.prisma.campaign.update({ where: { campaignId }, data: { status: CampaignStatus.PAUSED } });
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.PAUSE_REASON_RECORDED,
+      targetType: 'Campaign',
+      targetId: campaignId,
+      description: `Paused campaign "${paused.name}" (${campaignId}). Alasan: ${cleanReason}`,
+      before: { status: campaign.status },
+      after: { status: paused.status, reason: cleanReason },
+      ipAddress,
+    });
+
+    return this.formatCampaign(paused);
   }
 
   async activateDueCampaigns(): Promise<{ activated: number; ended: number; issued: number }> {
@@ -303,10 +523,39 @@ export class CampaignService {
     return { activated, ended: ended.count, issued };
   }
 
-  async deleteCampaign(campaignId: string, adminId: string, ipAddress: string = 'unknown'): Promise<{ message: string }> {
+  /**
+   * G356-G357: hapus kampanye.
+   * - Tolak bila status ACTIVE.
+   * - Tolak bila campaign sudah menerbitkan voucher (vouchers count > 0),
+   *   KECUALI status DRAFT + force=true + reason wajib.
+   * - Penghapusan paksa menonaktifkan dulu voucher terbit (CW-009) lalu hapus campaign.
+   * - Audit: CAMPAIGN_DELETED.
+   */
+  async deleteCampaign(campaignId: string, adminId: string, opts: { force?: boolean; reason?: string } = {}, ipAddress: string = 'unknown'): Promise<{ message: string }> {
     const campaign = await this.prisma.campaign.findUnique({ where: { campaignId } });
     if (!campaign) throw new NotFoundException({ code: ErrorCodes.CAMPAIGN_NOT_FOUND, message: 'Campaign not found' });
-    if (campaign.status === 'ACTIVE') throw new BadRequestException({ code: ErrorCodes.CAMPAIGN_ACTIVE, message: 'Cannot delete an active campaign' });
+    if (campaign.status === CampaignStatus.ACTIVE) {
+      throw new BadRequestException({ code: ErrorCodes.CAMPAIGN_ACTIVE, message: 'Tidak bisa menghapus kampanye yang sedang aktif — jeda dulu' });
+    }
+
+    const voucherCount = await this.prisma.voucher.count({ where: { campaignId: campaign.id } });
+    const force = opts.force === true;
+    const reason = opts.reason?.trim() ?? '';
+    if (voucherCount > 0) {
+      const allowed = campaign.status === CampaignStatus.DRAFT && force && reason.length >= 5;
+      if (!allowed) {
+        throw new BadRequestException({
+          code: ErrorCodes.CAMPAIGN_HAS_VOUCHERS,
+          message: `Campaign sudah menerbitkan ${voucherCount} voucher dan tidak bisa dihapus.`
+            + (campaign.status === CampaignStatus.DRAFT
+              ? ' Untuk draf, ulangi dengan force=true + reason (min 5 karakter).'
+              : ' Hanya kampanye DRAFT yang bisa dihapus paksa.'),
+          voucherCount,
+        });
+      }
+    } else if (force && reason.length < 5) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'reason wajib diisi (min 5 karakter) bila force=true' });
+    }
 
     // CW-009: hapus campaign HARUS mencabut voucher yang sudah diterbitkan.
     // Relasi onDelete: SetNull membuat campaignId voucher jadi NULL, dan
@@ -324,14 +573,244 @@ export class CampaignService {
 
     this.auditLog.logAdminAction({
       adminId,
-      action: AuditAction.ADMIN_ACTION,
+      action: AuditAction.CAMPAIGN_DELETED,
       targetType: 'Campaign',
       targetId: campaignId,
-      description: `Deleted campaign "${campaign.name}" (${campaignId}); deactivated ${deactivated.count} issued voucher(s)`,
+      description: `Deleted campaign "${campaign.name}" (${campaignId}); deactivated ${deactivated.count} issued voucher(s)${force ? `. Alasan paksa: ${reason}` : ''}`,
+      before: { name: campaign.name, status: campaign.status, voucherCount },
+      after: { force, reason: force ? reason : undefined },
       ipAddress,
     });
 
     return { message: 'Campaign deleted' };
+  }
+
+  /** G358: riwayat versi kampanye (paginasi, terbaru dulu). */
+  async getCampaignVersions(campaignId: string, page = 1, limit = 20): Promise<object> {
+    const campaign = await this.prisma.campaign.findUnique({ where: { campaignId } });
+    if (!campaign) throw new NotFoundException({ code: ErrorCodes.CAMPAIGN_NOT_FOUND, message: 'Campaign not found' });
+    const safePage = Math.max(1, Math.floor(page));
+    const safeLimit = Math.min(Math.max(1, Math.floor(limit)), 50);
+    const [versions, total] = await Promise.all([
+      this.prisma.campaignVersion.findMany({
+        where: { campaignId: campaign.id },
+        orderBy: [{ version: 'desc' }],
+        skip: (safePage - 1) * safeLimit,
+        take: safeLimit,
+      }),
+      this.prisma.campaignVersion.count({ where: { campaignId: campaign.id } }),
+    ]);
+    const totalPages = Math.ceil(total / safeLimit);
+    return {
+      data: versions.map(v => ({
+        id: v.id,
+        version: v.version,
+        payload: v.payload,
+        changedBy: v.changedBy,
+        changeReason: v.changeReason,
+        createdAt: v.createdAt,
+      })),
+      total,
+      page: safePage,
+      limit: safeLimit,
+      totalPages,
+      hasNext: safePage < totalPages,
+      hasPrev: safePage > 1,
+    };
+  }
+
+  /**
+   * G362: duplikat kampanye ke DRAFT baru — tanpa hasil redemption.
+   * Menyalin konfigurasi (tipe, diskon, targeting, kuota, rollout) tetapi:
+   * - status selalu DRAFT, currentRedemptions = 0
+   * - promoCode dikosongkan (unik) — admin mengisi kode baru saat edit draf
+   * - bila jadwal asli sudah lewat, digeser maju mempertahankan durasi
+   * - menulis CampaignVersion v1 + audit CAMPAIGN_UPDATED
+   */
+  async duplicateCampaign(campaignId: string, adminId: string, opts: { name?: string } = {}, ipAddress: string = 'unknown'): Promise<object> {
+    const campaign = await this.prisma.campaign.findUnique({ where: { campaignId } });
+    if (!campaign) throw new NotFoundException({ code: ErrorCodes.CAMPAIGN_NOT_FOUND, message: 'Campaign not found' });
+
+    const name = (opts.name?.trim() || `${campaign.name} (salinan)`.slice(0, 100)).slice(0, 100);
+    if (name.trim().length < 3 || /[<>]/.test(name)) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Campaign name must be 3–100 safe characters' });
+    }
+
+    // Geser jadwal bila sudah lewat — draf salinan harus bisa diaktifkan.
+    const now = new Date();
+    const durationMs = campaign.endsAt.getTime() - campaign.startsAt.getTime();
+    let startsAt = campaign.startsAt;
+    let endsAt = campaign.endsAt;
+    let datesAdjusted = false;
+    if (endsAt <= now) {
+      startsAt = now;
+      endsAt = new Date(now.getTime() + Math.max(durationMs, 24 * 60 * 60 * 1000));
+      datesAdjusted = true;
+    }
+
+    let copy: Campaign | null = null;
+    for (let attempt = 0; attempt < MAX_CAMPAIGN_ID_RETRIES; attempt++) {
+      const count = await this.prisma.campaign.count();
+      const newCampaignId = generateCampaignId(count + 1 + attempt);
+      try {
+        copy = await this.prisma.campaign.create({
+          data: {
+            campaignId: newCampaignId,
+            name,
+            description: campaign.description,
+            type: campaign.type,
+            status: CampaignStatus.DRAFT,
+            startsAt,
+            endsAt,
+            discountValue: campaign.discountValue,
+            discountPercent: campaign.discountPercent,
+            maxDiscount: campaign.maxDiscount,
+            freeTransactions: campaign.freeTransactions,
+            targetAudience: campaign.targetAudience,
+            targetMinRank: campaign.targetMinRank,
+            targetDormantDays: campaign.targetDormantDays,
+            targetNewUserOnly: campaign.targetNewUserOnly,
+            promoCode: null,
+            maxRedemptions: campaign.maxRedemptions,
+            currentRedemptions: 0,
+            rolloutPercent: campaign.rolloutPercent,
+            createdBy: adminId,
+          },
+        });
+        break;
+      } catch (err: unknown) {
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002' && attempt < MAX_CAMPAIGN_ID_RETRIES - 1) continue;
+        throw err;
+      }
+    }
+    if (!copy) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Gagal membuat salinan kampanye' });
+    }
+
+    await this.writeCampaignVersion(copy, adminId, `Duplikat dari ${campaign.campaignId}`, []);
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.CAMPAIGN_UPDATED,
+      targetType: 'Campaign',
+      targetId: copy.campaignId,
+      description: `Duplicated campaign "${campaign.name}" (${campaignId}) → "${copy.name}" (${copy.campaignId}) sebagai DRAFT`,
+      before: { sourceCampaignId: campaignId },
+      after: { name: copy.name, status: copy.status, datesAdjusted },
+      ipAddress,
+    });
+
+    return { ...this.formatCampaign(copy), datesAdjusted, sourceCampaignId: campaignId };
+  }
+
+  /**
+   * G363-G365: analitik kampanye.
+   * - redemptions: jumlah penukaran (baris voucher_usages milik voucher kampanye)
+   * - skipped: voucher terbit yang masih aktif & belum kedaluwarsa tapi belum pernah ditebus
+   * - errors: voucher yang dinonaktifkan sebelum waktunya (deactivatedAt terisi)
+   * - actualPromoCost: SUM(discountApplied) dari usages, dalam IDR
+   * - quota: kuota terpakai vs maxRedemptions + alarm bila > 80%
+   * - audienceEstimate: estimasi penerima bila kampanye diterbitkan sekarang
+   */
+  async getCampaignAnalytics(campaignId: string): Promise<object> {
+    const campaign = await this.prisma.campaign.findUnique({ where: { campaignId } });
+    if (!campaign) throw new NotFoundException({ code: ErrorCodes.CAMPAIGN_NOT_FOUND, message: 'Campaign not found' });
+    const now = new Date();
+
+    const [voucherStats, usages, costAgg] = await Promise.all([
+      this.prisma.voucher.groupBy({
+        by: ['voucherType'],
+        where: { campaignId: campaign.id },
+        _count: { _all: true },
+        _sum: { currentUsage: true },
+      }),
+      this.prisma.voucherUsage.findMany({
+        where: { voucher: { campaignId: campaign.id } },
+        select: { userId: true },
+      }),
+      this.prisma.voucherUsage.aggregate({
+        where: { voucher: { campaignId: campaign.id } },
+        _sum: { discountApplied: true },
+        _count: { _all: true },
+      }),
+    ]);
+
+    const [totalVouchers, activeVouchers, deactivatedVouchers, unusedActiveVouchers] = await Promise.all([
+      this.prisma.voucher.count({ where: { campaignId: campaign.id } }),
+      this.prisma.voucher.count({ where: { campaignId: campaign.id, isActive: true, validUntil: { gt: now } } }),
+      this.prisma.voucher.count({ where: { campaignId: campaign.id, deactivatedAt: { not: null } } }),
+      this.prisma.voucher.count({
+        where: { campaignId: campaign.id, isActive: true, validUntil: { gt: now }, currentUsage: 0 },
+      }),
+    ]);
+
+    const redemptions = costAgg._count._all;
+    const uniqueRedeemers = new Set(usages.map(u => u.userId)).size;
+    const actualPromoCost = costAgg._sum.discountApplied ? safeBigIntToNumber(costAgg._sum.discountApplied) / 100 : 0;
+
+    const quotaPercent = campaign.maxRedemptions
+      ? Math.round((campaign.currentRedemptions / campaign.maxRedemptions) * 1000) / 10
+      : null;
+    const quotaAlarm = quotaPercent !== null && quotaPercent > CAMPAIGN_QUOTA_ALARM_THRESHOLD;
+
+    const audienceEstimate = await this.prisma.user.count({ where: this.buildAudienceWhere(campaign) });
+
+    return {
+      campaignId: campaign.campaignId,
+      name: campaign.name,
+      status: campaign.status,
+      vouchers: {
+        total: totalVouchers,
+        active: activeVouchers,
+        deactivated: deactivatedVouchers,
+      },
+      redemptions,
+      uniqueRedeemers,
+      /** Voucher terbit, masih aktif & berlaku, tapi belum pernah ditebus. */
+      skipped: unusedActiveVouchers,
+      /** Voucher yang dinonaktifkan sebelum masa berlakunya habis. */
+      errors: deactivatedVouchers,
+      /** Biaya promo aktual (IDR) = total discountApplied dari semua penukaran. */
+      actualPromoCost,
+      byType: voucherStats.map(s => ({
+        voucherType: s.voucherType,
+        issued: s._count._all,
+        redemptions: s._sum.currentUsage ?? 0,
+      })),
+      quota: {
+        max: campaign.maxRedemptions,
+        used: campaign.currentRedemptions,
+        issued: totalVouchers,
+        percent: quotaPercent,
+        alarm: quotaAlarm,
+      },
+      audienceEstimate: {
+        eligibleUsers: audienceEstimate,
+        note: 'Estimasi pengguna yang memenuhi kriteria target bila kampanye diterbitkan sekarang (sebelum rollout sampling).',
+      },
+    };
+  }
+
+  /** Kriteria audience terstruktur — dipakai bersama issuePersonalVouchers & analitik. */
+  private buildAudienceWhere(campaign: Campaign): Prisma.UserWhereInput {
+    const where: Prisma.UserWhereInput = {
+      isActive: true,
+      isBanned: false,
+      deletedAt: null,
+    };
+    const ranks = this.rankFilter(campaign.targetMinRank);
+    if (ranks) where.membershipRank = { in: ranks };
+    if (campaign.targetNewUserOnly) where.totalOrdersCompleted = 0;
+    const and: Prisma.UserWhereInput[] = [];
+    if (campaign.targetDormantDays !== null) {
+      const cutoff = new Date(Date.now() - campaign.targetDormantDays * 24 * 60 * 60 * 1000);
+      and.push(
+        { totalOrdersCompleted: { gt: 0 } },
+        { ordersAsBuyer: { none: { status: 'COMPLETED', deletedAt: null, completedAt: { gte: cutoff } } } },
+        { ordersAsSeller: { none: { status: 'COMPLETED', deletedAt: null, completedAt: { gte: cutoff } } } },
+      );
+    }
+    if (and.length > 0) where.AND = and;
+    return where;
   }
 
   private async activateCampaignRecord(campaign: Campaign, skipIfAlreadyActive = false): Promise<Campaign> {
@@ -420,24 +899,7 @@ export class CampaignService {
     let remaining = campaign.maxRedemptions === null ? Number.POSITIVE_INFINITY : Math.max(0, campaign.maxRedemptions - existingIssued);
     if (remaining === 0) return { issued: 0, skipped: 0, notified: 0 };
 
-    const where: Prisma.UserWhereInput = {
-      isActive: true,
-      isBanned: false,
-      deletedAt: null,
-    };
-    const ranks = this.rankFilter(campaign.targetMinRank);
-    if (ranks) where.membershipRank = { in: ranks };
-    if (campaign.targetNewUserOnly) where.totalOrdersCompleted = 0;
-    const and: Prisma.UserWhereInput[] = [];
-    if (campaign.targetDormantDays !== null) {
-      const cutoff = new Date(Date.now() - campaign.targetDormantDays * 24 * 60 * 60 * 1000);
-      and.push(
-        { totalOrdersCompleted: { gt: 0 } },
-        { ordersAsBuyer: { none: { status: 'COMPLETED', deletedAt: null, completedAt: { gte: cutoff } } } },
-        { ordersAsSeller: { none: { status: 'COMPLETED', deletedAt: null, completedAt: { gte: cutoff } } } },
-      );
-    }
-    if (and.length > 0) where.AND = and;
+    const where: Prisma.UserWhereInput = this.buildAudienceWhere(campaign);
 
     let cursor: string | undefined;
     let issued = 0;
@@ -554,6 +1016,8 @@ export class CampaignService {
       createdBy: c.createdBy,
       createdAt: c.createdAt,
       updatedAt: c.updatedAt,
+      // G351: daftar field terkunci (badge "terkunci" di UI) — kosong saat DRAFT.
+      lockedFields: c.status === CampaignStatus.DRAFT ? [] : [...LOCKED_AFTER_ACTIVE],
     };
   }
 }

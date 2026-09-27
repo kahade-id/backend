@@ -92,6 +92,9 @@ const mockPrisma = {
   },
   voucher: {
     updateMany: jest.fn(),
+    // SP-034 (pre-existing): rollbackOrderVoucherUsage membaca campaignId
+    // sebelum delete — mock ini kurang sejak awal, bukan regresi gap.
+    findUnique: jest.fn(),
   },
   user: {
     update: jest.fn(),
@@ -104,6 +107,12 @@ const mockPrisma = {
     create: jest.fn(),
     findFirst: jest.fn().mockResolvedValue({ id: 'proof-1' }),
     findUnique: jest.fn(),
+  },
+  // GAP-C: guard completeOrder untuk order bermilestone (default 0 = order satu tahap).
+  // findMany: aktivasi milestone di payOrder — no-op bila tidak ada draft.
+  orderMilestone: {
+    count: jest.fn().mockResolvedValue(0),
+    findMany: jest.fn().mockResolvedValue([]),
   },
   $transaction: jest.fn(),
   $queryRaw: jest.fn().mockResolvedValue([]),
@@ -200,6 +209,9 @@ describe('OrderStateService', () => {
     mockPrisma.user.update.mockResolvedValue({});
     mockPrisma.$queryRaw.mockResolvedValue([]);
     mockReferralService.createReferralRewardIfEligible.mockResolvedValue(undefined);
+    // GAP-C: default order satu tahap (tanpa milestone) untuk completeOrder.
+    mockPrisma.orderMilestone.count.mockResolvedValue(0);
+    mockPrisma.orderMilestone.findMany.mockResolvedValue([]);
   });
 
   it('should be defined', () => {
@@ -641,6 +653,22 @@ describe('OrderStateService', () => {
       });
 
       await expect(service.completeOrder('ORD-001', 'wrong-buyer-id')).rejects.toThrow(BadRequestException);
+    });
+
+    it('GAP-C: menolak completeOrder legacy untuk order bermilestone (anti double-release)', async () => {
+      // Stub di luar transaksi karena preflight berjalan SEBELUM alokasi serial.
+      mockPrisma.order.findUnique.mockResolvedValue({ ...mockOrder, status: OrderStatus.IN_DELIVERY, buyerId: 'buyer-id' });
+      mockPrisma.orderMilestone.count.mockResolvedValue(2);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => fn(mockPrisma));
+
+      await expect(service.completeOrder('ORD-001', 'buyer-id')).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'MILESTONE_ORDER_LEGACY_FLOW_FORBIDDEN' }),
+      });
+      // Tidak ada pergerakan dana legacy yang terjadi, dan tidak ada serial wallet
+      // yang terbakar (preflight berjalan sebelum alokasi serial).
+      expect(mockPrisma.walletTransaction.create).not.toHaveBeenCalled();
+      expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
+      expect(mockWalletTxSerial.getNext).not.toHaveBeenCalled();
     });
 
     it('should throw BadRequestException when buyer or seller wallet is missing', async () => {

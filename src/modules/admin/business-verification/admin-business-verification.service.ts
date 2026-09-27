@@ -15,6 +15,15 @@ import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/
 import { bcryptCompare, decryptAES } from '../../../common/utils/crypto.util';
 import { escapeHtml } from '../../../common/utils/sanitize.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
+import {
+  deriveLegalEntityType,
+  documentsCompleteWhere,
+  isDocumentsCompleteRow,
+  legalEntityTypeWhere,
+  maskNpwp,
+  type LegalEntityType,
+} from './legal-entity.util';
+import type { BusinessVerificationQueueQueryDto } from './dto/business-verification-queue-query.dto';
 
 const VALID_STATUSES: BusinessVerificationStatus[] = [
   BusinessVerificationStatus.PENDING,
@@ -22,6 +31,41 @@ const VALID_STATUSES: BusinessVerificationStatus[] = [
   BusinessVerificationStatus.REJECTED,
   BusinessVerificationStatus.REVOKED,
 ];
+
+/**
+ * GAP-E G322 — masa berlaku verifikasi legalitas badan usaha.
+ *
+ * Skema tidak menyimpan tanggal kedaluwarsa per dokumen (dan worker ini
+ * dilarang membuat migrasi baru), sehingga alarm "dokumen legal kedaluwarsa"
+ * dihitung dari `approvedAt`: persetujuan dianggap berlaku selama
+ * LEGALITY_VALIDITY_DAYS hari, setelah itu badan usaha perlu verifikasi ulang.
+ *
+ * NILAI SEMENTARA — butuh KEPUTUSAN PRODUK: berapa lama persetujuan verifikasi
+ * bisnis berlaku, dan apakah tiap jenis dokumen (akta, SIUP/NIB) punya masa
+ * berlaku sendiri (butuh kolom validUntil per dokumen + migrasi).
+ */
+export const LEGALITY_VALIDITY_DAYS = 3 * 365;
+/** Ambang peringatan "segera kedaluwarsa": sisa <= 90 hari. */
+export const LEGALITY_WARNING_DAYS = 90;
+
+/** Tanggal kedaluwarsa masa berlaku dari approvedAt — null bila belum disetujui. */
+export function legalitasValidUntil(approvedAt?: Date | null): Date | null {
+  if (!approvedAt) return null;
+  return new Date(approvedAt.getTime() + LEGALITY_VALIDITY_DAYS * 24 * 60 * 60 * 1000);
+}
+
+/** Status masa berlaku: 'ok' | 'warning' (<=90 hari tersisa) | 'expired' | 'na'. */
+export function legalitasStatus(
+  approvedAt?: Date | null,
+  now: Date = new Date(),
+): 'ok' | 'warning' | 'expired' | 'na' {
+  const validUntil = legalitasValidUntil(approvedAt);
+  if (!validUntil) return 'na';
+  const remainingMs = validUntil.getTime() - now.getTime();
+  if (remainingMs <= 0) return 'expired';
+  if (remainingMs <= LEGALITY_WARNING_DAYS * 24 * 60 * 60 * 1000) return 'warning';
+  return 'ok';
+}
 
 /**
  * Section 1(d) — review verifikasi badan usaha lewat admin console.
@@ -85,14 +129,45 @@ export class AdminBusinessVerificationService {
   async getQueue(
     page = 1,
     limit = 20,
-    status?: string,
+    query: {
+      status?: string;
+      legalEntityType?: string;
+      docsComplete?: 'true' | 'false';
+      awaitingDocs?: 'true';
+      legalitasExpired?: 'true';
+    } = {},
   ): Promise<PaginatedResponse<Record<string, unknown>>> {
     const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
     const safeLimit = Number.isFinite(limit) ? Math.min(100, Math.max(1, Math.floor(limit))) : 20;
     const skip = (safePage - 1) * safeLimit;
 
-    const resolvedStatus = this.assertValidStatus(status);
-    const where: Prisma.BusinessVerificationWhereInput = resolvedStatus ? { status: resolvedStatus } : {};
+    const resolvedStatus = this.assertValidStatus(query.status);
+    const and: Prisma.BusinessVerificationWhereInput[] = [];
+
+    // GAP-E G314–G316: filter jenis badan hukum / kelengkapan dokumen /
+    // "menunggu dokumen tambahan" (sebelumnya hanya diekspor ke CSV).
+    if (query.legalEntityType) {
+      and.push(legalEntityTypeWhere(query.legalEntityType as LegalEntityType));
+    }
+    if (query.awaitingDocs === 'true') {
+      and.push({ status: BusinessVerificationStatus.PENDING });
+      and.push(documentsCompleteWhere(false));
+    } else if (query.docsComplete === 'true' || query.docsComplete === 'false') {
+      and.push(documentsCompleteWhere(query.docsComplete === 'true'));
+    }
+    // GAP-E G322: filter alarm legalitas kedaluwarsa (APPROVED + approvedAt
+    // lebih tua dari LEGALITY_VALIDITY_DAYS).
+    if (query.legalitasExpired === 'true') {
+      and.push({ status: BusinessVerificationStatus.APPROVED });
+      and.push({
+        approvedAt: { lte: new Date(Date.now() - LEGALITY_VALIDITY_DAYS * 24 * 60 * 60 * 1000) },
+      });
+    }
+
+    const where: Prisma.BusinessVerificationWhereInput = {
+      ...(resolvedStatus ? { status: resolvedStatus } : {}),
+      ...(and.length > 0 ? { AND: and } : {}),
+    };
 
     const [requests, total] = await Promise.all([
       this.prisma.businessVerification.findMany({
@@ -109,10 +184,14 @@ export class AdminBusinessVerificationService {
           businessName: true,
           deedNumber: true,
           siupNumber: true,
+          // PENTING: documentFileKeys hanya dipakai untuk menghitung
+          // docCount — NPWP (npwpNumber) TIDAK PERNAH di-select di antrean.
+          documentFileKeys: true,
           rejectionReason: true,
           attemptNumber: true,
           createdAt: true,
           reviewedAt: true,
+          approvedAt: true,
           reviewedBy: true,
           user: { select: { userId: true, email: true, fullName: true, accountType: true } },
           reviewer: { select: { adminId: true, fullName: true } },
@@ -121,7 +200,25 @@ export class AdminBusinessVerificationService {
       this.prisma.businessVerification.count({ where }),
     ]);
 
-    return createPaginatedResponse(requests, total, safePage, safeLimit);
+    // Kolom turunan untuk UI (GAP-E G313/G322): jenis badan hukum,
+    // kelengkapan dokumen, dan masa berlaku legalitas.
+    // documentFileKeys hanya dipakai menghitung docCount — tidak dikembalikan.
+    const rows = requests.map((r) => {
+      const { documentFileKeys, ...rest } = r;
+      const docCount = documentFileKeys.length;
+      const approvedAt = r.approvedAt ?? null;
+      const validUntil = legalitasValidUntil(approvedAt);
+      return {
+        ...rest,
+        legalEntityType: deriveLegalEntityType(r.businessName),
+        docCount,
+        documentsComplete: isDocumentsCompleteRow(r.deedNumber, r.siupNumber, docCount),
+        legalitasValidUntil: validUntil ? validUntil.toISOString() : null,
+        legalitasExpired: legalitasStatus(approvedAt) === 'expired',
+      };
+    });
+
+    return createPaginatedResponse(rows, total, safePage, safeLimit);
   }
 
   async getDetail(
@@ -137,6 +234,9 @@ export class AdminBusinessVerificationService {
         userId: true,
         status: true,
         businessName: true,
+        // NPWP terenkripsi: didekripsi lalu DI-MASK sebelum dikembalikan
+        // (preview minim-PII, G313). Tidak pernah mentah di respons detail.
+        npwpNumber: true,
         deedNumber: true,
         siupNumber: true,
         rejectionReason: true,
@@ -148,6 +248,10 @@ export class AdminBusinessVerificationService {
         reviewedBy: true,
         approvedAt: true,
         revokedAt: true,
+        assignedReviewerId: true,
+        assignedReviewer: { select: { id: true, adminId: true, fullName: true } },
+        // Hanya untuk menghitung docCount — tidak dikembalikan mentah.
+        documentFileKeys: true,
         user: { select: { userId: true, email: true, fullName: true, accountType: true } },
         reviewer: { select: { adminId: true, fullName: true } },
       },
@@ -159,8 +263,23 @@ export class AdminBusinessVerificationService {
       });
     }
 
-    // NPWP adalah data sensitif — admin melihatnya lewat getDocumentUrls yang
-    // butuh re-auth, jadi detail queue tidak membocorkannya (bahkan terenkripsi).
+    // NPWP adalah data sensitif — detail hanya membawa versi MASKED untuk
+    // preview minim-PII; NPWP mentah tetap hanya lewat getDocumentUrls
+    // yang butuh re-auth. Dekripsi gagal → null, detail tetap dikembalikan.
+    let npwpMasked: string | null = null;
+    try {
+      npwpMasked = maskNpwp(await decryptAES(request.npwpNumber));
+    } catch (err) {
+      this.logger.warn(
+        `[AdminBusinessVerification] NPWP decryption failed for detail ${verificationId}`,
+      );
+    }
+    const { npwpNumber: _encryptedNpwp, documentFileKeys, ...safeRequest } = request;
+    const docCount = documentFileKeys.length;
+
+    // NPWP adalah data sensitif — detail hanya membawa versi MASKED untuk
+    // preview minim-PII; NPWP mentah tetap hanya lewat getDocumentUrls
+    // yang butuh re-auth.
     if (adminId) {
       this.auditLog.logAdminAction({
         adminId,
@@ -172,7 +291,16 @@ export class AdminBusinessVerificationService {
       });
     }
 
-    return request;
+    return {
+      ...safeRequest,
+      legalEntityType: deriveLegalEntityType(request.businessName),
+      docCount,
+      documentsComplete: isDocumentsCompleteRow(request.deedNumber, request.siupNumber, docCount),
+      npwpMasked,
+      // GAP-E G321/G322: masa berlaku legalitas untuk tab "Riwayat"/detail.
+      legalitasValidUntil: legalitasValidUntil(request.approvedAt)?.toISOString() ?? null,
+      legalitasExpired: legalitasStatus(request.approvedAt) === 'expired',
+    };
   }
 
   async approve(
@@ -180,6 +308,7 @@ export class AdminBusinessVerificationService {
     adminId: string,
     notes?: string,
     ipAddress = 'internal',
+    batchId?: string,
   ): Promise<Record<string, unknown>> {
     const normalizedNotes = this.normalizeOptionalText(notes);
     const request = await this.prisma.businessVerification.findFirst({
@@ -232,7 +361,10 @@ export class AdminBusinessVerificationService {
       action: AuditAction.BUSINESS_VERIFICATION_APPROVED,
       targetType: 'BUSINESS_VERIFICATION',
       targetId: verificationId,
-      description: `Business verification ${verificationId} approved for user ${request.userId}${normalizedNotes ? ': ' + normalizedNotes : ''}`,
+      description:
+        `Business verification ${verificationId} approved for user ${request.userId}` +
+        (batchId ? ` [batchId=${batchId}]` : '') +
+        (normalizedNotes ? ': ' + normalizedNotes : ''),
       ipAddress,
     });
 
@@ -253,6 +385,7 @@ export class AdminBusinessVerificationService {
     reason: string,
     notes?: string,
     ipAddress = 'internal',
+    batchId?: string,
   ): Promise<Record<string, unknown>> {
     const normalizedReason = this.normalizeRequiredText(reason, 'Rejection reason');
     const normalizedNotes = this.normalizeOptionalText(notes);
@@ -303,7 +436,9 @@ export class AdminBusinessVerificationService {
       action: AuditAction.BUSINESS_VERIFICATION_REJECTED,
       targetType: 'BUSINESS_VERIFICATION',
       targetId: verificationId,
-      description: `Business verification ${verificationId} rejected for user ${request.userId}: ${normalizedReason}`,
+      description:
+        `Business verification ${verificationId} rejected for user ${request.userId}: ${normalizedReason}` +
+        (batchId ? ` [batchId=${batchId}]` : ''),
       ipAddress,
     });
 
@@ -329,8 +464,10 @@ export class AdminBusinessVerificationService {
     adminId: string,
     reason: string,
     ipAddress = 'internal',
+    notes?: string,
   ): Promise<Record<string, unknown>> {
     const normalizedReason = this.normalizeRequiredText(reason, 'Revocation reason');
+    const normalizedNotes = this.normalizeOptionalText(notes);
     const request = await this.prisma.businessVerification.findFirst({
       where: this.findWhere(verificationId),
       select: { id: true, verificationId: true, userId: true, status: true, businessName: true },
@@ -358,6 +495,7 @@ export class AdminBusinessVerificationService {
             reviewedAt: new Date(),
             revokedAt: new Date(),
             rejectionReason: normalizedReason,
+            adminNotes: normalizedNotes,
           },
         });
         if (guard.count === 0) {
@@ -493,5 +631,243 @@ export class AdminBusinessVerificationService {
       documentUrls,
       ...(partialErrors.length > 0 ? { partialErrors } : {}),
     };
+  }
+
+  /**
+   * GAP-E: penugasan reviewer bisnis yang beraudit (G293 untuk domain bisnis).
+   * assignedReviewerId terpisah dari reviewedBy (yang memutuskan) — menugaskan
+   * tidak mengubah status pengajuan. Tidak ada nilai AuditAction baru
+   * (menambah enum butuh migrasi) — penugasan dicatat sebagai ADMIN_ACTION
+   * dengan deskripsi eksplisit.
+   */
+  async assignReviewer(
+    verificationId: string,
+    reviewerAdminId: string,
+    actorAdminId: string,
+    ipAddress = 'internal',
+  ): Promise<Record<string, unknown>> {
+    const request = await this.prisma.businessVerification.findFirst({
+      where: this.findWhere(verificationId),
+      select: { id: true, verificationId: true, userId: true, status: true, assignedReviewerId: true },
+    });
+    if (!request) {
+      throw new NotFoundException({
+        code: ErrorCodes.BUSINESS_VERIFICATION_NOT_FOUND,
+        message: 'Business verification request not found',
+      });
+    }
+
+    const reviewer = await this.prisma.adminUser.findUnique({
+      where: { id: reviewerAdminId },
+      select: { id: true, adminId: true, fullName: true, isActive: true, role: true },
+    });
+    if (!reviewer || !reviewer.isActive) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Reviewer admin tidak ditemukan atau tidak aktif',
+      });
+    }
+
+    const updated = await this.prisma.businessVerification.update({
+      where: { id: request.id },
+      data: { assignedReviewerId: reviewer.id },
+      select: { id: true, verificationId: true, assignedReviewerId: true, updatedAt: true },
+    });
+
+    this.auditLog.logAdminAction({
+      adminId: actorAdminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'BUSINESS_VERIFICATION',
+      targetId: verificationId,
+      description:
+        `Business verification ${verificationId} assigned to reviewer ${reviewer.adminId} ` +
+        `(${reviewer.fullName}) by admin ${actorAdminId}`,
+      ipAddress,
+    });
+
+    return { ...updated, assignedReviewer: { adminId: reviewer.adminId, fullName: reviewer.fullName } };
+  }
+
+  /**
+   * GAP-E: ringkasan volume disetujui/ditolak/dicabut per periode untuk
+   * dasbor operasional. Dihitung dari reviewedAt dalam jendela periode;
+   * `pending` = kedalaman antrean saat ini (semua waktu).
+   */
+  async getSummary(period: '7d' | '30d' | '90d' = '30d'): Promise<Record<string, unknown>> {
+    const days = period === '7d' ? 7 : period === '90d' ? 90 : 30;
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const [approved, rejected, revoked, pending] = await Promise.all([
+      this.prisma.businessVerification.count({
+        where: { status: BusinessVerificationStatus.APPROVED, reviewedAt: { gte: since } },
+      }),
+      this.prisma.businessVerification.count({
+        where: { status: BusinessVerificationStatus.REJECTED, reviewedAt: { gte: since } },
+      }),
+      this.prisma.businessVerification.count({
+        where: { status: BusinessVerificationStatus.REVOKED, reviewedAt: { gte: since } },
+      }),
+      this.prisma.businessVerification.count({
+        where: { status: BusinessVerificationStatus.PENDING },
+      }),
+    ]);
+
+    return { period, approved, rejected, revoked, pending, totalReviewed: approved + rejected + revoked };
+  }
+
+  /**
+   * GAP-E: riwayat perubahan/audit untuk satu pengajuan — dibaca dari
+   * admin_audit_logs (targetId = id maupun verificationId) untuk tab
+   * "Riwayat" di detail: penugasan reviewer, akses dokumen, keputusan review.
+   */
+  async getHistory(verificationId: string): Promise<Record<string, unknown>[]> {
+    const request = await this.prisma.businessVerification.findFirst({
+      where: this.findWhere(verificationId),
+      select: { id: true, verificationId: true },
+    });
+    if (!request) {
+      throw new NotFoundException({
+        code: ErrorCodes.BUSINESS_VERIFICATION_NOT_FOUND,
+        message: 'Business verification request not found',
+      });
+    }
+
+    const logs = await this.prisma.adminAuditLog.findMany({
+      where: {
+        targetType: 'BUSINESS_VERIFICATION',
+        targetId: { in: [request.id, request.verificationId] },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+      select: {
+        id: true,
+        action: true,
+        description: true,
+        ipAddress: true,
+        createdAt: true,
+        admin: { select: { adminId: true, fullName: true } },
+      },
+    });
+
+    return logs.map((l) => ({
+      id: l.id,
+      action: l.action,
+      description: l.description,
+      ipAddress: l.ipAddress,
+      createdAt: l.createdAt,
+      admin: l.admin,
+    }));
+  }
+
+  /**
+   * GAP-E: ekspor antrean sebagai CSV. NPWP TIDAK PERNAH disertakan —
+   * kolom npwpNumber/npwpNumberHash tidak di-select sama sekali.
+   */
+  async exportCsv(query: BusinessVerificationQueueQueryDto): Promise<string> {
+    const and: Prisma.BusinessVerificationWhereInput[] = [];
+    const resolvedStatus = this.assertValidStatus(query.status);
+    const where: Prisma.BusinessVerificationWhereInput = resolvedStatus ? { status: resolvedStatus } : {};
+    if (query.legalEntityType) {
+      and.push(legalEntityTypeWhere(query.legalEntityType as LegalEntityType));
+    }
+    if (query.awaitingDocs === 'true') {
+      where.status = BusinessVerificationStatus.PENDING;
+      and.push(documentsCompleteWhere(false));
+    } else if (query.docsComplete === 'true' || query.docsComplete === 'false') {
+      and.push(documentsCompleteWhere(query.docsComplete === 'true'));
+    }
+    // GAP-E G322: ekspor juga bisa difilter alarm legalitas kedaluwarsa.
+    if (query.legalitasExpired === 'true') {
+      and.push({ status: BusinessVerificationStatus.APPROVED });
+      and.push({
+        approvedAt: { lte: new Date(Date.now() - LEGALITY_VALIDITY_DAYS * 24 * 60 * 60 * 1000) },
+      });
+    }
+    if (and.length > 0) {
+      where.AND = and;
+    }
+
+    const rows = await this.prisma.businessVerification.findMany({
+      where,
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: 5000,
+      // PENTING: npwpNumber & npwpNumberHash sengaja TIDAK di-select.
+      select: {
+        verificationId: true,
+        businessName: true,
+        deedNumber: true,
+        siupNumber: true,
+        documentFileKeys: true,
+        status: true,
+        userId: true,
+        attemptNumber: true,
+        rejectionReason: true,
+        createdAt: true,
+        reviewedAt: true,
+        approvedAt: true,
+        revokedAt: true,
+        reviewedBy: true,
+        assignedReviewerId: true,
+        user: { select: { email: true, fullName: true } },
+        reviewer: { select: { adminId: true, fullName: true } },
+      },
+    });
+
+    const esc = (v: unknown): string => {
+      const s = v === null || v === undefined ? '' : String(v);
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+
+    const header = [
+      'verification_id',
+      'nama_badan_usaha',
+      'jenis_badan_hukum',
+      'nomor_akta',
+      'nomor_siup_nib',
+      'jumlah_dokumen',
+      'dokumen_lengkap',
+      'status',
+      'user_id',
+      'email_pemohon',
+      'nama_pemohon',
+      'reviewer_ditugaskan',
+      'reviewer_pemutus',
+      'diajukan_pada',
+      'ditinjau_pada',
+      'disetujui_pada',
+      'dicabut_pada',
+      'alasan_penolakan',
+      'upaya_ke',
+    ];
+    const lines = [header.join(',')];
+    for (const r of rows) {
+      const docCount = r.documentFileKeys.length;
+      lines.push(
+        [
+          r.verificationId,
+          r.businessName,
+          deriveLegalEntityType(r.businessName),
+          r.deedNumber,
+          r.siupNumber,
+          docCount,
+          isDocumentsCompleteRow(r.deedNumber, r.siupNumber, docCount) ? 'YA' : 'TIDAK',
+          r.status,
+          r.userId,
+          r.user?.email,
+          r.user?.fullName,
+          r.assignedReviewerId,
+          r.reviewer ? `${r.reviewer.adminId} (${r.reviewer.fullName})` : '',
+          r.createdAt.toISOString(),
+          r.reviewedAt?.toISOString(),
+          r.approvedAt?.toISOString(),
+          r.revokedAt?.toISOString(),
+          r.rejectionReason,
+          r.attemptNumber,
+        ]
+          .map(esc)
+          .join(','),
+      );
+    }
+    return lines.join('\n');
   }
 }

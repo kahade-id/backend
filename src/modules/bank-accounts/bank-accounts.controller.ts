@@ -4,6 +4,8 @@ import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { BankAccountsService } from './bank-accounts.service';
 import { AddBankAccountDto } from './dto/add-bank-account.dto';
+import { UpdateBankAccountDto } from './dto/update-bank-account.dto';
+import { PasskeyReauthDto } from '../auth/dto/passkey.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { PhoneVerifiedGuard } from '../../common/guards/phone-verified.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -31,6 +33,7 @@ export class BankAccountsController {
   add(@CurrentUser() user: UserJwtPayload, @Body() dto: AddBankAccountDto): Promise<Record<string, unknown>> {
     return this.service.addBankAccount(
       user.sub, dto.bankCode, dto.bankName, dto.accountNumber, dto.accountName,
+      { password: dto.password, mfaCode: dto.mfaCode, otpCode: dto.otpCode, reauthToken: dto.reauthToken },
     );
   }
 
@@ -39,23 +42,32 @@ export class BankAccountsController {
   @Idempotency()
   @Post(':id/set-primary')
   @HttpCode(200)
-  setPrimary(@CurrentUser() user: UserJwtPayload, @Param('id', ParseIdPipe) id: string): Promise<Record<string, unknown>> {
-    return this.service.setPrimaryBankAccount(user.sub, id);
+  setPrimary(@CurrentUser() user: UserJwtPayload, @Param('id', ParseIdPipe) id: string, @Body() dto: PasskeyReauthDto): Promise<Record<string, unknown>> {
+    return this.service.setPrimaryBankAccount(
+      user.sub, id,
+      { password: dto.password, mfaCode: dto.mfaCode, otpCode: dto.otpCode, reauthToken: dto.reauthToken },
+    );
   }
 
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @UseGuards(UserThrottleGuard)
   @Idempotency()
   @Patch(':id')
-  update(@CurrentUser() user: UserJwtPayload, @Param('id', ParseIdPipe) id: string, @Body() dto: { accountName: string }): Promise<Record<string, unknown>> {
-    return this.service.updateBankAccount(user.sub, id, dto.accountName);
+  update(@CurrentUser() user: UserJwtPayload, @Param('id', ParseIdPipe) id: string, @Body() dto: UpdateBankAccountDto): Promise<Record<string, unknown>> {
+    return this.service.updateBankAccount(
+      user.sub, id, dto.accountName,
+      { password: dto.password, mfaCode: dto.mfaCode, otpCode: dto.otpCode, reauthToken: dto.reauthToken },
+    );
   }
 
   @Throttle({ default: { ttl: 60000, limit: 5 } })
   @UseGuards(UserThrottleGuard)
   @Idempotency()
   @Delete(':id')
-  delete(@CurrentUser() user: UserJwtPayload, @Param('id', ParseIdPipe) id: string): Promise<{ message: string }> {
-    return this.service.deleteBankAccount(user.sub, id);
+  delete(@CurrentUser() user: UserJwtPayload, @Param('id', ParseIdPipe) id: string, @Body() dto: PasskeyReauthDto): Promise<{ message: string }> {
+    return this.service.deleteBankAccount(
+      user.sub, id,
+      { password: dto.password, mfaCode: dto.mfaCode, otpCode: dto.otpCode, reauthToken: dto.reauthToken },
+    );
   }
 }

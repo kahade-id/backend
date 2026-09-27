@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { BankAccountsService } from '../bank-accounts.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { MidtransService } from '../../payment/midtrans.service';
+import { PasskeyService } from '../../auth/passkey.service';
 import { BankCode, Prisma } from '@prisma/client';
 import { initializeCrypto } from '../../../common/utils/crypto.util';
 
@@ -53,6 +54,11 @@ const mockConfig = {
 
 describe('BankAccountsService', () => {
   let service: BankAccountsService;
+  // GAP-A (G040): gerbang re-auth FAIL CLOSED — test memakai mock eksplisit
+  // (bukan mengandalkan @Optional yang absen).
+  const mockPasskeyService = {
+    requireRecentPasskeyOrReauth: jest.fn().mockResolvedValue(undefined),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -62,6 +68,7 @@ describe('BankAccountsService', () => {
         { provide: PrismaService, useValue: mockPrisma },
         { provide: MidtransService, useValue: mockMidtrans },
         { provide: ConfigService, useValue: mockConfig },
+        { provide: PasskeyService, useValue: mockPasskeyService },
       ],
     }).compile();
     service = module.get<BankAccountsService>(BankAccountsService);
@@ -434,4 +441,35 @@ describe('BankAccountsService', () => {
   });
 
   void BadRequestException;
+
+  describe('gerbang re-auth (G040, fail-closed)', () => {
+    it('MENOLAK mutasi bila PasskeyService tidak ter-inject (bukan dilewati diam-diam)', async () => {
+      const bareModule: TestingModule = await Test.createTestingModule({
+        providers: [
+          BankAccountsService,
+          { provide: PrismaService, useValue: mockPrisma },
+          { provide: MidtransService, useValue: mockMidtrans },
+          { provide: ConfigService, useValue: mockConfig },
+        ],
+      }).compile();
+      const bare = bareModule.get<BankAccountsService>(BankAccountsService);
+      await expect(
+        bare.addBankAccount('u-1', BankCode.BCA, 'BCA', '1234567890', 'BUDI'),
+      ).rejects.toMatchObject({ response: { code: 'REAUTH_UNAVAILABLE' } });
+      await bareModule.close();
+    });
+
+    it('memanggil gerbang re-auth pada mutasi bila PasskeyService tersedia', async () => {
+      // Gate dipanggil PERTAMA di addBankAccount — cukup panggil dan abaikan
+      // error downstream; yang diuji adalah gate-nya terpanggil.
+      await service
+        .addBankAccount('u-1', BankCode.BCA, 'BCA', '1234567890', 'BUDI')
+        .catch(() => undefined);
+      expect(mockPasskeyService.requireRecentPasskeyOrReauth).toHaveBeenCalledWith(
+        'u-1',
+        'bank_account_change',
+        expect.anything(),
+      );
+    });
+  });
 });

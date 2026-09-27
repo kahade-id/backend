@@ -8,7 +8,7 @@ import { BullModule } from '@nestjs/bull';
 import { Logger as NestLogger } from '@nestjs/common';
 
 // Config
-import { appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, flashConfig, r2Config, smtpConfig, fcmConfig, chatConfig } from './config';
+import { appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, flashConfig, r2Config, smtpConfig, fcmConfig, chatConfig, webauthnConfig } from './config';
 import { validateEnv } from './config/env.validation';
 import { initializeCrypto } from './common/utils/crypto.util';
 import { getRuntimeEnvFile } from './config/runtime-env-file';
@@ -28,6 +28,11 @@ import { ShowcaseModule } from './modules/showcase/showcase.module';
 import { BankAccountsModule } from './modules/bank-accounts/bank-accounts.module';
 import { WalletModule } from './modules/wallet/wallet.module';
 import { OrdersModule } from './modules/orders/orders.module';
+// GAP-C (G176–G200): order escrow bertahap (milestone).
+import { MilestonesModule } from './modules/milestones/milestones.module';
+import { CourierModule } from './modules/courier/courier.module';
+import { ReturnsModule } from './modules/returns/returns.module';
+import { InventoryModule } from './modules/inventory/inventory.module';
 import { ChatModule } from './modules/chat/chat.module';
 import { DisputesModule } from './modules/disputes/disputes.module';
 import { RatingsModule } from './modules/ratings/ratings.module';
@@ -53,10 +58,12 @@ import { SupportModule } from './modules/support/support.module';
 import { FeedbackModule } from './modules/feedback/feedback.module';
 import { ConfigApiModule } from './modules/config/config-api.module';
 import { SearchModule } from './modules/search/search.module';
+import { PartnerModule } from './modules/partner/partner.module';
 
 // Admin modules
 import { AdminModule } from './modules/admin/admin.module';
 import { HealthModule } from './modules/health/health.module';
+import { ObservabilityModule } from './modules/observability/observability.module';
 
 // Guards
 import { JwtAuthGuard, ADMIN_JWT_SERVICE } from './common/guards/jwt-auth.guard';
@@ -75,7 +82,7 @@ const runtimeEnvFile = getRuntimeEnvFile();
     ConfigModule.forRoot({
       isGlobal: true,
       ...(runtimeEnvFile ? { envFilePath: runtimeEnvFile } : {}),
-      load: [appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, flashConfig, r2Config, smtpConfig, fcmConfig, chatConfig],
+      load: [appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, flashConfig, r2Config, smtpConfig, fcmConfig, chatConfig, webauthnConfig],
       validate: validateEnv,
     }),
 
@@ -142,6 +149,10 @@ const runtimeEnvFile = getRuntimeEnvFile();
     BankAccountsModule,
     WalletModule,
     OrdersModule,
+    MilestonesModule, // GAP-C (G176–G200)
+    CourierModule,
+    ReturnsModule,
+    InventoryModule,
     ChatModule,
     DisputesModule,
     RatingsModule,
@@ -167,10 +178,12 @@ const runtimeEnvFile = getRuntimeEnvFile();
     FeedbackModule,
     ConfigApiModule,
     SearchModule,
+    PartnerModule, // GAP-F (G452-G475): public partner API & outbound webhooks
 
     // Admin modules
     AdminModule,
     HealthModule,
+    ObservabilityModule, // GAP-F (G476-G500): observability & kesiapan insiden
   ],
   providers: [
     {

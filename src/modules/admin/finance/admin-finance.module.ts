@@ -3,9 +3,13 @@ import { BullModule } from '@nestjs/bull';
 import { AdminFinanceController } from './admin-finance.controller';
 import { AdminFinanceService } from './admin-finance.service';
 import { ReconciliationService } from './reconciliation.service';
+import { ReconciliationFindingsService } from './reconciliation-findings.service';
+import { LedgerCorrectionService } from './ledger-corrections.service';
 import { ReconciliationProcessor, RECONCILIATION_QUEUE } from './reconciliation.processor';
 import { PrismaModule } from '../../../prisma/prisma.module';
 import { AuditLogModule } from '../../../common/services/audit-log.module';
+import { RedisModule } from '../../../redis/redis.module';
+import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { PaymentModule } from '../../../modules/payment/payment.module';
 import { DashboardModule } from '../dashboard/dashboard.module';
 
@@ -13,6 +17,7 @@ import { DashboardModule } from '../dashboard/dashboard.module';
   imports: [
     PrismaModule,
     AuditLogModule,
+    RedisModule,
     PaymentModule,
     DashboardModule, // AW-018: invalidasi cache summary dashboard
     BullModule.registerQueue({
@@ -25,7 +30,14 @@ import { DashboardModule } from '../dashboard/dashboard.module';
     }),
   ],
   controllers: [AdminFinanceController],
-  providers: [AdminFinanceService, ReconciliationService, ReconciliationProcessor],
+  providers: [
+    AdminFinanceService,
+    ReconciliationService,
+    ReconciliationFindingsService,
+    LedgerCorrectionService,
+    WalletTxSerialService,
+    ReconciliationProcessor,
+  ],
   exports: [ReconciliationService],
 })
 export class AdminFinanceModule {}

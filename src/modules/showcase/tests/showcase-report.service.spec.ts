@@ -11,6 +11,7 @@ import { UploadService } from '../../upload/upload.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { SubscriptionsService } from '../../subscriptions/subscriptions.service';
+import { AdminShowcaseReportsService } from '../../admin/showcase-reports/admin-showcase-reports.service';
 import { ReportShowcaseDto } from '../dto/report-showcase.dto';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 
@@ -119,6 +120,7 @@ describe('ShowcaseService — reportShowcase (K-1)', () => {
         { provide: AuditLogService, useValue: mockAuditLog },
         { provide: VerificationBadgeService, useValue: { getBadges: jest.fn().mockResolvedValue([]) } },
         { provide: SubscriptionsService, useValue: mockSubscriptions },
+        { provide: AdminShowcaseReportsService, useValue: { linkReportToCluster: jest.fn() } },
       ],
     }).compile();
     service = module.get<ShowcaseService>(ShowcaseService);

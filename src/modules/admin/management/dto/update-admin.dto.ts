@@ -22,4 +22,13 @@ export class UpdateAdminDto {
   @IsOptional()
   @IsBoolean()
   isActive?: boolean;
+
+  @ApiPropertyOptional({
+    description: 'Alasan perubahan — WAJIB bila role berubah (dicatat di audit ADMIN_ROLE_CHANGED).',
+  })
+  @IsOptional()
+  @IsString()
+  @MinLength(5)
+  @MaxLength(500)
+  reason?: string;
 }

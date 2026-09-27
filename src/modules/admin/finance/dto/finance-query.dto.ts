@@ -16,10 +16,11 @@ export class FinanceTransactionQueryDto extends PaginationDto {
 
   /**
    * WF-013: pencarian server-side (sebelumnya hanya filter client-side per halaman).
-   * Mencari di txId, description, dan orderId terkait. Dibatasi 100 karakter;
-   * Prisma mem-parameterize nilai (tidak ada injeksi SQL).
+   * E3: cakupan = txId, description, orderId terkait, DAN referensi eksternal
+   * (midtransOrderId, flashTransactionId, irisPayoutId, irisRef).
+   * Dibatasi 100 karakter; Prisma mem-parameterize nilai (tidak ada injeksi SQL).
    */
-  @ApiPropertyOptional({ description: 'Search across txId, description, and related order ID (max 100 chars)' })
+  @ApiPropertyOptional({ description: 'Search across txId, description, related order ID, and external provider references (max 100 chars)' })
   @IsOptional()
   @IsString()
   @MaxLength(100)

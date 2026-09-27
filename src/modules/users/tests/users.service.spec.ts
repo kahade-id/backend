@@ -10,6 +10,7 @@ import { VerificationBadgeService } from '../verification-badge.service';
 import { ReportFlagService } from '../../../common/services/report-flag.service';
 import { LocalStorageService } from '../../upload/local-storage.service';
 import { UserAnalyticsService } from '../user-analytics.service';
+import { AccountDeletionService } from '../account-deletion.service';
 import { Prisma } from '@prisma/client';
 import { bcryptHash } from '../../../common/utils/crypto.util';
 import * as cryptoUtils from '../../../common/utils/crypto.util';
@@ -41,6 +42,8 @@ const mockPrisma: any = {
   userShowcase: { findMany: jest.fn(), count: jest.fn(), create: jest.fn(), update: jest.fn(), findFirst: jest.fn(), delete: jest.fn() },
   twoFactorAuth: { findUnique: jest.fn(), updateMany: jest.fn() },
   userLink: { findMany: jest.fn(), delete: jest.fn(), update: jest.fn(), create: jest.fn() },
+  // GAP-B (G076–G083): loadPrivacySetting/canViewList membaca privacySetting.
+  privacySetting: { findUnique: jest.fn() },
   $transaction: jest.fn(),
 };
 const mockRedis = { get: jest.fn(), set: jest.fn(), del: jest.fn(), setex: jest.fn(), setNx: jest.fn(), releaseLock: jest.fn(), getPrefix: jest.fn().mockReturnValue('test:'), getClient: jest.fn() };
@@ -76,6 +79,8 @@ describe('UsersService', () => {
     mockReportFlag.evaluateTarget.mockResolvedValue({ flaggedForReview: false, distinctReporters: 1 });
     mockPrisma.$transaction.mockImplementation(async (fn: any) => fn(mockPrisma));
     mockPrisma.rating.aggregate.mockResolvedValue({ _avg: { stars: null } });
+    // GAP-B: privacySetting tidak ada -> default (list followers publik).
+    mockPrisma.privacySetting.findUnique.mockResolvedValue(null);
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         UsersService,
@@ -91,6 +96,25 @@ describe('UsersService', () => {
         { provide: LocalStorageService, useValue: mockLocalStorage },
         // Pre-existing: UserAnalyticsService belum di-mock di file test ini.
         { provide: UserAnalyticsService, useValue: mockUserAnalytics },
+        // GAP-A: UsersService memakai AccountDeletionService untuk status &
+        // pembatalan penghapusan akun — mock di suite ini (tidak diuji di sini).
+        {
+          provide: AccountDeletionService,
+          useValue: {
+            findExistingRequest: jest.fn().mockResolvedValue(null),
+            toResult: jest.fn((r: unknown) => r),
+            verifyDeletionRequestOtp: jest.fn().mockResolvedValue(undefined),
+            createRequest: jest.fn().mockResolvedValue({
+              message: 'Account deletion requested',
+              referenceCode: 'KAHADE-ABC123',
+              status: 'PENDING',
+              requestedAt: new Date(),
+              purgeAt: new Date(),
+              serverNow: new Date(),
+            }),
+            notifyRequestCreated: jest.fn().mockResolvedValue(undefined),
+          },
+        },
       ],
     }).compile();
     service = module.get<UsersService>(UsersService);

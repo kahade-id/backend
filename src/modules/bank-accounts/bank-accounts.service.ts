@@ -5,10 +5,11 @@ import {
   WalletTransactionStatus,
   WalletTransactionType,
 } from '@prisma/client';
-import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, BadRequestException, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MidtransService } from '../payment/midtrans.service';
+import { PasskeyService } from '../auth/passkey.service';
 import { encryptAES, hmacSHA256, decryptAES } from '../../common/utils/crypto.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { MAX_BANK_ACCOUNTS } from '../../common/constants/app.constants';
@@ -73,7 +74,36 @@ export class BankAccountsService {
     private prisma: PrismaService,
     private midtransService: MidtransService,
     private configService: ConfigService,
+    // GAP-A G040: gerbang re-auth kuat untuk perubahan rekening.
+    // @Optional dipertahankan hanya agar modul bisa di-unit-test tanpa
+    // AuthModule — tetapi assertBankChangeReauth FAIL CLOSED: bila
+    // PasskeyService tidak ter-inject, mutasi DITOLAK (bukan dilewati).
+    @Optional() private passkeyService?: PasskeyService,
   ) {}
+
+  /**
+   * GAP-A (G040): bila user punya passkey aktif dan kebijakan
+   * PASSKEY_REQUIRED_FOR mencakup 'bank_account_change', mutasi rekening
+   * wajib disertai bukti re-auth kuat (password/OTP/TOTP/reauthToken).
+   * Tanpa passkey aktif → kebijakan tidak berlaku (re-auth standar
+   * endpoint tetap jalan).
+   *
+   * FAIL CLOSED: PasskeyService tidak boleh undefined diam-diam — bila
+   * gerbang re-auth tidak tersedia, mutasi ditolak (503), bukan dilewati.
+   */
+  private async assertBankChangeReauth(
+    userId: string,
+    reauth: { password?: string; mfaCode?: string; otpCode?: string; reauthToken?: string },
+  ): Promise<void> {
+    if (!this.passkeyService) {
+      this.logger.error(`reauth gate unavailable for bank-account change (user ${userId})`);
+      throw new ServiceUnavailableException({
+        code: 'REAUTH_UNAVAILABLE',
+        message: 'Layanan verifikasi keamanan tidak tersedia. Coba lagi nanti.',
+      });
+    }
+    await this.passkeyService.requireRecentPasskeyOrReauth(userId, 'bank_account_change', reauth);
+  }
 
   async listBankAccounts(
     userId: string,
@@ -123,7 +153,10 @@ export class BankAccountsService {
     bankName: string,
     accountNumber: string,
     accountName: string,
+    reauth?: { password?: string; mfaCode?: string; otpCode?: string; reauthToken?: string },
   ): Promise<Record<string, unknown>> {
+    // GAP-A G040: konfirmasi tambahan untuk perubahan rekening.
+    await this.assertBankChangeReauth(userId, reauth ?? {});
     const existingCount = await this.prisma.bankAccount.count({
       where: { userId, deletedAt: null },
     });
@@ -308,7 +341,13 @@ export class BankAccountsService {
     return { ...created, accountName: verifiedAccountName };
   }
 
-  async deleteBankAccount(userId: string, bankAccountId: string): Promise<{ message: string }> {
+  async deleteBankAccount(
+    userId: string,
+    bankAccountId: string,
+    reauth?: { password?: string; mfaCode?: string; otpCode?: string; reauthToken?: string },
+  ): Promise<{ message: string }> {
+    // GAP-A G040: konfirmasi tambahan untuk perubahan rekening.
+    await this.assertBankChangeReauth(userId, reauth ?? {});
     await this.prisma.$transaction(
       async tx => {
         const locked = await tx.$queryRaw<
@@ -375,7 +414,10 @@ export class BankAccountsService {
   async setPrimaryBankAccount(
     userId: string,
     bankAccountId: string,
+    reauth?: { password?: string; mfaCode?: string; otpCode?: string; reauthToken?: string },
   ): Promise<Record<string, unknown>> {
+    // GAP-A G040: konfirmasi tambahan untuk perubahan rekening.
+    await this.assertBankChangeReauth(userId, reauth ?? {});
     return this.prisma.$transaction(
       async (tx: Prisma.TransactionClient) => {
         // Serialize primary-account changes for the same user. Without locking the
@@ -427,7 +469,14 @@ export class BankAccountsService {
     );
   }
 
-  async updateBankAccount(userId: string, bankAccountId: string, accountName?: string): Promise<Record<string, unknown>> {
+  async updateBankAccount(
+    userId: string,
+    bankAccountId: string,
+    accountName?: string,
+    reauth?: { password?: string; mfaCode?: string; otpCode?: string; reauthToken?: string },
+  ): Promise<Record<string, unknown>> {
+    // GAP-A G040: konfirmasi tambahan untuk perubahan rekening.
+    await this.assertBankChangeReauth(userId, reauth ?? {});
     if (!accountName || !accountName.trim()) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'accountName required' });
     }

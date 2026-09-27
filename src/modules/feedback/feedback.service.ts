@@ -13,6 +13,11 @@ export class FeedbackService {
    * userId di DB nullable dengan onDelete SetNull.
    */
   async create(userId: string | null, dto: CreateFeedbackDto): Promise<object> {
+    // G168: hitung slaDueAt dari rule kategori bila ada.
+    const rule = await this.prisma.feedbackSlaRule.findUnique({
+      where: { category: dto.category.trim() },
+    });
+    const now = new Date();
     const feedback = await this.prisma.feedback.create({
       data: {
         userId: userId ?? undefined,
@@ -21,13 +26,16 @@ export class FeedbackService {
         contact: dto.contact?.trim() ? dto.contact.trim() : undefined,
         rating: dto.rating ?? undefined,
         platform: dto.platform?.trim() ? dto.platform.trim() : 'app',
+        contactConsent: dto.contactConsent ?? false,
+        appVersion: dto.appVersion?.trim() ? dto.appVersion.trim() : undefined,
+        slaDueAt: rule ? new Date(now.getTime() + rule.hours * 3_600_000) : undefined,
       },
-      select: { id: true, createdAt: true },
+      select: { id: true, createdAt: true, slaDueAt: true },
     });
     this.logger.log(`Feedback tersimpan id=${feedback.id} userId=${userId ?? 'guest'}`);
     return {
       success: true,
-      data: { id: feedback.id, createdAt: feedback.createdAt },
+      data: { id: feedback.id, createdAt: feedback.createdAt, slaDueAt: feedback.slaDueAt },
     };
   }
 }

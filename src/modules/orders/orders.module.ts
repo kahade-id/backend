@@ -21,9 +21,12 @@ import { AuditLogModule } from '../../common/services/audit-log.module';
 import { QueueModule } from '../queue/queue.module';
 import { PaymentModule } from '../payment/payment.module';
 import { SubscriptionsModule } from '../subscriptions/subscriptions.module';
+// GAP-D (G256/G257): hook reservasi stok katalog — @Optional() di OrderStateService,
+// aman bila modul belum ter-import; tidak mengubah perilaku order existing.
+import { InventoryModule } from '../inventory/inventory.module';
 
 @Module({
-  imports: [ConfigModule, WalletModule, RedisModule, ReferralModule, forwardRef(() => DisputesModule), RealtimeModule, UploadModule, AuditLogModule, QueueModule, PaymentModule, SubscriptionsModule],
+  imports: [ConfigModule, WalletModule, RedisModule, ReferralModule, forwardRef(() => DisputesModule), RealtimeModule, UploadModule, AuditLogModule, QueueModule, PaymentModule, SubscriptionsModule, InventoryModule],
   controllers: [OrdersController],
   providers: [OrdersService, FeeCalculatorService, OrderStateService, OrderExtensionsService, OrderLinksService, DeliveryProofService, InvoiceService, ReceiptService, MembershipRankService, WalletTxSerialService],
   exports: [OrdersService, FeeCalculatorService, OrderStateService, OrderExtensionsService, OrderLinksService, DeliveryProofService, InvoiceService, ReceiptService, MembershipRankService],

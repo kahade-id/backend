@@ -53,6 +53,8 @@ export class TemplateService implements OnModuleInit {
     'two-fa-enabled-notification', 'two-fa-disabled-notification',
     'backup-codes-regenerated-notification', 'refresh-token-reuse-detected',
     'kyc-revoked',
+    // GAP-A: konfirmasi permintaan penghapusan akun.
+    'account-deletion',
   ]);
 
   private getOrCompile(templateName: string): Handlebars.TemplateDelegate {

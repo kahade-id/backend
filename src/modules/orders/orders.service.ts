@@ -15,6 +15,7 @@ import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { CONFIRMATION_DEADLINE_DAYS, KYC_THRESHOLD, CONFIRMATION_DEADLINE_DAYS_MAP, ORDER_MIN_VALUE, ORDER_MAX_VALUE, DELIVERY_DEADLINE_DAYS_MIN, DELIVERY_DEADLINE_DAYS_MAX, POST_COMPLETION_DISPUTE_WINDOW_HOURS } from '../../common/constants/app.constants';
 import { escapeLikePattern } from '../../common/utils/search.util';
+import { withSpan } from '../../common/tracing/tracing';
 
 const ORDER_COUNTERPART_COOLDOWN_SECONDS = 60;
 
@@ -195,7 +196,50 @@ export class OrdersService {
     }
   }
 
+  /**
+   * G479: span bisnis order.create — membungkus createOrderTx.
+   * Atribut span HANYA yang aman (tanpa title/description/username —
+   * itu PII dan tidak boleh jadi label span).
+   */
   async createOrder(
+    userId: string,
+    dto: {
+      role: 'BUYER' | 'SELLER';
+      counterpartUsername: string;
+      title: string;
+      description: string;
+      orderType: OrderType;
+      orderValue: number;
+      deliveryDeadlineDays: number;
+      deliveryDeadlineAt?: string;
+      feeResponsibility: FeeResponsibility;
+      voucherCode?: string;
+      attachments?: string[];
+      inquiryRoomId?: string;
+    },
+  ): Promise<{
+    orderId: string;
+    status: OrderStatus;
+    feeCalculation: {
+      feeRate: number;
+      feeAmount: number;
+      buyerFeeAmount: number;
+      sellerFeeAmount: number;
+      buyerPayAmount: number;
+      sellerReceiveAmount: number;
+      voucherDiscount: number;
+      voucherCashback: number;
+      membershipRankDiscount: number;
+    };
+    confirmationDeadlineAt: Date | null;
+  }> {
+    return withSpan('order.create', () => this.createOrderTx(userId, dto), {
+      orderType: dto.orderType,
+      currency: 'IDR',
+    });
+  }
+
+  private async createOrderTx(
     userId: string,
     dto: {
       role: 'BUYER' | 'SELLER';

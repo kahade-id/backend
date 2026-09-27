@@ -1,5 +1,5 @@
 import {
-  Controller, Get, Put, Patch, Delete, Post, Body, Query, Param,
+  Controller, Get, Put, Patch, Delete, Post, Body, Query, Param, Headers,
   ParseIntPipe, DefaultValuePipe, BadRequestException, UseGuards,
   UseInterceptors, UploadedFile,
 } from '@nestjs/common';
@@ -20,10 +20,13 @@ interface MulterFile {
   buffer: Buffer;
 }
 import { UsersService } from './users.service';
+import { AccountDeletionService, DeletionRequestResult, DeletionBlocker } from './account-deletion.service';
 import { UserSearchService } from './user-search.service';
 import { UserStatsService } from './user-stats.service';
 import { UserAnalyticsService } from './user-analytics.service';
 import { ProfileQAService } from './profile-qa.service';
+import { QaReportService } from './qa-report.service';
+import { QaReportDto, QaAppealDto } from './dto/qa-report.dto';
 import { OgMetadataService } from './og-metadata.service';
 import { VerificationBadgeService } from './verification-badge.service';
 import { ShowcaseService } from '../showcase/showcase.service';
@@ -56,9 +59,11 @@ export class UsersController {
     private userStatsService: UserStatsService,
     private userAnalyticsService: UserAnalyticsService,
     private profileQAService: ProfileQAService,
+    private qaReportService: QaReportService,
     private ogMetadataService: OgMetadataService,
     private verificationBadgeService: VerificationBadgeService,
     private showcaseService: ShowcaseService,
+    private accountDeletionService: AccountDeletionService,
   ) {}
 
   @Get('me')
@@ -228,8 +233,27 @@ export class UsersController {
     @CurrentUser('sub') userId: string,
     @CurrentUser('jti') accessTokenJti: string,
     @Body() dto: RequestAccountDeletionDto,
+    @Headers('x-idempotency-key') idempotencyKey?: string,
+  ): Promise<DeletionRequestResult> {
+    return this.usersService.requestAccountDeletion(userId, accessTokenJti, dto.password, dto.reason, dto.mfaCode, dto.otpCode, idempotencyKey);
+  }
+
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Get('me/deletion-eligibility')
+  @ApiOperation({ summary: 'Cek kelayakan penghapusan akun (blockers terstruktur)' })
+  async getDeletionEligibility(
+    @CurrentUser('sub') userId: string,
+  ): Promise<{ eligible: boolean; blockers: DeletionBlocker[] }> {
+    return this.accountDeletionService.getDeletionEligibility(userId);
+  }
+
+  @Throttle({ default: { ttl: 3600000, limit: 5 } })
+  @Post('me/deletion-otp')
+  @ApiOperation({ summary: 'Kirim OTP WhatsApp untuk re-auth penghapusan (akun tanpa password)' })
+  async sendDeletionRequestOtp(
+    @CurrentUser('sub') userId: string,
   ): Promise<{ message: string }> {
-    return this.usersService.requestAccountDeletion(userId, accessTokenJti, dto.password, dto.reason, dto.mfaCode);
+    return this.accountDeletionService.sendDeletionRequestOtp(userId);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 30 } })
@@ -949,6 +973,52 @@ export class UsersController {
     @Param('commentId', ParseIdPipe) commentId: string,
   ): Promise<object> {
     return this.profileQAService.unhideComment(userId, commentId);
+  }
+
+  // GAP-F (G431/G436): lapor konten Q&A + ajukan keberatan atas hide moderator.
+  // Laporan masuk antrean qa_reports (terpisah dari laporan etalase).
+
+  @Post('questions/:questionId/report')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({
+    summary: 'Report a profile question (G431)',
+    description:
+      'Melaporkan pertanyaan ke antrean moderasi platform (qa_reports), terpisah dari laporan etalase.',
+  })
+  async reportQuestion(
+    @CurrentUser('sub') userId: string,
+    @Param('questionId', ParseIdPipe) questionId: string,
+    @Body() dto: QaReportDto,
+  ): Promise<object> {
+    return this.qaReportService.reportQuestion(userId, questionId, dto.reasonCode, dto.note);
+  }
+
+  @Post('comments/:commentId/report')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({ summary: 'Report a Q&A comment (G431)' })
+  async reportComment(
+    @CurrentUser('sub') userId: string,
+    @Param('commentId', ParseIdPipe) commentId: string,
+    @Body() dto: QaReportDto,
+  ): Promise<object> {
+    return this.qaReportService.reportComment(userId, commentId, dto.reasonCode, dto.note);
+  }
+
+  @Post('qa/appeal')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({
+    summary: 'Ajukan keberatan atas hide moderator (G436)',
+    description:
+      'Hanya penulis konten atau pemilik profil, dan hanya untuk konten yang disembunyikan MODERATOR platform.',
+  })
+  async submitQaAppeal(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: QaAppealDto,
+  ): Promise<object> {
+    return this.qaReportService.submitAppeal(userId, dto.targetType, dto.targetId, dto.reason);
   }
 
   @Public()

@@ -11,6 +11,32 @@ import { ADMIN_VOUCHERS_LIST } from '../../../common/constants/redis-keys';
 import { toSen, toIdr } from '../../../common/utils/currency.util';
 
 const VOUCHER_LIST_TTL = 300;
+/** G375: ambang alarm kuota voucher — flag bila pemakaian > 80% dari maxUsageTotal. */
+export const VOUCHER_QUOTA_ALARM_THRESHOLD = 80;
+
+/** G371: samarkan email — hanya 2 karakter awal + domain yang terlihat. */
+export function maskEmail(email: string | null | undefined): string | null {
+  if (!email) return null;
+  const at = email.indexOf('@');
+  if (at <= 0) return '***';
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  return `${local.slice(0, 2)}***@${domain}`;
+}
+
+/** G371: samarkan nomor HP — hanya 4 digit terakhir yang terlihat. */
+export function maskPhoneNumber(phone: string | null | undefined): string | null {
+  if (!phone) return null;
+  const digits = phone.replace(/\D/g, '');
+  if (digits.length < 4) return '***';
+  return `***${digits.slice(-4)}`;
+}
+
+function voucherQuota(v: { maxUsageTotal: number | null; currentUsage: number }): { quotaUsedPercent: number | null; quotaAlarm: boolean } {
+  if (v.maxUsageTotal === null || v.maxUsageTotal <= 0) return { quotaUsedPercent: null, quotaAlarm: false };
+  const percent = Math.round((v.currentUsage / v.maxUsageTotal) * 1000) / 10;
+  return { quotaUsedPercent: percent, quotaAlarm: percent > VOUCHER_QUOTA_ALARM_THRESHOLD };
+}
 
 @Injectable()
 export class AdminVouchersService {
@@ -22,17 +48,25 @@ export class AdminVouchersService {
     private auditLog: AuditLogService,
   ) {}
 
-  async listVouchers(page: number, limit: number, isActive?: string): Promise<object> {
+  async listVouchers(page: number, limit: number, isActive?: string, search?: string): Promise<object> {
     const safePage = Math.max(1, Number.isFinite(page) ? Math.trunc(page) : 1);
     const safeLimit = Math.min(100, Math.max(1, Number.isFinite(limit) ? Math.trunc(limit) : 20));
     const normalizedActive =
       typeof isActive === 'string' ? isActive.trim().toLowerCase() : undefined;
+    const normalizedSearch = typeof search === 'string' && search.trim().length > 0 ? search.trim() : undefined;
     const where: Prisma.VoucherWhereInput = {};
     if (normalizedActive === 'true') where.isActive = true;
     if (normalizedActive === 'false') where.isActive = false;
+    // G372: pencarian voucher berdasarkan kode atau nama.
+    if (normalizedSearch) {
+      where.OR = [
+        { code: { contains: normalizedSearch, mode: 'insensitive' } },
+        { name: { contains: normalizedSearch, mode: 'insensitive' } },
+      ];
+    }
 
     if (safePage === 1) {
-      const cacheKey = ADMIN_VOUCHERS_LIST(normalizedActive, safeLimit);
+      const cacheKey = ADMIN_VOUCHERS_LIST(normalizedActive, safeLimit, normalizedSearch);
       const cached = await this.redis.get(cacheKey);
       if (cached) {
         try {
@@ -59,6 +93,7 @@ export class AdminVouchersService {
         maxDiscountAmount: v.maxDiscountAmount ? toIdr(v.maxDiscountAmount) : null,
         minOrderValue: v.minOrderValue ? toIdr(v.minOrderValue) : null,
         usageCount: v._count.usages,
+        ...voucherQuota(v),
       }));
 
       const result = createPaginatedResponse(data, total, safePage, safeLimit);
@@ -83,6 +118,7 @@ export class AdminVouchersService {
       maxDiscountAmount: v.maxDiscountAmount ? toIdr(v.maxDiscountAmount) : null,
       minOrderValue: v.minOrderValue ? toIdr(v.minOrderValue) : null,
       usageCount: v._count.usages,
+      ...voucherQuota(v),
     }));
 
     return createPaginatedResponse(data, total, safePage, safeLimit);
@@ -94,7 +130,8 @@ export class AdminVouchersService {
       include: {
         usages: {
           include: {
-            user: { select: { id: true, userId: true, fullName: true, email: true } },
+            // G371: PII disamarkan — email & nomor HP tidak pernah dikirim utuh ke admin web.
+            user: { select: { id: true, userId: true, fullName: true, email: true, phoneNumber: true } },
           },
           orderBy: [{ usedAt: 'desc' }, { id: 'desc' }],
           take: 50,
@@ -116,9 +153,17 @@ export class AdminVouchersService {
       maxDiscountAmount: voucher.maxDiscountAmount ? toIdr(voucher.maxDiscountAmount) : null,
       minOrderValue: voucher.minOrderValue ? toIdr(voucher.minOrderValue) : null,
       usageCount: voucher._count.usages,
+      ...voucherQuota(voucher),
       usages: voucher.usages.map(u => ({
         ...u,
         discountApplied: toIdr(u.discountApplied),
+        user: u.user ? {
+          id: u.user.id,
+          userId: u.user.userId,
+          fullName: u.user.fullName,
+          email: maskEmail(u.user.email),
+          phoneNumber: maskPhoneNumber(u.user.phoneNumber),
+        } : null,
       })),
     };
   }

@@ -23,10 +23,17 @@ import { UpdateLinksDto } from './dto/update-links.dto';
 import { OgMetadataService } from './og-metadata.service';
 import { VerificationBadgeService } from './verification-badge.service';
 import { UserAnalyticsService } from './user-analytics.service';
+import {
+  applyPrivacyToPublicProfile,
+  canViewList,
+  loadPrivacySetting,
+  type AccountContactInfo,
+} from './privacy-profile.util';
 import { generateNotifId } from '../../common/utils/id-generator.util';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import { verifyOtp } from '../../common/utils/otp.util';
 import { escapeLikePattern } from '../../common/utils/search.util';
+import { AccountDeletionService, DeletionRequestResult } from './account-deletion.service';
 
 /** Jumlah baris preview yang ikut di payload profil publik. List lengkap tetap
  * lewat endpoint paginasi masing-masing (followers/following/favorites). */
@@ -54,6 +61,8 @@ export class UsersService {
     // Self-hosted storage (2026-09-26, SS-007/ST-007): avatar & cover kini
     // disimpan di disk server, bukan R2.
     private localStorage: LocalStorageService,
+    // GAP-A: status & pembatalan penghapusan akun (request row, OTP, cancel).
+    private accountDeletionService: AccountDeletionService,
   ) {}
 
   async getMyProfile(userId: string): Promise<object> {
@@ -300,6 +309,8 @@ export class UsersService {
         id: true, userId: true, username: true, fullName: true, avatarUrl: true, headerUrl: true,
         accountType: true, bio: true, kycStatus: true, isVip: true, membershipRank: true,
         totalOrdersCompleted: true, averageRating: true, totalRatingCount: true, memberSince: true,
+        // G076: field identitas untuk kontrol visibilitas granular (direduksi di bawah).
+        email: true, phoneNumber: true, dateOfBirth: true, gender: true,
         // BUG#5: field tambahan khusus untuk menghitung trustScore publik
         // (reuse UserAnalyticsService.calculateTrustScore — tanpa duplikasi rumus).
         totalOrdersCancelled: true, totalOrdersDisputed: true, createdAt: true, isKahadePlus: true,
@@ -444,7 +455,16 @@ export class UsersService {
       createdAt: user.createdAt,
     });
 
-    return {
+    // G076–G083: muat pengaturan privasi pemilik & terapkan untuk viewer != owner.
+    const privacy = await loadPrivacySetting(this.prisma, user.id);
+    const accountContact: AccountContactInfo = {
+      email: user.email,
+      phone: await decryptPiiSafe(user.phoneNumber),
+      dateOfBirth: user.dateOfBirth ? user.dateOfBirth.toISOString().slice(0, 10) : null,
+      gender: user.gender ? String(user.gender) : null,
+    };
+
+    const profile = {
       // ================= Identity =================
       identity: {
         userId: user.userId,
@@ -546,6 +566,13 @@ export class UsersService {
       // sebagai alias yang selalu false supaya bentuk response tidak berubah.
       isBlocked: false,
     };
+
+    // G076–G083: redaksi sesuai PrivacySetting pemilik bila viewer bukan owner.
+    // followRow dihitung di atas (null bila viewer == owner / anonim).
+    return applyPrivacyToPublicProfile(profile, accountContact, privacy, {
+      isOwnProfile,
+      viewerFollowsOwner: Boolean(followRow),
+    });
   }
 
   async getMyStats(userId: string): Promise<object> {
@@ -923,18 +950,72 @@ export class UsersService {
     }
   }
 
-  async requestAccountDeletion(userId: string, currentAccessTokenJti?: string, password?: string, reason?: string, mfaCode?: string): Promise<{ message: string }> {
-    if (!password) {
-      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Password is required to delete your account' });
+  /**
+   * GAP-A (G069): notifikasi in-app saat penghapusan akun tertunda karena
+   * blocker (order aktif/sengketa, penarikan berjalan, saldo). Best-effort —
+   * tidak menggagalkan penolakan request itu sendiri.
+   */
+  private async notifyDeletionBlocked(
+    userId: string,
+    blockers: Array<{ code: string; message: string }>,
+  ): Promise<void> {
+    const type = NotificationType.SYSTEM_ANNOUNCEMENT;
+    const lines = blockers.map((b, i) => `${i + 1}. ${b.message}`).join('\n');
+    await this.prisma.notification.create({
+      data: {
+        notifId: generateNotifId(),
+        userId,
+        type,
+        category: getCategoryForType(type),
+        title: 'Penghapusan akun tertunda',
+        body:
+          `Permintaan penghapusan akun belum bisa diproses karena hal berikut:\n${lines}\n` +
+          `Selesaikan dulu hal di atas, lalu ajukan lagi dari menu Pengaturan → Hapus akun.`,
+        isRead: false,
+        refType: 'ACCOUNT_DELETION',
+        refId: 'blocked',
+      },
+    });
+  }
+
+  async requestAccountDeletion(
+    userId: string,
+    currentAccessTokenJti?: string,
+    password?: string,
+    reason?: string,
+    mfaCode?: string,
+    otpCode?: string,
+    idempotencyKey?: string,
+  ): Promise<DeletionRequestResult> {
+    // G072: idempoten — kunci duplikat atau request aktif yang sudah ada
+    // mengembalikan request yang sama (tanpa membuat duplikat / tanpa
+    // menjalankan ulang pemeriksaan).
+    const existingRequest = await this.accountDeletionService.findExistingRequest(userId, idempotencyKey);
+    if (existingRequest) {
+      return this.accountDeletionService.toResult(existingRequest);
     }
+
     const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { password: true } });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
-    if (!user.password) {
-      throw new BadRequestException({ code: ErrorCodes.INVALID_CREDENTIALS, message: 'Password login is not configured for this account' });
-    }
-    const passwordValid = await bcryptCompare(password, user.password);
-    if (!passwordValid) {
-      throw new BadRequestException({ code: ErrorCodes.INVALID_CREDENTIALS, message: 'Password salah' });
+
+    if (user.password) {
+      // Akun ber-password: password TETAP wajib (jangan lemahkan).
+      if (!password) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Password is required to delete your account' });
+      }
+      const passwordValid = await bcryptCompare(password, user.password);
+      if (!passwordValid) {
+        throw new BadRequestException({ code: ErrorCodes.INVALID_CREDENTIALS, message: 'Password salah' });
+      }
+    } else {
+      // G071: akun tanpa password (sosial/OTP) — re-auth via OTP WhatsApp.
+      if (!otpCode) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'Kode verifikasi WhatsApp wajib diisi untuk akun tanpa kata sandi',
+        });
+      }
+      await this.accountDeletionService.verifyDeletionRequestOtp(userId, otpCode);
     }
 
     const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({
@@ -979,8 +1060,11 @@ export class UsersService {
       },
     });
 
+    // GAP-A (G069): kumpulkan semua blocker; bila ada, kirim notifikasi in-app
+    // yang menjelaskan apa yang harus diselesaikan user, lalu tolak request.
+    const deletionBlockers: Array<{ code: string; message: string }> = [];
     if (disputedOrderCount > 0) {
-      throw new BadRequestException({
+      deletionBlockers.push({
         code: ErrorCodes.ACTIVE_ORDERS_PRESENT,
         message: `You have ${disputedOrderCount} ongoing dispute(s). Please wait for dispute resolution before deleting your account.`,
       });
@@ -1000,7 +1084,7 @@ export class UsersService {
     });
 
     if (activeOrderCount > 0) {
-      throw new BadRequestException({
+      deletionBlockers.push({
         code: ErrorCodes.ACTIVE_ORDERS_PRESENT,
         message: `You have ${activeOrderCount} active order(s). Complete or cancel all orders before deleting your account.`,
       });
@@ -1018,18 +1102,29 @@ export class UsersService {
     ]);
 
     if (pendingWithdrawalCount > 0) {
-      throw new BadRequestException({
+      deletionBlockers.push({
         code: ErrorCodes.ACTIVE_ORDERS_PRESENT,
         message: 'You have a withdrawal still being processed. Wait for it to finish before deleting your account.',
       });
     }
 
     if (wallet && (wallet.escrowBalance > BigInt(0) || wallet.availableBalance > BigInt(0) || wallet.totalBalance > BigInt(0))) {
-      throw new BadRequestException({
+      deletionBlockers.push({
         code: wallet.escrowBalance > BigInt(0) ? ErrorCodes.ESCROW_BALANCE_PRESENT : ErrorCodes.WALLET_BALANCE_PRESENT,
         message: wallet.escrowBalance > BigInt(0)
           ? 'You have funds locked in escrow. Complete all pending orders before deleting your account.'
           : 'You still have funds in your wallet. Withdraw or resolve the balance before deleting your account.',
+      });
+    }
+
+    if (deletionBlockers.length > 0) {
+      await this.notifyDeletionBlocked(userId, deletionBlockers).catch((err) => {
+        this.logger.warn(`[deletion] blocked notification failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+      throw new BadRequestException({
+        code: deletionBlockers[0].code,
+        message: deletionBlockers[0].message,
+        blockers: deletionBlockers,
       });
     }
 
@@ -1038,7 +1133,7 @@ export class UsersService {
     }
 
     const deletionAt = new Date();
-    await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    const requestResult = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const txActiveOrderCount = await tx.order.count({
         where: {
           OR: [{ buyerId: userId }, { sellerId: userId }],
@@ -1093,6 +1188,13 @@ export class UsersService {
         where: { userId },
         data: { pushToken: null, isTrusted: false, trustedAt: null },
       });
+
+      // GAP-A (G061/G072): catat request penghapusan (referenceCode, purgeAt)
+      // dalam transaksi yang sama dengan soft-delete user.
+      return this.accountDeletionService.createRequest(tx, userId, {
+        idempotencyKey: idempotencyKey?.trim() || randomUUID(),
+        reason,
+      });
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
     const expiresIn = this.configService.get<string>('jwt.expiresIn') ?? '15m';
@@ -1116,7 +1218,13 @@ export class UsersService {
       this.logger.warn(`[SECURITY] Account deletion persisted but Redis revocation propagation is unavailable: ${error instanceof Error ? error.message : String(error)}`);
     }
 
-    return { message: 'Account deletion requested. Your account will be permanently deleted within 30 days.' };
+    // GAP-A (G057): email konfirmasi + notifikasi in-app (best-effort — tidak
+    // menggagalkan request yang sudah ter-commit).
+    await this.accountDeletionService.notifyRequestCreated(userId, requestResult).catch((err) => {
+      this.logger.warn(`[deletion] notifyRequestCreated failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+
+    return requestResult;
   }
 
 
@@ -1519,6 +1627,20 @@ export class UsersService {
 
     const { page: safePage, limit: safeLimit, skip } = this.normalizePagination(page, limit);
 
+    // G077: hormati pengaturan privasi daftar follower pemilik profil.
+    // Daftar kosong (bukan 403) agar bentuk response tidak berubah.
+    const privacy = await loadPrivacySetting(this.prisma, user.id);
+    const isOwnList = viewerId === user.id;
+    const viewerFollowsOwner = viewerId && !isOwnList
+      ? Boolean(await this.prisma.follow.findUnique({
+          where: { followerId_followingId: { followerId: viewerId, followingId: user.id } },
+          select: { id: true },
+        }))
+      : false;
+    if (!canViewList(privacy.showFollowerList, { isOwnProfile: isOwnList, viewerFollowsOwner })) {
+      return { users: [], total: 0, page: safePage, limit: safeLimit };
+    }
+
     const excludedIds = await this.getViewerExcludedIds(viewerId ?? undefined);
     const visibleFollower = {
       isActive: true,
@@ -1583,6 +1705,19 @@ export class UsersService {
     }
 
     const { page: safePage, limit: safeLimit, skip } = this.normalizePagination(page, limit);
+
+    // G077: hormati pengaturan privasi daftar following pemilik profil.
+    const followingPrivacy = await loadPrivacySetting(this.prisma, user.id);
+    const isOwnFollowingList = viewerId === user.id;
+    const viewerFollowsOwnerForList = viewerId && !isOwnFollowingList
+      ? Boolean(await this.prisma.follow.findUnique({
+          where: { followerId_followingId: { followerId: viewerId, followingId: user.id } },
+          select: { id: true },
+        }))
+      : false;
+    if (!canViewList(followingPrivacy.showFollowingList, { isOwnProfile: isOwnFollowingList, viewerFollowsOwner: viewerFollowsOwnerForList })) {
+      return { users: [], total: 0, page: safePage, limit: safeLimit };
+    }
 
     const excludedIds = await this.getViewerExcludedIds(viewerId ?? undefined);
     const visibleFollowing = {

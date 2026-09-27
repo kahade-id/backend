@@ -17,6 +17,14 @@ import { NotificationQueueService } from '../queue/notification-queue.service';
 import { OrderQrisPaymentService } from '../payment/order-qris-payment.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { PAYMENT_DEADLINE_DAYS, MAX_ESCROW_BALANCE } from '../../common/constants/app.constants';
+import { withSpan } from '../../common/tracing/tracing';
+// GAP-C (G176): aktivasi milestone setelah escrow lock — no-op untuk order
+// satu tahap existing.
+import { activateMilestonesForOrderTx } from '../milestones/milestone-activation';
+// GAP-D (G256/G257): hook reservasi stok — @Optional(), best-effort post-commit,
+// no-op untuk order tanpa order lines katalog. Tidak mengubah perilaku order existing.
+import { Optional } from '@nestjs/common';
+import { InventoryService } from '../inventory/inventory.service';
 
 const VALID_CANCEL_REASONS = [
   'CHANGED_MIND',
@@ -73,6 +81,8 @@ export class OrderStateService {
     private realtime: RealtimeService,
     private membershipRankService: MembershipRankService,
     private notificationQueue: NotificationQueueService,
+    // GAP-D (G256/G257): @Optional() — aman bila InventoryModule belum ter-import.
+    @Optional() private inventoryService?: InventoryService,
   ) {}
 
   private validateTransition(from: OrderStatus, to: OrderStatus): void {
@@ -144,6 +154,17 @@ export class OrderStateService {
       await this.notificationQueue.enqueue({ userId: creatorId, type: notifType, title, body, pushData: { type: notifType, orderId } });
     }, 'CONFIRM_ACTION_NOTIFICATION');
 
+    // GAP-D (G256): cadangkan stok katalog setelah order dikonfirmasi seller.
+    // Best-effort — tidak pernah throw; no-op untuk order tanpa order lines.
+    if (action === 'ACCEPT') {
+      const inventory = this.inventoryService;
+      this.runPostCommitBestEffort(async () => {
+        const order = await this.prisma.order.findUnique({ where: { orderId }, select: { id: true } });
+        if (!order || !inventory) return;
+        await inventory.safeReserveForOrder(order.id);
+      }, 'CONFIRM_ACTION_INVENTORY_RESERVE');
+    }
+
     return { orderId, status: newStatus };
   }
 
@@ -167,7 +188,17 @@ export class OrderStateService {
     return { orderId, status: 'PROCESSING', walletTxId };
   }
 
+  /**
+   * G479: span bisnis order.complete — membungkus handleCompleteOrderTx.
+   * Atribut span hanya yang aman (tanpa judul order / nama user).
+   */
   async handleCompleteOrder(orderId: string, userId: string): Promise<CompleteOrderResult> {
+    return withSpan('order.complete', () => this.handleCompleteOrderTx(orderId, userId), {
+      currency: 'IDR',
+    });
+  }
+
+  private async handleCompleteOrderTx(orderId: string, userId: string): Promise<CompleteOrderResult> {
     await this.completeOrder(orderId, userId);
     this.runRealtimeBestEffort(() => this.realtime.emitToOrder(orderId, 'order.status_changed', { orderId, status: 'COMPLETED' }), 'COMPLETE_ORDER_STATUS');
 
@@ -191,6 +222,15 @@ export class OrderStateService {
       }
     }, 'COMPLETE_ORDER_NOTIFICATION');
 
+    // GAP-D (G256): kurangi stok katalog setelah order selesai.
+    // Best-effort — tidak pernah throw; no-op untuk order tanpa order lines.
+    const inventoryComplete = this.inventoryService;
+    this.runPostCommitBestEffort(async () => {
+      const order = await this.prisma.order.findUnique({ where: { orderId }, select: { id: true } });
+      if (!order || !inventoryComplete) return;
+      await inventoryComplete.safeDecrementForOrder(order.id);
+    }, 'COMPLETE_ORDER_INVENTORY_DECREMENT');
+
     return { orderId, status: 'COMPLETED' };
   }
 
@@ -211,6 +251,15 @@ export class OrderStateService {
       const recipientId = order.buyerId === userId ? order.sellerId : order.buyerId;
       await this.notificationQueue.enqueue({ userId: recipientId, type: NotificationType.ORDER_CANCELLED, title: 'Order Cancelled', body: `Order "${order.title}" has been cancelled. Reason: ${normalizedReason}${note ? `. ${note}` : ''}`, pushData: { type: 'ORDER_CANCELLED', orderId } });
     }, 'CANCEL_ORDER_NOTIFICATION');
+
+    // GAP-D (G256): lepaskan reservasi stok katalog setelah order dibatalkan.
+    // Best-effort — tidak pernah throw; no-op untuk order tanpa order lines.
+    const inventoryCancel = this.inventoryService;
+    this.runPostCommitBestEffort(async () => {
+      const order = await this.prisma.order.findUnique({ where: { orderId }, select: { id: true } });
+      if (!order || !inventoryCancel) return;
+      await inventoryCancel.safeReleaseForOrder(order.id, `ORDER_CANCELLED:${normalizedReason}`);
+    }, 'CANCEL_ORDER_INVENTORY_RELEASE');
 
     return { orderId, status: 'CANCELLED' };
   }
@@ -393,6 +442,10 @@ export class OrderStateService {
           description: `Escrow lock for order ${order.orderId}`,
         },
       });
+      // GAP-C (G176): aktivasi milestone SETELAH escrow lock sukses, dalam
+      // transaksi yang sama. No-op untuk order tanpa milestone — jalur escrow
+      // satu tahap existing tidak berubah.
+      await activateMilestonesForOrderTx(tx, order.id);
       const orderUpdated = await tx.order.updateMany({
         where: { id: order.id, status: OrderStatus.WAITING_PAYMENT, deletedAt: null }, // AUDIT-16
         data: {
@@ -437,7 +490,21 @@ export class OrderStateService {
      * so they are hoisted outright. The fee serial is drawn lazily because its row is conditional on
      * `feeAmount > 0`: hoisting it too would burn one on every zero-fee (fully vouchered)
      * completion, a gap the pre-fix code produced even with zero retries.
+     *
+     * GAP-C (G176/G186) preflight: tolak order bermilestone SEBELUM serial dialokasikan,
+     * agar pemanggilan salah tidak membakar nomor urut ledger. Guard otoritatif tetap
+     * ada di dalam transaksi (lihat bawah); preflight ini hanya optimasi hemat serial.
      */
+    const preflight = await this.prisma.order.findFirst({ where: { orderId, deletedAt: null }, select: { id: true } });
+    if (preflight) {
+      const preCount = await this.prisma.orderMilestone.count({ where: { orderId: preflight.id } });
+      if (preCount > 0) {
+        throw new BadRequestException({
+          code: 'MILESTONE_ORDER_LEGACY_FLOW_FORBIDDEN',
+          message: 'Order ini memakai skema milestone bertahap; selesaikan lewat alur milestone, bukan konfirmasi satu tahap',
+        });
+      }
+    }
     const releaseTxSerial = await this.getNextWalletTxSerial();
     const receiveTxSerial = await this.getNextWalletTxSerial();
     let feeSerial: number | null = null;
@@ -468,6 +535,17 @@ export class OrderStateService {
       this.validateTransition(order.status, OrderStatus.COMPLETED);
       if (order.buyerId !== buyerId) {
         throw new BadRequestException({ code: ErrorCodes.NOT_ORDER_PARTICIPANT, message: 'Not authorized to complete this order' });
+      }
+
+      // GAP-C (G176/G186): order bermilestone TIDAK BOLEH diselesaikan lewat
+      // jalur legacy — dana sudah dicairkan per tahap via milestone flow.
+      // Memanggil release penuh di sini akan mencairkan ganda (double-release).
+      const milestoneCount = await tx.orderMilestone.count({ where: { orderId: order.id } });
+      if (milestoneCount > 0) {
+        throw new BadRequestException({
+          code: 'MILESTONE_ORDER_LEGACY_FLOW_FORBIDDEN',
+          message: 'Order bermilestone diselesaikan lewat alur tahap (accept per milestone), bukan completeOrder.',
+        });
       }
 
       const acceptedProof = await tx.deliveryProof.findFirst({

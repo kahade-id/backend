@@ -13,6 +13,7 @@ import { MidtransService } from '../../payment/midtrans.service';
 import { WalletService } from '../../wallet/wallet.service';
 import { DEAD_LETTER_QUEUE } from '../../queue/queue.constants';
 import { NotificationQueueService } from '../../queue/notification-queue.service';
+import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
 
 import { AutoCompleteDeliveredOrdersService } from '../services/auto-complete-orders.service';
 import { AutoEscalateDisputesService } from '../services/auto-escalate-disputes.service';
@@ -155,7 +156,10 @@ describe('Scheduler services smoke', () => {
   });
 
   it('DataCleanupService — defined + skip', async () => {
-    const svc = await build<DataCleanupService>(DataCleanupService);
+    // GAP-A (G058/G059): DataCleanupService membutuhkan BullQueue_email.
+    const svc = await build<DataCleanupService>(DataCleanupService, [
+      { provide: getQueueToken(EMAIL_QUEUE), useValue: {} },
+    ]);
     expect(svc).toBeDefined();
     await svc.onModuleInit();
     await expect(svc.cleanupExpiredData()).resolves.toBeUndefined();

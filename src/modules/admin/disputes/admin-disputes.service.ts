@@ -185,6 +185,19 @@ export class AdminDisputesService {
         try { return await this.uploadService.generateDownloadUrl(key, 300); }
         catch { return null; }
       }));
+      // GAP-B3 (G149): jejak audit setiap kali moderator diberi tautan unduh
+      // bukti. Yang dicatat: evidenceId + sengketa + jumlah berkas + IP —
+      // TANPA menyimpan URL signed (capability kedaluwarsa, bukan data audit).
+      if (adminId && keys.length > 0) {
+        this.auditLog.logAdminAction({
+          adminId,
+          action: AuditAction.ADMIN_ACTION,
+          targetType: 'DisputeEvidence',
+          targetId: evidence.id,
+          description: `Admin meminta tautan unduh bukti pada sengketa ${dispute.disputeId} (${keys.length} berkas)`,
+          ipAddress: ipAddress ?? 'unknown',
+        });
+      }
       return { ...evidence, fileUrls: [], fileDownloadUrls: downloads.filter((url): url is string => Boolean(url)) };
     }));
 

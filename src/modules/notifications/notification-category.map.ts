@@ -32,6 +32,13 @@ const TRANSAKSI_TYPES: ReadonlySet<NotificationType> = new Set([
   NotificationType.WALLET_REFUND_RECEIVED,
   NotificationType.WALLET_TRANSFER_SENT,
   NotificationType.WALLET_TRANSFER_RECEIVED,
+  // GAP-C (G193): notifikasi tahap milestone escrow.
+  NotificationType.MILESTONE_SUBMITTED,
+  NotificationType.MILESTONE_REVISION_REQUESTED,
+  NotificationType.MILESTONE_ACCEPTED,
+  NotificationType.MILESTONE_RELEASED,
+  NotificationType.MILESTONE_DEADLINE_REMINDER,
+  NotificationType.MILESTONE_CANCELLED,
 ]);
 
 const PROMOSI_TYPES: ReadonlySet<NotificationType> = new Set([
@@ -47,8 +54,20 @@ const PROMOSI_TYPES: ReadonlySet<NotificationType> = new Set([
   NotificationType.TOPUP_BONUS_CREDITED,
 ]);
 
+/**
+ * GAP-F (G416/G417): tipe notifikasi moderasi laporan etalase.
+ * Nilai enum baru (lihat fragment gap-F-A-schema.prisma) — ditulis sebagai
+ * string agar file ini tetap dikompilasi sebelum `prisma generate` pasca-merge.
+ */
+const MODERATION_TYPE_NAMES: ReadonlySet<string> = new Set([
+  'MODERATION_REPORT_UPDATE',
+  'MODERATION_ITEM_TAKEDOWN',
+  'MODERATION_APPEAL_DECIDED',
+]);
+
 export function getCategoryForType(type: NotificationType): NotificationCategory {
   if (TRANSAKSI_TYPES.has(type)) return NotificationCategory.TRANSAKSI;
   if (PROMOSI_TYPES.has(type)) return NotificationCategory.PROMOSI;
+  if (MODERATION_TYPE_NAMES.has(type as string)) return NotificationCategory.INFORMASI;
   return NotificationCategory.INFORMASI;
 }

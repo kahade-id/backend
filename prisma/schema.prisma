@@ -104,6 +104,9 @@ enum WalletTransactionType {
   CAMPAIGN_CASHBACK
   // Bonus saldo dari voucher top-up; hanya dikreditkan saat top-up benar-benar settled.
   TOPUP_BONUS
+  // GAP-C (G186): release dana per tahap milestone — idempoten via
+  // OrderMilestone.releasedTxId + cek metadata.milestoneId dalam transaksi.
+  MILESTONE_RELEASE
 }
 
 enum WalletTransactionStatus {
@@ -299,6 +302,21 @@ enum NotificationType {
   DATA_EXPORT_READY
   SYSTEM_MAINTENANCE
   SYSTEM_ANNOUNCEMENT
+  // GAP-C (G193): notifikasi perubahan tahap milestone escrow.
+  MILESTONE_SUBMITTED
+  MILESTONE_REVISION_REQUESTED
+  MILESTONE_ACCEPTED
+  MILESTONE_RELEASED
+  MILESTONE_DEADLINE_REMINDER
+  MILESTONE_CANCELLED
+  // GAP-A login sosial (G001–G025, append-only; migrasi 20260927010100_gap_social_login
+  // menambahkannya via ALTER TYPE ... ADD VALUE IF NOT EXISTS di AKHIR enum).
+  SECURITY_SOCIAL_LINKED
+  SECURITY_SOCIAL_UNLINKED
+  // GAP-F G416/G417/G405 (append-only): nilai existing tidak diubah.
+  MODERATION_REPORT_UPDATE
+  MODERATION_ITEM_TAKEDOWN
+  MODERATION_APPEAL_DECIDED
 }
 
 enum SubscriptionPlan {
@@ -497,16 +515,45 @@ enum AuditAction {
   DISPUTE_CLAIM_SUBMITTED
   ADMIN_LOGIN
   ADMIN_LOGOUT
+  ADMIN_NEW_DEVICE_LOGIN
   ADMIN_ACTION
   SYSTEM_CONFIG_CHANGED
   VOUCHER_CREATED
   VOUCHER_DEACTIVATED
   KYC_DOCUMENTS_ACCESSED
+  // GAP-E1 KYC SLA & operasi antrean (G276–G300, append-only; migrasi 20260927050000_gap_e_admin_ops)
+  SLA_CONFIG_UPDATED
+  KYC_REVIEW_ASSIGNED
   BADGE_ASSIGNED
   BADGE_REVOKED
   BROADCAST_SENT
   USER_PASSWORD_RESET
   REPORT_RESOLVED
+  // GAP-E rekonsiliasi keuangan (G326–G350, append-only; migrasi 20260927050000_gap_e_admin_ops)
+  RECONCILIATION_FINDING_CREATED
+  RECONCILIATION_FINDING_ACKNOWLEDGED
+  MANUAL_LEDGER_CORRECTION
+  // GAP-E siklus edit/hapus kampanye (G351–G375, append-only; migrasi 20260927050000_gap_e_admin_ops)
+  CAMPAIGN_UPDATED
+  CAMPAIGN_DELETED
+  PAUSE_REASON_RECORDED
+  // GAP-E admin ops pengguna & tim (G376–G400, append-only; migrasi 20260927050000_gap_e_admin_ops)
+  USER_EXPORTED
+  ADMIN_SESSION_REVOKED
+  EMERGENCY_ACCESS_GRANTED
+  EMERGENCY_ACCESS_REVOKED
+  ADMIN_SUSPENDED
+  ADMIN_REACTIVATED
+  ADMIN_ROLE_CHANGED
+  CASE_HANDOFF_CREATED
+}
+
+// GAP-E rekonsiliasi keuangan (G326–G350): lifecycle status temuan rekonsiliasi.
+enum ReconciliationFindingStatus {
+  NEW
+  INVESTIGATING
+  RESOLVED
+  ACCEPTED
 }
 
 // Menggantikan AuditLog.action String — mencegah typo dan memastikan konsistensi
@@ -608,6 +655,27 @@ enum UserAuditAction {
   DEVICE_UNTRUSTED
   // Showcase
   SHOWCASE_REPORTED
+  // Passkey / WebAuthn (GAP-A, append-only)
+  PASSKEY_REGISTERED
+  PASSKEY_USED
+  PASSKEY_FAILED
+  PASSKEY_REVOKED
+  PASSKEY_RENAMED
+  // GAP-B kontrol privasi & ekspor data (G076–G100, append-only;
+  // migrasi 20260927020000_gap_b_privacy_export menambahkannya via
+  // ALTER TYPE ... ADD VALUE IF NOT EXISTS di AKHIR enum).
+  PRIVACY_SETTINGS_UPDATED
+  CONSENT_GRANTED
+  CONSENT_REVOKED
+  DATA_EXPORT_REQUESTED
+  DATA_EXPORT_DOWNLOADED
+  // GAP-A login sosial (G001–G025, append-only; migrasi 20260927010100_gap_social_login
+  // menambahkannya via ALTER TYPE ... ADD VALUE IF NOT EXISTS di AKHIR enum).
+  SOCIAL_PROVIDER_LINKED
+  SOCIAL_PROVIDER_UNLINKED
+  SOCIAL_LOGIN
+  // GAP-F G404 (append-only): pemilik item mengajukan banding.
+  SHOWCASE_APPEAL_FILED
 }
 
 // ============================================================
@@ -790,6 +858,11 @@ model User {
   ratingsReceived          Rating[]                @relation("RatingReceiver")
   notifications            Notification[]
   notificationPreference   NotificationPreference?
+  // GAP-C: relasi balik untuk model grup lain (ditambahkan agar schema valid;
+  // field milik grup G076/G085/G098, hanya relasi balik di sini).
+  privacySetting           PrivacySetting?
+  consentRecords           ConsentRecord[]
+  dataExportRequests       DataExportRequest[]
   voucherUsages            VoucherUsage[]
   referralCode             ReferralCode?
   referralUsed             ReferralRelation?       @relation("RefereeUser") // fix typo: ReferreeUser → RefereeUser
@@ -815,45 +888,59 @@ model User {
   disputeEvidences          DisputeEvidence[]          @relation("DisputeEvidenceSubmitter")
   mutualResolutionProposals MutualResolutionProposal[] @relation("MutualResolutionProposer")
 
-  extensionRequests        OrderExtensionRequest[]   @relation("ExtensionRequester")
-  extensionResponses       OrderExtensionRequest[]   @relation("ExtensionResponder")
+  extensionRequests         OrderExtensionRequest[]   @relation("ExtensionRequester")
+  extensionResponses        OrderExtensionRequest[]   @relation("ExtensionResponder")
   // Badge system — reverse relations untuk UserBadge
-  badges                   UserBadge[]
+  badges                    UserBadge[]
   // Password history — untuk cegah password cycling
-  passwordHistories        PasswordHistory[]
+  passwordHistories         PasswordHistory[]
   // Social links
-  links                    UserLink[]
+  links                     UserLink[]
   // Follow system
-  followers                Follow[]                  @relation("FollowingUser")
-  following                Follow[]                  @relation("FollowerUser")
+  followers                 Follow[]                  @relation("FollowingUser")
+  following                 Follow[]                  @relation("FollowerUser")
   // Favorites system
-  favoritesGiven           UserFavorite[]            @relation("FavoriteOwner")
-  favoritesReceived        UserFavorite[]            @relation("FavoriteTarget")
+  favoritesGiven            UserFavorite[]            @relation("FavoriteOwner")
+  favoritesReceived         UserFavorite[]            @relation("FavoriteTarget")
   // Saved-profile system, intentionally separate from favorites
-  savedProfilesGiven       UserSavedProfile[]        @relation("SavedProfileOwner")
-  savedProfilesReceived    UserSavedProfile[]        @relation("SavedProfileTarget")
+  savedProfilesGiven        UserSavedProfile[]        @relation("SavedProfileOwner")
+  savedProfilesReceived     UserSavedProfile[]        @relation("SavedProfileTarget")
   // Order links
-  orderLinksCreated        OrderLink[]               @relation("OrderLinkCreator")
+  orderLinksCreated         OrderLink[]               @relation("OrderLinkCreator")
   // Profile Q&A
-  questionsAsked           ProfileQuestion[]         @relation("QuestionAsker")
-  questionsReceived        ProfileQuestion[]         @relation("QuestionReceiver")
-  questionComments         ProfileQuestionComment[]  @relation("CommentAuthor")
+  questionsAsked            ProfileQuestion[]         @relation("QuestionAsker")
+  questionsReceived         ProfileQuestion[]         @relation("QuestionReceiver")
+  questionComments          ProfileQuestionComment[]  @relation("CommentAuthor")
   // Section 4: upvote pertanyaan profil
-  questionUpvotes          ProfileQuestionUpvote[]
-  supportTickets           SupportTicket[]           @relation("UserSupportTickets")
-  showcaseItems            UserShowcase[]
+  questionUpvotes           ProfileQuestionUpvote[]
+  supportTickets            SupportTicket[]           @relation("UserSupportTickets")
+  showcaseItems             UserShowcase[]
   // Section 3: interaksi sosial pada showcase (like & komentar)
-  showcaseLikes            ShowcaseLike[]
-  showcaseComments         ShowcaseComment[]
-  scheduledWithdrawals     ScheduledWithdrawal[]     @relation("UserScheduledWithdrawals")
-  deliveryProofsSubmitted  DeliveryProof[]           @relation("DeliveryProofSubmitter")
-  ratingReplies            RatingReply[]             @relation("RatingReplies")
-  orderLinksAccepted       OrderLink[]               @relation("OrderLinkAcceptor")
-  transactionTemplates     TransactionTemplate[]     @relation("UserTransactionTemplates")
-  idempotencyRecords       IdempotencyRecord[]
-  walletFavoriteRecipients WalletFavoriteRecipient[] @relation("WalletFavoriteOwner")
-  walletFavoritedBy        WalletFavoriteRecipient[] @relation("WalletFavoriteRecipient")
-  feedbacks                Feedback[]
+  showcaseLikes             ShowcaseLike[]
+  showcaseComments          ShowcaseComment[]
+  scheduledWithdrawals      ScheduledWithdrawal[]     @relation("UserScheduledWithdrawals")
+  deliveryProofsSubmitted   DeliveryProof[]           @relation("DeliveryProofSubmitter")
+  ratingReplies             RatingReply[]             @relation("RatingReplies")
+  orderLinksAccepted        OrderLink[]               @relation("OrderLinkAcceptor")
+  transactionTemplates      TransactionTemplate[]     @relation("UserTransactionTemplates")
+  idempotencyRecords        IdempotencyRecord[]
+  walletFavoriteRecipients  WalletFavoriteRecipient[] @relation("WalletFavoriteOwner")
+  walletFavoritedBy         WalletFavoriteRecipient[] @relation("WalletFavoriteRecipient")
+  feedbacks                 Feedback[]
+  // GAP-A: kredensial passkey/WebAuthn (back-relation, non-breaking).
+  passkeyCredentials        PasskeyCredential[]
+  // GAP-A: akun sosial tertaut (back-relation, non-breaking).
+  socialAccounts            SocialAccount[]
+  // GAP-A: permintaan penghapusan akun + riwayat status (back-relation, non-breaking).
+  accountDeletionRequests   AccountDeletionRequest[]
+  // GAP-A: user dari login sosial dengan nomor sintetis wajib verifikasi
+  // nomor HP asli sebelum aksi sensitif (G015). Default false = tidak ada
+  // perubahan perilaku untuk user lama.
+  requiresPhoneVerification Boolean                   @default(false)
+
+  // GAP-F G426–G450 (append-only): relasi balik moderasi Q&A.
+  qaReports QaReport[] @relation("QaReporter")
+  qaAppeals QaAppeal[] @relation("QaAppellant")
 
   //         — ketiga field ini sudah @unique, index dibuat otomatis. Redundan.
   @@index([kycStatus])
@@ -1076,6 +1163,25 @@ model KycRequest {
   rejectionReason String?
   adminNotes      String?    @db.Text
 
+  // GAP-E: reviewer yang ditugaskan — terpisah dari reviewedBy
+  // (admin yang memutuskan). Menugaskan tidak mengubah status pengajuan.
+  // Kolom DB: kyc_requests.assigned_reviewer_id (migrasi 20260927050000_gap_e_admin_ops).
+  assignedReviewerId String? @map("assigned_reviewer_id")
+  assignedReviewer   AdminUser?            @relation("KycAssignee", fields: [assignedReviewerId], references: [id], onDelete: SetNull)
+  assignments        KycReviewAssignment[]
+
+  // GAP-E (G276–G300): pelacakan SLA operasional tinjauan KYC
+  // (migrasi 20260927050000_gap_e_admin_ops).
+  // slaStartedAt: kapan jam SLA mulai berjalan (submit/resubmit; legacy PENDING
+  //   di-backfill dari createdAt oleh cron).
+  // slaPausedAt: SLA dijeda saat admin meminta dokumen tambahan.
+  // slaPausedAccumMs: total jeda terakumulasi (ms) — tidak dihitung dalam SLA.
+  // slaBreachedAt: kapan SLA dinyatakan lewat (oleh cron monitor).
+  slaStartedAt     DateTime? @map("sla_started_at")
+  slaPausedAt      DateTime? @map("sla_paused_at")
+  slaPausedAccumMs BigInt    @default(0) @map("sla_paused_accum_ms")
+  slaBreachedAt    DateTime? @map("sla_breached_at")
+
   // Metadata
   submittedIp   String?
   attemptNumber Int     @default(1)
@@ -1092,6 +1198,60 @@ model KycRequest {
   @@index([status, createdAt]) // compound untuk admin KYC queue: status-filter + sort by date
   @@index([reviewedBy]) // index untuk admin performance analytics
   @@map("kyc_requests")
+}
+
+// ============================================================
+// GAP-E (G276–G300): KONFIGURASI SLA OPERASIONAL & PENUGASAN REVIEWER KYC
+// Tabel dibuat oleh migrasi 20260927050000_gap_e_admin_ops.
+// ============================================================
+
+/// Konfigurasi SLA tinjauan operasional per cakupan (satu baris per scope).
+/// Di-seed dengan default 48 jam kalender oleh service saat pertama dibaca.
+model OperationalSlaConfig {
+  id               String   @id @default(cuid())
+  scope            String   @unique // 'KYC_PERSONAL' | 'BUSINESS_VERIFICATION'
+  slaHours         Int
+  useBusinessHours Boolean  @default(false)
+  updatedBy        String? // admin id (DB id) yang terakhir mengubah
+  changeReason     String?  @db.Text
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  audits OperationalSlaConfigAudit[]
+
+  @@map("operational_sla_configs")
+}
+
+/// Jejak audit setiap perubahan konfigurasi SLA (append-only).
+model OperationalSlaConfigAudit {
+  id               String               @id @default(cuid())
+  config           OperationalSlaConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+  configId         String
+  slaHours         Int
+  useBusinessHours Boolean
+  changedBy        String? // admin id (DB id)
+  changeReason     String?              @db.Text
+  createdAt        DateTime             @default(now())
+
+  @@index([configId])
+  @@map("operational_sla_config_audits")
+}
+
+/// Riwayat penugasan reviewer untuk satu pengajuan KYC. Hanya satu yang
+/// aktif dalam satu waktu; penugasan lama dinonaktifkan (releasedAt diisi).
+model KycReviewAssignment {
+  id           String     @id @default(cuid())
+  kycRequest   KycRequest @relation(fields: [kycRequestId], references: [id], onDelete: Cascade)
+  kycRequestId String
+  adminId      String // admin id (DB id) reviewer yang ditugaskan
+  assignedBy   String // admin id (DB id) yang menugaskan
+  assignedAt   DateTime   @default(now())
+  releasedAt   DateTime?
+  active       Boolean    @default(true)
+
+  @@index([kycRequestId])
+  @@index([adminId])
+  @@map("kyc_review_assignments")
 }
 
 // ============================================================
@@ -1145,6 +1305,13 @@ model BusinessVerification {
   revokedAt       DateTime?
   rejectionReason String?
   adminNotes      String?    @db.Text
+
+  // GAP-E G320: reviewer yang ditugaskan — terpisah dari reviewedBy
+  // (admin yang memutuskan). Menugaskan tidak mengubah status pengajuan.
+  // Kolom DB: business_verifications.assigned_reviewer_id
+  // (migrasi 20260927050000_gap_e_admin_ops).
+  assignedReviewerId String? @map("assigned_reviewer_id")
+  assignedReviewer   AdminUser? @relation("BusinessVerificationAssignee", fields: [assignedReviewerId], references: [id], onDelete: SetNull)
 
   // Metadata
   submittedIp   String?
@@ -1482,6 +1649,9 @@ model Order {
   statusHistories     OrderStatusHistory[]
   chatRoom            ChatRoom?
   dispute             Dispute?
+  // GAP-C (G176–G200): order escrow bertahap. Kosong untuk order satu tahap
+  // existing — perilaku escrow existing tidak berubah.
+  milestones          OrderMilestone[]
   ratings             Rating[]
   walletTransactions  WalletTransaction[]
   extensionRequests   OrderExtensionRequest[]
@@ -1489,6 +1659,9 @@ model Order {
   referralRewards     ReferralReward[]
   paymentTransactions PaymentTransaction[]
   deliveryProofs      DeliveryProof[]
+  // GAP-D: back-relation untuk domain baru (append-only, tidak mengubah perilaku existing)
+  returnRequests      ReturnRequest[] // G202: retur purnajual
+  orderItems          OrderItem[] // G259: order lines katalog produk
 
   @@index([buyerId])
   @@index([sellerId])
@@ -1824,6 +1997,10 @@ model Dispute {
   // Kategori sengketa (diisi saat buka sengketa)
   category DisputeCategory?
 
+  // GAP-C (G190): sengketa yang dibatasi ke milestone tertentu.
+  // Null = sengketa order satu tahap (perilaku existing tidak berubah).
+  milestoneId String?
+
   adminNotes String? @db.Text
 
   createdAt DateTime  @default(now())
@@ -1841,6 +2018,7 @@ model Dispute {
   @@index([assignedAdminId])
   @@index([createdAt])
   @@index([initiatorUserId])
+  @@index([milestoneId])
   @@map("disputes")
 }
 
@@ -2623,16 +2801,32 @@ model AdminUser {
   deletedAt DateTime?
 
   // Relations
-  auditLogs                   AdminAuditLog[]
-  kycReviews                  KycRequest[]           @relation("KycReviewer")
+  auditLogs                       AdminAuditLog[]
+  kycReviews                      KycRequest[]           @relation("KycReviewer")
   // Review verifikasi badan usaha — relasi terpisah dari kycReviews karena
   // BusinessVerification adalah domain verifikasi yang berbeda.
-  businessVerificationReviews BusinessVerification[] @relation("BusinessVerificationReviewer")
-  assignedDisputes            Dispute[]              @relation("DisputeAssignedAdmin")
-  disputeDecisions            DisputeDecision[]      @relation("DisputeDecider")
+  businessVerificationReviews     BusinessVerification[] @relation("BusinessVerificationReviewer")
+  businessVerificationAssignments BusinessVerification[] @relation("BusinessVerificationAssignee")
+  kycAssignments                  KycRequest[]           @relation("KycAssignee")
+  assignedDisputes                Dispute[]              @relation("DisputeAssignedAdmin")
+  disputeDecisions                DisputeDecision[]      @relation("DisputeDecider")
 
-  disputeEvidences DisputeEvidence[] @relation("DisputeEvidenceAdmin")
-  disputeMessages  DisputeMessage[]  @relation("DisputeMessageAdmin")
+  disputeEvidences      DisputeEvidence[]      @relation("DisputeEvidenceAdmin")
+  disputeMessages       DisputeMessage[]       @relation("DisputeMessageAdmin")
+  // GAP-E admin ops (G376–G400)
+  emergencyAccessGrants EmergencyAccessGrant[]
+  userExportAudits      UserExportAudit[]
+  adminSessions         AdminSession[]
+
+  // GAP-F G426–G450 (append-only): relasi balik moderasi Q&A.
+  qaReportAssignments QaReport[]               @relation("QaReportAssignee")
+  qaModerationEvents  QaModerationEvent[]      @relation("QaEventActor")
+  qaDeleteRequests    QaDeleteRequest[]        @relation("QaDeleteRequester")
+  qaDeleteApprovals   QaDeleteRequest[]        @relation("QaDeleteApprover")
+  qaHiddenQuestions   ProfileQuestion[]        @relation("QaQuestionHider")
+  qaAssignedQuestions ProfileQuestion[]        @relation("QaQuestionAssignee")
+  qaHiddenComments    ProfileQuestionComment[] @relation("QaCommentHider")
+  qaAssignedComments  ProfileQuestionComment[] @relation("QaCommentAssignee")
 
   @@index([isActive]) // query "semua admin aktif"
   @@index([deletedAt]) // soft-delete query optimization
@@ -2866,6 +3060,20 @@ model ProfileQuestion {
   /// instance yang balapan tidak mengirim dua notifikasi.
   reminderSentAt DateTime?
 
+  // GAP-F G428/G429/G434/G446 (append-only): kolom moderasi platform.
+  /// G428 — OWNER = hide self-service pemilik profil; MODERATOR = hide platform.
+  hiddenByType    QaHiddenByType? @map("hidden_by_type")
+  /// G428 — admin yang melakukan hide/unhide via jalur moderator.
+  hiddenByAdminId String?         @map("hidden_by_admin_id")
+  hiddenByAdmin   AdminUser?      @relation("QaQuestionHider", fields: [hiddenByAdminId], references: [id], onDelete: SetNull)
+  /// G434 — versi teredaksi (PII disensor); original TIDAK pernah diubah.
+  redactedText    String?         @map("redacted_text") @db.VarChar(500)
+  /// G429 — catatan internal moderator (hanya admin).
+  moderatorNote   String?         @map("moderator_note") @db.Text
+  /// G446 — assignment kasus.
+  assignedAdminId String?         @map("assigned_admin_id")
+  assignedAdmin   AdminUser?      @relation("QaQuestionAssignee", fields: [assignedAdminId], references: [id], onDelete: SetNull)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -2875,6 +3083,7 @@ model ProfileQuestion {
   @@index([receiverId])
   @@index([askerId])
   @@index([receiverId, isPublic, isHidden])
+  @@index([hiddenByType, isHidden])
   // Job reminder 48 jam: scan pertanyaan belum dijawab yang belum diingatkan.
   @@index([answeredAt, reminderSentAt, createdAt])
   // Urutan "terpopuler" di Q&A publik.
@@ -2918,11 +3127,21 @@ model ProfileQuestionComment {
   hiddenAt     DateTime?
   hiddenBy     String?              @db.VarChar(100)
 
+  // GAP-F G428/G429/G434/G446 (append-only): kolom moderasi platform.
+  hiddenByType    QaHiddenByType? @map("hidden_by_type")
+  hiddenByAdminId String?         @map("hidden_by_admin_id")
+  hiddenByAdmin   AdminUser?      @relation("QaCommentHider", fields: [hiddenByAdminId], references: [id], onDelete: SetNull)
+  redactedText    String?         @map("redacted_text") @db.VarChar(1000)
+  moderatorNote   String?         @map("moderator_note") @db.Text
+  assignedAdminId String?         @map("assigned_admin_id")
+  assignedAdmin   AdminUser?      @relation("QaCommentAssignee", fields: [assignedAdminId], references: [id], onDelete: SetNull)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([questionId])
   @@index([authorId])
+  @@index([hiddenByType, isHidden])
   @@index([parentId])
   @@map("profile_question_comments")
 }
@@ -2966,12 +3185,33 @@ model Campaign {
 
   vouchers Voucher[]
 
+  // GAP-E (G353/G358): riwayat versi kampanye — snapshot JSON sebelum tiap perubahan.
+  versions CampaignVersion[]
+
   @@index([status])
   @@index([status, startsAt, endsAt])
   @@index([type])
   @@index([targetMinRank])
   @@index([promoCode])
   @@map("campaigns")
+}
+
+// GAP-E (G353/G358, migrasi 20260927050000_gap_e_admin_ops — tidak ada migrasi baru).
+// Satu baris per perubahan kampanye: snapshot JSON campaign SEBELUM perubahan,
+// siapa yang mengubah, dan alasan perubahan (wajib).
+model CampaignVersion {
+  id           String   @id @default(cuid())
+  campaignId   String
+  campaign     Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  version      Int
+  payload      Json
+  changedBy    String?
+  changeReason String?
+  createdAt    DateTime @default(now())
+
+  @@unique([campaignId, version])
+  @@index([campaignId])
+  @@map("campaign_versions")
 }
 
 // ============================================================
@@ -3131,9 +3371,31 @@ model Feedback {
 
   createdAt DateTime @default(now())
 
+  // === GAP-C: workflow peninjauan feedback (G151–G175), kolom aditif ===
+  status         FeedbackStatus       @default(NEW)
+  assigneeId     String?
+  tags           String[]             @default([])
+  impactLabel    String?              @db.VarChar(50)
+  contactConsent Boolean              @default(false)
+  appVersion     String?              @db.VarChar(32)
+  slaDueAt       DateTime?
+  riskFlag       FeedbackRisk         @default(NONE)
+  closedReason   FeedbackCloseReason?
+  closedAt       DateTime?
+  redactedAt     DateTime?
+  updatedAt      DateTime             @updatedAt
+
+  assignments   FeedbackAssignment[]
+  internalNotes FeedbackInternalNote[]
+  replies       FeedbackReply[]
+  audit         FeedbackAudit[]
+
   @@index([userId])
   @@index([createdAt])
   @@index([category, createdAt])
+  @@index([status, createdAt])
+  @@index([assigneeId])
+  @@index([riskFlag])
   @@map("feedback")
 }
 
@@ -3232,6 +3494,12 @@ model ShowcaseReport {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  // GAP-F G401–G425: lifecycle moderasi pasca-final (relasi balik).
+  moderationEvents ReportModerationEvent[]
+  appeals          ReportAppeal[]
+  assignments      ReportAssignment[]
+  clusterLinks     ReportClusterMember[]
 
   @@unique([showcaseId, reporterId])
   @@index([status])
@@ -3401,4 +3669,1914 @@ model WalletFavoriteRecipient {
   @@index([userId])
   @@index([recipientId])
   @@map("wallet_favorite_recipients")
+}
+
+// ============================================================
+// GAP-E admin ops (G376–G400) — migrasi 20260927050000_gap_e_admin_ops.
+// Model selaras dengan migration.sql (tidak ada migrasi baru).
+// ============================================================
+
+// G393/G394: sesi login admin (dicatat saat login admin, bisa di-revoke).
+model AdminSession {
+  id         String    @id @default(cuid())
+  adminId    String
+  admin      AdminUser @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+  revokedAt  DateTime?
+  revokedBy  String?
+
+  @@index([adminId])
+  @@map("admin_sessions")
+}
+
+// G395: akses darurat berjangka (maks 120 menit), hanya SUPER_ADMIN.
+model EmergencyAccessGrant {
+  id        String    @id @default(cuid())
+  adminId   String
+  admin     AdminUser @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  grantedBy String
+  reason    String    @db.Text
+  scope     String
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([adminId])
+  @@map("emergency_access_grants")
+}
+
+// G380: audit setiap ekspor CSV pengguna.
+model UserExportAudit {
+  id        String    @id @default(cuid())
+  adminId   String
+  admin     AdminUser @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  filters   Json?
+  columns   String[]
+  rowCount  Int
+  reason    String    @db.Text
+  createdAt DateTime  @default(now())
+
+  @@index([adminId])
+  @@map("user_export_audits")
+}
+
+// G397: catatan handoff kasus antar petugas.
+model AdminCaseHandoff {
+  id          String   @id @default(cuid())
+  caseType    String
+  caseId      String
+  fromAdminId String
+  toAdminId   String
+  note        String?  @db.Text
+  createdAt   DateTime @default(now())
+
+  @@index([caseType, caseId])
+  @@index([toAdminId])
+  @@map("admin_case_handoffs")
+}
+
+// ============================================================
+// GAP-E rekonsiliasi keuangan (G326–G350) — migrasi 20260927050000_gap_e_admin_ops.
+// Model selaras dengan migration.sql (tidak ada migrasi baru).
+// ============================================================
+
+// G337-G338: temuan rekonsiliasi keuangan dengan lifecycle status.
+model ReconciliationFinding {
+  id                 String                      @id @default(cuid())
+  userId             String
+  recordedBalance    BigInt
+  computedBalance    BigInt
+  difference         BigInt
+  violatedInvariants String[]
+  status             ReconciliationFindingStatus @default(NEW)
+  batchId            String?
+  acknowledgedBy     String?
+  acknowledgedAt     DateTime?
+  notes              String?                     @db.Text
+  createdAt          DateTime                    @default(now())
+  updatedAt          DateTime                    @updatedAt
+
+  @@index([status])
+  @@index([userId])
+  @@index([batchId])
+  @@map("reconciliation_findings")
+}
+
+// === GAP-A: passkey ===
+// Kredensial WebAuthn/passkey per pengguna (G026–G050).
+//
+// - publicKey disimpan sebagai base64url dari COSE public key (bukan raw
+//   private key — private key TIDAK PERNAH dikirim ke server).
+// - counter dipakai untuk deteksi anomali/kloning authenticator (G046).
+// - Revoke bersifat soft (revokedAt) agar jejak audit tetap ada (G037).
+
+model PasskeyCredential {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  credentialId String    @unique @db.VarChar(255)
+  publicKey    String    @db.Text // base64url-encoded COSE public key bytes
+  counter      BigInt
+  deviceName   String    @db.VarChar(100)
+  deviceType   String?   @db.VarChar(20) // singleDevice | multiDevice (dari authenticator)
+  backedUp     Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  lastUsedAt   DateTime?
+  revokedAt    DateTime?
+
+  @@index([userId, revokedAt])
+  @@map("passkey_credentials")
+}
+
+// ============================================================================
+// FRAGMENT SCHEMA gap-F-D (observability & kesiapan insiden, G485/G497)
+// Audit 2026-09-26 — Grup F, worker D.
+//
+// APPEND-ONLY: tempel di AKHIR prisma/schema.prisma (setelah model terakhir)
+// saat batch deploy berikutnya. JANGAN sisipkan di tengah — diff migrasi
+// harus stabil. Tidak mengubah model/enum yang sudah ada.
+//
+// Model baru:
+//   - AlertEvent  : alert log persisten (lifecycle RAISED → ACKNOWLEDGED →
+//                   RESOLVED), ditulis AlertsService.raise().
+//   - IncidentLog : histori gangguan untuk halaman status publik
+//                   (GET /v1/status) + kelola admin.
+// Enum baru: AlertSeverity, AlertEventStatus, IncidentSeverity, IncidentStatus.
+//   (Tidak menyentuh AdminRole — sesuai aturan keras.)
+// ============================================================================
+
+enum AlertSeverity {
+  WARNING
+  CRITICAL
+}
+
+enum AlertEventStatus {
+  RAISED
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+model AlertEvent {
+  id             String           @id @default(cuid())
+  key            String           @unique // mis. "login_errors", "dlq_depth"
+  severity       AlertSeverity
+  message        String           @db.Text
+  context        Json? // angka diagnostik aman — TANPA PII
+  status         AlertEventStatus @default(RAISED)
+  raisedAt       DateTime         @default(now())
+  lastSeenAt     DateTime         @default(now())
+  cooldownUntil  DateTime?
+  acknowledgedBy String?
+  acknowledgedAt DateTime?
+  resolvedBy     String?
+  resolvedAt     DateTime?
+
+  @@index([status, lastSeenAt])
+  @@map("alert_events")
+}
+
+enum IncidentSeverity {
+  SEV1
+  SEV2
+  SEV3
+  SEV4
+}
+
+enum IncidentStatus {
+  INVESTIGATING
+  IDENTIFIED
+  MONITORING
+  RESOLVED
+}
+
+model IncidentLog {
+  id          String           @id @default(cuid())
+  title       String           @db.VarChar(200)
+  description String           @db.Text // teks publik — JANGAN tulis PII/nama user
+  severity    IncidentSeverity
+  status      IncidentStatus   @default(INVESTIGATING)
+  component   String           @db.VarChar(100) // mis. "payments", "otp", "api"
+  startedAt   DateTime         @default(now())
+  resolvedAt  DateTime?
+  createdBy   String? // admin_users.id
+  updatedBy   String?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@index([status, startedAt])
+  @@index([component])
+  @@map("incident_logs")
+}
+
+// === GAP-B: privacy/export ===
+// Kontrol privasi granular + persetujuan (consent) berversi + riwayat ekspor
+// data (G076–G100). Append-only: model & enum baru, tidak mengubah yang ada.
+//
+// - PrivacySetting: satu baris per user (userId unique); default kolom
+//   selaras dengan DEFAULT_PRIVACY_SETTING di
+//   src/modules/users/privacy-profile.util.ts.
+// - ConsentRecord: append-only per pemberian/penarikan; satu baris "terbuka"
+//   (revokedAt NULL) per (userId, type) menandakan consent aktif.
+//   policyVersion + policyTextHash = bukti teks kebijakan yang disetujui.
+//   IP mentah TIDAK disimpan — hanya hash SHA-256 (ipHash).
+// - DataExportRequest: jejak permintaan ekspor; artifactKey menunjuk ke file
+//   di storage privat. URL signed TIDAK disimpan mentah (dibuat on-demand
+//   saat unduh, TTL singkat) — lihat G100.
+// Migrasi: prisma/migrations/20260927020000_gap_b_privacy_export (SQL manual,
+// idempoten IF NOT EXISTS).
+
+enum PrivacyListVisibility {
+  EVERYONE
+  FOLLOWERS
+  ONLY_ME
+}
+
+enum QaCommentPolicy {
+  EVERYONE
+  FOLLOWERS
+  DISABLED
+}
+
+enum ConsentType {
+  MARKETING_PUSH
+  MARKETING_EMAIL
+  MARKETING_WHATSAPP
+  TRANSACTIONAL
+}
+
+enum DataExportStatus {
+  PENDING
+  READY
+  EXPIRED
+  FAILED
+}
+
+enum DataExportFormat {
+  JSON
+  CSV
+}
+
+model PrivacySetting {
+  id                        String                @id @default(cuid())
+  userId                    String                @unique
+  user                      User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // G076: visibilitas field identitas (berlaku untuk viewer != owner; opt-in).
+  showEmail                 Boolean               @default(false)
+  showPhone                 Boolean               @default(false)
+  showDob                   Boolean               @default(false)
+  showGender                Boolean               @default(false)
+  // G077: siapa yang dapat melihat daftar follower/following.
+  showFollowerList          PrivacyListVisibility @default(EVERYONE)
+  showFollowingList         PrivacyListVisibility @default(EVERYONE)
+  // G078: visibilitas default karya etalase baru.
+  showcaseDefaultVisibility ShowcaseVisibility    @default(PUBLIC)
+  // G079–G080: kebijakan komentar/tanya jawab profil.
+  qaCommentPolicy           QaCommentPolicy       @default(EVERYONE)
+  qaAnswerModeration        Boolean               @default(false)
+  // G081: tampilkan ulasan/rating di profil publik.
+  showReviews               Boolean               @default(true)
+  // G082: kunci statistik yang disembunyikan dari pengunjung publik.
+  hiddenStats               String[]              @default([])
+  // G083: izinkan profil diindeks mesin pencari.
+  searchEngineIndex         Boolean               @default(true)
+  createdAt                 DateTime              @default(now())
+  updatedAt                 DateTime              @updatedAt
+
+  @@map("privacy_settings")
+}
+
+model ConsentRecord {
+  id             String      @id @default(cuid())
+  userId         String
+  user           User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type           ConsentType
+  // G085: versi + hash teks kebijakan saat consent diberikan/ditarik.
+  policyVersion  String
+  policyTextHash String      @db.VarChar(64)
+  // Kanal pemberian: push/email/whatsapp/in-app (opsional).
+  channel        String?     @db.VarChar(32)
+  grantedAt      DateTime    @default(now())
+  revokedAt      DateTime?
+  // Hash SHA-256 IP pemberi (bukan IP mentah).
+  ipHash         String?     @db.VarChar(64)
+
+  @@index([userId])
+  @@index([userId, type, grantedAt])
+  @@map("consent_records")
+}
+
+model DataExportRequest {
+  id            String           @id @default(cuid())
+  userId        String
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status        DataExportStatus @default(PENDING)
+  format        DataExportFormat @default(JSON)
+  // Kunci artefak di storage privat (bukan URL signed mentah).
+  artifactKey   String?
+  requestedAt   DateTime         @default(now())
+  readyAt       DateTime?
+  expiresAt     DateTime?
+  // G100: jejak setiap akses unduhan.
+  downloadedAt  DateTime?
+  downloadCount Int              @default(0)
+  failureReason String?
+
+  @@index([userId, requestedAt])
+  @@map("data_export_requests")
+}
+
+// === GAP-D: RETURNS (G201–G225) — retur/tukar barang purnajual ===
+enum ReturnStatus {
+  REQUESTED
+  SELLER_REVIEW
+  CLARIFICATION_NEEDED
+  APPROVED
+  REJECTED
+  RETURN_SHIPPING
+  RECEIVED
+  RESOLVED_REFUND
+  RESOLVED_EXCHANGE
+  RESOLVED_REPAIR
+  ESCALATED
+  CANCELLED
+  EXPIRED
+}
+
+// --- G204: alasan terstruktur pengajuan retur (buyer) -------------------------
+enum ReturnReasonCode {
+  BARANG_RUSAK
+  BARANG_TIDAK_SESUAI_DESKRIPSI
+  BARANG_TIDAK_LENGKAP
+  BARANG_PALSU
+  SALAH_KIRIM_VARIAN
+  BARANG_KEDALUWARSA
+  KEMASAN_RUSAK_PARAH
+  LAINNYA
+}
+
+// --- G223: reason code penolakan konsisten (seller/admin) --------------------
+enum ReturnRejectReasonCode {
+  MELEWATI_BATAS_WAKTU
+  BARANG_TIDAK_RUSAK
+  KLAIM_TIDAK_VALID
+  BUKTI_TIDAK_CUKUP
+  BARANG_SUDAH_DIGUNAKAN
+  KERUSAKAN_AKIBAT_PEMBELI
+  DILUAR_CAKUPAN_KEBIJAKAN
+  LAINNYA
+}
+
+// --- G209: opsi penyelesaian -------------------------------------------------
+enum ReturnResolutionType {
+  REFUND
+  EXCHANGE
+  REPAIR
+  MUTUAL_AGREED
+}
+
+// --- G210: status persetujuan refund (idempoten) ------------------------------
+enum RefundApprovalStatus {
+  PENDING
+  EXECUTING
+  EXECUTED
+  FAILED
+}
+
+enum ReturnActorType {
+  BUYER
+  SELLER
+  ADMIN
+  SYSTEM
+}
+
+// --- G201: kebijakan retur per tipe order & kategori --------------------------
+model ReturnPolicy {
+  id                      String    @id @default(cuid())
+  orderType               OrderType // memakai enum existing (tanpa duplikasi)
+  category                String? // kategori barang; null = default semua kategori
+  returnWindowDays        Int       @default(7) // G203: jendela pengajuan pasca COMPLETED
+  sellerResponseHours     Int       @default(72) // G208: SLA respons seller (jam)
+  shipBackWindowDays      Int       @default(7) // batas kirim balik pasca APPROVED
+  clarificationWindowDays Int       @default(3) // batas jawab klarifikasi
+  requireReturnShipment   Boolean   @default(true) // G215: terima barang dulu sblm kompensasi
+  maxRefundBps            Int? // pagu refund (basis poin dari buyerPayAmount); null = penuh
+  isActive                Boolean   @default(true)
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  @@unique([orderType, category])
+  @@map("return_policies")
+}
+
+// --- Inti: pengajuan retur ----------------------------------------------------
+model ReturnRequest {
+  id       String       @id @default(cuid())
+  returnId String       @unique // format RTN-YYYYMMDD-XXXX (human readable)
+  orderId  String // FK ke Order.id (bukan orderId publik)
+  order    Order        @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  itemRef  String? // referensi item bila retur parsial; null = seluruh order
+  buyerId  String
+  sellerId String
+  status   ReturnStatus @default(REQUESTED)
+
+  // G204 alasan terstruktur + deskripsi bebas
+  reasonCode   ReturnReasonCode
+  reasonDetail String?          @db.Text
+
+  // G209 opsi penyelesaian yang disepakati
+  resolutionType ReturnResolutionType?
+  refundAmount   BigInt? // nominal refund disetujui (sen); null utk non-refund
+
+  // G207/G223 respons seller
+  sellerRespondBy       DateTime? // G208: deadline respons seller (dihitung server)
+  rejectReasonCode      ReturnRejectReasonCode?
+  rejectNote            String?                 @db.Text
+  clarificationQuestion String?                 @db.Text
+
+  // G212: instruksi kirim balik — HANYA diisi/ditampilkan setelah APPROVED
+  returnInstructions String?   @db.Text
+  shipBy             DateTime? // batas kirim balik pasca APPROVED
+
+  // G213: resi retur TERPISAH dari resi pengiriman awal
+  returnTrackingNumber String?
+  returnCourier        String?
+
+  // G215 konfirmasi terima barang retur
+  receivedAt   DateTime?
+  receivedNote String?   @db.Text
+
+  // G217 eskalasi ke sengketa: LINK ke dispute existing, jangan buat baru
+  disputeId String? // FK logis ke Dispute.id bila sudah ada case aktif
+
+  approvedAt  DateTime?
+  rejectedAt  DateTime?
+  resolvedAt  DateTime?
+  cancelledAt DateTime?
+  expiredAt   DateTime?
+  escalatedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  attachments    ReturnAttachment[]
+  notes          ReturnNote[]
+  timeline       ReturnTimeline[]
+  shipmentEvents ReturnShipmentEvent[]
+  refundApproval ReturnRefundApproval?
+
+  // G218: partial unique index (status non-terminal) didefinisikan di migration.sql
+  @@index([orderId])
+  @@index([buyerId, status])
+  @@index([sellerId, status])
+  @@index([status, sellerRespondBy])
+  @@index([status, createdAt])
+  @@map("return_requests")
+}
+
+// --- G205: foto kondisi + bukti (fileKey dari pipeline upload existing) -------
+model ReturnAttachment {
+  id              String        @id @default(cuid())
+  returnRequestId String
+  returnRequest   ReturnRequest @relation(fields: [returnRequestId], references: [id], onDelete: Cascade)
+  fileKey         String // dari POST /v1/upload/direct (purpose=return-evidence)
+  fileName        String
+  fileType        String
+  fileSize        Int
+  uploadedBy      String
+  // G222: retensi bukti — scheduler menghapus fileKey setelah retainUntil
+  retainUntil     DateTime?
+  purgedAt        DateTime?
+  createdAt       DateTime      @default(now())
+
+  @@index([returnRequestId])
+  @@index([retainUntil])
+  @@map("return_attachments")
+}
+
+// --- G216: negosiasi / catatan terlihat dua pihak -----------------------------
+model ReturnNote {
+  id              String          @id @default(cuid())
+  returnRequestId String
+  returnRequest   ReturnRequest   @relation(fields: [returnRequestId], references: [id], onDelete: Cascade)
+  authorId        String
+  authorRole      ReturnActorType
+  message         String          @db.Text
+  visibleToBoth   Boolean         @default(true) // false = catatan internal admin
+  createdAt       DateTime        @default(now())
+
+  @@index([returnRequestId, createdAt])
+  @@map("return_notes")
+}
+
+// --- G214/G220: timeline event purnajual + jejak audit append-only -----------
+model ReturnTimeline {
+  id              String          @id @default(cuid())
+  returnRequestId String
+  returnRequest   ReturnRequest   @relation(fields: [returnRequestId], references: [id], onDelete: Cascade)
+  event           String // mis. STATUS_CHANGED, NOTE_ADDED, REFUND_APPROVED ...
+  fromStatus      ReturnStatus?
+  toStatus        ReturnStatus?
+  actorId         String?
+  actorRole       ReturnActorType @default(SYSTEM)
+  metadata        Json? // detail bebas (nominal, resi, alasan, dsb.)
+  createdAt       DateTime        @default(now())
+
+  @@index([returnRequestId, createdAt])
+  @@map("return_timeline")
+}
+
+// --- G214: event tracking paket retur -----------------------------------------
+model ReturnShipmentEvent {
+  id              String        @id @default(cuid())
+  returnRequestId String
+  returnRequest   ReturnRequest @relation(fields: [returnRequestId], references: [id], onDelete: Cascade)
+  trackingNumber  String
+  courier         String?
+  status          String // status kurir ternormalisasi (PICKED_UP, IN_TRANSIT, DELIVERED, ...)
+  location        String?
+  eventAt         DateTime      @default(now())
+  rawPayload      Json?
+  createdAt       DateTime      @default(now())
+
+  @@index([returnRequestId, eventAt])
+  @@map("return_shipment_events")
+}
+
+// --- G210: persetujuan nominal refund — idempoten, TANPA panggil provider -----
+model ReturnRefundApproval {
+  id              String               @id @default(cuid())
+  returnRequestId String               @unique
+  returnRequest   ReturnRequest        @relation(fields: [returnRequestId], references: [id], onDelete: Restrict)
+  idempotencyKey  String               @unique // RTN-APPR-<returnId>; panggil 2x = 1 eksekusi
+  amount          BigInt // sen, ≤ buyerPayAmount (dan ≤ maxRefundBps bila ada)
+  status          RefundApprovalStatus @default(PENDING)
+  approvedBy      String // sellerId / adminId penyetuju
+  approvedByRole  ReturnActorType
+  approvedAt      DateTime             @default(now())
+  executedAt      DateTime?
+  failureReason   String?              @db.Text
+  walletTxIds     String[]             @default([]) // txId ledger ORDER_REFUND terkait
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  @@map("return_refund_approvals")
+}
+
+// === GAP-D: COURIER (G226–G250) — integrasi kurir & tracking ===
+// - Label = fileKey PRIVAT di storage lokal (bukan URL publik); unduhan
+//   memakai signed URL terautentikasi dengan expiry singkat.
+// ============================================================
+
+// Status tracking internal lintas kurir (G236). UNKNOWN dipakai ketika
+// provider timeout / event tak dikenal — JANGAN mengarang status (G240).
+enum ShipmentStatus {
+  CREATED
+  PICKED_UP
+  IN_TRANSIT
+  OUT_FOR_DELIVERY
+  DELIVERED
+  EXCEPTION
+  RETURNED
+  UNKNOWN
+}
+
+// Mode serah terima paket (G231).
+enum ShipmentMode {
+  PICKUP
+  DROPOFF
+}
+
+// Pihak penanggung biaya kirim (G243) — dikontrol SEBELUM payment.
+enum ShippingCostBearer {
+  SELLER
+  BUYER
+  SPLIT
+}
+
+// Lifecycle booking label di sisi Kahade (G232/G242).
+enum ShipmentBookingState {
+  DRAFT
+  BOOKED
+  FAILED
+  VOIDED
+}
+
+// Status rekonsiliasi tagihan provider vs biaya tercatat (G248).
+enum CourierBillStatus {
+  DRAFT
+  MATCHED
+  MISMATCH
+  ACKNOWLEDGED
+}
+
+// Status refund ongkir (G247).
+enum ShippingRefundStatus {
+  REQUESTED
+  APPROVED
+  REJECTED
+  PAID
+}
+
+// Katalog kurir + layanan (G227). Seed bawaan NONAKTIF — aktivasi via
+// feature flag per provider/wilayah (G249) oleh admin.
+model CourierService {
+  id              String   @id @default(cuid())
+  providerCode    String // mis. "jne", "jnt", "sicepat", "gosend", "anteraja", "paxel", "mock"
+  serviceCode     String // mis. "REG", "YES", "SAME_DAY", "INSTANT"
+  serviceName     String // nama tampil, mis. "JNE Reguler"
+  description     String?
+  enabled         Boolean  @default(false)
+  // Kode wilayah cakupan (mis. ["ID-JKT", "ID-BDG"] atau ["*"] = nasional).
+  regions         String[] @default([])
+  supportsPickup  Boolean  @default(true)
+  supportsDropoff Boolean  @default(true)
+  // SLA keterlambatan = ETA + slaGraceDays (G245), per service level.
+  slaGraceDays    Int      @default(2)
+  sortOrder       Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([providerCode, serviceCode])
+  @@index([providerCode])
+  @@index([enabled])
+  @@map("courier_services")
+}
+
+// Feature flag per provider + wilayah (G249). Baris (providerCode, "*")
+// = flag global provider; (providerCode, region) = override wilayah.
+model CourierRegionFlag {
+  id           String   @id @default(cuid())
+  providerCode String
+  region       String // kode wilayah atau "*" untuk global
+  enabled      Boolean  @default(false)
+  note         String?
+  updatedAt    DateTime @updatedAt
+
+  @@unique([providerCode, region])
+  @@index([providerCode])
+  @@map("courier_region_flags")
+}
+
+// Entitas pengiriman tersendiri (G233): booking ID + label provider disimpan
+// di sini, BUKAN di tabel orders. Fallback resi manual (G241) juga dicatat
+// di sini (isManual=true) — field trackingNumber/courierName di orders
+// tetap menjadi milik alur manual E10 yang sudah ada.
+model Shipment {
+  id       String @id @default(cuid())
+  // FK skalar ke orders.id — SENGAJA bukan field relasi Prisma: back-relation
+  // di model Order tidak boleh ditambahkan (schema.prisma milik worker lain).
+  // FK ON DELETE RESTRICT ada di migration.sql.
+  orderId  String @unique
+  sellerId String
+  buyerId  String
+
+  providerCode String
+  serviceCode  String?
+  mode         ShipmentMode         @default(PICKUP)
+  bookingState ShipmentBookingState @default(DRAFT)
+  status       ShipmentStatus       @default(CREATED)
+
+  // Identitas provider (G233).
+  providerBookingId String?
+  trackingNumber    String?
+
+  // Label = fileKey privat (G233). JANGAN pernah mengekspos fileKey mentah
+  // ke klien — unduhan hanya via signed URL terautentikasi (G234).
+  labelFileKey  String?
+  labelMimeType String?
+
+  // Biaya (G243/G244): estimasi saat quote vs aktual saat booking tercatat
+  // TERPISAH. Nilai dalam rupiah (BigInt), konsisten dengan pola wallet.
+  costBearer     ShippingCostBearer @default(SELLER)
+  estimatedCost  BigInt             @default(0)
+  actualCost     BigInt?
+  currency       String             @default("IDR")
+  refundedAmount BigInt             @default(0)
+
+  weightGrams Int?
+
+  // Kota + kode pos disimpan polos untuk filter/ops; alamat LENGKAP hanya di
+  // kolom JSON dan TIDAK PERNAH dikembalikan ke pihak tak berhak (G238).
+  originCity       String?
+  originPostalCode String?
+  destCity         String?
+  destPostalCode   String?
+  originDetail     Json? // { name, phone, address, city, postalCode } — privat
+  destDetail       Json? // { name, phone, address, city, postalCode } — privat
+
+  etaMinDays Int?
+  etaMaxDays Int?
+  // SLA keterlambatan (G245): slaDueAt = bookedAt + etaMaxDays + slaGraceDays.
+  slaDueAt   DateTime?
+
+  lastEventAt      DateTime?
+  lastEventRaw     String?
+  staleAlertSentAt DateTime?
+
+  // Fallback resi manual (G241): seller mengisi sendiri saat provider nonaktif.
+  isManual             Boolean @default(false)
+  manualTrackingNumber String?
+  manualCourierName    String?
+
+  voidedAt   DateTime?
+  voidReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  events      ShipmentEvent[]
+  webhookLogs CourierWebhookLog[]
+  refunds     ShippingCostRefund[]
+  billLines   CourierBillLine[]
+
+  @@index([orderId])
+  @@index([sellerId])
+  @@index([buyerId])
+  @@index([providerCode])
+  @@index([trackingNumber])
+  @@index([status])
+  @@index([bookingState])
+  @@index([status, lastEventAt]) // deteksi tracking macet (stale)
+  @@map("shipments")
+}
+
+// Event tracking per shipment (G236/G237). Dedup via unique
+// (shipmentId, providerEventId); provider boleh mengirim out-of-order.
+model ShipmentEvent {
+  id              String         @id @default(cuid())
+  shipmentId      String
+  shipment        Shipment       @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  providerEventId String
+  providerCode    String
+  rawStatus       String
+  status          ShipmentStatus
+  // Lokasi termasking, mis. "Jakarta***" / "Hub Bandung" — tanpa alamat lengkap (G238).
+  locationMasked  String?
+  description     String?
+  occurredAt      DateTime?
+  createdAt       DateTime       @default(now())
+
+  @@unique([shipmentId, providerEventId])
+  @@index([shipmentId, createdAt])
+  @@map("shipment_events")
+}
+
+// Log webhook mentah per provider (G235): verifikasi signature + idempotency.
+model CourierWebhookLog {
+  id             String    @id @default(cuid())
+  providerCode   String
+  shipmentId     String?
+  shipment       Shipment? @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+  // Idempotency key dari provider (header/body); null bila provider tidak mengirim.
+  idempotencyKey String?
+  signatureValid Boolean
+  payloadHash    String
+  outcome        String    @default("RECEIVED") // RECEIVED | PROCESSED | DUPLICATE | REJECTED
+  error          String?
+  createdAt      DateTime  @default(now())
+
+  @@index([providerCode, createdAt])
+  @@index([idempotencyKey])
+  @@map("courier_webhook_logs")
+}
+
+// Tagihan provider per periode untuk rekonsiliasi (G248).
+model CourierProviderBill {
+  id             String            @id @default(cuid())
+  providerCode   String
+  period         String // "YYYY-MM"
+  currency       String            @default("IDR")
+  billedAmount   BigInt
+  recordedAmount BigInt            @default(0)
+  status         CourierBillStatus @default(DRAFT)
+  notes          String?
+  createdBy      String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  lines CourierBillLine[]
+
+  @@unique([providerCode, period])
+  @@index([providerCode])
+  @@map("courier_provider_bills")
+}
+
+model CourierBillLine {
+  id             String              @id @default(cuid())
+  billId         String
+  bill           CourierProviderBill @relation(fields: [billId], references: [id], onDelete: Cascade)
+  shipmentId     String?
+  shipment       Shipment?           @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+  trackingNumber String?
+  billedAmount   BigInt
+  recordedAmount BigInt              @default(0)
+  delta          BigInt              @default(0) // billedAmount - recordedAmount
+  note           String?
+
+  @@index([billId])
+  @@index([trackingNumber])
+  @@map("courier_bill_lines")
+}
+
+// Refund ongkir (G247): diajukan seller/buyer, diputus admin.
+model ShippingCostRefund {
+  id          String               @id @default(cuid())
+  shipmentId  String
+  shipment    Shipment             @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  orderId     String
+  amount      BigInt
+  reason      String
+  status      ShippingRefundStatus @default(REQUESTED)
+  requestedBy String
+  decidedBy   String?
+  decidedAt   DateTime?
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  @@index([shipmentId])
+  @@index([status])
+  @@map("shipping_cost_refunds")
+}
+
+// === GAP-D: STOCK (G251–G275) — katalog produk & persediaan ===
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  OUT_OF_STOCK
+  ARCHIVED
+}
+
+// --- G272: moderasi produk TERPISAH dari moderasi showcase --------------------
+enum ProductModerationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  FLAGGED
+}
+
+// --- G266: jenis mutasi stok ---------------------------------------------------
+enum StockMovementType {
+  RESERVE // cadangkan untuk order (G255)
+  RELEASE // lepas reservasi: batal/kedaluwarsa/gagal (G256)
+  DEDUCT // kurangi stok pasca-konfirmasi order (G257)
+  RESTOCK // tambah stok (pembelian/import)
+  ADJUST // koreksi manual oleh pemilik/admin (G267)
+  RETURN // retur barang kembali ke stok
+}
+
+// --- G266: sumber mutasi -------------------------------------------------------
+enum StockMovementSource {
+  ORDER
+  MANUAL
+  IMPORT
+  SYSTEM
+  ADMIN
+}
+
+// --- G266/G267: peran actor ----------------------------------------------------
+enum StockActorRole {
+  SELLER
+  ADMIN
+  SYSTEM
+}
+
+// --- G255: status reservasi ----------------------------------------------------
+enum StockReservationStatus {
+  ACTIVE
+  RELEASED
+  CONSUMED
+  EXPIRED
+}
+
+// --- G259: order lines — productId, variantId, qty, unitPrice snapshot ---------
+model OrderItem {
+  id        String          @id @default(cuid())
+  // FK logis ke Order.id (bukan orderId publik). Satu arah — model Order
+  // tidak mendapat back-relation.
+  orderId   String
+  order     Order           @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  productId String?
+  product   Product?        @relation(fields: [productId], references: [id], onDelete: SetNull)
+  variantId String?
+  variant   ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  // Snapshot saat order dibuat (G259/G274): harga & nama dikunci agar
+  // perubahan katalog kemudian tidak mengubah nilai transaksi.
+  sku          String
+  productName  String
+  variantLabel String?
+  qty          Int
+  unitPriceSen BigInt // rupiah * 100, konsisten dengan pola wallet
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+  @@index([productId])
+  @@index([variantId])
+  @@map("order_items")
+}
+
+// --- G251: entitas produk terpisah dari showcase -------------------------------
+model Product {
+  id                String  @id @default(cuid())
+  // G252: SKU unik per produk — format divalidasi server (lihat
+  // inventory.constants.ts: SKU_PATTERN). Unik lintas tabel ditegakkan di
+  // service (products.sku vs product_variants.sku).
+  sku               String  @unique
+  sellerId          String // User.id pemilik (kolom logis, tanpa back-relation)
+  // G251/G269: tautan profil bisnis. Model BusinessProfile belum ada →
+  // referensi logis String?; dikeraskan saat modelnya diperkenalkan.
+  businessProfileId String?
+
+  name        String  @db.VarChar(150)
+  description String? @db.Text
+  category    String  @db.VarChar(80)
+
+  status           ProductStatus           @default(DRAFT)
+  moderationStatus ProductModerationStatus @default(PENDING)
+  moderationNote   String?                 @db.Text
+  moderatedBy      String?
+  moderatedAt      DateTime?
+
+  // G271: bila true, produk hanya bisa dibeli setelah verifikasi bisnis
+  // seller APPROVED (BusinessVerification). Filter katalog:
+  // ?verifiedBusinessOnly=true.
+  requiresBusinessVerification Boolean @default(false)
+
+  // Harga dasar dalam sen (rupiah*100). Varian boleh override.
+  priceSen BigInt
+  currency String @default("IDR")
+
+  // G254: stok tingkat produk — dipakai untuk produk TANPA varian.
+  // Produk bervarian memakai stok per varian; stok efektif katalog =
+  // Σ varian bila varian ada.
+  quantityAvailable Int @default(0)
+  quantityReserved  Int @default(0)
+
+  // G264: ambang peringatan stok menipis per SKU (0 = nonaktif).
+  lowStockThreshold Int @default(0)
+
+  // G268: berat & dimensi untuk kalkulasi ongkir (gram & cm).
+  weightGrams Int?
+  lengthCm    Decimal? @db.Decimal(8, 2)
+  widthCm     Decimal? @db.Decimal(8, 2)
+  heightCm    Decimal? @db.Decimal(8, 2)
+
+  // G253: skema atribut yang diizinkan, mis.
+  // { "ukuran": ["S","M","L"], "warna": ["Merah","Hitam"] }.
+  // Varian memvalidasi attributes terhadap skema ini.
+  attributesSchema Json?
+
+  imageFileKeys String[] @default([]) // fileKey privat dari POST /v1/upload/direct
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  variants         ProductVariant[]
+  orderItems       OrderItem[]
+  movements        StockMovement[]
+  moderationEvents ProductModerationEvent[]
+
+  @@index([sellerId, status])
+  @@index([status])
+  @@index([category, status])
+  @@index([sku])
+  @@index([sellerId, sku])
+  @@map("products")
+}
+
+// --- G253: varian produk — opsi ukuran/warna + kombinasi valid ------------------
+model ProductVariant {
+  id        String  @id @default(cuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  // G252: SKU unik per varian (format sama seperti produk).
+  sku String @unique
+
+  // G253: kombinasi atribut tervalidasi, mis. { "ukuran": "M", "warna": "Merah" }.
+  // Kunci ⊆ attributesSchema produk, nilai ∈ daftar yang diizinkan, dan
+  // kombinasi unik per produk (canonical key di service).
+  attributes Json
+
+  // Override harga; null = pakai harga produk.
+  priceSen BigInt?
+
+  // G254: stok per varian.
+  quantityAvailable Int @default(0)
+  quantityReserved  Int @default(0)
+
+  lowStockThreshold Int      @default(0)
+  weightGrams       Int?
+  imageFileKeys     String[] @default([])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orderItems OrderItem[]
+  movements  StockMovement[]
+
+  @@index([productId])
+  @@index([sku])
+  @@map("product_variants")
+}
+
+// --- G255: reservasi stok saat order menunggu pembayaran ------------------------
+model StockReservation {
+  id        String  @id @default(cuid())
+  orderId   String // Order.id (logis)
+  productId String?
+  variantId String?
+
+  // SKU yang dicadangkan — kunci idempotency per order (G257/G255).
+  sku    String
+  qty    Int
+  status StockReservationStatus @default(ACTIVE)
+
+  expiresAt  DateTime?
+  releasedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  // Idempoten: reserve ulang order yang sama = no-op (G255).
+  @@unique([orderId, sku])
+  @@index([orderId, status])
+  @@index([status, expiresAt])
+  @@map("stock_reservations")
+}
+
+// --- G266: riwayat mutasi stok beraudit (append-only) ---------------------------
+model StockMovement {
+  id        String          @id @default(cuid())
+  productId String
+  product   Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  variantId String?
+  variant   ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  type   StockMovementType
+  source StockMovementSource
+
+  actorId   String
+  actorRole StockActorRole
+
+  // G267: alasan WAJIB untuk ADJUST manual (divalidasi di service).
+  reason String? @db.Text
+  // Referensi bisnis: orderId publik, batch import id, dsb.
+  ref    String?
+
+  quantityChange Int // negatif = keluar, positif = masuk
+
+  beforeAvailable Int
+  afterAvailable  Int
+  beforeReserved  Int
+  afterReserved   Int
+
+  createdAt DateTime @default(now())
+
+  @@index([productId, createdAt])
+  @@index([variantId, createdAt])
+  @@index([type, createdAt])
+  @@index([actorId, createdAt])
+  @@map("stock_movements")
+}
+
+// --- G257: idempotency key per order untuk operasi stok --------------------------
+model InventoryOperation {
+  id             String   @id @default(cuid())
+  // Format: "DEDUCT:<orderDbId>" | "RESERVE:<orderDbId>" | "RELEASE:<orderDbId>".
+  idempotencyKey String   @unique
+  op             String // RESERVE | RELEASE | DEDUCT
+  orderId        String // Order.id (logis)
+  actorId        String?
+  createdAt      DateTime @default(now())
+
+  @@index([orderId])
+  @@map("inventory_operations")
+}
+
+// --- G272: audit moderasi produk (append-only) -----------------------------------
+model ProductModerationEvent {
+  id        String  @id @default(cuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  fromStatus ProductModerationStatus?
+  toStatus   ProductModerationStatus
+  actorId    String
+  actorRole  StockActorRole
+  note       String?                  @db.Text
+
+  createdAt DateTime @default(now())
+
+  @@index([productId, createdAt])
+  @@map("product_moderation_events")
+}
+
+// === GAP-C: Feedback workflow (G151–G175) ===
+// Model terpisah dari SupportTicket. adminId disimpan sebagai String polos
+// (tanpa FK) agar tidak menyentuh model AdminUser/User yang sudah ada.
+
+enum FeedbackStatus {
+  NEW
+  IN_REVIEW
+  ACTIONED
+  CLOSED
+}
+
+enum FeedbackCloseReason {
+  RESOLVED
+  DUPLICATE
+  NOT_ACTIONABLE
+  SPAM
+  OUT_OF_SCOPE
+  OTHER
+}
+
+enum FeedbackRisk {
+  NONE
+  SECURITY_RISK
+  FRAUD_RISK
+}
+
+enum FeedbackAuditAction {
+  STATUS_CHANGED
+  ASSIGNED
+  UNASSIGNED
+  TAG_ADDED
+  TAG_REMOVED
+  NOTE_ADDED
+  REPLY_SENT
+  CONTACTED
+  ESCALATED
+  RISK_FLAGGED
+  SLA_UPDATED
+  CLOSED
+  REOPENED
+}
+
+model FeedbackAssignment {
+  id         String   @id @default(cuid())
+  feedbackId String
+  feedback   Feedback @relation(fields: [feedbackId], references: [id], onDelete: Cascade)
+  adminId    String
+  assignedBy String?
+  note       String?  @db.VarChar(500)
+  createdAt  DateTime @default(now())
+
+  @@index([feedbackId, createdAt])
+  @@index([adminId])
+  @@map("feedback_assignments")
+}
+
+model FeedbackInternalNote {
+  id         String   @id @default(cuid())
+  feedbackId String
+  feedback   Feedback @relation(fields: [feedbackId], references: [id], onDelete: Cascade)
+  adminId    String
+  note       String   @db.Text
+  createdAt  DateTime @default(now())
+
+  @@index([feedbackId, createdAt])
+  @@map("feedback_internal_notes")
+}
+
+model FeedbackReply {
+  id         String   @id @default(cuid())
+  feedbackId String
+  feedback   Feedback @relation(fields: [feedbackId], references: [id], onDelete: Cascade)
+  adminId    String
+  body       String   @db.Text
+  createdAt  DateTime @default(now())
+
+  @@index([feedbackId, createdAt])
+  @@map("feedback_replies")
+}
+
+model FeedbackAudit {
+  id         String              @id @default(cuid())
+  feedbackId String
+  feedback   Feedback            @relation(fields: [feedbackId], references: [id], onDelete: Cascade)
+  adminId    String?
+  action     FeedbackAuditAction
+  detail     Json?
+  createdAt  DateTime            @default(now())
+
+  @@index([feedbackId, createdAt])
+  @@index([action, createdAt])
+  @@map("feedback_audit")
+}
+
+// Aturan SLA triase konfigurasional per kategori (G168).
+model FeedbackSlaRule {
+  id         String   @id @default(cuid())
+  category   String   @unique @db.VarChar(100)
+  hours      Int
+  isCritical Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@map("feedback_sla_rules")
+}
+
+// === GAP-C: Order escrow bertahap/milestone (G176–G200) ===
+// EKSTENSI produk: order satu tahap existing TIDAK berubah perilaku.
+// Escrow per milestone dialokasikan dari escrowBalance wallet buyer;
+// OrderMilestone.escrowHeld mencatat porsi tiap tahap (invariant:
+// sum(escrowHeld) + sum(released buyerAmount) = buyerPayAmount utk order milestone).
+
+enum MilestoneStatus {
+  DRAFT
+  AWAITING_ACTIVATION
+  SUBMITTED
+  REVISION_REQUESTED
+  ACCEPTED
+  RELEASED
+  CANCELLED
+  DISPUTED
+}
+
+enum MilestoneEventType {
+  CREATED
+  UPDATED
+  ACTIVATED
+  SUBMITTED
+  REVISION_REQUESTED
+  ACCEPTED
+  RELEASED
+  DEADLINE_EXTENDED
+  CANCELLED
+  DISPUTE_OPENED
+  DISPUTE_CLOSED
+  REMINDER_SENT
+  CHANGE_REQUESTED
+  CHANGE_APPROVED
+}
+
+enum MilestoneActorType {
+  BUYER
+  SELLER
+  ADMIN
+  SYSTEM
+}
+
+model OrderMilestone {
+  id      String @id @default(cuid())
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  seq     Int
+
+  title        String  @db.VarChar(120)
+  description  String? @db.Text
+  /// Nilai tahap — bagian dari Order.orderValue. Sum(amount) per order HARUS
+  /// = orderValue (divalidasi di service dalam transaksi + alat rekonsiliasi).
+  amount       BigInt
+  /// Bagian sellerReceiveAmount untuk tahap ini (proporsional, tahap terakhir
+  /// menyerap sisa pembulatan). Sum(sellerAmount) = sellerReceiveAmount.
+  sellerAmount BigInt
+  /// Bagian buyerPayAmount untuk tahap ini (proporsional, tahap terakhir
+  /// menyerap sisa). Sum(buyerAmount) = buyerPayAmount.
+  buyerAmount  BigInt
+  /// Fee platform tahap ini = buyerAmount - sellerAmount (G187).
+  /// Sum(feeAmount) = feeAmount order.
+  feeAmount    BigInt
+
+  status         MilestoneStatus @default(DRAFT)
+  deadline       DateTime?
+  reviewDeadline DateTime?
+
+  submittedAt   DateTime?
+  submittedById String?
+  acceptedAt    DateTime?
+  releasedAt    DateTime?
+  /// WalletTransaction.id dari MILESTONE_RELEASE — kunci idempotensi release.
+  releasedTxId  String?   @unique
+
+  revisionRounds    Int @default(0)
+  maxRevisionRounds Int @default(2)
+
+  /// Porsi escrow buyer yang ditahan untuk tahap ini (dalam satuan sen).
+  escrowHeld BigInt @default(0)
+
+  /// Perubahan pasca-bayar butuh persetujuan dua pihak (G179).
+  changeRequest        Json?
+  buyerApprovedChange  Boolean @default(false)
+  sellerApprovedChange Boolean @default(false)
+
+  evidence MilestoneEvidence[]
+  events   MilestoneEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([orderId, seq])
+  @@index([orderId, status])
+  @@map("order_milestones")
+}
+
+model MilestoneEvidence {
+  id           String         @id @default(cuid())
+  milestoneId  String
+  milestone    OrderMilestone @relation(fields: [milestoneId], references: [id], onDelete: Cascade)
+  fileKey      String         @db.VarChar(500)
+  fileType     String?        @db.VarChar(80)
+  caption      String?        @db.VarChar(280)
+  uploadedById String
+  createdAt    DateTime       @default(now())
+
+  @@index([milestoneId, createdAt])
+  @@map("milestone_evidence")
+}
+
+model MilestoneEvent {
+  id          String             @id @default(cuid())
+  milestoneId String
+  milestone   OrderMilestone     @relation(fields: [milestoneId], references: [id], onDelete: Cascade)
+  actorType   MilestoneActorType
+  actorId     String?
+  eventType   MilestoneEventType
+  payload     Json?
+  createdAt   DateTime           @default(now())
+
+  @@index([milestoneId, createdAt])
+  @@index([eventType, createdAt])
+  @@map("milestone_events")
+}
+
+// === GAP-A: social-login (G001–G025) ===
+// Relasi provider-subject yang stabil; email TIDAK dijadikan satu-satunya
+// identitas eksternal (G012). Consent dicatat saat penautan pertama (G020).
+enum SocialProvider {
+  GOOGLE
+  APPLE
+}
+
+model SocialAccount {
+  id                 String         @id @default(cuid())
+  userId             String
+  user               User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider           SocialProvider
+  providerSub        String
+  email              String?
+  linkedAt           DateTime       @default(now())
+  lastUsedAt         DateTime?
+  consentAt          DateTime?
+  consentTextVersion String?
+
+  @@unique([provider, providerSub])
+  @@index([userId])
+  @@map("social_accounts")
+}
+
+// === GAP-A: account deletion lifecycle (G051–G075) ===
+// Append-only, 2026-09-27. Mencerminkan migration
+// 20260927030100_gap_account_deletion (tabel dibuat di sana; model ini
+// ditambahkan agar Prisma Client mengenalinya).
+
+enum DeletionRequestStatus {
+  // Permintaan dibuat; masa tenggang 30 hari berjalan (satu-satunya status
+  // awal yang diproduksi kode saat ini — default kolom `status`).
+  REQUESTED
+  // Dipesan untuk kompatibilitas maju: diperlakukan sebagai "aktif" di semua
+  // filter (ACTIVE_DELETION_STATUSES), tetapi TIDAK ADA jalur kode yang
+  // menghasilkannya per 2026-09-27. Jangan mengasumsikan request PENDING ada.
+  PENDING
+  CANCELLED
+  PURGED
+  ON_HOLD
+}
+
+model AccountDeletionRequest {
+  id              String                         @id @default(cuid())
+  userId          String
+  user            User                           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  referenceCode   String                         @unique
+  status          DeletionRequestStatus          @default(REQUESTED)
+  idempotencyKey  String                         @unique
+  requestedAt     DateTime                       @default(now())
+  purgeAt         DateTime
+  cancelledAt     DateTime?
+  cancelReason    String?
+  purgedAt        DateTime?
+  legalHoldReason String?
+  reminder7dSent  Boolean                        @default(false)
+  reminder1dSent  Boolean                        @default(false)
+  createdAt       DateTime                       @default(now())
+  updatedAt       DateTime                       @updatedAt
+  history         AccountDeletionStatusHistory[]
+
+  @@index([userId, status])
+  @@index([status, purgeAt])
+  @@map("account_deletion_requests")
+}
+
+model AccountDeletionStatusHistory {
+  id          String                 @id @default(cuid())
+  requestId   String
+  request     AccountDeletionRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  fromStatus  DeletionRequestStatus?
+  toStatus    DeletionRequestStatus
+  actorUserId String?
+  actorType   String                 @db.VarChar(16)
+  reason      String?                @db.VarChar(500)
+  createdAt   DateTime               @default(now())
+
+  @@index([requestId, createdAt])
+  @@map("account_deletion_status_history")
+}
+
+// === GAP-F: moderation lifecycle (G401–G425) + Q&A moderation (G426–G450) + partner API (G451–G475) ===
+// Append-only, 2026-09-26. Relasi balik & kolom aditif ditambahkan ke model existing di bawah.
+
+// === GAP-F: ModerationEventAction ===
+// Aksi dalam lifecycle moderasi laporan etalase. Setiap aksi (termasuk review
+// awal) WAJIB menulis satu baris ReportModerationEvent — append-only (G403).
+enum ModerationEventAction {
+  REOPENED
+  NOTE_ADDED
+  APPEAL_FILED
+  APPEAL_DECIDED
+  RESTORED
+  RESTRICTED
+  TAKEDOWN
+  ASSIGNED
+  ESCALATED
+  EXPORTED
+  DISMISSED
+  NO_ACTION
+  UNDER_REVIEW
+}
+
+// === GAP-F: ModerationReasonCode ===
+// Kode alasan moderasi terstandar (G412). Definisi tiap kode untuk moderator:
+// fixes/docs/moderation-reason-codes.md
+enum ModerationReasonCode {
+  SPAM
+  HARASSMENT
+  FRAUD_SUSPECTED
+  PROHIBITED_ITEM
+  MISLEADING
+  IP_VIOLATION
+  NUDITY
+  OTHER
+}
+
+// === GAP-F: AppealStatus ===
+// Status banding atas keputusan moderasi (G404/G405).
+enum AppealStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// === GAP-F: AppellantType ===
+// Pihak yang mengajukan banding: OWNER (pemilik item) atau REPORTER (pelapor).
+enum AppellantType {
+  OWNER
+  REPORTER
+}
+
+// === GAP-F: NotificationType additions ===
+// MERGE: tambahkan tiga nilai berikut ke enum NotificationType yang sudah ada
+// di schema.prisma (append-only — nilai existing tidak diubah):
+//   MODERATION_REPORT_UPDATE  — status laporan berubah → notifikasi ke pelapor,
+//                              tanpa identitas pemilik item (G416, privasi-aware).
+//   MODERATION_ITEM_TAKEDOWN  — item di-takedown/dibatasi → notifikasi ke pemilik
+//                              item + cara mengajukan banding (G417).
+//   MODERATION_APPEAL_DECIDED — banding diputus → notifikasi ke pemilik item
+//                              (dan pelapor bila relevan) (G405).
+// Nilai-nilai ini dipakai di kode via string-cast agar tsc lolos sebelum
+// `prisma generate`; runtime valid setelah migrasi SQL di-apply.
+
+// === GAP-F: ReportModerationEvent ===
+// Jejak audit append-only SEMUA aksi moderasi atas sebuah laporan (G403, G420).
+// Ditulis oleh: review awal, reopen, catatan, assignment, restrict/restore,
+// takedown, appeal, eskalasi SLA, export. TIDAK PERNAH di-update/di-delete
+// oleh kode aplikasi (tidak ada endpoint mutasi selain create).
+model ReportModerationEvent {
+  id           String                @id @default(cuid())
+  reportId     String
+  report       ShowcaseReport        @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  actorAdminId String? // Admin ID (soft FK ke admin_users.id, pola sama seperti ShowcaseReport.reviewedBy); null = aksi sistem/scheduler
+  action       ModerationEventAction
+  stateFrom    ReportStatus?
+  stateTo      ReportStatus?
+  reasonCode   ModerationReasonCode?
+  note         String?               @db.Text
+  metadata     Json? // snapshot item (G409), slaDueAt, restrictUntil, export filter, dsb.
+  createdAt    DateTime              @default(now())
+
+  @@index([reportId, createdAt])
+  @@index([actorAdminId, createdAt])
+  @@map("report_moderation_events")
+}
+
+// === GAP-F: ReportAppeal ===
+// Banding atas keputusan moderasi final (G404/G405). Diajukan pemilik item
+// atas takedown (alasan + bukti baru WAJIB); dibedakan dari laporan baru —
+// laporan baru atas item yang sudah takedown → 409 dengan arahan ke appeal.
+model ReportAppeal {
+  id              String         @id @default(cuid())
+  reportId        String
+  report          ShowcaseReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  appellantType   AppellantType
+  appellantUserId String // userId pemilik/pelapor (soft FK ke users.id)
+  reason          String         @db.Text
+  newEvidence     Json // bukti baru wajib (keys/files) — G404
+  status          AppealStatus   @default(PENDING)
+  reviewerAdminId String? // soft FK admin_users.id; WAJIB != report.reviewedBy (G406)
+  decidedAt       DateTime?
+  decisionNote    String?        @db.Text // wajib saat decide (G422)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([reportId, status])
+  @@index([status, createdAt])
+  @@map("report_appeals")
+}
+
+// === GAP-F: ReportCluster ===
+// Cluster laporan duplikat: laporan baru dengan showcaseId+reason sama dalam
+// 24 jam ditautkan ke cluster yang sama (G415). Laporan sumber TIDAK dihapus —
+// cluster hanya menautkan.
+model ReportCluster {
+  id          String                @id @default(cuid())
+  showcaseId  String
+  reason      String                @db.VarChar(100)
+  reportCount Int                   @default(0)
+  createdAt   DateTime              @default(now())
+  members     ReportClusterMember[]
+
+  @@index([showcaseId, createdAt])
+  @@map("report_clusters")
+}
+
+// === GAP-F: ReportClusterMember ===
+// Join table keanggotaan cluster (menghindari kolom baru di ShowcaseReport).
+model ReportClusterMember {
+  id        String         @id @default(cuid())
+  clusterId String
+  cluster   ReportCluster  @relation(fields: [clusterId], references: [id], onDelete: Cascade)
+  reportId  String
+  report    ShowcaseReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  createdAt DateTime       @default(now())
+
+  @@unique([clusterId, reportId])
+  @@index([reportId])
+  @@map("report_cluster_members")
+}
+
+// === GAP-F: ReportAssignment ===
+// Assignment laporan ke admin + skor risiko + SLA (G411, G419).
+// Handoff = assignment baru (baris lama di-set unassignedAt; histori utuh).
+model ReportAssignment {
+  id              String         @id @default(cuid())
+  reportId        String
+  report          ShowcaseReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  assigneeAdminId String // soft FK admin_users.id
+  riskScore       Int // 0–100; >=70 = risiko tinggi (SLA 24 jam)
+  slaDueAt        DateTime // dihitung saat assignment: 24 jam (risiko tinggi) / 72 jam (normal)
+  escalated       Boolean        @default(false)
+  assignedAt      DateTime       @default(now())
+  unassignedAt    DateTime?
+  createdAt       DateTime       @default(now())
+
+  @@index([assigneeAdminId, slaDueAt])
+  @@index([slaDueAt])
+  @@map("report_assignments")
+}
+
+// === GAP-F: enum QaModerationReason ===
+// Reason code MODERATOR platform (G429). Berbeda dari ContentHiddenReason milik
+// self-service pemilik (SPAM|INAPPROPRIATE|HARASSMENT|OTHER): pemetaan ke kolom
+// hidden_reason lama: SPAM→SPAM, PROFANITY→INAPPROPRIATE, HARASSMENT→HARASSMENT,
+// PII_LEAK/SCAM_SUSPECTED/OFF_TOPIC/OTHER→OTHER. Kode presisi disimpan di
+// qa_moderation_events.reason_code + qa_reports.reason_code.
+enum QaModerationReason {
+  SPAM
+  PROFANITY
+  HARASSMENT
+  PII_LEAK
+  SCAM_SUSPECTED
+  OFF_TOPIC
+  OTHER
+
+  @@map("qa_moderation_reason")
+}
+
+// === GAP-F: enum QaHiddenByType ===
+// G428 — membedakan hide self-service pemilik profil vs hide moderator platform.
+enum QaHiddenByType {
+  OWNER
+  MODERATOR
+
+  @@map("qa_hidden_by_type")
+}
+
+// === GAP-F: enum QaReportTarget ===
+enum QaReportTarget {
+  QUESTION
+  COMMENT
+
+  @@map("qa_report_target")
+}
+
+// === GAP-F: enum QaReportStatus ===
+enum QaReportStatus {
+  PENDING
+  UNDER_REVIEW
+  DISMISSED
+  ACTION_TAKEN
+
+  @@map("qa_report_status")
+}
+
+// === GAP-F: enum QaAppealStatus ===
+enum QaAppealStatus {
+  PENDING
+  APPROVED
+  REJECTED
+
+  @@map("qa_appeal_status")
+}
+
+// === GAP-F: enum QaEventAction ===
+// G437 — append-only; tidak ada UPDATE/DELETE pada tabel ini.
+enum QaEventAction {
+  HIDDEN
+  UNHIDDEN
+  REDACTED
+  DELETED
+  APPEAL_SUBMITTED
+  APPEAL_APPROVED
+  APPEAL_REJECTED
+
+  @@map("qa_event_action")
+}
+
+// === GAP-F: enum QaDeleteApprovalStatus ===
+// G435 — hapus permanen dua langkah: request (SUPER_ADMIN) → approve
+// (SUPER_ADMIN lain, ≠ requester).
+enum QaDeleteApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+
+  @@map("qa_delete_approval_status")
+}
+
+// === GAP-F: model QaReport ===
+// G431 — laporan pengguna atas pertanyaan/komentar profil. Antrean TERPISAH
+// dari laporan etalase (showcase_reports).
+model QaReport {
+  id         String         @id @default(cuid())
+  targetType QaReportTarget @map("target_type")
+  // targetId sengaja TANPA FK (String polos) supaya laporan tetap jadi audit
+  // trail walau target dihapus permanen.
+  targetId   String         @map("target_id")
+  reporterId String         @map("reporter_id")
+  reporter   User           @relation("QaReporter", fields: [reporterId], references: [id], onDelete: Cascade)
+
+  reasonCode QaModerationReason @map("reason_code")
+  note       String?            @db.VarChar(500)
+
+  status QaReportStatus @default(PENDING)
+
+  // G446 — assignment kasus + handoff antar moderator.
+  assignedAdminId String?    @map("assigned_admin_id")
+  assignedAdmin   AdminUser? @relation("QaReportAssignee", fields: [assignedAdminId], references: [id], onDelete: SetNull)
+
+  resolvedAt DateTime? @map("resolved_at")
+  resolvedBy String?   @map("resolved_by") // admin_users.id resolver (soft FK, audit)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([targetType, targetId])
+  @@index([status, createdAt])
+  @@index([reporterId, createdAt])
+  @@index([assignedAdminId])
+  // Satu laporan TERBUKA per (pelapor, target): cegah duplikat spam laporan.
+  // Ditegakkan sebagai partial unique index di migration SQL.
+  @@map("qa_reports")
+}
+
+// === GAP-F: model QaAppeal ===
+// G436 — keberatan penulis (asker/author) atau pemilik profil (receiver) atas
+// hide MODERATOR. Reviewer wajib ≠ moderator yang melakukan hide (ditegakkan di
+// service; constraint CHECK tidak bisa karena butuh join event).
+model QaAppeal {
+  id          String         @id @default(cuid())
+  targetType  QaReportTarget @map("target_type")
+  targetId    String         @map("target_id") // tanpa FK, alasan sama seperti QaReport
+  appellantId String         @map("appellant_id")
+  appellant   User           @relation("QaAppellant", fields: [appellantId], references: [id], onDelete: Cascade)
+
+  reason String @db.VarChar(1000)
+
+  status QaAppealStatus @default(PENDING)
+
+  reviewerAdminId String?   @map("reviewer_admin_id") // admin_users.id (soft FK)
+  reviewedAt      DateTime? @map("reviewed_at")
+  reviewNote      String?   @map("review_note") @db.VarChar(1000)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([targetType, targetId])
+  @@index([status, createdAt])
+  @@index([appellantId])
+  @@map("qa_appeals")
+}
+
+// === GAP-F: model QaModerationEvent ===
+// G437 — log audit append-only seluruh aksi moderasi Q&A.
+model QaModerationEvent {
+  id         String         @id @default(cuid())
+  targetType QaReportTarget @map("target_type")
+  targetId   String         @map("target_id") // tanpa FK — event bertahan walau target dihapus permanen
+
+  // Nullable: event APPEAL_SUBMITTED dicatat atas nama appellant (user), bukan admin.
+  actorAdminId String?    @map("actor_admin_id")
+  actorAdmin   AdminUser? @relation("QaEventActor", fields: [actorAdminId], references: [id], onDelete: Restrict)
+
+  action QaEventAction
+
+  reasonCode QaModerationReason? @map("reason_code")
+  // Catatan internal — HANYA terlihat admin (tidak pernah diekspos ke API publik).
+  note       String?             @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([targetType, targetId, createdAt])
+  @@index([actorAdminId, createdAt])
+  @@index([action, createdAt])
+  @@map("qa_moderation_events")
+}
+
+// === GAP-F: model QaDeleteRequest ===
+// G435 — hapus permanen konten Q&A butuh approval dua langkah.
+model QaDeleteRequest {
+  id         String         @id @default(cuid())
+  targetType QaReportTarget @map("target_type")
+  targetId   String         @map("target_id")
+
+  requestedByAdminId String    @map("requested_by_admin_id")
+  requestedBy        AdminUser @relation("QaDeleteRequester", fields: [requestedByAdminId], references: [id], onDelete: Restrict)
+
+  approvedByAdminId String?    @map("approved_by_admin_id")
+  approvedBy        AdminUser? @relation("QaDeleteApprover", fields: [approvedByAdminId], references: [id], onDelete: SetNull)
+
+  status QaDeleteApprovalStatus @default(PENDING)
+
+  reason String? @db.VarChar(1000) // alasan penghapusan (internal)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  decidedAt DateTime? @map("decided_at")
+
+  @@index([status, createdAt])
+  @@index([targetType, targetId])
+  @@map("qa_delete_requests")
+}
+
+// === GAP-F: PartnerClientStatus ===
+enum PartnerClientStatus {
+  ACTIVE
+  SUSPENDED
+  REVOKED
+}
+
+// === GAP-F: PartnerWebhookDeliveryStatus ===
+enum PartnerWebhookDeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+  DLQ
+}
+
+// === GAP-F: ApiClient ===
+model ApiClient {
+  id                 String              @id @default(cuid())
+  orgName            String              @db.VarChar(120)
+  // Opsional: user pemilik akun merchant. Scalar saja (tanpa @relation) supaya
+  // fragment tidak perlu menambah field balik di model User.
+  ownerUserId        String?
+  status             PartnerClientStatus @default(ACTIVE)
+  isSandbox          Boolean             @default(false)
+  rateLimitPerMinute Int                 @default(100) // G460: configurable per client
+  quotaPerDay        Int                 @default(10000) // G461: kuota harian
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  keys             PartnerApiKey[]
+  webhookEndpoints PartnerWebhookEndpoint[]
+  usage            PartnerApiUsage[]
+
+  @@index([status])
+  @@index([ownerUserId])
+  @@map("partner_api_clients")
+}
+
+// === GAP-F: PartnerApiKey ===
+model PartnerApiKey {
+  id            String          @id @default(cuid())
+  clientId      String
+  client        ApiClient       @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  keyPrefix     String          @db.VarChar(16) // 8 char identifikasi, TANPA hash/secret
+  keyHash       String          @db.VarChar(255) // scrypt; plaintext TIDAK PERNAH disimpan
+  scopes        String[] // mis. ["orders:read","webhooks:manage"]
+  name          String?         @db.VarChar(80)
+  expiresAt     DateTime?
+  rotatedFromId String?
+  rotatedFrom   PartnerApiKey?  @relation("KeyRotation", fields: [rotatedFromId], references: [id], onDelete: SetNull)
+  rotatedTo     PartnerApiKey[] @relation("KeyRotation")
+  validUntil    DateTime? // jendela overlap rotasi (24 jam)
+  revokedAt     DateTime?
+  revokeReason  String?         @db.VarChar(280)
+  lastUsedAt    DateTime?
+  createdAt     DateTime        @default(now())
+
+  @@index([clientId])
+  @@index([keyPrefix])
+  @@map("partner_api_keys")
+}
+
+// === GAP-F: PartnerApiUsage ===
+model PartnerApiUsage {
+  id         String    @id @default(cuid())
+  clientId   String
+  client     ApiClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  date       DateTime  @db.Date
+  endpoint   String    @db.VarChar(200)
+  count      Int       @default(0)
+  errorCount Int       @default(0)
+
+  @@unique([clientId, date, endpoint])
+  @@index([clientId, date])
+  @@map("partner_api_usage")
+}
+
+// === GAP-F: PartnerWebhookEndpoint ===
+model PartnerWebhookEndpoint {
+  id                 String    @id @default(cuid())
+  clientId           String
+  client             ApiClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  url                String    @db.VarChar(500)
+  events             String[] // whitelist PARTNER_WEBHOOK_EVENTS
+  secretEnc          String    @db.Text // AES-GCM via pola PII; TIDAK PERNAH di-return API
+  isActive           Boolean   @default(false)
+  verifiedAt         DateTime?
+  challengeToken     String?   @db.VarChar(128)
+  challengeIssuedAt  DateTime?
+  lastDeliveryAt     DateTime?
+  lastDeliveryStatus String?   @db.VarChar(16)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  deliveries PartnerWebhookDelivery[]
+
+  @@index([clientId])
+  @@map("partner_webhook_endpoints")
+}
+
+// === GAP-F: PartnerWebhookDelivery ===
+model PartnerWebhookDelivery {
+  id           String                       @id @default(cuid())
+  endpointId   String
+  endpoint     PartnerWebhookEndpoint       @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  eventId      String                       @unique // idempotency key penerima (anti-replay)
+  eventType    String                       @db.VarChar(64)
+  payload      Json
+  attempt      Int                          @default(0)
+  status       PartnerWebhookDeliveryStatus @default(PENDING)
+  nextRetryAt  DateTime?
+  lastError    String?                      @db.VarChar(500) // redacted: tanpa body respons
+  responseCode Int?
+  createdAt    DateTime                     @default(now())
+  completedAt  DateTime?
+
+  @@index([endpointId, status])
+  @@index([status, nextRetryAt])
+  @@map("partner_webhook_deliveries")
+}
+
+// === GAP-F: PartnerAuditLog ===
+model PartnerAuditLog {
+  id          String   @id @default(cuid())
+  adminId     String
+  action      String   @db.VarChar(64) // CLIENT_CREATED, KEY_ISSUED, KEY_ROTATED, KEY_REVOKED, ...
+  targetType  String?  @db.VarChar(64)
+  targetId    String?
+  description String   @db.Text
+  before      Json?
+  after       Json?
+  ipAddress   String   @db.VarChar(64)
+  createdAt   DateTime @default(now())
+
+  @@index([targetId, targetType])
+  @@index([createdAt])
+  @@index([action])
+  @@map("partner_audit_logs")
 }

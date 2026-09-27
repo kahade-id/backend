@@ -6,8 +6,10 @@ import { UploadModule } from '../upload/upload.module';
 import { AuditLogModule } from '../../common/services/audit-log.module';
 import { VerificationBadgeModule } from '../users/verification-badge.module';
 import { ShowcaseController } from './showcase.controller';
+import { ShowcaseAppealsController } from './showcase-appeals.controller';
 import { ShowcaseService } from './showcase.service';
 import { SubscriptionsModule } from '../subscriptions/subscriptions.module';
+import { AdminShowcaseReportsModule } from '../admin/showcase-reports/admin-showcase-reports.module';
 
 /**
  * Section 3 — Showcase sebagai konten sosial + feed discover.
@@ -17,10 +19,15 @@ import { SubscriptionsModule } from '../subscriptions/subscriptions.module';
  * `ShowcaseService` di-export supaya UsersController (CRUD owner di
  * /users/me/showcase*) dan DeepLinksController (halaman share) bisa memakainya
  * tanpa memindahkan route lama.
+ *
+ * AdminShowcaseReportsModule diimpor untuk endpoint banding user-facing
+ * (G404: POST /v1/showcase/:id/appeals) — service logic terpusat di
+ * AdminShowcaseReportsService; tidak ada siklus dependensi (modul admin hanya
+ * bergantung pada AuditLogModule).
  */
 @Module({
-  imports: [ConfigModule, PrismaModule, RedisModule, UploadModule, AuditLogModule, VerificationBadgeModule, SubscriptionsModule],
-  controllers: [ShowcaseController],
+  imports: [ConfigModule, PrismaModule, RedisModule, UploadModule, AuditLogModule, VerificationBadgeModule, SubscriptionsModule, AdminShowcaseReportsModule],
+  controllers: [ShowcaseController, ShowcaseAppealsController],
   providers: [ShowcaseService],
   exports: [ShowcaseService],
 })

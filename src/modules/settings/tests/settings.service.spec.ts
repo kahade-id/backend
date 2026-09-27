@@ -16,17 +16,36 @@ const mockPrisma = {
   userSavedProfile: { deleteMany: jest.fn(), findMany: jest.fn() },
   user: { findUnique: jest.fn(), update: jest.fn() },
   userReport: { findFirst: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn() },
-  order: { findUnique: jest.fn() },
+  order: { findUnique: jest.fn(), findMany: jest.fn() },
+  // GAP-B (G090–G096): dataset builder ekspor menyentuh banyak model.
+  chatRoom: { findMany: jest.fn() },
+  dispute: { findMany: jest.fn() },
+  feedback: { findMany: jest.fn() },
+  profileQuestion: { findMany: jest.fn() },
+  profileQuestionComment: { findMany: jest.fn() },
+  profileQuestionUpvote: { findMany: jest.fn() },
+  rating: { findMany: jest.fn() },
+  showcaseComment: { findMany: jest.fn() },
+  showcaseLike: { findMany: jest.fn() },
+  supportTicket: { findMany: jest.fn() },
+  userShowcase: { findMany: jest.fn() },
+  wallet: { findUnique: jest.fn() },
+  walletTransaction: { findMany: jest.fn() },
   userSession: { findMany: jest.fn() },
   userDevice: { findMany: jest.fn() },
   bankAccount: { findMany: jest.fn() },
   userLink: { findMany: jest.fn() },
   userBadge: { findMany: jest.fn() },
   notificationPreference: { findUnique: jest.fn() },
+  // GAP-B (G076–G096): granular privacy + export request persistence.
+  privacySetting: { findUnique: jest.fn(), upsert: jest.fn() },
+  dataExportRequest: { create: jest.fn(), update: jest.fn(), count: jest.fn(), findMany: jest.fn(), findUnique: jest.fn() },
+  // GAP-B consent (G084–G086) — dipakai getConsents() di dalam buildExportDatasets.
+  consentRecord: { count: jest.fn(), create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), update: jest.fn() },
   $transaction: jest.fn(),
 };
 const mockAudit = { logUserAction: jest.fn() };
-const mockRedis = { get: jest.fn(), set: jest.fn(), setex: jest.fn(), setNx: jest.fn(), releaseLock: jest.fn() };
+const mockRedis = { get: jest.fn(), set: jest.fn(), setex: jest.fn(), setNx: jest.fn(), releaseLock: jest.fn(), del: jest.fn() };
 const mockConfig = { get: jest.fn() };
 const mockUpload = { uploadPrivateAccountExport: jest.fn() };
 const mockNotification = { enqueue: jest.fn() };
@@ -220,7 +239,9 @@ describe('SettingsService', () => {
 
   describe('privacy', () => {
     it('returns cached privacy settings when present', async () => {
-      mockRedis.get.mockResolvedValue(JSON.stringify({ profileVisible: true, showOnlineStatus: false }));
+      // GAP-B: cache format baru memuat field granular (showEmail) — cache
+      // format lama (hanya 2 toggle) sengaja dianggap miss oleh service.
+      mockRedis.get.mockResolvedValue(JSON.stringify({ profileVisible: true, showOnlineStatus: false, showEmail: false }));
       const res = await service.getPrivacySettings('u1');
       expect(res.showOnlineStatus).toBe(false);
       expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
@@ -229,6 +250,7 @@ describe('SettingsService', () => {
     it('falls back to DB on cache miss', async () => {
       mockRedis.get.mockResolvedValue(null);
       mockPrisma.user.findUnique.mockResolvedValue({ id: 'u1', profileVisible: true, showOnlineStatus: true });
+      mockPrisma.privacySetting.findUnique.mockResolvedValue(null);
       const res = await service.getPrivacySettings('u1');
       expect(res.profileVisible).toBe(true);
       expect(mockRedis.set).toHaveBeenCalled();
@@ -241,10 +263,13 @@ describe('SettingsService', () => {
     });
 
     it('updatePrivacySettings persists and caches', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue({ id: 'u1', profileVisible: true, showOnlineStatus: true });
+      // GAP-B: service membaca ulang dari DB setelah update — mock
+      // mencerminkan nilai yang baru disimpan.
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'u1', profileVisible: false, showOnlineStatus: true });
       mockPrisma.user.update.mockResolvedValue({});
       const res = await service.updatePrivacySettings('u1', { profileVisible: false });
       expect(res.profileVisible).toBe(false);
+      expect(mockRedis.del).toHaveBeenCalled();
       expect(mockRedis.set).toHaveBeenCalled();
     });
   });
@@ -306,6 +331,22 @@ describe('SettingsService', () => {
       mockPrisma.notificationPreference.findUnique.mockResolvedValue(null);
       mockPrisma.blockList.count.mockResolvedValue(0);
       mockPrisma.userReport.count.mockResolvedValue(0);
+      // GAP-B (G087): requestDataExport mencatat DataExportRequest PENDING → READY/FAILED.
+      mockPrisma.dataExportRequest.create.mockResolvedValue({ id: 'req-1' });
+      mockPrisma.dataExportRequest.update.mockResolvedValue({});
+      // GAP-B (G090–G096): dataset builder ekspor menyentuh banyak model.
+      for (const d of [
+        mockPrisma.order, mockPrisma.chatRoom, mockPrisma.dispute, mockPrisma.feedback,
+        mockPrisma.profileQuestion, mockPrisma.profileQuestionComment, mockPrisma.profileQuestionUpvote,
+        mockPrisma.rating, mockPrisma.showcaseComment, mockPrisma.showcaseLike, mockPrisma.supportTicket,
+        mockPrisma.userShowcase, mockPrisma.walletTransaction,
+      ]) {
+        d.findMany.mockResolvedValue([]);
+      }
+      mockPrisma.wallet.findUnique.mockResolvedValue(null);
+      mockPrisma.privacySetting.findUnique.mockResolvedValue(null);
+      mockPrisma.consentRecord.findMany.mockResolvedValue([]);
+      mockPrisma.userSavedProfile.findMany.mockResolvedValue([]);
       mockRedis.setNx.mockResolvedValue(true);
       mockRedis.releaseLock.mockResolvedValue(true);
       mockUpload.uploadPrivateAccountExport.mockResolvedValue({ downloadUrl: 'https://private.example/export.json', expiresAt: new Date('2026-08-19T00:00:00.000Z') });

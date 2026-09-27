@@ -1,5 +1,5 @@
 import { AdminRoute } from '../../../common/decorators/public.decorator';
-import { Controller, Get, Post, Delete, Param, Body, Query, UseGuards, Req, Res } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Param, Body, Query, UseGuards, Req, Res, HttpStatus } from '@nestjs/common';
 import { Response } from 'express';
 import { ParseIdPipe } from '../../../common/pipes/parse-id.pipe';
 import { ApiTags, ApiBearerAuth, ApiOperation, ApiResponse } from '@nestjs/swagger';
@@ -7,6 +7,9 @@ import { Request } from 'express';
 import { AdminJwtPayload } from '../../../common/types/jwt-payload.types';
 import { AdminUsersService } from './admin-users.service';
 import { UserListQueryDto } from './dto/user-list-query.dto';
+import { UserExportQueryDto } from './dto/user-export-query.dto';
+import { UserExportBodyDto } from './dto/user-export-body.dto';
+import { ModerationEventsQueryDto } from './dto/moderation-events-query.dto';
 import { UserOrderQueryDto } from './dto/user-order-query.dto';
 import { BanUserDto } from './dto/ban-user.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
@@ -14,6 +17,7 @@ import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
 import { WalletAdjustDto } from './dto/wallet-adjust.dto';
+import { DeletionLegalHoldDto } from './dto/deletion-legal-hold.dto';
 import { GrayRevokeDto } from './dto/gray-revoke.dto';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
 import { Idempotency } from '../../../common/decorators/idempotency.decorator';
@@ -275,17 +279,109 @@ export class AdminUsersController {
     return this.service.clearReviewFlag(userId, admin.sub, req.ip || 'unknown');
   }
 
+  @Get(':userId/moderation-events')
+  @ApiOperation({
+    summary: 'Timeline moderasi pengguna',
+    description:
+      'Menggabungkan AdminAuditLog (targetType User), keputusan KYC, resolusi laporan, ' +
+      'dan flag otomatis menjadi satu timeline terurut dengan flag source system|admin. ' +
+      'Catatan internal disembunyikan dari role CUSTOMER_SUPPORT.',
+  })
+  @ApiResponse({ status: 200, description: 'Moderation timeline returned.' })
+  @ApiResponse({ status: 404, description: 'User not found.' })
+  listModerationEvents(
+    @Param('userId', ParseIdPipe) userId: string,
+    @Query() query: ModerationEventsQueryDto,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.listModerationEvents(userId, query, admin.role, admin.sub, req.ip || 'unknown');
+  }
+
+  @Post('export')
+  @AdminRoles('SUPER_ADMIN')
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @ApiOperation({
+    summary: 'Ekspor CSV pengguna via body (kontrak admin web)',
+    description:
+      'Sama seperti GET export/csv tetapi menerima body JSON: { reason, columns, mask, search, status }. ' +
+      'reason WAJIB. Dataset > 5000 baris → 202 { jobId }.',
+  })
+  @ApiResponse({ status: 200, description: 'CSV file returned.' })
+  @ApiResponse({ status: 202, description: 'Export accepted — poll job status.' })
+  async exportViaBody(
+    @Body() dto: UserExportBodyDto,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+    @Res() res: Response,
+  ): Promise<void> {
+    const query: UserExportQueryDto = Object.assign(new UserExportQueryDto(), {
+      reason: dto.reason,
+      columns: dto.columns && dto.columns.length > 0 ? dto.columns.join(',') : undefined,
+      mask: dto.mask,
+      search: dto.search,
+      status: dto.status,
+    });
+    const result = await this.service.exportUsersCsv(query, admin.role, admin.sub, req.ip || 'unknown');
+    if (result.kind === 'async') {
+      res.status(HttpStatus.ACCEPTED).json({
+        jobId: result.jobId,
+        status: 'pending',
+        rowCount: result.rowCount,
+        pollUrl: `/v1/admin/users/export/jobs/${result.jobId}`,
+        message: 'Dataset besar — ekspor diproses di latar. Poll URL di atas untuk tautan unduh.',
+      });
+      return;
+    }
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
+    res.send(result.csv);
+  }
+
   @Get('export/csv')
   @AdminRoles('SUPER_ADMIN')
-  @ApiOperation({ summary: 'Export users CSV (19.4)' })
-  async exportCsv(@Query() query: UserListQueryDto, @Res() res: Response): Promise<void> {
-    const data = await this.service.listUsers(query.page ?? 1, 1000, query.search, query.status, query.sortBy, query.sortOrder) as any;
-    const users = data.data || data.users || [];
-    const csvHeader = 'userId,email,username,fullName,status,createdAt\n';
-    const csvRows = (users as any[]).map((u: any) => `${u.userId ?? ''},${u.email ?? ''},${u.username ?? ''},${(u.fullName ?? '').replace(/,/g, ' ')},${u.status ?? ''},${u.createdAt ?? ''}`).join('\n');
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename=\"users-export.csv\"');
-    res.send(csvHeader + csvRows);
+  @ApiOperation({
+    summary: 'Ekspor CSV pengguna (diperkuat, G380)',
+    description:
+      'Alasan (reason) wajib dan tercatat di UserExportAudit + AdminAuditLog. ' +
+      'Kolom opsional (default minimal), masking PII default aktif. ' +
+      'Dataset > 5000 baris → 202 + jobId (poll /export/jobs/:jobId untuk tautan unduh privat 15 menit).',
+  })
+  @ApiResponse({ status: 200, description: 'CSV file returned.' })
+  @ApiResponse({ status: 202, description: 'Export accepted — poll job status.' })
+  async exportCsv(
+    @Query() query: UserExportQueryDto,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+    @Res() res: Response,
+  ): Promise<void> {
+    const result = await this.service.exportUsersCsv(query, admin.role, admin.sub, req.ip || 'unknown');
+    if (result.kind === 'async') {
+      res.status(HttpStatus.ACCEPTED).json({
+        jobId: result.jobId,
+        status: 'pending',
+        rowCount: result.rowCount,
+        pollUrl: `/v1/admin/users/export/jobs/${result.jobId}`,
+        message: 'Dataset besar — ekspor diproses di latar. Poll URL di atas untuk tautan unduh.',
+      });
+      return;
+    }
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
+    res.send(result.csv);
+  }
+
+  @Get('export/jobs/:jobId')
+  @AdminRoles('SUPER_ADMIN')
+  @ApiOperation({ summary: 'Poll status job ekspor CSV async' })
+  @ApiResponse({ status: 200, description: 'Job status returned (ready → downloadUrl 15 menit).' })
+  @ApiResponse({ status: 404, description: 'Job not found or expired.' })
+  exportJobStatus(
+    @Param('jobId') jobId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+  ): Promise<object> {
+    return this.service.getExportJobStatus(jobId, admin.sub);
   }
 
   @Post(':userId/impersonate')
@@ -293,5 +389,55 @@ export class AdminUsersController {
   @ApiOperation({ summary: 'Impersonate user (19.3)' })
   async impersonate(@Param('userId', ParseIdPipe) userId: string, @CurrentAdmin() admin: AdminJwtPayload, @Req() req: Request): Promise<object> {
     return this.service.impersonateUser(userId, admin.sub, req.ip || 'unknown');
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // GAP-A (G067): status penghapusan akun + legal hold.
+  // ─────────────────────────────────────────────────────────────────
+
+  @Get(':userId/deletion')
+  @ApiOperation({
+    summary: 'Lihat status penghapusan akun',
+    description: 'Permintaan penghapusan terbaru user beserta riwayat status (read-only).',
+  })
+  @ApiResponse({ status: 200, description: 'Deletion status returned.' })
+  @ApiResponse({ status: 404, description: 'User not found.' })
+  getDeletionStatus(@Param('userId', ParseIdPipe) userId: string): Promise<object> {
+    return this.service.getDeletionStatus(userId);
+  }
+
+  @Post(':userId/deletion/legal-hold')
+  @AdminRoles('SUPER_ADMIN', 'CUSTOMER_SUPPORT')
+  @ApiOperation({
+    summary: 'Tahan penghapusan (legal hold)',
+    description:
+      'Ubah request aktif menjadi ON_HOLD karena sengketa/retensi hukum. ' +
+      'Purge worker melewati request ON_HOLD.',
+  })
+  @ApiResponse({ status: 200, description: 'Legal hold placed.' })
+  @ApiResponse({ status: 404, description: 'No active deletion request.' })
+  placeDeletionLegalHold(
+    @Param('userId', ParseIdPipe) userId: string,
+    @Body() dto: DeletionLegalHoldDto,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.placeDeletionLegalHold(userId, dto.reason, admin.sub, req.ip || 'unknown');
+  }
+
+  @Post(':userId/deletion/release-hold')
+  @AdminRoles('SUPER_ADMIN', 'CUSTOMER_SUPPORT')
+  @ApiOperation({
+    summary: 'Lepas legal hold penghapusan',
+    description: 'Kembalikan request ON_HOLD menjadi aktif (REQUESTED) dengan purgeAt yang sama.',
+  })
+  @ApiResponse({ status: 200, description: 'Legal hold released.' })
+  @ApiResponse({ status: 404, description: 'No ON_HOLD deletion request.' })
+  releaseDeletionLegalHold(
+    @Param('userId', ParseIdPipe) userId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.releaseDeletionLegalHold(userId, admin.sub, req.ip || 'unknown');
   }
 }

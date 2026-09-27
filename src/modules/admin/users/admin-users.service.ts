@@ -3,7 +3,8 @@ import { ConfigService } from '@nestjs/config';
 import { Logger } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
-import { Prisma, AuditAction, OrderStatus, WalletTransactionType, WalletTransactionStatus, OtpType, NotificationType } from '@prisma/client';
+import { randomUUID } from 'crypto';
+import { Prisma, AuditAction, OrderStatus, WalletTransactionType, WalletTransactionStatus, OtpType, NotificationType, DeletionRequestStatus } from '@prisma/client';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
@@ -22,6 +23,12 @@ import { parseJwtTtl } from '../../../common/utils/jwt.util';
 import { decryptPiiSafe, hashPhoneNumber, normalizePhoneNumber } from '../../../common/utils/pii.util';
 import { escapeLikePattern } from '../../../common/utils/search.util';
 import { DashboardService } from '../dashboard/dashboard.service';
+import { UploadService } from '../../upload/upload.service';
+import { LocalStorageService } from '../../upload/local-storage.service';
+import { encryptAES } from '../../../common/utils/crypto.util';
+import { applyUserMask, PII_UNMASKED_ROLES } from '../../../common/maskPiiByRole';
+import { UserExportQueryDto } from './dto/user-export-query.dto';
+import { ModerationEventsQueryDto, ModerationEventType } from './dto/moderation-events-query.dto';
 
 @Injectable()
 export class AdminUsersService {
@@ -40,6 +47,9 @@ export class AdminUsersService {
     // AW-018: invalidasi cache summary dashboard setelah mutasi yang
     // memengaruhi angka (via helper terpusat, bukan del() manual).
     private readonly dashboard: DashboardService,
+    // GAP-E (G380): signed URL 15 menit untuk hasil ekspor async.
+    private readonly uploadService: UploadService,
+    private readonly localStorage: LocalStorageService,
   ) {
     this.accessTokenTtlSeconds = parseJwtTtl(
       this.configService.get<string>('jwt.expiresIn') ?? '15m',
@@ -50,33 +60,7 @@ export class AdminUsersService {
   async listUsers(page = 1, limit = 20, search?: string, status?: string, sortBy?: string, sortOrder?: 'asc' | 'desc'): Promise<object> {
     const safeLimit = Math.min(limit, 100);
     const skip = (page - 1) * safeLimit;
-    const where: Prisma.UserWhereInput = { deletedAt: null };
-
-    if (search) {
-      const orClauses: Prisma.UserWhereInput[] = [
-        { email: { contains: escapeLikePattern(search), mode: 'insensitive' } },
-        { fullName: { contains: escapeLikePattern(search), mode: 'insensitive' } },
-        { userId: { contains: escapeLikePattern(search), mode: 'insensitive' } },
-        { username: { contains: escapeLikePattern(search), mode: 'insensitive' } },
-      ];
-      const digitsOnly = search.replace(/\D/g, '');
-      if (digitsOnly.length >= 8) {
-        try {
-          const normalized = normalizePhoneNumber(search);
-          orClauses.push({ phoneNumberHash: hashPhoneNumber(normalized) });
-        } catch {
-          /* ignore — invalid phone format, fall back to other fields */
-        }
-      }
-      where.OR = orClauses;
-    }
-    if (status === 'banned') where.isBanned = true;
-    if (status === 'active') where.isBanned = false;
-    if (status === 'kyc_approved') where.kycStatus = 'APPROVED';
-    if (status === 'kyc_pending') where.kycStatus = 'PENDING';
-    // Section 6: antrean moderasi — user yang terflag agregasi laporan
-    // (>= 3 reporter berbeda dalam 24 jam). Flag ini sinyal saja, bukan sanksi.
-    if (status === 'flagged') where.flaggedForReview = true;
+    const where = this.buildUserWhere(search, status);
 
     const allowedSortFields = ['createdAt', 'lastLoginAt', 'email', 'fullName'];
     const orderField = sortBy && allowedSortFields.includes(sortBy) ? sortBy : 'createdAt';
@@ -111,6 +95,41 @@ export class AdminUsersService {
       } : null,
     }));
     return createPaginatedResponse(serialized, total, page, safeLimit);
+  }
+
+  /**
+   * GAP-E (G380): where filter pengguna bersama untuk list & ekspor CSV.
+   * Diekstrak dari listUsers agar ekspor memakai semantik filter yang sama.
+   */
+  private buildUserWhere(search?: string, status?: string): Prisma.UserWhereInput {
+    const where: Prisma.UserWhereInput = { deletedAt: null };
+
+    if (search) {
+      const orClauses: Prisma.UserWhereInput[] = [
+        { email: { contains: escapeLikePattern(search), mode: 'insensitive' } },
+        { fullName: { contains: escapeLikePattern(search), mode: 'insensitive' } },
+        { userId: { contains: escapeLikePattern(search), mode: 'insensitive' } },
+        { username: { contains: escapeLikePattern(search), mode: 'insensitive' } },
+      ];
+      const digitsOnly = search.replace(/\D/g, '');
+      if (digitsOnly.length >= 8) {
+        try {
+          const normalized = normalizePhoneNumber(search);
+          orClauses.push({ phoneNumberHash: hashPhoneNumber(normalized) });
+        } catch {
+          /* ignore — invalid phone format, fall back to other fields */
+        }
+      }
+      where.OR = orClauses;
+    }
+    if (status === 'banned') where.isBanned = true;
+    if (status === 'active') where.isBanned = false;
+    if (status === 'kyc_approved') where.kycStatus = 'APPROVED';
+    if (status === 'kyc_pending') where.kycStatus = 'PENDING';
+    // Section 6: antrean moderasi — user yang terflag agregasi laporan
+    // (>= 3 reporter berbeda dalam 24 jam). Flag ini sinyal saja, bukan sanksi.
+    if (status === 'flagged') where.flaggedForReview = true;
+    return where;
   }
 
   async getUserDetail(userId: string, adminId?: string, ipAddress?: string): Promise<object> {
@@ -885,4 +904,695 @@ export class AdminUsersService {
       warning: 'This token is for debugging only, limited scope, expires in 15 minutes',
     };
   }
+
+  // ══════════════════════════════════════════════════════════════
+  // GAP-E — Timeline moderasi pengguna
+  // GET /v1/admin/users/:userId/moderation-events
+  //
+  // Menggabungkan 4 sumber menjadi satu timeline terurut menurun:
+  //  1. AdminAuditLog (targetType User) — aksi admin atas user ini
+  //     (termasuk ban/unban via USER_BANNED/USER_RESTORED).
+  //  2. KycRequest yang sudah diputus — keputusan KYC (admin).
+  //  3. UserReport yang sudah direview — resolusi laporan (admin).
+  //  4. Flag agregasi laporan — sinyal OTOMATIS (source 'system').
+  // Catatan internal KYC (adminNotes) disembunyikan dari CUSTOMER_SUPPORT.
+  // ══════════════════════════════════════════════════════════════
+
+  /** Role yang boleh melihat catatan internal moderasi (semua kecuali support biasa). */
+  private static readonly INTERNAL_NOTES_ALLOWED_ROLES = [
+    'SUPER_ADMIN',
+    'DISPUTE_ADMIN',
+    'KYC_ADMIN',
+    'FINANCE_ADMIN',
+  ];
+
+  private static readonly MODERATION_TIMELINE_LIMIT = 200;
+
+  async listModerationEvents(
+    userId: string,
+    query: ModerationEventsQueryDto,
+    requesterRole: string,
+    adminId?: string,
+    ipAddress?: string,
+  ): Promise<object> {
+    const id = await this.resolveUserId(userId);
+    if (adminId) {
+      this.auditLog.logAdminAction({
+        adminId,
+        action: AuditAction.ADMIN_ACTION,
+        targetType: 'User',
+        targetId: id,
+        description: `Viewed moderation timeline for user ${id}`,
+        ipAddress: ipAddress || 'unknown',
+      });
+    }
+
+    const canSeeInternalNotes = AdminUsersService.INTERNAL_NOTES_ALLOWED_ROLES.includes(requesterRole);
+    const eventFilter = query.event;
+    const actorFilter = query.actor;
+    const from = query.from ? new Date(query.from) : undefined;
+    const to = query.to ? new Date(query.to) : undefined;
+
+    const inRange = (d: Date): boolean =>
+      (!from || d >= from) && (!to || d <= to);
+    const actorOk = (actorId: string | null | undefined): boolean =>
+      !actorFilter || actorId === actorFilter;
+
+    type TimelineEvent = {
+      id: string;
+      type: ModerationEventType;
+      source: 'system' | 'admin';
+      title: string;
+      description: string | null;
+      actor: { id: string; name: string | null; role: string | null } | null;
+      createdAt: Date;
+      internalNote?: string;
+      internalNoteHidden?: boolean;
+      metadata?: Record<string, unknown>;
+    };
+    const events: TimelineEvent[] = [];
+
+    // 1. AdminAuditLog atas user ini.
+    const auditWhere: Prisma.AdminAuditLogWhereInput = {
+      targetId: id,
+      targetType: { in: ['User', 'user'] },
+    };
+    if (actorFilter) auditWhere.adminId = actorFilter;
+    if (from || to) {
+      auditWhere.createdAt = {};
+      if (from) (auditWhere.createdAt as Prisma.DateTimeFilter).gte = from;
+      if (to) (auditWhere.createdAt as Prisma.DateTimeFilter).lte = to;
+    }
+    const auditLogs = await this.prisma.adminAuditLog.findMany({
+      where: auditWhere,
+      orderBy: { createdAt: 'desc' },
+      take: AdminUsersService.MODERATION_TIMELINE_LIMIT,
+      include: { admin: { select: { id: true, fullName: true, role: true } } },
+    });
+    for (const log of auditLogs) {
+      let type: ModerationEventType = 'admin_action';
+      let title: string = log.action;
+      if (log.action === AuditAction.USER_BANNED) { type = 'ban'; title = 'Pengguna diblokir'; }
+      else if (log.action === AuditAction.USER_RESTORED) { type = 'unban'; title = 'Blokir dibuka'; }
+      if (eventFilter && type !== eventFilter) continue;
+      events.push({
+        id: `audit:${log.id}`,
+        type,
+        source: 'admin',
+        title,
+        description: log.description,
+        actor: log.admin ? { id: log.admin.id, name: log.admin.fullName, role: log.admin.role } : null,
+        createdAt: log.createdAt,
+        metadata: { action: log.action },
+      });
+    }
+
+    // 2. Keputusan KYC.
+    if (!eventFilter || eventFilter === 'kyc_decision') {
+      const kycDecisions = await this.prisma.kycRequest.findMany({
+        where: { userId: id, reviewedAt: { not: null } },
+        orderBy: { reviewedAt: 'desc' },
+        take: 50,
+        select: {
+          id: true, kycId: true, status: true, reviewedAt: true,
+          rejectionReason: true, adminNotes: true,
+          reviewer: { select: { id: true, fullName: true, role: true } },
+        },
+      });
+      for (const k of kycDecisions) {
+        if (!k.reviewedAt || !inRange(k.reviewedAt)) continue;
+        if (!actorOk(k.reviewer?.id)) continue;
+        const approved = k.status === 'APPROVED';
+        events.push({
+          id: `kyc:${k.id}`,
+          type: 'kyc_decision',
+          source: 'admin',
+          title: approved ? 'KYC disetujui' : `KYC ${k.status.toLowerCase()}`,
+          description: k.rejectionReason ?? null,
+          actor: k.reviewer ? { id: k.reviewer.id, name: k.reviewer.fullName, role: k.reviewer.role } : null,
+          createdAt: k.reviewedAt,
+          ...(canSeeInternalNotes && k.adminNotes
+            ? { internalNote: k.adminNotes }
+            : k.adminNotes
+              ? { internalNoteHidden: true }
+              : {}),
+          metadata: { kycId: k.kycId, status: k.status },
+        });
+      }
+    }
+
+    // 3. Resolusi laporan.
+    if (!eventFilter || eventFilter === 'report_resolved') {
+      const reports = await this.prisma.userReport.findMany({
+        where: { targetId: id, reviewedAt: { not: null } },
+        orderBy: { reviewedAt: 'desc' },
+        take: 50,
+        select: {
+          id: true, category: true, status: true, reviewedAt: true,
+          resolution: true,
+        },
+      });
+      // reviewedBy adalah soft FK (String) — ambil info admin terpisah bila ada.
+      const reviewerIds = [...new Set(reports.map((r) => (r as unknown as { reviewedBy: string | null }).reviewedBy).filter(Boolean))] as string[];
+      const reviewers = reviewerIds.length > 0
+        ? await this.prisma.adminUser.findMany({
+            where: { id: { in: reviewerIds } },
+            select: { id: true, fullName: true, role: true },
+          })
+        : [];
+      const reviewerById = new Map(reviewers.map((r) => [r.id, r]));
+      for (const r of reports) {
+        if (!r.reviewedAt || !inRange(r.reviewedAt)) continue;
+        const rb = (r as unknown as { reviewedBy: string | null }).reviewedBy;
+        if (!actorOk(rb)) continue;
+        const reviewer = rb ? reviewerById.get(rb) : undefined;
+        events.push({
+          id: `report:${r.id}`,
+          type: 'report_resolved',
+          source: 'admin',
+          title: `Laporan diselesaikan (${r.status})`,
+          description: r.resolution ?? null,
+          actor: reviewer ? { id: reviewer.id, name: reviewer.fullName, role: reviewer.role } : null,
+          createdAt: r.reviewedAt,
+          metadata: { category: r.category, reportId: r.id },
+        });
+      }
+    }
+
+    // 4. Flag agregasi laporan — sinyal otomatis (system).
+    if (!eventFilter || eventFilter === 'flag_raised' || eventFilter === 'flag_cleared') {
+      const user = await this.prisma.user.findUnique({
+        where: { id },
+        select: { flaggedForReview: true, flaggedForReviewAt: true },
+      });
+      if (user?.flaggedForReview && user.flaggedForReviewAt && inRange(user.flaggedForReviewAt)) {
+        if ((!eventFilter || eventFilter === 'flag_raised') && actorOk(null)) {
+          events.push({
+            id: `flag:${id}`,
+            type: 'flag_raised',
+            source: 'system',
+            title: 'Ditandai untuk review (otomatis)',
+            description: '≥ 3 pengguna berbeda melaporkan akun ini dalam 24 jam. Bukan sanksi — menunggu review admin.',
+            actor: null,
+            createdAt: user.flaggedForReviewAt,
+          });
+        }
+      }
+    }
+
+    events.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    const limited = events.slice(0, AdminUsersService.MODERATION_TIMELINE_LIMIT);
+    return {
+      data: limited,
+      total: events.length,
+      hasMore: events.length > limited.length,
+    };
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  // GAP-E (G380) — Ekspor CSV pengguna yang diperkuat
+  //
+  // - `reason` WAJIB → dicatat di UserExportAudit + AdminAuditLog.
+  // - `columns` opsional (whitelist); default kolom minimal.
+  // - `mask` default true; unmask hanya untuk role allowlist.
+  // - Dataset > 5000 baris → 202 + jobId; hasil di storage privat +
+  //   signed URL 15 menit (pola sama seperti ekspor akun ST-019).
+  // ══════════════════════════════════════════════════════════════
+
+  private static readonly EXPORTABLE_COLUMNS = [
+    'userId', 'username', 'fullName', 'email', 'phoneNumber', 'status',
+    'kycStatus', 'isBanned', 'banReason', 'emailVerified', 'phoneVerified',
+    'isActive', 'isKahadePlus', 'membershipRank', 'averageRating',
+    'totalOrdersAsBuyer', 'totalOrdersAsSeller', 'totalOrdersCompleted',
+    'createdAt', 'lastLoginAt',
+  ] as const;
+
+  private static readonly DEFAULT_EXPORT_COLUMNS = [
+    'userId', 'username', 'status', 'kycStatus', 'createdAt',
+  ];
+
+  /** Ambang async: di atas ini ekspor berjalan di latar (202 + jobId). */
+  private static readonly EXPORT_ASYNC_THRESHOLD = 5000;
+  private static readonly EXPORT_BATCH_SIZE = 1000;
+  private static readonly EXPORT_JOB_TTL_SECONDS = 2 * 60 * 60;
+  private static readonly EXPORT_JOB_KEY = (jobId: string): string => `admin_user_export_job:${jobId}`;
+  /** Signed URL unduhan hasil ekspor: 15 menit. */
+  private static readonly EXPORT_DOWNLOAD_TTL_SECONDS = 900;
+
+  private parseExportColumns(columns?: string): string[] {
+    if (!columns || !columns.trim()) return [...AdminUsersService.DEFAULT_EXPORT_COLUMNS];
+    const parsed = columns.split(',').map((c) => c.trim()).filter(Boolean);
+    const unknown = parsed.filter((c) => !(AdminUsersService.EXPORTABLE_COLUMNS as readonly string[]).includes(c));
+    if (unknown.length > 0) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: `Unknown export columns: ${unknown.join(', ')}. Allowed: ${AdminUsersService.EXPORTABLE_COLUMNS.join(', ')}`,
+      });
+    }
+    return [...new Set(parsed)];
+  }
+
+  private escapeCsvCell(value: unknown): string {
+    if (value === null || value === undefined) return '';
+    const s = String(value);
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  }
+
+  private async buildExportRow(
+    u: {
+      userId: string; username: string | null; fullName: string | null; email: string | null;
+      phoneNumber: string | null; isBanned: boolean; banReason: string | null; kycStatus: unknown;
+      emailVerified: boolean; phoneVerified: boolean; isActive: boolean; isKahadePlus: boolean | null;
+      membershipRank: string | null; averageRating: { toNumber(): number } | number | null;
+      totalOrdersAsBuyer: number; totalOrdersAsSeller: number; totalOrdersCompleted: number;
+      createdAt: Date; lastLoginAt: Date | null;
+    },
+    columns: string[],
+    adminRole: string,
+    mask: boolean,
+  ): Promise<string[]> {
+    const decryptedPhone = await decryptPiiSafe(u.phoneNumber);
+    const masked = applyUserMask(adminRole, { email: u.email, phoneNumber: decryptedPhone });
+    const email = mask ? masked.email : u.email;
+    const phone = mask ? masked.phoneNumber : decryptedPhone;
+    const values: Record<string, unknown> = {
+      userId: u.userId,
+      username: u.username,
+      fullName: u.fullName,
+      email,
+      phoneNumber: phone,
+      status: u.isBanned ? 'banned' : 'active',
+      kycStatus: u.kycStatus,
+      isBanned: u.isBanned,
+      banReason: u.banReason,
+      emailVerified: u.emailVerified,
+      phoneVerified: u.phoneVerified,
+      isActive: u.isActive,
+      isKahadePlus: u.isKahadePlus,
+      membershipRank: u.membershipRank,
+      averageRating: typeof u.averageRating === 'number' ? u.averageRating : u.averageRating?.toNumber() ?? null,
+      totalOrdersAsBuyer: u.totalOrdersAsBuyer,
+      totalOrdersAsSeller: u.totalOrdersAsSeller,
+      totalOrdersCompleted: u.totalOrdersCompleted,
+      createdAt: u.createdAt?.toISOString(),
+      lastLoginAt: u.lastLoginAt?.toISOString() ?? null,
+    };
+    return columns.map((c) => this.escapeCsvCell(values[c]));
+  }
+
+  private async writeExportAudit(
+    adminId: string,
+    dto: UserExportQueryDto,
+    columns: string[],
+    rowCount: number,
+    ipAddress: string,
+    jobId?: string,
+  ): Promise<void> {
+    await this.prisma.userExportAudit.create({
+      data: {
+        adminId,
+        filters: { search: dto.search ?? null, status: dto.status ?? null } as Prisma.InputJsonValue,
+        columns,
+        rowCount,
+        reason: dto.reason,
+      },
+    });
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.USER_EXPORTED,
+      targetType: 'User',
+      targetId: jobId ?? 'bulk',
+      description: `Admin exported ${rowCount} user(s) to CSV. Reason: ${dto.reason}${jobId ? ` (async job ${jobId})` : ''}`,
+      after: { rowCount, columns, filters: { search: dto.search ?? null, status: dto.status ?? null }, jobId: jobId ?? null },
+      ipAddress,
+    });
+  }
+
+  async exportUsersCsv(
+    dto: UserExportQueryDto,
+    adminRole: string,
+    adminId: string,
+    ipAddress: string,
+  ): Promise<
+    | { kind: 'sync'; csv: string; filename: string; rowCount: number }
+    | { kind: 'async'; jobId: string; rowCount: number }
+  > {
+    const columns = this.parseExportColumns(dto.columns);
+    const mask = dto.mask !== false;
+    if (!mask && !PII_UNMASKED_ROLES.includes(adminRole)) {
+      throw new ForbiddenException({
+        code: ErrorCodes.INSUFFICIENT_ADMIN_ROLE,
+        message: 'Unmasked export is restricted to SUPER_ADMIN',
+      });
+    }
+
+    const where = this.buildUserWhere(dto.search, dto.status);
+    const rowCount = await this.prisma.user.count({ where });
+
+    if (rowCount > AdminUsersService.EXPORT_ASYNC_THRESHOLD) {
+      const jobId = randomUUID();
+      const job = {
+        status: 'pending',
+        adminId,
+        adminRole,
+        reason: dto.reason,
+        columns,
+        mask,
+        filters: { search: dto.search ?? null, status: dto.status ?? null },
+        rowCount,
+        createdAt: new Date().toISOString(),
+      };
+      await this.redis.setex(
+        AdminUsersService.EXPORT_JOB_KEY(jobId),
+        AdminUsersService.EXPORT_JOB_TTL_SECONDS,
+        JSON.stringify(job),
+        { throwOnError: true },
+      );
+      await this.writeExportAudit(adminId, dto, columns, rowCount, ipAddress, jobId);
+      // Latar: jangan blok respons 202. Kegagalan dicatat di status job.
+      void this.runExportJobInBackground(jobId, job).catch((err: unknown) => {
+        this.logger.error(`Export job ${jobId} crashed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+      return { kind: 'async', jobId, rowCount };
+    }
+
+    // Jalur sinkron (≤ 5000 baris): bangun CSV langsung.
+    const header = columns.join(',');
+    const lines: string[] = [header];
+    let skip = 0;
+    for (;;) {
+      const batch = await this.prisma.user.findMany({
+        where,
+        skip,
+        take: AdminUsersService.EXPORT_BATCH_SIZE,
+        orderBy: { createdAt: 'asc' },
+        select: {
+          userId: true, username: true, fullName: true, email: true, phoneNumber: true,
+          isBanned: true, banReason: true, kycStatus: true,
+          emailVerified: true, phoneVerified: true, isActive: true, isKahadePlus: true,
+          membershipRank: true, averageRating: true,
+          totalOrdersAsBuyer: true, totalOrdersAsSeller: true, totalOrdersCompleted: true,
+          createdAt: true, lastLoginAt: true,
+        },
+      });
+      if (batch.length === 0) break;
+      for (const u of batch) {
+        lines.push((await this.buildExportRow(u, columns, adminRole, mask)).join(','));
+      }
+      skip += batch.length;
+      if (batch.length < AdminUsersService.EXPORT_BATCH_SIZE) break;
+    }
+
+    await this.writeExportAudit(adminId, dto, columns, rowCount, ipAddress);
+    const stamp = new Date().toISOString().slice(0, 10);
+    return {
+      kind: 'sync',
+      csv: '\uFEFF' + lines.join('\n'),
+      filename: `kahade-users-${stamp}.csv`,
+      rowCount,
+    };
+  }
+
+  /** Pekerja latar untuk ekspor async: batch → CSV → enkripsi → storage privat. */
+  private async runExportJobInBackground(
+    jobId: string,
+    job: {
+      adminId: string; adminRole: string; columns: string[]; mask: boolean;
+      filters: { search: string | null; status: string | null }; rowCount: number;
+    },
+  ): Promise<void> {
+    const key = AdminUsersService.EXPORT_JOB_KEY(jobId);
+    const fail = async (message: string): Promise<void> => {
+      await this.redis.setex(
+        key,
+        AdminUsersService.EXPORT_JOB_TTL_SECONDS,
+        JSON.stringify({ ...job, status: 'failed', error: message, finishedAt: new Date().toISOString() }),
+        { throwOnError: false },
+      );
+    };
+    try {
+      const where = this.buildUserWhere(job.filters.search ?? undefined, job.filters.status ?? undefined);
+      const lines: string[] = [job.columns.join(',')];
+      let skip = 0;
+      for (;;) {
+        const batch = await this.prisma.user.findMany({
+          where,
+          skip,
+          take: AdminUsersService.EXPORT_BATCH_SIZE,
+          orderBy: { createdAt: 'asc' },
+          select: {
+            userId: true, username: true, fullName: true, email: true, phoneNumber: true,
+            isBanned: true, banReason: true, kycStatus: true,
+            emailVerified: true, phoneVerified: true, isActive: true, isKahadePlus: true,
+            membershipRank: true, averageRating: true,
+            totalOrdersAsBuyer: true, totalOrdersAsSeller: true, totalOrdersCompleted: true,
+            createdAt: true, lastLoginAt: true,
+          },
+        });
+        if (batch.length === 0) break;
+        for (const u of batch) {
+          lines.push((await this.buildExportRow(u, job.columns, job.adminRole, job.mask)).join(','));
+        }
+        skip += batch.length;
+        // Update progres agar UI bisa menampilkan persentase.
+        await this.redis.setex(
+          key,
+          AdminUsersService.EXPORT_JOB_TTL_SECONDS,
+          JSON.stringify({ ...job, status: 'processing', processed: skip, rowCount: job.rowCount }),
+          { throwOnError: false },
+        );
+        if (batch.length < AdminUsersService.EXPORT_BATCH_SIZE) break;
+      }
+
+      const csv = '\uFEFF' + lines.join('\n');
+      // ST-019: enkripsi at-rest, pola sama seperti ekspor akun.
+      const encrypted = await encryptAES(Buffer.from(csv, 'utf-8').toString('base64'));
+      const fileKey = `uploads/admin-exports/${job.adminId}/${jobId}.csv`;
+      await this.localStorage.saveFile(fileKey, Buffer.from(encrypted, 'utf-8'));
+
+      await this.redis.setex(
+        key,
+        AdminUsersService.EXPORT_JOB_TTL_SECONDS,
+        JSON.stringify({ ...job, status: 'ready', processed: skip, fileKey, finishedAt: new Date().toISOString() }),
+        { throwOnError: false },
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Export job ${jobId} failed: ${message}`);
+      await fail(message);
+    }
+  }
+
+  /** Poll status job ekspor async. Signed URL 15 menit dibuat saat poll (fresh). */
+  async getExportJobStatus(jobId: string, adminId: string): Promise<object> {
+    const raw = await this.redis.get(AdminUsersService.EXPORT_JOB_KEY(jobId), { throwOnError: true });
+    if (!raw) {
+      throw new NotFoundException({ code: 'EXPORT_JOB_NOT_FOUND', message: 'Export job not found or expired' });
+    }
+    let job: Record<string, unknown>;
+    try {
+      job = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      throw new NotFoundException({ code: 'EXPORT_JOB_NOT_FOUND', message: 'Export job not found or expired' });
+    }
+    if (job.adminId !== adminId) {
+      throw new ForbiddenException({ code: ErrorCodes.FORBIDDEN, message: 'Export job belongs to another admin' });
+    }
+    if (job.status === 'ready' && typeof job.fileKey === 'string') {
+      const downloadUrl = await this.uploadService.generateDownloadUrl(
+        job.fileKey,
+        AdminUsersService.EXPORT_DOWNLOAD_TTL_SECONDS,
+      );
+      return {
+        jobId,
+        status: 'ready',
+        rowCount: job.rowCount,
+        processed: job.processed,
+        downloadUrl,
+        expiresIn: AdminUsersService.EXPORT_DOWNLOAD_TTL_SECONDS,
+        finishedAt: job.finishedAt,
+      };
+    }
+    return {
+      jobId,
+      status: job.status,
+      rowCount: job.rowCount,
+      processed: job.processed ?? 0,
+      error: job.error ?? null,
+      finishedAt: job.finishedAt ?? null,
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // GAP-A (G067): status penghapusan akun + legal hold.
+  // Data yang wajib ditahan (sengketa/retensi hukum) dipisahkan dari data
+  // yang akan dipurge: request ON_HOLD tidak diproses purge worker.
+  // ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Lihat permintaan penghapusan akun terbaru user + riwayat status
+   * (read-only untuk audit admin).
+   */
+  async getDeletionStatus(userId: string): Promise<object> {
+    // G071: user dalam masa tenggang sudah soft-deleted — lookup menyertakan mereka.
+    const user = await this.findUserIncludingDeletedOrThrow(userId);
+    const request = await this.prisma.accountDeletionRequest.findFirst({
+      where: { userId: user.id },
+      orderBy: { requestedAt: 'desc' },
+      include: {
+        history: { orderBy: { createdAt: 'asc' } },
+      },
+    });
+    if (!request) {
+      return { userId: user.id, request: null, history: [] };
+    }
+    return { userId: user.id, request, history: request.history };
+  }
+
+  /**
+   * Lookup user TANPA filter deletedAt — untuk alur penghapusan akun:
+   * user dengan request penghapusan aktif SUDAH soft-deleted (deletedAt
+   * terisi, isActive=false), jadi findActiveUserOrThrow selalu 404
+   * untuk mereka (GAP-A G071). Dipakai legal hold/release.
+   */
+  private async findUserIncludingDeletedOrThrow(userId: string) {
+    const user = await this.prisma.user.findFirst({
+      where: { OR: [{ id: userId }, { userId }] },
+      select: { id: true, userId: true, email: true },
+    });
+    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    return user;
+  }
+
+  /**
+   * Tahan penghapusan karena sengketa/retensi hukum (ON_HOLD).
+   * Purge worker melewati request ON_HOLD (G056).
+   */
+  async placeDeletionLegalHold(
+    userId: string,
+    reason: string,
+    adminId: string,
+    ipAddress: string = 'internal',
+  ): Promise<object> {
+    // G071: user dalam masa tenggang sudah soft-deleted — jangan pakai
+    // findActiveUserOrThrow (deletedAt: null) yang selalu 404 untuk mereka.
+    const user = await this.findUserIncludingDeletedOrThrow(userId);
+    if (!reason?.trim()) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Alasan legal hold wajib diisi.' });
+    }
+    const request = await this.prisma.accountDeletionRequest.findFirst({
+      where: {
+        userId: user.id,
+        status: { in: [DeletionRequestStatus.REQUESTED, DeletionRequestStatus.PENDING] },
+      },
+      orderBy: { requestedAt: 'desc' },
+    });
+    if (!request) {
+      throw new NotFoundException({
+        code: ErrorCodes.DELETION_REQUEST_NOT_FOUND,
+        message: 'Tidak ada permintaan penghapusan aktif untuk user ini.',
+      });
+    }
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const fresh = await tx.accountDeletionRequest.findUnique({ where: { id: request.id } });
+      if (!fresh || (fresh.status !== DeletionRequestStatus.REQUESTED && fresh.status !== DeletionRequestStatus.PENDING)) {
+        throw new ConflictException({
+          code: ErrorCodes.DELETION_REQUEST_NOT_ACTIVE,
+          message: 'Status permintaan berubah; muat ulang dan coba lagi.',
+        });
+      }
+      const next = await tx.accountDeletionRequest.update({
+        where: { id: request.id },
+        data: { status: DeletionRequestStatus.ON_HOLD, legalHoldReason: reason.trim().slice(0, 500) },
+      });
+      await tx.accountDeletionStatusHistory.create({
+        data: {
+          requestId: request.id,
+          fromStatus: fresh.status,
+          toStatus: DeletionRequestStatus.ON_HOLD,
+          actorType: 'ADMIN',
+          actorUserId: adminId,
+          reason: reason.trim().slice(0, 500),
+        },
+      });
+      return next;
+    });
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'AccountDeletionRequest',
+      targetId: request.id,
+      description: `Admin placed legal hold on deletion request ${request.referenceCode}. Reason: ${reason.trim().slice(0, 200)}`,
+      before: { status: request.status },
+      after: { status: DeletionRequestStatus.ON_HOLD, legalHoldReason: reason.trim().slice(0, 500) },
+      ipAddress,
+    });
+
+    return updated;
+  }
+
+  /**
+   * Lepaskan legal hold — request kembali aktif (REQUESTED) dengan purgeAt
+   * yang sama; riwayat mencatat pelepasan oleh admin.
+   */
+  async releaseDeletionLegalHold(
+    userId: string,
+    adminId: string,
+    ipAddress: string = 'internal',
+  ): Promise<object> {
+    // G071: lihat placeDeletionLegalHold — user dalam masa tenggang sudah
+    // soft-deleted, lookup harus menyertakan mereka.
+    const user = await this.findUserIncludingDeletedOrThrow(userId);
+    const request = await this.prisma.accountDeletionRequest.findFirst({
+      where: { userId: user.id, status: DeletionRequestStatus.ON_HOLD },
+      orderBy: { requestedAt: 'desc' },
+    });
+    if (!request) {
+      throw new NotFoundException({
+        code: ErrorCodes.DELETION_REQUEST_NOT_FOUND,
+        message: 'Tidak ada permintaan penghapusan yang sedang ON_HOLD untuk user ini.',
+      });
+    }
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const fresh = await tx.accountDeletionRequest.findUnique({ where: { id: request.id } });
+      if (!fresh || fresh.status !== DeletionRequestStatus.ON_HOLD) {
+        throw new ConflictException({
+          code: ErrorCodes.DELETION_REQUEST_NOT_ACTIVE,
+          message: 'Status permintaan berubah; muat ulang dan coba lagi.',
+        });
+      }
+      const next = await tx.accountDeletionRequest.update({
+        where: { id: request.id },
+        data: { status: DeletionRequestStatus.REQUESTED, legalHoldReason: null },
+      });
+      await tx.accountDeletionStatusHistory.create({
+        data: {
+          requestId: request.id,
+          fromStatus: DeletionRequestStatus.ON_HOLD,
+          toStatus: DeletionRequestStatus.REQUESTED,
+          actorType: 'ADMIN',
+          actorUserId: adminId,
+          reason: 'Legal hold dilepas admin',
+        },
+      });
+      return next;
+    });
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'AccountDeletionRequest',
+      targetId: request.id,
+      description: `Admin released legal hold on deletion request ${request.referenceCode}.`,
+      before: { status: DeletionRequestStatus.ON_HOLD },
+      after: { status: DeletionRequestStatus.REQUESTED },
+      ipAddress,
+    });
+
+    return updated;
+  }
+
 }

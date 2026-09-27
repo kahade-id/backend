@@ -9,6 +9,7 @@ import { RedisService } from '../../redis/redis.service';
 import { LocalStorageService } from './local-storage.service';
 import { encryptAES, decryptAES } from '../../common/utils/crypto.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
+import { withSpan } from '../../common/tracing/tracing';
 
 const nanoid = customAlphabet('1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ', 10);
 
@@ -183,7 +184,9 @@ const PRIVATE_FOLDER_PREFIXES: string[] = (Object.keys(PURPOSE_VISIBILITY) as Up
 // generateDownloadUrl(), uploadDirect(), dan endpoint download terautentikasi.
 export function isPrivateFileKey(fileKey: string): boolean {
   return PRIVATE_FOLDER_PREFIXES.some(prefix => fileKey.startsWith(prefix))
-    || fileKey.startsWith('uploads/account-exports/');
+    || fileKey.startsWith('uploads/account-exports/')
+    // GAP-E (G380): hasil ekspor CSV admin — privat + signed URL kedaluwarsa.
+    || fileKey.startsWith('uploads/admin-exports/');
 }
 
 /** Prefix folder publik yang diserve langsung oleh nginx tanpa auth. */
@@ -228,8 +231,21 @@ export class UploadService {
     return `${apiBase}/v1/upload/s?key=${encodeURIComponent(fileKey)}&exp=${exp}&sig=${sig}`;
   }
 
-  /** Verifikasi query signed download. Kembalikan fileKey bila valid. */
-  verifySignedDownload(key: string, exp: string, sig: string): string | null {
+  /**
+   * G100: buat URL unduhan bertanda waktu on-demand untuk artefak ekspor.
+   * Hanya untuk key privat yang aman; pemanggil wajib sudah mengotorisasi
+   * kepemilikan (mis. SettingsService.downloadExportRequest).
+   */
+  createSignedDownloadUrl(fileKey: string, expiresInSeconds: number): { downloadUrl: string; expiresAt: Date } {
+    if (!isSafeFileKey(fileKey) || !isPrivateFileKey(fileKey)) {
+      throw new BadRequestException({ code: ErrorCodes.INVALID_FILE_TYPE, message: 'Invalid private file key' });
+    }
+    const downloadUrl = this.buildSignedDownloadUrl(fileKey, expiresInSeconds);
+    const exp = Number(new URL(downloadUrl).searchParams.get('exp')) * 1000;
+    return { downloadUrl, expiresAt: new Date(exp) };
+  }
+
+  /** Verifikasi query signed download. Kembalikan fileKey bila valid. */  verifySignedDownload(key: string, exp: string, sig: string): string | null {
     if (!isSafeFileKey(key) || !isPrivateFileKey(key)) return null;
     const expNum = Number(exp);
     if (!Number.isInteger(expNum) || expNum <= Math.floor(Date.now() / 1000)) return null;
@@ -261,7 +277,7 @@ export class UploadService {
     // ST-019: export akun disimpan terenkripsi at-rest — dekripsi saat serve.
     // Fallback: file lama (sebelum enkripsi) yang sudah berupa JSON diserve
     // apa adanya agar masa transisi tidak merusak unduhan yang sedang berjalan.
-    if (fileKey.startsWith('uploads/account-exports/')) {
+    if (fileKey.startsWith('uploads/account-exports/') || fileKey.startsWith('uploads/admin-exports/')) {
       const chunks: Buffer[] = [];
       for await (const chunk of stream) chunks.push(chunk as Buffer);
       const raw = Buffer.concat(chunks).toString('utf-8');
@@ -277,7 +293,12 @@ export class UploadService {
         }
       }
       stream = Readable.from([buf]);
-      return { stream, contentType: 'application/json', size: buf.length };
+      // G098: arsip CSV dikemas sebagai ZIP — content-type mengikuti ekstensi.
+      // GAP-E (G380): ekspor CSV admin → text/csv.
+      const contentType = fileKey.startsWith('uploads/admin-exports/')
+        ? 'text/csv; charset=utf-8'
+        : fileKey.endsWith('.zip') ? 'application/zip' : 'application/json';
+      return { stream, contentType, size: buf.length };
     }
     return { stream, contentType: this.localStorage.getContentType(fileKey), size };
   }
@@ -678,8 +699,13 @@ export class UploadService {
    * signed URL kedaluwarsa (bukan URL publik permanen), dan file dihapus
    * otomatis oleh scheduler setelah 24 jam.
    */
-  async uploadPrivateAccountExport(userId: string, content: Buffer): Promise<{ downloadUrl: string; expiresAt: Date }> {
-    const fileKey = `uploads/account-exports/${userId}/${nanoid()}.json`;
+  async uploadPrivateAccountExport(
+    userId: string,
+    content: Buffer,
+    options?: { fileExtension?: 'json' | 'zip' },
+  ): Promise<{ downloadUrl: string; expiresAt: Date; fileKey: string }> {
+    const ext = options?.fileExtension === 'zip' ? 'zip' : 'json';
+    const fileKey = `uploads/account-exports/${userId}/${nanoid()}.${ext}`;
     if (!isSafeFileKey(fileKey)) {
       throw new Error('Generated account export key failed storage safety validation');
     }
@@ -690,10 +716,43 @@ export class UploadService {
     return {
       downloadUrl: this.buildSignedDownloadUrl(fileKey, expiresIn),
       expiresAt: new Date(Date.now() + expiresIn * 1000),
+      // G100: kunci artefak disimpan (bukan URL signed mentah); URL dibuat
+      // on-demand saat riwayat ekspor diunduh ulang.
+      fileKey,
     };
   }
 
+  /**
+   * G481: span upload.direct — HANYA { fileKeyHash, size, mime, purpose }.
+   * Tanpa isi file, tanpa nama file asli, tanpa userId mentah di atribut
+   * (fileKey di-hash SHA-256 sebelum masuk span).
+   */
   async uploadDirect(
+    userId: string,
+    purpose: UploadPurpose,
+    fileName: string,
+    contentType: string,
+    fileBuffer: Buffer,
+  ): Promise<{ fileKey: string; fileUrl: string }> {
+    return withSpan(
+      'upload.direct',
+      async (span) => {
+        const result = await this.uploadDirectTx(userId, purpose, fileName, contentType, fileBuffer);
+        span.setAttribute(
+          'fileKeyHash',
+          createHash('sha256').update(result.fileKey).digest('hex'),
+        );
+        return result;
+      },
+      {
+        size: fileBuffer.length,
+        mime: contentType,
+        purpose,
+      },
+    );
+  }
+
+  private async uploadDirectTx(
     userId: string,
     purpose: UploadPurpose,
     fileName: string,
@@ -804,7 +863,7 @@ export class UploadService {
 
   private isKnownStorageKey(fileKey: string): boolean {
     const parts = fileKey.split('/');
-    return parts.length === 4 && (Boolean(PURPOSE_BY_FOLDER[parts[1]]) || parts[1] === 'account-exports');
+    return parts.length === 4 && (Boolean(PURPOSE_BY_FOLDER[parts[1]]) || parts[1] === 'account-exports' || parts[1] === 'admin-exports');
   }
 
   private static readonly PURPOSE_FOLDER_MAP: Record<UploadPurpose, string> = PURPOSE_FOLDER_MAP_INTERNAL;

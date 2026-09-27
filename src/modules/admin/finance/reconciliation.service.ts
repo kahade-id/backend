@@ -44,10 +44,86 @@ export interface AuditTrailResult {
   transactions: AuditTrailRow[];
 }
 
+export interface ReconcileBatchSnapshot {
+  batchId: string;
+  requestedBy: string;
+  requestedAt: string;
+  completedAt: string;
+  walletsChecked: number;
+  discrepanciesCount: number;
+  urgentCount: number;
+  clean: boolean;
+}
+
+const BATCH_SNAPSHOTS_KEY = 'reconciliation.batches';
+const MAX_BATCH_SNAPSHOTS = 20;
+
 @Injectable()
 export class ReconciliationService {
 
   constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * E3: simpan snapshot ringkasan batch agar tidak berubah saat dilihat
+   * ulang (hasil job Bull bersifat sementara). Disimpan di system_configs
+   * sebagai JSON (maks 20 batch terbaru).
+   */
+  async recordBatchSnapshot(
+    batchId: string,
+    requestedBy: string,
+    requestedAt: string,
+    result: ReconciliationResult,
+    urgentCount = 0,
+  ): Promise<ReconcileBatchSnapshot> {
+    const snapshot: ReconcileBatchSnapshot = {
+      batchId,
+      requestedBy,
+      requestedAt,
+      completedAt: new Date().toISOString(),
+      walletsChecked: result.walletsChecked,
+      discrepanciesCount: result.discrepancies.length,
+      urgentCount,
+      clean: result.clean,
+    };
+    const existing = await this.prisma.systemConfig.findUnique({
+      where: { key: BATCH_SNAPSHOTS_KEY },
+      select: { value: true },
+    });
+    let snapshots: ReconcileBatchSnapshot[] = [];
+    if (existing?.value) {
+      try {
+        const parsed = JSON.parse(existing.value) as ReconcileBatchSnapshot[];
+        if (Array.isArray(parsed)) snapshots = parsed;
+      } catch {
+        snapshots = [];
+      }
+    }
+    snapshots = [snapshot, ...snapshots.filter((s) => s.batchId !== batchId)].slice(0, MAX_BATCH_SNAPSHOTS);
+    await this.prisma.systemConfig.upsert({
+      where: { key: BATCH_SNAPSHOTS_KEY },
+      create: {
+        key: BATCH_SNAPSHOTS_KEY,
+        value: JSON.stringify(snapshots),
+        description: 'Snapshot ringkasan batch rekonsiliasi wallet (20 terbaru)',
+      },
+      update: { value: JSON.stringify(snapshots) },
+    });
+    return snapshot;
+  }
+
+  async listBatchSnapshots(): Promise<ReconcileBatchSnapshot[]> {
+    const row = await this.prisma.systemConfig.findUnique({
+      where: { key: BATCH_SNAPSHOTS_KEY },
+      select: { value: true },
+    });
+    if (!row?.value) return [];
+    try {
+      const parsed = JSON.parse(row.value) as ReconcileBatchSnapshot[];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
 
   async reconcileWalletBalance(userId: string): Promise<WalletDiscrepancy | null> {
     const wallet = await this.prisma.wallet.findUnique({

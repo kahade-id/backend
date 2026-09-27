@@ -186,6 +186,24 @@ export class DisputesController {
     return this.disputeMessageService.getMessages(disputeId, userId, pagination.page ?? 1, pagination.limit ?? 50);
   }
 
+  /**
+   * GAP-B3 (G139/G148): minta ulang signed URL lampiran pesan yang kedaluwarsa.
+   * Guard ganda: JWT global + `validateDisputeAccess` (hanya peserta sengketa)
+   * + fileKey harus terdaftar di pesan sengketa ini. Tidak ada URL mentah yang
+   * ditampilkan/disimpan — klien selalu lewat endpoint ini.
+   */
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Get(':disputeId/attachments/signed-url')
+  @ApiOperation({ summary: 'Get a fresh signed download URL for a dispute message attachment' })
+  async getMessageAttachmentSignedUrl(
+    @CurrentUser('sub') userId: string,
+    @Param('disputeId', ParseIdPipe) disputeId: string,
+    @Query('fileKey') fileKey: string,
+  ): Promise<{ url: string; expiresAt: string }> {
+    return this.disputeMessageService.getAttachmentSignedUrl(disputeId, userId, fileKey);
+  }
+
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 60000, limit: 20 } })
   @Idempotency()

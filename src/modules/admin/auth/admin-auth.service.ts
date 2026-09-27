@@ -34,6 +34,7 @@ export class AdminAuthService {
     password: string,
     totpToken?: string,
     ipAddress?: string,
+    userAgent?: string,
   ): Promise<
     | { requiresMfa: true; tempToken: string }
     | { requiresMfaSetup: true; tempToken: string }
@@ -161,6 +162,9 @@ export class AdminAuthService {
 
     this.logger.log(`Admin login: ${admin.adminId} [${admin.role}] dari ${ipAddress}`);
 
+    // GAP-E G393: catat sesi login admin (dapat di-revoke via management API).
+    await this.recordAdminSession(admin.id, ipAddress, userAgent);
+
     this.auditLogService.logAdminAction({
       adminId: admin.id,
       action: AuditAction.ADMIN_LOGIN,
@@ -194,6 +198,7 @@ export class AdminAuthService {
     tempToken: string,
     totpToken: string,
     ipAddress?: string,
+    userAgent?: string,
   ): Promise<{ accessToken: string; refreshToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }> {
     let payload: import('../../auth/token.service').TempTokenPayload;
     try {
@@ -269,6 +274,9 @@ export class AdminAuthService {
     const refreshToken = this.tokenService.signAdminRefreshToken({ sub: admin.id });
     this.logger.log(`Admin 2FA login: ${admin.adminId} [${admin.role}] dari ${ipAddress}`);
 
+    // GAP-E G393: catat sesi login admin (dapat di-revoke via management API).
+    await this.recordAdminSession(admin.id, ipAddress, userAgent);
+
     this.auditLogService.logAdminAction({
       adminId: admin.id,
       action: AuditAction.ADMIN_LOGIN,
@@ -330,6 +338,7 @@ export class AdminAuthService {
     tempToken: string,
     totpToken: string,
     ipAddress?: string,
+    userAgent?: string,
   ): Promise<{ accessToken: string; refreshToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }> {
     const admin = await this.verifyMfaSetupToken(tempToken);
 
@@ -367,7 +376,7 @@ export class AdminAuthService {
     this.logger.log(`Admin MFA enabled for ${admin.email}`);
 
     // Kembalikan sesi penuh — setara login sukses setelah MFA.
-    return this.issueAdminSession(admin, ipAddress);
+    return this.issueAdminSession(admin, ipAddress, userAgent);
   }
 
   private async verifyMfaSetupToken(tempToken: string) {
@@ -590,6 +599,7 @@ export class AdminAuthService {
   private async issueAdminSession(
     admin: { id: string; adminId: string; fullName: string; email: string; role: AdminRole; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: Date | null },
     ipAddress?: string,
+    userAgent?: string,
   ): Promise<{ accessToken: string; refreshToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }> {
     await this.prisma.adminUser.update({
       where: { id: admin.id },
@@ -618,6 +628,9 @@ export class AdminAuthService {
       ipAddress: ipAddress ?? 'unknown',
     });
 
+    // GAP-E G393: catat sesi login admin (dapat di-revoke via management API).
+    await this.recordAdminSession(admin.id, ipAddress, userAgent);
+
     return {
       accessToken,
       refreshToken,
@@ -632,6 +645,64 @@ export class AdminAuthService {
         lastLoginAt: new Date().toISOString(),
       },
     };
+  }
+
+  /**
+   * GAP-E G393: catat sesi login admin ke AdminSession sehingga terlihat di
+   * GET /v1/admin/management/:id/sessions dan dapat dicabut.
+   * Best-effort: kegagalan pencatatan tidak menggagalkan login.
+   */
+  /**
+   * GAP-E G393: catat sesi admin + deteksi login dari perangkat/lokasi baru.
+   * Bila admin belum pernah login dari kombinasi userAgent+IP ini, catat audit
+   * ADMIN_NEW_DEVICE_LOGIN dan tulis alert `[ADMIN ALERT]` (pola yang sama
+   * dengan SLA/dispute: belum ada kanal notifikasi in-app untuk admin).
+   */
+  private async recordAdminSession(adminId: string, ipAddress?: string, userAgent?: string): Promise<void> {
+    try {
+      const normalizedIp = ipAddress ?? 'unknown';
+      const normalizedUa = userAgent ?? null;
+      const prior = await this.prisma.adminSession.findFirst({
+        where: {
+          adminId,
+          OR: [
+            { userAgent: normalizedUa },
+            { ipAddress: normalizedIp },
+          ],
+        },
+        select: { id: true },
+      });
+      await this.prisma.adminSession.create({
+        data: {
+          adminId,
+          ipAddress: normalizedIp,
+          userAgent: normalizedUa,
+        },
+      });
+      if (!prior && normalizedUa !== null) {
+        this.logger.warn(
+          `[ADMIN ALERT] Login admin dari perangkat/lokasi baru: adminId=${adminId} ip=${normalizedIp} ua=${String(normalizedUa).slice(0, 120)}`,
+        );
+        try {
+          this.auditLogService.logAdminAction({
+            adminId,
+            action: AuditAction.ADMIN_NEW_DEVICE_LOGIN,
+            targetType: 'AdminUser',
+            targetId: adminId,
+            description: `Login admin dari perangkat/lokasi baru (ip=${normalizedIp})`,
+            after: { userAgent: String(normalizedUa).slice(0, 200) },
+            ipAddress: normalizedIp,
+            userAgent: String(normalizedUa).slice(0, 200),
+          });
+        } catch (err) {
+          this.logger.error(`Failed to audit new-device admin login: ${String(err)}`);
+        }
+      }
+    } catch (err) {
+      this.logger.error(
+        `Failed to record admin session for ${adminId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   private async isAdminMfaRequired(): Promise<boolean> {

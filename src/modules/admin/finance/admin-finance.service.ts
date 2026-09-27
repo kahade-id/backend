@@ -18,6 +18,39 @@ import { decryptAES } from '../../../common/utils/crypto.util';
 import { toIdr } from '../../../common/utils/currency.util';
 import { parseDateBoundaryWIB, startOfDayWIB, toWIB } from '../../../common/utils/date.util';
 import { DashboardService } from '../dashboard/dashboard.service';
+import { maskSecretsDeep, toInitials } from './finance-secrets.util';
+import { URGENT_INVARIANT } from './reconciliation-findings.service';
+
+export type TimelineEventKind = 'LEDGER' | 'WEBHOOK' | 'PROVIDER' | 'REVERSAL';
+
+export interface TimelineEventInput {
+  at: Date | null | undefined;
+  kind: TimelineEventKind;
+  label: string;
+  detail?: string | null;
+}
+
+export interface TimelineEvent {
+  at: string;
+  kind: TimelineEventKind;
+  label: string;
+  detail: string | null;
+}
+
+/**
+ * E3: gabung + urutkan event timeline secara kronologis menaik
+ * (fungsi murni — di-unit-test terpisah).
+ */
+export function buildSortedTimeline(inputs: TimelineEventInput[]): TimelineEvent[] {
+  const withDates = inputs.filter((i): i is TimelineEventInput & { at: Date } => !!i.at);
+  withDates.sort((a, b) => a.at.getTime() - b.at.getTime() || a.kind.localeCompare(b.kind));
+  return withDates.map((e) => ({
+    at: (e.at as Date).toISOString(),
+    kind: e.kind,
+    label: e.label,
+    detail: e.detail ?? null,
+  }));
+}
 
 @Injectable()
 export class AdminFinanceService {
@@ -88,12 +121,18 @@ export class AdminFinanceService {
     }
 
     // WF-013: pencarian server-side — digabung AND dengan filter lain.
+    // E3: cakupan diperluas ke referensi eksternal (midtransOrderId,
+    // flashTransactionId, irisPayoutId, irisRef).
     const search = (q ?? '').trim().slice(0, 100);
     if (search) {
       where.OR = [
         { txId: { contains: search } },
         { description: { contains: search, mode: 'insensitive' } },
         { order: { orderId: { contains: search } } },
+        { paymentTx: { midtransOrderId: { contains: search, mode: 'insensitive' } } },
+        { paymentTx: { flashTransactionId: { contains: search, mode: 'insensitive' } } },
+        { irisPayoutId: { contains: search } },
+        { irisRef: { contains: search } },
       ];
     }
 
@@ -133,7 +172,29 @@ export class AdminFinanceService {
     adminId: string,
     ipAddress: string = 'unknown',
   ): Promise<object> {
+    const detail = await this.buildTransactionDetail(txId, adminId, ipAddress);
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'WalletTransaction',
+      targetId: (detail as { id: string }).id,
+      description: `Viewed transaction detail ${(detail as { txId: string }).txId}`,
+      ipAddress,
+    });
+
+    return detail;
+  }
+
+  private async buildTransactionDetail(
+    txId: string,
+    adminId: string,
+    ipAddress: string = 'unknown',
+  ): Promise<object> {
     // B-22 (audit-fix): lookup by public txId only.
+    // E3 (G326-G350): audit kebocoran secret — metadata & payload webhook
+    // di-mask; tambah relasi order/topup, status provider, referensi
+    // eksternal, dan webhook terkait.
     const tx = await this.prisma.walletTransaction.findFirst({
       where: { txId },
       include: {
@@ -143,11 +204,51 @@ export class AdminFinanceService {
             user: { select: { userId: true, fullName: true, email: true } },
           },
         },
-        order: { select: { id: true, orderId: true, status: true } },
+        order: {
+          select: {
+            id: true,
+            orderId: true,
+            status: true,
+            buyerId: true,
+            sellerId: true,
+            // E3: schema Order kini memakai orderValue/buyerPayAmount/
+            // sellerReceiveAmount (totalAmount dihapus worker lain).
+            orderValue: true,
+            buyerPayAmount: true,
+            sellerReceiveAmount: true,
+            createdAt: true,
+          },
+        },
         bankAccount: {
           select: { id: true, bankCode: true, accountName: true, accountNumber: true },
         },
-        paymentTx: { select: { id: true, midtransOrderId: true, method: true, status: true } },
+        paymentTx: {
+          select: {
+            id: true,
+            midtransOrderId: true,
+            provider: true,
+            purpose: true,
+            method: true,
+            status: true,
+            fraudStatus: true,
+            vaNumber: true,
+            vaBank: true,
+            flashTransactionId: true,
+            webhookReceivedAt: true,
+            webhookPayload: true,
+            paidAt: true,
+            settledAt: true,
+            failedAt: true,
+            expiredAt: true,
+            createdAt: true,
+          },
+        },
+        reversalTx: {
+          select: { id: true, txId: true, type: true, status: true, amount: true, createdAt: true },
+        },
+        reversals: {
+          select: { id: true, txId: true, type: true, status: true, amount: true, createdAt: true },
+        },
       },
     });
 
@@ -164,6 +265,9 @@ export class AdminFinanceService {
       amount: toIdr(tx.amount),
       balanceBefore: toIdr(tx.balanceBefore),
       balanceAfter: toIdr(tx.balanceAfter),
+      // E3: metadata mentah TIDAK PERNAH dikembalikan tanpa masking —
+      // berpotensi menyimpan secret provider (server key, signature, token).
+      metadata: maskSecretsDeep(tx.metadata),
     };
 
     if (result.bankAccount) {
@@ -197,7 +301,230 @@ export class AdminFinanceService {
       };
     }
 
-    return result;
+    // Referensi eksternal provider (ID korelasi, bukan secret).
+    const externalRefs = {
+      midtransOrderId: tx.paymentTx?.midtransOrderId ?? null,
+      irisPayoutId: tx.irisPayoutId ?? null,
+      irisRef: tx.irisRef ?? null,
+      flashTransactionId: tx.paymentTx?.flashTransactionId ?? null,
+      vaNumber: tx.paymentTx?.vaNumber ?? null,
+      vaBank: tx.paymentTx?.vaBank ?? null,
+    };
+
+    // Status provider dari sisi payment transaction.
+    const providerStatus = tx.paymentTx
+      ? {
+          provider: tx.paymentTx.provider,
+          status: tx.paymentTx.status,
+          fraudStatus: tx.paymentTx.fraudStatus,
+          webhookReceivedAt: tx.paymentTx.webhookReceivedAt,
+          paidAt: tx.paymentTx.paidAt,
+          settledAt: tx.paymentTx.settledAt,
+          failedAt: tx.paymentTx.failedAt,
+          expiredAt: tx.paymentTx.expiredAt,
+        }
+      : null;
+
+    const webhooks = await this.findRelatedWebhooks(externalRefs);
+
+    // E3: BigInt (sen) di relasi order/reversal WAJIB dikonversi ke number
+    // IDR — JSON.stringify melempar TypeError untuk BigInt.
+    const order = tx.order
+      ? {
+          ...tx.order,
+          orderValue: toIdr(tx.order.orderValue),
+          buyerPayAmount: toIdr(tx.order.buyerPayAmount),
+          sellerReceiveAmount: toIdr(tx.order.sellerReceiveAmount),
+        }
+      : null;
+    const reversalTx = tx.reversalTx
+      ? { ...tx.reversalTx, amount: toIdr(tx.reversalTx.amount) }
+      : null;
+    const reversals = (tx.reversals ?? []).map((r) => ({
+      ...r,
+      amount: toIdr(r.amount),
+    }));
+
+    return {
+      ...result,
+      owner: tx.wallet?.user ?? null,
+      order,
+      reversalTx,
+      reversals,
+      externalRefs,
+      providerStatus,
+      webhooks,
+      // paymentTx dengan payload webhook yang sudah di-mask.
+      paymentTx: tx.paymentTx
+        ? { ...tx.paymentTx, webhookPayload: maskSecretsDeep(tx.paymentTx.webhookPayload) }
+        : null,
+    };
+  }
+
+  /**
+   * E3: webhook terkait sebuah transaksi — dicocokkan lewat
+   * `payload->>'order_id'` (= midtransOrderId) atau transactionId provider
+   * (= iris payout/ref). Payload di-mask dari secret.
+   */
+  private async findRelatedWebhooks(externalRefs: {
+    midtransOrderId: string | null;
+    irisPayoutId: string | null;
+    irisRef: string | null;
+  }): Promise<Array<Record<string, unknown>>> {
+    const refValues = [externalRefs.midtransOrderId, externalRefs.irisPayoutId, externalRefs.irisRef].filter(
+      (v): v is string => !!v,
+    );
+    if (refValues.length === 0) return [];
+    type WebhookRow = {
+      id: string;
+      source: string;
+      event: string;
+      isProcessed: boolean;
+      processedAt: Date | null;
+      errorMessage: string | null;
+      retryCount: number;
+      createdAt: Date;
+      payload: unknown;
+    };
+    const rows = await this.prisma.$queryRaw<WebhookRow[]>`
+      SELECT id, source, event, "isProcessed", "processedAt", "errorMessage", "retryCount", "createdAt", payload
+      FROM webhook_logs
+      WHERE payload->>'order_id' = ANY(${refValues}::text[])
+         OR "transactionId" = ANY(${refValues}::text[])
+      ORDER BY "createdAt" DESC
+      LIMIT 50`;
+    return rows.map((r) => ({ ...r, payload: maskSecretsDeep(r.payload) }));
+  }
+
+  /**
+   * E3: timeline gabungan event ledger + webhook untuk satu transaksi,
+   * terurut waktu menaik.
+   */
+  async getTransactionTimeline(txId: string, adminId: string, ipAddress: string = 'unknown'): Promise<object> {
+    const detail = (await this.buildTransactionDetail(txId, adminId, ipAddress)) as {
+      id: string;
+      txId: string;
+      type: string;
+      status: string;
+      createdAt: Date;
+      completedAt: Date | null;
+      failureReason: string | null;
+      reversalTx: { txId: string; createdAt: Date } | null;
+      reversals: Array<{ txId: string; createdAt: Date; type: string }>;
+      paymentTx: {
+        status: string;
+        webhookReceivedAt: Date | null;
+        paidAt: Date | null;
+        settledAt: Date | null;
+        failedAt: Date | null;
+        expiredAt: Date | null;
+        createdAt: Date;
+      } | null;
+      webhooks: Array<{
+        id: string;
+        source: string;
+        event: string;
+        isProcessed: boolean;
+        createdAt: Date;
+        errorMessage: string | null;
+      }>;
+    };
+
+    const inputs: TimelineEventInput[] = [];
+    const push = (at: Date | null | undefined, kind: TimelineEventKind, label: string, detail?: string | null) => {
+      inputs.push({ at, kind, label, detail: detail ?? null });
+    };
+
+    push(detail.createdAt, 'LEDGER', `Transaksi ${detail.txId} dibuat`, `type=${detail.type} status=${detail.status}`);
+    if (detail.paymentTx) {
+      const p = detail.paymentTx;
+      push(p.createdAt, 'PROVIDER', 'Payment transaction dibuat', `status=${p.status}`);
+      push(p.webhookReceivedAt, 'WEBHOOK', 'Webhook provider diterima', `status=${p.status}`);
+      push(p.paidAt, 'PROVIDER', 'Pembayaran diterima provider');
+      push(p.settledAt, 'PROVIDER', 'Dana settlement dari provider');
+      push(p.failedAt, 'PROVIDER', 'Pembayaran gagal/kedaluwarsa di provider');
+      push(p.expiredAt, 'PROVIDER', 'Payment transaction kedaluwarsa');
+    }
+    for (const w of detail.webhooks ?? []) {
+      push(
+        w.createdAt,
+        'WEBHOOK',
+        `${w.source}: ${w.event}`,
+        w.isProcessed ? 'diproses' : w.errorMessage ? `gagal: ${w.errorMessage.slice(0, 200)}` : 'belum diproses',
+      );
+    }
+    push(detail.completedAt, 'LEDGER', `Transaksi ${detail.status}`, detail.failureReason ?? undefined);
+    if (detail.reversalTx) {
+      push(detail.reversalTx.createdAt, 'REVERSAL', `Reversal oleh ${detail.reversalTx.txId}`);
+    }
+    for (const r of detail.reversals ?? []) {
+      push(r.createdAt, 'REVERSAL', `Reversal ${r.txId}`, `type=${r.type}`);
+    }
+
+    const events = buildSortedTimeline(inputs);
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'WalletTransaction',
+      targetId: detail.id,
+      description: `Viewed transaction timeline ${detail.txId}`,
+      ipAddress,
+    });
+
+    return {
+      txId: detail.txId,
+      events,
+    };
+  }
+
+  /**
+   * E3: ekspor CSV laporan rekonsiliasi TANPA PII — identitas pengguna hanya
+   * inisial (tanpa userId/email/nomor telepon).
+   */
+  async buildFindingsCsvExport(): Promise<string> {
+    const findings = await this.prisma.reconciliationFinding.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 5000,
+    });
+    const userIds = [...new Set(findings.map((f) => f.userId))];
+    const users = userIds.length
+      ? await this.prisma.user.findMany({
+          where: { id: { in: userIds } },
+          select: { id: true, fullName: true },
+        })
+      : [];
+    const nameById = new Map(users.map((u) => [u.id, u.fullName]));
+
+    const csvCell = (v: unknown): string => {
+      const s = v === null || v === undefined ? '' : String(v);
+      return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const lines: string[] = [];
+    lines.push(`# reconciliation findings export generated_at=${new Date().toISOString()} (WIB) — tanpa PII`);
+    lines.push(
+      'finding_id,inisial_pengguna,status,saldo_tercatat_idr,saldo_hitung_ulang_idr,selisih_idr,urgent,invariant_dilanggar,umur_hari,dibuat_pada',
+    );
+    for (const f of findings) {
+      const ageDays = Math.floor((Date.now() - f.createdAt.getTime()) / (24 * 3600 * 1000));
+      lines.push(
+        [
+          f.id,
+          toInitials(nameById.get(f.userId)),
+          f.status,
+          toIdr(f.recordedBalance),
+          toIdr(f.computedBalance),
+          toIdr(f.difference),
+          f.violatedInvariants.includes(URGENT_INVARIANT) ? 'YA' : 'TIDAK',
+          f.violatedInvariants.join('|'),
+          ageDays,
+          f.createdAt.toISOString(),
+        ]
+          .map(csvCell)
+          .join(','),
+      );
+    }
+    return lines.join('\n') + '\n';
   }
 
   async getFinancialSummary(): Promise<object> {

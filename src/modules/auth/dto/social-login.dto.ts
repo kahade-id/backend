@@ -21,6 +21,11 @@ export class SocialLoginDto {
   @IsString()
   deviceInfo?: string;
 
+  @ApiPropertyOptional({ description: 'Nonce yang dikirim saat otorisasi Apple (wajib untuk Apple, anti-replay G011)' })
+  @IsOptional()
+  @IsString()
+  nonce?: string;
+
   @ApiPropertyOptional({ description: 'Access token (required for Apple to verify)' })
   @IsOptional()
   @IsString()

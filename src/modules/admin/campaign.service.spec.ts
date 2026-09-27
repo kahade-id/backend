@@ -1,10 +1,11 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException } from '@nestjs/common';
-import { CampaignStatus, CampaignType, MembershipRank } from '@prisma/client';
+import { AuditAction, CampaignStatus, CampaignType, MembershipRank } from '@prisma/client';
 import { CampaignService } from './campaign.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { NotificationQueueService } from '../queue/notification-queue.service';
+import * as ErrorCodes from '../../common/constants/error-codes';
 
 const mockPrisma = {
   campaign: {
@@ -17,7 +18,10 @@ const mockPrisma = {
     delete: jest.fn(),
   },
   user: { findMany: jest.fn() },
-  voucher: { count: jest.fn(), create: jest.fn() },
+  voucher: { count: jest.fn(), create: jest.fn(), updateMany: jest.fn() },
+  voucherUsage: { findMany: jest.fn(), aggregate: jest.fn() },
+  campaignVersion: { aggregate: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn() },
+  $transaction: jest.fn(),
 };
 const mockAuditLog = { logAdminAction: jest.fn() };
 const mockNotificationQueue = { enqueue: jest.fn().mockResolvedValue(undefined) };
@@ -127,6 +131,139 @@ describe('CampaignService', () => {
 
   it('rejects an update with no actual fields', async () => {
     mockPrisma.campaign.findUnique.mockResolvedValue(baseCampaign);
-    await expect(service.updateCampaign(baseCampaign.campaignId, 'admin', {})).rejects.toThrow('At least one campaign field');
+    await expect(service.updateCampaign(baseCampaign.campaignId, 'admin', {
+      changeReason: 'Tidak ada perubahan berarti',
+    })).rejects.toThrow('At least one campaign field');
+  });
+
+  it('G351: rejects changing locked fields once the campaign is no longer DRAFT', async () => {
+    mockPrisma.campaign.findUnique.mockResolvedValue({ ...baseCampaign, status: CampaignStatus.ACTIVE, promoCode: 'LAMA123' });
+    await expect(
+      service.updateCampaign(baseCampaign.campaignId, 'admin', {
+        promoCode: 'BARU123',
+        changeReason: 'Ubah kode promo aktif',
+      }),
+    ).rejects.toMatchObject({ response: expect.objectContaining({ code: ErrorCodes.CAMPAIGN_FIELD_LOCKED }) });
+    expect(mockPrisma.campaign.update).not.toHaveBeenCalled();
+    expect(mockPrisma.campaignVersion.create).not.toHaveBeenCalled();
+  });
+
+  it('G351: still allows editing unlocked fields on an ACTIVE campaign', async () => {
+    mockPrisma.campaign.findUnique.mockResolvedValue({ ...baseCampaign, status: CampaignStatus.ACTIVE, promoCode: 'LAMA123' });
+    mockPrisma.campaignVersion.aggregate.mockResolvedValue({ _max: { version: 1 } });
+    mockPrisma.campaignVersion.create.mockResolvedValue({});
+    mockPrisma.campaign.update.mockResolvedValue({ ...baseCampaign, name: 'Nama baru' });
+    const result = await service.updateCampaign(baseCampaign.campaignId, 'admin', {
+      name: 'Nama baru',
+      promoCode: 'LAMA123', // nilai sama → tidak dianggap perubahan field terkunci
+      changeReason: 'Perbaiki nama campaign',
+    });
+    expect(result).toMatchObject({ name: 'Nama baru' });
+  });
+
+  it('G353: writes a CampaignVersion with incremented version BEFORE the update, plus CAMPAIGN_UPDATED audit', async () => {
+    mockPrisma.campaign.findUnique.mockResolvedValue(baseCampaign);
+    mockPrisma.campaignVersion.aggregate.mockResolvedValue({ _max: { version: 5 } });
+    mockPrisma.campaignVersion.create.mockResolvedValue({});
+    mockPrisma.campaign.update.mockResolvedValue({ ...baseCampaign, name: 'Nama baru' });
+
+    await service.updateCampaign(baseCampaign.campaignId, 'admin', {
+      name: 'Nama baru',
+      changeReason: 'Perpanjang periode promo akhir tahun',
+    });
+
+    expect(mockPrisma.campaignVersion.create).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.campaignVersion.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        version: 6,
+        changedBy: 'admin',
+        changeReason: 'Perpanjang periode promo akhir tahun',
+      }),
+    }));
+    const createCalls = mockPrisma.campaignVersion.create.mock.invocationCallOrder[0];
+    const updateCalls = mockPrisma.campaign.update.mock.invocationCallOrder[0];
+    expect(createCalls).toBeLessThan(updateCalls);
+    expect(mockAuditLog.logAdminAction).toHaveBeenCalledWith(expect.objectContaining({
+      action: AuditAction.CAMPAIGN_UPDATED,
+      targetId: baseCampaign.campaignId,
+    }));
+  });
+
+  it('G356: rejects deleting a DRAFT campaign that has issued vouchers without force', async () => {
+    mockPrisma.campaign.findUnique.mockResolvedValue(baseCampaign);
+    mockPrisma.voucher.count.mockResolvedValue(3);
+    await expect(
+      service.deleteCampaign(baseCampaign.campaignId, 'admin', {}),
+    ).rejects.toMatchObject({ response: expect.objectContaining({ code: ErrorCodes.CAMPAIGN_HAS_VOUCHERS }) });
+    expect(mockPrisma.campaign.delete).not.toHaveBeenCalled();
+  });
+
+  it('G356: rejects deleting an ACTIVE campaign even when no vouchers were issued', async () => {
+    mockPrisma.campaign.findUnique.mockResolvedValue({ ...baseCampaign, status: CampaignStatus.ACTIVE });
+    mockPrisma.voucher.count.mockResolvedValue(0);
+    await expect(service.deleteCampaign(baseCampaign.campaignId, 'admin', {})).rejects.toBeInstanceOf(BadRequestException);
+    expect(mockPrisma.campaign.delete).not.toHaveBeenCalled();
+  });
+
+  it('G357: deletes a DRAFT campaign with issued vouchers only with force+reason, deactivating vouchers and auditing CAMPAIGN_DELETED', async () => {
+    mockPrisma.campaign.findUnique.mockResolvedValue(baseCampaign);
+    mockPrisma.voucher.count.mockResolvedValue(3);
+    mockPrisma.$transaction.mockResolvedValue([{ count: 3 }, baseCampaign]);
+
+    const result = await service.deleteCampaign(baseCampaign.campaignId, 'admin', {
+      force: true,
+      reason: 'Salah konfigurasi target audiens',
+    });
+
+    expect(result).toEqual({ message: 'Campaign deleted' });
+    expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1); // vouchers dinonaktifkan + campaign dihapus atomik
+    expect(mockAuditLog.logAdminAction).toHaveBeenCalledWith(expect.objectContaining({
+      action: AuditAction.CAMPAIGN_DELETED,
+      targetId: baseCampaign.campaignId,
+    }));
+  });
+
+  it('G356: deletes a DRAFT campaign without issued vouchers without force', async () => {
+    mockPrisma.campaign.findUnique.mockResolvedValue(baseCampaign);
+    mockPrisma.voucher.count.mockResolvedValue(0);
+    mockPrisma.$transaction.mockResolvedValue([{ count: 0 }, baseCampaign]);
+    const result = await service.deleteCampaign(baseCampaign.campaignId, 'admin', {});
+    expect(result).toEqual({ message: 'Campaign deleted' });
+    expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('G359-G361: activate is idempotent for an already-ACTIVE campaign (no duplicate version, no audit)', async () => {
+    mockPrisma.campaign.findUnique.mockResolvedValue({ ...baseCampaign, status: CampaignStatus.ACTIVE });
+    const result = await service.activateCampaign(baseCampaign.campaignId, 'admin', { reason: 'Mulai promo akhir tahun' });
+    expect(result).toMatchObject({ alreadyActive: true });
+    expect(mockPrisma.campaignVersion.create).not.toHaveBeenCalled();
+    expect(mockPrisma.voucher.create).not.toHaveBeenCalled();
+    expect(mockAuditLog.logAdminAction).not.toHaveBeenCalled();
+  });
+
+  it('G359: pause writes a CampaignVersion and PAUSE_REASON_RECORDED audit with the mandatory reason', async () => {
+    mockPrisma.campaign.findUnique.mockResolvedValue({ ...baseCampaign, status: CampaignStatus.ACTIVE });
+    mockPrisma.campaignVersion.aggregate.mockResolvedValue({ _max: { version: 2 } });
+    mockPrisma.campaignVersion.create.mockResolvedValue({});
+    mockPrisma.campaign.update.mockResolvedValue({ ...baseCampaign, status: CampaignStatus.PAUSED });
+
+    await service.pauseCampaign(baseCampaign.campaignId, 'admin', 'Anggaran promo bulan ini habis');
+
+    expect(mockPrisma.campaignVersion.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        version: 3,
+        changedBy: 'admin',
+        changeReason: 'Jeda: Anggaran promo bulan ini habis',
+      }),
+    }));
+    expect(mockAuditLog.logAdminAction).toHaveBeenCalledWith(expect.objectContaining({
+      action: AuditAction.PAUSE_REASON_RECORDED,
+      targetId: baseCampaign.campaignId,
+    }));
+  });
+
+  it('G359: rejects pause without a reason', async () => {
+    await expect(service.pauseCampaign(baseCampaign.campaignId, 'admin', '')).rejects.toBeInstanceOf(BadRequestException);
+    expect(mockPrisma.campaign.update).not.toHaveBeenCalled();
   });
 });

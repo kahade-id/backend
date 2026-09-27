@@ -16,6 +16,7 @@ import { OtpService } from '../otp.service';
 import { OtpGatewayService } from '../otp-gateway.service';
 import { OtpTriggerService } from '../otp-trigger.service';
 import { AuthLocationService } from '../auth-location.service';
+import { AppleAuthService } from '../apple-auth.service';
 import { RealtimeService } from '../../realtime/realtime.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
@@ -108,7 +109,7 @@ const mockRedis = {
   // jest.fn so existing counter setups/assertions keep working.
   // (assigned after literal — see below)
   expire: jest.fn().mockResolvedValue(1),
-  setNx: jest.fn(),
+  setNx: jest.fn().mockResolvedValue(true),
   releaseLock: jest.fn().mockResolvedValue(true),
   getPrefix: jest.fn().mockReturnValue('test:'),
   getClient: jest.fn(),
@@ -179,6 +180,7 @@ describe('AuthService', () => {
         { provide: RealtimeService, useValue: { emitToUser: jest.fn(), emitToRoom: jest.fn() } },
         { provide: OtpTriggerService, useValue: { createTrigger: jest.fn(), getTriggerStatus: jest.fn() } },
         { provide: AuthLocationService, useValue: { logEvent: jest.fn().mockResolvedValue(undefined) } },
+        { provide: AppleAuthService, useValue: { isConfigured: jest.fn().mockReturnValue(false), verifyIdentityToken: jest.fn() } },
         { provide: getQueueToken(EMAIL_QUEUE), useValue: mockEmailQueue },
       ],
     }).compile();

@@ -1,0 +1,290 @@
+// ============================================================
+// GAP D PART C — INTEGRASI KURIR & TRACKING OTOMATIS (G226–G250)
+//
+// File skema TERPISAH (append-only): JANGAN pindahkan model/enum ini ke
+// schema.prisma. Prisma 5 menggabungkan semua file *.prisma di direktori
+// ini menjadi satu skema logis saat `prisma generate` / `migrate`.
+//
+// Prinsip desain:
+// - Modul logistik TERPISAH dari order/wallet: tidak ada perubahan perilaku
+//   pada model Order/Wallet yang sudah ada. Shipment menyimpan orderId sebagai
+//   FK SKALAR ke orders.id (tanpa field relasi Prisma) — Prisma 5.22 menolak
+//   relasi satu arah tanpa back-relation di model Order, dan model Order ada
+//   di schema.prisma yang tidak boleh diubah worker ini. Integritas
+//   referensial ditegakkan oleh FK ON DELETE RESTRICT di migration.sql.
+// - TIDAK ADA kredensial provider nyata di sini maupun di kode: secret hanya
+//   via env/config (lihat src/modules/courier/courier.config.ts).
+// - Label = fileKey PRIVAT di storage lokal (bukan URL publik); unduhan
+//   memakai signed URL terautentikasi dengan expiry singkat.
+// ============================================================
+
+// Status tracking internal lintas kurir (G236). UNKNOWN dipakai ketika
+// provider timeout / event tak dikenal — JANGAN mengarang status (G240).
+enum ShipmentStatus {
+  CREATED
+  PICKED_UP
+  IN_TRANSIT
+  OUT_FOR_DELIVERY
+  DELIVERED
+  EXCEPTION
+  RETURNED
+  UNKNOWN
+}
+
+// Mode serah terima paket (G231).
+enum ShipmentMode {
+  PICKUP
+  DROPOFF
+}
+
+// Pihak penanggung biaya kirim (G243) — dikontrol SEBELUM payment.
+enum ShippingCostBearer {
+  SELLER
+  BUYER
+  SPLIT
+}
+
+// Lifecycle booking label di sisi Kahade (G232/G242).
+enum ShipmentBookingState {
+  DRAFT
+  BOOKED
+  FAILED
+  VOIDED
+}
+
+// Status rekonsiliasi tagihan provider vs biaya tercatat (G248).
+enum CourierBillStatus {
+  DRAFT
+  MATCHED
+  MISMATCH
+  ACKNOWLEDGED
+}
+
+// Status refund ongkir (G247).
+enum ShippingRefundStatus {
+  REQUESTED
+  APPROVED
+  REJECTED
+  PAID
+}
+
+// Katalog kurir + layanan (G227). Seed bawaan NONAKTIF — aktivasi via
+// feature flag per provider/wilayah (G249) oleh admin.
+model CourierService {
+  id             String   @id @default(cuid())
+  providerCode   String   // mis. "jne", "jnt", "sicepat", "gosend", "anteraja", "paxel", "mock"
+  serviceCode    String   // mis. "REG", "YES", "SAME_DAY", "INSTANT"
+  serviceName    String   // nama tampil, mis. "JNE Reguler"
+  description    String?
+  enabled        Boolean  @default(false)
+  // Kode wilayah cakupan (mis. ["ID-JKT", "ID-BDG"] atau ["*"] = nasional).
+  regions        String[] @default([])
+  supportsPickup  Boolean @default(true)
+  supportsDropoff Boolean @default(true)
+  // SLA keterlambatan = ETA + slaGraceDays (G245), per service level.
+  slaGraceDays   Int      @default(2)
+  sortOrder      Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([providerCode, serviceCode])
+  @@index([providerCode])
+  @@index([enabled])
+  @@map("courier_services")
+}
+
+// Feature flag per provider + wilayah (G249). Baris (providerCode, "*")
+// = flag global provider; (providerCode, region) = override wilayah.
+model CourierRegionFlag {
+  id           String   @id @default(cuid())
+  providerCode String
+  region       String   // kode wilayah atau "*" untuk global
+  enabled      Boolean  @default(false)
+  note         String?
+  updatedAt    DateTime @updatedAt
+
+  @@unique([providerCode, region])
+  @@index([providerCode])
+  @@map("courier_region_flags")
+}
+
+// Entitas pengiriman tersendiri (G233): booking ID + label provider disimpan
+// di sini, BUKAN di tabel orders. Fallback resi manual (G241) juga dicatat
+// di sini (isManual=true) — field trackingNumber/courierName di orders
+// tetap menjadi milik alur manual E10 yang sudah ada.
+model Shipment {
+  id         String @id @default(cuid())
+  // FK skalar ke orders.id — SENGAJA bukan field relasi Prisma: back-relation
+  // di model Order tidak boleh ditambahkan (schema.prisma milik worker lain).
+  // FK ON DELETE RESTRICT ada di migration.sql.
+  orderId    String @unique
+  sellerId   String
+  buyerId    String
+
+  providerCode String
+  serviceCode  String?
+  mode         ShipmentMode       @default(PICKUP)
+  bookingState ShipmentBookingState @default(DRAFT)
+  status       ShipmentStatus     @default(CREATED)
+
+  // Identitas provider (G233).
+  providerBookingId String?
+  trackingNumber    String?
+
+  // Label = fileKey privat (G233). JANGAN pernah mengekspos fileKey mentah
+  // ke klien — unduhan hanya via signed URL terautentikasi (G234).
+  labelFileKey  String?
+  labelMimeType String?
+
+  // Biaya (G243/G244): estimasi saat quote vs aktual saat booking tercatat
+  // TERPISAH. Nilai dalam rupiah (BigInt), konsisten dengan pola wallet.
+  costBearer    ShippingCostBearer @default(SELLER)
+  estimatedCost BigInt             @default(0)
+  actualCost    BigInt?
+  currency      String             @default("IDR")
+  refundedAmount BigInt            @default(0)
+
+  weightGrams Int?
+
+  // Kota + kode pos disimpan polos untuk filter/ops; alamat LENGKAP hanya di
+  // kolom JSON dan TIDAK PERNAH dikembalikan ke pihak tak berhak (G238).
+  originCity       String?
+  originPostalCode String?
+  destCity         String?
+  destPostalCode   String?
+  originDetail     Json? // { name, phone, address, city, postalCode } — privat
+  destDetail       Json? // { name, phone, address, city, postalCode } — privat
+
+  etaMinDays Int?
+  etaMaxDays Int?
+  // SLA keterlambatan (G245): slaDueAt = bookedAt + etaMaxDays + slaGraceDays.
+  slaDueAt DateTime?
+
+  lastEventAt      DateTime?
+  lastEventRaw     String?
+  staleAlertSentAt DateTime?
+
+  // Fallback resi manual (G241): seller mengisi sendiri saat provider nonaktif.
+  isManual            Boolean @default(false)
+  manualTrackingNumber String?
+  manualCourierName    String?
+
+  voidedAt   DateTime?
+  voidReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  events       ShipmentEvent[]
+  webhookLogs  CourierWebhookLog[]
+  refunds      ShippingCostRefund[]
+  billLines    CourierBillLine[]
+
+  @@index([orderId])
+  @@index([sellerId])
+  @@index([buyerId])
+  @@index([providerCode])
+  @@index([trackingNumber])
+  @@index([status])
+  @@index([bookingState])
+  @@index([status, lastEventAt]) // deteksi tracking macet (stale)
+  @@map("shipments")
+}
+
+// Event tracking per shipment (G236/G237). Dedup via unique
+// (shipmentId, providerEventId); provider boleh mengirim out-of-order.
+model ShipmentEvent {
+  id              String         @id @default(cuid())
+  shipmentId      String
+  shipment        Shipment       @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  providerEventId String
+  providerCode    String
+  rawStatus       String
+  status          ShipmentStatus
+  // Lokasi termasking, mis. "Jakarta***" / "Hub Bandung" — tanpa alamat lengkap (G238).
+  locationMasked  String?
+  description     String?
+  occurredAt      DateTime?
+  createdAt       DateTime       @default(now())
+
+  @@unique([shipmentId, providerEventId])
+  @@index([shipmentId, createdAt])
+  @@map("shipment_events")
+}
+
+// Log webhook mentah per provider (G235): verifikasi signature + idempotency.
+model CourierWebhookLog {
+  id             String    @id @default(cuid())
+  providerCode   String
+  shipmentId     String?
+  shipment       Shipment? @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+  // Idempotency key dari provider (header/body); null bila provider tidak mengirim.
+  idempotencyKey String?
+  signatureValid Boolean
+  payloadHash    String
+  outcome        String    @default("RECEIVED") // RECEIVED | PROCESSED | DUPLICATE | REJECTED
+  error          String?
+  createdAt      DateTime  @default(now())
+
+  @@index([providerCode, createdAt])
+  @@index([idempotencyKey])
+  @@map("courier_webhook_logs")
+}
+
+// Tagihan provider per periode untuk rekonsiliasi (G248).
+model CourierProviderBill {
+  id             String            @id @default(cuid())
+  providerCode   String
+  period         String            // "YYYY-MM"
+  currency       String            @default("IDR")
+  billedAmount   BigInt
+  recordedAmount BigInt            @default(0)
+  status         CourierBillStatus @default(DRAFT)
+  notes          String?
+  createdBy      String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  lines CourierBillLine[]
+
+  @@unique([providerCode, period])
+  @@index([providerCode])
+  @@map("courier_provider_bills")
+}
+
+model CourierBillLine {
+  id             String   @id @default(cuid())
+  billId         String
+  bill           CourierProviderBill @relation(fields: [billId], references: [id], onDelete: Cascade)
+  shipmentId     String?
+  shipment       Shipment? @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+  trackingNumber String?
+  billedAmount   BigInt
+  recordedAmount BigInt   @default(0)
+  delta          BigInt   @default(0) // billedAmount - recordedAmount
+  note           String?
+
+  @@index([billId])
+  @@index([trackingNumber])
+  @@map("courier_bill_lines")
+}
+
+// Refund ongkir (G247): diajukan seller/buyer, diputus admin.
+model ShippingCostRefund {
+  id         String               @id @default(cuid())
+  shipmentId String
+  shipment   Shipment            @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  orderId    String
+  amount     BigInt
+  reason     String
+  status     ShippingRefundStatus @default(REQUESTED)
+  requestedBy String
+  decidedBy   String?
+  decidedAt   DateTime?
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  @@index([shipmentId])
+  @@index([status])
+  @@map("shipping_cost_refunds")
+}

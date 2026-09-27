@@ -123,7 +123,9 @@ async function bootstrap(): Promise<void> {
   if (!isReadOnlySmoke) {
     validateSecrets();
   }
-  const app = await NestFactory.create(rootModule);
+  // GAP D part C (G235): rawBody diaktifkan agar webhook kurir dapat
+  // memverifikasi signature HMAC dari body mentah (fail-closed).
+  const app = await NestFactory.create(rootModule, { rawBody: true });
   if (isReadOnlySmoke) {
     validateSecrets();
   }

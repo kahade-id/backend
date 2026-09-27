@@ -19,6 +19,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { TOKEN_ISSUER, USER_TOKEN_AUDIENCE } from '../auth/token.service';
 import { TOKEN_BLACKLIST, SESSION_REVOKED_KEY } from '../../common/constants/redis-keys';
 import { TYPING_HOLD_MS, TYPING_REBROADCAST_INTERVAL_MS } from '../../common/constants/app.constants';
+import { wsOnConnect, wsOnDisconnect } from '../observability/ws-metrics.service';
 
 interface AuthenticatedSocket extends Socket {
   userId?: string;
@@ -312,6 +313,12 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
       }
 
       client.userId = payload.sub;
+      // G493: metrik koneksi WebSocket (tanpa userId/IP di store — hanya counter).
+      wsOnConnect(
+        client.id,
+        payload.sub,
+        (client.handshake.auth?.appVersion ?? client.handshake.query?.appVersion) as string | undefined,
+      );
       if (payload.exp) {
         client._tokenExp = payload.exp;
       }
@@ -353,6 +360,8 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
   }
 
   async handleDisconnect(client: AuthenticatedSocket): Promise<void> {
+    // G493: metrik koneksi WebSocket.
+    wsOnDisconnect(client.id, client.userId);
     if (client.userId) {
       // Putus koneksi tidak boleh meninggalkan indikator "sedang mengetik"
       // yang menyala selamanya di layar lawan bicara.

@@ -21,6 +21,8 @@ import {
   SHOWCASE_VIEW_DEDUPE_TTL_SECONDS,
 } from '../../common/constants/app.constants';
 import { SubscriptionsService } from '../subscriptions/subscriptions.service';
+import { AdminShowcaseReportsService } from '../admin/showcase-reports/admin-showcase-reports.service';
+import { moderationDb } from '../admin/showcase-reports/moderation-prisma.types';
 import { CreateShowcaseItemDto, UpdateShowcaseItemDto } from './dto/showcase-item.dto';
 import { CreateShowcaseCommentDto, UpdateShowcaseCommentDto } from './dto/showcase-comment.dto';
 import { ShowcaseFeedQueryDto, ShowcaseFeedSort } from './dto/showcase-feed-query.dto';
@@ -166,6 +168,8 @@ export class ShowcaseService {
     private readonly auditLog: AuditLogService,
     private readonly verificationBadgeService: VerificationBadgeService,
     private readonly subscriptionsService: SubscriptionsService,
+    // GAP-F (G415): cluster duplikat laporan — best-effort, tidak menggagalkan laporan.
+    private readonly moderation: AdminShowcaseReportsService,
   ) {}
 
   // ==================================================================
@@ -1708,6 +1712,8 @@ export class ShowcaseService {
    * 2. Tolak laporan terhadap item sendiri (400).
    * 3. Cegah duplikat: satu user hanya boleh melaporkan satu item sekali (409).
    * 4. Simpan ke `showcase_reports` + catat ke user audit log (`SHOWCASE_REPORTED`).
+   * 5. GAP-F: laporan atas item takedown → 409 dengan arahan banding; laporan
+   *    baru ditautkan ke cluster duplikat (G415, best-effort).
    *
    * Validasi `reason`/`description` ditangani `ReportShowcaseDto` via ValidationPipe.
    */
@@ -1720,6 +1726,19 @@ export class ShowcaseService {
     // 1. Visibility check — hanya item yang terlihat oleh pelapor yang bisa dilaporkan.
     const visible = await this.findVisibleShowcase(showcaseId, userId);
     if (!visible) {
+      // GAP-F (G404): item tidak tayang karena DINONAKTIFKAN moderasi
+      // (takedown/restrict) → 409 dengan arahan: pemilik mengajukan banding,
+      // laporan baru tidak diperlukan. Bukan 404 generik agar UX jelas.
+      // Best-effort: bila tabel moderasi belum di-merge, pertahankan 404 lama.
+      const takenDown = await this.findModerationEnforcement(showcaseId);
+      if (takenDown) {
+        throw new ConflictException({
+          code: ErrorCodes.REPORT_APPEAL_REQUIRED,
+          message:
+            'Item ini sudah dinonaktifkan oleh moderasi Kahade sehingga tidak bisa dilaporkan lagi. ' +
+            'Bila Anda pemilik item, ajukan banding melalui aplikasi Kahade.',
+        });
+      }
       throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
     }
     if (visible.row.userId === userId) {
@@ -1774,6 +1793,35 @@ export class ShowcaseService {
       this.logger.warn(`Failed to write audit log for showcase report ${report.id}: ${(err as Error).message}`);
     }
 
+    // 5. GAP-F (G415): tautkan laporan baru ke cluster duplikat (showcaseId +
+    // reason sama dalam 24 jam). Best-effort — tidak menggagalkan laporan.
+    void this.moderation.linkReportToCluster(report.id, showcaseId, dto.reason);
+
     return { reported: true, reportId: report.id };
+  }
+
+  /**
+   * GAP-F (G404): cari enforcement moderasi (TAKEDOWN/RESTRICTED) atas sebuah
+   * item — dipakai untuk 409-with-appeal-direction saat item takedown dilaporkan.
+   * Best-effort: null bila tabel fragment belum tersedia.
+   */
+  private async findModerationEnforcement(showcaseId: string): Promise<{ reportId: string } | null> {
+    try {
+      const mod = moderationDb(this.prisma);
+      const ev = await mod.reportModerationEvent.findFirst({
+        where: {
+          action: { in: ['TAKEDOWN', 'RESTRICTED'] },
+          report: { showcaseId },
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { reportId: true },
+      });
+      return ev ? { reportId: ev.reportId } : null;
+    } catch (err) {
+      this.logger.warn(
+        `findModerationEnforcement(${showcaseId}) failed (best-effort): ${(err as Error).message}`,
+      );
+      return null;
+    }
   }
 }

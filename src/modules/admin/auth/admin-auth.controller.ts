@@ -60,7 +60,8 @@ export class AdminAuthController {
     | { accessToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }
   > {
     const ip = req.ip || 'unknown';
-    const result = await this.adminAuthService.login(dto.email, dto.password, dto.totpToken, ip);
+    const userAgent = req.headers['user-agent'];
+    const result = await this.adminAuthService.login(dto.email, dto.password, dto.totpToken, ip, userAgent);
 
     if ('requiresMfa' in result) return result;
     if ('requiresMfaSetup' in result) return result;
@@ -83,7 +84,8 @@ export class AdminAuthController {
     @Res({ passthrough: true }) res: Response,
   ): Promise<{ accessToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }> {
     const ip = req.ip || 'unknown';
-    const result = await this.adminAuthService.verifyAdmin2fa(dto.tempToken, dto.totpToken, ip);
+    const userAgent = req.headers['user-agent'];
+    const result = await this.adminAuthService.verifyAdmin2fa(dto.tempToken, dto.totpToken, ip, userAgent);
 
     this.setRefreshCookie(res, result.refreshToken);
     const { refreshToken: _rt, ...body } = result;
@@ -183,7 +185,8 @@ export class AdminAuthController {
     @Res({ passthrough: true }) res: Response,
   ): Promise<{ accessToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }> {
     const ip = req.ip || 'unknown';
-    const result = await this.adminAuthService.enableMfa(dto.tempToken, dto.totpToken, ip);
+    const userAgent = req.headers['user-agent'];
+    const result = await this.adminAuthService.enableMfa(dto.tempToken, dto.totpToken, ip, userAgent);
 
     this.setRefreshCookie(res, result.refreshToken);
     const { refreshToken: _rt, ...body } = result;

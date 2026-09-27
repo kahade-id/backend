@@ -23,6 +23,9 @@ import { toIdr, toSen } from '../../common/utils/currency.util';
 import { resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
 import { generatePaymentTxId, generateWalletTxId } from '../../common/utils/id-generator.util';
 import { PrismaService } from '../../prisma/prisma.service';
+// GAP-C (G176): aktivasi milestone setelah QRIS escrow lock — no-op untuk
+// order satu tahap existing.
+import { activateMilestonesForOrderTx } from '../milestones/milestone-activation';
 import { MidtransService } from './midtrans.service';
 
 const DEFAULT_QRIS_EXPIRY_MINUTES = 30;
@@ -442,6 +445,10 @@ export class OrderQrisPaymentService {
             metadata: { paymentSource: 'QRIS', providerFee: toIdr(freshPayment.paymentFee) },
           },
         });
+
+        // GAP-C (G176): aktivasi milestone SETELAH QRIS escrow lock sukses,
+        // dalam transaksi yang sama. No-op untuk order tanpa milestone.
+        await activateMilestonesForOrderTx(tx, order.id);
 
         const orderUpdated = await tx.order.updateMany({
           where: { id: order.id, status: OrderStatus.WAITING_PAYMENT, deletedAt: null }, // AUDIT-16

@@ -10,6 +10,7 @@ import * as ErrorCodes from '../../common/constants/error-codes';
 import { UserAuditAction } from '@prisma/client';
 import { UploadService } from '../upload/upload.service';
 import { KycDocumentType } from './dto/submit-kyc.dto';
+import { getEffectiveSlaConfig, accumulatePauseOnResume } from '../admin/kyc/sla.util';
 
 export const MAX_KYC_ATTEMPTS = 10;
 
@@ -223,6 +224,8 @@ export class KycService {
               livenessFileKey: encryptedLivenessKey,
               submittedIp: ipAddress,
               attemptNumber: attemptCount + 1,
+              // GAP-E (G279): jam mulai SLA operasional.
+              slaStartedAt: new Date(),
             },
           });
           await tx.user.update({
@@ -469,6 +472,8 @@ export class KycService {
               livenessFileKey: encryptedLivenessKey,
               submittedIp: ipAddress ?? null,
               attemptNumber: attemptCount + 1,
+              // GAP-E (G279): jam mulai SLA operasional (baru per pengajuan ulang).
+              slaStartedAt: new Date(),
             },
           });
           await tx.user.update({
@@ -496,5 +501,94 @@ export class KycService {
     });
 
     return { kycId: updated.kycId, status: updated.status, documentType: docType, livenessProvided: !!extra?.livenessFileKey };
+  }
+
+  /**
+   * GAP-E (G279): pengguna melengkapi dokumen yang diminta admin.
+   * Dokumen baru (terenkripsi) menggantikan yang lama pada pengajuan yang
+   * sama, dan jam SLA yang dijeda DILANJUTKAN (akumulasi jeda dalam satuan
+   * jam SLA sesuai config). Hanya untuk pengajuan PENDING yang sedang pause.
+   */
+  async supplementDocuments(
+    userId: string,
+    requestId: string,
+    files: { ktpFileKey?: string; selfieFileKey?: string; livenessFileKey?: string },
+    ipAddress?: string,
+  ): Promise<Record<string, unknown>> {
+    const request = await this.prisma.kycRequest.findFirst({
+      where: { OR: [{ id: requestId }, { kycId: requestId }] },
+      select: {
+        id: true,
+        kycId: true,
+        userId: true,
+        status: true,
+        slaPausedAt: true,
+        slaPausedAccumMs: true,
+      },
+    });
+    if (!request) {
+      throw new BadRequestException({
+        code: ErrorCodes.KYC_NOT_FOUND,
+        message: 'KYC request not found',
+      });
+    }
+    if (request.userId !== userId) {
+      throw new ForbiddenException({
+        code: ErrorCodes.FORBIDDEN,
+        message: 'This KYC request does not belong to you',
+      });
+    }
+    if (request.status !== KycStatus.PENDING) {
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_STATUS,
+        message: `Documents can only be completed for PENDING requests (current: ${request.status})`,
+      });
+    }
+    if (!request.slaPausedAt) {
+      throw new BadRequestException({
+        code: ErrorCodes.KYC_NOT_PAUSED,
+        message: 'No additional documents are being requested for this KYC request',
+      });
+    }
+
+    const keys = [files.ktpFileKey, files.selfieFileKey, files.livenessFileKey].filter(
+      (k): k is string => !!k,
+    );
+    if (keys.length === 0) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'At least one document file key is required',
+      });
+    }
+    await this.verifyKycFilesConfirmed(userId, keys);
+
+    const data: Prisma.KycRequestUpdateInput = {};
+    if (files.ktpFileKey) data.ktpPhotoUrl = await encryptKycKtp(files.ktpFileKey);
+    if (files.selfieFileKey) data.selfiePhotoUrl = await encryptKycSelfie(files.selfieFileKey);
+    if (files.livenessFileKey) data.livenessFileKey = await encryptKycSelfie(files.livenessFileKey);
+
+    // Resume: akumulasi jeda dalam satuan jam SLA.
+    const config = await getEffectiveSlaConfig(this.prisma, 'KYC_PERSONAL');
+    const now = new Date();
+    const { accumMs } = accumulatePauseOnResume(
+      { slaPausedAt: request.slaPausedAt, slaPausedAccumMs: request.slaPausedAccumMs, slaStartedAt: null },
+      now,
+      config.useBusinessHours,
+    );
+    data.slaPausedAt = null;
+    data.slaPausedAccumMs = BigInt(accumMs);
+
+    await this.prisma.kycRequest.update({ where: { id: request.id }, data });
+
+    this.auditLog.logUserAction({
+      userId,
+      action: UserAuditAction.KYC_SUBMITTED,
+      entityType: 'KycRequest',
+      entityId: request.id,
+      description: `User completed requested KYC documents (${request.kycId}); SLA resumed`,
+      ipAddress,
+    });
+
+    return { kycId: request.kycId, resumed: true, slaResumedAt: now.toISOString() };
   }
 }

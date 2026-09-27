@@ -16,6 +16,9 @@ import type { Request } from 'express';
 import { isLoopbackInternalProbe } from './internal-readiness.util';
 import { withTimeout } from '../../common/utils/background-reliability.util';
 import { getCronRuntimeSnapshots } from '../../common/utils/cron-runtime.registry';
+import { SyntheticService } from '../observability/synthetic.service';
+import { DependenciesService } from '../observability/dependencies.service';
+import { ObservabilityModule } from '../observability/observability.module';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { AUDIT_LOG_QUEUE } from '../../common/services/audit-log.service';
@@ -300,6 +303,7 @@ class SmtpHealthIndicator extends HealthIndicator {
  * - cron_alert:webhook_inbox_dead_letter / cron_alert:webhook_inbox_retry_failed (webhook-retry cron)
  * - cron_alert:fraud_escalation (fraud-challenge-escalation cron, CW-011)
  * - cron_alert:withdrawal_stuck (withdrawal-reconciliation cron, CW-012)
+ * - cron_alert:reconciliation_urgent (temuan rekonsiliasi |difference| > ambang, E3)
  * Sehat = tidak ada kunci alert yang aktif.
  */
 @Injectable()
@@ -326,13 +330,14 @@ class OpsAlertsHealthIndicator extends HealthIndicator {
 
   async isHealthy(key: string): Promise<HealthIndicatorResult> {
     try {
-      const [dlqDepth, dlqMonitorFailed, webhookDeadLetter, webhookRetryFailed, fraudEscalation, withdrawalStuck] = await Promise.all([
+      const [dlqDepth, dlqMonitorFailed, webhookDeadLetter, webhookRetryFailed, fraudEscalation, withdrawalStuck, reconciliationUrgent] = await Promise.all([
         this.readAlert('cron_alert:dlq_depth'),
         this.readAlert('cron_alert:dlq_monitor_failed'),
         this.readAlert('cron_alert:webhook_inbox_dead_letter'),
         this.readAlert('cron_alert:webhook_inbox_retry_failed'),
         this.readAlert('cron_alert:fraud_escalation'),
         this.readAlert('cron_alert:withdrawal_stuck'),
+        this.readAlert('cron_alert:reconciliation_urgent'),
       ]);
       const active = {
         dlqDepth: dlqDepth !== null,
@@ -341,11 +346,12 @@ class OpsAlertsHealthIndicator extends HealthIndicator {
         webhookRetryFailed: webhookRetryFailed !== null,
         fraudEscalation: fraudEscalation !== null,
         withdrawalStuck: withdrawalStuck !== null,
+        reconciliationUrgent: reconciliationUrgent !== null,
       };
       const healthy = Object.values(active).every((v) => !v);
       return this.getStatus(key, healthy, {
         ...active,
-        detail: { dlqDepth, dlqMonitorFailed, webhookDeadLetter, webhookRetryFailed, fraudEscalation, withdrawalStuck },
+        detail: { dlqDepth, dlqMonitorFailed, webhookDeadLetter, webhookRetryFailed, fraudEscalation, withdrawalStuck, reconciliationUrgent },
       });
     } catch {
       return this.getStatus(key, false, { message: 'ops alerts health check unavailable' });
@@ -416,6 +422,8 @@ export class HealthController {
     private prisma: PrismaService,
     private config: ConfigService,
     private redis: RedisService,
+    private syntheticChecks: SyntheticService,
+    private dependencies: DependenciesService,
     @Optional() @InjectQueue(EMAIL_QUEUE) private readonly emailQueue?: Queue,
     @Optional() @InjectQueue(NOTIFICATION_QUEUE) private readonly notificationQueue?: Queue,
     @Optional() @InjectQueue(AUDIT_LOG_QUEUE) private readonly auditLogQueue?: Queue,
@@ -457,7 +465,16 @@ export class HealthController {
       (): Promise<HealthIndicatorResult> => this.smtpIndicator.isHealthy('smtp'),
       (): Promise<HealthIndicatorResult> => this.queueIndicator('queues'),
     ]);
-    return { ...result, maintenance: false };
+    // G488: status dependensi terperinci (ok/degraded/down + latency) di
+    // samping indikator boolean Terminus — tanpa secret/kredensial.
+    const dependencies = await this.dependencies.getStatuses().catch(() => []);
+    return {
+      ...result,
+      maintenance: false,
+      // G490: release version di setiap respons health untuk korelasi deploy.
+      release: process.env.RELEASE_SHA || process.env.APP_VERSION || 'unknown',
+      dependencies,
+    };
   }
 
   /**
@@ -556,10 +573,23 @@ export class HealthController {
       (): Promise<HealthIndicatorResult> => this.opsAlertsIndicator.isHealthy('alerts'),
     ]);
   }
+
+  /**
+   * G489: synthetic check read-only untuk monitoring eksternal (tanpa akun).
+   * DB `SELECT 1`, Redis PING, storage tulis-baca-hapus file temp.
+   * Publik + throttle ketat; tidak membuat data bisnis apa pun.
+   */
+  @Get('synthetic')
+  @Throttle({ default: { ttl: 60000, limit: 6 } })
+  async synthetic(): Promise<unknown> {
+    return this.syntheticChecks.run();
+  }
 }
 
 @Module({
-  imports: [TerminusModule],
+  // G489/G488: SyntheticService + DependenciesService disediakan
+  // ObservabilityModule (tanpa import ini, DI HealthController gagal boot).
+  imports: [TerminusModule, ObservabilityModule],
   controllers: [HealthController],
   providers: [
     RedisHealthIndicator,

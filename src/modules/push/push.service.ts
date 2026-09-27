@@ -4,6 +4,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { NotificationType } from '@prisma/client';
 import * as admin from 'firebase-admin';
 import { getMinutesInTimezone, isMinutesInRange } from '../../common/utils/timezone.util';
+import { recordDeliveryMetric } from '../observability/delivery-metrics.service';
 
 const EXPO_PUSH_API_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_PUSH_BATCH_SIZE = 100;
@@ -238,13 +239,17 @@ export class PushService implements OnModuleInit {
 
         if (!response.ok) {
           this.logger.error(`Expo push API returned ${response.status}: ${await response.text()}`);
+          // G494: metrik delivery — hanya counter, tanpa token/payload.
+          recordDeliveryMetric('push', 'expo', 'failed');
           continue;
         }
 
         const result = await response.json() as { data: Array<{ status: string; message?: string; details?: { error?: string } }> };
+        let failed = 0;
         for (let i = 0; i < (result.data?.length ?? 0); i++) {
           const ticket = result.data[i];
           if (ticket.status !== 'error') continue;
+          failed += 1;
           const errorType = ticket.details?.error;
           if (errorType === 'DeviceNotRegistered' && deviceIdMap) {
             const deviceId = deviceIdMap.get(tokenBatch[i]);
@@ -259,8 +264,14 @@ export class PushService implements OnModuleInit {
             this.logger.warn(`Expo push error: ${ticket.message}`);
           }
         }
+        // G494: metrik delivery — hanya counter, tanpa token/payload.
+        if (failed > 0) recordDeliveryMetric('push', 'expo', 'failed', failed);
+        const okCount = (result.data?.length ?? 0) - failed;
+        if (okCount > 0) recordDeliveryMetric('push', 'expo', 'sent', okCount);
       } catch (error) {
         this.logger.error(`Expo push API call failed: ${(error as Error).message}`);
+        // G494: metrik delivery — hanya counter, tanpa token/payload.
+        recordDeliveryMetric('push', 'expo', 'failed');
       }
     }
   }
@@ -273,6 +284,8 @@ export class PushService implements OnModuleInit {
   ): Promise<void> {
     if (!(await this.shouldSendPush(userId, data))) {
       this.logger.debug(`Push skipped: preference disabled for type ${data?.notificationType}`);
+      // G494: metrik delivery — hanya counter, tanpa token/payload.
+      recordDeliveryMetric('push', 'all', 'skipped');
       return;
     }
 
@@ -286,7 +299,11 @@ export class PushService implements OnModuleInit {
         .map((d) => d.pushToken)
         .filter((t): t is string => !!t);
 
-      if (allTokens.length === 0) return;
+      if (allTokens.length === 0) {
+        // G494: metrik delivery — hanya counter, tanpa token/payload.
+        recordDeliveryMetric('push', 'all', 'skipped');
+        return;
+      }
 
       const fcmTokens: string[] = [];
       const expoTokens: string[] = [];
@@ -347,8 +364,14 @@ export class PushService implements OnModuleInit {
           this.logger.log(`Cleaned ${invalidTokenIds.length} invalid push tokens`);
         }
         this.logger.debug(`FCM push sent: ${successCount}/${fcmTokens.length} succeeded`);
+        // G494: metrik delivery — hanya counter, tanpa token/payload.
+        const fcmFailed = fcmTokens.length - successCount;
+        if (successCount > 0) recordDeliveryMetric('push', 'fcm', 'sent', successCount);
+        if (fcmFailed > 0) recordDeliveryMetric('push', 'fcm', 'failed', fcmFailed);
       } else if (fcmTokens.length > 0) {
         this.logger.warn(`FCM push skipped: ${fcmTokens.length} native token(s) registered but Firebase Admin is unavailable`);
+        // G494: metrik delivery — hanya counter, tanpa token/payload.
+        recordDeliveryMetric('push', 'fcm', 'skipped');
       }
 
       if (unsupportedNativeTokenCount > 0) {

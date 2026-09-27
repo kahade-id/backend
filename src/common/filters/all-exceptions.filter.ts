@@ -56,6 +56,8 @@ export class AllExceptionsFilter implements ExceptionFilter {
       scope.setExtra('method', request.method);
       scope.setExtra('requestId', requestId);
       scope.setExtra('userId', (request as unknown as { user?: { sub?: string } }).user?.sub);
+      // G490: sertakan release version di setiap error event.
+      scope.setExtra('release', process.env.RELEASE_SHA || process.env.APP_VERSION || 'unknown');
       Sentry.captureException(exception);
     });
 
@@ -67,8 +69,11 @@ export class AllExceptionsFilter implements ExceptionFilter {
         'AllExceptionsFilter',
       );
     } else {
+      // G490: release version di setiap log error (winston defaultMeta juga
+      // membawa version, ini untuk grep cepat di log mentah).
+      const release = process.env.RELEASE_SHA || process.env.APP_VERSION || 'unknown';
       this.logger.error(
-        `Unhandled exception: ${request.method} ${request.url} [${requestId}]`,
+        `Unhandled exception: ${request.method} ${request.url} [${requestId}] [release=${release}]`,
         exception instanceof Error ? exception.message : 'Unknown error',
       );
     }

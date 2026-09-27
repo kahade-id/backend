@@ -36,6 +36,9 @@ import {
   DormantWinbackVoucherService,
   ExpireExtensionRequestsService,
   RefundReconciliationService,
+  FeedbackGuestContactRedactionService,
+  MilestoneReminderService,
+  ModerationSlaService,
 } from './services';
 import { AdminFinanceModule } from '../admin/finance/admin-finance.module';
 import { WithdrawalsModule } from '../withdrawals/withdrawals.module';
@@ -54,14 +57,20 @@ import {
 } from '../../common/utils/cron-runtime.registry';
 import { QueueModule } from '../queue/queue.module';
 import { RedisService } from '../../redis/redis.service';
+// GAP-D (G256): pelepasan reservasi stok saat order kedaluwarsa — @Optional()
+// di ExpireUnpaidOrdersService, best-effort, no-op untuk order tanpa order lines.
+import { InventoryModule } from '../inventory/inventory.module';
 import { safeErrorMessage } from '../../common/utils/background-reliability.util';
 import { AuditLogModule } from '../../common/services/audit-log.module';
+import { AdminShowcaseReportsModule } from '../admin/showcase-reports/admin-showcase-reports.module';
 import { CampaignService } from '../admin/campaign.service';
 import { UploadModule } from '../upload/upload.module';
 import { ShowcaseHardDeleteService } from './services/showcase-hard-delete.service';
+import { KycSlaMonitorService } from './services/kyc-sla-monitor.service';
+import { AdminFeedbackModule } from '../admin/feedback/admin-feedback.module';
 
 @Module({
-  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, AuditLogModule, UploadModule],
+  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, AdminShowcaseReportsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, AuditLogModule, UploadModule, AdminFeedbackModule, InventoryModule],
   providers: [
     WalletDailyResetService,
     DataCleanupService,
@@ -94,6 +103,10 @@ import { ShowcaseHardDeleteService } from './services/showcase-hard-delete.servi
     DormantWinbackVoucherService,
     ExpireExtensionRequestsService,
     RefundReconciliationService,
+    FeedbackGuestContactRedactionService,
+    MilestoneReminderService, // GAP-C (G182)
+    ModerationSlaService, // GAP-F (G419/G423): terdaftar sebagai provider agar cron SLA moderasi berjalan
+    KycSlaMonitorService,
     CampaignService,
     WalletTxSerialService,
     MidtransService,

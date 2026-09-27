@@ -11,6 +11,7 @@ import { AdminVouchersModule } from './vouchers/admin-vouchers.module';
 import { AdminSystemModule } from './system/admin-system.module';
 import { AdminReportsModule } from './reports/admin-reports.module';
 import { AdminShowcaseReportsModule } from './showcase-reports/admin-showcase-reports.module';
+import { AdminQaModerationModule } from './qa-moderation/admin-qa-moderation.module';
 import { AdminBadgesModule } from './badges/admin-badges.module';
 import { AdminSubscriptionsModule } from './subscriptions/admin-subscriptions.module';
 import { AdminInsuranceClaimsModule } from './insurance-claims/admin-insurance-claims.module';
@@ -21,6 +22,9 @@ import { AdminAnalyticsModule } from './analytics/admin-analytics.module';
 import { AdminCampaignsModule } from './campaigns/admin-campaigns.module';
 import { AdminSupportModule } from './support/admin-support.module';
 import { AdminChatModule } from './chat/admin-chat.module';
+import { AdminFeedbackModule } from './feedback/admin-feedback.module';
+// GAP-C (G196–G199): admin milestone.
+import { AdminMilestonesModule } from './milestones/admin-milestones.module';
 
 @Module({
   imports: [
@@ -36,6 +40,7 @@ import { AdminChatModule } from './chat/admin-chat.module';
     AdminSystemModule,
     AdminReportsModule,
     AdminShowcaseReportsModule,
+    AdminQaModerationModule,
     AdminBadgesModule,
     AdminSubscriptionsModule,
     AdminInsuranceClaimsModule,
@@ -46,6 +51,8 @@ import { AdminChatModule } from './chat/admin-chat.module';
     AdminCampaignsModule,
     AdminSupportModule,
     AdminChatModule,
+    AdminFeedbackModule,
+    AdminMilestonesModule, // GAP-C (G196–G199)
   ],
 })
 export class AdminModule {}

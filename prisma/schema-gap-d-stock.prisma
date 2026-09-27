@@ -1,0 +1,304 @@
+// ============================================================================
+// GAP D PART STOCK — KATALOG PRODUK & PERSEDIAAN TERSTRUKTUR (G251–G275)
+//
+// File skema TERPISAH (append-only): JANGAN pindahkan model/enum ini ke
+// schema.prisma. Prisma 5 menggabungkan semua file *.prisma di direktori ini
+// menjadi satu skema logis saat `prisma generate` / `migrate`.
+//
+// KEPUTUSAN DESAIN (E11 — ekstensi marketplace, bukan bug):
+// - Entitas Product TERPISAH dari showcase (G251): showcase = konten sosial,
+//   product = barang yang bisa dibeli dengan SKU + stok. Tidak ada relasi
+//   Product → Showcase.
+// - sellerId = User.id (kolom logis, tanpa back-relation di model User).
+//   businessProfileId (G251/G269) = referensi logis ke profil bisnis — model
+//   BusinessProfile BELUM ADA di skema, jadi kolom ini String? TANPA hard FK;
+//   dikeraskan saat model profil bisnis diperkenalkan. Listing produk
+//   menaut ke profil bisnis via sellerId + businessProfileId.
+// - Relasi ke Order bersifat SATU ARAH (tanpa back-relation di model Order):
+//   OrderItem.order dan StockReservation.orderId hanya menyimpan Order.id.
+//   PERILAKU order/wallet/showcase existing TIDAK DIUBAH.
+// - Stok dua kolom (G254): quantityAvailable vs quantityReserved. Stok yang
+//   "bisa dijual" = available - reserved. Anti-overselling (G258) ditegakkan
+//   di SQL (conditional UPDATE), bukan di application layer.
+// - Setiap mutasi stok WAJIB menulis baris StockMovement beraudit (G266):
+//   actor, actorRole, source, reason, ref, before/after (available+reserved).
+// - Idempotency key per order (G257): InventoryOperation.idempotencyKey unik,
+//   mis. "DEDUCT:<orderDbId>". Panggil 2x = 1 eksekusi.
+// - Kode TypeScript memakai union string lokal (inventory.types.ts) hingga
+//   client Prisma di-regenerate pasca-merge; nilai enum di sini adalah
+//   sumber kebenaran.
+// ============================================================================
+
+// --- G261: status listing produk ---------------------------------------------
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  OUT_OF_STOCK
+  ARCHIVED
+}
+
+// --- G272: moderasi produk TERPISAH dari moderasi showcase --------------------
+enum ProductModerationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  FLAGGED
+}
+
+// --- G266: jenis mutasi stok ---------------------------------------------------
+enum StockMovementType {
+  RESERVE      // cadangkan untuk order (G255)
+  RELEASE      // lepas reservasi: batal/kedaluwarsa/gagal (G256)
+  DEDUCT       // kurangi stok pasca-konfirmasi order (G257)
+  RESTOCK      // tambah stok (pembelian/import)
+  ADJUST       // koreksi manual oleh pemilik/admin (G267)
+  RETURN       // retur barang kembali ke stok
+}
+
+// --- G266: sumber mutasi -------------------------------------------------------
+enum StockMovementSource {
+  ORDER
+  MANUAL
+  IMPORT
+  SYSTEM
+  ADMIN
+}
+
+// --- G266/G267: peran actor ----------------------------------------------------
+enum StockActorRole {
+  SELLER
+  ADMIN
+  SYSTEM
+}
+
+// --- G255: status reservasi ----------------------------------------------------
+enum StockReservationStatus {
+  ACTIVE
+  RELEASED
+  CONSUMED
+  EXPIRED
+}
+
+// --- G259: order lines — productId, variantId, qty, unitPrice snapshot ---------
+model OrderItem {
+  id        String @id @default(cuid())
+  // FK logis ke Order.id (bukan orderId publik). Satu arah — model Order
+  // tidak mendapat back-relation.
+  orderId   String
+  order     Order  @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  productId String?
+  product   Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  variantId String?
+  variant   ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  // Snapshot saat order dibuat (G259/G274): harga & nama dikunci agar
+  // perubahan katalog kemudian tidak mengubah nilai transaksi.
+  sku            String
+  productName    String
+  variantLabel   String?
+  qty            Int
+  unitPriceSen   BigInt // rupiah * 100, konsisten dengan pola wallet
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+  @@index([productId])
+  @@index([variantId])
+  @@map("order_items")
+}
+
+// --- G251: entitas produk terpisah dari showcase -------------------------------
+model Product {
+  id          String @id @default(cuid())
+  // G252: SKU unik per produk — format divalidasi server (lihat
+  // inventory.constants.ts: SKU_PATTERN). Unik lintas tabel ditegakkan di
+  // service (products.sku vs product_variants.sku).
+  sku         String @unique
+  sellerId    String // User.id pemilik (kolom logis, tanpa back-relation)
+  // G251/G269: tautan profil bisnis. Model BusinessProfile belum ada →
+  // referensi logis String?; dikeraskan saat modelnya diperkenalkan.
+  businessProfileId String?
+
+  name        String  @db.VarChar(150)
+  description String? @db.Text
+  category    String  @db.VarChar(80)
+
+  status           ProductStatus           @default(DRAFT)
+  moderationStatus ProductModerationStatus @default(PENDING)
+  moderationNote   String?                 @db.Text
+  moderatedBy      String?
+  moderatedAt      DateTime?
+
+  // G271: bila true, produk hanya bisa dibeli setelah verifikasi bisnis
+  // seller APPROVED (BusinessVerification). Filter katalog:
+  // ?verifiedBusinessOnly=true.
+  requiresBusinessVerification Boolean @default(false)
+
+  // Harga dasar dalam sen (rupiah*100). Varian boleh override.
+  priceSen BigInt
+  currency String @default("IDR")
+
+  // G254: stok tingkat produk — dipakai untuk produk TANPA varian.
+  // Produk bervarian memakai stok per varian; stok efektif katalog =
+  // Σ varian bila varian ada.
+  quantityAvailable Int @default(0)
+  quantityReserved  Int @default(0)
+
+  // G264: ambang peringatan stok menipis per SKU (0 = nonaktif).
+  lowStockThreshold Int @default(0)
+
+  // G268: berat & dimensi untuk kalkulasi ongkir (gram & cm).
+  weightGrams Int?
+  lengthCm    Decimal? @db.Decimal(8, 2)
+  widthCm     Decimal? @db.Decimal(8, 2)
+  heightCm    Decimal? @db.Decimal(8, 2)
+
+  // G253: skema atribut yang diizinkan, mis.
+  // { "ukuran": ["S","M","L"], "warna": ["Merah","Hitam"] }.
+  // Varian memvalidasi attributes terhadap skema ini.
+  attributesSchema Json?
+
+  imageFileKeys String[] @default([]) // fileKey privat dari POST /v1/upload/direct
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  variants          ProductVariant[]
+  orderItems        OrderItem[]
+  movements         StockMovement[]
+  moderationEvents  ProductModerationEvent[]
+
+  @@index([sellerId, status])
+  @@index([status])
+  @@index([category, status])
+  @@index([sku])
+  @@index([sellerId, sku])
+  @@map("products")
+}
+
+// --- G253: varian produk — opsi ukuran/warna + kombinasi valid ------------------
+model ProductVariant {
+  id        String  @id @default(cuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  // G252: SKU unik per varian (format sama seperti produk).
+  sku String @unique
+
+  // G253: kombinasi atribut tervalidasi, mis. { "ukuran": "M", "warna": "Merah" }.
+  // Kunci ⊆ attributesSchema produk, nilai ∈ daftar yang diizinkan, dan
+  // kombinasi unik per produk (canonical key di service).
+  attributes Json
+
+  // Override harga; null = pakai harga produk.
+  priceSen BigInt?
+
+  // G254: stok per varian.
+  quantityAvailable Int @default(0)
+  quantityReserved  Int @default(0)
+
+  lowStockThreshold Int @default(0)
+  weightGrams       Int?
+  imageFileKeys     String[] @default([])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orderItems  OrderItem[]
+  movements   StockMovement[]
+
+  @@index([productId])
+  @@index([sku])
+  @@map("product_variants")
+}
+
+// --- G255: reservasi stok saat order menunggu pembayaran ------------------------
+model StockReservation {
+  id        String @id @default(cuid())
+  orderId   String // Order.id (logis)
+  productId String?
+  variantId String?
+
+  // SKU yang dicadangkan — kunci idempotency per order (G257/G255).
+  sku    String
+  qty    Int
+  status StockReservationStatus @default(ACTIVE)
+
+  expiresAt  DateTime?
+  releasedAt DateTime?
+  createdAt  DateTime @default(now())
+
+  // Idempoten: reserve ulang order yang sama = no-op (G255).
+  @@unique([orderId, sku])
+  @@index([orderId, status])
+  @@index([status, expiresAt])
+  @@map("stock_reservations")
+}
+
+// --- G266: riwayat mutasi stok beraudit (append-only) ---------------------------
+model StockMovement {
+  id        String @id @default(cuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+  variantId String?
+  variant   ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  type   StockMovementType
+  source StockMovementSource
+
+  actorId   String
+  actorRole StockActorRole
+
+  // G267: alasan WAJIB untuk ADJUST manual (divalidasi di service).
+  reason String? @db.Text
+  // Referensi bisnis: orderId publik, batch import id, dsb.
+  ref    String?
+
+  quantityChange Int // negatif = keluar, positif = masuk
+
+  beforeAvailable Int
+  afterAvailable  Int
+  beforeReserved  Int
+  afterReserved   Int
+
+  createdAt DateTime @default(now())
+
+  @@index([productId, createdAt])
+  @@index([variantId, createdAt])
+  @@index([type, createdAt])
+  @@index([actorId, createdAt])
+  @@map("stock_movements")
+}
+
+// --- G257: idempotency key per order untuk operasi stok --------------------------
+model InventoryOperation {
+  id             String   @id @default(cuid())
+  // Format: "DEDUCT:<orderDbId>" | "RESERVE:<orderDbId>" | "RELEASE:<orderDbId>".
+  idempotencyKey String   @unique
+  op             String   // RESERVE | RELEASE | DEDUCT
+  orderId        String   // Order.id (logis)
+  actorId        String?
+  createdAt      DateTime @default(now())
+
+  @@index([orderId])
+  @@map("inventory_operations")
+}
+
+// --- G272: audit moderasi produk (append-only) -----------------------------------
+model ProductModerationEvent {
+  id        String @id @default(cuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  fromStatus ProductModerationStatus?
+  toStatus   ProductModerationStatus
+  actorId    String
+  actorRole  StockActorRole
+  note       String? @db.Text
+
+  createdAt DateTime @default(now())
+
+  @@index([productId, createdAt])
+  @@map("product_moderation_events")
+}

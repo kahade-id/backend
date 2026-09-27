@@ -1,6 +1,7 @@
 import { Injectable, Logger, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
+import { recordDeliveryMetric } from '../observability/delivery-metrics.service';
 
 export type OtpDeliveryMethod = 'SMS' | 'WHATSAPP';
 export type OtpProviderName = 'mock' | 'fonnte' | 'twilio';
@@ -14,6 +15,14 @@ export interface OtpDeliveryResult {
 interface OtpProviderAdapter {
   send(phoneNumber: string, code: string, method: OtpDeliveryMethod): Promise<OtpDeliveryResult>;
   supportsMethod(method: OtpDeliveryMethod): boolean;
+  /**
+   * Kirim teks notifikasi WhatsApp ARBITER (bukan OTP).
+   * GAP-A (G058/G059): pengingat penghapusan akun harus bisa diterima user
+   * yang sesi & push-nya sudah dicabut — WhatsApp resmi Kahade adalah
+   * satu-satunya kanal yang dijamin sampai. Ini BUKAN jalur OTP: OTP tetap
+   * hanya mengalir lewat alur trigger yang diinisiasi user.
+   */
+  sendText(phoneNumber: string, message: string): Promise<OtpDeliveryResult>;
 }
 
 const DEFAULT_OTP_TEMPLATE = (code: string, method: OtpDeliveryMethod): string =>
@@ -33,6 +42,16 @@ class MockOtpProvider implements OtpProviderAdapter {
     this.logger.warn(
       `[MOCK OTP GATEWAY] Phone: ${phoneNumber}, Method: ${method} ` +
         `— set OTP_PROVIDER=fonnte|twilio with credentials to send real messages.`,
+    );
+    return Promise.resolve({
+      success: true,
+      messageId: `mock_${Date.now()}_${randomBytes(4).toString('hex')}`,
+    });
+  }
+
+  sendText(phoneNumber: string, _message: string): Promise<OtpDeliveryResult> {
+    this.logger.warn(
+      `[MOCK WHATSAPP] Text to ${phoneNumber} — set OTP_PROVIDER=fonnte|twilio to deliver.`,
     );
     return Promise.resolve({
       success: true,
@@ -73,9 +92,23 @@ class FonnteOtpProvider implements OtpProviderAdapter {
     }
 
     const target = this.toFonnteTarget(phoneNumber);
+    return this.postTextMessage(target, DEFAULT_OTP_TEMPLATE(code, method));
+  }
+
+  /**
+   * GAP-A (G058/G059): kirim teks notifikasi WhatsApp arbitrer (bukan OTP)
+   * lewat endpoint /send Fonnte yang sama. Dipakai pengingat penghapusan
+   * akun — BUKAN jalur OTP.
+   */
+  async sendText(phoneNumber: string, message: string): Promise<OtpDeliveryResult> {
+    const target = this.toFonnteTarget(phoneNumber);
+    return this.postTextMessage(target, message);
+  }
+
+  private async postTextMessage(target: string, message: string): Promise<OtpDeliveryResult> {
     const body = new URLSearchParams({
       target,
-      message: DEFAULT_OTP_TEMPLATE(code, method),
+      message,
       countryCode: this.countryCode,
     }).toString();
 
@@ -158,10 +191,28 @@ class TwilioOtpProvider implements OtpProviderAdapter {
     const to = method === 'WHATSAPP' ? `whatsapp:${phoneNumber}` : phoneNumber;
     const fromField =
       method === 'WHATSAPP' && !from.startsWith('whatsapp:') ? `whatsapp:${from}` : from;
+    return this.postMessage(to, fromField, DEFAULT_OTP_TEMPLATE(code, method));
+  }
+
+  /**
+   * GAP-A (G058/G059): teks notifikasi WhatsApp arbitrer (bukan OTP).
+   * Hanya lewat nomor WhatsApp Twilio — SMS tidak didukung untuk notifikasi.
+   */
+  async sendText(phoneNumber: string, message: string): Promise<OtpDeliveryResult> {
+    const from = this.fromWhatsApp;
+    if (!from) {
+      this.logger.error('Twilio WhatsApp "from" number not configured — set TWILIO_WHATSAPP_FROM.');
+      return { success: false, error: 'OTP_DELIVERY_NOT_CONFIGURED' };
+    }
+    const fromField = from.startsWith('whatsapp:') ? from : `whatsapp:${from}`;
+    return this.postMessage(`whatsapp:${phoneNumber}`, fromField, message);
+  }
+
+  private async postMessage(to: string, fromField: string, bodyText: string): Promise<OtpDeliveryResult> {
     const body = new URLSearchParams({
       To: to,
       From: fromField,
-      Body: DEFAULT_OTP_TEMPLATE(code, method),
+      Body: bodyText,
     }).toString();
 
     const url = `https://api.twilio.com/2010-04-01/Accounts/${this.accountSid}/Messages.json`;
@@ -236,7 +287,32 @@ export class OtpGatewayService {
     code: string,
     method: OtpDeliveryMethod,
   ): Promise<OtpDeliveryResult> {
-    return this.provider.send(phoneNumber, code, method);
+    const result = await this.provider.send(phoneNumber, code, method);
+    // G494: metrik delivery — hanya counter agregat per provider,
+    // tanpa nomor tujuan/kode OTP.
+    recordDeliveryMetric('otp', this.providerName, result.success ? 'sent' : 'failed');
+    return result;
+  }
+
+  /**
+   * GAP-A (G058/G059): kirim teks notifikasi WhatsApp arbitrer (BUKAN OTP).
+   *
+   * Dipakai pengingat penghapusan akun: user dalam masa tenggang sudah
+   * kehilangan sesi & push token, dan bisa tidak punya email — WhatsApp
+   * resmi Kahade adalah kanal yang dijamin sampai.
+   *
+   * BUKAN jalur OTP: OTP tetap hanya mengalir lewat alur trigger yang
+   * diinisiasi user (otp-trigger.service). Metrik dicatat di channel
+   * 'whatsapp' yang terpisah dari 'otp'.
+   */
+  async sendTextMessage(phoneNumber: string, message: string): Promise<OtpDeliveryResult> {
+    if (!this.provider.supportsMethod('WHATSAPP')) {
+      this.logger.warn('WhatsApp text requested but provider does not support WHATSAPP.');
+      return { success: false, error: 'WHATSAPP_NOT_SUPPORTED' };
+    }
+    const result = await this.provider.sendText(phoneNumber, message);
+    recordDeliveryMetric('whatsapp', this.providerName, result.success ? 'sent' : 'failed');
+    return result;
   }
 
   /**

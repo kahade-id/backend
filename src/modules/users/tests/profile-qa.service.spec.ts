@@ -14,6 +14,9 @@ const mockPrisma: any = {
   // Section 4: upvote pertanyaan.
   profileQuestionUpvote: { findMany: jest.fn(), create: jest.fn(), deleteMany: jest.fn() },
   $transaction: jest.fn(),
+  // G428: sinkronisasi hidden_by_type via raw SQL (best-effort bila kolom belum ada).
+  $queryRaw: jest.fn(),
+  $executeRaw: jest.fn(),
 };
 
 describe('ProfileQAService', () => {
@@ -215,6 +218,82 @@ describe('ProfileQAService', () => {
       mockPrisma.profileQuestion.findUnique.mockResolvedValue({ receiverId: 'u1', askerId: 'y' });
       const res = await service.deleteQuestion('u1', 'q1');
       expect(res.message).toContain('deleted');
+    });
+  });
+
+  describe('G449 — IDOR: self-service hide hanya pemilik profil', () => {
+    it('user A tidak bisa hide pertanyaan di profil user B (hideQuestion)', async () => {
+      mockPrisma.profileQuestion.findUnique.mockResolvedValue({
+        id: 'q1', receiverId: 'userB', isHidden: false,
+      });
+      await expect(service.hideQuestion('userA', 'q1', 'SPAM')).rejects.toThrow(ForbiddenException);
+      expect(mockPrisma.profileQuestion.update).not.toHaveBeenCalled();
+    });
+
+    it('user A tidak bisa hide komentar di profil user B (hideComment)', async () => {
+      mockPrisma.profileQuestionComment.findUnique.mockResolvedValue({
+        id: 'c1', isHidden: false, question: { receiverId: 'userB' },
+      });
+      await expect(service.hideComment('userA', 'c1', 'SPAM')).rejects.toThrow(ForbiddenException);
+      expect(mockPrisma.profileQuestionComment.update).not.toHaveBeenCalled();
+    });
+
+    it('user A tidak bisa unhide konten profil user B', async () => {
+      mockPrisma.profileQuestion.findUnique.mockResolvedValue({
+        id: 'q1', receiverId: 'userB', isHidden: true,
+      });
+      await expect(service.unhideQuestion('userA', 'q1')).rejects.toThrow(ForbiddenException);
+      mockPrisma.profileQuestionComment.findUnique.mockResolvedValue({
+        id: 'c1', isHidden: true, question: { receiverId: 'userB' },
+      });
+      await expect(service.unhideComment('userA', 'c1')).rejects.toThrow(ForbiddenException);
+    });
+
+    it('pemilik profil tetap bisa hide/unhide kontennya sendiri', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([{ hidden_by_type: 'OWNER' }]);
+      mockPrisma.$executeRaw.mockResolvedValue(1);
+      mockPrisma.profileQuestion.findUnique.mockResolvedValue({
+        id: 'q1', receiverId: 'userB', isHidden: false,
+      });
+      mockPrisma.profileQuestion.update.mockResolvedValue({ id: 'q1', isHidden: true });
+      await expect(service.hideQuestion('userB', 'q1', 'SPAM')).resolves.toBeDefined();
+      // G428 — hide pemilik mencatat hidden_by_type=OWNER via raw SQL.
+      expect(mockPrisma.$executeRaw).toHaveBeenCalled();
+      const hideSql = String(mockPrisma.$executeRaw.mock.calls[0][0].sql ?? mockPrisma.$executeRaw.mock.calls[0][0]);
+      expect(hideSql).toMatch(/hidden_by_type/);
+      expect(mockPrisma.$executeRaw.mock.calls[0][0].values).toContain('OWNER');
+
+      mockPrisma.profileQuestionComment.findUnique.mockResolvedValue({
+        id: 'c1', isHidden: false, question: { receiverId: 'userB' },
+      });
+      mockPrisma.profileQuestionComment.update.mockResolvedValue({ id: 'c1', isHidden: true });
+      await expect(service.hideComment('userB', 'c1', 'SPAM')).resolves.toBeDefined();
+    });
+
+    it('G428 — pemilik TIDAK bisa unhide konten yang di-hide moderator platform', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([{ hidden_by_type: 'MODERATOR' }]);
+      mockPrisma.profileQuestion.findUnique.mockResolvedValue({
+        id: 'q1', receiverId: 'userB', isHidden: true,
+      });
+      await expect(service.unhideQuestion('userB', 'q1')).rejects.toThrow(ForbiddenException);
+      expect(mockPrisma.profileQuestion.update).not.toHaveBeenCalled();
+
+      mockPrisma.profileQuestionComment.findUnique.mockResolvedValue({
+        id: 'c1', isHidden: true, question: { receiverId: 'userB' },
+      });
+      await expect(service.unhideComment('userB', 'c1')).rejects.toThrow(ForbiddenException);
+      expect(mockPrisma.profileQuestionComment.update).not.toHaveBeenCalled();
+    });
+
+    it('G428 — pemilik bisa unhide konten yang ia hide sendiri (hidden_by_type=OWNER/NULL)', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([{ hidden_by_type: 'OWNER' }]);
+      mockPrisma.$executeRaw.mockResolvedValue(1);
+      mockPrisma.profileQuestion.findUnique.mockResolvedValue({
+        id: 'q1', receiverId: 'userB', isHidden: true,
+      });
+      mockPrisma.profileQuestion.update.mockResolvedValue({ id: 'q1', isHidden: false });
+      await expect(service.unhideQuestion('userB', 'q1')).resolves.toBeDefined();
+      expect(mockPrisma.profileQuestion.update).toHaveBeenCalled();
     });
   });
 });

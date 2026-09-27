@@ -17,6 +17,7 @@ import { UploadService } from '../../upload/upload.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { SubscriptionsService } from '../../subscriptions/subscriptions.service';
+import { AdminShowcaseReportsService } from '../../admin/showcase-reports/admin-showcase-reports.service';
 
 const OWNER_ID = 'owner-5';
 const VIEWER_ID = 'viewer-5';
@@ -136,6 +137,7 @@ describe('ShowcaseService — audit Batch 5', () => {
         { provide: AuditLogService, useValue: { logUserAction: jest.fn(), logAdminAction: jest.fn() } },
         { provide: VerificationBadgeService, useValue: { getBadges: jest.fn().mockResolvedValue([]), getSealTierMap: jest.fn().mockResolvedValue(new Map()) } },
         { provide: SubscriptionsService, useValue: mockSubscriptions },
+        { provide: AdminShowcaseReportsService, useValue: { linkReportToCluster: jest.fn() } },
       ],
     }).compile();
     service = module.get<ShowcaseService>(ShowcaseService);

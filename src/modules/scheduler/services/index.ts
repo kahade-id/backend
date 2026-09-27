@@ -28,3 +28,7 @@ export { ReferralLeaderboardRefreshService } from './referral-leaderboard-refres
 export { DormantWinbackVoucherService } from './dormant-winback-voucher.service';
 export { ExpireExtensionRequestsService } from './expire-extension-requests.service';
 export { RefundReconciliationService } from './refund-reconciliation.service';
+export { KycSlaMonitorService } from './kyc-sla-monitor.service';
+export { FeedbackGuestContactRedactionService } from './feedback-guest-contact-redaction.service';
+export { MilestoneReminderService } from './milestone-reminder.service';
+export { ModerationSlaService } from './moderation-sla.service';

@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { OrderStatus, ActorType, NotificationType, Prisma } from '@prisma/client';
 import { randomUUID } from 'crypto';
@@ -8,6 +8,9 @@ import { RedisService } from '../../../redis/redis.service';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
 import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { rollbackOrderVoucherUsage } from '../../../common/utils/voucher-rollback.util';
+// GAP-D (G256): pelepasan reservasi stok saat order kedaluwarsa — @Optional(),
+// best-effort, no-op untuk order tanpa order lines katalog.
+import { InventoryService } from '../../inventory/inventory.service';
 
 @Injectable()
 export class ExpireUnpaidOrdersService {
@@ -16,6 +19,7 @@ export class ExpireUnpaidOrdersService {
   constructor(
     private prisma: PrismaService,
     private redis: RedisService,
+    @Optional() private inventoryService?: InventoryService,
   ) {}
 
   private emitRealtimeBestEffort(
@@ -136,6 +140,14 @@ export class ExpireUnpaidOrdersService {
             );
 
             if (!didExpire) continue;
+
+            // GAP-D (G256): lepaskan reservasi stok katalog untuk order yang
+            // kedaluwarsa. Best-effort — tidak pernah throw; no-op bila tidak
+            // ada order lines katalog.
+            if (this.inventoryService) {
+              const inventory = this.inventoryService;
+              await inventory.safeReleaseForOrder(order.id, 'ORDER_EXPIRED:TIMEOUT_PAYMENT');
+            }
 
             this.prisma.notification
               .create({

@@ -23,6 +23,10 @@ const pending = {
   userId: 'user-1',
   status: BusinessVerificationStatus.PENDING,
   businessName: 'PT Kawal Hak Dengan Aman',
+  npwpNumber: 'enc:01.234.567.8-901.000',
+  documentFileKeys: ['enc:uploads/business-documents/user-1/a.pdf'],
+  deedNumber: '01/2020',
+  siupNumber: null,
 };
 
 const mockPrisma: any = {
@@ -79,7 +83,7 @@ describe('AdminBusinessVerificationService', () => {
     });
 
     it('rejects an unknown status filter', async () => {
-      await expect(service.getQueue(1, 20, 'MAYBE')).rejects.toMatchObject({
+      await expect(service.getQueue(1, 20, { status: 'MAYBE' })).rejects.toMatchObject({
         response: expect.objectContaining({ code: ErrorCodes.INVALID_STATUS }),
       });
       expect(mockPrisma.businessVerification.findMany).not.toHaveBeenCalled();
@@ -87,19 +91,52 @@ describe('AdminBusinessVerificationService', () => {
 
     it('accepts every documented status', async () => {
       for (const status of ['PENDING', 'APPROVED', 'REJECTED', 'REVOKED']) {
-        await service.getQueue(1, 20, status);
+        await service.getQueue(1, 20, { status });
         expect(mockPrisma.businessVerification.findMany).toHaveBeenLastCalledWith(
           expect.objectContaining({ where: { status } }),
         );
       }
     });
 
-    it('never returns the encrypted NPWP in the queue projection', async () => {
-      await service.getQueue(1, 20);
+    it('never returns the encrypted NPWP or raw document keys in queue rows', async () => {
+      mockPrisma.businessVerification.findMany.mockResolvedValueOnce([
+        {
+          id: 'bv-1',
+          verificationId: 'BIZ-20260912-000007-ABCD',
+          userId: 'user-1',
+          status: 'PENDING',
+          businessName: 'PT Kawal Hak Dengan Aman',
+          deedNumber: '01/2020',
+          siupNumber: null,
+          documentFileKeys: ['enc:a', 'enc:b'],
+          approvedAt: null,
+          createdAt: new Date('2026-09-20T00:00:00Z'),
+          reviewedAt: null,
+          reviewedBy: null,
+        },
+      ]);
+      const res: any = await service.getQueue(1, 20);
+      // documentFileKeys boleh di-select untuk menghitung docCount,
+      // tapi TIDAK boleh bocor ke baris respons.
       const select = mockPrisma.businessVerification.findMany.mock.calls[0][0].select;
       expect(select.npwpNumber).toBeUndefined();
       expect(select.npwpNumberHash).toBeUndefined();
-      expect(select.documentFileKeys).toBeUndefined();
+      const row = res.data[0];
+      expect(row.npwpNumber).toBeUndefined();
+      expect(row.documentFileKeys).toBeUndefined();
+      expect(row.docCount).toBe(2);
+      expect(row.documentsComplete).toBe(true);
+      expect(row.legalEntityType).toBe('PT');
+    });
+
+    it('filters by legalEntityType, docsComplete, and awaitingDocs', async () => {
+      await service.getQueue(1, 20, { legalEntityType: 'PT' });
+      expect(mockPrisma.businessVerification.findMany).toHaveBeenLastCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ AND: expect.any(Array) }) }),
+      );
+      await service.getQueue(1, 20, { awaitingDocs: 'true' });
+      const where = mockPrisma.businessVerification.findMany.mock.calls.at(-1)[0].where;
+      expect(JSON.stringify(where)).toContain('PENDING');
     });
   });
 
@@ -125,12 +162,14 @@ describe('AdminBusinessVerificationService', () => {
       );
     });
 
-    it('does not leak the NPWP or document keys in the detail payload', async () => {
-      await service.getDetail('bv-1');
-      const select = mockPrisma.businessVerification.findFirst.mock.calls[0][0].select;
-      expect(select.npwpNumber).toBeUndefined();
-      expect(select.npwpNumberHash).toBeUndefined();
-      expect(select.documentFileKeys).toBeUndefined();
+    it('returns only the MASKED npwp and never raw keys in the detail payload', async () => {
+      const detail: any = await service.getDetail('bv-1');
+      expect(detail.npwpNumber).toBeUndefined();
+      expect(detail.documentFileKeys).toBeUndefined();
+      // NPWP terdekripsi lalu di-mask: hanya 4 digit terakhir yang terlihat.
+      expect(detail.npwpMasked).toBe('••.•••.•••.•-••1.000');
+      expect(detail.docCount).toBe(1);
+      expect(detail.documentsComplete).toBe(true);
     });
   });
 

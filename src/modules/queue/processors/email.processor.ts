@@ -8,6 +8,7 @@ import { RedisService } from '../../../redis/redis.service';
 import { TemplateService } from '../../../common/services/template.service';
 import { DEAD_LETTER_QUEUE, deadLetterJobId, QUEUE_JOB_TIMEOUT_MS } from '../queue.constants';
 import { safeErrorMessage } from '../../../common/utils/background-reliability.util';
+import { recordDeliveryMetric } from '../../observability/delivery-metrics.service';
 
 export const EMAIL_QUEUE = 'email';
 
@@ -170,6 +171,8 @@ export class EmailProcessor implements OnModuleDestroy {
       });
 
       this.logger.log(`Email job ${job.id} sent successfully`);
+      // G494: metrik delivery — hanya counter, tanpa alamat/isi email.
+      recordDeliveryMetric('email', 'smtp', 'sent');
     } catch (error) {
       if (error instanceof Error && isPermanentFailure(error)) {
         this.logger.warn(
@@ -198,6 +201,8 @@ export class EmailProcessor implements OnModuleDestroy {
 
 
     if (job.attemptsMade >= (job.opts.attempts || 1)) {
+      // G494: metrik delivery — kegagalan final (bukan tiap retry). Hanya counter.
+      recordDeliveryMetric('email', 'smtp', 'failed');
       const failureData = {
         jobId: job.id,
         error: sanitizedMessage,

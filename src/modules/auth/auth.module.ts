@@ -9,6 +9,9 @@ import { CaptchaService } from './captcha.service';
 import { OtpGatewayService } from './otp-gateway.service';
 import { OtpTriggerService } from './otp-trigger.service';
 import { AuthLocationService } from './auth-location.service';
+import { PasskeyService } from './passkey.service';
+import { PasskeyController } from './passkey.controller';
+import { AppleAuthService } from './apple-auth.service';
 import { QueueModule } from '../queue/queue.module';
 import { AuditLogModule } from '../../common/services/audit-log.module';
 
@@ -19,7 +22,7 @@ import { AuditLogModule } from '../../common/services/audit-log.module';
     QueueModule,
     AuditLogModule,
   ],
-  controllers: [AuthController, LegacyFonnteWebhookController],
+  controllers: [AuthController, LegacyFonnteWebhookController, PasskeyController],
   providers: [
     AuthService,
     TokenService,
@@ -28,7 +31,9 @@ import { AuditLogModule } from '../../common/services/audit-log.module';
     OtpGatewayService,
     OtpTriggerService,
     AuthLocationService,
+    PasskeyService,
+    AppleAuthService,
   ],
-  exports: [AuthService, TokenService, OtpService, CaptchaService, OtpGatewayService, OtpTriggerService, AuthLocationService, JwtModule],
+  exports: [AuthService, TokenService, OtpService, CaptchaService, OtpGatewayService, OtpTriggerService, AuthLocationService, PasskeyService, AppleAuthService, JwtModule],
 })
 export class AuthModule {}

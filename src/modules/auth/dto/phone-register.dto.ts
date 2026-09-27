@@ -66,4 +66,14 @@ export class PhoneRegisterDto {
   @IsOptional()
   @Type(() => LocationDto)
   location?: LocationDto;
+
+  @ApiPropertyOptional({
+    description:
+      'Token signup sosial (scope social_signup) dari login Google/Apple untuk identitas baru. ' +
+      'Ditautkan setelah nomor HP terverifikasi; registrasi tetap sukses bila penautan gagal.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(2048)
+  socialLinkToken?: string;
 }

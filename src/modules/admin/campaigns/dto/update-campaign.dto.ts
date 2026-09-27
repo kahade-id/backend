@@ -1,6 +1,6 @@
 import { IsBoolean, IsDateString, IsEnum, IsInt, IsNumber, IsOptional, IsString, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
 import { Transform } from 'class-transformer';
-import { ApiPropertyOptional } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { CampaignStatus, MembershipRank } from '@prisma/client';
 
 const trim = ({ value }: { value: unknown }) => typeof value === 'string' ? value.trim() : value;
@@ -55,7 +55,11 @@ export class UpdateCampaignDto {
   @IsOptional() @IsEnum(CampaignStatus)
   status?: CampaignStatus;
 
-  @ApiPropertyOptional({ description: 'Staged rollout percentage (0-100). Can only be increased once set.', minimum: 0, maximum: 100 })
-  @IsOptional() @IsNumber() @Min(0) @Max(100)
+  @ApiPropertyOptional({ description: 'Staged rollout percentage (1-100). Can only be increased once set.', minimum: 1, maximum: 100 })
+  @IsOptional() @IsNumber() @Min(1, { message: 'rolloutPercent must be between 1 and 100' }) @Max(100)
   rolloutPercent?: number;
+
+  @ApiProperty({ description: 'Alasan perubahan (wajib, min 5 karakter) — dicatat di riwayat versi & audit', minLength: 5, maxLength: 1000, example: 'Perpanjang periode promo akhir tahun' })
+  @IsString() @MinLength(5, { message: 'changeReason wajib diisi (min 5 karakter)' }) @MaxLength(1000) @Matches(/\S/, { message: 'changeReason cannot be blank' }) @Transform(trim)
+  changeReason!: string;
 }

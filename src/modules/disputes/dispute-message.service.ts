@@ -68,12 +68,97 @@ export class DisputeMessageService {
       }),
     ]);
 
+    // GAP-B3 (G136/G139): sertakan signed URL + waktu kedaluwarsa per lampiran
+    // supaya klien bisa me-render pratinjau tanpa endpoint tambahan. URL dibuat
+    // best-effort (TTL 300 dtk, sama seperti evidence) — kegagalan satu berkas
+    // tidak boleh menggagalkan daftar pesan; klien memakai endpoint refresh
+    // `GET :disputeId/attachments/signed-url` bila URL kedaluwarsa.
+    const enriched = await Promise.all(
+      messages.reverse().map(async (message) => ({
+        ...message,
+        attachments: await this.attachSignedUrls(message.attachments),
+      })),
+    );
+
     return {
-      messages: messages.reverse(),
+      messages: enriched,
       total,
       page: safePage,
       limit: safeLimit,
       totalPages: Math.ceil(total / safeLimit),
+    };
+  }
+
+  /**
+   * GAP-B3 (G136/G139): signed URL per lampiran pesan. Best-effort — lampiran
+   * tanpa URL valid tetap dikembalikan (klien menampilkan metadata + status
+   * "tidak tersedia", dan bisa meminta URL baru lewat endpoint refresh).
+   */
+  private async attachSignedUrls(
+    attachments: unknown,
+  ): Promise<Array<Record<string, unknown>>> {
+    if (!Array.isArray(attachments)) return [];
+    const ATTACHMENT_URL_TTL_SECONDS = 300;
+    return Promise.all(
+      attachments.map(async (raw) => {
+        const attachment = (raw ?? {}) as Record<string, unknown>;
+        const fileKey = typeof attachment.fileKey === 'string' ? attachment.fileKey : '';
+        if (!fileKey) return attachment;
+        try {
+          const url = await this.uploadService.generateDownloadUrl(
+            fileKey,
+            ATTACHMENT_URL_TTL_SECONDS,
+          );
+          return {
+            ...attachment,
+            url,
+            expiresAt: new Date(Date.now() + ATTACHMENT_URL_TTL_SECONDS * 1000).toISOString(),
+          };
+        } catch (error) {
+          // URL tidak bisa dibuat (key asing/hilang) — metadata tetap tampil.
+          this.logger.warn(
+            `Dispute attachment signed URL failed for key=${fileKey}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          return attachment;
+        }
+      }),
+    );
+  }
+
+  /**
+   * GAP-B3 (G139/G148): URL unduh baru untuk lampiran pesan yang kedaluwarsa.
+   *
+   * Guard: (1) pemanggil HARUS peserta sengketa (`validateDisputeAccess`),
+   * (2) fileKey HARUS terdaftar sebagai lampiran salah satu pesan sengketa ini
+   * (containment jsonb — mencegah penandatanganan key arbitrer milik orang
+   * lain), (3) tidak ada URL mentah yang disimpan — hanya fileKey di query.
+   */
+  async getAttachmentSignedUrl(
+    disputeId: string,
+    userId: string,
+    fileKey: string,
+  ): Promise<{ url: string; expiresAt: string }> {
+    const dispute = await this.validateDisputeAccess(disputeId, userId);
+    if (typeof fileKey !== 'string' || fileKey.length === 0 || fileKey.length > 512) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid file key' });
+    }
+    const ATTACHMENT_URL_TTL_SECONDS = 300;
+    const rows = await this.prisma.$queryRaw<Array<{ id: string }>>`
+      SELECT id FROM "dispute_messages"
+      WHERE "disputeId" = ${dispute.id}
+        AND attachments::jsonb @> jsonb_build_array(jsonb_build_object('fileKey', ${fileKey}))
+      LIMIT 1
+    `;
+    if (rows.length === 0) {
+      throw new NotFoundException({
+        code: ErrorCodes.FILE_NOT_FOUND_OR_EXPIRED,
+        message: 'Attachment not found in this dispute',
+      });
+    }
+    const url = await this.uploadService.generateDownloadUrl(fileKey, ATTACHMENT_URL_TTL_SECONDS);
+    return {
+      url,
+      expiresAt: new Date(Date.now() + ATTACHMENT_URL_TTL_SECONDS * 1000).toISOString(),
     };
   }
 

@@ -12,8 +12,12 @@ import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { AdminFinanceService } from './admin-finance.service';
 import { ReconciliationService } from './reconciliation.service';
+import { ReconciliationFindingsService } from './reconciliation-findings.service';
+import { LedgerCorrectionService } from './ledger-corrections.service';
 import { RECONCILIATION_QUEUE, ReconciliationJobData } from './reconciliation.processor';
 import { FinanceTransactionQueryDto } from './dto/finance-query.dto';
+import { FindingsQueryDto, AcknowledgeFindingDto, BatchDiscrepanciesQueryDto } from './dto/finance-findings.dto';
+import { RequestCorrectionDto, DecideCorrectionDto, CorrectionsQueryDto } from './dto/ledger-correction.dto';
 import { WithdrawalApproveDto, WithdrawalRejectDto } from './dto/withdrawal-action.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
 import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
@@ -32,6 +36,8 @@ export class AdminFinanceController {
   constructor(
     private readonly service: AdminFinanceService,
     private readonly reconciliationService: ReconciliationService,
+    private readonly findingsService: ReconciliationFindingsService,
+    private readonly correctionsService: LedgerCorrectionService,
     @InjectQueue(RECONCILIATION_QUEUE) private readonly reconciliationQueue: Queue<ReconciliationJobData>,
   ) {}
 
@@ -48,6 +54,14 @@ export class AdminFinanceController {
   @ApiResponse({ status: 404, description: 'Transaction not found.' })
   getTransactionDetail(@Param('txId', ParseIdPipe) txId: string, @CurrentAdmin('sub') adminId: string, @Req() req: Request): Promise<object> {
     return this.service.getTransactionDetail(txId, adminId, req.ip || 'unknown');
+  }
+
+  @Get('transactions/:txId/timeline')
+  @ApiOperation({ summary: 'Transaction timeline', description: 'Combined ledger + webhook events for a transaction, sorted chronologically. Secrets in payloads are masked.' })
+  @ApiResponse({ status: 200, description: 'Timeline returned.' })
+  @ApiResponse({ status: 404, description: 'Transaction not found.' })
+  getTransactionTimeline(@Param('txId', ParseIdPipe) txId: string, @CurrentAdmin('sub') adminId: string, @Req() req: Request): Promise<object> {
+    return this.service.getTransactionTimeline(txId, adminId, req.ip || 'unknown');
   }
 
   @Get('summary')
@@ -111,11 +125,18 @@ export class AdminFinanceController {
   @ApiResponse({ status: 404, description: 'Wallet not found.' })
   async reconcileUser(@Param('userId', ParseIdPipe) userId: string, @CurrentAdmin('sub') adminId: string, @Req() req: Request): Promise<object> {
     const discrepancy = await this.reconciliationService.reconcileWalletBalance(userId);
+    // E3: selisih disimpan sebagai ReconciliationFinding (dedup otomatis).
+    const findings = await this.findingsService.recordFromDiscrepancies(
+      discrepancy ? [discrepancy] : [],
+      null,
+      adminId,
+    );
     const result = {
       userId,
       reconciledAt: new Date().toISOString(),
       clean: discrepancy === null,
       discrepancy: discrepancy ?? undefined,
+      findingId: findings[0]?.id ?? null,
     };
 
     this.service.logReconciliation(adminId, userId, result.clean, req.ip || 'unknown');
@@ -213,6 +234,131 @@ export class AdminFinanceController {
     const csv = await this.service.buildFinanceCsvExport(fromDate, toDate);
     res!.setHeader('Content-Type', 'text/csv');
     res!.setHeader('Content-Disposition', 'attachment; filename="finance-export.csv"');
+    res!.send(csv);
+  }
+
+  // ============================================================
+  // E3 (G326-G350): temuan rekonsiliasi
+  // ============================================================
+
+  @Get('findings')
+  @ApiOperation({ summary: 'List reconciliation findings', description: 'Paginated findings with filters: status, minDifferenceIdr, maxAgeDays, invariant, urgentOnly.' })
+  @ApiResponse({ status: 200, description: 'Findings returned.' })
+  listFindings(@Query() query: FindingsQueryDto): Promise<object> {
+    return this.findingsService.listFindings(query);
+  }
+
+  @Post('findings/:id/acknowledge')
+  @AdminRoles('FINANCE_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({ summary: 'Acknowledge finding', description: 'Transition a finding to INVESTIGATING/RESOLVED/ACCEPTED with notes. Audited.' })
+  @ApiResponse({ status: 200, description: 'Finding acknowledged.' })
+  @ApiResponse({ status: 404, description: 'Finding not found.' })
+  @ApiResponse({ status: 409, description: 'Invalid status transition.' })
+  acknowledgeFinding(
+    @Param('id', ParseIdPipe) id: string,
+    @Body() dto: AcknowledgeFindingDto,
+    @CurrentAdmin('sub') adminId: string,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.findingsService.acknowledgeFinding(id, adminId, dto, req.ip || 'unknown');
+  }
+
+  // ============================================================
+  // E3 (G326-G350): koreksi ledger manual — dual approval
+  // ============================================================
+
+  @Post('corrections')
+  @AdminRoles('FINANCE_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({
+    summary: 'Request ledger correction (step 1 of 2)',
+    description: 'Creates a PENDING_APPROVAL correction request. NO balance mutation happens here. Requires Idempotency-Key header.',
+  })
+  @ApiResponse({ status: 200, description: 'Correction request created (or replayed idempotently).' })
+  requestCorrection(
+    @Body() dto: RequestCorrectionDto,
+    @CurrentAdmin('sub') adminId: string,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.correctionsService.requestCorrection(adminId, dto, req.ip || 'unknown');
+  }
+
+  @Get('corrections')
+  @AdminRoles('FINANCE_ADMIN', 'SUPER_ADMIN')
+  @ApiOperation({ summary: 'List correction requests', description: 'Correction requests with their approval status. Filter by status.' })
+  @ApiResponse({ status: 200, description: 'Corrections returned.' })
+  listCorrections(@Query() query: CorrectionsQueryDto): Promise<object> {
+    return this.correctionsService.listCorrections(query);
+  }
+
+  @Get('corrections/:id')
+  @AdminRoles('FINANCE_ADMIN', 'SUPER_ADMIN')
+  @ApiOperation({ summary: 'Get correction request', description: 'Single correction request with its decision (if any).' })
+  @ApiResponse({ status: 200, description: 'Correction returned.' })
+  @ApiResponse({ status: 404, description: 'Correction request not found.' })
+  getCorrection(@Param('id', ParseIdPipe) id: string): Promise<object> {
+    return this.correctionsService.getCorrection(id);
+  }
+
+  @Post('corrections/:id/approve')
+  @AdminRoles('FINANCE_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({
+    summary: 'Decide correction (step 2 of 2)',
+    description: 'APPROVE executes the ledger mutation (must be a DIFFERENT admin than the requester); REJECT cancels. Requires Idempotency-Key header.',
+  })
+  @ApiResponse({ status: 200, description: 'Decision recorded.' })
+  @ApiResponse({ status: 403, description: 'Self-approval is forbidden.' })
+  @ApiResponse({ status: 404, description: 'Correction request not found.' })
+  @ApiResponse({ status: 409, description: 'Already decided.' })
+  decideCorrection(
+    @Param('id', ParseIdPipe) id: string,
+    @Body() dto: DecideCorrectionDto,
+    @CurrentAdmin('sub') adminId: string,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.correctionsService.decideCorrection(id, adminId, dto, req.ip || 'unknown');
+  }
+
+  // ============================================================
+  // E3 (G326-G350): batch rekonsiliasi terjadwal
+  // ============================================================
+
+  @Get('reconcile/batches')
+  @ApiOperation({ summary: 'List reconciliation batch snapshots', description: 'Immutable summaries of past reconcile-all runs (newest first).' })
+  @ApiResponse({ status: 200, description: 'Batch snapshots returned.' })
+  listReconcileBatches(): Promise<object> {
+    return this.reconciliationService.listBatchSnapshots().then((batches) => ({ batches }));
+  }
+
+  @Get('reconcile/batches/:batchId/discrepancies')
+  @ApiOperation({ summary: 'Batch discrepancies drill-down', description: 'Paginated findings recorded for a specific batch.' })
+  @ApiResponse({ status: 200, description: 'Batch discrepancies returned.' })
+  getBatchDiscrepancies(
+    @Param('batchId') batchId: string,
+    @Query() query: BatchDiscrepanciesQueryDto,
+  ): Promise<object> {
+    return this.findingsService.listByBatch(batchId, query.page ?? 1, query.limit ?? 20);
+  }
+
+  @Get('reconcile/findings/export/csv')
+  @ApiOperation({ summary: 'Export reconciliation findings CSV (tanpa PII)', description: 'Findings report with user identities reduced to initials — no userId, email, or phone numbers.' })
+  @ApiResponse({ status: 200, description: 'CSV exported.' })
+  async exportFindingsCsv(
+    @CurrentAdmin('sub') adminId: string,
+    @Req() req: Request,
+    @Res() res?: Response,
+  ): Promise<void> {
+    const csv = await this.service.buildFindingsCsvExport();
+    this.service.logReconciliation(adminId, 'findings-export', true, req.ip || 'unknown');
+    res!.setHeader('Content-Type', 'text/csv');
+    res!.setHeader('Content-Disposition', 'attachment; filename="reconciliation-findings.csv"');
     res!.send(csv);
   }
 }

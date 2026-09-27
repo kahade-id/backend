@@ -18,8 +18,9 @@ import { OtpService } from './otp.service';
 import { OtpTriggerService, type TriggerPayload } from './otp-trigger.service';
 import { OtpTriggerPurpose } from './dto/otp-trigger.dto';
 import { AuthLocationService } from './auth-location.service';
+import { AppleAuthService } from './apple-auth.service';
 import type { LocationDto } from './dto/location.dto';
-import { OtpType, NotificationType, UserAuditAction, Gender, Prisma, User } from '@prisma/client';
+import { OtpType, NotificationType, UserAuditAction, Gender, Prisma, User, SocialProvider } from '@prisma/client';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import {
   generateUserId,
@@ -125,6 +126,8 @@ export class AuthService {
     private locationService: AuthLocationService,
     private otpTriggerService: OtpTriggerService,
     @InjectQueue(EMAIL_QUEUE) private readonly emailQueue: Queue<EmailJobData>,
+    // GAP-A (G009): verifikasi token Apple; tetap nonaktif kecuali dikonfigurasi.
+    private readonly appleAuth: AppleAuthService,
   ) {}
 
   /**
@@ -937,6 +940,171 @@ export class AuthService {
   }
 
   // ─────────────────────────────────────────────────────────────────
+  // GAP-A: passkey / WebAuthn (G027–G050) — dipakai oleh PasskeyService
+  // ─────────────────────────────────────────────────────────────────
+  /**
+   * Re-auth untuk operasi sensitif passkey (G027, G036, G037, G039).
+   *
+   * Kebijakan berlapis:
+   *  1. `reauthToken` (scope `passkey_reauth`, sekali pakai, dari alur
+   *     recover/verify) → langsung lolos.
+   *  2. Bila user punya password: password WAJIB benar; bila 2FA aktif,
+   *     `mfaCode` (TOTP/backup) juga WAJIB via verifySensitiveMfa.
+   *  3. Bila tanpa password (akun social-only): `otpCode` WhatsApp
+   *     (OtpType.SENSITIVE_ACTION) WAJIB; bila 2FA aktif, `mfaCode` juga WAJIB.
+   */
+  async assertPasskeyReauthenticated(
+    userId: string,
+    dto: { password?: string; mfaCode?: string; otpCode?: string; reauthToken?: string },
+  ): Promise<void> {
+    if (dto.reauthToken) {
+      let payload: TempTokenPayload;
+      try {
+        payload = this.tokenService.verifyTempToken(dto.reauthToken);
+      } catch {
+        throw new UnauthorizedException({
+          code: ErrorCodes.INVALID_TOKEN,
+          message: 'Token re-autentikasi tidak valid atau kedaluwarsa. Minta kode OTP baru.',
+        });
+      }
+      if (payload.scope !== 'passkey_reauth' || payload.sub !== userId) {
+        throw new UnauthorizedException({
+          code: ErrorCodes.INVALID_TOKEN,
+          message: 'Token re-autentikasi tidak valid.',
+        });
+      }
+      await this.claimTempTokenOnce(
+        payload.jti,
+        this.getTempTokenTtlFromPayload(payload),
+        'REAUTH_TOKEN_USED',
+        'Token re-autentikasi sudah dipakai. Minta kode OTP baru.',
+      );
+      return;
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, password: true, isActive: true, isBanned: true, phoneNumber: true },
+    });
+    if (!user || !user.isActive || user.isBanned) {
+      throw new UnauthorizedException({
+        code: ErrorCodes.INVALID_CREDENTIALS,
+        message: 'Kredensial tidak valid.',
+      });
+    }
+    if (user.password) {
+      if (!dto.password || !(await bcryptCompare(dto.password, user.password))) {
+        throw new UnauthorizedException({
+          code: ErrorCodes.INVALID_CREDENTIALS,
+          message: 'Kata sandi salah. Masukkan kata sandi Anda untuk melanjutkan.',
+        });
+      }
+    } else {
+      // Akun tanpa password (social-only): re-auth via OTP WhatsApp.
+      const otpOk =
+        !!dto.otpCode &&
+        (await this.otpService.verifyPhoneOtp(user.phoneNumber, OtpType.SENSITIVE_ACTION, dto.otpCode));
+      if (!otpOk) {
+        throw new UnauthorizedException({
+          code: 'INVALID_OTP',
+          message: 'Kode OTP WhatsApp salah atau kedaluwarsa.',
+        });
+      }
+    }
+    await this.verifySensitiveMfa(userId, dto.mfaCode);
+  }
+
+  /**
+   * Menerbitkan sesi setelah assertion passkey terverifikasi (G030).
+   *
+   * Alur pasca-kredensial disamakan dengan login(): cek status akun,
+   * migrasi nomor HP, lalu 2FA. Keputusan produk: passkey dihitung sebagai
+   * faktor kuat, tetapi bila 2FA aktif user tetap diminta TOTP
+   * (passkey + TOTP) — kecuali perangkat sudah dipercaya (trusted device),
+   * mengikuti kebijakan yang sama dengan login password.
+   */
+  async loginWithPasskey(
+    userId: string,
+    ipAddress: string,
+    opts: { deviceId: string; deviceInfo?: string; location?: LocationDto },
+  ): Promise<
+    | LoginResult
+    | { requiresPhoneMigration: true; migrationToken: string }
+  > {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user || !user.isActive || user.isBanned) {
+      throw new UnauthorizedException({
+        code: ErrorCodes.INVALID_CREDENTIALS,
+        message: 'Invalid credentials',
+      });
+    }
+    if (user.lockedUntil && user.lockedUntil > new Date()) {
+      const remainingSeconds = Math.ceil((user.lockedUntil.getTime() - Date.now()) / 1000);
+      throw new UnauthorizedException({
+        code: ErrorCodes.ACCOUNT_LOCKED,
+        message: 'Account is temporarily locked due to too many failed attempts',
+        lockoutRemainingSeconds: remainingSeconds,
+      });
+    }
+
+    // Migrasi wajib nomor HP — sama seperti login password.
+    if (!user.phoneVerified) {
+      const migrationToken = this.tokenService.signTempToken({
+        sub: user.id,
+        scope: 'phone_migration',
+        deviceId: opts.deviceId,
+      });
+      await this.locationService.logEvent({
+        userId: user.id,
+        event: 'login',
+        location: opts.location ?? null,
+        ipAddress,
+        deviceId: opts.deviceId,
+      });
+      return { requiresPhoneMigration: true as const, migrationToken };
+    }
+
+    const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({
+      where: { userId: user.id },
+    });
+    if (twoFactorAuth?.isEnabled) {
+      let skipTwoFa = false;
+      if (opts.deviceId) {
+        const trustedDevice = await this.prisma.userDevice.findFirst({
+          where: { userId: user.id, deviceId: opts.deviceId, isTrusted: true },
+        });
+        if (trustedDevice?.trustedAt) {
+          const trustExpiryMs =
+            (this.configService.get<number>('app.trustedDeviceDays') ?? 30) * 24 * 60 * 60 * 1000;
+          if (Date.now() - trustedDevice.trustedAt.getTime() >= trustExpiryMs) {
+            await this.prisma.userDevice.update({
+              where: { id: trustedDevice.id },
+              data: { isTrusted: false, trustedAt: null },
+            });
+          } else {
+            skipTwoFa = true;
+          }
+        }
+      }
+      if (!skipTwoFa) {
+        const tempToken = this.tokenService.signTempToken({
+          sub: user.id,
+          scope: '2fa_verify',
+          deviceId: opts.deviceId,
+        });
+        return { requires2FA: true, tempToken };
+      }
+    }
+
+    return this.issueLoginSession(user, ipAddress, {
+      deviceId: opts.deviceId,
+      deviceInfo: opts.deviceInfo,
+      isMfaEnabled: twoFactorAuth?.isEnabled ?? false,
+      location: opts.location,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────
   // PHONE REGISTER (e-wallet style — after OTP verification)
   // ─────────────────────────────────────────────────────────────────
   // ─────────────────────────────────────────────────────────────────
@@ -958,12 +1126,21 @@ export class AuthService {
       deviceInfo?: string;
       location?: LocationDto;
       referralCode?: string;
+      /**
+       * Token signup sosial (scope 'social_signup', sub='pending') dari
+       * /v1/auth/social/login untuk identitas baru. Setelah user dibuat
+       * (nomor HP terverifikasi via OTP WhatsApp), akun sosial ditautkan.
+       * Gagal menautkan TIDAK menggagalkan registrasi — frontend diberi tahu
+       * via socialLinked=false agar user bisa menautkan dari Pengaturan.
+       */
+      socialLinkToken?: string;
     },
     ipAddress: string,
   ): Promise<{
     accessToken: string;
     refreshToken: string;
     user: LoginUserPayload;
+    socialLinked: boolean;
   }> {
     let payload: TempTokenPayload;
     try {
@@ -1174,6 +1351,21 @@ export class AuthService {
     }
 
     const refreshToken = this.tokenService.signRefreshToken({ sub: user.id });
+
+    // Penautan akun sosial pasca-registrasi (identitas baru dari social login).
+    // Nomor HP sudah terverifikasi di titik ini — penautan aman dilakukan.
+    let socialLinked = false;
+    if (dto.socialLinkToken) {
+      socialLinked = await this.linkSocialSignupToken(dto.socialLinkToken, user.id, ipAddress).catch(
+        (err) => {
+          this.logger.warn(
+            `social signup link failed for user ${user.id}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return false;
+        },
+      );
+    }
+
     const sessionId = await this.saveSession(
       user.id,
       refreshToken,
@@ -1239,7 +1431,103 @@ export class AuthService {
         gender: null,
         createdAt: new Date().toISOString(),
       },
+      socialLinked,
     };
+  }
+
+  /**
+   * Tautkan identitas sosial ke user yang baru registrasi (scope 'social_signup').
+   * Dipanggil SETELAH nomor HP terverifikasi di phoneRegister. Token sekali-pakai
+   * diklaim SETELAH SocialAccount berhasil dibuat — kegagalan sebelum klaim
+   * membiarkan token tetap valid untuk percobaan ulang dari Pengaturan.
+   * Melempar Error bila token tidak valid (pemanggil memutuskan: registrasi
+   * tetap sukses, socialLinked=false).
+   */
+  private async linkSocialSignupToken(
+    socialLinkToken: string,
+    userId: string,
+    ipAddress: string,
+  ): Promise<boolean> {
+    let payload: TempTokenPayload;
+    try {
+      payload = this.tokenService.verifyTempToken(socialLinkToken);
+    } catch {
+      throw new Error('Token penautan sosial kedaluwarsa. Tautkan dari Pengaturan → Keamanan.');
+    }
+    const extra = payload as TempTokenPayload & {
+      provider?: SocialProvider;
+      providerSub?: string;
+      email?: string | null;
+    };
+    if (
+      payload.scope !== 'social_signup' ||
+      payload.sub !== 'pending' ||
+      !extra.provider ||
+      !extra.providerSub
+    ) {
+      throw new Error('Token penautan sosial tidak valid.');
+    }
+    const providerLabel = extra.provider === 'GOOGLE' ? 'Google' : 'Apple';
+    const taken = await this.prisma.socialAccount.findUnique({
+      where: { provider_providerSub: { provider: extra.provider, providerSub: extra.providerSub } },
+      select: { id: true, userId: true },
+    });
+    if (taken) {
+      if (taken.userId === userId) return true; // idempoten
+      throw new Error(`Akun ${providerLabel} ini sudah tertaut ke akun Kahade lain.`);
+    }
+    const now = new Date();
+    try {
+      await this.prisma.socialAccount.create({
+        data: {
+          userId,
+          provider: extra.provider,
+          providerSub: extra.providerSub,
+          email: extra.email ?? null,
+          lastUsedAt: now,
+          consentAt: now,
+          consentTextVersion: AuthService.SOCIAL_CONSENT_VERSION,
+        },
+      });
+    } catch (err) {
+      // Balapan dua percobaan dengan token yang sama: satu menang di unique
+      // constraint. Perlakukan sebagai idempoten bila pemiliknya user ini.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        const raced = await this.prisma.socialAccount.findUnique({
+          where: { provider_providerSub: { provider: extra.provider, providerSub: extra.providerSub } },
+          select: { userId: true },
+        });
+        if (raced && raced.userId === userId) {
+          // Lanjut ke klaim token di bawah.
+        } else {
+          throw new Error(`Akun ${providerLabel} ini sudah tertaut ke akun Kahade lain.`);
+        }
+      } else {
+        throw err;
+      }
+    }
+    await this.claimTempTokenOnce(
+      payload.jti,
+      this.getTempTokenTtlFromPayload(payload),
+      'SOCIAL_SIGNUP_TOKEN_USED',
+      'Token penautan sosial sudah dipakai.',
+    );
+    this.auditLog.logUserAction({
+      userId,
+      action: UserAuditAction.SOCIAL_PROVIDER_LINKED,
+      entityType: 'SocialAccount',
+      entityId: `${extra.provider}:${extra.providerSub}`,
+      description: `${providerLabel} ditautkan saat registrasi nomor HP (identitas sosial baru)`,
+      ipAddress,
+    });
+    await this.sendSocialSecurityNotification(
+      userId,
+      `Masuk dengan ${providerLabel} diaktifkan`,
+      `Akun ${providerLabel} Anda telah ditautkan sebagai metode masuk. Jika ini bukan Anda, segera lepaskan dari menu Keamanan.`,
+      ipAddress,
+    ).catch(() => undefined);
+    this.logger.log(`social_login_step provider=${extra.provider.toLowerCase()} step=signup_linked`);
+    return true;
   }
 
   /** Buat username unik dari nama lengkap: nama + 4 digit acak. */
@@ -4014,32 +4302,80 @@ export class AuthService {
   }
 
   // ─────────────────────────────────────────────────────────────────
-  // SOCIAL LOGIN (Google, Apple)
+  // SOCIAL LOGIN (Google, Apple) — GAP-A G001–G025
   // ─────────────────────────────────────────────────────────────────
+
+  /**
+   * G020: versi teks persetujuan yang ditampilkan ke pengguna sebelum profil
+   * dasar provider dikirim ke Kahade. Disimpan di social_accounts
+   * (consentAt + consentTextVersion) sebagai bukti persetujuan.
+   */
+  static readonly SOCIAL_CONSENT_VERSION = 'social-consent-v1';
+
+  /**
+   * G003: kontrak kapabilitas provider agar aplikasi tidak menebak konfigurasi
+   * environment. Public, tanpa PII.
+   */
+  /**
+   * G002/G003: kapabilitas provider login sosial. Publik, tanpa PII —
+   * aplikasi memakai ini untuk menampilkan/menyembunyikan tombol Google &
+   * Apple tanpa menebak env. `appId` adalah OAuth client ID (publik by
+   * design) yang dipakai aplikasi untuk memulai alur OAuth.
+   */
+  getSocialProviders(): {
+    providers: { provider: 'GOOGLE' | 'APPLE'; enabled: boolean; appId: string | null }[];
+  } {
+    const googleClientId =
+      this.configService.get<string>('app.googleClientId') || process.env.GOOGLE_CLIENT_ID;
+    const appleClientId = this.appleAuth.getClientId();
+    return {
+      providers: [
+        { provider: 'GOOGLE', enabled: !!googleClientId, appId: googleClientId ?? null },
+        { provider: 'APPLE', enabled: !!appleClientId, appId: appleClientId ?? null },
+      ],
+    };
+  }
+
+  /**
+   * G004: entry point POST /v1/auth/social-login.
+   *
+   * Mengembalikan sesi penuh, ATAU `{ requiresLink: true, ... }`:
+   * - email provider dipakai akun lain → konflik; TIDAK PERNAH di-auto-link/
+   *   di-auto-create (G014). Aplikasi menampilkan layar konfirmasi + re-auth
+   *   akun lama, lalu POST /v1/auth/social/link/confirm.
+   * - identitas baru (isNewIdentity) → aplikasi mengarahkan ke pendaftaran
+   *   nomor HP (OTP WhatsApp); linkToken scope social_signup ditautkan di
+   *   POST /v1/auth/phone-register setelah nomor terverifikasi.
+   */
   async socialLogin(
     provider: 'google' | 'apple',
     idToken: string,
     deviceId: string | undefined,
     deviceInfo: string | undefined,
     ipAddress: string,
-  ): Promise<{ accessToken: string; refreshToken: string; user: LoginUserPayload; isNewUser: boolean }> {
+    nonce?: string,
+  ): Promise<SocialLoginResult | SocialLoginPendingLink> {
     if (provider === 'google') {
-      return this.socialLoginGoogle(idToken, deviceId, deviceInfo, ipAddress);
+      const identity = await this.verifyGoogleIdentity(idToken);
+      return this.loginWithSocialIdentity('GOOGLE', identity, deviceId, deviceInfo, ipAddress);
     }
-    // Apple login can be added similarly; for now treat as unsupported but structured
-    throw new BadRequestException({
-      code: 'SOCIAL_PROVIDER_NOT_SUPPORTED',
-      message: `Social provider ${provider} is not yet configured. Please use phone OTP login.`,
-    });
+    // G009–G011: Apple aktif hanya bila dikonfigurasi (G002); selain itu tetap
+    // melempar SOCIAL_PROVIDER_NOT_SUPPORTED yang terstruktur (G005).
+    if (!this.appleAuth.isConfigured()) {
+      throw new BadRequestException({
+        code: 'SOCIAL_PROVIDER_NOT_SUPPORTED',
+        message: `Social provider ${provider} is not yet configured. Please use phone OTP login.`,
+      });
+    }
+    const identity = await this.verifyAppleIdentity(idToken, nonce);
+    return this.loginWithSocialIdentity('APPLE', identity, deviceId, deviceInfo, ipAddress);
   }
 
-  private async socialLoginGoogle(
-    idToken: string,
-    deviceId: string | undefined,
-    deviceInfo: string | undefined,
-    ipAddress: string,
-  ): Promise<{ accessToken: string; refreshToken: string; user: LoginUserPayload; isNewUser: boolean }> {
-    const googleClientId = this.configService.get<string>('app.googleClientId') || process.env.GOOGLE_CLIENT_ID;
+  /** Identitas terverifikasi dari provider (tanpa token mentah). */
+  private async verifyGoogleIdentity(idToken: string): Promise<SocialIdentity> {
+    // G005: belum dikonfigurasi → 503 terstruktur, bukan alur gagal misterius.
+    const googleClientId =
+      this.configService.get<string>('app.googleClientId') || process.env.GOOGLE_CLIENT_ID;
     if (!googleClientId) {
       throw new ServiceUnavailableException({
         code: 'SOCIAL_LOGIN_NOT_CONFIGURED',
@@ -4047,92 +4383,179 @@ export class AuthService {
       });
     }
     const client = new OAuth2Client(googleClientId);
-    let payload: { email?: string; name?: string; sub: string; picture?: string; email_verified?: boolean };
     try {
       const ticket = await client.verifyIdToken({ idToken, audience: googleClientId });
       const p = ticket.getPayload();
-      if (!p || !p.email) throw new Error('No email in token');
-      payload = { email: p.email, name: p.name, sub: p.sub, picture: p.picture, email_verified: p.email_verified };
+      if (!p || !p.sub || !p.email) throw new Error('No subject/email in token');
+      // G024: metrik funnel anonim — provider + tahap saja.
+      this.logger.log('social_login_step provider=google step=token_verified');
+      return {
+        sub: p.sub,
+        email: p.email,
+        emailVerified: p.email_verified ?? false,
+        name: p.name,
+      };
     } catch (e) {
       this.logger.warn(`Google ID token verification failed: ${e instanceof Error ? e.message : String(e)}`);
       throw new BadRequestException({ code: 'INVALID_SOCIAL_TOKEN', message: 'Invalid Google ID token' });
     }
+  }
 
-    const normalizedEmail = payload.email!.toLowerCase();
-    let user = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
-    let isNewUser = false;
+  /** G009–G011: verifikasi identityToken Apple (JWKS + nonce anti-replay). */
+  private async verifyAppleIdentity(
+    identityToken: string,
+    nonce: string | undefined,
+  ): Promise<SocialIdentity> {
+    try {
+      const identity = await this.appleAuth.verifyIdentityToken(identityToken, nonce);
+      // G024: metrik funnel anonim — provider + tahap saja, tanpa token/email mentah.
+      this.logger.log('social_login_step provider=apple step=token_verified');
+      return {
+        sub: identity.sub,
+        email: identity.email,
+        emailVerified: identity.emailVerified ?? false,
+      };
+    } catch (e) {
+      this.logger.warn(`Apple identity token verification failed: ${e instanceof Error ? e.message : String(e)}`);
+      throw new BadRequestException({ code: 'INVALID_SOCIAL_TOKEN', message: 'Invalid Apple identity token' });
+    }
+  }
 
-    if (!user) {
-      // Create new user from Google profile
-      const userId = generateUserId();
-      const myReferralCode = generateReferralCode();
-      const encryptedPhone = await encryptPii(`google_${payload.sub}`); // placeholder phone to satisfy unique constraint; will need real phone later
-      // Check if we can generate unique phone placeholder that won't collide
-      // Use google sub as phone hash base
-      const phoneHash = hashPhoneNumber(`+628000000000`); // temporary, will be replaced via phone verification flow
-      // Actually, phoneNumber is required unique. For social login without phone, we need to allow null? Schema says required.
-      // So we generate a synthetic but unique phone that user must change later.
-      // Better: create with random synthetic Indonesian number in reserved range that will be flagged unverified.
-      const syntheticPhone = `+62899${payload.sub.slice(0, 8).replace(/\D/g, '').padEnd(8, '0')}`;
-      const syntheticHash = hashPhoneNumber(syntheticPhone);
-      const syntheticEncrypted = await encryptPii(syntheticPhone);
+  /**
+   * Inti login sosial — dipakai login Google & Apple (G012–G016, G020–G024).
+   *
+   *  1. (provider, providerSub) sudah tertaut → login langsung (G012).
+   *  2. Email dipakai akun lain → requiresLink + linkToken TANPA user id
+   *     (G014). Penautan hanya setelah re-auth akun lama di /social/link/confirm.
+   *  3. Identitas baru → requiresLink + signup token (isNewIdentity). TIDAK
+   *     ada pembuatan akun diam-diam: registrasi tetap nomor HP + OTP
+   *     WhatsApp; penautan terjadi di phone-register setelah verifikasi.
+   *  4. 2FA aktif → TWO_FA_REQUIRED (G016), sama seperti login password.
+   */
+  private async loginWithSocialIdentity(
+    provider: SocialProvider,
+    identity: SocialIdentity,
+    deviceId: string | undefined,
+    deviceInfo: string | undefined,
+    ipAddress: string,
+  ): Promise<SocialLoginResult | SocialLoginPendingLink> {
+    const providerSlug = provider === 'GOOGLE' ? 'google' : 'apple';
+    const providerLabel = provider === 'GOOGLE' ? 'Google' : 'Apple';
 
-      try {
-        user = await this.prisma.$transaction(async (tx) => {
-          const newUser = await tx.user.create({
-            data: {
-              userId,
-              email: normalizedEmail,
-              emailVerified: payload.email_verified ?? true,
-              emailVerifiedAt: payload.email_verified ? new Date() : null,
-              fullName: payload.name || normalizedEmail.split('@')[0],
-              avatarUrl: payload.picture || null,
-              phoneNumber: syntheticEncrypted,
-              phoneNumberHash: syntheticHash,
-              phoneVerified: false,
-            },
-          });
-          await tx.wallet.create({ data: { userId: newUser.id } });
-          await tx.notificationPreference.create({ data: { userId: newUser.id } });
-          await tx.referralCode.create({ data: { userId: newUser.id, code: myReferralCode } });
-          return newUser;
+    // 1. Relasi stabil provider-subject (G012) — email BUKAN identitas utama.
+    const linked = await this.prisma.socialAccount.findUnique({
+      where: { provider_providerSub: { provider, providerSub: identity.sub } },
+      include: { user: true },
+    });
+    if (linked?.user) {
+      const user = linked.user;
+      this.assertSocialAccountUsable(user, providerLabel);
+      await this.prisma.socialAccount.update({
+        where: { id: linked.id },
+        data: { lastUsedAt: new Date() },
+      });
+      this.logger.log(`social_login_step provider=${providerSlug} step=linked_login`);
+      return this.issueSocialSession(user, deviceId, deviceInfo, ipAddress, false, providerLabel);
+    }
+
+    // 2. Konflik email (G014): email provider sudah dipakai akun lain
+    // (password/OTP). Jangan buat akun duplikat, jangan auto-link.
+    // linkToken TIDAK mengikat ke user id — hanya { provider, providerSub,
+    // email } (sub='pending'). Frontend meminta user membuktikan kepemilikan
+    // akun Kahade lama (password/2FA/OTP WhatsApp) di /social/link/confirm
+    // SEBELUM penautan terjadi. Tanpa re-auth, token ini tidak berguna.
+    const normalizedEmail = identity.email?.trim().toLowerCase();
+    if (normalizedEmail) {
+      const existing = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
+      if (existing) {
+        const linkToken = this.tokenService.signTempToken({
+          sub: 'pending',
+          scope: 'social_link_confirm',
+          deviceId,
+          extra: { provider, providerSub: identity.sub, email: normalizedEmail },
         });
-        isNewUser = true;
-      } catch (err) {
-        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-          // Race: user created between check and transaction
-          user = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
-          if (!user) throw err;
-        } else {
-          throw err;
-        }
+        this.logger.log(`social_login_step provider=${providerSlug} step=email_conflict`);
+        return {
+          requiresLink: true as const,
+          linkToken,
+          maskedEmail: maskEmail(normalizedEmail),
+          provider: providerSlug,
+        };
       }
     }
 
-    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    // 3. Identitas sosial baru — BUKAN dibuatkan akun diam-diam.
+    // Keputusan produk: registrasi tetap nomor HP + OTP WhatsApp. Social login
+    // adalah metode masuk tambahan, bukan jalur registrasi alternatif.
+    // Kembalikan signup token (scope 'social_signup', sub='pending') agar
+    // frontend mengarahkan user ke pendaftaran nomor HP; penautan terjadi
+    // di phone-register SETELAH nomor terverifikasi.
+    const signupToken = this.tokenService.signTempToken({
+      sub: 'pending',
+      scope: 'social_signup',
+      deviceId,
+      extra: { provider, providerSub: identity.sub, email: normalizedEmail ?? null },
+    });
+    this.logger.log(`social_login_step provider=${providerSlug} step=new_identity_link_required`);
+    return {
+      requiresLink: true as const,
+      linkToken: signupToken,
+      provider: providerSlug,
+      isNewIdentity: true,
+    };
+  }
 
+  /** G023: pesan seragam untuk akun nonaktif/dibatasi/dikunci. */
+  private assertSocialAccountUsable(
+    user: { isActive: boolean; isBanned: boolean; lockedUntil: Date | null },
+    providerLabel: string,
+  ): void {
     if (!user.isActive || user.isBanned) {
-      throw new ForbiddenException({ code: ErrorCodes.ACCOUNT_INACTIVE, message: 'Account is inactive or banned' });
+      throw new ForbiddenException({
+        code: ErrorCodes.ACCOUNT_INACTIVE,
+        message: 'Akun ini nonaktif atau dibatasi. Hubungi support Kahade.',
+      });
     }
-
     if (user.lockedUntil && user.lockedUntil > new Date()) {
       const remaining = Math.ceil((user.lockedUntil.getTime() - Date.now()) / 1000);
-      throw new UnauthorizedException({ code: ErrorCodes.ACCOUNT_LOCKED, message: 'Account locked', lockoutRemainingSeconds: remaining });
+      throw new UnauthorizedException({
+        code: ErrorCodes.ACCOUNT_LOCKED,
+        message: 'Akun dikunci sementara karena terlalu banyak percobaan gagal.',
+        lockoutRemainingSeconds: remaining,
+      });
     }
+  }
 
+  /**
+   * Terbitkan sesi setelah identitas sosial terverifikasi (G016).
+   * 2FA aktif → TWO_FA_REQUIRED (controller memetakan ke layar kode),
+   * sama seperti login password — login sosial TIDAK melemahkan 2FA.
+   */
+  private async issueSocialSession(
+    user: {
+      id: string; userId: string; username: string | null; email: string | null;
+      fullName: string; avatarUrl: string | null; bio: string | null; accountType: string;
+      emailVerified: boolean; kycStatus: string; isKahadePlus: boolean;
+      subscriptionExpiresAt: Date | null; membershipRank: string;
+      phoneNumber: string; phoneVerified: boolean; dateOfBirth: Date | null;
+      gender: string | null; createdAt: Date;
+    },
+    deviceId: string | undefined,
+    deviceInfo: string | undefined,
+    ipAddress: string,
+    isNewUser: boolean,
+    providerLabel: string,
+  ): Promise<SocialLoginResult> {
     const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({ where: { userId: user.id } });
     if (twoFactorAuth?.isEnabled) {
-      // For social login, still require 2FA if enabled
-      const tempToken = this.tokenService.signTempToken({ sub: user.id, scope: '2fa_verify', deviceId: deviceId || 'social' });
-      // Return as if requires 2FA - caller should handle; we throw with temp token info via custom error? Instead we return partial and let controller handle.
-      // For simplicity, we enforce 2FA via temp token response structure similar to phone OTP.
-      // But our return type expects full login; so we handle by returning requires2FA via exception containing tempToken.
-      // To keep consistent, we will return tokens only if no 2FA; otherwise we throw a special response.
-      // We'll implement by returning a result that includes requires2FA flag - adjust method signature to allow.
-      // For now, we return tokens and let 2FA be checked separately if needed; simplest: require 2FA via temp token error.
+      const tempToken = this.tokenService.signTempToken({
+        sub: user.id,
+        scope: '2fa_verify',
+        deviceId: deviceId || 'social',
+      });
       throw new BadRequestException({
         code: 'TWO_FA_REQUIRED',
-        message: '2FA verification required',
+        message: 'Verifikasi 2FA diperlukan.',
         tempToken,
       });
     }
@@ -4162,7 +4585,7 @@ export class AuthService {
       action: UserAuditAction.LOGIN,
       entityType: 'User',
       entityId: user.id,
-      description: `User logged in via Google social login from ${ipAddress}`,
+      description: `User logged in via ${providerLabel} social login from ${ipAddress}`,
       ipAddress,
     });
 
@@ -4193,4 +4616,374 @@ export class AuthService {
       },
     };
   }
+
+  /**
+   * G014: konfirmasi penautan setelah konflik email. linkToken sekali-pakai
+   * (scope social_link_confirm, sub='pending', TTL 5 menit) hanya membawa
+   * { provider, providerSub, email } — TIDAK membawa user id.
+   *
+   * Anti account-takeover: user WAJIB membuktikan kepemilikan akun Kahade
+   * lama via `reauth` (password / OTP WhatsApp / reauthToken + TOTP bila 2FA
+   * aktif, pola sama dengan assertPasskeyReauthenticated). Tanpa re-auth yang
+   * valid, penautan DITOLAK — penguasaan email di provider saja tidak cukup.
+   */
+  async confirmSocialLink(
+    linkToken: string,
+    reauth: { password?: string; mfaCode?: string; otpCode?: string; reauthToken?: string },
+    deviceId: string | undefined,
+    deviceInfo: string | undefined,
+    ipAddress: string,
+  ): Promise<SocialLoginResult> {
+    let payload: TempTokenPayload;
+    try {
+      payload = this.tokenService.verifyTempToken(linkToken);
+    } catch {
+      throw new UnauthorizedException({
+        code: ErrorCodes.INVALID_TOKEN,
+        message: 'Tautan konfirmasi kedaluwarsa. Ulangi login sosial Anda.',
+      });
+    }
+    const extra = payload as TempTokenPayload & {
+      provider?: SocialProvider;
+      providerSub?: string;
+      email?: string;
+    };
+    if (
+      payload.scope !== 'social_link_confirm' ||
+      payload.sub !== 'pending' ||
+      !extra.provider ||
+      !extra.providerSub ||
+      !extra.email
+    ) {
+      throw new UnauthorizedException({
+        code: ErrorCodes.INVALID_TOKEN,
+        message: 'Tautan konfirmasi tidak valid.',
+      });
+    }
+
+    // Akun pemilik email — dicari dari email, bukan dari token.
+    const normalizedEmail = extra.email.trim().toLowerCase();
+    const user = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
+    if (!user) {
+      throw new NotFoundException({
+        code: ErrorCodes.USER_NOT_FOUND,
+        message: 'Akun dengan email ini tidak ditemukan. Mungkin sudah dihapus.',
+      });
+    }
+    const providerLabel = extra.provider === 'GOOGLE' ? 'Google' : 'Apple';
+    this.assertSocialAccountUsable(user, providerLabel);
+
+    // Re-auth akun lama WAJIB sebelum penautan (anti take-over).
+    await this.assertPasskeyReauthenticated(user.id, reauth);
+
+    // Klaim token sekali-pakai SETELAH re-auth lolos — percobaan gagal tidak
+    // membakar token (user bisa memperbaiki password/OTP).
+    await this.claimTempTokenOnce(
+      payload.jti,
+      this.getTempTokenTtlFromPayload(payload),
+      'LINK_TOKEN_USED',
+      'Tautan konfirmasi sudah dipakai. Ulangi login sosial Anda.',
+    );
+
+    const taken = await this.prisma.socialAccount.findUnique({
+      where: { provider_providerSub: { provider: extra.provider, providerSub: extra.providerSub } },
+      select: { id: true, userId: true },
+    });
+    if (taken) {
+      if (taken.userId === user.id) {
+        // Sudah tertaut (mis. double-submit) → langsung login.
+        this.logger.log(`social_login_step provider=${extra.provider.toLowerCase()} step=link_confirmed_idempotent`);
+        return this.issueSocialSession(user, deviceId, deviceInfo, ipAddress, false, providerLabel);
+      }
+      throw new ConflictException({
+        code: 'SOCIAL_ACCOUNT_TAKEN',
+        message: `Akun ${providerLabel} ini sudah tertaut ke akun Kahade lain.`,
+      });
+    }
+
+    const now = new Date();
+    await this.prisma.socialAccount.create({
+      data: {
+        userId: user.id,
+        provider: extra.provider,
+        providerSub: extra.providerSub,
+        email: extra.email ?? null,
+        lastUsedAt: now,
+        consentAt: now,
+        consentTextVersion: AuthService.SOCIAL_CONSENT_VERSION,
+      },
+    });
+    this.auditLog.logUserAction({
+      userId: user.id,
+      action: UserAuditAction.SOCIAL_PROVIDER_LINKED,
+      entityType: 'SocialAccount',
+      entityId: `${extra.provider}:${extra.providerSub}`,
+      description: `${providerLabel} ditautkan via konfirmasi konflik email (re-auth terverifikasi)`,
+      ipAddress,
+    });
+    await this.sendSocialSecurityNotification(
+      user.id,
+      `${providerLabel} ditautkan ke akun Anda`,
+      `Akun ${providerLabel} baru saja ditautkan ke akun Kahade Anda setelah konfirmasi. Jika ini bukan Anda, segera lepaskan dari menu Keamanan.`,
+      ipAddress,
+    ).catch(() => undefined);
+
+    this.logger.log(`social_login_step provider=${extra.provider.toLowerCase()} step=link_confirmed`);
+    return this.issueSocialSession(user, deviceId, deviceInfo, ipAddress, false, providerLabel);
+  }
+
+  /**
+   * G013: tautkan Google/Apple dari akun yang sedang login.
+   * Wajib re-auth (password/OTP + TOTP bila 2FA aktif) sebelum menautkan.
+   */
+  async linkSocialProvider(
+    userId: string,
+    provider: 'google' | 'apple',
+    idToken: string,
+    nonce: string | undefined,
+    reauth: { password?: string; mfaCode?: string; otpCode?: string },
+    ipAddress: string,
+  ): Promise<{ message: string; linked: LinkedSocialProvider[] }> {
+    await this.assertPasskeyReauthenticated(userId, reauth);
+
+    const identity =
+      provider === 'google' ? await this.verifyGoogleIdentity(idToken) : await this.verifyAppleIdentity(idToken, nonce);
+    const providerEnum: SocialProvider = provider === 'google' ? 'GOOGLE' : 'APPLE';
+    const providerLabel = provider === 'google' ? 'Google' : 'Apple';
+
+    const taken = await this.prisma.socialAccount.findUnique({
+      where: { provider_providerSub: { provider: providerEnum, providerSub: identity.sub } },
+      select: { id: true, userId: true },
+    });
+    if (taken) {
+      if (taken.userId === userId) {
+        return { message: `Akun ${providerLabel} sudah tertaut ke akun ini.`, linked: await this.getLinkedSocialProviders(userId) };
+      }
+      throw new ConflictException({
+        code: 'SOCIAL_ACCOUNT_TAKEN',
+        message: `Akun ${providerLabel} ini sudah tertaut ke akun Kahade lain.`,
+      });
+    }
+
+    // Email provider tidak boleh milik akun lain (G014).
+    const normalizedEmail = identity.email?.trim().toLowerCase();
+    if (normalizedEmail) {
+      const owner = await this.prisma.user.findUnique({ where: { email: normalizedEmail }, select: { id: true } });
+      if (owner && owner.id !== userId) {
+        throw new ConflictException({
+          code: 'SOCIAL_EMAIL_CONFLICT',
+          message: `Email ${providerLabel} ini dipakai akun Kahade lain. Lepaskan dulu dari akun tersebut.`,
+        });
+      }
+    }
+
+    const now = new Date();
+    await this.prisma.socialAccount.create({
+      data: {
+        userId,
+        provider: providerEnum,
+        providerSub: identity.sub,
+        email: normalizedEmail ?? null,
+        lastUsedAt: now,
+        // G020: persetujuan dicatat sebelum profil provider dipakai.
+        consentAt: now,
+        consentTextVersion: AuthService.SOCIAL_CONSENT_VERSION,
+      },
+    });
+    this.auditLog.logUserAction({
+      userId,
+      action: UserAuditAction.SOCIAL_PROVIDER_LINKED,
+      entityType: 'SocialAccount',
+      entityId: `${providerEnum}:${identity.sub}`,
+      description: `${providerLabel} ditautkan dari menu keamanan`,
+      ipAddress,
+    });
+    await this.sendSocialSecurityNotification(
+      userId,
+      `${providerLabel} ditautkan ke akun Anda`,
+      `Akun ${providerLabel} baru saja ditautkan sebagai metode masuk. Jika ini bukan Anda, segera lepaskan dari menu Keamanan dan amankan akun Anda.`,
+      ipAddress,
+    ).catch(() => undefined);
+
+    this.logger.log(`social_login_step provider=${provider} step=linked_from_settings`);
+    return { message: `Akun ${providerLabel} berhasil ditautkan.`, linked: await this.getLinkedSocialProviders(userId) };
+  }
+
+  /**
+   * G019: lepas tautan provider. Wajib re-auth; menolak bila ini
+   * satu-satunya metode login yang tersisa.
+   */
+  async unlinkSocialProvider(
+    userId: string,
+    provider: 'google' | 'apple',
+    reauth: { password?: string; mfaCode?: string; otpCode?: string },
+    ipAddress: string,
+  ): Promise<{ message: string; linked: LinkedSocialProvider[] }> {
+    await this.assertPasskeyReauthenticated(userId, reauth);
+
+    const providerEnum: SocialProvider = provider === 'google' ? 'GOOGLE' : 'APPLE';
+    const providerLabel = provider === 'google' ? 'Google' : 'Apple';
+    const link = await this.prisma.socialAccount.findFirst({
+      where: { userId, provider: providerEnum },
+      select: { id: true },
+    });
+    if (!link) {
+      throw new NotFoundException({
+        code: 'SOCIAL_PROVIDER_NOT_LINKED',
+        message: `Akun ${providerLabel} belum tertaut ke akun ini.`,
+      });
+    }
+
+    // G019: jangan kunci pengguna keluar dari akunnya sendiri.
+    // Metode masuk yang dihitung: password, login OTP WhatsApp (phoneVerified),
+    // provider sosial lain, dan passkey aktif.
+    const [user, otherSocials, activePasskeys] = await Promise.all([
+      this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { password: true, phoneVerified: true },
+      }),
+      this.prisma.socialAccount.count({ where: { userId, id: { not: link.id } } }),
+      this.prisma.passkeyCredential.count({ where: { userId, revokedAt: null } }),
+    ]);
+    const hasPassword = !!user?.password;
+    // Nomor HP terverifikasi = selalu bisa masuk via OTP WhatsApp.
+    const hasPhoneLogin = user?.phoneVerified === true;
+    if (!hasPassword && !hasPhoneLogin && otherSocials === 0 && activePasskeys === 0) {
+      throw new BadRequestException({
+        code: 'SOCIAL_LAST_METHOD',
+        message:
+          'Ini satu-satunya metode masuk Anda. Tambahkan kata sandi, verifikasi nomor HP, atau metode lain dulu sebelum melepas tautan ini.',
+      });
+    }
+
+    await this.prisma.socialAccount.delete({ where: { id: link.id } });
+    this.auditLog.logUserAction({
+      userId,
+      action: UserAuditAction.SOCIAL_PROVIDER_UNLINKED,
+      entityType: 'SocialAccount',
+      entityId: link.id,
+      description: `${providerLabel} dilepas dari akun`,
+      ipAddress,
+    });
+    await this.sendSocialSecurityNotification(
+      userId,
+      `${providerLabel} dilepas dari akun Anda`,
+      `Tautan ${providerLabel} sebagai metode masuk telah dilepas. Jika ini bukan Anda, segera amankan akun Anda.`,
+      ipAddress,
+    ).catch(() => undefined);
+
+    return { message: `Tautan ${providerLabel} berhasil dilepas.`, linked: await this.getLinkedSocialProviders(userId) };
+  }
+
+  /**
+   * G018: provider mana yang tertaut — tanpa membuka token provider.
+   * Email ditampilkan apa adanya ke pemilik akun (miliknya sendiri).
+   */
+  async getLinkedSocialProviders(userId: string): Promise<LinkedSocialProvider[]> {
+    const rows = await this.prisma.socialAccount.findMany({
+      where: { userId },
+      orderBy: { linkedAt: 'asc' },
+      select: { provider: true, email: true, linkedAt: true, lastUsedAt: true },
+    });
+    return rows.map((r) => ({
+      provider: (r.provider === 'GOOGLE' ? 'google' : 'apple') as 'google' | 'apple',
+      email: r.email,
+      linkedAt: r.linkedAt,
+      lastUsedAt: r.lastUsedAt,
+    }));
+  }
+
+  /**
+   * G015: tolak aksi sensitif bila nomor HP masih sintetis (akun sosial
+   * yang belum mengganti nomor). Dipakai withdraw, rekening bank, dsb.
+   */
+  async assertRealPhoneForSensitive(userId: string): Promise<void> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { requiresPhoneVerification: true },
+    });
+    if (user?.requiresPhoneVerification) {
+      throw new ForbiddenException({
+        code: 'PHONE_VERIFICATION_REQUIRED',
+        message:
+          'Verifikasi nomor HP Anda terlebih dahulu via WhatsApp sebelum memakai fitur ini. Buka Profil → Verifikasi nomor HP.',
+      });
+    }
+  }
+
+  /** G021: notifikasi keamanan in-app saat provider ditautkan/dilepas. */
+  private async sendSocialSecurityNotification(
+    userId: string,
+    title: string,
+    body: string,
+    ipAddress?: string,
+  ): Promise<void> {
+    const type = NotificationType.SECURITY_NEW_LOGIN;
+    await this.prisma.notification.create({
+      data: {
+        notifId: generateNotifId(),
+        userId,
+        type,
+        category: getCategoryForType(type),
+        title,
+        body,
+      },
+    });
+    this.prisma.emitNotificationCreated({
+      userId,
+      title,
+      body,
+      data: { type: 'SECURITY_ALERT', notificationType: type, ipAddress: ipAddress ?? 'unknown' },
+    });
+  }
+}
+
+/**
+ * G012: identitas sosial terverifikasi — sub (stabil) sebagai kunci,
+ * email hanya atribut pelengkap.
+ */
+export interface SocialIdentity {
+  sub: string;
+  email?: string;
+  emailVerified: boolean;
+  name?: string;
+}
+
+export interface SocialLoginResult {
+  accessToken: string;
+  refreshToken: string;
+  user: LoginUserPayload;
+  isNewUser: boolean;
+}
+
+/** G014: email provider bentrok dengan akun lain — butuh konfirmasi taut. */
+export interface SocialLoginPendingLink {
+  requiresLink: true;
+  linkToken: string;
+  /** Ada hanya untuk konflik email (akun lama). Identitas baru tidak membawa email termask. */
+  maskedEmail?: string;
+  provider: 'google' | 'apple';
+  /**
+   * true bila identitas sosial belum punya akun Kahade sama sekali.
+   * Frontend WAJIB mengarahkan ke pendaftaran nomor HP (OTP WhatsApp);
+   * linkToken (scope 'social_signup') dipakai untuk menautkan SETELAH
+   * nomor HP terverifikasi — bukan untuk membuat akun diam-diam.
+   */
+  isNewIdentity?: boolean;
+}
+
+/** G018: ringkasan provider tertaut (tanpa token). */
+export interface LinkedSocialProvider {
+  provider: 'google' | 'apple';
+  email: string | null;
+  linkedAt: Date;
+  lastUsedAt: Date | null;
+}
+
+/** Masking email untuk layar konfirmasi konflik (G014). */
+function maskEmail(email: string): string {
+  const [local, domain] = email.split('@');
+  if (!domain) return '••••••';
+  const head = local.slice(0, 1);
+  return `${head}••••••@${domain}`;
 }

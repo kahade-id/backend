@@ -1,0 +1,43 @@
+import { IsString, IsOptional, IsIn, MaxLength, IsISO8601 } from 'class-validator';
+import { ApiPropertyOptional } from '@nestjs/swagger';
+
+/** Jenis event pada timeline moderasi pengguna. */
+export const MODERATION_EVENT_TYPES = [
+  'ban',
+  'unban',
+  'kyc_decision',
+  'report_resolved',
+  'flag_raised',
+  'flag_cleared',
+  'admin_action',
+] as const;
+
+export type ModerationEventType = (typeof MODERATION_EVENT_TYPES)[number];
+
+/**
+ * GAP-E — query timeline moderasi pengguna.
+ * Filter: jenis event, aktor (id admin), rentang waktu.
+ */
+export class ModerationEventsQueryDto {
+  @ApiPropertyOptional({ description: 'Filter jenis event.', enum: MODERATION_EVENT_TYPES })
+  @IsOptional()
+  @IsString()
+  @IsIn(MODERATION_EVENT_TYPES as unknown as string[])
+  event?: ModerationEventType;
+
+  @ApiPropertyOptional({ description: 'Filter aktor: id admin pelaksana.' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  actor?: string;
+
+  @ApiPropertyOptional({ description: 'Batas awal (ISO 8601).' })
+  @IsOptional()
+  @IsISO8601()
+  from?: string;
+
+  @ApiPropertyOptional({ description: 'Batas akhir (ISO 8601).' })
+  @IsOptional()
+  @IsISO8601()
+  to?: string;
+}

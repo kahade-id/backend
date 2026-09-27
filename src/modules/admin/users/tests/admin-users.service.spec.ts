@@ -10,6 +10,8 @@ import { DashboardService } from '../../dashboard/dashboard.service';
 import { OtpService } from '../../../auth/otp.service';
 import { VerificationBadgeService } from '../../../users/verification-badge.service';
 import { EMAIL_QUEUE } from '../../../queue/processors/email.processor';
+import { UploadService } from '../../../upload/upload.service';
+import { LocalStorageService } from '../../../upload/local-storage.service';
 
 jest.mock('../../../../common/utils/pii.util', () => ({
   decryptPiiSafe: jest.fn(async (value: string | null) => value),
@@ -59,6 +61,9 @@ describe('AdminUsersService — siklus hidup flaggedForReview (Section 6)', () =
         { provide: `BullQueue_${EMAIL_QUEUE}`, useValue: mockEmailQueue },
         // AW-018: mock helper invalidasi cache dashboard terpusat.
         { provide: DashboardService, useValue: { invalidateSummaryCache: jest.fn() } },
+        // GAP-E (G380): signed URL ekspor async — tidak dipakai di suite ini.
+        { provide: UploadService, useValue: { generateDownloadUrl: jest.fn() } },
+        { provide: LocalStorageService, useValue: { saveFile: jest.fn() } },
       ],
     }).compile();
     service = module.get<AdminUsersService>(AdminUsersService);

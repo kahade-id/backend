@@ -2,6 +2,7 @@ import {
   Controller,
   Post,
   Get,
+  Delete,
   Body,
   Param,
   Query,
@@ -17,8 +18,9 @@ import { ApiTags } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { Throttle } from '@nestjs/throttler';
 import { Request, Response } from 'express';
-import { AuthService } from './auth.service';
+import { AuthService, type SocialLoginResult, type SocialLoginPendingLink } from './auth.service';
 import { CaptchaService } from './captcha.service';
+import { AccountDeletionService } from '../users/account-deletion.service';
 import { OtpGatewayService, OtpDeliveryMethod } from './otp-gateway.service';
 import { CsrfService } from '../../common/services/csrf.service';
 import { Public } from '../../common/decorators/public.decorator';
@@ -48,14 +50,27 @@ import {
   RequestPhoneChangeDto,
   ConfirmPhoneChangeDto,
   SocialLoginDto,
+  LinkSocialProviderDto,
+  ConfirmSocialLinkDto,
+  UnlinkSocialProviderDto,
   RequestOtpTriggerDto,
   ConfirmPhoneMigrationDto,
+  DeletionStatusRequestDto,
+  DeletionStatusVerifyDto,
+  DeletionCancelDto,
 } from './dto';
 import {
   OtpTriggerService,
   type TriggerPayload,
   type OtpTriggerStatus,
 } from './otp-trigger.service';
+
+/** Type guard G014: hasil social-login berupa permintaan konfirmasi taut. */
+function isSocialLoginPendingLink(
+  r: SocialLoginResult | SocialLoginPendingLink,
+): r is SocialLoginPendingLink {
+  return (r as SocialLoginPendingLink).requiresLink === true;
+}
 
 @ApiTags('auth')
 @Controller('auth')
@@ -67,6 +82,7 @@ export class AuthController {
     private captchaService: CaptchaService,
     private otpGateway: OtpGatewayService,
     private otpTriggerService: OtpTriggerService,
+    private accountDeletionService: AccountDeletionService,
   ) {}
 
   @Public()
@@ -153,6 +169,68 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   async getOtpMethods(): Promise<{ methods: OtpDeliveryMethod[] }> {
     return { methods: this.otpGateway.getSupportedMethods() };
+  }
+
+  /**
+   * GAP-A (G052): status penghapusan akun pra-login — langkah 1.
+   * Body { phoneNumber } atau { email } → bila ada request aktif, kirim OTP
+   * via WhatsApp ke nomor terdaftar. TIDAK membuat sesi login.
+   */
+  @Public()
+  @Throttle({ default: { ttl: 3600000, limit: 5 } })
+  @Post('deletion/status')
+  @HttpCode(HttpStatus.OK)
+  async requestDeletionStatus(
+    @Body() dto: DeletionStatusRequestDto,
+  ): Promise<{ requiresOtp: boolean; maskedPhone?: string }> {
+    return this.accountDeletionService.requestStatusOtp({
+      phoneNumber: dto.phoneNumber,
+      email: dto.email,
+    });
+  }
+
+  /**
+   * GAP-A (G052/G064): status penghapusan akun pra-login — langkah 2.
+   * Verifikasi OTP → status lengkap + deletionToken sekali-pakai
+   * (scope 'deletion_cancel', TTL 15 menit). TIDAK membuat sesi login.
+   */
+  @Public()
+  @Throttle({ default: { ttl: 3600000, limit: 10 } })
+  @Post('deletion/status/verify')
+  @HttpCode(HttpStatus.OK)
+  async verifyDeletionStatus(@Body() dto: DeletionStatusVerifyDto): Promise<{
+    referenceCode: string;
+    status: string;
+    requestedAt: Date;
+    purgeAt: Date;
+    daysRemaining: number;
+    serverNow: Date;
+    deletionToken: string;
+    deletionTokenExpiresIn: number;
+  }> {
+    return this.accountDeletionService.verifyStatusOtp(
+      { phoneNumber: dto.phoneNumber, email: dto.email },
+      dto.otp,
+    );
+  }
+
+  /**
+   * GAP-A (G053): batalkan penghapusan akun pra-login.
+   * Butuh deletionToken dari status/verify; reaktivasi transaksional;
+   * sesi lama tetap revoked (user login ulang normal).
+   */
+  @Public()
+  @Throttle({ default: { ttl: 3600000, limit: 10 } })
+  @Post('deletion/cancel')
+  @HttpCode(HttpStatus.OK)
+  async cancelAccountDeletion(@Body() dto: DeletionCancelDto): Promise<{
+    message: string;
+    referenceCode: string;
+    status: string;
+    reactivatedAt: Date;
+    serverNow: Date;
+  }> {
+    return this.accountDeletionService.cancelDeletion(dto.deletionToken, dto.cancelReason);
   }
 
   @Public()
@@ -298,7 +376,17 @@ export class AuthController {
     const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
     const deviceInfo = dto.deviceInfo || req.headers['user-agent'] || 'unknown';
     try {
-      const result = await this.authService.socialLogin(dto.provider, dto.idToken, dto.deviceId, deviceInfo, ipAddress);
+      // G011: nonce diteruskan untuk verifikasi Apple (anti-replay).
+      const result = await this.authService.socialLogin(
+        dto.provider, dto.idToken, dto.deviceId, deviceInfo, ipAddress, dto.nonce,
+      );
+      if (isSocialLoginPendingLink(result)) {
+        // G014: konflik email → aplikasi menampilkan layar konfirmasi taut
+        // (re-auth akun lama wajib di /social/link/confirm).
+        // Identitas baru (isNewIdentity) → aplikasi mengarahkan ke pendaftaran
+        // nomor HP; linkToken (scope social_signup) ditautkan di phone-register.
+        return result as unknown as Record<string, unknown>;
+      }
       this.setRefreshTokenCookie(res, result.refreshToken);
       this.setAccessTokenCookie(res, result.accessToken);
       return result as unknown as Record<string, unknown>;
@@ -309,6 +397,111 @@ export class AuthController {
       }
       throw error;
     }
+  }
+
+  /**
+   * GAP-A (G003): kontrak kapabilitas provider login sosial.
+   * Public, tanpa PII — aplikasi memakai ini untuk menampilkan/
+   * menyembunyikan tombol Google & Apple (G002) tanpa menebak env.
+   */
+  @Public()
+  @Get('social/providers')
+  async getSocialProviders(): Promise<{
+    providers: { provider: 'GOOGLE' | 'APPLE'; enabled: boolean; appId: string | null }[];
+  }> {
+    return this.authService.getSocialProviders();
+  }
+
+  /**
+   * GAP-A (G018): daftar provider yang tertaut ke akun ini.
+   * Menampilkan provider + email + waktu taut — tanpa token provider.
+   */
+  @Get('social')
+  async listSocialProviders(@CurrentUser('sub') userId: string) {
+    return { items: await this.authService.getLinkedSocialProviders(userId) };
+  }
+
+  /**
+   * GAP-A (G013): tautkan Google/Apple dari akun yang sedang login.
+   * Wajib re-auth (password/OTP + TOTP bila 2FA aktif); persetujuan
+   * dicatat sebelum profil provider dipakai (G020).
+   */
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Post('social/link')
+  @HttpCode(HttpStatus.OK)
+  async linkSocialProvider(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: LinkSocialProviderDto,
+    @Req() req: Request,
+  ) {
+    const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
+    return this.authService.linkSocialProvider(
+      userId, dto.provider, dto.idToken, dto.nonce,
+      { password: dto.password, mfaCode: dto.mfaCode, otpCode: dto.otpCode },
+      ipAddress,
+    );
+  }
+
+  /**
+   * GAP-A (G014): konfirmasi penautan setelah konflik email pada login sosial.
+   * linkToken sekali-pakai dari respons { requiresLink: true }.
+   */
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Post('social/link/confirm')
+  @HttpCode(HttpStatus.OK)
+  @AllowResponseFields('refreshToken')
+  async confirmSocialLink(
+    @Body() dto: ConfirmSocialLinkDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<Record<string, unknown>> {
+    const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
+    const deviceInfo = dto.deviceInfo || req.headers['user-agent'] || 'unknown';
+    try {
+      const result = await this.authService.confirmSocialLink(
+        dto.linkToken,
+        {
+          password: dto.password,
+          mfaCode: dto.mfaCode,
+          otpCode: dto.otpCode,
+          reauthToken: dto.reauthToken,
+        },
+        dto.deviceId,
+        deviceInfo,
+        ipAddress,
+      );
+      this.setRefreshTokenCookie(res, result.refreshToken);
+      this.setAccessTokenCookie(res, result.accessToken);
+      return result as unknown as Record<string, unknown>;
+    } catch (error: any) {
+      const response = error?.getResponse?.();
+      if (response && typeof response === 'object' && (response as any).code === 'TWO_FA_REQUIRED') {
+        return { requires2FA: true, tempToken: (response as any).tempToken };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * GAP-A (G019): lepas tautan provider. Wajib re-auth; menolak bila ini
+   * satu-satunya metode login yang tersisa.
+   */
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Delete('social/:provider')
+  async unlinkSocialProvider(
+    @CurrentUser('sub') userId: string,
+    @Param('provider') provider: string,
+    @Body() dto: UnlinkSocialProviderDto,
+    @Req() req: Request,
+  ) {
+    if (provider !== 'google' && provider !== 'apple') {
+      throw new GoneException({ code: 'SOCIAL_PROVIDER_NOT_SUPPORTED', message: 'Provider tidak dikenal.' });
+    }
+    const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
+    return this.authService.unlinkSocialProvider(
+      userId, provider, { password: dto.password, mfaCode: dto.mfaCode, otpCode: dto.otpCode }, ipAddress,
+    );
   }
 
   @Public()
@@ -333,6 +526,7 @@ export class AuthController {
         deviceInfo,
         location: dto.location,
         referralCode: dto.referralCode,
+        socialLinkToken: dto.socialLinkToken,
       },
       ipAddress,
     );

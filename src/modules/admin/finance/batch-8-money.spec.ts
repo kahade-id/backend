@@ -195,10 +195,16 @@ describe('Batch 8 money — WF-013 server-side search (q)', () => {
     await service.listTransactions({ ...baseQuery, q: 'WLT-2026' } as never);
 
     const where = prisma.walletTransaction.findMany.mock.calls[0][0].where;
+    // E3: cakupan pencarian diperluas ke referensi eksternal provider
+    // (midtransOrderId, flashTransactionId, irisPayoutId, irisRef).
     expect(where.OR).toEqual([
       { txId: { contains: 'WLT-2026' } },
       { description: { contains: 'WLT-2026', mode: 'insensitive' } },
       { order: { orderId: { contains: 'WLT-2026' } } },
+      { paymentTx: { midtransOrderId: { contains: 'WLT-2026', mode: 'insensitive' } } },
+      { paymentTx: { flashTransactionId: { contains: 'WLT-2026', mode: 'insensitive' } } },
+      { irisPayoutId: { contains: 'WLT-2026' } },
+      { irisRef: { contains: 'WLT-2026' } },
     ]);
     // dipakai juga untuk count agar paginasi konsisten
     expect(prisma.walletTransaction.count.mock.calls[0][0].where).toEqual(where);

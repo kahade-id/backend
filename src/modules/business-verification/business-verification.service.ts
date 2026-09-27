@@ -285,6 +285,8 @@ export class BusinessVerificationService {
                   documentFileKeys: encryptedKeys,
                   submittedIp: ipAddress ?? null,
                   attemptNumber: previousCount + 1,
+                  // GAP-E: SLA verifikasi bisnis dihitung dari createdAt
+                  // (tidak ada kolom SLA khusus di business_verifications).
                 },
                 select: {
                   id: true,

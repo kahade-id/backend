@@ -34,8 +34,8 @@ export const ADMIN_REFRESH_BLACKLIST = (jti: string): string => `admin_refresh_b
 export const SESSION_REVOKED_KEY = (sessionId: string): string => `session_revoked:${sessionId}`;
 
 export const ADMIN_SYSTEM_CONFIGS = `admin:system:configs`;
-export const ADMIN_VOUCHERS_LIST = (isActive: string | undefined, limit: number): string =>
-  `admin:vouchers:list:${isActive ?? 'all'}:${limit}`;
+export const ADMIN_VOUCHERS_LIST = (isActive: string | undefined, limit: number, search?: string): string =>
+  `admin:vouchers:list:${isActive ?? 'all'}:${limit}:${search ? Buffer.from(search).toString('base64url') : 'all'}`;
 
 export const FEE_CONFIG_CACHE = `fee:config`;
 
@@ -103,3 +103,6 @@ export const OTP_TRIGGER_COOLDOWN = (phone: string, purpose: string): string =>
   `otp_trigger_cooldown:${phone}:${purpose}`;
 export const OTP_TRIGGER_PHONE_RATE = (phone: string): string => `otp_trigger_phone_rate:${phone}`;
 export const OTP_TRIGGER_IP_RATE = (ip: string): string => `otp_trigger_ip_rate:${ip}`;
+
+/** GAP-A: kunci purge penghapusan akun per-user (G056) — satu worker per user. */
+export const DELETION_PURGE_LOCK = (userId: string): string => `deletion_purge:${userId}`;

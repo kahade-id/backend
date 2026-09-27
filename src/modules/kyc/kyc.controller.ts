@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Body, Query, Req, BadRequestException, UseGuards } from '@nestjs/common';
+import { Controller, Post, Get, Body, Param, Query, Req, BadRequestException, UseGuards } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { KycService } from './kyc.service';
@@ -6,7 +6,9 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import { SubmitKycDto, KycDocumentType } from './dto/submit-kyc.dto';
+import { SupplementDocumentsDto } from './dto/supplement-documents.dto';
 import { PaginationDto, PaginatedResponse } from '../../common/dto/pagination.dto';
+import { ParseIdPipe } from '../../common/pipes/parse-id.pipe';
 import { Request } from 'express';
 
 @ApiTags('kyc')
@@ -80,6 +82,36 @@ export class KycController {
         livenessFileKey: dto.livenessFileKey,
       },
     );
+  }
+
+  @Post(':id/supplement-documents')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  @ApiOperation({ summary: 'Lengkapi dokumen yang diminta admin (SLA dilanjutkan)' })
+  async supplementDocuments(
+    @CurrentUser('sub') userId: string,
+    @Param('id', ParseIdPipe) id: string,
+    @Body() dto: SupplementDocumentsDto,
+    @Req() req: Request,
+  ): Promise<Record<string, unknown>> {
+    this.validateSupplementFileOwnership(userId, dto);
+    return this.kycService.supplementDocuments(userId, id, dto, req.ip);
+  }
+
+  private validateSupplementFileOwnership(userId: string, dto: SupplementDocumentsDto): void {
+    const checks = [
+      { key: dto.ktpFileKey, prefix: `uploads/kyc-ktp/${userId}/` },
+      { key: dto.selfieFileKey, prefix: `uploads/kyc-selfie/${userId}/` },
+      { key: dto.livenessFileKey, prefix: `uploads/kyc-liveness/${userId}/` },
+    ];
+    for (const c of checks) {
+      if (c.key && !c.key.startsWith(c.prefix)) {
+        throw new BadRequestException({
+          code: 'FILE_ACCESS_DENIED',
+          message: `File key does not belong to this user or invalid prefix: ${c.prefix}`,
+        });
+      }
+    }
   }
 
   private validateKycFileOwnership(userId: string, dto: SubmitKycDto): void {

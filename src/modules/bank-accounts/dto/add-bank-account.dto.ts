@@ -1,9 +1,10 @@
-import { IsString, IsEnum, Length, Matches, MinLength, MaxLength } from 'class-validator';
-import { ApiProperty } from '@nestjs/swagger';
+import { IsString, IsEnum, Length, Matches, MinLength, MaxLength, IsOptional } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { BankCode } from '@prisma/client';
 import { Transform } from 'class-transformer';
+import { PasskeyReauthDto } from '../../auth/dto/passkey.dto';
 
-export class AddBankAccountDto {
+export class AddBankAccountDto extends PasskeyReauthDto {
   @ApiProperty({ enum: BankCode, description: 'Bank code (must match BankCode enum)' })
   @IsEnum(BankCode, { message: 'Invalid bank code. Use a code available at /public/banks.' })
   bankCode!: BankCode;

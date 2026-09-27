@@ -1,5 +1,5 @@
-import { Injectable, BadRequestException, NotFoundException, ForbiddenException, ConflictException } from '@nestjs/common';
-import { ContentHiddenReason } from '@prisma/client';
+import { Injectable, BadRequestException, NotFoundException, ForbiddenException, ConflictException, Logger } from '@nestjs/common';
+import { ContentHiddenReason, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { escapeHtml } from '../../common/utils/sanitize.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
@@ -52,7 +52,70 @@ interface PaginatedComments { data: CommentResponse[]; total: number; page: numb
 
 @Injectable()
 export class ProfileQAService {
+  private readonly logger = new Logger(ProfileQAService.name);
+
   constructor(private prisma: PrismaService) {}
+
+  /**
+   * G428 — sinkronisasi jalur hide dengan moderasi platform.
+   * Kolom hidden_by_type/hidden_by_admin_id berasal dari migrasi qa_moderation
+   * (belum ada di Prisma client) sehingga ditulis via raw SQL, best-effort:
+   * bila migrasi belum diterapkan, hide/unhide pemilik tetap jalan seperti
+   * sebelumnya (NULL = diperlakukan sebagai OWNER oleh semua consumer).
+   */
+  private async markOwnerHidden(
+    table: 'profile_questions' | 'profile_question_comments',
+    id: string,
+    hidden: boolean,
+  ): Promise<void> {
+    try {
+      await this.prisma.$executeRaw(
+        table === 'profile_questions'
+          ? Prisma.sql`UPDATE profile_questions
+                       SET hidden_by_type = ${hidden ? 'OWNER' : null}::qa_hidden_by_type,
+                           hidden_by_admin_id = NULL
+                       WHERE id = ${id}`
+          : Prisma.sql`UPDATE profile_question_comments
+                       SET hidden_by_type = ${hidden ? 'OWNER' : null}::qa_hidden_by_type,
+                           hidden_by_admin_id = NULL
+                       WHERE id = ${id}`,
+      );
+    } catch (err) {
+      this.logger.warn(
+        `markOwnerHidden: kolom hidden_by_type belum tersedia (${(err as Error).message}) — hide tetap dicatat via kolom existing`,
+      );
+    }
+  }
+
+  /**
+   * G428 — pemilik profil TIDAK boleh unhide konten yang disembunyikan
+   * moderator platform. Hanya unhide bila hidden_by_type = OWNER atau NULL
+   * (NULL = hide lama pra-migrasi, diperlakukan sebagai OWNER).
+   */
+  private async assertOwnerMayUnhide(
+    table: 'profile_questions' | 'profile_question_comments',
+    id: string,
+  ): Promise<void> {
+    try {
+      const rows = await this.prisma.$queryRaw<Array<{ hidden_by_type: string | null }>>(
+        table === 'profile_questions'
+          ? Prisma.sql`SELECT hidden_by_type::text AS hidden_by_type FROM profile_questions WHERE id = ${id}`
+          : Prisma.sql`SELECT hidden_by_type::text AS hidden_by_type FROM profile_question_comments WHERE id = ${id}`,
+      );
+      if (rows.length > 0 && rows[0].hidden_by_type === 'MODERATOR') {
+        throw new ForbiddenException({
+          code: ErrorCodes.FORBIDDEN,
+          message: 'Content hidden by platform moderators can only be unhidden by moderators',
+        });
+      }
+    } catch (err) {
+      if (err instanceof ForbiddenException) throw err;
+      // Kolom belum ada (pra-migrasi): izinkan unhide seperti perilaku lama.
+      this.logger.warn(
+        `assertOwnerMayUnhide: kolom hidden_by_type belum tersedia (${(err as Error).message}) — unhide diizinkan`,
+      );
+    }
+  }
 
   async askQuestion(askerId: string, receiverUsername: string, question: string): Promise<QuestionCreatedResponse> {
     const trimmed = question.trim();
@@ -437,6 +500,9 @@ export class ProfileQAService {
         message: hidden ? 'Question is already hidden' : 'Question is not hidden',
       });
     }
+    if (!hidden) {
+      await this.assertOwnerMayUnhide('profile_questions', questionId);
+    }
 
     const updated = await this.prisma.profileQuestion.update({
       where: { id: questionId },
@@ -445,6 +511,7 @@ export class ProfileQAService {
         : { isHidden: false, hiddenReason: null, hiddenAt: null, hiddenBy: null },
       select: { id: true, isHidden: true, hiddenReason: true, hiddenAt: true },
     });
+    await this.markOwnerHidden('profile_questions', questionId, hidden);
     return updated;
   }
 
@@ -480,14 +547,19 @@ export class ProfileQAService {
         message: hidden ? 'Comment is already hidden' : 'Comment is not hidden',
       });
     }
+    if (!hidden) {
+      await this.assertOwnerMayUnhide('profile_question_comments', commentId);
+    }
 
-    return this.prisma.profileQuestionComment.update({
+    const updated = await this.prisma.profileQuestionComment.update({
       where: { id: commentId },
       data: hidden
         ? { isHidden: true, hiddenReason: reason, hiddenAt: new Date(), hiddenBy: userId }
         : { isHidden: false, hiddenReason: null, hiddenAt: null, hiddenBy: null },
       select: { id: true, isHidden: true, hiddenReason: true, hiddenAt: true },
     });
+    await this.markOwnerHidden('profile_question_comments', commentId, hidden);
+    return updated;
   }
 
   async addComment(userId: string, questionId: string, content: string, parentId?: string): Promise<CommentResponse> {

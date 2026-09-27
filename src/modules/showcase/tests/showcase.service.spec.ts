@@ -10,6 +10,7 @@ import { UploadService } from '../../upload/upload.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { SubscriptionsService } from '../../subscriptions/subscriptions.service';
+import { AdminShowcaseReportsService } from '../../admin/showcase-reports/admin-showcase-reports.service';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { SHOWCASE_MAX_IMAGES, SHOWCASE_MAX_ITEMS } from '../../../common/constants/app.constants';
 
@@ -184,6 +185,7 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
         { provide: AuditLogService, useValue: { logUserAction: jest.fn(), logAdminAction: jest.fn() } },
         { provide: VerificationBadgeService, useValue: { getBadges: jest.fn().mockResolvedValue([]), getSealTierMap: jest.fn().mockResolvedValue(new Map()) } },
         { provide: SubscriptionsService, useValue: mockSubscriptions },
+        { provide: AdminShowcaseReportsService, useValue: { linkReportToCluster: jest.fn() } },
       ],
     }).compile();
     service = module.get<ShowcaseService>(ShowcaseService);

@@ -4,6 +4,10 @@ import { AuditLogService } from '../../../common/services/audit-log.service';
 import { RedisService } from '../../../redis/redis.service';
 import { CreateAdminDto } from './dto/create-admin.dto';
 import { UpdateAdminDto } from './dto/update-admin.dto';
+import { SuspendAdminDto } from './dto/suspend-admin.dto';
+import { ChangeAdminRoleDto } from './dto/change-admin-role.dto';
+import { CreateEmergencyGrantDto } from './dto/emergency-grant.dto';
+import { CreateHandoffDto, HandoffQueryDto } from './dto/create-handoff.dto';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditAction } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
@@ -159,8 +163,18 @@ export class AdminManagementService {
       throw new ForbiddenException({ code: 'CANNOT_DEACTIVATE_SELF', message: 'Cannot deactivate your own account' });
     }
 
+    // GAP-E G390: alasan WAJIB bila role berubah lewat update generik ini
+    // (jalur khusus PUT :id/role juga mewajibkan via ChangeAdminRoleDto).
+    const roleChanged = dto.role !== undefined && dto.role !== admin.role;
+    if (roleChanged && (!dto.reason || !dto.reason.trim())) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Alasan wajib diisi bila role berubah',
+      });
+    }
+
     const accessStateChanged =
-      (dto.role !== undefined && dto.role !== admin.role)
+      roleChanged
       || (dto.isActive !== undefined && dto.isActive !== admin.isActive);
     if (admin.role === 'SUPER_ADMIN' && admin.isActive && accessStateChanged) {
       const activeSuperAdmins = await this.prisma.adminUser.count({ where: { role: 'SUPER_ADMIN', isActive: true, deletedAt: null } });
@@ -204,6 +218,21 @@ export class AdminManagementService {
         description: `Updated admin "${admin.fullName}" (${admin.adminId}): ${changes.join(', ')}`,
         before: { fullName: admin.fullName, role: admin.role, isActive: admin.isActive },
         after: { fullName: updated.fullName, role: updated.role, isActive: updated.isActive },
+        ipAddress,
+      });
+    }
+
+    // GAP-E G390: perubahan role lewat update generik tetap diaudit eksplisit
+    // sebagai ADMIN_ROLE_CHANGED dengan before/after.
+    if (roleChanged) {
+      this.auditLog.logAdminAction({
+        adminId: updaterId,
+        action: AuditAction.ADMIN_ROLE_CHANGED,
+        targetType: 'AdminUser',
+        targetId: admin.id,
+        description: `Changed role of admin "${admin.fullName}" (${admin.adminId}): ${admin.role} → ${dto.role}. Reason: ${dto.reason}`,
+        before: { role: admin.role },
+        after: { role: dto.role, reason: dto.reason },
         ipAddress,
       });
     }
@@ -328,5 +357,644 @@ export class AdminManagementService {
     });
 
     return { message: 'Admin deleted successfully' };
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  // GAP-E (G376–G400) — operasional admin & tim
+  // ══════════════════════════════════════════════════════════════
+
+  /** Menandai semua token akses admin sebagai kedaluwarsa (paksa login ulang). */
+  private async revokeAdminTokens(adminId: string): Promise<void> {
+    await this.redis.setex(
+      `admin_revoked:${adminId}`,
+      ADMIN_ACCESS_TOKEN_TTL_SECONDS,
+      String(Math.floor(Date.now() / 1000)),
+      { throwOnError: true },
+    );
+  }
+
+  private async findAdminOrThrow(id: string) {
+    const admin = await this.prisma.adminUser.findFirst({ where: { id, deletedAt: null } });
+    if (!admin) {
+      throw new NotFoundException({ code: ErrorCodes.ADMIN_NOT_FOUND, message: 'Admin not found' });
+    }
+    return admin;
+  }
+
+  private async assertNotLastSuperAdmin(admin: { role: string; isActive: boolean }): Promise<void> {
+    if (admin.role === 'SUPER_ADMIN' && admin.isActive) {
+      const activeSuperAdmins = await this.prisma.adminUser.count({
+        where: { role: 'SUPER_ADMIN', isActive: true, deletedAt: null },
+      });
+      if (activeSuperAdmins <= 1) {
+        throw new ForbiddenException({ code: 'LAST_SUPER_ADMIN', message: 'At least one active super admin must remain.' });
+      }
+    }
+  }
+
+  // ── Sesi admin (G393/G394) ──────────────────────────────────────
+
+  /** Daftar sesi login admin (aktif + yang baru dicabut). */
+  async listAdminSessions(adminId: string): Promise<object> {
+    await this.findAdminOrThrow(adminId);
+    const sessions = await this.prisma.adminSession.findMany({
+      where: { adminId },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+      select: {
+        id: true, ipAddress: true, userAgent: true,
+        createdAt: true, lastSeenAt: true, revokedAt: true, revokedBy: true,
+      },
+    });
+    return { data: sessions, total: sessions.length };
+  }
+
+  /**
+   * Cabut satu sesi admin (audit ADMIN_SESSION_REVOKED).
+   *
+   * Keamanan: JWT admin bersifat stateless dan tidak tertaut per-sesi di DB
+   * (tidak ada kolom jti di AdminSession — perubahan schema di luar cakupan
+   * GAP-E, tanpa migrasi baru), sehingga `revokedAt` saja tidak membatalkan
+   * token yang sudah terbit. Sebagai fail-safe, pencabutan sesi juga
+   * menaikkan epoch `admin_revoked:` untuk admin tersebut — SELURUH token
+   * akses admin itu menjadi tidak valid dan ia harus login ulang.
+   */
+  async revokeAdminSession(adminId: string, sessionId: string, revokerId: string, ipAddress: string): Promise<{ message: string }> {
+    await this.findAdminOrThrow(adminId);
+    const session = await this.prisma.adminSession.findFirst({
+      where: { id: sessionId, adminId, revokedAt: null },
+    });
+    if (!session) {
+      throw new NotFoundException({ code: 'ADMIN_SESSION_NOT_FOUND', message: 'Active admin session not found' });
+    }
+    await this.prisma.adminSession.update({
+      where: { id: sessionId },
+      data: { revokedAt: new Date(), revokedBy: revokerId },
+    });
+    // Fail-safe: batalkan juga token JWT yang beredar milik admin ini.
+    await this.revokeAdminTokens(adminId);
+    this.auditLog.logAdminAction({
+      adminId: revokerId,
+      action: AuditAction.ADMIN_SESSION_REVOKED,
+      targetType: 'AdminUser',
+      targetId: adminId,
+      description: `Revoked admin session ${sessionId} for admin ${adminId}`,
+      before: { revokedAt: null },
+      after: { revokedAt: new Date().toISOString(), revokedBy: revokerId },
+      ipAddress,
+    });
+    return { message: 'Sesi admin dicabut.' };
+  }
+
+  // ── Suspend / reactivate (G391/G392) ────────────────────────────
+
+  /**
+   * Suspend akun admin: isActive=false + token dicabut + audit ADMIN_SUSPENDED.
+   * Riwayat audit dipertahankan (bukan delete) — akun bisa di-reactivate.
+   */
+  async suspendAdmin(targetId: string, dto: SuspendAdminDto, actorId: string, ipAddress: string): Promise<object> {
+    if (targetId === actorId) {
+      throw new ForbiddenException({ code: 'CANNOT_SUSPEND_SELF', message: 'Tidak bisa men-suspend akun sendiri' });
+    }
+    const admin = await this.findAdminOrThrow(targetId);
+    if (!admin.isActive) {
+      throw new ConflictException({ code: 'ALREADY_SUSPENDED', message: 'Admin sudah dalam status suspend/nonaktif' });
+    }
+    await this.assertNotLastSuperAdmin(admin);
+
+    const updated = await this.prisma.adminUser.update({
+      where: { id: targetId },
+      data: { isActive: false },
+      select: { id: true, adminId: true, fullName: true, email: true, role: true, isActive: true },
+    });
+
+    await this.revokeAdminTokens(targetId);
+
+    this.auditLog.logAdminAction({
+      adminId: actorId,
+      action: AuditAction.ADMIN_SUSPENDED,
+      targetType: 'AdminUser',
+      targetId: admin.id,
+      description: `Suspended admin "${admin.fullName}" (${admin.adminId}). Reason: ${dto.reason}`,
+      before: { isActive: true },
+      after: { isActive: false, reason: dto.reason },
+      ipAddress,
+    });
+
+    return updated;
+  }
+
+  /** Aktifkan kembali akun admin yang di-suspend (audit ADMIN_REACTIVATED). */
+  async reactivateAdmin(targetId: string, actorId: string, ipAddress: string): Promise<object> {
+    const admin = await this.findAdminOrThrow(targetId);
+    if (admin.isActive) {
+      throw new ConflictException({ code: 'ALREADY_ACTIVE', message: 'Admin sudah aktif' });
+    }
+    const updated = await this.prisma.adminUser.update({
+      where: { id: targetId },
+      data: { isActive: true },
+      select: { id: true, adminId: true, fullName: true, email: true, role: true, isActive: true },
+    });
+
+    this.auditLog.logAdminAction({
+      adminId: actorId,
+      action: AuditAction.ADMIN_REACTIVATED,
+      targetType: 'AdminUser',
+      targetId: admin.id,
+      description: `Reactivated admin "${admin.fullName}" (${admin.adminId})`,
+      before: { isActive: false },
+      after: { isActive: true },
+      ipAddress,
+    });
+
+    return updated;
+  }
+
+  // ── Ubah role (G390) ───────────────────────────────────────────
+
+  /**
+   * Ubah role admin — alasan WAJIB, audit ADMIN_ROLE_CHANGED dengan
+   * before/after. Token lama dicabut agar hak baru berlaku segera.
+   */
+  async changeAdminRole(targetId: string, dto: ChangeAdminRoleDto, actorId: string, ipAddress: string): Promise<object> {
+    if (targetId === actorId) {
+      throw new ForbiddenException({ code: 'CANNOT_CHANGE_OWN_ROLE', message: 'Cannot change your own role' });
+    }
+    const admin = await this.findAdminOrThrow(targetId);
+    if (dto.role === admin.role) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Role baru sama dengan role saat ini' });
+    }
+    await this.assertNotLastSuperAdmin(admin);
+
+    const updated = await this.prisma.adminUser.update({
+      where: { id: targetId },
+      data: { role: dto.role as never },
+      select: { id: true, adminId: true, fullName: true, email: true, role: true, isActive: true },
+    });
+
+    await this.revokeAdminTokens(targetId);
+
+    this.auditLog.logAdminAction({
+      adminId: actorId,
+      action: AuditAction.ADMIN_ROLE_CHANGED,
+      targetType: 'AdminUser',
+      targetId: admin.id,
+      description: `Changed role of admin "${admin.fullName}" (${admin.adminId}): ${admin.role} → ${dto.role}. Reason: ${dto.reason}`,
+      before: { role: admin.role },
+      after: { role: dto.role, reason: dto.reason },
+      ipAddress,
+    });
+
+    return updated;
+  }
+
+  // ── Akses darurat berjangka (G395) ──────────────────────────────
+
+  /**
+   * Grant akses darurat berjangka. Guard SUPER_ADMIN ada di controller
+   * (@AdminRoles) — service memvalidasi ulang agar tidak bisa dilewati.
+   */
+  async createEmergencyGrant(dto: CreateEmergencyGrantDto, granterId: string, granterRole: string, ipAddress: string): Promise<object> {
+    if (granterRole !== 'SUPER_ADMIN') {
+      throw new ForbiddenException({ code: ErrorCodes.INSUFFICIENT_ADMIN_ROLE, message: 'Emergency access grant requires SUPER_ADMIN' });
+    }
+    const target = await this.findAdminOrThrow(dto.adminId);
+    if (target.id === granterId) {
+      throw new ForbiddenException({ code: 'CANNOT_GRANT_SELF', message: 'Tidak bisa memberi akses darurat ke diri sendiri' });
+    }
+    if (!target.isActive) {
+      throw new BadRequestException({ code: ErrorCodes.ACCOUNT_INACTIVE, message: 'Target admin is not active' });
+    }
+
+    const existing = await this.prisma.emergencyAccessGrant.findFirst({
+      where: { adminId: target.id, revokedAt: null, expiresAt: { gt: new Date() } },
+    });
+    if (existing) {
+      throw new ConflictException({ code: 'GRANT_ALREADY_ACTIVE', message: 'Admin sudah memiliki grant akses darurat yang aktif' });
+    }
+
+    const expiresAt = new Date(Date.now() + dto.expiresInMinutes * 60_000);
+    const grant = await this.prisma.emergencyAccessGrant.create({
+      data: {
+        adminId: target.id,
+        grantedBy: granterId,
+        reason: dto.reason,
+        scope: dto.scope,
+        expiresAt,
+      },
+      select: { id: true, adminId: true, grantedBy: true, reason: true, scope: true, expiresAt: true, createdAt: true },
+    });
+
+    this.auditLog.logAdminAction({
+      adminId: granterId,
+      action: AuditAction.EMERGENCY_ACCESS_GRANTED,
+      targetType: 'AdminUser',
+      targetId: target.id,
+      description: `Granted emergency access to admin "${target.fullName}" (${target.adminId}) for ${dto.expiresInMinutes} min. Scope: ${dto.scope}. Reason: ${dto.reason}`,
+      after: { grantId: grant.id, scope: dto.scope, expiresAt: expiresAt.toISOString() },
+      ipAddress,
+    });
+
+    return grant;
+  }
+
+  /** Daftar grant akses darurat yang masih aktif (belum kedaluwarsa/dicabut). */
+  async listActiveEmergencyGrants(): Promise<object> {
+    return this.listEmergencyGrants(true);
+  }
+
+  /**
+   * GAP-E (G395, kontrak admin web `GET /v1/admin/emergency-grants`) —
+   * daftar grant akses darurat; `activeOnly=false` menampilkan riwayat
+   * termasuk yang kedaluwarsa/dicabut.
+   */
+  async listEmergencyGrants(activeOnly = true): Promise<object> {
+    const grants = await this.prisma.emergencyAccessGrant.findMany({
+      where: activeOnly ? { revokedAt: null, expiresAt: { gt: new Date() } } : {},
+      orderBy: { createdAt: 'desc' },
+      include: {
+        admin: { select: { id: true, adminId: true, fullName: true, email: true, role: true } },
+      },
+    });
+    return { data: grants, total: grants.length };
+  }
+
+  async revokeEmergencyGrant(grantId: string, revokerId: string, ipAddress: string): Promise<{ message: string }> {
+    const grant = await this.prisma.emergencyAccessGrant.findFirst({
+      where: { id: grantId, revokedAt: null, expiresAt: { gt: new Date() } },
+      include: { admin: { select: { id: true, adminId: true, fullName: true } } },
+    });
+    if (!grant) {
+      throw new NotFoundException({ code: 'GRANT_NOT_FOUND', message: 'Grant akses darurat aktif tidak ditemukan' });
+    }
+    await this.prisma.emergencyAccessGrant.update({
+      where: { id: grantId },
+      data: { revokedAt: new Date() },
+    });
+
+    this.auditLog.logAdminAction({
+      adminId: revokerId,
+      action: AuditAction.EMERGENCY_ACCESS_REVOKED,
+      targetType: 'AdminUser',
+      targetId: grant.adminId,
+      description: `Revoked emergency access grant ${grantId} for admin "${grant.admin.fullName}" (${grant.admin.adminId})`,
+      before: { revokedAt: null },
+      after: { revokedAt: new Date().toISOString(), revokedBy: revokerId },
+      ipAddress,
+    });
+
+    return { message: 'Grant akses darurat dicabut.' };
+  }
+
+  // ── Review akses periodik (G396) ─────────────────────────────────
+
+  /** Siklus sertifikasi ulang akses (hari). Disepakati operasional: 90 hari. */
+  private static readonly ACCESS_REVIEW_CYCLE_DAYS = 90;
+  private static readonly ACCESS_REVIEW_MARKER = 'ACCESS_REVIEW_CERTIFIED';
+
+  /**
+   * Daftar admin + tanggal sertifikasi ulang akses terakhir.
+   * Tanggal = terbaru dari: createdAt, ADMIN_ROLE_CHANGED terakhir, atau
+   * penandaan "direview" terakhir (via markAccessReviewed).
+   */
+  async accessReview(): Promise<object> {
+    const admins = await this.prisma.adminUser.findMany({
+      where: { deletedAt: null },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true, adminId: true, fullName: true, email: true, role: true, isActive: true, createdAt: true },
+    });
+
+    const logs = await this.prisma.adminAuditLog.findMany({
+      where: {
+        targetType: 'AdminUser',
+        targetId: { in: admins.map((a) => a.id) },
+        action: { in: [AuditAction.ADMIN_ROLE_CHANGED, AuditAction.ADMIN_ACTION] },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { targetId: true, action: true, description: true, createdAt: true, adminId: true },
+      take: 2000,
+    });
+
+    const now = Date.now();
+    const cycleMs = AdminManagementService.ACCESS_REVIEW_CYCLE_DAYS * 24 * 60 * 60 * 1000;
+
+    const rows = admins.map((a) => {
+      let lastCertifiedAt = a.createdAt;
+      let certifiedBy: string | null = null;
+      for (const log of logs) {
+        if (log.targetId !== a.id) continue;
+        const isMark = log.action === AuditAction.ADMIN_ACTION
+          && (log.description ?? '').startsWith(AdminManagementService.ACCESS_REVIEW_MARKER);
+        const isRoleChange = log.action === AuditAction.ADMIN_ROLE_CHANGED;
+        if ((isMark || isRoleChange) && log.createdAt > lastCertifiedAt) {
+          lastCertifiedAt = log.createdAt;
+          certifiedBy = log.adminId;
+        }
+      }
+      const nextDueAt = new Date(lastCertifiedAt.getTime() + cycleMs);
+      return {
+        id: a.id,
+        adminId: a.adminId,
+        fullName: a.fullName,
+        email: a.email,
+        role: a.role,
+        isActive: a.isActive,
+        lastCertifiedAt: lastCertifiedAt.toISOString(),
+        certifiedBy,
+        nextReviewDueAt: nextDueAt.toISOString(),
+        overdue: now > nextDueAt.getTime(),
+        cycleDays: AdminManagementService.ACCESS_REVIEW_CYCLE_DAYS,
+      };
+    });
+
+    return { data: rows, total: rows.length };
+  }
+
+  /** Tandai akses admin sudah direview (sertifikasi ulang manual). */
+  async markAccessReviewed(targetId: string, actorId: string, ipAddress: string): Promise<{ message: string }> {
+    const admin = await this.findAdminOrThrow(targetId);
+    const now = new Date();
+    this.auditLog.logAdminAction({
+      adminId: actorId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'AdminUser',
+      targetId: admin.id,
+      description: `${AdminManagementService.ACCESS_REVIEW_MARKER}: access of admin "${admin.fullName}" (${admin.adminId}, role ${admin.role}) certified`,
+      after: {
+        accessReviewedAt: now.toISOString(),
+        nextReviewDueAt: new Date(now.getTime() + AdminManagementService.ACCESS_REVIEW_CYCLE_DAYS * 24 * 60 * 60 * 1000).toISOString(),
+      },
+      ipAddress,
+    });
+    return { message: 'Akses ditandai sudah direview.' };
+  }
+
+  /**
+   * GAP-E (G392, kontrak admin web `GET /v1/admin/management/:id/audit-log`) —
+   * histori perubahan hak akun admin (role, suspend, revoke sesi, dsb.)
+   * dari AdminAuditLog, diurut terbaru dulu.
+   */
+  async listAdminAuditLog(targetId: string, page = 1, limit = 20): Promise<object> {
+    await this.findAdminOrThrow(targetId);
+    const safePage = Math.max(page, 1);
+    const safeLimit = Math.min(Math.max(limit, 1), 100);
+    const where = { targetType: 'AdminUser', targetId };
+    const [logs, total] = await Promise.all([
+      this.prisma.adminAuditLog.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: (safePage - 1) * safeLimit,
+        take: safeLimit,
+        select: {
+          id: true,
+          action: true,
+          description: true,
+          ipAddress: true,
+          createdAt: true,
+          admin: { select: { id: true, adminId: true, fullName: true } },
+        },
+      }),
+      this.prisma.adminAuditLog.count({ where }),
+    ]);
+    const data = logs.map((l) => ({
+      id: l.id,
+      action: String(l.action),
+      description: l.description,
+      ipAddress: l.ipAddress,
+      createdAt: l.createdAt.toISOString(),
+      actor: l.admin ? { id: l.admin.id, adminId: l.admin.adminId, fullName: l.admin.fullName } : null,
+    }));
+    return { data, total, page: safePage, limit: safeLimit, totalPages: Math.ceil(total / safeLimit) };
+  }
+
+  // ── Handoff kasus (G397) ─────────────────────────────────────────
+
+  /** Catat handoff kasus antar petugas + audit CASE_HANDOFF_CREATED. */
+  async createHandoff(dto: CreateHandoffDto, actorId: string, ipAddress: string): Promise<object> {
+    if (dto.fromAdminId === dto.toAdminId) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'fromAdminId dan toAdminId tidak boleh sama' });
+    }
+    const [from, to] = await Promise.all([
+      this.findAdminOrThrow(dto.fromAdminId),
+      this.findAdminOrThrow(dto.toAdminId),
+    ]);
+    if (!from.isActive || !to.isActive) {
+      throw new BadRequestException({ code: ErrorCodes.ACCOUNT_INACTIVE, message: 'Admin pemberi/penerima tidak aktif' });
+    }
+
+    const handoff = await this.prisma.adminCaseHandoff.create({
+      data: {
+        caseType: dto.caseType,
+        caseId: dto.caseId,
+        fromAdminId: from.id,
+        toAdminId: to.id,
+        note: dto.note ?? null,
+      },
+    });
+
+    this.auditLog.logAdminAction({
+      adminId: actorId,
+      action: AuditAction.CASE_HANDOFF_CREATED,
+      targetType: 'AdminUser',
+      targetId: to.id,
+      description: `Handoff ${dto.caseType} ${dto.caseId}: ${from.fullName} → ${to.fullName}${dto.note ? `. Note: ${dto.note}` : ''}`,
+      after: { handoffId: handoff.id, caseType: dto.caseType, caseId: dto.caseId, fromAdminId: from.id, toAdminId: to.id },
+      ipAddress,
+    });
+
+    return handoff;
+  }
+
+  /** Riwayat handoff untuk satu kasus (dipakai di detail kasus). */
+  async listHandoffsByCase(query: HandoffQueryDto): Promise<object> {
+    const handoffs = await this.prisma.adminCaseHandoff.findMany({
+      where: { caseType: query.caseType, caseId: query.caseId },
+      orderBy: { createdAt: 'desc' },
+    });
+    const adminIds = [...new Set(handoffs.flatMap((h) => [h.fromAdminId, h.toAdminId]))];
+    const admins = adminIds.length > 0
+      ? await this.prisma.adminUser.findMany({
+          where: { id: { in: adminIds } },
+          select: { id: true, fullName: true, role: true },
+        })
+      : [];
+    const byId = new Map(admins.map((a) => [a.id, a]));
+    return {
+      data: handoffs.map((h) => ({
+        ...h,
+        fromAdmin: byId.get(h.fromAdminId) ?? null,
+        toAdmin: byId.get(h.toAdminId) ?? null,
+      })),
+      total: handoffs.length,
+    };
+  }
+
+  /**
+   * Beban kasus per petugas: jumlah handoff yang DITERIMA (30 hari terakhir)
+   * + jumlah kasus yang sedang di-assign (dispute aktif).
+   */
+  async handoffWorkload(): Promise<object> {
+    const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const [received, assignedDisputes] = await Promise.all([
+      this.prisma.adminCaseHandoff.groupBy({
+        by: ['toAdminId'],
+        where: { createdAt: { gte: since } },
+        _count: { id: true },
+      }),
+      this.prisma.dispute.groupBy({
+        by: ['assignedAdminId'],
+        where: { assignedAdminId: { not: null }, status: { not: 'RESOLVED' } },
+        _count: { id: true },
+      }),
+    ]);
+    const adminIds = [...new Set([
+      ...received.map((r) => r.toAdminId),
+      ...assignedDisputes.map((d) => d.assignedAdminId as string),
+    ])];
+    const admins = adminIds.length > 0
+      ? await this.prisma.adminUser.findMany({
+          where: { id: { in: adminIds }, deletedAt: null },
+          select: { id: true, fullName: true, role: true, isActive: true },
+        })
+      : [];
+    const byId = new Map(admins.map((a) => [a.id, a]));
+    const rows = adminIds.map((id) => ({
+      adminId: id,
+      admin: byId.get(id) ?? null,
+      handoffsReceived30d: received.find((r) => r.toAdminId === id)?._count.id ?? 0,
+      activeAssignedDisputes: assignedDisputes.find((d) => d.assignedAdminId === id)?._count.id ?? 0,
+    }));
+    rows.sort((a, b) => (b.handoffsReceived30d + b.activeAssignedDisputes) - (a.handoffsReceived30d + a.activeAssignedDisputes));
+    return { data: rows, total: rows.length, windowDays: 30 };
+  }
+
+  // ── Jejak aktivitas admin (G399) ────────────────────────────────
+
+  /** Retensi log aktivitas admin (hari). Operasional: 365 hari. */
+  private static readonly ACTIVITY_LOG_RETENTION_DAYS = 365;
+  /** Batas baris ekspor CSV aktivitas. */
+  private static readonly ACTIVITY_EXPORT_MAX_ROWS = 10_000;
+
+  private buildActivityWhere(filters: { adminId?: string; action?: string; from?: string; to?: string }) {
+    const actionValues = Object.values(AuditAction) as string[];
+    const where: Record<string, unknown> = {};
+    if (filters.adminId) where.adminId = filters.adminId;
+    if (filters.action && actionValues.includes(filters.action)) {
+      where.action = filters.action as AuditAction;
+    }
+    const createdAt: Record<string, Date> = {};
+    if (filters.from) {
+      const from = new Date(filters.from);
+      if (!Number.isNaN(from.getTime())) createdAt.gte = from;
+    }
+    if (filters.to) {
+      const to = new Date(filters.to);
+      if (!Number.isNaN(to.getTime())) createdAt.lte = to;
+    }
+    if (Object.keys(createdAt).length > 0) where.createdAt = createdAt;
+    return where;
+  }
+
+  private formatActivityEntry(l: {
+    id: string;
+    adminId: string | null;
+    action: AuditAction;
+    description: string | null;
+    ipAddress: string | null;
+    createdAt: Date;
+    admin: { adminId: string; fullName: string } | null;
+  }) {
+    return {
+      id: l.id,
+      adminId: l.adminId,
+      adminName: l.admin?.fullName ?? null,
+      action: String(l.action),
+      description: l.description,
+      ipAddress: l.ipAddress,
+      createdAt: l.createdAt.toISOString(),
+    };
+  }
+
+  /**
+   * GAP-E (G399) — jejak aktivitas admin dengan filter admin/aksi/rentang
+   * waktu. Filter `action` yang tidak dikenal diabaikan (bukan error).
+   */
+  async listAdminActivity(filters: {
+    adminId?: string; action?: string; from?: string; to?: string; page?: number; limit?: number;
+  }): Promise<object> {
+    const safePage = Math.max(filters.page ?? 1, 1);
+    const safeLimit = Math.min(Math.max(filters.limit ?? 20, 1), 100);
+    const where = this.buildActivityWhere(filters);
+    const [logs, total] = await Promise.all([
+      this.prisma.adminAuditLog.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: (safePage - 1) * safeLimit,
+        take: safeLimit,
+        select: {
+          id: true, adminId: true, action: true, description: true,
+          ipAddress: true, createdAt: true,
+          admin: { select: { adminId: true, fullName: true } },
+        },
+      }),
+      this.prisma.adminAuditLog.count({ where }),
+    ]);
+    return createPaginatedResponse(
+      logs.map((l) => this.formatActivityEntry(l)),
+      total,
+      safePage,
+      safeLimit,
+    );
+  }
+
+  /**
+   * GAP-E (G399) — ekspor CSV jejak aktivitas (diaudit sebagai USER_EXPORTED).
+   * Tanpa PII sensitif: hanya nama admin pelaksana, bukan email.
+   */
+  async exportAdminActivityCsv(
+    filters: { adminId?: string; action?: string; from?: string; to?: string },
+    actorId: string,
+    ipAddress: string,
+  ): Promise<string> {
+    const where = this.buildActivityWhere(filters);
+    const logs = await this.prisma.adminAuditLog.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: AdminManagementService.ACTIVITY_EXPORT_MAX_ROWS,
+      select: {
+        id: true, adminId: true, action: true, description: true,
+        ipAddress: true, createdAt: true,
+        admin: { select: { adminId: true, fullName: true } },
+      },
+    });
+    const escapeCsv = (v: string | null | undefined) =>
+      `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const header = 'id,admin_id,admin_name,action,description,ip_address,created_at';
+    const lines = logs.map((l) =>
+      [
+        l.id, l.adminId, l.admin?.fullName ?? '', String(l.action),
+        l.description ?? '', l.ipAddress ?? '', l.createdAt.toISOString(),
+      ]
+        .map((v) => escapeCsv(v))
+        .join(','),
+    );
+    this.auditLog.logAdminAction({
+      adminId: actorId,
+      action: AuditAction.USER_EXPORTED,
+      targetType: 'AdminAuditLog',
+      targetId: 'activity-log',
+      description: `Exported admin activity log CSV (${logs.length} rows)`,
+      after: { rowCount: logs.length, filters },
+      ipAddress,
+    });
+    return [header, ...lines].join('\n');
+  }
+
+  /** GAP-E (G399) — kebijakan retensi log aktivitas admin. */
+  async getActivityRetention(): Promise<object> {
+    return {
+      retentionDays: AdminManagementService.ACTIVITY_LOG_RETENTION_DAYS,
+      note: 'Log aktivitas admin disimpan 365 hari, lalu diarsip ke cold storage dan dihapus dari database operasional.',
+    };
   }
 }

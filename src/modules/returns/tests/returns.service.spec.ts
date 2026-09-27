@@ -1,0 +1,388 @@
+/**
+ * GAP-D retur — unit test (G225).
+ *
+ * Mencakup: guard transisi state legal/ilegal, idempotensi approval refund
+ * (G210: 2x createApproval → 1 record; claim eksekusi 2x → tepat 1 eksekusi
+ * ledger), dan penolakan pengajuan ganda (G218). Prisma di-mock penuh —
+ * tidak butuh database.
+ */
+import {
+  BadRequestException,
+  ConflictException,
+} from '@nestjs/common';
+import { PrismaService } from '../../../prisma/prisma.service';
+import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
+import { UploadService } from '../../upload/upload.service';
+import { AuditLogService } from '../../../common/services/audit-log.service';
+import { ReturnsService, RETURN_DUPLICATE } from '../returns.service';
+import { ReturnsNotifyService } from '../returns-notify.service';
+import { ReturnsRefundService } from '../returns-refund.service';
+import {
+  assertLegalReturnTransition,
+  isLegalReturnTransition,
+  RETURN_INVALID_TRANSITION,
+  ACTIVE_RETURN_STATUSES,
+} from '../returns-state';
+import { TERMINAL_RETURN_STATUSES } from '../returns.types';
+import type { ReturnRequestRow } from '../returns.types';
+
+type MockFn = jest.Mock;
+
+function makeDelegate() {
+  return {
+    findUnique: jest.fn(),
+    findFirst: jest.fn(),
+    findMany: jest.fn(),
+    count: jest.fn(),
+    create: jest.fn(),
+    update: jest.fn(),
+    updateMany: jest.fn(),
+  };
+}
+type Delegate = ReturnType<typeof makeDelegate>;
+
+function baseReturn(overrides: Partial<ReturnRequestRow> = {}): ReturnRequestRow {
+  return {
+    id: 'ret-db-1',
+    returnId: 'RTN-20260926-0001',
+    orderId: 'order-db-1',
+    itemRef: null,
+    buyerId: 'buyer-1',
+    sellerId: 'seller-1',
+    status: 'REQUESTED',
+    reasonCode: 'BARANG_RUSAK',
+    reasonDetail: null,
+    resolutionType: 'REFUND',
+    refundAmount: null,
+    sellerRespondBy: new Date(Date.now() + 72 * 3_600_000),
+    rejectReasonCode: null,
+    rejectNote: null,
+    clarificationQuestion: null,
+    returnInstructions: null,
+    shipBy: null,
+    returnTrackingNumber: null,
+    returnCourier: null,
+    receivedAt: null,
+    receivedNote: null,
+    disputeId: null,
+    approvedAt: null,
+    rejectedAt: null,
+    resolvedAt: null,
+    cancelledAt: null,
+    expiredAt: null,
+    escalatedAt: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    ...overrides,
+  };
+}
+
+describe('ReturnsService (GAP-D retur)', () => {
+  let prisma: Record<string, unknown>;
+  let delegates: Record<string, Delegate>;
+  let orderDelegate: Delegate;
+  let walletDelegate: Delegate;
+  let serial: { getNextForPrefix: MockFn };
+  let uploadService: { verifyEvidenceFileKeysBatch: MockFn; cleanupFileKeys: MockFn };
+  let auditLog: { logUserAction: MockFn; logAdminAction: MockFn };
+  let notify: { notifyStage: MockFn; notifyBoth: MockFn };
+  let refundService: ReturnsRefundService;
+  let service: ReturnsService;
+
+  beforeEach(() => {
+    delegates = {
+      returnPolicy: makeDelegate(),
+      returnRequest: makeDelegate(),
+      returnAttachment: makeDelegate(),
+      returnNote: makeDelegate(),
+      returnTimeline: makeDelegate(),
+      returnShipmentEvent: makeDelegate(),
+      returnRefundApproval: makeDelegate(),
+    };
+    orderDelegate = makeDelegate();
+    walletDelegate = makeDelegate();
+    prisma = {
+      ...delegates,
+      order: orderDelegate,
+      dispute: makeDelegate(),
+      wallet: walletDelegate,
+      walletTransaction: makeDelegate(),
+      notification: makeDelegate(),
+      adminAuditLog: makeDelegate(),
+      $transaction: jest.fn(),
+      emitNotificationCreated: jest.fn(),
+    };
+    serial = { getNextForPrefix: jest.fn().mockResolvedValue(7) };
+    uploadService = {
+      verifyEvidenceFileKeysBatch: jest.fn(),
+      cleanupFileKeys: jest.fn().mockResolvedValue({ deleted: 1, errors: [] }),
+    };
+    auditLog = { logUserAction: jest.fn(), logAdminAction: jest.fn() };
+    notify = {
+      notifyStage: jest.fn().mockResolvedValue(undefined),
+      notifyBoth: jest.fn().mockResolvedValue(undefined),
+    };
+    refundService = new ReturnsRefundService(
+      prisma as unknown as PrismaService,
+      serial as unknown as WalletTxSerialService,
+    );
+    service = new ReturnsService(
+      prisma as unknown as PrismaService,
+      serial as unknown as WalletTxSerialService,
+      uploadService as unknown as UploadService,
+      auditLog as unknown as AuditLogService,
+      notify as unknown as ReturnsNotifyService,
+      refundService,
+    );
+    jest.clearAllMocks();
+    // jest.clearAllMocks menghapus implementasi mockResolvedValue di atas —
+    // setel ulang default yang dibutuhkan semua test.
+    serial.getNextForPrefix.mockResolvedValue(7);
+    notify.notifyStage.mockResolvedValue(undefined);
+    notify.notifyBoth.mockResolvedValue(undefined);
+    uploadService.cleanupFileKeys.mockResolvedValue({ deleted: 1, errors: [] });
+    delegates.returnTimeline.create.mockResolvedValue({});
+  });
+
+  // ---------------------------------------------------------- state machine
+  describe('state machine (G202)', () => {
+    it('mengizinkan transisi legal REQUESTED → SELLER_REVIEW', () => {
+      expect(isLegalReturnTransition('REQUESTED', 'SELLER_REVIEW')).toBe(true);
+    });
+
+    it('menolak transisi ilegal REQUESTED → RECEIVED', () => {
+      expect(isLegalReturnTransition('REQUESTED', 'RECEIVED')).toBe(false);
+    });
+
+    it('assertLegalReturnTransition melempar dengan kode RETURN_INVALID_TRANSITION', () => {
+      try {
+        assertLegalReturnTransition('APPROVED', 'REQUESTED');
+        fail('seharusnya melempar');
+      } catch (err) {
+        expect(err).toBeInstanceOf(BadRequestException);
+        const res = (err as BadRequestException).getResponse() as Record<string, unknown>;
+        expect((res.details as Record<string, unknown>).transitionCode).toBe(RETURN_INVALID_TRANSITION);
+      }
+    });
+
+    it('status terminal tidak punya transisi keluar', () => {
+      for (const s of TERMINAL_RETURN_STATUSES) {
+        expect(isLegalReturnTransition(s, 'ESCALATED')).toBe(false);
+        expect(isLegalReturnTransition(s, 'REQUESTED')).toBe(false);
+      }
+    });
+
+    it('REJECTED hanya bisa ke ESCALATED', () => {
+      expect(isLegalReturnTransition('REJECTED', 'ESCALATED')).toBe(true);
+      expect(isLegalReturnTransition('REJECTED', 'APPROVED')).toBe(false);
+      expect(isLegalReturnTransition('REJECTED', 'CANCELLED')).toBe(false);
+    });
+
+    it('ACTIVE_RETURN_STATUSES mencakup status berjalan, bukan terminal', () => {
+      expect(ACTIVE_RETURN_STATUSES.has('REQUESTED')).toBe(true);
+      expect(ACTIVE_RETURN_STATUSES.has('RECEIVED')).toBe(true);
+      expect(ACTIVE_RETURN_STATUSES.has('CANCELLED')).toBe(false);
+      expect(ACTIVE_RETURN_STATUSES.has('RESOLVED_REFUND')).toBe(false);
+      expect(ACTIVE_RETURN_STATUSES.has('ESCALATED')).toBe(false);
+    });
+  });
+
+  // ------------------------------------------------------- guard di service
+  describe('guard transisi di service', () => {
+    it('sellerStartReview: REQUESTED → SELLER_REVIEW (legal)', async () => {
+      delegates.returnRequest.findUnique.mockResolvedValue(baseReturn({ status: 'REQUESTED' }));
+      delegates.returnRequest.updateMany.mockResolvedValue({ count: 1 });
+      // mustFind kedua (setelah update) mengembalikan status baru
+      delegates.returnRequest.findUnique.mockResolvedValueOnce(baseReturn({ status: 'REQUESTED' }))
+        .mockResolvedValueOnce(baseReturn({ status: 'SELLER_REVIEW' }));
+
+      const out = await service.sellerStartReview('ret-db-1', 'seller-1');
+      expect(out.status).toBe('SELLER_REVIEW');
+      expect(delegates.returnRequest.updateMany).toHaveBeenCalledTimes(1);
+    });
+
+    it('sellerStartReview pada status RECEIVED ditolak (ilegal)', async () => {
+      delegates.returnRequest.findUnique.mockResolvedValue(baseReturn({ status: 'RECEIVED' }));
+
+      await expect(service.sellerStartReview('ret-db-1', 'seller-1'))
+        .rejects.toBeInstanceOf(BadRequestException);
+      expect(delegates.returnRequest.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('transisi konkuren (updateMany count=0) melempar konflik', async () => {
+      delegates.returnRequest.findUnique.mockResolvedValue(baseReturn({ status: 'REQUESTED' }));
+      delegates.returnRequest.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(service.sellerStartReview('ret-db-1', 'seller-1'))
+        .rejects.toBeInstanceOf(ConflictException);
+    });
+  });
+
+  // ------------------------------------------- idempotensi approval (G210)
+  describe('idempotensi approval refund (G210)', () => {
+    const approvalInput = (ret: ReturnRequestRow) => ({
+      returnRequest: ret,
+      amountSen: BigInt(150000),
+      approvedBy: 'seller-1',
+      approvedByRole: 'SELLER' as const,
+      maxRefundSen: BigInt(200000),
+    });
+
+    it('2x createApproval → 1 record (panggilan kedua mengembalikan existing)', async () => {
+      const created = {
+        id: 'appr-1', returnRequestId: 'ret-db-1', idempotencyKey: 'RTN-APPR-RTN-20260926-0001',
+        amount: BigInt(150000), status: 'PENDING', approvedBy: 'seller-1',
+        approvedByRole: 'SELLER', approvedAt: new Date(), executedAt: null,
+        failureReason: null, walletTxIds: [],
+      };
+      delegates.returnRefundApproval.findUnique
+        .mockResolvedValueOnce(null)      // panggilan 1: belum ada
+        .mockResolvedValueOnce(created);  // panggilan 2: sudah ada
+      delegates.returnRefundApproval.create.mockResolvedValue(created);
+
+      const ret = baseReturn();
+      const first = await refundService.createApproval(approvalInput(ret));
+      const second = await refundService.createApproval(approvalInput(ret));
+
+      expect(first.id).toBe('appr-1');
+      expect(second.id).toBe('appr-1');
+      expect(delegates.returnRefundApproval.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('nominal nol / negatif ditolak', async () => {
+      await expect(refundService.createApproval({
+        ...approvalInput(baseReturn()),
+        amountSen: BigInt(0),
+      })).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('nominal melebihi pagu ditolak', async () => {
+      await expect(refundService.createApproval({
+        ...approvalInput(baseReturn()),
+        amountSen: BigInt(999999),
+      })).rejects.toBeInstanceOf(BadRequestException);
+    });
+  });
+
+  // ------------------------------------------- idempotensi eksekusi (G211)
+  describe('idempotensi eksekusi refund (G211): 2x resolve → 1 eksekusi ledger', () => {
+    const received = () => baseReturn({
+      status: 'RECEIVED',
+      resolutionType: 'REFUND',
+      refundAmount: BigInt(150000),
+    });
+    const pendingApproval = () => ({
+      id: 'appr-1', returnRequestId: 'ret-db-1', idempotencyKey: 'RTN-APPR-RTN-20260926-0001',
+      amount: BigInt(150000), status: 'PENDING', approvedBy: 'seller-1',
+      approvedByRole: 'SELLER', approvedAt: new Date(), executedAt: null,
+      failureReason: null, walletTxIds: [],
+    });
+    const executedApproval = () => ({ ...pendingApproval(), status: 'EXECUTED', executedAt: new Date() });
+
+    function mockLedgerSuccess() {
+      walletDelegate.findFirst
+        .mockResolvedValueOnce({ id: 'wallet-seller' })
+        .mockResolvedValueOnce({ id: 'wallet-buyer' });
+      const tx = {
+        $queryRaw: jest.fn().mockResolvedValue([]),
+        wallet: {
+          findUnique: jest.fn().mockImplementation(({ where }: { where: { id: string } }) => Promise.resolve({
+            id: where.id, version: 3, isLocked: false, availableBalance: BigInt(500000),
+          })),
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
+        walletTransaction: { create: jest.fn().mockResolvedValue({}) },
+      };
+      (prisma.$transaction as MockFn).mockImplementation(async (cb: (t: unknown) => Promise<unknown>) => cb(tx));
+      delegates.returnRefundApproval.update.mockResolvedValue({});
+    }
+
+    it('resolveReturn 2x: eksekusi ledger tepat 1x', async () => {
+      delegates.returnRequest.findUnique.mockResolvedValue(received());
+      delegates.returnPolicy.findFirst.mockResolvedValue(null); // default policy
+      // panggilan 1: approval PENDING → klaim sukses → eksekusi
+      // panggilan 2: approval sudah EXECUTED → lewati eksekusi
+      delegates.returnRefundApproval.findUnique
+        .mockResolvedValueOnce(pendingApproval())
+        .mockResolvedValue(executedApproval());
+      delegates.returnRefundApproval.updateMany.mockResolvedValue({ count: 1 });
+      delegates.returnRequest.updateMany.mockResolvedValue({ count: 1 });
+      mockLedgerSuccess();
+      const executeSpy = jest.spyOn(refundService, 'executeLedgerRefund');
+
+      await service.resolveReturn('ret-db-1', 'seller-1', 'SELLER', 'REFUND');
+      await service.resolveReturn('ret-db-1', 'seller-1', 'SELLER', 'REFUND');
+
+      expect(executeSpy).toHaveBeenCalledTimes(1);
+      expect(delegates.returnRefundApproval.updateMany).toHaveBeenCalledTimes(1); // klaim atomik 1x
+      executeSpy.mockRestore();
+    });
+
+    it('claimExecution: klaim kedua gagal (false) — tidak ada eksekusi ganda', async () => {
+      delegates.returnRefundApproval.updateMany
+        .mockResolvedValueOnce({ count: 1 })
+        .mockResolvedValueOnce({ count: 0 });
+
+      expect(await refundService.claimExecution('appr-1')).toBe(true);
+      expect(await refundService.claimExecution('appr-1')).toBe(false);
+    });
+  });
+
+  // ------------------------------------------------- pengajuan ganda (G218)
+  describe('cegah pengajuan ganda (G218)', () => {
+    const eligibleOk = {
+      eligible: true, reason: null, submitDeadline: new Date(Date.now() + 86_400_000),
+      returnWindowDays: 7, orderPublicId: 'ORD-20260926-0001',
+    };
+
+    it('pengajuan kedua saat case aktif → ConflictException RETURN_DUPLICATE', async () => {
+      jest.spyOn(service, 'getEligibility').mockResolvedValue(eligibleOk);
+      orderDelegate.findFirst.mockResolvedValue({
+        id: 'order-db-1', orderId: 'ORD-20260926-0001', buyerId: 'buyer-1',
+        sellerId: 'seller-1', status: 'COMPLETED', orderType: 'PHYSICAL_GOODS',
+        completedAt: new Date(), buyerPayAmount: BigInt(200000),
+      });
+      delegates.returnPolicy.findFirst.mockResolvedValue(null);
+      // cek duplikat di createReturn menemukan case aktif
+      delegates.returnRequest.findFirst.mockResolvedValue(baseReturn({ status: 'SELLER_REVIEW' }));
+
+      try {
+        await service.createReturn('buyer-1', {
+          orderId: 'ORD-20260926-0001',
+          reasonCode: 'BARANG_RUSAK',
+        } as never);
+        fail('seharusnya melempar ConflictException');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ConflictException);
+        const res = (err as ConflictException).getResponse() as Record<string, unknown>;
+        expect(res.code).toBe(RETURN_DUPLICATE);
+      }
+      expect(delegates.returnRequest.create).not.toHaveBeenCalled();
+    });
+
+    it('race konkuren (unique violation P2002) → ConflictException RETURN_DUPLICATE', async () => {
+      jest.spyOn(service, 'getEligibility').mockResolvedValue(eligibleOk);
+      orderDelegate.findFirst.mockResolvedValue({
+        id: 'order-db-1', orderId: 'ORD-20260926-0001', buyerId: 'buyer-1',
+        sellerId: 'seller-1', status: 'COMPLETED', orderType: 'PHYSICAL_GOODS',
+        completedAt: new Date(), buyerPayAmount: BigInt(200000),
+      });
+      delegates.returnPolicy.findFirst.mockResolvedValue(null);
+      delegates.returnRequest.findFirst.mockResolvedValue(null); // lolos cek aplikasi
+      const p2002 = Object.assign(new Error('Unique constraint failed'), { code: 'P2002' });
+      delegates.returnRequest.create.mockRejectedValue(p2002); // backstop DB menang
+
+      try {
+        await service.createReturn('buyer-1', {
+          orderId: 'ORD-20260926-0001',
+          reasonCode: 'BARANG_RUSAK',
+        } as never);
+        fail('seharusnya melempar ConflictException');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ConflictException);
+        const res = (err as ConflictException).getResponse() as Record<string, unknown>;
+        expect(res.code).toBe(RETURN_DUPLICATE);
+      }
+    });
+  });
+});

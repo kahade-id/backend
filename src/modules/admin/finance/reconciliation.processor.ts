@@ -2,6 +2,7 @@ import { Processor, Process, OnQueueFailed, OnQueueCompleted } from '@nestjs/bul
 import { Injectable, Logger } from '@nestjs/common';
 import { Job } from 'bull';
 import { ReconciliationService, ReconciliationResult } from './reconciliation.service';
+import { ReconciliationFindingsService, URGENT_INVARIANT } from './reconciliation-findings.service';
 
 export const RECONCILIATION_QUEUE = 'reconciliation';
 
@@ -15,7 +16,10 @@ export interface ReconciliationJobData {
 export class ReconciliationProcessor {
   private readonly logger = new Logger(ReconciliationProcessor.name);
 
-  constructor(private readonly reconciliationService: ReconciliationService) {}
+  constructor(
+    private readonly reconciliationService: ReconciliationService,
+    private readonly findingsService: ReconciliationFindingsService,
+  ) {}
 
   @Process({ name: 'reconcile-all', concurrency: 1 })
   async handleReconcileAll(job: Job<ReconciliationJobData>): Promise<ReconciliationResult> {
@@ -25,6 +29,28 @@ export class ReconciliationProcessor {
       `Reconcile-all job ${job.id} complete: ${result.walletsChecked} wallets, ` +
       `${result.discrepancies.length} discrepancies`,
     );
+
+    // E3: selisih → temuan (dedup) + snapshot batch yang immutable.
+    const batchId = String(job.id ?? `batch-${Date.now()}`);
+    let urgentCount = 0;
+    try {
+      const created = await this.findingsService.recordFromDiscrepancies(
+        result.discrepancies,
+        batchId,
+        job.data.requestedBy,
+      );
+      urgentCount = created.filter((f) => f.violatedInvariants.includes(URGENT_INVARIANT)).length;
+      await this.reconciliationService.recordBatchSnapshot(
+        batchId,
+        job.data.requestedBy,
+        job.data.requestedAt,
+        result,
+        urgentCount,
+      );
+    } catch (err) {
+      // Snapshot/temuan gagal tidak boleh menggagalkan hasil rekonsiliasi.
+      this.logger.error(`Failed to persist reconcile-all batch snapshot: ${(err as Error).message}`, (err as Error).stack);
+    }
     return result;
   }
 

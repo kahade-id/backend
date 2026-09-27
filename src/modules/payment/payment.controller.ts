@@ -16,6 +16,7 @@ import { Throttle } from '@nestjs/throttler';
 import { PaymentService } from './payment.service';
 import { MidtransNotificationDto } from './dto/midtrans-notification.dto';
 import * as ErrorCodes from '../../common/constants/error-codes';
+import { withSpan } from '../../common/tracing/tracing';
 
 @ApiTags('payments')
 @Controller('payments')
@@ -57,9 +58,26 @@ export class PaymentController {
     // PAY-014: req.ip respects Express 'trust proxy' setting (configured in main.ts
     // via TRUSTED_PROXY_CIDR) which correctly parses X-Forwarded-For from trusted proxies.
     const sourceIp = req.ip || req.socket?.remoteAddress || '';
-    return this.paymentService.handleMidtransWebhook(
-      { ...body, ...notification } as MidtransNotificationDto,
-      sourceIp,
+    // G480: span payment.webhook — HANYA { provider, amount, currency, status,
+    // latencyMs }. Tanpa order_id mentah, tanpa payload mentah, tanpa IP.
+    return withSpan(
+      'payment.webhook',
+      (span) =>
+        this.paymentService
+          .handleMidtransWebhook(
+            { ...body, ...notification } as MidtransNotificationDto,
+            sourceIp,
+          )
+          .then((result) => {
+            span.setAttribute('status', 'ok');
+            return result;
+          }),
+      {
+        provider: 'midtrans',
+        amount: notification.gross_amount ?? 'unknown',
+        currency: (body['currency'] as string | undefined) ?? 'IDR',
+        status: notification.transaction_status ?? 'unknown',
+      },
     );
   }
 }

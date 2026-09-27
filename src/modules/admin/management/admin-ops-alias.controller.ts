@@ -13,7 +13,7 @@ import { ParseIdPipe } from '../../../common/pipes/parse-id.pipe';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
 import { Idempotency } from '../../../common/decorators/idempotency.decorator';
 import { Request } from 'express';
-import { AdminManagementController } from './admin-management.controller';
+import { AdminManagementService } from './admin-management.service';
 import { CreateEmergencyGrantDto } from './dto/emergency-grant.dto';
 import { CreateHandoffDto, HandoffQueryDto } from './dto/create-handoff.dto';
 
@@ -22,10 +22,9 @@ import { CreateHandoffDto, HandoffQueryDto } from './dto/create-handoff.dto';
  * yang dipakai admin web (src/lib/api/admin/management.ts).
  *
  * Route asli tetap hidup di `/v1/admin/management/...`; controller ini
- * hanya mendelegasikan ke AdminManagementController agar logika tidak
- * terduplikasi. Semua guard/decorator direplikasi 1:1 (SUPER_ADMIN,
- * throttle, idempotency) karena decorator pada controller target TIDAK
- * ikut dieksekusi saat method dipanggil langsung.
+ * mendelegasikan ke AdminManagementService (bukan ke controller lain —
+ * controller bukan provider sehingga tidak bisa di-inject). Semua
+ * guard/decorator direplikasi 1:1 (SUPER_ADMIN, throttle, idempotency).
  */
 @ApiTags('admin-ops')
 @ApiBearerAuth('access-token')
@@ -34,20 +33,20 @@ import { CreateHandoffDto, HandoffQueryDto } from './dto/create-handoff.dto';
 @AdminRoute()
 @Controller('admin')
 export class AdminOpsAliasController {
-  constructor(private readonly management: AdminManagementController) {}
+  constructor(private readonly service: AdminManagementService) {}
 
   @Get('emergency-grants')
   @ApiOperation({ summary: 'Daftar grant akses darurat (kontrak admin web)' })
   @ApiResponse({ status: 200, description: 'Emergency grants returned.' })
   listEmergencyGrantsWeb(@Query('activeOnly') activeOnly?: string): Promise<object> {
-    return this.management.listEmergencyGrantsWeb(activeOnly);
+    return this.service.listEmergencyGrants(activeOnly !== 'false' && activeOnly !== '0');
   }
 
   @Get('emergency-grants/active')
   @ApiOperation({ summary: 'Daftar grant akses darurat yang aktif' })
   @ApiResponse({ status: 200, description: 'Active emergency grants returned.' })
   listActiveEmergencyGrants(): Promise<object> {
-    return this.management.listEmergencyGrants();
+    return this.service.listActiveEmergencyGrants();
   }
 
   @Post('emergency-grants')
@@ -62,7 +61,7 @@ export class AdminOpsAliasController {
     @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<object> {
-    return this.management.createEmergencyGrant(dto, adminId, admin, req);
+    return this.service.createEmergencyGrant(dto, adminId, admin?.role ?? '', req.ip ?? '');
   }
 
   @Delete('emergency-grants/:id')
@@ -76,7 +75,7 @@ export class AdminOpsAliasController {
     @CurrentAdmin('sub') adminId: string,
     @Req() req: Request,
   ): Promise<{ message: string }> {
-    return this.management.revokeEmergencyGrantWeb(grantId, adminId, req);
+    return this.service.revokeEmergencyGrant(grantId, adminId, req.ip ?? '');
   }
 
   @Post('emergency-grants/:grantId/revoke')
@@ -91,14 +90,14 @@ export class AdminOpsAliasController {
     @CurrentAdmin('sub') adminId: string,
     @Req() req: Request,
   ): Promise<{ message: string }> {
-    return this.management.revokeEmergencyGrant(grantId, adminId, req);
+    return this.service.revokeEmergencyGrant(grantId, adminId, req.ip ?? '');
   }
 
   @Get('access-review')
   @ApiOperation({ summary: 'Review akses periodik (kontrak admin web)' })
   @ApiResponse({ status: 200, description: 'Access review list returned.' })
   accessReview(): Promise<object> {
-    return this.management.accessReview();
+    return this.service.accessReview();
   }
 
   @Post('access-review/:adminId/certify')
@@ -113,21 +112,21 @@ export class AdminOpsAliasController {
     @CurrentAdmin('sub') adminId: string,
     @Req() req: Request,
   ): Promise<object> {
-    return this.management.certifyAccessReview(targetId, adminId, req);
+    return this.service.markAccessReviewed(targetId, adminId, req.ip ?? '');
   }
 
   @Get('handoffs/workload')
   @ApiOperation({ summary: 'Beban kasus per petugas (kontrak admin web)' })
   @ApiResponse({ status: 200, description: 'Workload returned.' })
   handoffWorkload(): Promise<object> {
-    return this.management.handoffWorkload();
+    return this.service.handoffWorkload();
   }
 
   @Get('handoffs')
   @ApiOperation({ summary: 'Riwayat handoff satu kasus (kontrak admin web)' })
   @ApiResponse({ status: 200, description: 'Handoff history returned.' })
   listHandoffs(@Query() query: HandoffQueryDto): Promise<object> {
-    return this.management.listHandoffs(query);
+    return this.service.listHandoffsByCase(query);
   }
 
   @Post('handoffs')
@@ -140,6 +139,6 @@ export class AdminOpsAliasController {
     @CurrentAdmin('sub') adminId: string,
     @Req() req: Request,
   ): Promise<object> {
-    return this.management.createHandoff(dto, adminId, req);
+    return this.service.createHandoff(dto, adminId, req.ip ?? '');
   }
 }

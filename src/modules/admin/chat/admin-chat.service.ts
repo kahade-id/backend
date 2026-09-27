@@ -253,6 +253,46 @@ export class AdminChatService {
     return { userId, total: events.length, circumventionCount, events };
   }
 
+  /**
+   * ADM-115 — resolve room chat dari orderId publik untuk admin.
+   * Hanya mengembalikan room bertipe ORDER; room INQUIRY (DM pribadi)
+   * tidak pernah tertaut ke order sehingga tidak bisa bocor lewat sini.
+   * Akses isi pesan tetap lewat getRoomMessagesForAdmin yang melempar 403
+   * untuk non-ORDER (privasi DM terjaga).
+   */
+  async getRoomIdByOrder(orderId: string, adminId: string, ipAddress: string): Promise<object> {
+    const order = await this.prisma.order.findFirst({
+      where: { OR: [{ id: orderId }, { orderId }] },
+      select: { id: true, orderId: true },
+    });
+    if (!order) {
+      throw new NotFoundException({
+        code: ErrorCodes.NOT_FOUND,
+        message: 'Order not found',
+      });
+    }
+    const room = await this.prisma.chatRoom.findFirst({
+      where: { orderId: order.id, type: 'ORDER' },
+      select: { id: true },
+    });
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'Order',
+      targetId: order.orderId,
+      description: `Admin looked up chat room for order ${order.orderId}`,
+      after: { roomId: room?.id ?? null },
+      ipAddress,
+    });
+    if (!room) {
+      throw new NotFoundException({
+        code: ErrorCodes.NOT_FOUND,
+        message: 'No transaction chat room found for this order',
+      });
+    }
+    return { roomId: room.id, orderDbId: order.id, orderId: order.orderId };
+  }
+
   private pickEnum<T extends string>(value: string, allowed: readonly T[], label: string): T {
     const normalized = value.toUpperCase() as T;
     if (!allowed.includes(normalized)) {

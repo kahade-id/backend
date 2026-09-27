@@ -374,7 +374,7 @@ export class AdminSystemService {
   }
 
   async listAuditLogs(query: AuditLogQueryDto): Promise<object> {
-    const { page = 1, limit = 20, action, adminId, targetType, startDate, endDate } = query;
+    const { page = 1, limit = 20, action, adminId, targetType, targetId, startDate, endDate } = query;
     const safeLimit = Math.min(limit, 100);
     const safePage = Math.min(Math.max(page, 1), MAX_ADMIN_PAGE);
     const skip = (safePage - 1) * safeLimit;
@@ -391,6 +391,11 @@ export class AdminSystemService {
 
     if (targetType) {
       where.targetType = targetType;
+    }
+
+    // ADM-128: exact match pada targetId — jejak versi per entitas.
+    if (targetId) {
+      where.targetId = targetId;
     }
 
     if (startDate || endDate) {

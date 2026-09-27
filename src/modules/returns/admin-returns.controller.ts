@@ -37,6 +37,10 @@ export class AdminReturnsController {
 
   @Post(':id/action')
   @Idempotency()
+  // ADM-104: aksi uang (APPROVE → refund, FORCE_RESOLVE_* → tutup paksa)
+  // hanya boleh dilakukan SUPER_ADMIN / DISPUTE_ADMIN — CUSTOMER_SUPPORT
+  // sengaja dikecualikan walau guard level-class mengizinkannya.
+  @AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN')
   @ApiOperation({ summary: 'Aksi admin: approve / reject / escalate / force-resolve' })
   async act(
     @Param('id') id: string,

@@ -108,6 +108,22 @@ export class AdminChatController {
     return this.service.listUserModerationEvents(userId, limit);
   }
 
+  @Get('rooms/by-order/:orderId')
+  @ApiOperation({
+    summary: 'Resolve chat room from order ID',
+    description:
+      'ADM-115: returns the transaction chat room for an order so admins can open the conversation from the order detail. Only ORDER rooms are ever returned; DM rooms cannot leak through this path.',
+  })
+  @ApiResponse({ status: 200, description: 'Room resolved.' })
+  @ApiResponse({ status: 404, description: 'Order or room not found.' })
+  getRoomIdByOrder(
+    @Param('orderId', ParseIdPipe) orderId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.getRoomIdByOrder(orderId, admin.sub, req.ip || 'unknown');
+  }
+
   @Get('rooms/:roomId/messages')
   @ApiOperation({
     summary: 'Read a chat room as admin',

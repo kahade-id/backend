@@ -758,6 +758,9 @@ export class ReturnsService {
         });
       case 'ESCALATE':
         return this.escalateToDispute(returnDbId, adminId, 'ADMIN', dto.note);
+      case 'EXTEND_DEADLINE':
+        // ADM-114: tombol "+24 jam" kini punya implementasi backend.
+        return this.extendSellerDeadlineAsAdmin(ret, adminId);
       case 'FORCE_RESOLVE_REFUND':
       case 'FORCE_RESOLVE_EXCHANGE':
       case 'FORCE_RESOLVE_REPAIR': {
@@ -775,6 +778,82 @@ export class ReturnsService {
         return this.resolveReturn(current.id, adminId, 'ADMIN', outcome, dto.note ?? 'Force-resolve oleh admin.');
       }
     }
+  }
+
+  /**
+   * ADM-114 — perpanjangan deadline respons seller oleh admin (tombol "+24 jam").
+   *
+   * Fail-closed by design:
+   * - Hanya untuk status REQUESTED / SELLER_REVIEW yang masih punya
+   *   sellerRespondBy. Case terminal / tanpa deadline ditolak 400.
+   * - Setiap perpanjangan persis 24 jam; maksimal 3x per case. Hitungan
+   *   memakai ReturnTimeline (event ADMIN_EXTENDED_DEADLINE) sehingga tidak
+   *   butuh kolom/migrasi baru.
+   * - Tercatat di timeline audit (before/after) + notifikasi ke kedua pihak.
+   * - RBAC diwarisi dari act(): SUPER_ADMIN / DISPUTE_ADMIN (ADM-104).
+   *   Idempotency-Key dijamin controller (@Idempotency()).
+   */
+  private async extendSellerDeadlineAsAdmin(ret: ReturnRequestRow, adminId: string): Promise<ReturnRequestRow> {
+    const EXTEND_HOURS = 24;
+    const MAX_EXTENSIONS = 3;
+
+    if (!['REQUESTED', 'SELLER_REVIEW'].includes(ret.status as string)) {
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_STATUS,
+        message: `Deadline hanya dapat diperpanjang saat status REQUESTED/SELLER_REVIEW (saat ini: ${ret.status}).`,
+      });
+    }
+    if (!ret.sellerRespondBy) {
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_STATUS,
+        message: 'Case ini tidak memiliki deadline respons seller.',
+      });
+    }
+
+    const priorExtensions = await this.db().returnTimeline.count({
+      where: { returnRequestId: ret.id, event: 'ADMIN_EXTENDED_DEADLINE' },
+    });
+    if (priorExtensions >= MAX_EXTENSIONS) {
+      throw new BadRequestException({
+        code: ErrorCodes.EXTENSION_LIMIT_REACHED,
+        message: `Batas perpanjangan tercapai (${MAX_EXTENSIONS}x). Eskalasi case ini bila butuh waktu lebih.`,
+      });
+    }
+
+    const previousDeadline = new Date(ret.sellerRespondBy);
+    const newDeadline = new Date(previousDeadline.getTime() + EXTEND_HOURS * 3_600_000);
+    const updated = await this.db().returnRequest.update({
+      where: { id: ret.id },
+      data: { sellerRespondBy: newDeadline },
+    });
+
+    await this.logTimeline(ret.id, 'ADMIN_EXTENDED_DEADLINE', {
+      from: ret.status as never,
+      to: ret.status as never,
+      actorId: adminId,
+      actorRole: 'ADMIN',
+      metadata: {
+        previousDeadline: previousDeadline.toISOString(),
+        newDeadline: newDeadline.toISOString(),
+        extensionHours: EXTEND_HOURS,
+        extensionNumber: priorExtensions + 1,
+        maxExtensions: MAX_EXTENSIONS,
+      },
+    });
+
+    this.notify.notifyBoth(
+      ret.buyerId,
+      ret.sellerId,
+      'RETURN_DEADLINE_EXTENDED',
+      `Deadline respons retur ${ret.returnId} diperpanjang`,
+      `Batas respons penjual untuk retur ${ret.returnId} diperpanjang 24 jam oleh admin (hingga ${this.formatWib(newDeadline)}).`,
+      `Deadline respons retur ${ret.returnId} diperpanjang`,
+      `Batas waktu respons Anda untuk retur ${ret.returnId} diperpanjang 24 jam oleh admin (hingga ${this.formatWib(newDeadline)}).`,
+      ret.id,
+      ret.returnId,
+    ).catch((e) => this.logger.warn(`notif extend-deadline gagal: ${(e as Error).message}`));
+
+    return updated as ReturnRequestRow;
   }
 
   // --------------------------------------------------------------- cron hooks

@@ -9,6 +9,7 @@ import { Request } from 'express';
 import { AdminJwtPayload } from '../../../common/types/jwt-payload.types';
 import { AdminDisputesService } from './admin-disputes.service';
 import { DisputeDecisionDto } from './dispute-decision.dto';
+import { ResolvePreviewQueryDto } from './dto/resolve-preview-query.dto';
 import { DisputeListQueryDto } from './dto/dispute-list-query.dto';
 import { AssignDisputeDto } from './dto/assign-dispute.dto';
 import { SendDisputeMessageDto } from './dto/send-dispute-message.dto';
@@ -119,6 +120,22 @@ export class AdminDisputesController {
   @ApiResponse({ status: 404, description: 'Dispute not found.' })
   markUnderReview(@Param('disputeId', ParseIdPipe) disputeId: string, @CurrentAdmin() admin: AdminJwtPayload, @Req() req: Request): Promise<object> {
     return this.service.markUnderReview(disputeId, admin.sub, req.ip || 'unknown');
+  }
+
+  // ADM-109 (audit-fix): pratinjau nominal read-only SEBELUM eksekusi resolve.
+  // GET tanpa mutasi sehingga tidak perlu Idempotency-Key; guard status sama
+  // dengan resolve agar angka yang ditampilkan pasti bisa dieksekusi.
+  @Get(':disputeId/resolve/preview')
+  @AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN')
+  @ApiOperation({ summary: 'Preview disbursement amounts before resolving', description: 'ADM-109: returns buyer/seller/platform amounts for a proposed decision without mutating anything. Dispute must be in UNDER_REVIEW or ESCALATED status.' })
+  @ApiResponse({ status: 200, description: 'Preview returned.' })
+  @ApiResponse({ status: 400, description: 'Invalid status or split percentages do not sum to 100.' })
+  @ApiResponse({ status: 404, description: 'Dispute not found.' })
+  previewResolve(
+    @Param('disputeId', ParseIdPipe) disputeId: string,
+    @Query() query: ResolvePreviewQueryDto,
+  ): Promise<object> {
+    return this.service.previewResolveDispute(disputeId, query);
   }
 
   // B-32 (audit-fix): resolve mutates wallet balances and MUST be idempotent

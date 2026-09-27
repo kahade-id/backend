@@ -230,6 +230,125 @@ export class AdminDisputesService {
     };
   }
 
+  /**
+   * ADM-109 — SATU sumber kebenaran komputasi pembagian dana putusan sengketa.
+   * Dipakai resolveDispute (eksekusi) dan previewResolveDispute (pratinjau).
+   * Perilaku keuangan TIDAK berubah: logika disalin verbatim dari resolve.
+   */
+  private computeDisbursementAmounts(
+    order: { buyerPayAmount: bigint; sellerReceiveAmount: bigint; completedAt: Date | null },
+    decision: 'FULL_BUYER' | 'FULL_SELLER' | 'SPLIT',
+    buyerPercent: number | undefined,
+    sellerPercent: number | undefined,
+  ): {
+    buyerAmount: bigint;
+    sellerAmount: bigint;
+    platformRetainAmount: bigint;
+    escrowedAmount: bigint;
+    platformFee: bigint;
+    totalDisbursement: bigint;
+    isPostCompletionDispute: boolean;
+  } {
+    const isPostCompletionDispute = order.completedAt !== null;
+    const sellerReceiveAmount = order.sellerReceiveAmount;
+
+    const escrowedAmount = isPostCompletionDispute
+      ? sellerReceiveAmount
+      : order.buyerPayAmount;
+    const platformFee = isPostCompletionDispute
+      ? BigInt(0)
+      : order.buyerPayAmount - sellerReceiveAmount;
+
+    if (escrowedAmount <= BigInt(0)) {
+      throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'No escrowed funds available for dispute resolution' });
+    }
+
+    let buyerAmount: bigint;
+    let sellerAmount: bigint;
+    let platformRetainAmount: bigint;
+
+    // Kebijakan platform fee saat putusan FULL_BUYER (lihat
+    // DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE di app.constants.ts):
+    // - false (default, perilaku saat ini): platform menahan fee — pembeli
+    //   menerima sellerReceiveAmount (nilai order), fee tidak ikut refund.
+    // - true (rekomendasi, perlu keputusan produk): fee ikut refund — pembeli
+    //   menerima buyerPayAmount penuh (escrowedAmount) saat transaksi batal
+    //   total; platform tidak menahan fee untuk order ini.
+    // Catatan: untuk sengketa pasca-completion, platformFee selalu 0 sehingga
+    // kedua cabang identik.
+    if (decision === 'FULL_BUYER') {
+      if (DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE) {
+        buyerAmount = escrowedAmount;
+        sellerAmount = BigInt(0);
+        platformRetainAmount = BigInt(0);
+      } else {
+        buyerAmount = sellerReceiveAmount;
+        sellerAmount = BigInt(0);
+        platformRetainAmount = platformFee;
+      }
+    } else if (decision === 'FULL_SELLER') {
+      buyerAmount = BigInt(0);
+      sellerAmount = sellerReceiveAmount;
+      platformRetainAmount = platformFee;
+    } else {
+      buyerAmount = (sellerReceiveAmount * BigInt(buyerPercent!)) / BigInt(100);
+      sellerAmount = sellerReceiveAmount - buyerAmount;
+      platformRetainAmount = platformFee;
+    }
+
+    const totalDisbursement = buyerAmount + sellerAmount + platformRetainAmount;
+    if (totalDisbursement > escrowedAmount) {
+      throw new BadRequestException({
+        code: ErrorCodes.DISPUTE_AMOUNT_EXCEEDS_ESCROW,
+        message: `Total disbursement (${totalDisbursement}) exceeds escrowed amount (${escrowedAmount})`,
+      });
+    }
+
+    return { buyerAmount, sellerAmount, platformRetainAmount, escrowedAmount, platformFee, totalDisbursement, isPostCompletionDispute };
+  }
+
+  /**
+   * ADM-109 — pratinjau nominal SEBELUM eksekusi resolve. Read-only: tidak ada
+   * mutasi, tidak ada alokasi serial wallet. Guard status sama dengan resolve
+   * agar angka yang ditampilkan pasti bisa dieksekusi.
+   */
+  async previewResolveDispute(
+    disputeId: string,
+    query: { decision: 'FULL_BUYER' | 'FULL_SELLER' | 'SPLIT'; buyerPercent?: number; sellerPercent?: number },
+  ): Promise<object> {
+    validateSplitPercents(query as DisputeDecisionDto);
+
+    const dispute = await this.prisma.dispute.findFirst({
+      where: { OR: [{ id: disputeId }, { disputeId }] },
+      include: { order: true },
+    });
+    if (!dispute) throw new NotFoundException({ code: ErrorCodes.DISPUTE_NOT_FOUND, message: 'Dispute not found' });
+
+    const resolvableStatuses: string[] = ['UNDER_REVIEW', 'ESCALATED'];
+    if (!resolvableStatuses.includes(dispute.status as string)) {
+      throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: `Dispute must be in UNDER_REVIEW or ESCALATED status to resolve (current: ${dispute.status})` });
+    }
+
+    const amounts = this.computeDisbursementAmounts(dispute.order, query.decision, query.buyerPercent, query.sellerPercent);
+    return {
+      disputeId: dispute.disputeId,
+      orderId: dispute.order.orderId,
+      decision: query.decision,
+      buyerPercent: query.buyerPercent ?? null,
+      sellerPercent: query.sellerPercent ?? null,
+      buyerAmount: toIdr(amounts.buyerAmount),
+      sellerAmount: toIdr(amounts.sellerAmount),
+      platformRetainAmount: toIdr(amounts.platformRetainAmount),
+      escrowedAmount: toIdr(amounts.escrowedAmount),
+      platformFee: toIdr(amounts.platformFee),
+      buyerAmountSen: amounts.buyerAmount.toString(),
+      sellerAmountSen: amounts.sellerAmount.toString(),
+      platformRetainAmountSen: amounts.platformRetainAmount.toString(),
+      isPostCompletionDispute: amounts.isPostCompletionDispute,
+      feePolicy: { fullBuyerRefundsPlatformFee: DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE },
+    };
+  }
+
   async resolveDispute(disputeId: string, adminId: string, dto: DisputeDecisionDto, ipAddress: string = 'internal'): Promise<object> {
     validateSplitPercents(dto);
 
@@ -251,60 +370,22 @@ export class AdminDisputesService {
       throw new ForbiddenException({ code: ErrorCodes.NOT_ASSIGNED_ADMIN, message: 'Only the assigned admin or a SUPER_ADMIN can resolve this dispute' });
     }
 
-    const isPostCompletionDispute = dispute.order.completedAt !== null;
-    const sellerReceiveAmount = dispute.order.sellerReceiveAmount;
-
-    const escrowedAmount = isPostCompletionDispute
-      ? sellerReceiveAmount
-      : dispute.order.buyerPayAmount;
-    const platformFee = isPostCompletionDispute
-      ? BigInt(0)
-      : dispute.order.buyerPayAmount - sellerReceiveAmount;
-
-    if (escrowedAmount <= BigInt(0)) {
-      throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'No escrowed funds available for dispute resolution' });
-    }
-
-    let buyerAmount: bigint;
-    let sellerAmount: bigint;
-    let platformRetainAmount: bigint;
-
-    // Kebijakan platform fee saat putusan FULL_BUYER (lihat
-    // DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE di app.constants.ts):
-    // - false (default, perilaku saat ini): platform menahan fee — pembeli
-    //   menerima sellerReceiveAmount (nilai order), fee tidak ikut refund.
-    // - true (rekomendasi, perlu keputusan produk): fee ikut refund — pembeli
-    //   menerima buyerPayAmount penuh (escrowedAmount) saat transaksi batal
-    //   total; platform tidak menahan fee untuk order ini.
-    // Catatan: untuk sengketa pasca-completion, platformFee selalu 0 sehingga
-    // kedua cabang identik.
-    if (dto.decision === 'FULL_BUYER') {
-      if (DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE) {
-        buyerAmount = escrowedAmount;
-        sellerAmount = BigInt(0);
-        platformRetainAmount = BigInt(0);
-      } else {
-        buyerAmount = sellerReceiveAmount;
-        sellerAmount = BigInt(0);
-        platformRetainAmount = platformFee;
-      }
-    } else if (dto.decision === 'FULL_SELLER') {
-      buyerAmount = BigInt(0);
-      sellerAmount = sellerReceiveAmount;
-      platformRetainAmount = platformFee;
-    } else {
-      buyerAmount = (sellerReceiveAmount * BigInt(dto.buyerPercent!)) / BigInt(100);
-      sellerAmount = sellerReceiveAmount - buyerAmount;
-      platformRetainAmount = platformFee;
-    }
-
-    const totalDisbursement = buyerAmount + sellerAmount + platformRetainAmount;
-    if (totalDisbursement > escrowedAmount) {
-      throw new BadRequestException({
-        code: ErrorCodes.DISPUTE_AMOUNT_EXCEEDS_ESCROW,
-        message: `Total disbursement (${totalDisbursement}) exceeds escrowed amount (${escrowedAmount})`,
-      });
-    }
+    // ADM-109: komputasi pembagian dana — satu-satunya sumber kebenaran untuk
+    // resolve & pratinjau. Jangan duplikasi logika ini di tempat lain.
+    const amounts = this.computeDisbursementAmounts(
+      dispute.order,
+      dto.decision,
+      dto.buyerPercent,
+      dto.sellerPercent,
+    );
+    const {
+      buyerAmount,
+      sellerAmount,
+      platformRetainAmount,
+      escrowedAmount,
+      totalDisbursement,
+      isPostCompletionDispute,
+    } = amounts;
 
     // Redis-backed wallet serials are not rolled back with PostgreSQL. Allocate
     // them before the transaction so a later retry/serialization recovery can

@@ -385,4 +385,71 @@ describe('ReturnsService (GAP-D retur)', () => {
       }
     });
   });
+
+  // --------------------------------- ADM-114: EXTEND_DEADLINE (+24 jam, fail-closed)
+  describe('adminAct EXTEND_DEADLINE (ADM-114)', () => {
+    const base = new Date('2026-09-27T10:00:00Z');
+
+    beforeEach(() => {
+      delegates.returnRequest.findUnique.mockResolvedValue(
+        baseReturn({ status: 'REQUESTED', sellerRespondBy: base }),
+      );
+      delegates.returnTimeline.count.mockResolvedValue(0);
+      delegates.returnRequest.update.mockImplementation(async (args: { data: Record<string, unknown> }) =>
+        baseReturn({ status: 'REQUESTED', sellerRespondBy: args.data.sellerRespondBy as Date }),
+      );
+    });
+
+    it('menambah tepat 24 jam ke sellerRespondBy + mencatat timeline + notifikasi', async () => {
+      const out = await service.adminAct('ret-db-1', 'admin-1', { action: 'EXTEND_DEADLINE' });
+      const expected = new Date(base.getTime() + 24 * 3_600_000);
+      expect(delegates.returnRequest.update).toHaveBeenCalledWith({
+        where: { id: 'ret-db-1' },
+        data: { sellerRespondBy: expected },
+      });
+      expect(out.sellerRespondBy).toEqual(expected);
+      expect(delegates.returnTimeline.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            event: 'ADMIN_EXTENDED_DEADLINE',
+            actorId: 'admin-1',
+            actorRole: 'ADMIN',
+          }),
+        }),
+      );
+      expect(notify.notifyBoth).toHaveBeenCalledWith(
+        'buyer-1', 'seller-1', 'RETURN_DEADLINE_EXTENDED',
+        expect.any(String), expect.any(String), expect.any(String), expect.any(String),
+        'ret-db-1', 'RTN-20260926-0001',
+      );
+    });
+
+    it('menolak bila status terminal (INVALID_STATUS) — fail closed', async () => {
+      delegates.returnRequest.findUnique.mockResolvedValue(
+        baseReturn({ status: 'RESOLVED_REFUND', sellerRespondBy: base }),
+      );
+      await expect(
+        service.adminAct('ret-db-1', 'admin-1', { action: 'EXTEND_DEADLINE' }),
+      ).rejects.toMatchObject({ response: expect.objectContaining({ code: 'INVALID_STATUS' }) });
+      expect(delegates.returnRequest.update).not.toHaveBeenCalled();
+    });
+
+    it('menolak bila sellerRespondBy null — fail closed', async () => {
+      delegates.returnRequest.findUnique.mockResolvedValue(
+        baseReturn({ status: 'REQUESTED', sellerRespondBy: null }),
+      );
+      await expect(
+        service.adminAct('ret-db-1', 'admin-1', { action: 'EXTEND_DEADLINE' }),
+      ).rejects.toMatchObject({ response: expect.objectContaining({ code: 'INVALID_STATUS' }) });
+      expect(delegates.returnRequest.update).not.toHaveBeenCalled();
+    });
+
+    it('menolak perpanjangan ke-4 (EXTENSION_LIMIT_REACHED) — cap 3x', async () => {
+      delegates.returnTimeline.count.mockResolvedValue(3);
+      await expect(
+        service.adminAct('ret-db-1', 'admin-1', { action: 'EXTEND_DEADLINE' }),
+      ).rejects.toMatchObject({ response: expect.objectContaining({ code: 'EXTENSION_LIMIT_REACHED' }) });
+      expect(delegates.returnRequest.update).not.toHaveBeenCalled();
+    });
+  });
 });

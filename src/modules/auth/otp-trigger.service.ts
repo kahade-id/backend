@@ -11,6 +11,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { OtpService } from './otp.service';
 import { OtpGatewayService } from './otp-gateway.service';
+import { OpsSettingsService } from '../ops-settings/ops-settings.service';
 import { TokenService } from './token.service';
 import { AuthLocationService } from './auth-location.service';
 import { hashPhoneNumber } from '../../common/utils/pii.util';
@@ -92,6 +93,7 @@ export class OtpTriggerService {
     private readonly tokenService: TokenService,
     private readonly locationService: AuthLocationService,
     private readonly config: ConfigService,
+    private readonly opsSettings: OpsSettingsService,
   ) {}
 
   // ── Pembuatan trigger ────────────────────────────────────────────
@@ -270,13 +272,15 @@ export class OtpTriggerService {
    * (return false di sini) agar webhook tanpa secret ditolak.
    */
   verifyWebhookSecret(provided?: string): boolean {
-    const expected = this.config.get<string>('FONNTE_WEBHOOK_SECRET');
+    // OPS: secret dibaca via OpsSettingsService (DB panel > .env) agar bisa
+    // diset dari admin panel tanpa SSH ke server.
+    const expected = this.opsSettings.getSecret('FONNTE_WEBHOOK_SECRET');
     if (!expected) {
       // Secret belum dikonfigurasi: izinkan dengan peringatan KERAS. Gate utama
       // tetap pencocokan refCode (48-bit, TTL 10 mnt) + nomor pengirim.
       this.logger.error(
         '[SECURITY] FONNTE_WEBHOOK_SECRET is not set — accepting Fonnte webhook without secret verification (fail-open). ' +
-          'ACTION REQUIRED: set FONNTE_WEBHOOK_SECRET in production .env and update the webhook URL in the Fonnte dashboard ' +
+          'ACTION REQUIRED: set FONNTE_WEBHOOK_SECRET via admin panel (Pengaturan Operasional) or production .env and update the webhook URL in the Fonnte dashboard ' +
           'to https://api.kahade.id/v1/auth/webhooks/fonnte?webhookSecret=<secret>, then switch verifyWebhookSecret to fail-closed (return false when !expected).',
       );
       return true;

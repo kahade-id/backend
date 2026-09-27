@@ -1,5 +1,6 @@
 import { Injectable, Logger, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { OpsSettingsService } from '../ops-settings/ops-settings.service';
 import { randomBytes } from 'crypto';
 import { recordDeliveryMetric } from '../observability/delivery-metrics.service';
 
@@ -65,7 +66,12 @@ class FonnteOtpProvider implements OtpProviderAdapter {
 
   constructor(
     private readonly logger: Logger,
-    private readonly token: string,
+    /**
+     * OPS: token dibaca via provider function (bukan string statis) agar
+     * rotasi token via admin panel langsung berlaku tanpa restart.
+     * Mengembalikan undefined bila token belum dikonfigurasi.
+     */
+    private readonly tokenProvider: () => string | undefined,
     endpoint?: string,
     private readonly countryCode: string = '62',
   ) {
@@ -106,6 +112,13 @@ class FonnteOtpProvider implements OtpProviderAdapter {
   }
 
   private async postTextMessage(target: string, message: string): Promise<OtpDeliveryResult> {
+    // OPS: token dibaca per pengiriman — rotasi via admin panel langsung berlaku.
+    // Fail-closed: tanpa token, pengiriman GAGAL eksplisit (bukan mock diam-diam).
+    const token = this.tokenProvider();
+    if (!token) {
+      this.logger.error('Fonnte token belum dikonfigurasi — pengiriman WhatsApp dibatalkan (fail-closed). Set FONNTE_API_TOKEN via admin panel (Pengaturan Operasional) atau .env.');
+      return { success: false, error: 'OTP_PROVIDER_NOT_CONFIGURED' };
+    }
     const body = new URLSearchParams({
       target,
       message,
@@ -117,7 +130,7 @@ class FonnteOtpProvider implements OtpProviderAdapter {
       res = await fetch(this.endpoint, {
         method: 'POST',
         headers: {
-          Authorization: this.token,
+          Authorization: token,
           'Content-Type': 'application/x-www-form-urlencoded',
         },
         body,
@@ -257,7 +270,10 @@ export class OtpGatewayService {
   private readonly provider: OtpProviderAdapter;
   private readonly providerName: OtpProviderName;
 
-  constructor(@Inject(ConfigService) private readonly config: ConfigService) {
+  constructor(
+    @Inject(ConfigService) private readonly config: ConfigService,
+    private readonly opsSettings: OpsSettingsService,
+  ) {
     const configuredProvider = (this.config.get<string>('OTP_PROVIDER') || 'mock').toLowerCase();
     const supportedProviders: OtpProviderName[] = ['mock', 'fonnte', 'twilio'];
     if (!supportedProviders.includes(configuredProvider as OtpProviderName) && this.isProductionRuntime()) {
@@ -347,11 +363,17 @@ export class OtpGatewayService {
   private buildProvider(name: OtpProviderName): OtpProviderAdapter {
     switch (name) {
       case 'fonnte': {
-        const token = this.config.get<string>('FONNTE_API_TOKEN');
-        if (!token) {
-          if (this.isProductionRuntime()) {
-            throw new Error('OTP_PROVIDER=fonnte requires FONNTE_API_TOKEN in production. Refusing to start with mock fallback.');
-          }
+        // OPS: token dibaca dinamis via OpsSettingsService (DB panel > .env).
+        // Boot TIDAK lagi throw bila token kosong — token bisa diprovisioning
+        // belakangan via admin panel. Pengiriman tanpa token gagal eksplisit
+        // (OTP_PROVIDER_NOT_CONFIGURED), bukan mock diam-diam.
+        const hasToken = () => !!this.opsSettings.getSecret('FONNTE_API_TOKEN');
+        if (!hasToken() && this.isProductionRuntime()) {
+          this.logger.error(
+            'OTP_PROVIDER=fonnte tetapi FONNTE_API_TOKEN belum diset — pengiriman WhatsApp akan GAGAL sampai token diset via admin panel (Pengaturan Operasional) atau .env.',
+          );
+        }
+        if (!hasToken() && !this.isProductionRuntime()) {
           this.logger.error(
             `OTP_PROVIDER=fonnte but FONNTE_API_TOKEN is not set — falling back to mock gateway. ` +
               `Real OTPs will NOT be delivered.`,
@@ -360,9 +382,9 @@ export class OtpGatewayService {
         }
         return new FonnteOtpProvider(
           this.logger,
-          token,
-          this.config.get<string>('FONNTE_API_URL') || undefined,
-          this.config.get<string>('FONNTE_COUNTRY_CODE') || '62',
+          () => this.opsSettings.getSecret('FONNTE_API_TOKEN'),
+          this.opsSettings.get('FONNTE_API_URL') || this.config.get<string>('FONNTE_API_URL') || undefined,
+          this.opsSettings.get('FONNTE_COUNTRY_CODE') || this.config.get<string>('FONNTE_COUNTRY_CODE') || '62',
         );
       }
       case 'twilio': {

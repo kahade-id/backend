@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { OtpTriggerService } from '../otp-trigger.service';
 import { OtpTriggerPurpose } from '../dto/otp-trigger.dto';
 import { initializeCrypto } from '../../../common/utils/crypto.util';
+import { OpsSettingsService } from '../../ops-settings/ops-settings.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { OtpService } from '../otp.service';
@@ -33,6 +34,12 @@ describe('OtpTriggerService', () => {
   const mockConfig = {
     get: jest.fn((key: string) => (key === 'FONNTE_WEBHOOK_SECRET' ? 'test-secret' : undefined)),
   };
+  // OPS: webhook secret kini dibaca via OpsSettingsService (DB panel > .env).
+  const mockOpsSettings = {
+    get: jest.fn((key: string) => (key === 'FONNTE_WEBHOOK_SECRET' ? 'test-secret' : undefined)),
+    getSecret: jest.fn((key: string) => (key === 'FONNTE_WEBHOOK_SECRET' ? 'test-secret' : undefined)),
+    has: jest.fn((key: string) => key === 'FONNTE_WEBHOOK_SECRET'),
+  };
 
   const baseDto = {
     phoneNumber: '081234567890',
@@ -52,12 +59,16 @@ describe('OtpTriggerService', () => {
         { provide: TokenService, useValue: {} },
         { provide: AuthLocationService, useValue: { logEvent: jest.fn() } },
         { provide: ConfigService, useValue: mockConfig },
+        { provide: OpsSettingsService, useValue: mockOpsSettings },
       ],
     }).compile();
 
     service = module.get<OtpTriggerService>(OtpTriggerService);
     jest.clearAllMocks();
     mockConfig.get.mockImplementation(
+      (key: string) => (key === 'FONNTE_WEBHOOK_SECRET' ? 'test-secret' : undefined),
+    );
+    mockOpsSettings.getSecret.mockImplementation(
       (key: string) => (key === 'FONNTE_WEBHOOK_SECRET' ? 'test-secret' : undefined),
     );
   });
@@ -105,6 +116,8 @@ describe('OtpTriggerService', () => {
 
     it('mengizinkan dengan peringatan bila secret server belum diset (fail-open terdokumentasi)', () => {
       mockConfig.get.mockReturnValue(undefined);
+      mockOpsSettings.getSecret.mockReturnValue(undefined);
+      mockOpsSettings.get.mockReturnValue(undefined);
       expect(service.verifyWebhookSecret('test-secret')).toBe(true);
       expect(service.verifyWebhookSecret(undefined)).toBe(true);
     });

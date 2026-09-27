@@ -19,6 +19,7 @@ import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
+import { OpsSettingsService } from '../ops-settings/ops-settings.service';
 
 export type DependencyStatus = 'ok' | 'degraded' | 'down';
 
@@ -36,6 +37,7 @@ export class DependenciesService {
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
     private readonly config: ConfigService,
+    private readonly opsSettings: OpsSettingsService,
   ) {}
 
   async getStatuses(): Promise<DependencyInfo[]> {
@@ -102,7 +104,7 @@ export class DependenciesService {
     const isProd = (process.env.NODE_ENV || 'development') === 'production';
     const tokenConfigured =
       provider === 'fonnte'
-        ? !!process.env.FONNTE_API_TOKEN
+        ? this.opsSettings.has('FONNTE_API_TOKEN')
         : provider === 'twilio'
           ? !!process.env.TWILIO_AUTH_TOKEN
           : true;

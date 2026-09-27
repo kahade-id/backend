@@ -42,6 +42,7 @@ import { VouchersModule } from './modules/vouchers/vouchers.module';
 import { SubscriptionsModule } from './modules/subscriptions/subscriptions.module';
 import { InsuranceModule } from './modules/insurance/insurance.module';
 import { SettingsModule } from './modules/settings/settings.module';
+import { OpsSettingsModule } from './modules/ops-settings/ops-settings.module';
 import { UploadModule } from './modules/upload/upload.module';
 import { PublicModule } from './modules/public/public.module';
 import { BadgesModule } from './modules/badges/badges.module';
@@ -162,6 +163,7 @@ const runtimeEnvFile = getRuntimeEnvFile();
     SubscriptionsModule,
     InsuranceModule,
     SettingsModule,
+    OpsSettingsModule,
     UploadModule,
     PublicModule,
     BadgesModule,

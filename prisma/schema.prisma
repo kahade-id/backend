@@ -5580,3 +5580,36 @@ model PartnerAuditLog {
   @@index([action])
   @@map("partner_audit_logs")
 }
+
+// === OPS: AppSetting — operational config manageable via admin panel ===
+// Hanya key operasional (token integrasi, flag) yang boleh dikelola.
+// Secret disimpan terenkripsi AES-GCM; boot secret & kunci kripto TETAP di .env
+// dan tidak masuk registry (lihat settings.registry.ts).
+model AppSetting {
+  key       String   @id @db.VarChar(128)
+  value     String   @db.Text // ciphertext bila isSecret=true
+  isSecret  Boolean  @default(true)
+  label     String?  @db.VarChar(255)
+  updatedBy String?  @db.VarChar(128)
+  version   Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("app_settings")
+}
+
+// Audit trail perubahan setting — hanya menyimpan petunjuk mask, TIDAK PERNAH
+// nilai secret utuh.
+model AppSettingAudit {
+  id        String   @id @default(cuid())
+  key       String   @db.VarChar(128)
+  action    String   @db.VarChar(32) // SET, TEST
+  changedBy String   @db.VarChar(128)
+  valueHint String?  @db.VarChar(64) // mis. "••••ab12" — mask, bukan secret
+  success   Boolean?
+  detail    String?  @db.Text
+  createdAt DateTime @default(now())
+
+  @@index([key, createdAt])
+  @@map("app_setting_audits")
+}

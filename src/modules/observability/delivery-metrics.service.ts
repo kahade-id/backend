@@ -23,6 +23,7 @@
  * Tidak ada payload pesan, nomor tujuan, atau isi email yang disimpan.
  */
 import { Injectable } from '@nestjs/common';
+import { OpsSettingsService } from '../ops-settings/ops-settings.service';
 
 export type DeliveryChannel = 'push' | 'email' | 'otp' | 'whatsapp';
 export type DeliveryStatus = 'sent' | 'failed' | 'skipped';
@@ -83,6 +84,8 @@ export function getDeliveryStats(): DeliveryStats[] {
 
 @Injectable()
 export class DeliveryMetricsService {
+  constructor(private readonly opsSettings: OpsSettingsService) {}
+
   record(channel: DeliveryChannel, provider: string, status: DeliveryStatus): void {
     recordDeliveryMetric(channel, provider, status);
   }
@@ -95,7 +98,7 @@ export class DeliveryMetricsService {
   getOtpProviderStatus(): { provider: string; tokenConfigured: boolean; production: boolean } {
     const provider = (process.env.OTP_PROVIDER || 'mock').toLowerCase();
     const tokenConfigured =
-      provider === 'fonnte' ? !!process.env.FONNTE_API_TOKEN
+      provider === 'fonnte' ? this.opsSettings.has('FONNTE_API_TOKEN')
       : provider === 'twilio' ? !!process.env.TWILIO_AUTH_TOKEN
       : true;
     return { provider, tokenConfigured, production: (process.env.NODE_ENV || 'development') === 'production' };

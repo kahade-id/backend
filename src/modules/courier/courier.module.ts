@@ -12,14 +12,16 @@ import { CourierAdminController } from './courier-admin.controller';
 import { CourierService } from './courier.service';
 import { CourierConfigService } from './courier.config';
 import { CourierRegistry } from './providers/courier-registry';
-import { MockCourierProvider } from './providers/mock-courier.provider';
 import { UploadModule } from '../upload/upload.module';
 import { QueueModule } from '../queue/queue.module';
 
 @Module({
   imports: [ConfigModule, UploadModule, QueueModule],
   controllers: [CourierController, CourierWebhookController, CourierAdminController],
-  providers: [CourierService, CourierConfigService, CourierRegistry, MockCourierProvider],
+  // NOTE: MockCourierProvider TIDAK didaftarkan di sini — ia di-instantiate
+  // manual oleh CourierRegistry via `new MockCourierProvider(code)` karena
+  // constructor-nya butuh argumen `code` (bukan dependency injection).
+  providers: [CourierService, CourierConfigService, CourierRegistry],
   exports: [CourierService, CourierRegistry],
 })
 export class CourierModule {}

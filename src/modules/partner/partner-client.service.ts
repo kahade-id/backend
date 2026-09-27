@@ -18,6 +18,7 @@ import {
 import {
   CreatePartnerClientDto,
   IssuePartnerKeyDto,
+  RotatePartnerKeyDto,
   RevokePartnerKeyDto,
   UpdatePartnerClientDto,
 } from './dto/partner.dto';
@@ -172,11 +173,13 @@ export class PartnerClientService {
     return { key, plaintext };
   }
 
-  /** Rotate: new key issued; old key stays valid for 24h overlap (G455). */
+  /** Rotate: new key issued; old key stays valid for 24h overlap (G455).
+   *  ADM-306: dto opsional — name/scopes/expiresAt yang kosong diwarisi dari
+   *  kunci lama, sehingga client boleh memanggil rotate tanpa body. */
   async rotateKey(
     clientId: string,
     keyId: string,
-    dto: IssuePartnerKeyDto,
+    dto: RotatePartnerKeyDto,
     adminId: string,
     ip: string,
   ): Promise<{ key: PartnerApiKeyRecord; plaintext: string }> {
@@ -191,7 +194,12 @@ export class PartnerClientService {
       throw new BadRequestException({ code: 'PARTNER_KEY_REVOKED', message: 'Key sudah di-revoke' });
     }
 
-    const { key: newKey, plaintext } = await this.issueKey(clientId, dto, adminId, ip);
+    const effective: IssuePartnerKeyDto = {
+      name: dto.name?.trim() || oldKey.name || 'rotated-key',
+      scopes: dto.scopes && dto.scopes.length > 0 ? dto.scopes : oldKey.scopes,
+      expiresAt: dto.expiresAt ?? (oldKey.expiresAt ? oldKey.expiresAt.toISOString() : undefined),
+    };
+    const { key: newKey, plaintext } = await this.issueKey(clientId, effective, adminId, ip);
     // Mark lineage + overlap window on the OLD key.
     const validUntil = new Date(Date.now() + PARTNER_KEY_ROTATION_OVERLAP_MS);
     await this.p.partnerApiKey.update({ where: { id: keyId }, data: { validUntil } });

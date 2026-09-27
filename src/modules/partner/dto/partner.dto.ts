@@ -92,6 +92,29 @@ export class RevokePartnerKeyDto {
   reason!: string;
 }
 
+/**
+ * ADM-306 — rotasi: semua field opsional; nilai yang tidak diisi diwarisi
+ * dari kunci lama (semantik rotasi: kunci baru = salinan kunci lama).
+ * Client admin memanggil rotate TANPA body.
+ */
+export class RotatePartnerKeyDto {
+  @IsString()
+  @IsOptional()
+  @MaxLength(80)
+  name?: string;
+
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(16)
+  @IsIn(PARTNER_SCOPES as unknown as string[], { each: true })
+  @IsOptional()
+  scopes?: string[];
+
+  @IsISO8601()
+  @IsOptional()
+  expiresAt?: string;
+}
+
 export class CreateWebhookEndpointDto {
   @IsString()
   @IsNotEmpty()

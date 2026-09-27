@@ -31,6 +31,7 @@ import {
   CreatePartnerClientDto,
   CreateWebhookEndpointDto,
   IssuePartnerKeyDto,
+  RotatePartnerKeyDto,
   RevokePartnerKeyDto,
   UpdatePartnerClientDto,
   UpdateWebhookEndpointDto,
@@ -67,12 +68,24 @@ export class AdminPartnerController {
   @Get(':id')
   @ApiOperation({ summary: 'Client detail: keys (redacted), endpoints, usage summary' })
   async getClient(@Param('id', ParseIdPipe) id: string) {
-    const [client, endpoints, usageSummary] = await Promise.all([
+    // ADM-304: kunci (teredaksi) diekspos eksplisit sebagai `keys` agar
+    // client admin tidak perlu mengorek nested object.
+    const [clientRow, endpoints, usageSummary] = await Promise.all([
       this.clients.getClient(id),
       this.webhooks.listEndpoints(id),
       this.usage.summary(id),
     ]);
-    return { client, endpoints, usage: usageSummary };
+    const row = clientRow as unknown as Record<string, unknown>;
+    const { keys, ...client } = row;
+    return { client, keys, endpoints, usage: usageSummary };
+  }
+
+  @Get(':id/keys')
+  @ApiOperation({ summary: 'List API keys for a client (redacted — no hashes/secrets)' })
+  async listKeys(@Param('id', ParseIdPipe) id: string) {
+    // ADM-304: endpoint daftar kunci eksplisit (ringkasan teredaksi).
+    const row = (await this.clients.getClient(id)) as unknown as Record<string, unknown>;
+    return { clientId: id, keys: row['keys'] ?? [] };
   }
 
   @Patch(':id')
@@ -109,11 +122,11 @@ export class AdminPartnerController {
 
   @Post(':id/keys/:keyId/rotate')
   @HttpCode(HttpStatus.CREATED)
-  @ApiOperation({ summary: 'Rotate key — new key issued, old key valid 24h overlap' })
+  @ApiOperation({ summary: 'Rotate key — new key issued, old key valid 24h overlap (body optional; inherited from old key)' })
   rotateKey(
     @Param('id', ParseIdPipe) id: string,
     @Param('keyId', ParseIdPipe) keyId: string,
-    @Body() dto: IssuePartnerKeyDto,
+    @Body() dto: RotatePartnerKeyDto,
     @CurrentAdmin('sub') adminId: string,
     @Req() req: Request,
   ) {

@@ -35,7 +35,9 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
     key: 'FONNTE_WEBHOOK_SECRET',
     label: 'Fonnte Webhook Secret',
     description:
-      'Secret verifikasi webhook Fonnte (parameter ?webhookSecret=). ' +
+      'Secret verifikasi webhook Fonnte. Kirim via header x-fonnte-secret ' +
+      '(disarankan) atau field body webhookSecret — JANGAN via query param ' +
+      '?webhookSecret= karena URL tercatat di nginx access log (SEC-003). ' +
       'Wajib diset untuk hardening produksi; kosong = fail-open (tidak aman).',
     isSecret: true,
     testable: false,

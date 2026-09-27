@@ -280,8 +280,10 @@ export class OtpTriggerService {
       // tetap pencocokan refCode (48-bit, TTL 10 mnt) + nomor pengirim.
       this.logger.error(
         '[SECURITY] FONNTE_WEBHOOK_SECRET is not set — accepting Fonnte webhook without secret verification (fail-open). ' +
-          'ACTION REQUIRED: set FONNTE_WEBHOOK_SECRET via admin panel (Pengaturan Operasional) or production .env and update the webhook URL in the Fonnte dashboard ' +
-          'to https://api.kahade.id/v1/auth/webhooks/fonnte?webhookSecret=<secret>, then switch verifyWebhookSecret to fail-closed (return false when !expected).',
+          'ACTION REQUIRED: set FONNTE_WEBHOOK_SECRET via admin panel (Pengaturan Operasional) or production .env. ' +
+          'Kirim secret via header x-fonnte-secret (disarankan) atau field body webhookSecret — JANGAN via query param ?webhookSecret= ' +
+          'karena URL tercatat di nginx access log (SEC-003). Webhook URL di dashboard Fonnte: https://api.kahade.id/v1/auth/webhooks/fonnte. ' +
+          'Then switch verifyWebhookSecret to fail-closed (return false when !expected).',
       );
       return true;
     }

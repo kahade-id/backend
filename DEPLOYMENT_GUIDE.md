@@ -11,7 +11,7 @@
 > kedua atau file environment kedua.
 
 > **Pola produksi legacy yang dipertahankan.** Semua secret tetap berada pada
-> `/var/www/kahade/.env`; file tersebut tidak pernah disalin ke checkout
+> `/var/www/kahade/apps/backend/.env`; file tersebut tidak pernah disalin ke checkout
 > release atau Git. Source rilis bersifat immutable di
 > `/var/www/kahade-release-<SHA>`, sementara PM2 selalu menjalankan symlink
 > `/var/www/kahade-current` melalui satu konfigurasi
@@ -390,8 +390,8 @@ ganti value development dengan value production — dan isi semua secret yang
 kosong dengan `openssl rand -hex 32`.
 
 ```bash
-cp .env.example /var/www/kahade/.env
-nano /var/www/kahade/.env
+cp .env.example /var/www/kahade/apps/backend/.env
+nano /var/www/kahade/apps/backend/.env
 ```
 
 **PENTING:** Setiap secret harus unik. Jangan gunakan value yang sama untuk key berbeda.
@@ -546,6 +546,14 @@ OTP_PROVIDER=fonnte
 # Kalau OTP_PROVIDER=fonnte — token wajib diisi:
 FONNTE_API_TOKEN=
 
+# ─── Fonnte Webhook Hardening (SEC-003) ──────────────────────────
+# URL webhook di dashboard Fonnte: https://api.kahade.id/v1/auth/webhooks/fonnte
+# JANGAN menempelkan secret di URL (?webhookSecret=...) — full URL tercatat
+# di nginx access log sehingga secret terekspos. Kirim secret via HEADER
+# `x-fonnte-secret` (disarankan) atau field body `webhookSecret`.
+# Set secret-nya di panel admin /ops-settings (FONNTE_WEBHOOK_SECRET) —
+# query param tetap didukung untuk kompatibilitas, tapi tidak disarankan.
+
 # Kalau OTP_PROVIDER=twilio — pakai ini sebagai gantinya (minimal salah satu
 # dari TWILIO_SMS_FROM / TWILIO_WHATSAPP_FROM harus diisi):
 # TWILIO_ACCOUNT_SID=
@@ -650,8 +658,8 @@ echo "DB_PASSWORD=$(openssl rand -hex 24)"
 ### 6.5 Secure the .env File
 
 ```bash
-chmod 600 /var/www/kahade/.env
-ls -la /var/www/kahade/.env
+chmod 600 /var/www/kahade/apps/backend/.env
+ls -la /var/www/kahade/apps/backend/.env
 # -rw------- 1 kahade kahade
 ```
 
@@ -720,7 +728,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         PORT: 3000,
-        RUNTIME_ENV_FILE: '/var/www/kahade/.env',
+        RUNTIME_ENV_FILE: '/var/www/kahade/apps/backend/.env',
       },
       kill_timeout: 30000,
       autorestart: true,
@@ -792,6 +800,15 @@ pm2 show kahade-api            # Detailed info
 ---
 
 ## 8. Nginx Reverse Proxy
+
+> **PERINGATAN DRIFT (SEC-505/SEC-511, 27 Sep 2026).** File `deploy/nginx.conf`
+> di repo ini **tidak identik** dengan konfigurasi nginx yang live di server
+> (nama upstream & zone berbeda, patch surgical live seperti prefix `/uploads/`
+> publik/privat dan header CSP `sandbox` belum tentu tercermin di repo, dan
+> tidak ada block untuk `admin.kahade.id` di repo). **Jangan replace config
+> live dengan file repo secara mentah** — sinkronkan manual per-block dan
+> selalu `nginx -t` sebelum reload. Sampai sinkronisasi selesai, config live
+> adalah yang kanonis.
 
 ### 8.1 Create Server Block (HTTP only — temporary)
 
@@ -1017,7 +1034,7 @@ sudo ufw status verbose
 ### 10.2 Verify NODE_ENV
 
 ```bash
-grep NODE_ENV /var/www/kahade/.env
+grep NODE_ENV /var/www/kahade/apps/backend/.env
 # Harus: NODE_ENV=production
 ```
 
@@ -1207,39 +1224,42 @@ Jika `SENTRY_DSN` di-set di `.env`, error tracking otomatis aktif untuk producti
 
 ## 12. Database Backup
 
-### 12.1 Automated Daily Backup
+> **SEC-306 (27 Sep 2026):** backup DB berisi seluruh PII user dalam plaintext
+> — **wajib terenkripsi**. Skrip kanonis: `scripts/backup-db.sh` di repo
+> (pg_dump → `gpg --symmetric --cipher-algo AES256`, output
+> `kahade_prod_<ts>.dump.gpg`). Passphrase dari file terpisah
+> (`KAHADE_BACKUP_PASSPHRASE_FILE`, chmod 600) — TIDAK hardcoded dan TIDAK
+> dari `.env` aplikasi. Runbook lengkap + langkah server manual:
+> [`docs/BACKUP-RUNBOOK.md`](./docs/BACKUP-RUNBOOK.md).
+
+### 12.1 Automated Daily Backup (terenkripsi)
 
 ```bash
 sudo mkdir -p /var/backups/kahade
 sudo chown kahade:kahade /var/backups/kahade
+sudo chmod 700 /var/backups/kahade
 
 sudo su - kahade
-cat > ~/backup-db.sh << 'SCRIPT'
-#!/bin/bash
-set -euo pipefail
 
-BACKUP_DIR="/var/backups/kahade"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-BACKUP_FILE="${BACKUP_DIR}/kahade_prod_${TIMESTAMP}.dump"
+# 1. Salin skrip backup terenkripsi dari rilis aktif ke home kahade.
+cp /var/www/kahade-current/scripts/backup-db.sh ~/backup-db.sh
+cp /var/www/kahade-current/scripts/backup-retention.sh ~/backup-retention.sh
+chmod +x ~/backup-db.sh ~/backup-retention.sh
 
-PGPASSWORD="PASSWORD_DB_ANDA" pg_dump \
-  -h 127.0.0.1 \
-  -U kahade_prod \
-  -d kahade_prod \
-  --no-owner \
-  --no-privileges \
-  --format=custom \
-  -f "${BACKUP_FILE}"
+# 2. Buat passphrase file (32 byte random, chmod 600) — JANGAN taruh di
+#    direktori yang sama dengan backup, dan JANGAN commit ke Git.
+openssl rand -base64 32 | tr -d '\n' > ~/.kahade-backup.passphrase
+chmod 600 ~/.kahade-backup.passphrase
 
-find "${BACKUP_DIR}" -name "kahade_prod_*.dump" -mtime +14 -delete
-
-echo "[$(date)] Backup: ${BACKUP_FILE} ($(du -h ${BACKUP_FILE} | cut -f1))"
-SCRIPT
-
-chmod +x ~/backup-db.sh
+# 3. Uji sekali secara manual SEBELUM mengandalkan cron (password DB
+#    dibaca dari env KAHADE_PG_BACKUP_PASSWORD).
+KAHADE_BACKUP_PASSPHRASE_FILE="$HOME/.kahade-backup.passphrase" \
+KAHADE_PG_BACKUP_PASSWORD='PASSWORD_DB_ANDA' \
+  ~/backup-db.sh
 ```
 
-> **Catatan:** `--format=custom` sudah mengompresi secara internal (zlib). Tidak perlu pipe ke `gzip`.
+> **Catatan:** `--format=custom` sudah mengompresi secara internal (zlib);
+> gpg hanya menambah lapisan enkripsi AES-256.
 
 ### 12.2 Add to Cron
 
@@ -1247,16 +1267,32 @@ chmod +x ~/backup-db.sh
 crontab -e
 ```
 
-```
-0 2 * * * /home/kahade/backup-db.sh >> /var/log/kahade/backup.log 2>&1
+```cron
+0 2 * * * KAHADE_BACKUP_PASSPHRASE_FILE=/home/kahade/.kahade-backup.passphrase KAHADE_PG_BACKUP_PASSWORD='PASSWORD_DB_ANDA' /home/kahade/backup-db.sh >> /var/log/kahade/backup.log 2>&1
 ```
 
-### 12.3 Restore dari Backup
+> Lihat `docs/BACKUP-RUNBOOK.md` §2 untuk cara menyimpan password DB
+> tanpa menuliskannya di crontab.
+
+### 12.3 Restore dari Backup Terenkripsi
 
 ```bash
-pg_restore -h 127.0.0.1 -U kahade_prod -d kahade_prod \
-  --clean --if-exists --no-owner \
-  /var/backups/kahade/kahade_prod_XXXXXXXX_XXXXXX.dump
+# Dekripsi ke pipe (tanpa file plaintext intermediate), lalu pg_restore:
+gpg --batch --quiet --pinentry-mode loopback \
+  --passphrase-file /home/kahade/.kahade-backup.passphrase \
+  --decrypt /var/backups/kahade/kahade_prod_XXXXXXXX_XXXXXX.dump.gpg \
+  | pg_restore --clean --if-exists --no-owner \
+      -h 127.0.0.1 -U kahade_prod -d kahade_prod
+```
+
+Untuk verifikasi berkala, pakai `scripts/verify-backup.sh` (mendukung
+`.dump.gpg`; me-restore ke DB temporer lalu `shred` file temp):
+
+```bash
+KAHADE_VERIFY_ADMIN_URL='<admin-url-server-verifikasi>' \
+KAHADE_BACKUP_PASSPHRASE_FILE=/home/kahade/.kahade-backup.passphrase \
+  /var/www/kahade-current/scripts/verify-backup.sh \
+  /var/backups/kahade/kahade_prod_XXXXXXXX_XXXXXX.dump.gpg
 ```
 
 ### 12.4 Upload ke S3 (Optional)
@@ -1305,7 +1341,7 @@ operator sebelum menjalankan `prisma migrate deploy`.
 
 Sebelum cutover, jalankan kandidat pada port loopback berbeda dengan
 `SMOKE_MODE=true`, `HOST=127.0.0.1`, dan `SMOKE_ENV_FILE` menunjuk ke satu file
-legacy `/var/www/kahade/.env`. Smoke mode tidak boleh memuat
+legacy `/var/www/kahade/apps/backend/.env`. Smoke mode tidak boleh memuat
 worker, scheduler, queue, WebSocket, atau route bisnis. Health harus `200`,
 route `/v1/orders` harus `404`, dan listener hanya boleh berada di loopback.
 
@@ -1872,7 +1908,7 @@ Perubahan berikut mempengaruhi deployment setelah audit. Pastikan sudah diterapk
 | FEE_DEDUCT audit trail | Audit balanceBefore/After akurat | Tidak perlu aksi — otomatis |
 
 **Upgrade dari versi sebelum audit:** tambahkan `WALLET_PIN_PEPPER` melalui
-editor aman pada satu file legacy `/var/www/kahade/.env`, lalu
+editor aman pada satu file legacy `/var/www/kahade/apps/backend/.env`, lalu
 gunakan prosedur immutable di Section 13. Jangan menambah environment variable
 melalui `echo`, jangan melakukan `git pull` pada runtime, dan jangan melakukan
 `pm2 reload` untuk memindahkan source release.

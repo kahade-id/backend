@@ -274,9 +274,15 @@ export class AuthController {
 
   /**
    * Webhook pesan masuk Fonnte. Diproteksi shared secret (bukan JWT user).
-   * Secret dapat dikirim via header `x-fonnte-secret`, field body
+   * Secret dapat dikirim via header `x-fonnte-secret` (DISARANKAN), field body
    * `webhookSecret`, atau query param `?webhookSecret=` (cara Fonnte
    * menempelkan secret di URL webhook dashboard).
+   *
+   * SEC-003: query param DIDUKUNG untuk kompatibilitas, tapi TIDAK DISARANKAN —
+   * full URL tercatat di nginx access log sehingga secret terekspos di log.
+   * Pakai header `x-fonnte-secret` atau field body bila dashboard Fonnte
+   * mendukungnya.
+   *
    * Selalu 200 — Fonnte me-retry bila respons non-2xx.
    */
   @Public()

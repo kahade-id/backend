@@ -35,7 +35,7 @@
    dipisah koma, mis. `PARTNER_EGRESS_ALLOWLIST=203.0.113.0/24,198.51.100.8/32`.
    Bila diset, hanya alamat dalam daftar yang boleh menjadi target webhook.
    Prosedur perubahan: ajukan ke tim platform → verifikasi kepemilikan CIDR
-   oleh mitra → update env di `/var/www/kahade/.env` → `pm2 reload kahade-api`
+   oleh mitra → update env di `/var/www/kahade/apps/backend/.env` → `pm2 reload kahade-api`
    → uji `webhook.test` → catat di `PartnerAuditLog` (`EGRESS_ALLOWLIST_UPDATED`).
 5. Redirect HTTP **tidak diikuti** oleh dispatcher webhook.
 

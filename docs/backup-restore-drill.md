@@ -10,7 +10,7 @@ bulan. Hasil drill dicatat di bawah (tanggal, pelaku, hasil, temuan).
 | PostgreSQL (semua tabel incl. `alert_events`, `incident_logs`) | `pg_dump` / snapshot volume | Harian | 30 hari |
 | Direktori upload `/var/www/kahade-storage` | snapshot/rsync | Harian | 30 hari |
 | Redis (cache & Bull) | RDB/AOF | Harian | 7 hari (cache — boleh hilang; antrean kritis harus drain dulu) |
-| `.env` produksi (`/var/www/kahade/.env`) | vault offline terenkripsi | Tiap perubahan | Versi |
+| `.env` produksi (`/var/www/kahade/apps/backend/.env`) | vault offline terenkripsi | Tiap perubahan | Versi |
 | Konfigurasi nginx | snapshot `/etc/nginx` | Tiap perubahan | Versi |
 
 Catatan: file lama di Cloudflare R2 adalah data legacy (tidak dimigrasi

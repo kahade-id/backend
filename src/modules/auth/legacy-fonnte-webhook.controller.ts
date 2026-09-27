@@ -32,6 +32,9 @@ export class LegacyFonnteWebhookController {
     @Req() req: Request,
   ): Promise<{ ok: true }> {
     const q = req.query as Record<string, unknown> | undefined;
+    // SEC-003: urutan preferensi header > body > query. Query param didukung
+    // untuk kompatibilitas (dashboard Fonnte menempelkan secret di URL), tapi
+    // TIDAK disarankan karena full URL tercatat di nginx access log.
     const secret =
       (req.headers['x-fonnte-secret'] as string | undefined) ??
       (typeof body.webhookSecret === 'string' ? body.webhookSecret : undefined) ??

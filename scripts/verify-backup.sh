@@ -24,8 +24,8 @@ if [ ! -f "$BACKUP_FILE" ]; then
 fi
 
 case "$BACKUP_FILE" in
-  *.sql.gz|*.dump|*.sql) ;;
-  *) echo "ERROR: Unsupported backup format; expected .sql.gz, .dump, or .sql: $BACKUP_FILE" >&2; exit 1 ;;
+  *.sql.gz|*.dump|*.dump.gpg|*.sql) ;;
+  *) echo "ERROR: Unsupported backup format; expected .sql.gz, .dump, .dump.gpg, or .sql: $BACKUP_FILE" >&2; exit 1 ;;
 esac
 
 # Milliseconds plus a cryptographically random suffix prevent collisions when
@@ -53,6 +53,17 @@ restore_sql() {
     gunzip -c -- "$BACKUP_FILE" | psql "$VERIFY_URL" --quiet -v ON_ERROR_STOP=1
   elif [[ "$BACKUP_FILE" == *.dump ]]; then
     pg_restore --exit-on-error --no-owner --no-privileges --dbname="$VERIFY_URL" -- "$BACKUP_FILE"
+  elif [[ "$BACKUP_FILE" == *.dump.gpg ]]; then
+    # SEC-306: backup terenkripsi — dekripsi ke file temp, restore, lalu
+    # hancurkan temp (shred) agar tidak ada plaintext sisa di disk.
+    : "${KAHADE_BACKUP_PASSPHRASE_FILE:?KAHADE_BACKUP_PASSPHRASE_FILE wajib di-set untuk backup terenkripsi}"
+    local tmp
+    tmp="$(mktemp /tmp/kahade-verify-XXXXXX.dump)"
+    gpg --batch --quiet --pinentry-mode loopback \
+      --passphrase-file "$KAHADE_BACKUP_PASSPHRASE_FILE" \
+      --decrypt --output "$tmp" -- "$BACKUP_FILE"
+    pg_restore --exit-on-error --no-owner --no-privileges --dbname="$VERIFY_URL" -- "$tmp"
+    shred -u -- "$tmp"
   else
     psql "$VERIFY_URL" --quiet -v ON_ERROR_STOP=1 < "$BACKUP_FILE"
   fi

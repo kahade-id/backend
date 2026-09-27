@@ -12,7 +12,7 @@ esac
 
 [ -d "$BACKUP_DIR" ] || { echo "Backup directory not found: $BACKUP_DIR" >&2; exit 1; }
 
-mapfile -t db_files < <(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name 'db-*.sql.gz' -o -name 'kahade_prod_*.dump' \) -printf '%T@ %p\n' | sort -nr | cut -d' ' -f2-)
+mapfile -t db_files < <(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name 'db-*.sql.gz' -o -name 'kahade_prod_*.dump' -o -name 'kahade_prod_*.dump.gpg' \) -printf '%T@ %p\n' | sort -nr | cut -d' ' -f2-)
 if [ "${#db_files[@]}" -eq 0 ]; then
   echo 'No database backup found; refusing cleanup.' >&2
   exit 1
@@ -22,6 +22,17 @@ latest_db="${db_files[0]}"
 case "$latest_db" in
   *.sql.gz) gzip -t -- "$latest_db" ;;
   *.dump) pg_restore --list -- "$latest_db" >/dev/null ;;
+  *.dump.gpg)
+    # SEC-306: backup terenkripsi — validasi dengan dekripsi ke pipe (tanpa
+    # menulis plaintext ke disk). Butuh KAHADE_BACKUP_PASSPHRASE_FILE.
+    if [ -n "${KAHADE_BACKUP_PASSPHRASE_FILE:-}" ] && [ -f "$KAHADE_BACKUP_PASSPHRASE_FILE" ]; then
+      gpg --batch --quiet --pinentry-mode loopback \
+        --passphrase-file "$KAHADE_BACKUP_PASSPHRASE_FILE" \
+        --decrypt -- "$latest_db" 2>/dev/null | pg_restore --list - >/dev/null
+    else
+      echo 'WARNING: passphrase file tidak tersedia — lewati validasi integritas backup terenkripsi.' >&2
+    fi
+    ;;
   *) echo "Unsupported database backup format: $latest_db" >&2; exit 1 ;;
 esac
 

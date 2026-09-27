@@ -216,8 +216,10 @@ export class ReturnQueueQueryDto {
 
 /** Aksi admin atas satu case retur. */
 export class AdminReturnActionDto {
-  @IsIn(['APPROVE', 'REJECT', 'ESCALATE', 'FORCE_RESOLVE_REFUND', 'FORCE_RESOLVE_EXCHANGE', 'FORCE_RESOLVE_REPAIR'] as const)
-  action!: 'APPROVE' | 'REJECT' | 'ESCALATE' | 'FORCE_RESOLVE_REFUND' | 'FORCE_RESOLVE_EXCHANGE' | 'FORCE_RESOLVE_REPAIR';
+  // ADM-114: EXTEND_DEADLINE — perpanjangan deadline respons seller +24 jam
+  // (fail-closed: hanya REQUESTED/SELLER_REVIEW, maks 3x per case).
+  @IsIn(['APPROVE', 'REJECT', 'ESCALATE', 'FORCE_RESOLVE_REFUND', 'FORCE_RESOLVE_EXCHANGE', 'FORCE_RESOLVE_REPAIR', 'EXTEND_DEADLINE'] as const)
+  action!: 'APPROVE' | 'REJECT' | 'ESCALATE' | 'FORCE_RESOLVE_REFUND' | 'FORCE_RESOLVE_EXCHANGE' | 'FORCE_RESOLVE_REPAIR' | 'EXTEND_DEADLINE';
 
   @IsOptional()
   @IsIn(RETURN_RESOLUTION_TYPES)

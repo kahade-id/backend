@@ -55,6 +55,9 @@ export class AdminMilestonesService {
           releasedTxId: true,
           revisionRounds: true,
           escrowHeld: true,
+          // ADM-124: createdAt wajib di tipe admin MilestoneAdminItem —
+          // sertakan agar kontrak tidak berbohong.
+          createdAt: true,
           updatedAt: true,
           order: { select: { orderId: true, title: true, buyerId: true, sellerId: true, status: true } },
         },

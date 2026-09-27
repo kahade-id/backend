@@ -18,6 +18,13 @@ export class AuditLogQueryDto extends PaginationDto {
   @IsString()
   targetType?: string;
 
+  // ADM-128: filter target spesifik agar riwayat review satu entitas
+  // (mis. satu ChatModerationEvent) bisa diambil tanpa mengunduh semua log.
+  @ApiPropertyOptional({ description: 'Filter by target resource ID (exact match)' })
+  @IsOptional()
+  @IsString()
+  targetId?: string;
+
   @ApiPropertyOptional({ description: 'Start date in ISO 8601 format' })
   @IsOptional()
   @IsDateString()

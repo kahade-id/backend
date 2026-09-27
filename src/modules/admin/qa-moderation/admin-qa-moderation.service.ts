@@ -1146,7 +1146,7 @@ export class AdminQaModerationService {
         (reasonCode ? ` (reason: ${reasonCode})` : '') +
         (note ? ` — ${note.slice(0, 500)}` : '');
       await db.$executeRaw(Prisma.sql`
-        INSERT INTO admin_audit_logs (id, admin_id, action, target_type, target_id, description, ip_address, created_at)
+        INSERT INTO admin_audit_logs ("id", "adminId", "action", "targetType", "targetId", "description", "ipAddress", "createdAt")
         VALUES (gen_random_uuid()::text, ${actorAdminId}, 'ADMIN_ACTION'::"AuditAction",
                 ${'QA_MODERATION'}, ${targetId}, ${description}, 'unknown', NOW())
       `);

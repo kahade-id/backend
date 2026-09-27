@@ -482,4 +482,27 @@ describe('MilestonesService lifecycle (G200)', () => {
     await svc.acceptMilestone(m1.id, 'buyer-1');
     expect(db.orderMilestone.find((x) => x.id === m1.id)!.status).toBe(MilestoneStatus.RELEASED);
   });
+
+  it('SEC-102: releaseMilestone (retry) ditolak saat order DISPUTED — escrow tidak cair di tengah adjudikasi', async () => {
+    const { svc, db } = await fullSetup();
+    const m1 = db.orderMilestone[0];
+    m1.status = MilestoneStatus.ACCEPTED; // stuck: belum release, jalur retry publik
+    db.order.find((o) => o.id === 'order-1')!.status = 'DISPUTED';
+    const sellerBefore = db.wallet.find((w) => w.userId === 'seller-1')!.availableBalance;
+    await expect(svc.releaseMilestone(m1.id, 'buyer-1')).rejects.toMatchObject({
+      message: expect.stringContaining('PROCESSING'),
+    });
+    expect(db.orderMilestone.find((x) => x.id === m1.id)!.status).toBe(MilestoneStatus.ACCEPTED);
+    expect(db.wallet.find((w) => w.userId === 'seller-1')!.availableBalance).toBe(sellerBefore);
+  });
+
+  it('SEC-102: cancelRemaining ditolak saat order DISPUTED — refund hanya via adjudikasi', async () => {
+    const { svc, db } = await fullSetup();
+    db.order.find((o) => o.id === 'order-1')!.status = 'DISPUTED';
+    const buyerBefore = db.wallet.find((w) => w.userId === 'buyer-1')!.availableBalance;
+    await expect(svc.cancelRemaining('order-1', 'buyer-1')).rejects.toMatchObject({
+      message: expect.stringContaining('PROCESSING'),
+    });
+    expect(db.wallet.find((w) => w.userId === 'buyer-1')!.availableBalance).toBe(buyerBefore);
+  });
 });

@@ -1046,6 +1046,9 @@ export class MilestonesService {
         message: 'Hanya tahap berstatus ACCEPTED yang dapat dicairkan.',
       });
     }
+    // SEC-102: pencairan tahap juga di-guard status order — ACCEPTED yang
+    // order-nya DISPUTED tidak boleh cair via retry publik.
+    this.assertOrderAllowsMilestoneAction(milestone.order);
     const result = await this.prisma.$transaction((tx) => this.releaseMilestoneFunds(tx, milestoneId, userId));
     return { id: milestoneId, releasedTxId: result.releasedTxId, alreadyReleased: false };
   }
@@ -1123,6 +1126,9 @@ export class MilestonesService {
     if (role !== MilestoneActorType.BUYER && role !== MilestoneActorType.SELLER) {
       throw new ForbiddenException({ code: 'FORBIDDEN', message: 'Hanya pihak order yang dapat membatalkan.' });
     }
+    // SEC-102: refund sisa tahap juga di-guard status order — tidak boleh
+    // mengembalikan escrowHeld saat order DISPUTED (adjudikasi yang berhak).
+    this.assertOrderAllowsMilestoneAction(order);
 
     const result = await this.prisma.$transaction(async (tx) => {
       const remaining = await tx.orderMilestone.findMany({

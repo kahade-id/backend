@@ -452,4 +452,41 @@ describe('ReturnsService (GAP-D retur)', () => {
       expect(delegates.returnRequest.update).not.toHaveBeenCalled();
     });
   });
+
+  // ----------------- ADM-113: getDetail menyertakan buyerPayAmount (string)
+  describe('getDetail menyertakan buyerPayAmount (ADM-113)', () => {
+    it('order.buyerPayAmount dikembalikan sebagai string untuk dialog nominal', async () => {
+      delegates.returnRequest.findUnique.mockResolvedValue(
+        baseReturn({ status: 'SELLER_REVIEW', sellerRespondBy: new Date() }),
+      );
+      orderDelegate.findUnique.mockResolvedValue({
+        orderId: 'ORD-20260926-0001', orderType: 'PHYSICAL_GOODS', status: 'COMPLETED',
+        completedAt: new Date(), buyerPayAmount: BigInt(200000),
+      });
+      delegates.returnAttachment.findMany.mockResolvedValue([]);
+      delegates.returnNote.findMany.mockResolvedValue([]);
+      delegates.returnTimeline.findMany.mockResolvedValue([]);
+      delegates.returnShipmentEvent.findMany.mockResolvedValue([]);
+      delegates.returnRefundApproval.findFirst.mockResolvedValue(null);
+
+      const detail = await service.getDetail('ret-db-1', 'admin-1', { isAdmin: true });
+      expect(detail.order).not.toBeNull();
+      expect((detail.order as { buyerPayAmount: string }).buyerPayAmount).toBe('200000');
+    });
+
+    it('order null bila order tidak ditemukan — tidak throw', async () => {
+      delegates.returnRequest.findUnique.mockResolvedValue(
+        baseReturn({ status: 'REQUESTED', sellerRespondBy: new Date() }),
+      );
+      orderDelegate.findUnique.mockResolvedValue(null);
+      delegates.returnAttachment.findMany.mockResolvedValue([]);
+      delegates.returnNote.findMany.mockResolvedValue([]);
+      delegates.returnTimeline.findMany.mockResolvedValue([]);
+      delegates.returnShipmentEvent.findMany.mockResolvedValue([]);
+      delegates.returnRefundApproval.findFirst.mockResolvedValue(null);
+
+      const detail = await service.getDetail('ret-db-1', 'admin-1', { isAdmin: true });
+      expect(detail.order).toBeNull();
+    });
+  });
 });

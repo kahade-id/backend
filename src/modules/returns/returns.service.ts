@@ -345,7 +345,7 @@ export class ReturnsService {
       db.returnTimeline.findMany({ where: { returnRequestId: ret.id }, orderBy: { createdAt: 'asc' } }),
       db.returnShipmentEvent.findMany({ where: { returnRequestId: ret.id }, orderBy: { eventAt: 'asc' } }),
       db.returnRefundApproval.findUnique({ where: { returnRequestId: ret.id } }),
-      this.prisma.order.findUnique({ where: { id: ret.orderId }, select: { orderId: true, orderType: true, status: true, completedAt: true } }),
+      this.prisma.order.findUnique({ where: { id: ret.orderId }, select: { orderId: true, orderType: true, status: true, completedAt: true, buyerPayAmount: true } }),
     ]);
     // G212: instruksi kirim balik hanya terlihat setelah APPROVED.
     const showInstructions = ['APPROVED', 'RETURN_SHIPPING', 'RECEIVED', 'RESOLVED_REFUND', 'RESOLVED_EXCHANGE', 'RESOLVED_REPAIR'].includes(ret.status);
@@ -356,7 +356,15 @@ export class ReturnsService {
       reasonLabel: RETURN_REASON_LABEL[ret.reasonCode],
       rejectReasonLabel: ret.rejectReasonCode ? RETURN_REJECT_REASON_LABEL[ret.rejectReasonCode] : null,
       resolutionLabel: ret.resolutionType ? RETURN_RESOLUTION_LABEL[ret.resolutionType] : null,
-      order: order ? { orderId: order.orderId, orderType: order.orderType, status: order.status, completedAt: order.completedAt } : null,
+      // ADM-113: buyerPayAmount dibutuhkan panel admin untuk menampilkan
+      // nominal refund yang akan dieksekusi (default APPROVE = full).
+      order: order ? {
+        orderId: order.orderId,
+        orderType: order.orderType,
+        status: order.status,
+        completedAt: order.completedAt,
+        buyerPayAmount: order.buyerPayAmount != null ? order.buyerPayAmount.toString() : null,
+      } : null,
       attachments: (attachments as Record<string, unknown>[]).map((a) => ({
         id: a.id, fileKey: a.fileKey, fileName: a.fileName, fileType: a.fileType,
         fileSize: a.fileSize, createdAt: a.createdAt,

@@ -121,9 +121,12 @@ const FEED_CURSOR_VERSION = 2;
  * Sentinel untuk cabang "pemilik melihat itemnya sendiri" pada filter OR.
  * `userId` adalah cuid, jadi nilai ini tidak akan pernah cocok dengan baris apa
  * pun; dipakai supaya cabang tersebut tetap ada (dan tidak berubah arti) ketika
- * `viewerId` undefined (viewer anonim).
+ * `viewerId` undefined (viewer anonim). `userId` adalah cuid (huruf kecil/angka,
+ * tanpa tanda hubung), jadi sentinel dengan tanda hubung ini tidak pernah cocok.
+ * JANGAN memakai byte NUL: PostgreSQL menolak 0x00 di kolom teks (error 22021)
+ * sehingga semua request anonim menjadi 500.
  */
-const SELF_BRANCH_NEVER_MATCHES = '\u0000anonymous';
+const SELF_BRANCH_NEVER_MATCHES = 'no-such-viewer';
 
 interface FeedCursorPayload {
   /** createdAt baris terakhir, dalam epoch ms. */

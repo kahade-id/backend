@@ -9,10 +9,10 @@
  */
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { Reflector } from '@nestjs/core';
-import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
-import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
-import { ADMIN_ROLES_KEY } from '../../../common/decorators/admin-roles.decorator';
-import { IS_ADMIN_ROUTE_KEY } from '../../../common/decorators/public.decorator';
+import { JwtAdminGuard } from '../../../../common/guards/jwt-admin.guard';
+import { AdminRolesGuard } from '../../../../common/guards/admin-roles.guard';
+import { ADMIN_ROLES_KEY } from '../../../../common/decorators/admin-roles.decorator';
+import { IS_ADMIN_ROUTE_KEY } from '../../../../common/decorators/public.decorator';
 import { AdminManagementController } from '../admin-management.controller';
 import { AdminOpsAliasController } from '../admin-ops-alias.controller';
 

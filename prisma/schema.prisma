@@ -533,6 +533,9 @@ enum AuditAction {
   RECONCILIATION_FINDING_CREATED
   RECONCILIATION_FINDING_ACKNOWLEDGED
   MANUAL_LEDGER_CORRECTION
+  // ADM-205 dual control withdrawal (append-only; migrasi 20260927170000_withdrawal_dual_approval_audit)
+  WITHDRAWAL_APPROVED
+  WITHDRAWAL_REJECTED
   // GAP-E siklus edit/hapus kampanye (G351–G375, append-only; migrasi 20260927050000_gap_e_admin_ops)
   CAMPAIGN_UPDATED
   CAMPAIGN_DELETED

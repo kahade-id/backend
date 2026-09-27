@@ -84,7 +84,7 @@ export class AdminFinanceController {
   @UseGuards(UserThrottleGuard)
   @Idempotency()
   @Throttle({ default: { ttl: 60000, limit: 10 } })
-  @ApiOperation({ summary: 'Approve pending withdrawal', description: 'Approve a pending withdrawal transaction and mark it as successful. Requires Idempotency-Key.' })
+  @ApiOperation({ summary: 'Approve pending withdrawal (dual control)', description: 'ADM-205: records this admin\'s approval. The Iris payout is executed ONLY after the required quorum of DIFFERENT admins approve (default: 2 for all amounts — fail-closed; configurable via SystemConfig withdrawal.dual_approval_threshold_idr). First approval returns AWAITING_SECOND_APPROVAL without touching the payout. Requires Idempotency-Key.' })
   @ApiResponse({ status: 200, description: 'Withdrawal approved.' })
   @ApiResponse({ status: 404, description: 'Transaction not found.' })
   approveWithdrawal(@Param('txId', ParseIdPipe) txId: string, @Body() dto: WithdrawalApproveDto, @CurrentAdmin('sub') adminId: string, @Req() req: Request): Promise<object> {

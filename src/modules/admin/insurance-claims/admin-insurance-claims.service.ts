@@ -28,7 +28,10 @@ const TERMINAL_STATUSES: InsuranceClaimStatus[] = [
  * langsung loncat ke PAID tanpa persetujuan.
  */
 const ALLOWED_TRANSITIONS: Record<string, InsuranceClaimStatus[]> = {
-  APPROVED: [InsuranceClaimStatus.DRAFT, InsuranceClaimStatus.SUBMITTED],
+  // ADM-209: DRAFT DIHAPUS dari transisi APPROVED. Klaim yang belum disubmit
+  // user tidak boleh di-approve (apalagi dibayar) admin — proteksi tidak boleh
+  // hanya di client. REJECTED dari DRAFT tetap diizinkan (tidak menggerakkan uang).
+  APPROVED: [InsuranceClaimStatus.SUBMITTED],
   REJECTED: [
     InsuranceClaimStatus.DRAFT,
     InsuranceClaimStatus.SUBMITTED,

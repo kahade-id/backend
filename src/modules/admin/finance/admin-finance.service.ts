@@ -38,6 +38,31 @@ export interface TimelineEvent {
 }
 
 /**
+ * ADM-205 — dual control untuk approve withdrawal (maker-checker).
+ *
+ * Sebelum perbaikan ini, SATU admin FINANCE_ADMIN bisa menyetujui penarikan
+ * berapa pun nominalnya dan langsung memicu payout Iris nyata. Sekarang dua
+ * admin BERBEDA wajib menyetujui sebelum payout dieksekusi.
+ *
+ * Desain tanpa schema baru: tiap persetujuan dicatat sebagai baris append-only
+ * di `admin_audit_logs` (action WITHDRAWAL_APPROVED, targetType
+ * 'WithdrawalApproval', targetId = id internal WalletTransaction). Kuorum
+ * dihitung dari DISTINCT adminId — satu admin tidak bisa menyetujui dua kali.
+ *
+ * Threshold configurable (open question produk — nilai final belum diputuskan):
+ * SystemConfig `withdrawal.dual_approval_threshold_idr`. Bila key tidak ada /
+ * tidak valid → FAIL-CLOSED: SEMUA nominal butuh 2 approval.
+ */
+export const WITHDRAWAL_APPROVAL_TARGET_TYPE = 'WithdrawalApproval';
+export const WITHDRAWAL_DUAL_APPROVAL_THRESHOLD_KEY = 'withdrawal.dual_approval_threshold_idr';
+
+export interface WithdrawalApprovalInfo {
+  approvals: number;
+  requiredApprovals: number;
+  approvedByMe: boolean;
+}
+
+/**
  * E3: gabung + urutkan event timeline secara kronologis menaik
  * (fungsi murni — di-unit-test terpisah).
  */
@@ -71,6 +96,51 @@ export class AdminFinanceService {
     // AW-018: invalidasi cache summary dashboard (via helper terpusat).
     private readonly dashboard: DashboardService,
   ) {}
+
+  /**
+   * ADM-205 — guard murni (unit-testable): berapa approval berbeda yang
+   * dibutuhkan untuk nominal tertentu.
+   * - threshold null/tidak valid/<=0 → 2 (FAIL-CLOSED default).
+   * - threshold > 0: nominal <= threshold → 1, di atasnya → 2.
+   */
+  static requiredWithdrawalApprovals(amountIdr: number, thresholdIdr: number | null): number {
+    if (thresholdIdr === null || !Number.isFinite(thresholdIdr) || thresholdIdr <= 0) {
+      return 2;
+    }
+    return amountIdr <= thresholdIdr ? 1 : 2;
+  }
+
+  /** ADM-205: baca threshold dual-approval; null = belum dikonfigurasi (fail-closed). */
+  private async getWithdrawalDualApprovalThresholdIdr(): Promise<number | null> {
+    try {
+      const row = await this.prisma.systemConfig.findUnique({
+        where: { key: WITHDRAWAL_DUAL_APPROVAL_THRESHOLD_KEY },
+        select: { value: true },
+      });
+      if (!row) return null;
+      const parsed = Number(String(row.value).trim());
+      if (!Number.isFinite(parsed) || parsed < 0) return null;
+      return Math.trunc(parsed);
+    } catch (error) {
+      // Fail-closed: bila config tidak bisa dibaca, anggap belum dikonfigurasi
+      // → semua nominal butuh dual approval.
+      this.logger.warn(`Gagal membaca ${WITHDRAWAL_DUAL_APPROVAL_THRESHOLD_KEY}; fail-closed ke dual approval: ${(error as Error).message}`);
+      return null;
+    }
+  }
+
+  /** ADM-205: daftar DISTINCT adminId yang sudah menyetujui withdrawal ini. */
+  private async getWithdrawalApproverIds(txInternalId: string): Promise<string[]> {
+    const rows = await this.prisma.adminAuditLog.findMany({
+      where: {
+        action: AuditAction.WITHDRAWAL_APPROVED,
+        targetType: WITHDRAWAL_APPROVAL_TARGET_TYPE,
+        targetId: txInternalId,
+      },
+      select: { adminId: true },
+    });
+    return [...new Set(rows.map((r) => r.adminId))];
+  }
 
   async listTransactions(query: FinanceTransactionQueryDto): Promise<object> {
     const { page = 1, limit = 20, type, status, startDate, endDate, q } = query;
@@ -759,6 +829,31 @@ export class AdminFinanceService {
       this.prisma.walletTransaction.count({ where }),
     ]);
 
+    // ADM-205: info kuorum dual approval per baris — satu query untuk semua id
+    // (tanpa N+1) agar UI bisa menampilkan "1/2 persetujuan" & menonaktifkan
+    // tombol bagi admin yang sudah menyetujui.
+    const dualThresholdIdr = await this.getWithdrawalDualApprovalThresholdIdr();
+    const approvalRows = withdrawals.length
+      ? await this.prisma.adminAuditLog.findMany({
+          where: {
+            action: AuditAction.WITHDRAWAL_APPROVED,
+            targetType: WITHDRAWAL_APPROVAL_TARGET_TYPE,
+            targetId: { in: withdrawals.map((w) => w.id) },
+          },
+          select: { targetId: true, adminId: true },
+        })
+      : [];
+    const approversByTx = new Map<string, Set<string>>();
+    for (const row of approvalRows) {
+      if (!row.targetId) continue;
+      let set = approversByTx.get(row.targetId);
+      if (!set) {
+        set = new Set<string>();
+        approversByTx.set(row.targetId, set);
+      }
+      set.add(row.adminId);
+    }
+
     const serialized = await Promise.all(
       withdrawals.map(async tx => {
         let maskedAccountNumber: string | null = null;
@@ -786,11 +881,22 @@ export class AdminFinanceService {
             /* pre-migration data */
           }
         }
+        // ADM-205: kuorum dual approval untuk baris ini.
+        const approverSet = approversByTx.get(tx.id) ?? new Set<string>();
+        const approvalInfo: WithdrawalApprovalInfo = {
+          approvals: approverSet.size,
+          requiredApprovals: AdminFinanceService.requiredWithdrawalApprovals(
+            toIdr(tx.amount),
+            dualThresholdIdr,
+          ),
+          approvedByMe: approverSet.has(adminId),
+        };
         return {
           ...tx,
           amount: toIdr(tx.amount),
           balanceBefore: toIdr(tx.balanceBefore),
           balanceAfter: toIdr(tx.balanceAfter),
+          approvalInfo,
           bankAccount: tx.bankAccount
             ? {
                 ...tx.bankAccount,
@@ -848,6 +954,56 @@ export class AdminFinanceService {
       });
     }
 
+    // ADM-205 (dual control): catat persetujuan admin ini SEBELUM payout.
+    // Payout hanya dieksekusi bila kuorum admin BERBEDA tercapai.
+    const amountIdr = toIdr(tx.amount);
+    const dualThresholdIdr = await this.getWithdrawalDualApprovalThresholdIdr();
+    const requiredApprovals = AdminFinanceService.requiredWithdrawalApprovals(amountIdr, dualThresholdIdr);
+    const priorApproverIds = await this.getWithdrawalApproverIds(tx.id);
+    if (priorApproverIds.includes(adminId)) {
+      throw new ConflictException({
+        code: ErrorCodes.WITHDRAWAL_ALREADY_APPROVED,
+        message:
+          'Anda sudah menyetujui penarikan ini — menunggu persetujuan admin lain sebelum payout dieksekusi',
+      });
+    }
+    await this.prisma.adminAuditLog.create({
+      data: {
+        adminId,
+        action: AuditAction.WITHDRAWAL_APPROVED,
+        targetType: WITHDRAWAL_APPROVAL_TARGET_TYPE,
+        targetId: tx.id,
+        description:
+          `Withdrawal approval ${priorApproverIds.length + 1}/${requiredApprovals} untuk ${tx.txId ?? tx.id} ` +
+          `(Rp${amountIdr.toLocaleString('id-ID')}) oleh admin ${adminId}`,
+        after: {
+          txId: tx.txId,
+          amountIdr,
+          thresholdIdr: dualThresholdIdr,
+          requiredApprovals,
+          approvedAt: new Date().toISOString(),
+        } as unknown as Prisma.InputJsonValue,
+        ipAddress,
+      },
+    });
+    const approverIds = await this.getWithdrawalApproverIds(tx.id);
+    if (approverIds.length < requiredApprovals) {
+      // Kuorum belum tercapai: JANGAN sentuh status / payout. Transaksi tetap
+      // PENDING_PROCESS agar muncul di antrean untuk admin kedua.
+      await this.dashboard.invalidateSummaryCache();
+      return {
+        status: 'AWAITING_SECOND_APPROVAL',
+        txId: tx.txId,
+        amountIdr,
+        approvals: approverIds.length,
+        requiredApprovals,
+        executed: false,
+        message:
+          `Persetujuan ke-${approverIds.length} tercatat. ` +
+          `Butuh ${requiredApprovals - approverIds.length} persetujuan admin berbeda lagi sebelum payout dieksekusi.`,
+      };
+    }
+
     const txUpdate = await this.prisma.walletTransaction.updateMany({
       where: {
         id: tx.id,
@@ -860,6 +1016,22 @@ export class AdminFinanceService {
     });
 
     if (txUpdate.count === 0) {
+      // ADM-205: dengan dual control, dua admin bisa mencapai kuorum hampir
+      // bersamaan — yang kalah optimistic-lock claim tidak boleh menerima
+      // error mentah bila payout sudah dieksekusi persetujuan lain.
+      const current = await this.prisma.walletTransaction.findUnique({
+        where: { id: tx.id },
+        select: { withdrawStatus: true, txId: true },
+      });
+      if (current && current.withdrawStatus !== 'PENDING_PROCESS') {
+        return {
+          status: 'ALREADY_EXECUTED',
+          txId: current.txId,
+          executed: true,
+          message:
+            'Payout sudah dieksekusi oleh persetujuan admin lain — tidak ada payout ganda',
+        };
+      }
       throw new ConflictException({
         code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT,
         message: 'Withdrawal was already processed by another admin, please refresh',
@@ -927,12 +1099,13 @@ export class AdminFinanceService {
 
     const updated = await this.prisma.walletTransaction.findUniqueOrThrow({ where: { id: tx.id } });
 
+    // ADM-205: payout dieksekusi setelah kuorum dual approval tercapai.
     this.auditLog.logAdminAction({
       adminId,
-      action: AuditAction.ADMIN_ACTION,
+      action: AuditAction.WITHDRAWAL_APPROVED,
       targetType: 'WalletTransaction',
       targetId: tx.id,
-      description: `Approved withdrawal payout ${tx.txId ?? tx.id}`,
+      description: `Approved withdrawal payout ${tx.txId ?? tx.id} — kuorum dual approval tercapai, payout dieksekusi`,
       ipAddress,
     });
 
@@ -1061,7 +1234,7 @@ export class AdminFinanceService {
 
     this.auditLog.logAdminAction({
       adminId,
-      action: AuditAction.ADMIN_ACTION,
+      action: AuditAction.WITHDRAWAL_REJECTED,
       targetType: 'WalletTransaction',
       targetId: tx.id,
       description: `Rejected withdrawal ${tx.txId ?? tx.id} (refunded to user)${adminNote ? ': ' + adminNote : ''}`,

@@ -3540,11 +3540,19 @@ model UserShowcase {
   /// Jumlah kali deep link share dibuka/dibagikan. Di-increment atomik saat
   /// GET /v1/showcase/:id/share (pola atomic counter seperti likeCount).
   shareCount   Int @default(0)
+  /// View pada hari kalender berjalan (zona Asia/Jakarta) — sumber ranking
+  /// sort feed "popular" (populer harian). Di-update atomik di recordView:
+  /// naik bila bucket hari masih sama, reset ke 1 bila hari berganti (satu
+  /// statement CASE — tanpa cron). Bukan bagian financial core.
+  hotViews Int @default(0)
+  /// Tanggal (WIB) terakhir hotViews dihitung. Null = belum pernah dihitung.
+  hotViewDate DateTime? @db.Date
 
   images     ShowcaseImage[]
   likes      ShowcaseLike[]
   comments   ShowcaseComment[]
   reports    ShowcaseReport[]
+  dailyStats ShowcaseDailyStat[]
   // SH-B-011: back-relation asal etalase (nullable di sisi Order/OrderLink).
   orders     Order[]           @relation("OrderShowcase")
   orderLinks OrderLink[]       @relation("OrderLinkShowcase")
@@ -3557,12 +3565,38 @@ model UserShowcase {
   deletedAt DateTime?
 
   @@index([userId, isActive, sortOrder])
-  // Feed discover: sort "latest" (createdAt) dan "popular" (likeCount). Kolom id
-  // ikut di index karena dipakai sebagai tiebreak cursor pagination.
+  // Feed discover: sort "latest" (createdAt), "popular" harian (hotViews),
+  // dan "foryou" (skor dihitung di aplikasi). Kolom id ikut di index karena
+  // dipakai sebagai tiebreak cursor pagination.
   @@index([visibility, isActive, createdAt, id])
   @@index([visibility, isActive, likeCount, id])
+  @@index([visibility, isActive, hotViews, id])
   @@index([category])
   @@map("user_showcases")
+}
+
+/// Agregat harian view showcase per hari kalender (zona Asia/Jakarta).
+/// Ditulis best-effort (upsert) oleh ShowcaseService.recordView — metrik
+/// non-kritis, kegagalan tulis tidak menggagalkan pencatatan view.
+/// Dipakai sebagai riwayat popularitas (analitik/admin, mis. "populer minggu
+/// ini" di masa depan); ranking feed "popular" harian memakai kolom
+/// denormalisasi UserShowcase.hotViews agar bisa diurut + keyset-pagination
+/// langsung di query feed tanpa join agregat. Bukan bagian financial core.
+model ShowcaseDailyStat {
+  id         String       @id @default(cuid())
+  showcaseId String
+  showcase   UserShowcase @relation(fields: [showcaseId], references: [id], onDelete: Cascade)
+
+  /// Hari kalender (WIB). Satu baris per (showcase, hari).
+  date  DateTime @db.Date
+  views Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([showcaseId, date])
+  @@index([date])
+  @@map("showcase_daily_stats")
 }
 
 /// Laporan user terhadap item showcase (Etalase). Satu user hanya boleh

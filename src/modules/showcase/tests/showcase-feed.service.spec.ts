@@ -31,6 +31,9 @@ function feedRow(index: number, overrides: Record<string, unknown> = {}) {
     isActive: true,
     sortOrder: index,
     likeCount: index,
+    // hotViews: view pada hari kalender berjalan (populer harian). Default 0;
+    // test popular meng-override sesuai skenario.
+    hotViews: 0,
     commentCount: 0,
     viewCount: 0,
     createdAt: new Date(Date.UTC(2026, 8, 10 - index)),
@@ -54,8 +57,8 @@ function rows(count: number) {
   return Array.from({ length: count }, (_, i) => feedRow(i + 1));
 }
 
-/** Cursor opaque yang dihasilkan service: base64url(JSON{v,t,l,i}). */
-function encodeCursor(t: number, l: number, i: string, version = 1): string {
+/** Cursor opaque yang dihasilkan service: base64url(JSON{v,t,l,i[,s]}). */
+function encodeCursor(t: number, l: number, i: string, version = 2): string {
   return Buffer.from(JSON.stringify({ v: version, t, l, i }), 'utf8').toString('base64url');
 }
 
@@ -296,10 +299,11 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
       expect(lastQuery().orderBy).toEqual([{ createdAt: 'desc' }, { id: 'desc' }]);
     });
 
-    it('sorts popular by likeCount with createdAt and id tiebreaks', async () => {
+    it('sorts popular by daily hotViews with createdAt and id tiebreaks', async () => {
       const result = (await feed(service, undefined, { sort: 'popular' })) as any;
       expect(result.sort).toBe('popular');
-      expect(lastQuery().orderBy).toEqual([{ likeCount: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }]);
+      // Populer HARIAN: hotViews (view hari kalender berjalan), bukan likeCount all-time.
+      expect(lastQuery().orderBy).toEqual([{ hotViews: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }]);
     });
 
     it('falls back to latest for an unknown sort value', async () => {
@@ -336,15 +340,15 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
       ]);
     });
 
-    it('applies a (likeCount, createdAt, id) keyset for the popular sort', async () => {
+    it('applies a (hotViews, createdAt, id) keyset for the popular sort', async () => {
       const t = Date.UTC(2026, 8, 5, 12, 0, 0);
       await feed(service, undefined, { sort: 'popular', cursor: encodeCursor(t, 42, 'cshowcase000000000000042') });
       const keyset = lastQuery().where.AND.find((c: any) => c.OR !== undefined);
       expect(keyset.OR).toEqual([
-        { likeCount: { lt: 42 } },
-        { likeCount: 42, createdAt: { lt: new Date(t) } },
+        { hotViews: { lt: 42 } },
+        { hotViews: 42, createdAt: { lt: new Date(t) } },
         {
-          likeCount: 42,
+          hotViews: 42,
           createdAt: { gte: new Date(t), lt: new Date(t + 1) },
           id: { lt: 'cshowcase000000000000042' },
         },
@@ -361,22 +365,28 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
     });
 
     it('rejects a malformed cursor with 400 INVALID_CURSOR', async () => {
-      for (const bad of ['not-base64-json', Buffer.from('{"v":1}', 'utf8').toString('base64url'), '!!']) {
+      for (const bad of ['not-base64-json', Buffer.from('{"v":2}', 'utf8').toString('base64url'), '!!']) {
         await expect(feed(service, undefined, { cursor: bad })).rejects.toThrow(BadRequestException);
       }
       expect(mockPrisma.userShowcase.findMany).not.toHaveBeenCalled();
     });
 
     it('rejects a cursor from an older payload version', async () => {
-      const legacy = encodeCursor(Date.UTC(2026, 8, 5), 1, 'cshowcase000000000000001', 0);
+      // v1: `l` masih berarti likeCount all-time — tidak boleh dipakai untuk
+      // keyset populer harian.
+      const legacy = encodeCursor(Date.UTC(2026, 8, 5), 1, 'cshowcase000000000000001', 1);
       await expect(feed(service, undefined, { cursor: legacy })).rejects.toMatchObject({
+        response: { code: ErrorCodes.INVALID_CURSOR },
+      });
+      const ancient = encodeCursor(Date.UTC(2026, 8, 5), 1, 'cshowcase000000000000001', 0);
+      await expect(feed(service, undefined, { cursor: ancient })).rejects.toMatchObject({
         response: { code: ErrorCodes.INVALID_CURSOR },
       });
     });
 
     it('rejects a cursor with a non-finite timestamp or an oversized id', async () => {
-      const badTime = Buffer.from(JSON.stringify({ v: 1, t: 'yesterday', l: 1, i: 'x' }), 'utf8').toString('base64url');
-      const badId = Buffer.from(JSON.stringify({ v: 1, t: 1, l: 1, i: 'x'.repeat(65) }), 'utf8').toString('base64url');
+      const badTime = Buffer.from(JSON.stringify({ v: 2, t: 'yesterday', l: 1, i: 'x' }), 'utf8').toString('base64url');
+      const badId = Buffer.from(JSON.stringify({ v: 2, t: 1, l: 1, i: 'x'.repeat(65) }), 'utf8').toString('base64url');
       await expect(feed(service, undefined, { cursor: badTime })).rejects.toThrow(BadRequestException);
       await expect(feed(service, undefined, { cursor: badId })).rejects.toThrow(BadRequestException);
     });
@@ -402,7 +412,7 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
       mockPrisma.userShowcase.findMany.mockResolvedValue([...page, feedRow(4)]);
       const result = (await feed(service, undefined, { limit: 3 })) as any;
       const decoded = decodeCursor(result.nextCursor);
-      expect(decoded).toEqual({ v: 1, t: page[2].createdAt.getTime(), l: page[2].likeCount, i: page[2].id });
+      expect(decoded).toEqual({ v: 2, t: page[2].createdAt.getTime(), l: page[2].likeCount, i: page[2].id });
     });
 
     it('returns nextCursor null on the last page', async () => {

@@ -8,8 +8,8 @@ import {
   SHOWCASE_SEARCH_MAX_LENGTH,
 } from '../../../common/constants/app.constants';
 
-/** Opsi urutan feed discover. */
-export const SHOWCASE_FEED_SORTS = ['latest', 'popular'] as const;
+/** Opsi urutan feed discover: terbaru, populer harian, atau personal (Untuk Anda). */
+export const SHOWCASE_FEED_SORTS = ['latest', 'popular', 'foryou'] as const;
 export type ShowcaseFeedSort = (typeof SHOWCASE_FEED_SORTS)[number];
 
 /**
@@ -43,7 +43,7 @@ export class ShowcaseFeedQueryDto {
   @IsOptional()
   @IsString()
   @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim().toLowerCase() : value))
-  @IsIn(SHOWCASE_FEED_SORTS as unknown as string[], { message: 'sort must be one of: latest, popular' })
+  @IsIn(SHOWCASE_FEED_SORTS as unknown as string[], { message: 'sort must be one of: latest, popular, foryou' })
   sort: ShowcaseFeedSort = 'latest';
 
   @ApiPropertyOptional({ maxLength: SHOWCASE_CATEGORY_MAX_LENGTH })

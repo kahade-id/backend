@@ -101,6 +101,7 @@ const mockPrisma: any = {
   showcaseImage: { findMany: jest.fn(), findFirst: jest.fn(), count: jest.fn(), createMany: jest.fn(), updateMany: jest.fn(), delete: jest.fn() },
   showcaseLike: { findMany: jest.fn(), create: jest.fn(), deleteMany: jest.fn() },
   showcaseComment: { findMany: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn(), count: jest.fn(), create: jest.fn(), update: jest.fn(), delete: jest.fn() },
+  showcaseDailyStat: { upsert: jest.fn() },
   $transaction: jest.fn(),
   $executeRaw: jest.fn().mockResolvedValue(1),
 };
@@ -633,6 +634,34 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
         data: { viewCount: { increment: 1 } },
       });
       expect(result.viewCount).toBe(31);
+    });
+
+    it('records daily popularity signals on a counted view (hotViews CASE + agregat harian)', async () => {
+      await service.getShowcaseDetail(SHOWCASE_ID, VIEWER_ID);
+      // hotViews: satu statement CASE atomik — naik bila bucket hari (WIB)
+      // masih sama, reset ke 1 bila hari berganti.
+      expect(mockPrisma.$executeRaw).toHaveBeenCalled();
+      const sql = String(mockPrisma.$executeRaw.mock.calls[0][0]);
+      expect(sql).toContain('hotViews');
+      expect(sql).toContain('hotViewDate');
+      // Agregat harian: upsert best-effort per (showcase, hari).
+      expect(mockPrisma.showcaseDailyStat.upsert).toHaveBeenCalledWith({
+        where: { showcaseId_date: { showcaseId: SHOWCASE_ID, date: expect.any(Date) } },
+        update: { views: { increment: 1 } },
+        create: { showcaseId: SHOWCASE_ID, date: expect.any(Date), views: 1 },
+      });
+    });
+
+    it('skips the daily aggregate when the row vanished between check and write', async () => {
+      mockPrisma.$executeRaw.mockResolvedValueOnce(0);
+      await service.getShowcaseDetail(SHOWCASE_ID, VIEWER_ID);
+      expect(mockPrisma.showcaseDailyStat.upsert).not.toHaveBeenCalled();
+    });
+
+    it('does not fail the detail request when the daily aggregate write fails', async () => {
+      mockPrisma.showcaseDailyStat.upsert.mockRejectedValueOnce(new Error('db down'));
+      const result = (await service.getShowcaseDetail(SHOWCASE_ID, VIEWER_ID)) as any;
+      expect(result.id).toBe(SHOWCASE_ID);
     });
 
     it('counts a view only once per viewer within the dedupe window', async () => {

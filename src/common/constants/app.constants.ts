@@ -183,6 +183,19 @@ export const SHOWCASE_FEED_DEFAULT_LIMIT = 20;
 export const SHOWCASE_FEED_MAX_LIMIT = 50;
 /** Satu view dihitung sekali per (viewer, showcase) dalam window ini. */
 export const SHOWCASE_VIEW_DEDUPE_TTL_SECONDS = 3600;
+/** Sort "foryou": ukuran pool kandidat per segmen. Pool dibatasi supaya satu
+ *  request feed tidak memuat ribuan baris (tiap item ikut memuat author +
+ *  gambar); skor personal dihitung di aplikasi dari pool ini. */
+export const SHOWCASE_FOR_YOU_AFFINITY_POOL = 150;
+export const SHOWCASE_FOR_YOU_FOLLOWED_POOL = 100;
+export const SHOWCASE_FOR_YOU_RECENT_POOL = 150;
+/** Sort "foryou": batas sinyal yang dibaca untuk membangun profil afinitas. */
+export const SHOWCASE_FOR_YOU_LIKE_SIGNAL_LIMIT = 200;
+export const SHOWCASE_FOR_YOU_FOLLOW_SIGNAL_LIMIT = 500;
+/** Sort "foryou": `now` dibulatkan ke bucket ini supaya skor yang dihitung
+ *  ulang antar-halaman identik bit-per-bit (syarat keyset pagination
+ *  in-memory tetap valid bila halaman 2 diminta beberapa menit kemudian). */
+export const SHOWCASE_FOR_YOU_SCORE_TIME_BUCKET_MS = 15 * 60 * 1000;
 /** SH-B-004: satu share nyata dihitung sekali per (viewer, showcase) dalam window ini. */
 export const SHOWCASE_SHARE_DEDUPE_TTL_SECONDS = 86400;
 export const SHOWCASE_SEARCH_MIN_LENGTH = 2;

@@ -15,6 +15,12 @@ import {
   ORDER_MIN_VALUE,
   SHOWCASE_COMMENT_MAX_LENGTH,
   SHOWCASE_FEED_MAX_LIMIT,
+  SHOWCASE_FOR_YOU_AFFINITY_POOL,
+  SHOWCASE_FOR_YOU_FOLLOWED_POOL,
+  SHOWCASE_FOR_YOU_FOLLOW_SIGNAL_LIMIT,
+  SHOWCASE_FOR_YOU_LIKE_SIGNAL_LIMIT,
+  SHOWCASE_FOR_YOU_RECENT_POOL,
+  SHOWCASE_FOR_YOU_SCORE_TIME_BUCKET_MS,
   SHOWCASE_MAX_IMAGES_ABSOLUTE,
   SHOWCASE_MAX_ITEMS,
   SHOWCASE_REPLY_LIMIT,
@@ -100,8 +106,11 @@ const COMMENT_INCLUDE = {
 } satisfies Prisma.ShowcaseCommentInclude;
 
 /** Versi payload cursor. Naikkan bila struktur cursor berubah supaya cursor lama
- *  ditolak eksplisit (INVALID_CURSOR) alih-alih menghasilkan halaman ngawur. */
-const FEED_CURSOR_VERSION = 1;
+ *  ditolak eksplisit (INVALID_CURSOR) alih-alih menghasilkan halaman ngawur.
+ *  v2 (2026-09-28): `l` pada sort "popular" berubah arti dari likeCount
+ *  (all-time) menjadi hotViews (populer harian); sort "foryou" menambah `s`
+ *  (skor personal). */
+const FEED_CURSOR_VERSION = 2;
 
 /**
  * Sentinel untuk cabang "pemilik melihat itemnya sendiri" pada filter OR.
@@ -114,18 +123,42 @@ const SELF_BRANCH_NEVER_MATCHES = '\u0000anonymous';
 interface FeedCursorPayload {
   /** createdAt baris terakhir, dalam epoch ms. */
   t: number;
-  /** likeCount baris terakhir (dipakai sort `popular`). */
+  /** Kunci numerik baris terakhir: hotViews untuk sort "popular",
+   *  likeCount untuk sort lain (tidak dipakai "latest", tapi tetap diisi
+   *  agar struktur cursor seragam). */
   l: number;
   /** id baris terakhir — tiebreak terakhir, menjamin urutan total. */
   i: string;
+  /** Skor personal baris terakhir — hanya diisi untuk sort "foryou". */
+  s?: number;
 }
 
-function encodeFeedCursor(row: { createdAt: Date; likeCount: number; id: string }): string {
+/**
+ * Tanggal hari kalender berjalan dalam zona Asia/Jakarta, format YYYY-MM-DD.
+ * Dipakai sebagai bucket agregat harian (hotViews, showcase_daily_stats):
+ * "populer harian" berarti populer pada hari kalender ini bagi user Indonesia.
+ */
+function wibToday(): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Jakarta',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
+}
+
+function encodeFeedCursor(
+  row: { createdAt: Date; likeCount: number; hotViews: number; id: string },
+  sort: ShowcaseFeedSort,
+  score?: number,
+): string {
   const payload: { v: number } & FeedCursorPayload = {
     v: FEED_CURSOR_VERSION,
     t: row.createdAt.getTime(),
-    l: row.likeCount,
+    l: sort === 'popular' ? row.hotViews : row.likeCount,
     i: row.id,
+    // Skor personal hanya untuk "foryou" — dipakai keyset in-memory.
+    ...(sort === 'foryou' && typeof score === 'number' ? { s: score } : {}),
   };
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
@@ -145,17 +178,45 @@ function decodeFeedCursor(cursor: string): FeedCursorPayload {
     !Number.isFinite(p.t) ||
     typeof p.l !== 'number' ||
     !Number.isFinite(p.l) ||
+    (p.s !== undefined && (typeof p.s !== 'number' || !Number.isFinite(p.s))) ||
     typeof p.i !== 'string' ||
     p.i.length === 0 ||
     p.i.length > 64
   ) {
     throw new BadRequestException({ code: ErrorCodes.INVALID_CURSOR, message: 'Invalid feed cursor' });
   }
-  return { t: p.t as number, l: p.l as number, i: p.i as string };
+  return {
+    t: p.t as number,
+    l: p.l as number,
+    i: p.i as string,
+    ...(typeof p.s === 'number' ? { s: p.s as number } : {}),
+  };
 }
 
 function toNumber(value: bigint | null): number | null {
   return value === null || value === undefined ? null : Number(value);
+}
+
+/** Profil afinitas viewer untuk sort "foryou" (tab "Untuk Anda"). */
+interface ForYouSignals {
+  /** kategori (lowercase) → jumlah item yang di-like viewer di kategori itu. */
+  categoryAffinity: Map<string, number>;
+  /** id seller yang di-follow viewer. */
+  followedSellerIds: Set<string>;
+}
+
+/**
+ * Urutan total untuk sort "foryou": skor desc, lalu createdAt desc, lalu id
+ * desc — cerminan tiebreak keyset SQL pada sort latest/popular.
+ */
+function compareForYouEntries(
+  a: { row: { createdAt: Date; id: string }; score: number },
+  b: { row: { createdAt: Date; id: string }; score: number },
+): number {
+  if (b.score !== a.score) return b.score - a.score;
+  const timeDiff = b.row.createdAt.getTime() - a.row.createdAt.getTime();
+  if (timeDiff !== 0) return timeDiff;
+  return b.row.id.localeCompare(a.row.id);
 }
 
 @Injectable()
@@ -1031,6 +1092,34 @@ export class ShowcaseService {
       where: { id: showcaseId, deletedAt: null, isActive: true },
       data: { viewCount: { increment: 1 } },
     });
+    // Populer harian: hotViews naik bila bucket hari kalender (WIB) masih
+    // sama, reset ke 1 bila hari sudah berganti — satu statement CASE yang
+    // atomik, tanpa cron. Guard status sama seperti updateMany di atas (R2).
+    const today = wibToday();
+    const touched = await this.prisma.$executeRaw`
+      UPDATE "user_showcases"
+      SET "hotViews" = CASE WHEN "hotViewDate" = ${today}::date THEN "hotViews" + 1 ELSE 1 END,
+          "hotViewDate" = ${today}::date
+      WHERE "id" = ${showcaseId} AND "deletedAt" IS NULL AND "isActive" = TRUE
+    `;
+    // Agregat harian (riwayat popularitas untuk analitik/admin). Best-effort:
+    // metrik non-kritis — kegagalan tulis tidak boleh menggagalkan pencatatan
+    // view (fail-open seperti Redis di atas). Dilewati bila barisnya ternyata
+    // sudah tidak valid di antara check dan tulis (touched = 0).
+    if (touched !== 0) {
+      try {
+        const dayStart = new Date(`${today}T00:00:00Z`);
+        await this.prisma.showcaseDailyStat.upsert({
+          where: { showcaseId_date: { showcaseId, date: dayStart } },
+          update: { views: { increment: 1 } },
+          create: { showcaseId, date: dayStart, views: 1 },
+        });
+      } catch (error) {
+        this.logger.warn(
+          `recordView: agregat harian gagal untuk showcase=${showcaseId}: ${(error as Error)?.message ?? error}`,
+        );
+      }
+    }
     return true;
   }
 
@@ -1040,7 +1129,8 @@ export class ShowcaseService {
 
   async getFeed(viewerId: string | undefined, query: ShowcaseFeedQueryDto): Promise<object> {
     const limit = Math.min(Math.max(1, Math.floor(query.limit ?? 20)), SHOWCASE_FEED_MAX_LIMIT);
-    const sort: ShowcaseFeedSort = query.sort === 'popular' ? 'popular' : 'latest';
+    const sort: ShowcaseFeedSort =
+      query.sort === 'foryou' ? 'foryou' : query.sort === 'popular' ? 'popular' : 'latest';
 
     const excludedIds = await this.getViewerExcludedIds(viewerId);
     const andClauses: Prisma.UserShowcaseWhereInput[] = [];
@@ -1124,9 +1214,30 @@ export class ShowcaseService {
       });
     }
 
+    // Sort "foryou": ranking personal dihitung di aplikasi (butuh sinyal
+    // viewer), jadi jalurnya terpisah dari keyset SQL latest/popular.
+    if (sort === 'foryou') {
+      return this.getForYouFeed(viewerId, baseWhere, andClauses, query, limit);
+    }
+    return this.getRankedFeed(sort, baseWhere, andClauses, query, limit, viewerId);
+  }
+
+  /**
+   * Feed latest/popular dengan keyset pagination di SQL. Sort "popular" =
+   * populer HARIAN: diurutkan menurut hotViews (view pada hari kalender
+   * berjalan, zona Asia/Jakarta) — bukan likeCount all-time.
+   */
+  private async getRankedFeed(
+    sort: 'latest' | 'popular',
+    baseWhere: Prisma.UserShowcaseWhereInput,
+    andClauses: Prisma.UserShowcaseWhereInput[],
+    query: ShowcaseFeedQueryDto,
+    limit: number,
+    viewerId: string | undefined,
+  ): Promise<object> {
     // Keyset: "baris-baris setelah cursor" menurut urutan sort. Menggunakan
     // tuple (sortKey..., id) sehingga hasilnya deterministik walau banyak baris
-    // berbagi createdAt/likeCount yang sama.
+    // berbagi createdAt/hotViews yang sama.
     if (query.cursor) {
       const cursor = decodeFeedCursor(query.cursor);
       const cursorDate = new Date(cursor.t);
@@ -1140,12 +1251,14 @@ export class ShowcaseService {
       // (bucket, id) selalu maju sehingga tidak ada livelock halaman.
       const cursorMsEnd = new Date(cursor.t + 1);
       if (sort === 'popular') {
+        // Kunci keyset = (hotViews, createdAt, id): cursor.l membawa hotViews
+        // baris terakhir (cursor v2).
         andClauses.push({
           OR: [
-            { likeCount: { lt: cursor.l } },
-            { likeCount: cursor.l, createdAt: { lt: cursorDate } },
+            { hotViews: { lt: cursor.l } },
+            { hotViews: cursor.l, createdAt: { lt: cursorDate } },
             {
-              likeCount: cursor.l,
+              hotViews: cursor.l,
               createdAt: { gte: cursorDate, lt: cursorMsEnd },
               id: { lt: cursor.i },
             },
@@ -1165,7 +1278,7 @@ export class ShowcaseService {
       andClauses.length > 0 ? { ...baseWhere, AND: andClauses } : baseWhere;
     const orderBy: Prisma.UserShowcaseOrderByWithRelationInput[] =
       sort === 'popular'
-        ? [{ likeCount: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }]
+        ? [{ hotViews: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }]
         : [{ createdAt: 'desc' }, { id: 'desc' }];
 
     // Ambil limit + 1: satu baris ekstra dipakai untuk memastikan `hasMore`
@@ -1179,6 +1292,175 @@ export class ShowcaseService {
 
     const hasMore = rows.length > limit;
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const nextCursor =
+      hasMore && pageRows.length > 0 ? encodeFeedCursor(pageRows[pageRows.length - 1], sort) : null;
+    return this.serializeFeedPage(viewerId, pageRows, { sort, limit, hasMore, nextCursor });
+  }
+
+  /**
+   * Sort "foryou" (tab "Untuk Anda"): ranking personal per viewer.
+   *
+   * Skor per item = kesegaran + afinitas kategori (dari item yang di-like
+   * viewer) + boost seller yang di-follow + komponen keramaian kecil
+   * (hotViews/likeCount sebagai tiebreak kualitas). Skor bergantung pada
+   * viewer sehingga pengurutan tidak bisa di-keyset di SQL: kandidat diambil
+   * dari 3 pool (afinitas kategori, seller yang di-follow, terbaru — semuanya
+   * memakai filter `where` yang sama persis dengan feed biasa), digabung
+   * (dedupe per id), diberi skor di aplikasi, lalu keyset in-memory memakai
+   * cursor (skor, createdAt, id).
+   *
+   * Tamu (tanpa viewerId) atau user tanpa sinyal (cold start) → fallback ke
+   * populer harian supaya tab tetap berguna.
+   */
+  private async getForYouFeed(
+    viewerId: string | undefined,
+    baseWhere: Prisma.UserShowcaseWhereInput,
+    andClauses: Prisma.UserShowcaseWhereInput[],
+    query: ShowcaseFeedQueryDto,
+    limit: number,
+  ): Promise<object> {
+    const signals = viewerId ? await this.getForYouSignals(viewerId) : null;
+    const hasSignal =
+      !!signals && (signals.categoryAffinity.size > 0 || signals.followedSellerIds.size > 0);
+    if (!hasSignal) {
+      // Fallback: populer harian — deterministik dan sama untuk semua user.
+      return this.getRankedFeed('popular', baseWhere, andClauses, query, limit, viewerId);
+    }
+
+    const where: Prisma.UserShowcaseWhereInput =
+      andClauses.length > 0 ? { ...baseWhere, AND: andClauses } : baseWhere;
+    const orderBy: Prisma.UserShowcaseOrderByWithRelationInput[] = [
+      { createdAt: 'desc' },
+      { id: 'desc' },
+    ];
+    const findPool = (poolWhere: Prisma.UserShowcaseWhereInput, take: number) =>
+      this.prisma.userShowcase
+        .findMany({ where: poolWhere, orderBy, take, include: SHOWCASE_INCLUDE })
+        .then((rows) => rows as unknown as ShowcaseRow[]);
+
+    const likedCategories = [...signals.categoryAffinity.keys()];
+    const followedIds = [...signals.followedSellerIds];
+    // Tiga pool kandidat — semuanya menghormati filter feed yang sama
+    // (visibilitas, blokir, kategori/search/harga/lokasi dari query).
+    const [affinityRows, followedRows, recentRows] = await Promise.all([
+      // Pool 1: item terbaru dari kategori yang disukai viewer.
+      likedCategories.length > 0
+        ? findPool({ ...where, category: { in: likedCategories } }, SHOWCASE_FOR_YOU_AFFINITY_POOL)
+        : Promise.resolve([] as ShowcaseRow[]),
+      // Pool 2: item terbaru dari seller yang di-follow viewer.
+      followedIds.length > 0
+        ? findPool({ ...where, userId: { in: followedIds } }, SHOWCASE_FOR_YOU_FOLLOWED_POOL)
+        : Promise.resolve([] as ShowcaseRow[]),
+      // Pool 3: item terbaru secara umum (discovery + keragaman).
+      findPool(where, SHOWCASE_FOR_YOU_RECENT_POOL),
+    ]);
+
+    const merged = new Map<string, ShowcaseRow>();
+    for (const row of [...affinityRows, ...followedRows, ...recentRows]) {
+      if (!merged.has(row.id)) merged.set(row.id, row);
+    }
+
+    // `now` dibulatkan ke bucket 15 menit supaya skor yang dihitung ulang
+    // antar-request identik bit-per-bit (syarat keyset in-memory tetap valid
+    // bila halaman 2 diminta beberapa menit setelah halaman 1).
+    const nowBucket =
+      Math.floor(Date.now() / SHOWCASE_FOR_YOU_SCORE_TIME_BUCKET_MS) *
+      SHOWCASE_FOR_YOU_SCORE_TIME_BUCKET_MS;
+    const scored = [...merged.values()].map((row) => ({
+      row,
+      score: this.scoreForYouItem(row, signals, nowBucket),
+    }));
+    scored.sort(compareForYouEntries);
+
+    // Keyset in-memory: hanya baris "setelah" cursor (skor, createdAt, id).
+    let after = scored;
+    if (query.cursor) {
+      const cursor = decodeFeedCursor(query.cursor);
+      if (cursor.s === undefined) {
+        throw new BadRequestException({
+          code: ErrorCodes.INVALID_CURSOR,
+          message: 'Invalid feed cursor',
+        });
+      }
+      const cursorMsEnd = cursor.t + 1;
+      const idx = scored.findIndex((entry) => {
+        const t = entry.row.createdAt.getTime();
+        if (entry.score !== cursor.s) return entry.score < (cursor.s as number);
+        if (t < cursor.t) return true;
+        // Bucket [t, t+1ms): presisi cursor hanya milidetik (pola T2) + tiebreak id.
+        if (t >= cursor.t && t < cursorMsEnd) return entry.row.id < cursor.i;
+        return false;
+      });
+      after = idx === -1 ? [] : scored.slice(idx);
+    }
+
+    const hasMore = after.length > limit;
+    const page = hasMore ? after.slice(0, limit) : after;
+    const pageRows = page.map((entry) => entry.row);
+    const nextCursor =
+      hasMore && page.length > 0
+        ? encodeFeedCursor(page[page.length - 1].row, 'foryou', page[page.length - 1].score)
+        : null;
+    return this.serializeFeedPage(viewerId, pageRows, { sort: 'foryou', limit, hasMore, nextCursor });
+  }
+
+  /**
+   * Profil afinitas viewer: kategori dari item yang di-like + seller yang
+   * di-follow. Dua query kecil dan bounded (bukan seluruh riwayat).
+   */
+  private async getForYouSignals(viewerId: string): Promise<ForYouSignals> {
+    const [likes, follows] = await Promise.all([
+      this.prisma.showcaseLike.findMany({
+        where: { userId: viewerId },
+        select: { showcase: { select: { category: true } } },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: SHOWCASE_FOR_YOU_LIKE_SIGNAL_LIMIT,
+      }),
+      this.prisma.follow.findMany({
+        where: { followerId: viewerId },
+        select: { followingId: true },
+        take: SHOWCASE_FOR_YOU_FOLLOW_SIGNAL_LIMIT,
+      }),
+    ]);
+    const categoryAffinity = new Map<string, number>();
+    for (const like of likes) {
+      // Kategori disimpan lowercase (lihat normalizeCategory) — samakan di sini.
+      const cat = like.showcase?.category?.trim().toLowerCase();
+      if (!cat) continue;
+      categoryAffinity.set(cat, (categoryAffinity.get(cat) ?? 0) + 1);
+    }
+    return {
+      categoryAffinity,
+      followedSellerIds: new Set(follows.map((f) => f.followingId)),
+    };
+  }
+
+  /**
+   * Skor personal satu item untuk sort "foryou". Deterministik untuk
+   * (item, sinyal, bucket waktu) yang sama — syarat keyset in-memory.
+   */
+  private scoreForYouItem(row: ShowcaseRow, signals: ForYouSignals, nowBucketMs: number): number {
+    const ageHours = Math.max(0, (nowBucketMs - row.createdAt.getTime()) / 3600000);
+    // Kesegaran: 1000 saat baru lahir, meluruh (setengah tiap 24 jam).
+    let score = 1000 / (1 + ageHours / 24);
+    // Afinitas kategori: makin sering like kategori ini makin besar boost
+    // (cap 5 like supaya satu kategori tidak mendominasi selamanya).
+    const catLikes = row.category ? (signals.categoryAffinity.get(row.category) ?? 0) : 0;
+    if (catLikes > 0) score += 300 * Math.min(catLikes, 5);
+    // Seller yang di-follow: boost tetap yang besar.
+    if (signals.followedSellerIds.has(row.userId)) score += 500;
+    // Keramaian sebagai tiebreak kualitas (cap supaya tidak mengalahkan
+    // sinyal personal).
+    score += Math.min(row.hotViews, 200) * 0.5 + Math.min(row.likeCount, 200);
+    return score;
+  }
+
+  /** Serialisasi satu halaman feed → kontrak respons (dipakai semua sort). */
+  private async serializeFeedPage(
+    viewerId: string | undefined,
+    pageRows: ShowcaseRow[],
+    opts: { sort: ShowcaseFeedSort; limit: number; hasMore: boolean; nextCursor: string | null },
+  ): Promise<object> {
     const likedIds = await this.getLikedShowcaseIds(viewerId, pageRows.map((row) => row.id));
     // S1: badge 3-tier author (satu batch, cached di Redis).
     const badgeMap = await this.getAuthorBadgeMap(pageRows.map((row) => row.user.id));
@@ -1190,10 +1472,10 @@ export class ShowcaseService {
           authorBadges: badgeMap.get(row.user.id) ?? [],
         }),
       ),
-      sort,
-      limit,
-      hasMore,
-      nextCursor: hasMore && pageRows.length > 0 ? encodeFeedCursor(pageRows[pageRows.length - 1]) : null,
+      sort: opts.sort,
+      limit: opts.limit,
+      hasMore: opts.hasMore,
+      nextCursor: opts.nextCursor,
     };
   }
 

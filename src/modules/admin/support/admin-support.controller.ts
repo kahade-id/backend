@@ -56,7 +56,7 @@ export class AdminSupportController {
     @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<object> {
-    return this.service.replyToTicket(ticketId, admin.sub, dto.message, req.ip ?? '');
+    return this.service.replyToTicket(ticketId, admin.sub, dto.message, req.ip ?? '', dto.attachments ?? []);
   }
 
   @UseGuards(UserThrottleGuard)

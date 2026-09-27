@@ -112,14 +112,15 @@ describe('ShowcaseService — listSavedShowcases (BE-IMP item 54)', () => {
       }),
     );
     expect(result.total).toBe(2);
-    expect(result.items).toHaveLength(2);
-    expect(result.items[0].id).toBe(SHOWCASE_ID_2);
-    expect(result.items[0].savedAt).toEqual(new Date('2026-09-03T00:00:00.000Z'));
-    expect(result.items[0].isSaved).toBe(true);
+    // createPaginatedResponse memakai key `data` (konsisten dengan feed & endpoint paginated lain).
+    expect(result.data).toHaveLength(2);
+    expect(result.data[0].id).toBe(SHOWCASE_ID_2);
+    expect(result.data[0].savedAt).toEqual(new Date('2026-09-03T00:00:00.000Z'));
+    expect(result.data[0].isSaved).toBe(true);
     // Bentuk kartu publik sama seperti feed.
-    expect(result.items[0].title).toBe('Karya kedua');
-    expect(result.items[0].author.username).toBe('seller');
-    expect(result.items[0].saveCount).toBe(7);
+    expect(result.data[0].title).toBe('Karya kedua');
+    expect(result.data[0].author.username).toBe('seller');
+    expect(result.data[0].saveCount).toBe(7);
   });
 
   it('mengembalikan daftar kosong ketika user belum menyimpan apa pun', async () => {
@@ -129,7 +130,7 @@ describe('ShowcaseService — listSavedShowcases (BE-IMP item 54)', () => {
     const result = (await service.listSavedShowcases(USER_ID, 1, 20)) as any;
 
     expect(result.total).toBe(0);
-    expect(result.items).toEqual([]);
+    expect(result.data).toEqual([]);
   });
 
   it('page kedua memakai skip yang benar', async () => {

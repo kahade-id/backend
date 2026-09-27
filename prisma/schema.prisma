@@ -1205,9 +1205,13 @@ model NotificationPreference {
 
   // Item 8 (batch 2026-09-28): frekuensi ringkasan notifikasi digest.
   // 'off' = mati (default, perilaku lama), 'daily' = harian, 'weekly' = mingguan.
-  digestFrequency String @default("off")
+  // @map eksplisit: migrasi 20260928030000 memakai snake_case, sedangkan
+  // konvensi tabel ini camelCase tanpa @map — tanpa ini Prisma P2022
+  // (mencari "digestFrequency" yang tidak ada). Ditemukan 2026-09-28 dari
+  // 500 di GET /v1/notifications/unread-count.
+  digestFrequency String @default("off") @map("digest_frequency")
   // Kapan digest terakhir dikirim (dipakai cron untuk hitung jatuh tempo).
-  lastDigestSentAt DateTime?
+  lastDigestSentAt DateTime? @map("last_digest_sent_at")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

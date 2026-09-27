@@ -25,6 +25,10 @@ import { CreateHandoffDto, HandoffQueryDto } from './dto/create-handoff.dto';
  * mendelegasikan ke AdminManagementService (bukan ke controller lain —
  * controller bukan provider sehingga tidak bisa di-inject). Semua
  * guard/decorator direplikasi 1:1 (SUPER_ADMIN, throttle, idempotency).
+ *
+ * ADM-422: kesetaraan guard kedua controller ditegakkan oleh contract test
+ * `tests/admin-ops-alias-guard-contract.spec.ts` — ubah satu sisi tanpa sisi
+ * lain → test gagal.
  */
 @ApiTags('admin-ops')
 @ApiBearerAuth('access-token')

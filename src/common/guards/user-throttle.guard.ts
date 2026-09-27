@@ -52,10 +52,12 @@ export class UserThrottleGuard implements CanActivate {
     try {
       const allowed = await this.redis.evalSlidingWindow(key, windowMs, limit, Date.now());
       if (!allowed) {
+        // ADM-426: sertakan retryAfter agar UI login bisa menampilkan countdown.
         throw new HttpException(
           {
             statusCode: HttpStatus.TOO_MANY_REQUESTS,
             message: 'Too many requests. Please try again later.',
+            retryAfter: Math.ceil(windowMs / 1000),
           },
           HttpStatus.TOO_MANY_REQUESTS,
         );

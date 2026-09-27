@@ -1,4 +1,5 @@
 import { AdminManagementService } from '../admin-management.service';
+import { ADMIN_SESSION_ABSOLUTE_TTL_SECONDS } from '../../../auth/token.service';
 
 import { ForbiddenException } from '@nestjs/common';
 
@@ -25,11 +26,11 @@ describe('AdminManagementService token revocation epochs', () => {
     prisma.adminUser.findFirst.mockResolvedValue({ id: 'target', adminId: 'ADM-1', fullName: 'Target', role: 'KYC_ADMIN', isActive: true, isMfaEnabled: true });
     prisma.adminUser.update.mockResolvedValue({ id: 'target', adminId: 'ADM-1', fullName: 'Target', role: 'FINANCE_ADMIN', isActive: true, isMfaEnabled: true });
 
-    await service.updateAdmin('target', { role: 'FINANCE_ADMIN' } as never, 'updater', '198.51.100.10');
+    await service.updateAdmin('target', { role: 'FINANCE_ADMIN', reason: 'rotasi role uji' } as never, 'updater', '198.51.100.10');
 
     expect(redis.setex).toHaveBeenCalledWith(
       'admin_revoked:target',
-      2 * 60 * 60,
+      ADMIN_SESSION_ABSOLUTE_TTL_SECONDS,
       expect.stringMatching(/^\d+$/),
       { throwOnError: true },
     );
@@ -41,7 +42,7 @@ describe('AdminManagementService token revocation epochs', () => {
 
     await service.resetAdmin2fa('target', 'updater', '198.51.100.10');
 
-    expect(redis.setex).toHaveBeenCalledWith('admin_revoked:target', 2 * 60 * 60, expect.stringMatching(/^\d+$/), { throwOnError: true });
+    expect(redis.setex).toHaveBeenCalledWith('admin_revoked:target', ADMIN_SESSION_ABSOLUTE_TTL_SECONDS, expect.stringMatching(/^\d+$/), { throwOnError: true });
   });
 
   it('revokes old tokens after unlocking an admin account', async () => {
@@ -50,7 +51,7 @@ describe('AdminManagementService token revocation epochs', () => {
 
     await service.unlockAdmin('target', 'updater', '198.51.100.10');
 
-    expect(redis.setex).toHaveBeenCalledWith('admin_revoked:target', 2 * 60 * 60, expect.stringMatching(/^\d+$/), { throwOnError: true });
+    expect(redis.setex).toHaveBeenCalledWith('admin_revoked:target', ADMIN_SESSION_ABSOLUTE_TTL_SECONDS, expect.stringMatching(/^\d+$/), { throwOnError: true });
   });
 
   it('rejects resetting the current admin own 2FA', async () => {
@@ -62,7 +63,7 @@ describe('AdminManagementService token revocation epochs', () => {
   it('rejects demoting the last active super admin', async () => {
     prisma.adminUser.findFirst.mockResolvedValue({ id: 'target', fullName: 'Target', role: 'SUPER_ADMIN', isActive: true });
     prisma.adminUser.count.mockResolvedValue(1);
-    await expect(service.updateAdmin('target', { role: 'CUSTOMER_SUPPORT' } as never, 'updater', '198.51.100.10')).rejects.toBeInstanceOf(ForbiddenException);
+    await expect(service.updateAdmin('target', { role: 'CUSTOMER_SUPPORT', reason: 'uji demosi' } as never, 'updater', '198.51.100.10')).rejects.toBeInstanceOf(ForbiddenException);
     expect(prisma.adminUser.update).not.toHaveBeenCalled();
   });
 
@@ -79,6 +80,6 @@ describe('AdminManagementService token revocation epochs', () => {
 
     await service.deleteAdmin('target', 'deleter', '198.51.100.10');
 
-    expect(redis.setex).toHaveBeenCalledWith('admin_revoked:target', 2 * 60 * 60, expect.stringMatching(/^\d+$/), { throwOnError: true });
+    expect(redis.setex).toHaveBeenCalledWith('admin_revoked:target', ADMIN_SESSION_ABSOLUTE_TTL_SECONDS, expect.stringMatching(/^\d+$/), { throwOnError: true });
   });
 });

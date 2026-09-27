@@ -15,6 +15,7 @@ import {
   Body, Controller, Get, Param, Patch, Post, Query, UseGuards,
 } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
+import { AdminRoute } from '../../common/decorators/public.decorator';
 import { JwtAdminGuard } from '../../common/guards/jwt-admin.guard';
 import { AdminRolesGuard } from '../../common/guards/admin-roles.guard';
 import { AdminRoles } from '../../common/decorators/admin-roles.decorator';
@@ -31,6 +32,7 @@ const SUPER = 'SUPER_ADMIN' as const;
 const ALL_ROLES = ['SUPER_ADMIN', 'DISPUTE_ADMIN', 'KYC_ADMIN', 'FINANCE_ADMIN', 'CUSTOMER_SUPPORT'] as const;
 
 @UseGuards(JwtAdminGuard, AdminRolesGuard)
+@AdminRoute() // ADM-411: lapis kedua — global JwtAuthGuard ikut mewajibkan token admin.
 @Controller('admin/observability')
 @Throttle({ default: { ttl: 60_000, limit: 30 } })
 export class ObservabilityController {

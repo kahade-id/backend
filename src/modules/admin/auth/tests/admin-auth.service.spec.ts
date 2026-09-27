@@ -162,3 +162,77 @@ describe('AdminAuthService refresh account-state enforcement', () => {
     expect(redis.get).not.toHaveBeenCalled();
   });
 });
+
+describe('AdminAuthService revokeAllOwnSessions (ADM-420)', () => {
+  let service: AdminAuthService;
+  const prisma = {
+    adminUser: { findUnique: jest.fn() },
+    adminSession: { updateMany: jest.fn() },
+  };
+  const redis = { get: jest.fn(), setNx: jest.fn(), setex: jest.fn(), del: jest.fn() };
+  // jwt.adminExpiresIn default '30m' bila tidak di-set; uji dengan nilai eksplisit.
+  const config = { get: jest.fn() };
+  const auditLogService = { logAdminAction: jest.fn() };
+  const tokenService = {
+    verifyAdminRefreshToken: jest.fn(),
+    signAdminAccessToken: jest.fn(),
+    signAdminRefreshToken: jest.fn(),
+  };
+
+  beforeEach(() => {
+    jest.resetAllMocks();
+    prisma.adminSession.updateMany.mockResolvedValue({ count: 3 });
+    config.get.mockImplementation((key: string) => {
+      if (key === 'jwt.adminExpiresIn') return '30m';
+      if (key === 'jwt.adminRefreshExpiresIn') return '7d';
+      return undefined;
+    });
+    service = new AdminAuthService(
+      prisma as never,
+      redis as never,
+      config as never,
+      auditLogService as never,
+      tokenService as never,
+    );
+  });
+
+  it('mencabut sesi DB, menaikkan epoch marker, dan mengaudit', async () => {
+    const res = await service.revokeAllOwnSessions('admin-1', '198.51.100.10');
+    expect(res).toMatchObject({ revokedCount: 3 });
+    expect(prisma.adminSession.updateMany).toHaveBeenCalledWith({
+      where: { adminId: 'admin-1', revokedAt: null },
+      data: { revokedAt: expect.any(Date), revokedBy: 'admin-1' },
+    });
+    expect(auditLogService.logAdminAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'ADMIN_SESSION_REVOKED', adminId: 'admin-1' }),
+    );
+  });
+
+  it('TTL marker >= umur absolut sesi 24 jam (menutup jendela fail-open refresh)', async () => {
+    // Dengan access 30m: TTL harus 24 jam (umur absolut sesi, SEC-502),
+    // bukan 2 jam — refresh token curian (< 24 jam) tidak boleh bangkit
+    // setelah marker kedaluwarsa.
+    await service.revokeAllOwnSessions('admin-1', '198.51.100.10');
+    expect(redis.setex).toHaveBeenCalledWith(
+      'admin_revoked:admin-1',
+      24 * 60 * 60,
+      expect.stringMatching(/^\d+$/),
+      { throwOnError: true },
+    );
+  });
+
+  it('TTL marker mengikuti access TTL bila dikonfigurasi lebih panjang dari 24 jam', async () => {
+    config.get.mockImplementation((key: string) => {
+      if (key === 'jwt.adminExpiresIn') return '48h';
+      if (key === 'jwt.adminRefreshExpiresIn') return '7d';
+      return undefined;
+    });
+    await service.revokeAllOwnSessions('admin-1', '198.51.100.10');
+    expect(redis.setex).toHaveBeenCalledWith(
+      'admin_revoked:admin-1',
+      48 * 60 * 60,
+      expect.stringMatching(/^\d+$/),
+      { throwOnError: true },
+    );
+  });
+});

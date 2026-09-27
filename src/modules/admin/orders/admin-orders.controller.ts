@@ -10,6 +10,7 @@ import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
 import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
+import { AdminJwtPayload } from '../../../common/types/jwt-payload.types';
 import { Idempotency } from '../../../common/decorators/idempotency.decorator';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
 
@@ -41,17 +42,23 @@ export class AdminOrdersController {
   @Idempotency()
   @UseGuards(UserThrottleGuard)
   @AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN')
-  @ApiOperation({ summary: 'Force cancel order', description: 'Admin force-cancels an order with optional escrow refund.' })
+  @ApiOperation({
+    summary: 'Force cancel order',
+    description:
+      'Admin force-cancels an order with optional escrow refund. ' +
+      'ADM-404: DISPUTE_ADMIN hanya untuk order dengan dispute aktif; di luar itu butuh SUPER_ADMIN. Reason wajib (min 10 karakter).',
+  })
   @ApiResponse({ status: 200, description: 'Order force-cancelled.' })
   @ApiResponse({ status: 400, description: 'Invalid order status for cancellation.' })
+  @ApiResponse({ status: 403, description: 'DISPUTE_ADMIN di luar konteks dispute aktif.' })
   @ApiResponse({ status: 404, description: 'Order not found.' })
   forceCancel(
     @Param('orderId', ParseIdPipe) orderId: string,
     @Body() dto: ForceActionDto,
-    @CurrentAdmin('sub') adminId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<{ orderId: string; status: string }> {
-    return this.service.forceCancel(orderId, adminId, dto, req.ip || 'unknown');
+    return this.service.forceCancel(orderId, admin.sub, admin.role, dto, req.ip || 'unknown');
   }
 
   @Post(':orderId/force-complete')

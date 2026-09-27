@@ -19,6 +19,7 @@ import { toIdr } from '../../../common/utils/currency.util';
 import { parseDateBoundaryWIB, startOfDayWIB, toWIB } from '../../../common/utils/date.util';
 import { DashboardService } from '../dashboard/dashboard.service';
 import { maskSecretsDeep, toInitials } from './finance-secrets.util';
+import { withCsvExportWatermark } from '../../../common/utils/csv-watermark.util';
 import { URGENT_INVARIANT } from './reconciliation-findings.service';
 
 export type TimelineEventKind = 'LEDGER' | 'WEBHOOK' | 'PROVIDER' | 'REVERSAL';
@@ -176,7 +177,7 @@ export class AdminFinanceService {
 
     this.auditLog.logAdminAction({
       adminId,
-      action: AuditAction.ADMIN_ACTION,
+      action: AuditAction.FINANCE_TRANSACTION_VIEWED,
       targetType: 'WalletTransaction',
       targetId: (detail as { id: string }).id,
       description: `Viewed transaction detail ${(detail as { txId: string }).txId}`,
@@ -277,7 +278,7 @@ export class AdminFinanceService {
         maskedNumber = `****${plain.slice(-4)}`;
         this.auditLog.logAdminAction({
           adminId,
-          action: AuditAction.ADMIN_ACTION,
+          action: AuditAction.BANK_ACCOUNT_NUMBER_ACCESSED,
           targetType: 'BankAccount',
           targetId: result.bankAccount.id ?? 'unknown',
           description: 'Bank account number decrypted for withdrawal detail view',
@@ -465,7 +466,7 @@ export class AdminFinanceService {
 
     this.auditLog.logAdminAction({
       adminId,
-      action: AuditAction.ADMIN_ACTION,
+      action: AuditAction.FINANCE_TRANSACTION_VIEWED,
       targetType: 'WalletTransaction',
       targetId: detail.id,
       description: `Viewed transaction timeline ${detail.txId}`,
@@ -482,7 +483,8 @@ export class AdminFinanceService {
    * E3: ekspor CSV laporan rekonsiliasi TANPA PII — identitas pengguna hanya
    * inisial (tanpa userId/email/nomor telepon).
    */
-  async buildFindingsCsvExport(): Promise<string> {
+  // ADM-429: exporterAdminId dipakai untuk watermark keterlacakan di baris awal CSV.
+  async buildFindingsCsvExport(exporterAdminId: string): Promise<string> {
     const findings = await this.prisma.reconciliationFinding.findMany({
       orderBy: { createdAt: 'desc' },
       take: 5000,
@@ -524,7 +526,8 @@ export class AdminFinanceService {
           .join(','),
       );
     }
-    return lines.join('\n') + '\n';
+    // ADM-429: watermark pengekspor di baris awal CSV untuk keterlacakan kebocoran.
+    return withCsvExportWatermark(lines.join('\n') + '\n', exporterAdminId, 'admin/finance/reconcile-findings/export');
   }
 
   async getFinancialSummary(): Promise<object> {
@@ -645,7 +648,8 @@ export class AdminFinanceService {
    * agregat — tanpa PII. Nilai dikutip (CSV-safe) dan nested object
    * di-flatten agar tidak ada sel JSON mentah.
    */
-  async buildFinanceCsvExport(from: Date, to: Date): Promise<string> {
+  // ADM-429: exporterAdminId dipakai untuk watermark keterlacakan di baris awal CSV.
+  async buildFinanceCsvExport(from: Date, to: Date, exporterAdminId: string): Promise<string> {
     const summary = (await this.getFinancialSummary()) as Record<string, unknown>;
 
     type DailyRow = { day: Date; total: bigint; cnt: bigint };
@@ -723,7 +727,8 @@ export class AdminFinanceService {
         ].map(csvCell).join(','),
       );
     }
-    return lines.join('\n') + '\n';
+    // ADM-429: watermark pengekspor di baris awal CSV untuk keterlacakan kebocoran.
+    return withCsvExportWatermark(lines.join('\n') + '\n', exporterAdminId, 'admin/finance/export');
   }
 
   async listPendingWithdrawals(
@@ -768,7 +773,7 @@ export class AdminFinanceService {
             maskedAccountNumber = `****${plain.slice(-4)}`;
             this.auditLog.logAdminAction({
               adminId,
-              action: AuditAction.ADMIN_ACTION,
+              action: AuditAction.BANK_ACCOUNT_NUMBER_ACCESSED,
               targetType: 'BankAccount',
               targetId: tx.bankAccount.id ?? 'unknown',
               description: 'Bank account number decrypted for withdrawal list view',
@@ -870,7 +875,7 @@ export class AdminFinanceService {
       const plainAccountNumber = await decryptAES(tx.bankAccount.accountNumber);
       this.auditLog.logAdminAction({
         adminId,
-        action: AuditAction.ADMIN_ACTION,
+        action: AuditAction.BANK_ACCOUNT_NUMBER_ACCESSED,
         targetType: 'BankAccount',
         targetId: tx.bankAccount.id ?? 'unknown',
         description: `Bank account number decrypted for payout processing (tx: ${tx.txId})`,
@@ -912,7 +917,7 @@ export class AdminFinanceService {
       });
       this.auditLog.logAdminAction({
         adminId,
-        action: AuditAction.ADMIN_ACTION,
+        action: AuditAction.WITHDRAWAL_PAYOUT_UNCONFIRMED,
         targetType: 'WalletTransaction',
         targetId: tx.id,
         description: `Withdrawal payout submission could not be confirmed for ${tx.txId ?? tx.id}; retained in PROCESSING for Iris reconciliation`,
@@ -929,7 +934,7 @@ export class AdminFinanceService {
 
     this.auditLog.logAdminAction({
       adminId,
-      action: AuditAction.ADMIN_ACTION,
+      action: AuditAction.WITHDRAWAL_APPROVED,
       targetType: 'WalletTransaction',
       targetId: tx.id,
       description: `Approved withdrawal payout ${tx.txId ?? tx.id}`,
@@ -1061,7 +1066,7 @@ export class AdminFinanceService {
 
     this.auditLog.logAdminAction({
       adminId,
-      action: AuditAction.ADMIN_ACTION,
+      action: AuditAction.WITHDRAWAL_REJECTED,
       targetType: 'WalletTransaction',
       targetId: tx.id,
       description: `Rejected withdrawal ${tx.txId ?? tx.id} (refunded to user)${adminNote ? ': ' + adminNote : ''}`,
@@ -1082,7 +1087,7 @@ export class AdminFinanceService {
   logReconciliation(adminId: string, userId: string, clean: boolean, ipAddress: string): void {
     this.auditLog.logAdminAction({
       adminId,
-      action: AuditAction.ADMIN_ACTION,
+      action: AuditAction.WALLET_RECONCILED,
       targetType: 'Wallet',
       targetId: userId,
       description: `Admin reconciled wallet for user ${userId} — ${clean ? 'clean' : 'discrepancy found'}`,

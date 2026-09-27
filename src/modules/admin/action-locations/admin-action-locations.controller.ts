@@ -37,10 +37,10 @@ class ActionLocationsQueryDto {
 @ApiTags('admin-action-locations')
 @ApiBearerAuth('access-token')
 @UseGuards(JwtAdminGuard, AdminRolesGuard)
-// Tidak ada role fraud di enum AdminRole — lokasi aksi sensitif adalah data
-// keamanan/fraud: SUPER_ADMIN penuh + DISPUTE_ADMIN (membutuhkan konteks
-// lokasi saat menangani sengketa/banding).
-@AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN')
+// ADM-421: lokasi aksi adalah data keamanan/fraud yang sensitif — SUPER_ADMIN-only.
+// Tidak ada konsumen UI untuk DISPUTE_ADMIN (satu-satunya pemanggil UI adalah
+// halaman detail user yang section lokasinya pun hanya tampil untuk SUPER_ADMIN).
+@AdminRoles('SUPER_ADMIN')
 @AdminRoute()
 @Controller('admin/action-locations')
 export class AdminActionLocationsController {

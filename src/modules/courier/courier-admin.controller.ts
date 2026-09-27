@@ -1,5 +1,11 @@
 /**
  * courier-admin.controller.ts — endpoint admin /v1/admin/courier/* (G247–G249).
+ *
+ * ADM-412 (2026-09-27): endpoint tulis di bawah ini (bills, refunds decide/mark-paid,
+ * catalog PATCH, flags) BELUM memiliki pemanggil di admin web — attack surface tanpa
+ * konsumen UI. Guard tetap ketat (SUPER_ADMIN untuk mutasi). Keputusan produk yang
+ * dibutuhkan: (a) bangun UI-nya, atau (b) nonaktifkan endpoint sampai UI siap.
+ * Jangan menambah pemanggil baru tanpa meninjau ulang kebutuhan bisnisnya.
  */
 import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';

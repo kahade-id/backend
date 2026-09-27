@@ -578,6 +578,53 @@ export class AdminAuthService {
     return { message: 'Logout successful' };
   }
 
+  /**
+   * ADM-420 — self-service "keluar dari semua perangkat" untuk admin.
+   *
+   * Mencabut SEMUA sesi milik admin pemanggil (termasuk sesi saat ini):
+   *  - tandai semua baris AdminSession aktif sebagai revoked,
+   *  - naikkan epoch `admin_revoked:<adminId>` di Redis → SELURUH access token
+   *    DAN refresh token admin ini menjadi tidak valid (fail-closed),
+   *  - catat audit ADMIN_SESSION_REVOKED.
+   *
+   * Catatan desain: token akses admin bersifat stateless tanpa tautan jti
+   * per-sesi, sehingga "cabut sesi lain tapi pertahankan sesi ini" tidak bisa
+   * ditegakkan untuk token yang sudah terbit — pilihannya hanya cabut-semua.
+   * Klien WAJIB mengarahkan ke /login setelah memanggil endpoint ini karena
+   * token yang dipakai untuk memanggil ikut mati.
+   */
+  async revokeAllOwnSessions(adminId: string, ipAddress: string): Promise<{ message: string; revokedCount: number }> {
+    const { count } = await this.prisma.adminSession.updateMany({
+      where: { adminId, revokedAt: null },
+      data: { revokedAt: new Date(), revokedBy: adminId },
+    });
+    // Fail-safe: batalkan juga seluruh JWT (akses + refresh) yang beredar.
+    // ADM-420: TTL marker = max(umur access token, umur absolut sesi 24 jam).
+    // Refresh token dihormati sampai min(refresh TTL, 24 jam absolut / SEC-502);
+    // marker yang kedaluwarsa lebih dulu membuka jendela fail-open di mana
+    // refresh token curian menerbitkan access token baru. Lebih lama = lebih aman.
+    const revokedMarkerTtlSeconds = Math.max(
+      this.getAdminAccessTokenTtlSeconds(),
+      ADMIN_SESSION_ABSOLUTE_TTL_SECONDS,
+    );
+    await this.redis.setex(`admin_revoked:${adminId}`, revokedMarkerTtlSeconds, String(Math.floor(Date.now() / 1000)), {
+      throwOnError: true,
+    });
+    this.auditLogService.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_SESSION_REVOKED,
+      targetType: 'AdminUser',
+      targetId: adminId,
+      description: `Admin revoked all own sessions (self-service, ${count} session(s))`,
+      after: { revokedCount: count, selfService: true },
+      ipAddress,
+    });
+    return {
+      message: 'Semua sesi Anda telah dicabut, termasuk sesi ini. Silakan login ulang.',
+      revokedCount: count,
+    };
+  }
+
   async getProfile(
     adminId: string,
   ): Promise<{

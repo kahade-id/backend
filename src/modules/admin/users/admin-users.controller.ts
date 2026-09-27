@@ -224,8 +224,8 @@ export class AdminUsersController {
 
   @Post(':userId/verified/gray/revoke')
   @UseGuards(UserThrottleGuard)
-  @AdminRoles('SUPER_ADMIN', 'KYC_ADMIN')
-  @ApiOperation({ summary: 'Revoke gray verified tier', description: 'Mencabut tier abu (Terverifikasi Penuh) manual. Syarat otomatis tidak diubah; badge hilang sampai di-restore. SUPER_ADMIN dan KYC_ADMIN.' })
+  @AdminRoles('SUPER_ADMIN')
+  @ApiOperation({ summary: 'Revoke gray verified tier', description: 'Mencabut tier abu (Terverifikasi Penuh) manual. Syarat otomatis tidak diubah; badge hilang sampai di-restore. SUPER_ADMIN only (ADM-410).' })
   @ApiResponse({ status: 200, description: 'Gray tier revoked.' })
   @ApiResponse({ status: 403, description: 'Insufficient admin role, or cannot revoke own tier.' })
   @ApiResponse({ status: 404, description: 'User not found.' })
@@ -241,8 +241,8 @@ export class AdminUsersController {
 
   @Post(':userId/verified/gray/restore')
   @UseGuards(UserThrottleGuard)
-  @AdminRoles('SUPER_ADMIN', 'KYC_ADMIN')
-  @ApiOperation({ summary: 'Restore gray verified tier', description: 'Mengembalikan tier abu (Terverifikasi Penuh) yang sebelumnya di-revoke. SUPER_ADMIN dan KYC_ADMIN.' })
+  @AdminRoles('SUPER_ADMIN')
+  @ApiOperation({ summary: 'Restore gray verified tier', description: 'Mengembalikan tier abu (Terverifikasi Penuh) yang sebelumnya di-revoke. SUPER_ADMIN only (ADM-410).' })
   @ApiResponse({ status: 200, description: 'Gray tier restored.' })
   @ApiResponse({ status: 400, description: 'Gray tier is not revoked.' })
   @ApiResponse({ status: 403, description: 'Insufficient admin role.' })
@@ -384,12 +384,11 @@ export class AdminUsersController {
     return this.service.getExportJobStatus(jobId, admin.sub);
   }
 
-  @Post(':userId/impersonate')
-  @AdminRoles('SUPER_ADMIN')
-  @ApiOperation({ summary: 'Impersonate user (19.3)' })
-  async impersonate(@Param('userId', ParseIdPipe) userId: string, @CurrentAdmin() admin: AdminJwtPayload, @Req() req: Request): Promise<object> {
-    return this.service.impersonateUser(userId, admin.sub, req.ip || 'unknown');
-  }
+  // ADM-401: endpoint POST :userId/impersonate DIHAPUS total (2026-09-27).
+  // Token impersonate sebelumnya adalah string unsigned `imp_<adminId>_<userId>_<timestamp>`
+  // (self-asserted, mudah ditebak, tanpa validasi server-side) — tidak boleh ada di produk keuangan.
+  // Sampai ada desain impersonasi yang benar (scoped JWT 5 menit, single-use, diaudit),
+  // endpoint ini tidak dikembalikan.
 
   // ─────────────────────────────────────────────────────────────────
   // GAP-A (G067): status penghapusan akun + legal hold.
@@ -407,7 +406,9 @@ export class AdminUsersController {
   }
 
   @Post(':userId/deletion/legal-hold')
-  @AdminRoles('SUPER_ADMIN', 'CUSTOMER_SUPPORT')
+  // ADM-413: legal hold adalah tindakan berkonsekuensi hukum (menahan hak hapus data) —
+  // hanya SUPER_ADMIN. CUSTOMER_SUPPORT tidak lagi bisa menaruh/melepas hold.
+  @AdminRoles('SUPER_ADMIN')
   @ApiOperation({
     summary: 'Tahan penghapusan (legal hold)',
     description:
@@ -426,7 +427,8 @@ export class AdminUsersController {
   }
 
   @Post(':userId/deletion/release-hold')
-  @AdminRoles('SUPER_ADMIN', 'CUSTOMER_SUPPORT')
+  // ADM-413: lihat catatan pada legal-hold — hanya SUPER_ADMIN.
+  @AdminRoles('SUPER_ADMIN')
   @ApiOperation({
     summary: 'Lepas legal hold penghapusan',
     description: 'Kembalikan request ON_HOLD menjadi aktif (REQUESTED) dengan purgeAt yang sama.',

@@ -16,6 +16,7 @@ import { toSen, toIdr } from '../../../common/utils/currency.util';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { OtpService } from '../../auth/otp.service';
+import { withCsvExportWatermark } from '../../../common/utils/csv-watermark.util';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { EMAIL_QUEUE, EmailJobData } from '../../queue/processors/email.processor';
 import { generateNotifId, generateWalletTxId } from '../../../common/utils/id-generator.util';
@@ -734,7 +735,7 @@ export class AdminUsersService {
   async getUserAuditLog(userId: string, page = 1, limit = 20, adminId?: string, ipAddress?: string): Promise<object> {
     const id = await this.resolveUserId(userId);
     if (adminId) {
-      this.auditLog.logAdminAction({ adminId, action: AuditAction.ADMIN_ACTION, targetType: 'AuditLog', targetId: id, description: `Viewed user audit log (page=${page})`, ipAddress: ipAddress || 'unknown' });
+      this.auditLog.logAdminAction({ adminId, action: AuditAction.AUDIT_LOG_VIEWED, targetType: 'AuditLog', targetId: id, description: `Viewed user audit log (page=${page})`, ipAddress: ipAddress || 'unknown' });
     }
     const safeLimit = Math.min(limit, 100);
     const skip = (page - 1) * safeLimit;
@@ -879,31 +880,10 @@ export class AdminUsersService {
     return { message: 'Password reset email sent to user' };
   }
 
-  async impersonateUser(userId: string, adminId: string, ipAddress: string): Promise<object> {
-    const id = await this.resolveUserId(userId);
-    const user = await this.prisma.user.findUnique({ where: { id }, select: { id: true, userId: true, email: true, isBanned: true, isActive: true } });
-    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
-    if (user.isBanned || !user.isActive) throw new BadRequestException({ code: ErrorCodes.ACCOUNT_INACTIVE, message: 'Cannot impersonate inactive/banned user' });
-
-    // Generate a short-lived impersonation token (15 min) - in real prod use JWT service
-    const impersonationToken = `imp_${adminId}_${id}_${Date.now()}`;
-
-    this.auditLog.logAdminAction({
-      adminId,
-      action: AuditAction.ADMIN_ACTION,
-      targetType: 'User',
-      targetId: id,
-      description: `Admin ${adminId} impersonated user ${id} (token ${impersonationToken.slice(0, 20)}...)`,
-      ipAddress,
-    });
-
-    return {
-      impersonationToken,
-      userId: user.userId,
-      expiresIn: 900,
-      warning: 'This token is for debugging only, limited scope, expires in 15 minutes',
-    };
-  }
+  // ADM-401/ADM-407: impersonateUser DIHAPUS total (2026-09-27).
+  // Token impersonate sebelumnya unsigned & guessable (`imp_<adminId>_<userId>_<timestamp>`)
+  // dan fragmennya ditulis ke audit log. Kedua pola dilarang di produk keuangan:
+  // jangan pernah menulis material mirip kredensial ke audit log.
 
   // ══════════════════════════════════════════════════════════════
   // GAP-E — Timeline moderasi pengguna
@@ -1307,7 +1287,8 @@ export class AdminUsersService {
     const stamp = new Date().toISOString().slice(0, 10);
     return {
       kind: 'sync',
-      csv: '\uFEFF' + lines.join('\n'),
+      // ADM-429: watermark pengekspor di baris awal CSV untuk keterlacakan kebocoran.
+      csv: withCsvExportWatermark('\uFEFF' + lines.join('\n'), adminId, 'admin/users/export'),
       filename: `kahade-users-${stamp}.csv`,
       rowCount,
     };
@@ -1364,7 +1345,8 @@ export class AdminUsersService {
         if (batch.length < AdminUsersService.EXPORT_BATCH_SIZE) break;
       }
 
-      const csv = '\uFEFF' + lines.join('\n');
+      // ADM-429: watermark pengekspor di baris awal CSV untuk keterlacakan kebocoran.
+      const csv = withCsvExportWatermark('\uFEFF' + lines.join('\n'), job.adminId, 'admin/users/export');
       // ST-019: enkripsi at-rest, pola sama seperti ekspor akun.
       const encrypted = await encryptAES(Buffer.from(csv, 'utf-8').toString('base64'));
       const fileKey = `uploads/admin-exports/${job.adminId}/${jobId}.csv`;

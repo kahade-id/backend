@@ -17,10 +17,11 @@ interface MulterFile {
   size: number;
   buffer: Buffer;
 }
-import { UploadService } from './upload.service';
+import { UploadService, DirectUploadResult } from './upload.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { PresignedUrlDto, UploadPurpose } from './dto/presigned-url.dto';
 import { ConfirmUploadDto } from './dto/confirm-upload.dto';
+import { UPLOAD_DIRECT_MULTER_MAX_BYTES } from '../../common/constants/app.constants';
 
 class CleanupFilesDto {
   @IsArray()
@@ -90,15 +91,16 @@ export class UploadController {
     },
   })
   // Batch 1A (ST-009): batas multer diselaraskan ke batas purpose maksimum
-  // (50 MB untuk CHAT_ATTACHMENT / DISPUTE_EVIDENCE). Validasi per-purpose
-  // tetap ditegakkan di UploadService.uploadDirect() — multer hanya guard kasar.
-  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 50 * 1024 * 1024 } }))
+  // (105 MiB — sedikit di atas batas video showcase 100 MiB, batch 19 TIM A).
+  // Validasi per-purpose tetap ditegakkan di UploadService.uploadDirect() —
+  // multer hanya guard kasar.
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: UPLOAD_DIRECT_MULTER_MAX_BYTES } }))
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   async uploadDirect(
     @CurrentUser('sub') userId: string,
     @UploadedFile() file: MulterFile,
     @Body('purpose') purpose: string,
-  ): Promise<{ fileKey: string; fileUrl: string }> {
+  ): Promise<DirectUploadResult> {
     if (!file) {
       throw new BadRequestException({ code: 'VALIDATION_ERROR', message: 'File is required' });
     }

@@ -938,6 +938,9 @@ model User {
   showcaseItems             UserShowcase[]
   // Section 3: interaksi sosial pada showcase (like & komentar)
   showcaseLikes             ShowcaseLike[]
+  // Batch 19 TIM A (item 3 & 4): save showcase + highlight etalase
+  showcaseSaves             ShowcaseSave[]
+  highlights                UserHighlight[]
   showcaseComments          ShowcaseComment[]
   scheduledWithdrawals      ScheduledWithdrawal[]     @relation("UserScheduledWithdrawals")
   deliveryProofsSubmitted   DeliveryProof[]           @relation("DeliveryProofSubmitter")
@@ -3540,12 +3543,18 @@ model UserShowcase {
   isActive        Boolean            @default(true)
   sortOrder       Int                @default(0)
 
+  /// Batch 19 TIM A (item 6): kondisi barang. Nullable — item lama tanpa
+  /// kondisi tetap muncul bila filter ?condition= tidak dipakai.
+  condition ShowcaseCondition?
+
   /// Counter denormalisasi. Selalu di-update lewat Prisma atomic increment
   /// ({ increment } / { decrement }) di dalam transaksi yang sama dengan
   /// mutasi barisnya — pola TransactionTemplatesService.recordUsage.
   likeCount    Int @default(0)
   commentCount Int @default(0)
   viewCount    Int @default(0)
+  /// Batch 19 TIM A (item 3): jumlah user yang menyimpan (save) item ini.
+  saveCount    Int @default(0)
   /// Jumlah kali deep link share dibuka/dibagikan. Di-increment atomik saat
   /// GET /v1/showcase/:id/share (pola atomic counter seperti likeCount).
   shareCount   Int @default(0)
@@ -3559,6 +3568,8 @@ model UserShowcase {
 
   images     ShowcaseImage[]
   likes      ShowcaseLike[]
+  saves      ShowcaseSave[]
+  highlightItems UserHighlightItem[]
   comments   ShowcaseComment[]
   reports    ShowcaseReport[]
   dailyStats ShowcaseDailyStat[]
@@ -3608,6 +3619,47 @@ model ShowcaseDailyStat {
   @@map("showcase_daily_stats")
 }
 
+/// Highlight etalase (batch 19 TIM A, item 4): koleksi pilihan berisi
+/// produk-produk etalase milik user, dengan cover opsional.
+model UserHighlight {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title        String  @db.VarChar(80)
+  /// Id ShowcaseImage milik salah satu etalase milik user (divalidasi di
+  /// service; nullable = pakai media pertama produk pertama sebagai cover).
+  /// SENGAJA tanpa FK ke showcase_images: media bisa dihapus user kapan saja,
+  /// dan cover yang menunjuk media terhapus cukup diabaikan (fallback cover).
+  coverMediaId String?
+  sortOrder    Int     @default(0)
+
+  items UserHighlightItem[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([userId, sortOrder])
+  @@map("user_highlights")
+}
+
+/// Item produk di dalam sebuah highlight (many-to-many terurut).
+model UserHighlightItem {
+  id          String        @id @default(cuid())
+  highlightId String
+  highlight   UserHighlight @relation(fields: [highlightId], references: [id], onDelete: Cascade)
+  showcaseId  String
+  showcase    UserShowcase  @relation(fields: [showcaseId], references: [id], onDelete: Cascade)
+  sortOrder   Int           @default(0)
+
+  createdAt DateTime @default(now())
+
+  @@unique([highlightId, showcaseId])
+  @@index([highlightId, sortOrder])
+  @@map("user_highlight_items")
+}
+
 /// Laporan user terhadap item showcase (Etalase). Satu user hanya boleh
 /// melaporkan satu item sekali — duplikat dicegah via unique constraint
 /// (showcaseId, reporterId). Diproses oleh admin via antrean moderasi.
@@ -3648,6 +3700,14 @@ enum ShowcaseVisibility {
   PRIVATE
 }
 
+/// Kondisi barang etalase (batch 19 TIM A, item 6).
+/// BARU = barang baru; BEKAS = barang bekas/second. Nullable di UserShowcase —
+/// item lama tanpa kondisi tetap muncul bila filter ?condition= tidak dipakai.
+enum ShowcaseCondition {
+  BARU
+  BEKAS
+}
+
 /// Kategori alasan konten disembunyikan oleh moderator. Dipakai bersama oleh
 /// ShowcaseComment (Section 3) dan ProfileQuestion (Section 4) supaya alasan
 /// moderasi konsisten di seluruh platform.
@@ -3673,6 +3733,19 @@ model ShowcaseImage {
   fileKey   String? @db.VarChar(512)
   sortOrder Int     @default(0)
 
+  // Batch 19 TIM A (item 1 & 2) — media etalase bukan cuma gambar:
+  // kind: 'image' | 'video' | 'spin360'. Default 'image' agar baris lama aman.
+  // 'video': imageUrl = URL file video; thumbnailUrl = JPEG preview (ffmpeg).
+  // 'spin360': satu set foto berurutan (8-24 frame) diikat groupKey yang sama,
+  //   diurut groupOrder 0..n-1.
+  kind         String  @default("image") @db.VarChar(16)
+  thumbnailUrl String? @db.VarChar(512)
+  durationSec  Int?
+  width        Int?
+  height       Int?
+  groupKey     String? @db.VarChar(64)
+  groupOrder   Int?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -3695,6 +3768,24 @@ model ShowcaseLike {
   @@index([showcaseId, createdAt, id])
   @@index([userId])
   @@map("showcase_likes")
+}
+
+/// Save (bookmark) pada showcase — prasyarat endpoint GET savers (batch 19
+/// TIM A, item 3). Unique (userId, showcaseId) ditegakkan di DB supaya dua
+/// request balapan tidak menghasilkan save ganda / counter melenceng.
+model ShowcaseSave {
+  id         String       @id @default(cuid())
+  showcaseId String
+  showcase   UserShowcase @relation(fields: [showcaseId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, showcaseId])
+  @@index([showcaseId, createdAt, id])
+  @@index([userId])
+  @@map("showcase_saves")
 }
 
 /// Komentar showcase dengan balasan bersarang satu tingkat (parentId).

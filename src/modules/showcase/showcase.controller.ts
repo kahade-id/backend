@@ -261,6 +261,78 @@ export class ShowcaseController {
     return this.showcaseService.unlikeShowcase(userId, showcaseId);
   }
 
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Post(':showcaseId/save')
+  @Idempotency()
+  @ApiOperation({
+    summary: 'Save (bookmark) a showcase item',
+    description:
+      'Batch 19 TIM A (item 3). Menyimpan item ke koleksi pribadi. Sudah save → 409 SHOWCASE_ALREADY_SAVED.',
+  })
+  async saveShowcase(
+    @CurrentUser('sub') userId: string,
+    @Param('showcaseId', ParseIdPipe) showcaseId: string,
+  ): Promise<object> {
+    return this.showcaseService.saveShowcase(userId, showcaseId);
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Delete(':showcaseId/save')
+  @Idempotency()
+  @ApiOperation({ summary: 'Remove your save from a showcase item' })
+  async unsaveShowcase(
+    @CurrentUser('sub') userId: string,
+    @Param('showcaseId', ParseIdPipe) showcaseId: string,
+  ): Promise<object> {
+    return this.showcaseService.unsaveShowcase(userId, showcaseId);
+  }
+
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @Get(':showcaseId/likers')
+  @ApiOperation({
+    summary: 'List users who liked a showcase item (public, paginated)',
+    description:
+      'Batch 19 TIM A (item 3). Publik — item PRIVATE / tidak visible → 404. ' +
+      'Pagination offset (?page&limit, maks 100) + tiebreak id agar stabil.',
+  })
+  async listLikers(
+    @Param('showcaseId', ParseIdPipe) showcaseId: string,
+    @CurrentUser('sub') viewerId: string | null,
+    @Query() pagination: PaginationDto,
+  ): Promise<object> {
+    return this.showcaseService.listLikers(
+      showcaseId,
+      viewerId ?? undefined,
+      pagination.page ?? 1,
+      pagination.limit ?? 20,
+    );
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @Get(':showcaseId/savers')
+  @ApiOperation({
+    summary: 'List users who saved a showcase item (owner only)',
+    description:
+      'Batch 19 TIM A (item 3). PRIVASI: hanya pemilik produk. ' +
+      'Bukan pemilik → 403 SHOWCASE_FORBIDDEN. Bentuk respons sama seperti likers (savedAt).',
+  })
+  async listSavers(
+    @CurrentUser('sub') userId: string,
+    @Param('showcaseId', ParseIdPipe) showcaseId: string,
+    @Query() pagination: PaginationDto,
+  ): Promise<object> {
+    return this.showcaseService.listSavers(
+      userId,
+      showcaseId,
+      pagination.page ?? 1,
+      pagination.limit ?? 20,
+    );
+  }
+
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Get(':showcaseId')

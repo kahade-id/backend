@@ -31,6 +31,7 @@ import { QaReportDto, QaAppealDto } from './dto/qa-report.dto';
 import { OgMetadataService } from './og-metadata.service';
 import { VerificationBadgeService } from './verification-badge.service';
 import { ShowcaseService } from '../showcase/showcase.service';
+import { HighlightsService } from '../showcase/highlights/highlights.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
 import { Public } from '../../common/decorators/public.decorator';
@@ -65,6 +66,7 @@ export class UsersController {
     private ogMetadataService: OgMetadataService,
     private verificationBadgeService: VerificationBadgeService,
     private showcaseService: ShowcaseService,
+    private highlightsService: HighlightsService,
     private accountDeletionService: AccountDeletionService,
   ) {}
 
@@ -806,6 +808,25 @@ export class UsersController {
     @Query('filter', new ParseQueryStringPipe('filter', 20)) filter: string,
   ): Promise<object> {
     return this.usersService.getUserRatings(username, page, limit, filter, viewerId);
+  }
+
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @Get(':username/highlights')
+  @ApiOperation({
+    summary: 'Get public showcase highlights for a user profile',
+    description:
+      'Batch 19 TIM A (item 4): daftar highlight publik milik username. ' +
+      'Hanya highlight yang punya >=1 produk PUBLIC + aktif + tidak dihapus yang diekspos; ' +
+      'produk private/takedown tidak pernah bocor ke payload. ' +
+      'Profil private / nonaktif / banned / terhapus -> 404 USER_NOT_FOUND; ' +
+      'viewer yang terlibat relasi block juga 404, bukan 403 (disamakan dengan GET /users/:username/ratings).',
+  })
+  async getUserHighlights(
+    @Param('username', ParseUsernamePipe) username: string,
+    @CurrentUser('sub') viewerId: string | null,
+  ): Promise<object> {
+    return this.highlightsService.getPublicHighlightsByUsername(username, viewerId);
   }
 
   @Post(':username/questions')

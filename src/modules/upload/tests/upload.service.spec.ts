@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { UploadService } from '../upload.service';
 import { RedisService } from '../../../redis/redis.service';
 import { LocalStorageService } from '../local-storage.service';
+import { VideoProcessingService } from '../video-processing.service';
 
 jest.mock('@aws-sdk/client-s3', () => ({
   S3Client: jest.fn().mockImplementation(() => ({ send: jest.fn() })),
@@ -59,6 +60,13 @@ describe('UploadService — confirmUpload', () => {
           getFileSize: jest.fn().mockResolvedValue(1024),
           getContentType: jest.fn().mockResolvedValue('image/jpeg'),
           readFileRange: jest.fn().mockResolvedValue(Buffer.alloc(16)),
+        } },
+        // Batch 19 TIM A (item 1): UploadService kini menginject
+        // VideoProcessingService — mock DI untuk wiring test lama.
+        { provide: VideoProcessingService, useValue: {
+          isAvailable: jest.fn().mockReturnValue(true),
+          probeVideo: jest.fn(),
+          generateThumbnail: jest.fn(),
         } },
       ],
     }).compile();

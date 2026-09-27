@@ -181,6 +181,32 @@ export const SHOWCASE_REPLY_LIMIT = 20;
  *  supaya satu halaman tetap ringan (tiap item ikut memuat author + gambar). */
 export const SHOWCASE_FEED_DEFAULT_LIMIT = 20;
 export const SHOWCASE_FEED_MAX_LIMIT = 50;
+// ── Batch 19 TIM A (item 1 & 2): video & media etalase ──
+// Pilihan angka (didokumentasikan di docs/batch19-tim-a-kontrak-api.md):
+// 100 MiB ≈ video 720p ±2–3 menit pada bitrate wajar; 180 detik = batas konten
+// etalase pendek (bukan hosting video panjang). Validasi server-side, fail closed.
+/** Ukuran maksimum file video showcase (bytes). */
+export const SHOWCASE_VIDEO_MAX_BYTES = 100 * 1024 * 1024;
+/** Durasi maksimum video showcase (detik). */
+export const SHOWCASE_VIDEO_MAX_DURATION_SEC = 180;
+/** Durasi minimum video showcase (detik) — menolak file 0-detik/korup. */
+export const SHOWCASE_VIDEO_MIN_DURATION_SEC = 1;
+/** Guard kasar multer di POST /upload/direct: sedikit di atas batas video. */
+export const UPLOAD_DIRECT_MULTER_MAX_BYTES = 105 * 1024 * 1024;
+/** Lebar thumbnail video showcase (px); tinggi mengikuti aspek rasio. */
+export const SHOWCASE_VIDEO_THUMBNAIL_WIDTH = 640;
+/** Jumlah frame minimum & maksimum untuk satu set spin360. */
+export const SHOWCASE_SPIN360_MIN_FRAMES = 8;
+export const SHOWCASE_SPIN360_MAX_FRAMES = 24;
+/** Panjang maksimum groupKey spin360 (alnum, dash, underscore). */
+export const SHOWCASE_SPIN360_GROUP_KEY_MAX_LENGTH = 64;
+// ── Batch 19 TIM A (item 4): highlight etalase ──
+/** Batas highlight per user. */
+export const SHOWCASE_MAX_HIGHLIGHTS = 20;
+/** Batas produk per highlight. */
+export const SHOWCASE_HIGHLIGHT_MAX_PRODUCTS = 50;
+/** Panjang judul highlight. */
+export const SHOWCASE_HIGHLIGHT_TITLE_MAX_LENGTH = 80;
 /** Satu view dihitung sekali per (viewer, showcase) dalam window ini. */
 export const SHOWCASE_VIEW_DEDUPE_TTL_SECONDS = 3600;
 /** Sort "foryou": ukuran pool kandidat per segmen. Pool dibatasi supaya satu

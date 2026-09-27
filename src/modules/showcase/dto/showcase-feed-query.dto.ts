@@ -1,6 +1,7 @@
-import { IsOptional, IsString, IsIn, IsInt, Min, Max, MaxLength } from 'class-validator';
+import { IsOptional, IsString, IsIn, IsInt, IsNumber, IsEnum, Min, Max, MaxLength } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
 import { ApiPropertyOptional } from '@nestjs/swagger';
+import { ShowcaseCondition } from '@prisma/client';
 import {
   SHOWCASE_CATEGORY_MAX_LENGTH,
   SHOWCASE_FEED_DEFAULT_LIMIT,
@@ -97,4 +98,32 @@ export class ShowcaseFeedQueryDto {
   @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
   @MaxLength(SHOWCASE_SEARCH_MAX_LENGTH)
   location?: string;
+
+  @ApiPropertyOptional({
+    enum: ['baru', 'bekas'],
+    description:
+      'Filter kondisi barang (batch 19 TIM A, item 6). Enum: BARU = barang baru, ' +
+      'BEKAS = barang bekas/second. Item tanpa kondisi disembunyikan saat filter aktif.',
+  })
+  @IsOptional()
+  @IsString()
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim().toUpperCase() : value))
+  @IsEnum(ShowcaseCondition, { message: 'condition must be one of: baru, bekas' })
+  condition?: ShowcaseCondition;
+
+  @ApiPropertyOptional({
+    description:
+      'Filter rating penjual (batch 19 TIM A, item 6): hanya item yang averageRating ' +
+      'pemilik >= nilai ini (0–5, desimal boleh). Pemilik tanpa rating dianggap ' +
+      'tidak lolos kecuali nilai 0.',
+    minimum: 0,
+    maximum: 5,
+    example: 4.0,
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  @Max(5)
+  minSellerRating?: number;
 }

@@ -29,7 +29,7 @@ const mockPrisma: any = {
   blockList: { findUnique: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn(), create: jest.fn(), delete: jest.fn() },
   userFavorite: { findUnique: jest.fn(), findMany: jest.fn(), count: jest.fn(), create: jest.fn(), delete: jest.fn(), deleteMany: jest.fn() },
   userSavedProfile: { findUnique: jest.fn(), findMany: jest.fn(), count: jest.fn(), create: jest.fn(), deleteMany: jest.fn() },
-  rating: { findMany: jest.fn(), count: jest.fn(), aggregate: jest.fn() },
+  rating: { findMany: jest.fn(), count: jest.fn(), groupBy: jest.fn().mockResolvedValue([]), aggregate: jest.fn() },
   userReport: { findFirst: jest.fn(), count: jest.fn(), create: jest.fn() },
   order: { count: jest.fn(), findUnique: jest.fn() },
   wallet: { findUnique: jest.fn() },
@@ -779,6 +779,7 @@ describe('UsersService', () => {
       mockPrisma.user.findUnique.mockResolvedValue({ id: 'target', averageRating: 4.5, profileVisible: true, isActive: true, isBanned: false, deletedAt: null });
       mockPrisma.rating.findMany.mockResolvedValue([]);
       mockPrisma.rating.count.mockResolvedValue(0);
+    mockPrisma.rating.groupBy.mockResolvedValue([]);
 
       await service.getUserRatings('public-user', 1, 20, undefined, 'viewer');
       expect(mockPrisma.rating.findMany).toHaveBeenCalledWith(expect.objectContaining({

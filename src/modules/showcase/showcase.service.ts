@@ -26,12 +26,17 @@ import {
   SHOWCASE_REPLY_LIMIT,
   SHOWCASE_SEARCH_MIN_LENGTH,
   SHOWCASE_SHARE_DEDUPE_TTL_SECONDS,
+  SHOWCASE_SPIN360_MAX_FRAMES,
+  SHOWCASE_SPIN360_MIN_FRAMES,
+  SHOWCASE_VIDEO_MAX_DURATION_SEC,
   SHOWCASE_VIEW_DEDUPE_TTL_SECONDS,
 } from '../../common/constants/app.constants';
+import { createPaginatedResponse } from '../../common/dto/pagination.dto';
 import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 import { AdminShowcaseReportsService } from '../admin/showcase-reports/admin-showcase-reports.service';
 import { moderationDb } from '../admin/showcase-reports/moderation-prisma.types';
 import { CreateShowcaseItemDto, UpdateShowcaseItemDto } from './dto/showcase-item.dto';
+import { ShowcaseMediaInputDto, ShowcaseMediaKind } from './dto/showcase-media.dto';
 import { CreateShowcaseCommentDto, UpdateShowcaseCommentDto } from './dto/showcase-comment.dto';
 import { ShowcaseFeedQueryDto, ShowcaseFeedSort } from './dto/showcase-feed-query.dto';
 import { ReportShowcaseDto } from './dto/report-showcase.dto';
@@ -219,6 +224,39 @@ function compareForYouEntries(
   return b.row.id.localeCompare(a.row.id);
 }
 
+/** Batch 19 TIM A (item 1 & 2): bentuk ternormalisasi satu entri media untuk create ShowcaseImage. */
+interface MediaCreateEntry {
+  fileKey: string;
+  imageUrl: string;
+  sortOrder: number;
+  kind: string;
+  thumbnailUrl: string | null;
+  durationSec: number | null;
+  width: number | null;
+  height: number | null;
+  groupKey: string | null;
+  groupOrder: number | null;
+}
+
+/** Normalkan hasil prepareImageKeys (jalur lama, kind=image) maupun prepareMediaEntries ke MediaCreateEntry. */
+function toImageCreates(entries: Array<MediaCreateEntry | { fileKey: string; imageUrl: string }>): MediaCreateEntry[] {
+  return entries.map((entry, index) => {
+    const full = entry as Partial<MediaCreateEntry> & { fileKey: string; imageUrl: string };
+    return {
+      fileKey: full.fileKey,
+      imageUrl: full.imageUrl,
+      sortOrder: full.sortOrder ?? index,
+      kind: full.kind ?? ShowcaseMediaKind.IMAGE,
+      thumbnailUrl: full.thumbnailUrl ?? null,
+      durationSec: full.durationSec ?? null,
+      width: full.width ?? null,
+      height: full.height ?? null,
+      groupKey: full.groupKey ?? null,
+      groupOrder: full.groupOrder ?? null,
+    };
+  });
+}
+
 @Injectable()
 export class ShowcaseService {
   private readonly logger = new Logger(ShowcaseService.name);
@@ -394,16 +432,31 @@ export class ShowcaseService {
    */
   private serializeShowcase(
     row: ShowcaseRow,
-    options: { isLiked?: boolean; isOwner?: boolean; authorBadges?: Array<{ type: string }> } = {},
+    options: { isLiked?: boolean; isSaved?: boolean; isOwner?: boolean; authorBadges?: Array<{ type: string }> } = {},
   ): Record<string, unknown> {
+    // Batch 19 TIM A (item 1 & 2): media etalase bisa image/video/spin360.
+    // Field lama (id/imageUrl/sortOrder) tetap — kontrak lama tidak berubah.
     const images = row.images.map((image) => ({
       id: image.id,
+      kind: image.kind ?? 'image',
       imageUrl: image.imageUrl,
+      thumbnailUrl: image.thumbnailUrl ?? null,
+      durationSec: image.durationSec ?? null,
+      width: image.width ?? null,
+      height: image.height ?? null,
+      groupKey: image.groupKey ?? null,
+      groupOrder: image.groupOrder ?? null,
       sortOrder: image.sortOrder,
     }));
     const priceMin = toNumber(row.priceMin);
     const priceMax = toNumber(row.priceMax);
-    const coverImageUrl = images.length > 0 ? images[0].imageUrl : null;
+    // Video memakai thumbnail sebagai cover agar kartu feed tidak hitam.
+    const firstMedia = images[0];
+    const coverImageUrl = firstMedia
+      ? firstMedia.kind === 'video' && firstMedia.thumbnailUrl
+        ? firstMedia.thumbnailUrl
+        : firstMedia.imageUrl
+      : null;
     const orderValue = priceMin ?? priceMax ?? null;
     const counterpartUsername = row.user.username ?? row.user.userId;
 
@@ -426,6 +479,8 @@ export class ShowcaseService {
       visibility: row.visibility,
       isActive: row.isActive,
       sortOrder: row.sortOrder,
+      // Batch 19 TIM A (item 6): kondisi barang (BARU/BEKAS/null).
+      condition: row.condition ?? null,
       images,
       coverImageUrl,
       // Alias deprecated: kolom tunggal `imageUrl` sudah diganti ShowcaseImage.
@@ -438,7 +493,10 @@ export class ShowcaseService {
       viewCount: row.viewCount,
       // S-4: berapa kali deep link share item ini dibuka.
       shareCount: row.shareCount,
+      // Batch 19 TIM A (item 3): save counter + status save viewer.
+      saveCount: row.saveCount,
       isLiked: Boolean(options.isLiked),
+      isSaved: Boolean(options.isSaved),
       isOwner: Boolean(options.isOwner),
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
@@ -554,7 +612,20 @@ export class ShowcaseService {
   async createShowcaseItem(userId: string, dto: CreateShowcaseItemDto): Promise<object> {
     const title = this.normalizeTitle(dto.title);
     this.assertPriceRange(dto.priceMin, dto.priceMax);
-    const imageFileKeys = await this.prepareImageKeys(userId, dto.imageFileKeys);
+    // Batch 19 TIM A: media (image/video/spin360) ATAU imageFileKeys lama —
+    // keduanya sekaligus = ambigu → tolak (fail closed).
+    if (dto.media !== undefined && dto.imageFileKeys !== undefined) {
+      throw new BadRequestException({
+        code: ErrorCodes.SHOWCASE_INVALID_MEDIA,
+        message: 'Gunakan salah satu: media atau imageFileKeys, tidak bisa keduanya',
+      });
+    }
+    const mediaEntries = dto.media !== undefined
+      ? await this.prepareMediaEntries(userId, dto.media)
+      : null;
+    const imageFileKeys = dto.media !== undefined
+      ? []
+      : await this.prepareImageKeys(userId, dto.imageFileKeys);
 
     const limitError = () =>
       new BadRequestException({
@@ -586,12 +657,9 @@ export class ShowcaseService {
               priceMin: dto.priceMin !== undefined ? BigInt(dto.priceMin) : null,
               priceMax: dto.priceMax !== undefined ? BigInt(dto.priceMax) : null,
               sortOrder: dto.sortOrder ?? count,
+              condition: dto.condition ?? null,
               images: {
-                create: imageFileKeys.map((image, index) => ({
-                  imageUrl: image.imageUrl,
-                  fileKey: image.fileKey,
-                  sortOrder: index,
-                })),
+                create: toImageCreates(mediaEntries ?? imageFileKeys),
               },
             },
             include: SHOWCASE_INCLUDE,
@@ -622,6 +690,14 @@ export class ShowcaseService {
     const priceMax = dto.priceMax !== undefined ? dto.priceMax : toNumber(existing.priceMax) ?? undefined;
     this.assertPriceRange(priceMin, priceMax);
 
+    // Batch 19 TIM A: media ATAU imageFileKeys — keduanya sekaligus = ambigu.
+    if (dto.media !== undefined && dto.imageFileKeys !== undefined) {
+      throw new BadRequestException({
+        code: ErrorCodes.SHOWCASE_INVALID_MEDIA,
+        message: 'Gunakan salah satu: media atau imageFileKeys, tidak bisa keduanya',
+      });
+    }
+
     const data: Prisma.UserShowcaseUpdateInput = {};
     if (dto.title !== undefined) data.title = this.normalizeTitle(dto.title);
     if (dto.description !== undefined) data.description = this.normalizeDescription(dto.description);
@@ -632,12 +708,38 @@ export class ShowcaseService {
     if (dto.priceMax !== undefined) data.priceMax = BigInt(dto.priceMax);
     if (dto.isActive !== undefined) data.isActive = dto.isActive;
     if (dto.sortOrder !== undefined) data.sortOrder = dto.sortOrder;
+    // Batch 19 TIM A (item 6): kondisi barang.
+    if (dto.condition !== undefined) data.condition = dto.condition;
 
     // R-3: samakan dengan create — item tidak boleh berakhir tanpa gambar sama
     // sekali. Array kosong ditolak eksplisit dengan pesan yang jelas (bukan
     // diartikan "hapus semua gambar"); penghapusan per gambar tetap lewat
     // endpoint DELETE /users/me/showcase/images/:imageId.
-    if (dto.imageFileKeys !== undefined) {
+    if (dto.media !== undefined) {
+      if (dto.media.length === 0) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message:
+            'media must contain at least 1 entry: a showcase item cannot be left without media. ' +
+            'Remove individual media via DELETE /users/me/showcase/images/:imageId instead.',
+        });
+      }
+      // SH-B-007: validasi dulu TANPA consume; konfirmasi one-time baru
+      // di-consume SETELAH update DB sukses.
+      const mediaEntries = await this.prepareMediaEntries(userId, dto.media, { consume: false });
+      const removedKeys = existing.images.flatMap((image) =>
+        [image.fileKey, image.thumbnailUrl ? this.uploadService.fileKeyFromPublicUrl(image.thumbnailUrl) : null].filter(
+          (k): k is string => Boolean(k),
+        ),
+      );
+      data.images = {
+        deleteMany: {},
+        create: toImageCreates(mediaEntries),
+      };
+      // Bersihkan object lama dari storage SETELAH commit supaya kegagalan
+      // storage tidak membatalkan update yang sudah sukses.
+      this.scheduleImageCleanup(userId, removedKeys);
+    } else if (dto.imageFileKeys !== undefined) {
       if (dto.imageFileKeys.length === 0) {
         throw new BadRequestException({
           code: ErrorCodes.VALIDATION_ERROR,
@@ -676,7 +778,10 @@ export class ShowcaseService {
     // SH-B-007: consume SETELAH update sukses. Bila consume gagal di sini
     // (sangat jarang — balapan double-submit), item sudah benar di DB;
     // key yang tersisa kedaluwarsa sendiri via TTL konfirmasi.
-    if (dto.imageFileKeys !== undefined && dto.imageFileKeys.length > 0) {
+    if (dto.media !== undefined && dto.media.length > 0) {
+      const consumeKeys = [...new Set(dto.media.flatMap((m) => [m.fileKey, m.thumbnailFileKey].filter((k): k is string => Boolean(k))))];
+      await this.uploadService.consumeUploadConfirmations(userId, consumeKeys);
+    } else if (dto.imageFileKeys !== undefined && dto.imageFileKeys.length > 0) {
       await this.uploadService.consumeUploadConfirmations(userId, dto.imageFileKeys);
     }
 
@@ -746,6 +851,12 @@ export class ShowcaseService {
    * konfirmasi one-time — pemanggil wajib memanggil
    * `uploadService.consumeUploadConfirmations()` SETELAH mutasi DB sukses.
    */
+  /**
+   * Batch 19 TIM A (item 1 & 2): satu entri media yang siap di-create sebagai
+   * baris ShowcaseImage. `prepareImageKeys` (jalur lama) menghasilkan subset
+   * { fileKey, imageUrl }; `toImageCreates` menormalkan keduanya ke bentuk ini
+   * supaya create/update punya satu sumber kebenaran.
+   */
   private async prepareImageKeys(
     userId: string,
     fileKeys: string[] | undefined,
@@ -768,6 +879,129 @@ export class ShowcaseService {
     });
     return fileKeys.map((fileKey) => ({ fileKey, imageUrl: this.uploadService.buildPublicUrl(fileKey) }));
   }
+  /**
+   * Batch 19 TIM A (item 1 & 2): validasi + normalisasi daftar media
+   * (image/video/spin360) untuk create/update etalase.
+   *
+   * Fail closed di setiap langkah:
+   *  - kind=video WAJIB punya thumbnailFileKey (confirmed SHOWCASE_IMAGE milik user).
+   *  - kind=spin360 WAJIB punya groupKey + groupOrder; tiap grup 8-24 frame
+   *    dengan groupOrder 0..n-1 kontinu (tanpa lompat/duplikat).
+   *  - fileKey harus confirmed upload milik user dengan purpose yang cocok
+   *    (image/spin360 -> SHOWCASE_IMAGE, video -> SHOWCASE_VIDEO).
+   *  - duplikat fileKey (termasuk thumbnail) dalam satu request ditolak.
+   */
+  private async prepareMediaEntries(
+    userId: string,
+    entries: ShowcaseMediaInputDto[],
+    opts: { consume?: boolean } = {},
+  ): Promise<MediaCreateEntry[]> {
+    if (entries.length === 0) return [];
+    const maxImages = await this.subscriptionsService.getMaxShowcaseImages(userId);
+    if (entries.length > maxImages) {
+      throw new BadRequestException({
+        code: ErrorCodes.SHOWCASE_IMAGE_LIMIT_REACHED,
+        message: `Maximum ${maxImages} media per showcase item`,
+      });
+    }
+    const shouldConsume = opts.consume ?? true;
+
+    const imageKeys: string[] = [];
+    const videoKeys: string[] = [];
+    const thumbKeys: string[] = [];
+    const spinKeys: string[] = [];
+    const spinOrders = new Map<string, number[]>();
+    for (const entry of entries) {
+      if (entry.kind === ShowcaseMediaKind.VIDEO) {
+        if (!entry.thumbnailFileKey) {
+          throw new BadRequestException({
+            code: ErrorCodes.SHOWCASE_INVALID_MEDIA,
+            message: 'thumbnailFileKey wajib diisi untuk media video',
+          });
+        }
+        videoKeys.push(entry.fileKey);
+        thumbKeys.push(entry.thumbnailFileKey);
+      } else if (entry.kind === ShowcaseMediaKind.SPIN360) {
+        if (!entry.groupKey || entry.groupOrder === undefined) {
+          throw new BadRequestException({
+            code: ErrorCodes.SHOWCASE_SPIN360_INVALID,
+            message: 'groupKey dan groupOrder wajib diisi untuk media spin360',
+          });
+        }
+        spinKeys.push(entry.fileKey);
+        const orders = spinOrders.get(entry.groupKey) ?? [];
+        orders.push(entry.groupOrder);
+        spinOrders.set(entry.groupKey, orders);
+      } else {
+        imageKeys.push(entry.fileKey);
+      }
+    }
+
+    // Validasi grup spin360: 8-24 frame, groupOrder tepat 0..n-1.
+    for (const [groupKey, orders] of spinOrders) {
+      if (orders.length < SHOWCASE_SPIN360_MIN_FRAMES || orders.length > SHOWCASE_SPIN360_MAX_FRAMES) {
+        throw new BadRequestException({
+          code: ErrorCodes.SHOWCASE_SPIN360_INVALID,
+          message: `Grup spin360 "${groupKey}" harus berisi ${SHOWCASE_SPIN360_MIN_FRAMES}-${SHOWCASE_SPIN360_MAX_FRAMES} frame`,
+        });
+      }
+      const sorted = [...orders].sort((a, b) => a - b);
+      if (!sorted.every((value, index) => value === index)) {
+        throw new BadRequestException({
+          code: ErrorCodes.SHOWCASE_SPIN360_INVALID,
+          message: `Grup spin360 "${groupKey}": groupOrder harus 0..${orders.length - 1} kontinu tanpa lompat`,
+        });
+      }
+    }
+
+    // Duplikat key dalam satu request = ambigu → tolak sebelum verifikasi.
+    const allKeys = [...imageKeys, ...videoKeys, ...thumbKeys, ...spinKeys];
+    if (new Set(allKeys).size !== allKeys.length) {
+      throw new BadRequestException({
+        code: ErrorCodes.SHOWCASE_INVALID_MEDIA,
+        message: 'Duplikat fileKey dalam daftar media tidak diizinkan',
+      });
+    }
+
+    // Verifikasi kepemilikan + konfirmasi per purpose (fail closed).
+    // verifyUserFileKeys melempar bila key bukan milik user / belum confirmed /
+    // ukuran di luar batas / purpose salah.
+    await this.uploadService.verifyUserFileKeys(userId, imageKeys, UploadPurpose.SHOWCASE_IMAGE, {
+      maxFiles: maxImages, consume: shouldConsume, label: 'Showcase media',
+    });
+    await this.uploadService.verifyUserFileKeys(userId, spinKeys, UploadPurpose.SHOWCASE_IMAGE, {
+      maxFiles: maxImages, consume: shouldConsume, label: 'Spin360 frame',
+    });
+    await this.uploadService.verifyUserFileKeys(userId, thumbKeys, UploadPurpose.SHOWCASE_IMAGE, {
+      maxFiles: maxImages, consume: shouldConsume, label: 'Video thumbnail',
+    });
+    await this.uploadService.verifyUserFileKeys(userId, videoKeys, UploadPurpose.SHOWCASE_VIDEO, {
+      maxFiles: maxImages, consume: shouldConsume, label: 'Showcase video',
+    });
+
+    const thumbByFileKey = new Map<string, string>();
+    for (const entry of entries) {
+      if (entry.kind === ShowcaseMediaKind.VIDEO && entry.thumbnailFileKey) {
+        thumbByFileKey.set(entry.fileKey, entry.thumbnailFileKey);
+      }
+    }
+    return entries.map((entry, index) => {
+      const thumbKey = thumbByFileKey.get(entry.fileKey);
+      return {
+        fileKey: entry.fileKey,
+        imageUrl: this.uploadService.buildPublicUrl(entry.fileKey),
+        sortOrder: index,
+        kind: entry.kind,
+        thumbnailUrl: thumbKey ? this.uploadService.buildPublicUrl(thumbKey) : null,
+        durationSec: entry.durationSec ?? null,
+        width: entry.width ?? null,
+        height: entry.height ?? null,
+        groupKey: entry.kind === ShowcaseMediaKind.SPIN360 ? entry.groupKey ?? null : null,
+        groupOrder: entry.kind === ShowcaseMediaKind.SPIN360 ? entry.groupOrder ?? null : null,
+      };
+    });
+  }
+
 
   /**
    * Hapus object gambar dari R2 tanpa menggagalkan operasi utamanya.
@@ -947,11 +1181,13 @@ export class ShowcaseService {
     })) as unknown as ShowcaseRow[];
 
     const likedIds = await this.getLikedShowcaseIds(viewerId, items.map((item) => item.id));
+    const savedIds = await this.getSavedShowcaseIds(viewerId, items.map((item) => item.id));
     const badgeMap = await this.getAuthorBadgeMap(items.map((item) => item.user.id));
     return {
       items: items.map((item) =>
         this.serializeShowcase(item, {
           isLiked: likedIds.has(item.id),
+          isSaved: savedIds.has(item.id),
           authorBadges: badgeMap.get(item.user.id) ?? [],
         }),
       ),
@@ -983,11 +1219,13 @@ export class ShowcaseService {
     const shouldCountView = !(visible.isOwner && !visible.row.isActive);
     const counted = shouldCountView ? await this.recordView(showcaseId, viewerId, options.clientIp) : false;
     const likedIds = await this.getLikedShowcaseIds(viewerId, [showcaseId]);
+    const savedIds = await this.getSavedShowcaseIds(viewerId, [showcaseId]);
     const badgeMap = await this.getAuthorBadgeMap([visible.row.user.id]);
 
     return {
       ...this.serializeShowcase(visible.row, {
         isLiked: likedIds.has(showcaseId),
+        isSaved: savedIds.has(showcaseId),
         isOwner: visible.isOwner,
         authorBadges: badgeMap.get(visible.row.user.id) ?? [],
       }),
@@ -1048,12 +1286,17 @@ export class ShowcaseService {
       viewerId,
       related.map((r) => r.id),
     );
+    const savedIds = await this.getSavedShowcaseIds(
+      viewerId,
+      related.map((r) => r.id),
+    );
     const badgeMap = await this.getAuthorBadgeMap(
       related.map((r) => r.user.id),
     );
     return related.map((r) =>
       this.serializeShowcase(r, {
         isLiked: likedIds.has(r.id),
+        isSaved: savedIds.has(r.id),
         authorBadges: badgeMap.get(r.user.id) ?? [],
       }),
     );
@@ -1212,6 +1455,19 @@ export class ShowcaseService {
       andClauses.push({
         user: { address: { contains: escapeLikePattern(location), mode: 'insensitive' } },
       });
+    }
+
+    // Batch 19 TIM A (item 6): filter kondisi barang. Item tanpa kondisi
+    // disembunyikan saat filter aktif (tidak bisa dipastikan cocok).
+    if (query.condition !== undefined) {
+      andClauses.push({ condition: query.condition });
+    }
+
+    // Batch 19 TIM A (item 6): filter rating penjual minimum. averageRating
+    // adalah Decimal denormalisasi di users (>= 0, default 0, non-null).
+    // Nilai 0 = tidak memfilter (semua pemilik lolos).
+    if (query.minSellerRating !== undefined && query.minSellerRating > 0) {
+      andClauses.push({ user: { averageRating: { gte: query.minSellerRating } } });
     }
 
     // Sort "foryou": ranking personal dihitung di aplikasi (butuh sinyal
@@ -1462,6 +1718,7 @@ export class ShowcaseService {
     opts: { sort: ShowcaseFeedSort; limit: number; hasMore: boolean; nextCursor: string | null },
   ): Promise<object> {
     const likedIds = await this.getLikedShowcaseIds(viewerId, pageRows.map((row) => row.id));
+    const savedIds = await this.getSavedShowcaseIds(viewerId, pageRows.map((row) => row.id));
     // S1: badge 3-tier author (satu batch, cached di Redis).
     const badgeMap = await this.getAuthorBadgeMap(pageRows.map((row) => row.user.id));
 
@@ -1469,6 +1726,7 @@ export class ShowcaseService {
       items: pageRows.map((row) =>
         this.serializeShowcase(row, {
           isLiked: likedIds.has(row.id),
+          isSaved: savedIds.has(row.id),
           authorBadges: badgeMap.get(row.user.id) ?? [],
         }),
       ),
@@ -1610,6 +1868,182 @@ export class ShowcaseService {
       (err as { code?: string }).code === 'P2002'
     );
   }
+
+  // ==================================================================
+  // Save / unsave + daftar likers/savers (batch 19 TIM A, item 3)
+  // ==================================================================
+
+  /** `isSaved` untuk banyak item sekaligus — satu query, bukan N+1 (pola getLikedShowcaseIds). */
+  private async getSavedShowcaseIds(viewerId: string | undefined, showcaseIds: string[]): Promise<Set<string>> {
+    if (!viewerId || showcaseIds.length === 0) return new Set();
+    const rows = await this.prisma.showcaseSave.findMany({
+      where: { userId: viewerId, showcaseId: { in: showcaseIds } },
+      select: { showcaseId: true },
+    });
+    return new Set(rows.map((r) => r.showcaseId));
+  }
+
+  async saveShowcase(userId: string, showcaseId: string): Promise<object> {
+    const visible = await this.findVisibleShowcase(showcaseId, userId);
+    if (!visible) {
+      throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
+    }
+    await this.assertNoBlockRelation(userId, visible.row.userId);
+
+    try {
+      const updated = await this.prisma.$transaction(async (tx) => {
+        await tx.showcaseSave.create({ data: { userId, showcaseId } });
+        // Guard seperti likeShowcase (SH-B-010): item yang ter-soft-delete /
+        // nonaktif di antara visibility-check dan commit TIDAK menaikkan counter.
+        const bumped = await tx.userShowcase.updateMany({
+          where: { id: showcaseId, deletedAt: null, isActive: true },
+          data: { saveCount: { increment: 1 } },
+        });
+        if (bumped.count === 0) {
+          throw new NotFoundException({
+            code: ErrorCodes.SHOWCASE_NOT_FOUND,
+            message: 'Showcase item is no longer available',
+          });
+        }
+        const row = await tx.userShowcase.findUnique({
+          where: { id: showcaseId },
+          select: { saveCount: true },
+        });
+        return { saveCount: row?.saveCount ?? 0 };
+      });
+      return { saved: true, saveCount: updated.saveCount };
+    } catch (err) {
+      // Unique (userId, showcaseId) -> save ganda dari request balapan.
+      if (this.isUniqueViolation(err)) {
+        const current = await this.prisma.userShowcase.findUnique({
+          where: { id: showcaseId },
+          select: { saveCount: true },
+        });
+        throw new ConflictException({
+          code: ErrorCodes.SHOWCASE_ALREADY_SAVED,
+          message: 'You already saved this showcase item',
+          saveCount: current?.saveCount ?? null,
+        });
+      }
+      throw err;
+    }
+  }
+
+  async unsaveShowcase(userId: string, showcaseId: string): Promise<object> {
+    const visible = await this.findVisibleShowcase(showcaseId, userId);
+    if (!visible) {
+      throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
+    }
+    await this.assertNoBlockRelation(userId, visible.row.userId);
+
+    const deleted = await this.prisma.showcaseSave.deleteMany({ where: { userId, showcaseId } });
+    if (deleted.count === 0) {
+      throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_SAVED, message: 'You have not saved this showcase item' });
+    }
+    // Decrement dengan guard gt 0 supaya counter tidak pernah negatif bila
+    // ada drift data historis.
+    await this.prisma.userShowcase.updateMany({
+      where: { id: showcaseId, saveCount: { gt: 0 } },
+      data: { saveCount: { decrement: 1 } },
+    });
+    const current = await this.prisma.userShowcase.findUnique({
+      where: { id: showcaseId },
+      select: { saveCount: true },
+    });
+    return { saved: false, saveCount: current?.saveCount ?? 0 };
+  }
+
+  /**
+   * Daftar user yang me-like item — PUBLIK (item harus visible untuk viewer).
+   * Pagination offset + tiebreak { id } agar halaman stabil (pola listComments).
+   */
+  async listLikers(
+    showcaseId: string,
+    viewerId: string | undefined,
+    page: number,
+    limit: number,
+  ): Promise<object> {
+    const visible = await this.findVisibleShowcase(showcaseId, viewerId);
+    if (!visible) {
+      throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
+    }
+    const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
+    const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 100) : 20;
+    const skip = (safePage - 1) * safeLimit;
+    const [rows, total] = await Promise.all([
+      this.prisma.showcaseLike.findMany({
+        where: { showcaseId },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip,
+        take: safeLimit,
+        select: {
+          createdAt: true,
+          user: { select: { id: true, userId: true, username: true, fullName: true, avatarUrl: true } },
+        },
+      }),
+      this.prisma.showcaseLike.count({ where: { showcaseId } }),
+    ]);
+    const data = rows.map((row) => ({
+      userId: row.user.userId,
+      username: row.user.username,
+      fullName: row.user.fullName,
+      avatarUrl: row.user.avatarUrl,
+      likedAt: row.createdAt,
+    }));
+    return createPaginatedResponse(data, total, safePage, safeLimit);
+  }
+
+  /**
+   * Daftar user yang menyimpan item — HANYA pemilik produk (privasi).
+   * Bukan pemilik -> 403 SHOWCASE_FORBIDDEN. Item yang tidak ada / terhapus ->
+   * 404 (sama seperti likers) agar keberadaan item tak bocor via perbedaan
+   * status code.
+   */
+  async listSavers(
+    userId: string,
+    showcaseId: string,
+    page: number,
+    limit: number,
+  ): Promise<object> {
+    const item = await this.prisma.userShowcase.findFirst({
+      where: { id: showcaseId, deletedAt: null },
+      select: { id: true, userId: true },
+    });
+    if (!item) {
+      throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
+    }
+    if (item.userId !== userId) {
+      throw new ForbiddenException({
+        code: ErrorCodes.SHOWCASE_FORBIDDEN,
+        message: 'Hanya pemilik produk yang dapat melihat daftar penyimpan',
+      });
+    }
+    const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
+    const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 100) : 20;
+    const skip = (safePage - 1) * safeLimit;
+    const [rows, total] = await Promise.all([
+      this.prisma.showcaseSave.findMany({
+        where: { showcaseId },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip,
+        take: safeLimit,
+        select: {
+          createdAt: true,
+          user: { select: { id: true, userId: true, username: true, fullName: true, avatarUrl: true } },
+        },
+      }),
+      this.prisma.showcaseSave.count({ where: { showcaseId } }),
+    ]);
+    const data = rows.map((row) => ({
+      userId: row.user.userId,
+      username: row.user.username,
+      fullName: row.user.fullName,
+      avatarUrl: row.user.avatarUrl,
+      savedAt: row.createdAt,
+    }));
+    return createPaginatedResponse(data, total, safePage, safeLimit);
+  }
+
 
   // ==================================================================
   // Komentar

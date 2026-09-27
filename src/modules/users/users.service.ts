@@ -1544,6 +1544,25 @@ export class UsersService {
       this.prisma.rating.count({ where }),
     ]);
 
+    // Batch 19 TIM A (item 5): distribusi bintang 1-5 atas filter visibilitas
+    // dasar yang SAMA (isHidden=false, giver aktif/tidak-banned/visible) tapi
+    // TANPA filter positive/neutral/negative — jadi distribusi tidak bergeser
+    // saat pengguna berpindah tab filter. Field lama tidak diubah.
+    const distributionRows = await this.prisma.rating.groupBy({
+      by: ['stars'],
+      where: {
+        receiverId: user.id,
+        isHidden: false,
+        giver: { isActive: true, isBanned: false, deletedAt: null, profileVisible: true },
+      },
+      _count: { stars: true },
+    });
+    const distribution: Record<string, number> = { '1': 0, '2': 0, '3': 0, '4': 0, '5': 0 };
+    for (const row of distributionRows) {
+      const key = String(row.stars);
+      if (key in distribution) distribution[key] = row._count.stars;
+    }
+
     return {
       ratings,
       // `total` = jumlah rating yang lolos filter visibilitas halaman ini;
@@ -1553,6 +1572,8 @@ export class UsersService {
       total,
       averageRating: Number(user.averageRating ?? 0),
       totalRatingCount: user.totalRatingCount,
+      // Batch 19 TIM A (item 5): hitungan per bintang (string key "1".."5").
+      distribution,
       filter: filter || null,
       page: safePage,
       limit: safeLimit,

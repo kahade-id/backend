@@ -8,6 +8,8 @@ import { VerificationBadgeModule } from '../users/verification-badge.module';
 import { ShowcaseController } from './showcase.controller';
 import { ShowcaseAppealsController } from './showcase-appeals.controller';
 import { ShowcaseService } from './showcase.service';
+import { HighlightsController } from './highlights/highlights.controller';
+import { HighlightsService } from './highlights/highlights.service';
 import { SubscriptionsModule } from '../subscriptions/subscriptions.module';
 import { AdminShowcaseReportsModule } from '../admin/showcase-reports/admin-showcase-reports.module';
 
@@ -27,8 +29,8 @@ import { AdminShowcaseReportsModule } from '../admin/showcase-reports/admin-show
  */
 @Module({
   imports: [ConfigModule, PrismaModule, RedisModule, UploadModule, AuditLogModule, VerificationBadgeModule, SubscriptionsModule, AdminShowcaseReportsModule],
-  controllers: [ShowcaseController, ShowcaseAppealsController],
-  providers: [ShowcaseService],
-  exports: [ShowcaseService],
+  controllers: [ShowcaseController, ShowcaseAppealsController, HighlightsController],
+  providers: [ShowcaseService, HighlightsService],
+  exports: [ShowcaseService, HighlightsService],
 })
 export class ShowcaseModule {}

@@ -12,6 +12,10 @@ export enum UploadPurpose {
   // Section 3 (Showcase social content): gambar item showcase. PUBLIC bucket
   // karena gambar ini memang ditayangkan di feed discover & profil publik.
   SHOWCASE_IMAGE = 'SHOWCASE_IMAGE',
+  // Batch 19 TIM A (item 1): video item showcase (video/*). PUBLIC bucket,
+  // diserve nginx dengan HTTP Range; thumbnail JPEG dibuat server-side
+  // (ffmpeg) dan disimpan di folder SHOWCASE_IMAGE.
+  SHOWCASE_VIDEO = 'SHOWCASE_VIDEO',
   AVATAR = 'AVATAR',
   CHAT_ATTACHMENT = 'CHAT_ATTACHMENT',
   DISPUTE_EVIDENCE = 'DISPUTE_EVIDENCE',

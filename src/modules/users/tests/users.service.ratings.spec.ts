@@ -10,6 +10,7 @@ import { VerificationBadgeService } from '../verification-badge.service';
 import { UserAnalyticsService } from '../user-analytics.service';
 import { LocalStorageService } from '../../upload/local-storage.service';
 import { ReportFlagService } from '../../../common/services/report-flag.service';
+import { AccountDeletionService } from '../account-deletion.service';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 
 jest.mock('../../../common/utils/pii.util', () => ({
@@ -25,7 +26,7 @@ const VIEWER_ID = 'viewer-1';
 const mockPrisma: any = {
   user: { findUnique: jest.fn() },
   blockList: { findFirst: jest.fn() },
-  rating: { findMany: jest.fn(), count: jest.fn() },
+  rating: { findMany: jest.fn(), count: jest.fn(), groupBy: jest.fn().mockResolvedValue([]) },
 };
 const mockRedis = { get: jest.fn(), set: jest.fn(), del: jest.fn(), setex: jest.fn(), setNx: jest.fn(), releaseLock: jest.fn(), getPrefix: jest.fn().mockReturnValue('test:'), getClient: jest.fn() };
 const mockAudit = { logUserAction: jest.fn() };
@@ -55,6 +56,7 @@ describe('UsersService — daftar rating publik (Section 5)', () => {
     mockPrisma.blockList.findFirst.mockResolvedValue(null);
     mockPrisma.rating.findMany.mockResolvedValue([]);
     mockPrisma.rating.count.mockResolvedValue(0);
+    mockPrisma.rating.groupBy.mockResolvedValue([]);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -69,6 +71,9 @@ describe('UsersService — daftar rating publik (Section 5)', () => {
         { provide: LocalStorageService, useValue: {} },
         // Section 6: agregasi laporan -> flag moderasi internal.
         { provide: ReportFlagService, useValue: { evaluateTarget: jest.fn(async () => ({ flaggedForReview: false, distinctReporters: 0 })) } },
+        // Auth overhaul (pre-existing, bukan TIM A): UsersService menginject
+        // AccountDeletionService — mock DI supaya spec ini bisa jalan.
+        { provide: AccountDeletionService, useValue: {} },
       ],
     }).compile();
     service = module.get<UsersService>(UsersService);

@@ -1,12 +1,21 @@
-import { Injectable, BadRequestException, NotFoundException, Logger, ConflictException } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, Logger, ConflictException, InternalServerErrorException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHash, createHmac, timingSafeEqual } from 'crypto';
 import { Readable } from 'stream';
+import * as fs from 'fs';
+import * as path from 'path';
 
 import { customAlphabet } from 'nanoid';
 import { UploadPurpose } from './dto/presigned-url.dto';
 import { RedisService } from '../../redis/redis.service';
 import { LocalStorageService } from './local-storage.service';
+import { VideoProcessingService } from './video-processing.service';
+import {
+  SHOWCASE_VIDEO_MAX_BYTES,
+  SHOWCASE_VIDEO_MAX_DURATION_SEC,
+  SHOWCASE_VIDEO_MIN_DURATION_SEC,
+  SHOWCASE_VIDEO_THUMBNAIL_WIDTH,
+} from '../../common/constants/app.constants';
 import { encryptAES, decryptAES } from '../../common/utils/crypto.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { withSpan } from '../../common/tracing/tracing';
@@ -29,6 +38,9 @@ const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
   // Section 3: gambar showcase tampil publik di feed, jadi hanya image raster.
   // PDF/SVG ditolak — tidak bisa dirender sebagai thumbnail kartu feed.
   [UploadPurpose.SHOWCASE_IMAGE]: ['image/jpeg', 'image/png', 'image/webp'],
+  // Batch 19 TIM A (item 1): video showcase — mp4/mov/webm, magic-byte
+  // terverifikasi di MAGIC_BYTES (ftyp brand spesifik / EBML).
+  [UploadPurpose.SHOWCASE_VIDEO]: ['video/mp4', 'video/quicktime', 'video/webm'],
   [UploadPurpose.AVATAR]: ['image/jpeg', 'image/png', 'image/webp'],
   [UploadPurpose.CHAT_ATTACHMENT]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm', 'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/mp4'],
   [UploadPurpose.DISPUTE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm'],
@@ -70,6 +82,8 @@ const MAX_FILE_SIZE: Record<UploadPurpose, number> = {
   [UploadPurpose.KYC_LIVENESS]: 5 * 1024 * 1024,
   [UploadPurpose.BUSINESS_DOCUMENT]: 10 * 1024 * 1024,
   [UploadPurpose.SHOWCASE_IMAGE]: 5 * 1024 * 1024,
+  // Batch 19 TIM A (item 1): 100 MiB (lihat SHOWCASE_VIDEO_MAX_BYTES).
+  [UploadPurpose.SHOWCASE_VIDEO]: SHOWCASE_VIDEO_MAX_BYTES,
   [UploadPurpose.AVATAR]: 2 * 1024 * 1024,
   [UploadPurpose.CHAT_ATTACHMENT]: 50 * 1024 * 1024,
   [UploadPurpose.DISPUTE_EVIDENCE]: 50 * 1024 * 1024,
@@ -111,6 +125,20 @@ const MAGIC_BYTES: { mime: string; runs: { offset: number; bytes: number[] }[] }
   { mime: 'image/heif', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x73, 0x66, 0x31] }] }, // ftypmsf1
   { mime: 'image/avif', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66] }] }, // ftypavif
   { mime: 'image/avif', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x73] }] }, // ftypavis
+  // Batch 19 TIM A (item 1): magic-byte video untuk purpose SHOWCASE_VIDEO.
+  // ISO-BMFF "ftyp" + brand spesifik (offset 8..11) — HARUS setelah entri
+  // heic/heif/avif di atas supaya brand-brand itu tidak salah terdeteksi mp4.
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x6D] }] }, // ftypisom
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x32] }] }, // ftypiso2
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x70, 0x34, 0x31] }] }, // ftypmp41
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x70, 0x34, 0x32] }] }, // ftypmp42
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x63, 0x31] }] }, // ftypavc1
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x34, 0x76, 0x20] }] }, // ftypm4v␣
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x64, 0x61, 0x73, 0x68] }] }, // ftypdash
+  { mime: 'video/quicktime', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x71, 0x74, 0x20, 0x20] }] }, // ftypqt␣␣
+  // WebM = EBML header (0x1A45DFA3). MKV juga EBML — dibedakan tidak di sini;
+  // keduanya container video aman (ekstensi hasil mapping = .webm).
+  { mime: 'video/webm', runs: [{ offset: 0, bytes: [0x1A, 0x45, 0xDF, 0xA3] }] },
 ];
 
 const MIME_HEADER_BYTES = 32;
@@ -171,6 +199,9 @@ const PURPOSE_VISIBILITY: Record<UploadPurpose, 'private' | 'public'> = {
   [UploadPurpose.KYC_LIVENESS]: 'private',
   [UploadPurpose.BUSINESS_DOCUMENT]: 'private',
   [UploadPurpose.SHOWCASE_IMAGE]: 'public',
+  // Batch 19 TIM A (item 1): video showcase tampil publik di feed — diserve
+  // nginx dengan HTTP Range (seek). Thumbnail-nya masuk SHOWCASE_IMAGE.
+  [UploadPurpose.SHOWCASE_VIDEO]: 'public',
   [UploadPurpose.AVATAR]: 'public',
   [UploadPurpose.CHAT_ATTACHMENT]: 'private',
   [UploadPurpose.DISPUTE_EVIDENCE]: 'private',
@@ -185,6 +216,7 @@ const PURPOSE_FOLDER_MAP_INTERNAL: Record<UploadPurpose, string> = {
   [UploadPurpose.KYC_LIVENESS]: 'kyc-liveness',
   [UploadPurpose.BUSINESS_DOCUMENT]: 'business-documents',
   [UploadPurpose.SHOWCASE_IMAGE]: 'showcase-images',
+  [UploadPurpose.SHOWCASE_VIDEO]: 'showcase-videos',
   [UploadPurpose.AVATAR]: 'avatars',
   [UploadPurpose.CHAT_ATTACHMENT]: 'chat-attachments',
   [UploadPurpose.DISPUTE_EVIDENCE]: 'dispute-evidence',
@@ -217,10 +249,29 @@ export function isPrivateFileKey(fileKey: string): boolean {
 }
 
 /** Prefix folder publik yang diserve langsung oleh nginx tanpa auth. */
-export const PUBLIC_FOLDER_PREFIXES = ['uploads/avatars/', 'uploads/headers/', 'uploads/showcase-images/'];
+export const PUBLIC_FOLDER_PREFIXES = ['uploads/avatars/', 'uploads/headers/', 'uploads/showcase-images/', 'uploads/showcase-videos/'];
 
 export function isPublicFileKey(fileKey: string): boolean {
   return PUBLIC_FOLDER_PREFIXES.some(prefix => fileKey.startsWith(prefix));
+}
+
+/**
+ * Batch 19 TIM A (item 1): hasil upload direct. Field tambahan (thumbnail,
+ * durasi, dimensi) HANYA diisi untuk purpose SHOWCASE_VIDEO — respons purpose
+ * lain tidak berubah bentuknya (aditif).
+ */
+export interface DirectUploadResult {
+  fileKey: string;
+  fileUrl: string;
+  /** SHOWCASE_VIDEO: key thumbnail JPEG hasil ffmpeg (sudah terkonfirmasi). */
+  thumbnailFileKey?: string;
+  /** SHOWCASE_VIDEO: URL publik thumbnail. */
+  thumbnailUrl?: string;
+  /** SHOWCASE_VIDEO: durasi detik (dibulatkan). */
+  durationSec?: number;
+  /** SHOWCASE_VIDEO: dimensi stream video pertama. */
+  width?: number;
+  height?: number;
 }
 
 @Injectable()
@@ -231,6 +282,7 @@ export class UploadService {
     private configService: ConfigService,
     private redis: RedisService,
     private localStorage: LocalStorageService,
+    private videoProcessing: VideoProcessingService,
   ) {}
 
   // ── Batch 1A (ST-002/03-#1): signed URL HMAC untuk file privat ──
@@ -697,6 +749,19 @@ export class UploadService {
   }
 
   /**
+   * Batch 19 TIM A: kebalikan buildPublicUrl — kembalikan fileKey dari URL
+   * publik, atau null bila URL tidak cocok dengan base storage. Dipakai untuk
+   * cleanup thumbnail lama saat media etalase diganti (hanya thumbnailUrl yang
+   * tersimpan di DB, bukan key-nya).
+   */
+  fileKeyFromPublicUrl(url: string): string | null {
+    const publicBase = (this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads').replace(/\/+$/, '');
+    if (typeof url !== 'string' || !url.startsWith(`${publicBase}/`)) return null;
+    const fileKey = `uploads/${url.slice(publicBase.length + 1)}`;
+    return isSafeFileKey(fileKey) ? fileKey : null;
+  }
+
+  /**
    * SH-B-007: konsumsi konfirmasi upload one-time TANPA validasi ulang.
    * Dipakai pemanggil yang sudah memvalidasi via `verifyUserFileKeys(...,
    * { consume: false })` dan baru boleh meng-consume SETELAH mutasi DB-nya
@@ -779,7 +844,7 @@ export class UploadService {
     fileName: string,
     contentType: string,
     fileBuffer: Buffer,
-  ): Promise<{ fileKey: string; fileUrl: string }> {
+  ): Promise<DirectUploadResult> {
     return withSpan(
       'upload.direct',
       async (span) => {
@@ -804,7 +869,7 @@ export class UploadService {
     fileName: string,
     contentType: string,
     fileBuffer: Buffer,
-  ): Promise<{ fileKey: string; fileUrl: string }> {
+  ): Promise<DirectUploadResult> {
     const allowedTypes = ALLOWED_CONTENT_TYPES[purpose];
     if (!allowedTypes.includes(contentType)) {
       throw new BadRequestException({
@@ -876,6 +941,14 @@ export class UploadService {
     const redisKey = `confirmed_upload:${userId}:${fileKey}`;
     await this.redis.setNx(redisKey, '1', CONFIRMED_KEY_TTL_SECONDS);
 
+    // Batch 19 TIM A (item 1): SHOWCASE_VIDEO — validasi durasi + thumbnail.
+    // Fail closed: video yang tidak lolos dihapus dari storage dan upload
+    // ditolak; tidak ada file setengah-jadi yang bertahan.
+    let videoMeta: Pick<DirectUploadResult, 'thumbnailFileKey' | 'thumbnailUrl' | 'durationSec' | 'width' | 'height'> | undefined;
+    if (purpose === UploadPurpose.SHOWCASE_VIDEO) {
+      videoMeta = await this.processShowcaseVideo(userId, fileKey);
+    }
+
     // Batch 1A (ST-004): purpose PRIVAT (KYC/dokumen/bukti) mendapat signed URL
     // kedaluwarsa, bukan URL publik permanen. Purpose publik (avatar/showcase)
     // tetap mendapat URL publik via nginx.
@@ -883,7 +956,98 @@ export class UploadService {
       ? this.buildSignedDownloadUrl(fileKey, 900)
       : this.localStorage.getPublicUrl(fileKey);
 
-    return { fileKey, fileUrl };
+    return { fileKey, fileUrl, ...videoMeta };
+  }
+
+  /**
+   * Batch 19 TIM A (item 1): pasca-pemrosesan video showcase.
+   *
+   * 1. Cek ffmpeg/ffprobe tersedia (prasyarat deploy di server).
+   * 2. Probe durasi + dimensi via ffprobe — gagal parse = bukan video valid.
+   * 3. Tolak bila durasi di luar [MIN, MAX].
+   * 4. Generate thumbnail JPEG (lebar 640px) via ffmpeg, disimpan di folder
+   *    SHOWCASE_IMAGE milik user yang sama dan DITANDAI terkonfirmasi
+   *    (confirmed_upload) supaya langsung bisa dipakai sebagai media showcase.
+   *
+   * Setiap kegagalan menghapus file video yang sudah tersimpan (fail closed —
+   * tidak ada artefak yatim) lalu melempar error yang sesuai.
+   */
+  private async processShowcaseVideo(
+    userId: string,
+    fileKey: string,
+  ): Promise<Pick<DirectUploadResult, 'thumbnailFileKey' | 'thumbnailUrl' | 'durationSec' | 'width' | 'height'>> {
+    const discardVideo = async (): Promise<void> => {
+      await this.localStorage.deleteFile(fileKey).catch(() => undefined);
+    };
+
+    if (!this.videoProcessing.isAvailable()) {
+      await discardVideo();
+      // 500: kesalahan konfigurasi server (ffmpeg belum diinstal) — bukan
+      // kesalahan input user. Prasyarat deploy tercatat di laporan batch.
+      throw new InternalServerErrorException({
+        code: ErrorCodes.UPLOAD_FAILED,
+        message: 'Video processing is temporarily unavailable on the server',
+      });
+    }
+
+    let probe: { durationSec: number; width: number; height: number };
+    try {
+      probe = await this.videoProcessing.probeVideo(this.localStorage.resolvePath(fileKey));
+    } catch {
+      await discardVideo();
+      throw new BadRequestException({
+        code: ErrorCodes.VIDEO_UNPROCESSABLE,
+        message: 'File is not a valid video or its duration cannot be determined',
+      });
+    }
+
+    if (probe.durationSec > SHOWCASE_VIDEO_MAX_DURATION_SEC) {
+      await discardVideo();
+      throw new BadRequestException({
+        code: ErrorCodes.VIDEO_TOO_LONG,
+        message: `Video duration exceeds the maximum of ${SHOWCASE_VIDEO_MAX_DURATION_SEC} seconds`,
+      });
+    }
+    if (probe.durationSec < SHOWCASE_VIDEO_MIN_DURATION_SEC) {
+      await discardVideo();
+      throw new BadRequestException({
+        code: ErrorCodes.VIDEO_UNPROCESSABLE,
+        message: 'Video duration is too short or the file is corrupted',
+      });
+    }
+
+    // Thumbnail: key mengikuti pola fileKey aman (lolos isSafeFileKey), folder
+    // SHOWCASE_IMAGE milik user yang sama supaya bisa dilampirkan sebagai
+    // media showcase tanpa langkah konfirmasi tambahan.
+    const thumbKey = `uploads/showcase-images/${userId}/${Date.now()}-thumb-${nanoid()}.jpg`;
+    try {
+      const destPath = this.localStorage.resolvePath(thumbKey);
+      await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+      await this.videoProcessing.generateThumbnail(
+        this.localStorage.resolvePath(fileKey),
+        destPath,
+        Math.min(1, probe.durationSec / 2),
+        SHOWCASE_VIDEO_THUMBNAIL_WIDTH,
+      );
+    } catch {
+      await discardVideo();
+      await this.localStorage.deleteFile(thumbKey).catch(() => undefined);
+      throw new InternalServerErrorException({
+        code: ErrorCodes.UPLOAD_FAILED,
+        message: 'Failed to generate video thumbnail',
+      });
+    }
+
+    // Tandai thumbnail sebagai confirmed (dibuat server-side, bukan oleh user).
+    await this.redis.setNx(`confirmed_upload:${userId}:${thumbKey}`, '1', CONFIRMED_KEY_TTL_SECONDS);
+
+    return {
+      thumbnailFileKey: thumbKey,
+      thumbnailUrl: this.localStorage.getPublicUrl(thumbKey),
+      durationSec: Math.round(probe.durationSec),
+      width: probe.width,
+      height: probe.height,
+    };
   }
 
   async cleanupFileKeys(userId: string, fileKeys: string[]): Promise<{ deleted: number; errors: { fileKey: string; reason: string }[] }> {

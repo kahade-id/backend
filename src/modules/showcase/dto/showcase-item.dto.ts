@@ -1,10 +1,10 @@
 import {
   ArrayMaxSize, ArrayMinSize, ArrayUnique, IsArray, IsBoolean, IsEnum, IsInt,
-  IsOptional, IsString, Max, MaxLength, Min,
+  IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { ShowcaseVisibility } from '@prisma/client';
+import { ShowcaseVisibility, ShowcaseCondition } from '@prisma/client';
 import {
   ORDER_MAX_VALUE,
   SHOWCASE_CATEGORY_MAX_LENGTH,
@@ -13,6 +13,7 @@ import {
   SHOWCASE_MAX_IMAGES_ABSOLUTE,
   SHOWCASE_TITLE_MAX_LENGTH,
 } from '../../../common/constants/app.constants';
+import { ShowcaseMediaInputDto } from './showcase-media.dto';
 
 /**
  * Section 3 — showcase item.
@@ -104,6 +105,32 @@ export class CreateShowcaseItemDto {
   @ArrayUnique()
   @IsString({ each: true })
   imageFileKeys?: string[];
+
+  @ApiPropertyOptional({
+    enum: ShowcaseCondition,
+    description:
+      'Kondisi barang: BARU = barang baru, BEKAS = barang bekas/second. ' +
+      'Query memakai "baru"|"bekas" (case-insensitive).',
+  })
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim().toUpperCase() : value))
+  @IsEnum(ShowcaseCondition)
+  condition?: ShowcaseCondition;
+
+  @ApiPropertyOptional({
+    type: [ShowcaseMediaInputDto],
+    description:
+      'Daftar media (image/video/spin360) — pengganti modern imageFileKeys. ' +
+      'Bila diisi, imageFileKeys TIDAK BOLEH diisi juga (pilih salah satu). ' +
+      'Maksimum ' + String(SHOWCASE_MAX_IMAGES_ABSOLUTE) + ' entri; batas per-user mengikuti status Kahade+.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(SHOWCASE_MAX_IMAGES_ABSOLUTE)
+  @ValidateNested({ each: true })
+  @Type(() => ShowcaseMediaInputDto)
+  media?: ShowcaseMediaInputDto[];
 }
 
 export class UpdateShowcaseItemDto {
@@ -190,4 +217,27 @@ export class UpdateShowcaseItemDto {
   @ArrayUnique()
   @IsString({ each: true })
   imageFileKeys?: string[];
+
+  @ApiPropertyOptional({
+    enum: ShowcaseCondition,
+    description: 'Kondisi barang: BARU = barang baru, BEKAS = barang bekas/second ("baru"|"bekas", case-insensitive).',
+  })
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim().toUpperCase() : value))
+  @IsEnum(ShowcaseCondition)
+  condition?: ShowcaseCondition;
+
+  @ApiPropertyOptional({
+    type: [ShowcaseMediaInputDto],
+    description:
+      'Bila diisi, seluruh media diganti dengan daftar ini (pengganti modern imageFileKeys). ' +
+      'Bila diisi, imageFileKeys TIDAK BOLEH diisi juga (pilih salah satu). Tidak boleh kosong.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1, { message: 'media must contain at least 1 entry: a showcase item cannot be left without media.' })
+  @ArrayMaxSize(SHOWCASE_MAX_IMAGES_ABSOLUTE)
+  @ValidateNested({ each: true })
+  @Type(() => ShowcaseMediaInputDto)
+  media?: ShowcaseMediaInputDto[];
 }

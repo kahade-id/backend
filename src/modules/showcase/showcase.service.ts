@@ -2047,6 +2047,52 @@ export class ShowcaseService {
     return createPaginatedResponse(data, total, safePage, safeLimit);
   }
 
+  /**
+   * BE-IMP (item 54): karya tersimpan milik user — untuk sinkronisasi koleksi
+   * pribadi di frontend ("Karya tersimpan sync").
+   *
+   * Penyimpanan memakai model `ShowcaseSave` yang sudah ada (userId,
+   * showcaseId, createdAt + unique constraint) — tidak perlu tabel/model baru.
+   * Urutan: terbaru disimpan dulu. Setiap item memakai bentuk kartu publik
+   * yang sama dengan feed (`serializeShowcase`) + `savedAt`.
+   *
+   * Item tetap dikembalikan walau sudah nonaktif/terhapus (soft delete) agar
+   * frontend bisa menandai/membersihkan bookmark lokalnya — sinkronisasi
+   * butuh melihat tombstone, bukan daftar yang diam-diam menyusut.
+   */
+  async listSavedShowcases(
+    userId: string,
+    page: number,
+    limit: number,
+  ): Promise<object> {
+    const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
+    const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 100) : 20;
+    const skip = (safePage - 1) * safeLimit;
+    const [rows, total] = await Promise.all([
+      this.prisma.showcaseSave.findMany({
+        where: { userId },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip,
+        take: safeLimit,
+        include: { showcase: { include: SHOWCASE_INCLUDE } },
+      }),
+      this.prisma.showcaseSave.count({ where: { userId } }),
+    ]);
+    const showcaseRows = rows.map((row) => row.showcase) as unknown as ShowcaseRow[];
+    const likedIds = await this.getLikedShowcaseIds(userId, showcaseRows.map((row) => row.id));
+    const badgeMap = await this.getAuthorBadgeMap(showcaseRows.map((row) => row.user.id));
+    const items = showcaseRows.map((item, index) => ({
+      ...this.serializeShowcase(item, {
+        isLiked: likedIds.has(item.id),
+        isSaved: true,
+        isOwner: item.user.id === userId,
+        authorBadges: badgeMap.get(item.user.id) ?? [],
+      }),
+      savedAt: rows[index].createdAt,
+    }));
+    return createPaginatedResponse(items, total, safePage, safeLimit);
+  }
+
 
   // ==================================================================
   // Komentar

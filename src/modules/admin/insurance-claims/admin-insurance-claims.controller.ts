@@ -11,6 +11,7 @@ import { AdminRole } from '@prisma/client';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
 import { Request } from 'express';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
+import { Idempotency } from '../../../common/decorators/idempotency.decorator';
 
 @ApiTags('admin-insurance-claims')
 @ApiBearerAuth('access-token')
@@ -29,6 +30,7 @@ export class AdminInsuranceClaimsController {
   }
 
   @Patch(':claimId')
+  @Idempotency()
   @UseGuards(UserThrottleGuard)
   // ADM-208: reviewClaim (termasuk transisi PAID yang mengeksekusi payout
   // nyata ke wallet) HANYA untuk role keuangan. Class-level mengizinkan

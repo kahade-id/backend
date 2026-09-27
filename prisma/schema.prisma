@@ -534,6 +534,7 @@ enum AuditAction {
   // GAP-E rekonsiliasi keuangan (G326–G350, append-only; migrasi 20260927050000_gap_e_admin_ops)
   RECONCILIATION_FINDING_CREATED
   RECONCILIATION_FINDING_ACKNOWLEDGED
+  RECONCILIATION_FINDING_REOPENED
   MANUAL_LEDGER_CORRECTION
   // ADM-205 dual control withdrawal (append-only; migrasi 20260927170000_withdrawal_dual_approval_audit)
   WITHDRAWAL_APPROVED

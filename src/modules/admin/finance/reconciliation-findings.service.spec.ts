@@ -138,12 +138,19 @@ describe('ReconciliationFindingsService', () => {
     );
   });
 
-  it('menolak transisi status yang tidak valid (RESOLVED → INVESTIGATING)', async () => {
+  it('ADM-228: mengizinkan reopen RESOLVED → INVESTIGATING dengan catatan (audit REOPENED)', async () => {
     prisma.reconciliationFinding.findUnique.mockResolvedValue(findingRow({ status: 'RESOLVED' }));
-    await expect(
-      service().acknowledgeFinding('finding-1', 'admin-1', { status: 'INVESTIGATING', notes: 'cek lagi' }, '127.0.0.1'),
-    ).rejects.toBeInstanceOf(ConflictException);
-    expect(prisma.reconciliationFinding.update).not.toHaveBeenCalled();
+    prisma.reconciliationFinding.update.mockResolvedValue(findingRow({ status: 'INVESTIGATING' }));
+    const res = (await service().acknowledgeFinding(
+      'finding-1',
+      'admin-1',
+      { status: 'INVESTIGATING', notes: 'cek lagi' },
+      '127.0.0.1',
+    )) as { status: string };
+    expect(res.status).toBe('INVESTIGATING');
+    expect(auditLog.logAdminAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'RECONCILIATION_FINDING_REOPENED' }),
+    );
   });
 
   it('mengizinkan transisi NEW → INVESTIGATING dengan catatan', async () => {

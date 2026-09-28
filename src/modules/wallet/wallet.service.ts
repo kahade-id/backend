@@ -98,6 +98,9 @@ interface WalletSummary {
   isLocked: boolean;
   /** Kode i18n untuk alasan penguncian (bukan teks hardcode). */
   lockReasonCode: string | null;
+  // Batch 139 BE-API1 (item 107): rincian escrow per order (read-only) di
+  // samping agregat `escrowBalance` — dukung I001.
+  escrowBreakdown: Array<{ orderId: string; amount: number }>;
 }
 
 interface TransactionSummary {
@@ -283,7 +286,33 @@ export class WalletService implements OnModuleInit {
       lockReasonCode: wallet.isLocked
         ? (wallet.lockReasonCode ?? 'WALLET_LOCKED_CONTACT_SUPPORT')
         : null,
+      // Batch 139 BE-API1 (item 107): rincian escrow per order. Dana escrow
+      // ditahan di wallet BUYER sejak paidAt sampai cair/refund — jadi
+      // order yang masih menahan escrow = buyer==user, sudah dibayar, status
+      // masih PROCESSING/IN_DELIVERY/DISPUTED. Read-only; tidak menyentuh
+      // logika escrow. Catatan: order milestone opt-in dengan partial release
+      // memakai buyerPayAmount penuh (rilis parsial tidak dilacak per order)
+      // — agregat `escrowBalance` tetap sumber kebenaran.
+      escrowBreakdown: await this.getEscrowBreakdown(userId),
     };
+  }
+
+  /**
+   * Batch 139 BE-API1 (item 107): rincian escrow per order untuk GET /v1/wallet.
+   * Read-only — satu query ringan (buyerId + status terindeks).
+   */
+  private async getEscrowBreakdown(userId: string): Promise<Array<{ orderId: string; amount: number }>> {
+    const rows = await this.prisma.order.findMany({
+      where: {
+        buyerId: userId,
+        paidAt: { not: null },
+        status: { in: [OrderStatus.PROCESSING, OrderStatus.IN_DELIVERY, OrderStatus.DISPUTED] },
+        deletedAt: null,
+      },
+      select: { orderId: true, buyerPayAmount: true },
+      orderBy: { paidAt: 'desc' },
+    });
+    return rows.map((r) => ({ orderId: r.orderId, amount: toIdr(r.buyerPayAmount) }));
   }
 
   async getTransactions(
@@ -293,6 +322,8 @@ export class WalletService implements OnModuleInit {
     type?: string,
     from?: string,
     to?: string,
+    // Batch 139 BE-API1 (item 106): filter status server-side.
+    status?: string,
   ): Promise<PaginatedResponse<TransactionSummary>> {
     const wallet = await this.prisma.wallet.findUnique({ where: { userId } });
     if (!wallet)
@@ -310,6 +341,19 @@ export class WalletService implements OnModuleInit {
         throw new BadRequestException({
           code: 'INVALID_TRANSACTION_TYPE',
           message: `Invalid transaction type: "${type}". Valid values: ${Object.values(WalletTransactionType).join(', ')}`,
+        });
+      }
+    }
+    // Batch 139 BE-API1 (item 106): filter status server-side (pola sama
+    // dengan filter `type` di atas — nilai di luar enum → 400, bukan daftar
+    // kosong; FE membangun chip dari enum: PENDING/SUCCESS/FAILED/CANCELLED/REVERSED).
+    if (status) {
+      if (Object.values(WalletTransactionStatus).includes(status as WalletTransactionStatus)) {
+        where.status = status as WalletTransactionStatus;
+      } else {
+        throw new BadRequestException({
+          code: 'INVALID_TRANSACTION_STATUS',
+          message: `Invalid transaction status: "${status}". Valid values: ${Object.values(WalletTransactionStatus).join(', ')}`,
         });
       }
     }
@@ -407,6 +451,8 @@ export class WalletService implements OnModuleInit {
         balanceBefore: true,
         balanceAfter: true,
         createdAt: true,
+        updatedAt: true,
+        completedAt: true,
         metadata: true,
         order: { select: { orderId: true, title: true, status: true } },
       },
@@ -426,7 +472,35 @@ export class WalletService implements OnModuleInit {
       createdAt: transaction.createdAt,
       metadata: transaction.metadata,
       order: transaction.order,
+      // Batch 139 BE-API1 (item 109): riwayat status mutasi (dukung I008).
+      // Diturunkan dari timestamp yang ada — tidak ada tabel histori status
+      // khusus: PENDING@createdAt selalu ada; entri final ditambah bila
+      // status sudah berubah dari PENDING (acuan completedAt, fallback
+      // updatedAt). Read-only, turunan murni.
+      timeline: this.buildTransactionTimeline(transaction),
     };
+  }
+
+  /**
+   * Batch 139 BE-API1 (item 109): bangun `timeline: [{status, at}]` dari
+   * timestamp WalletTransaction. Murni turunan — tanpa tulis/logika baru.
+   */
+  private buildTransactionTimeline(tx: {
+    status: WalletTransactionStatus;
+    createdAt: Date;
+    updatedAt: Date;
+    completedAt: Date | null;
+  }): Array<{ status: string; at: Date }> {
+    const timeline: Array<{ status: string; at: Date }> = [
+      { status: WalletTransactionStatus.PENDING, at: tx.createdAt },
+    ];
+    if (tx.status !== WalletTransactionStatus.PENDING) {
+      const finalAt = tx.completedAt ?? tx.updatedAt;
+      if (finalAt) {
+        timeline.push({ status: tx.status, at: finalAt });
+      }
+    }
+    return timeline;
   }
 
   private static percentToBps(pct: number): number {
@@ -495,7 +569,7 @@ export class WalletService implements OnModuleInit {
   async getTopupStatus(
     userId: string,
     paymentTxId: string,
-  ): Promise<{ status: PaymentStatus; txId: string; amount: number }> {
+  ): Promise<{ status: PaymentStatus; txId: string; amount: number; expiresAt: string | null; expiredAt: string | null }> {
     // Mobile clients poll this endpoint after initiating a top-up to learn
     // when the Midtrans webhook has settled the payment. We accept the
     // public-facing `midtransOrderId` (returned to the client as
@@ -503,7 +577,7 @@ export class WalletService implements OnModuleInit {
     // calling user so it cannot be used to enumerate other users' txs.
     const tx = await this.prisma.paymentTransaction.findFirst({
       where: { midtransOrderId: paymentTxId, userId },
-      select: { midtransOrderId: true, status: true, amount: true },
+      select: { midtransOrderId: true, status: true, amount: true, expiredAt: true },
     });
     if (!tx) {
       throw new NotFoundException({
@@ -511,10 +585,17 @@ export class WalletService implements OnModuleInit {
         message: 'Top-up transaction not found',
       });
     }
+    // Batch 139 BE-API1 (item 108): ISO absolut untuk countdown I002.
+    // Keluarkan KEDUANYA secara additive: `expiredAt` (nama di brief) dan
+    // `expiresAt` (nama yang dibaca FE: app/topup.tsx, lib/api/wallet.ts) —
+    // nilai identik, null bila tidak ada.
+    const expiryIso = tx.expiredAt ? tx.expiredAt.toISOString() : null;
     return {
       status: tx.status,
       txId: tx.midtransOrderId,
       amount: toIdr(tx.amount),
+      expiredAt: expiryIso,
+      expiresAt: expiryIso,
     };
   }
 

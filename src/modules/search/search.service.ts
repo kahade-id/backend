@@ -224,9 +224,9 @@ export class SearchService {
 
     if (tsQuery) {
       const [rows, countResult] = await Promise.all([
-        this.prisma.$queryRaw<{ id: string; userId: string; username: string | null; fullName: string; avatarUrl: string | null; rank: number }[]>`
+        this.prisma.$queryRaw<{ id: string; userId: string; username: string | null; fullName: string; avatarUrl: string | null; membershipRank: string | null; rank: number }[]>`
           SELECT
-            id, "userId", username, "fullName", "avatarUrl",
+            id, "userId", username, "fullName", "avatarUrl", "membershipRank",
             ts_rank(
               to_tsvector('simple', coalesce(username, '') || ' ' || "fullName"),
               to_tsquery('simple', ${tsQuery})
@@ -265,7 +265,7 @@ export class SearchService {
               { fullName: { contains: escapeLikePattern(query), mode: 'insensitive' } },
             ],
           },
-          select: { id: true, userId: true, username: true, fullName: true, avatarUrl: true },
+          select: { id: true, userId: true, username: true, fullName: true, avatarUrl: true, membershipRank: true },
           take,
         }),
         this.prisma.user.count({
@@ -287,7 +287,9 @@ export class SearchService {
     // DC-009: response memakai `userId` PUBLIK (USR-XXXX) — selaras dengan
     // GET /v1/users/search, /v1/users/discover, dan author di showcase feed.
     // Kolom `id` internal hanya dipakai untuk lookup sealTier, tidak diekspos.
-    type SearchUserRow = { id: string; userId: string; username: string | null; fullName: string; avatarUrl: string | null };
+    // Batch 139 BE-API1 (item 104): `membershipRank` disematkan per hasil user
+    // (nama persis yang dibaca FE `app/search.tsx`: `item.user.membershipRank`).
+    type SearchUserRow = { id: string; userId: string; username: string | null; fullName: string; avatarUrl: string | null; membershipRank: string | null };
     const sealMap = await this.verificationBadgeService.getSealTierMap(
       (results as SearchUserRow[]).map((r) => r.id),
     );
@@ -296,6 +298,7 @@ export class SearchService {
       username: r.username,
       fullName: r.fullName,
       avatarUrl: r.avatarUrl,
+      membershipRank: r.membershipRank ?? null,
       sealTier: sealMap.get(r.id) ?? null,
     }));
 
@@ -448,13 +451,12 @@ export class SearchService {
   }
 
   private async searchShowcase(query: string, userId: string | undefined, limit?: number, location?: string): Promise<{ results: object[]; total: number }> {
-    // DC-019 (audit Discovery 2026-09-26): bentuk MINIMAL ini disengaja —
-    // hasil search showcase adalah ringkasan untuk navigasi, bukan kartu feed.
-    // Memperkaya dengan images/likeCount/author penuh = join berat di endpoint
-    // yang dioptimasi untuk latency. Kontrak: {id, title, description, userId,
-    // createdAt} dengan `userId` PUBLIK (USR-XXXX, selaras DC-009).
-    // Bila frontend kelak butuh kartu kaya dari search, tambahkan mode
-    // `detail=full` — jangan memperkaya default ini tanpa ukur dampak.
+    // DC-019 (audit Discovery 2026-09-26): bentuk minimal dulu disengaja untuk
+    // latency. Batch 139 BE-API1 (item 105) memperkaya menjadi rich card
+    // (I079): harga + cover image + counter like/save — kolom ini murah
+    // (kolom langsung di user_showcases + satu subquery media pertama),
+    // tanpa join author penuh. Kontrak: {id, title, description, userId,
+    // createdAt} + {priceMin, priceMax, coverImageUrl, likeCount, saveCount}.
     const take = limit || this.LIMIT;
     const tsQuery = this.buildTsQuery(query);
     // T2 (audit Discovery 2026-09-26): paritas privasi dengan searchUsers —
@@ -472,12 +474,25 @@ export class SearchService {
     const locationSql = locationFilter
       ? Prisma.sql`AND sc."userId" IN (SELECT id FROM users WHERE address ILIKE '%' || ${escapeLikePattern(locationFilter)} || '%')`
       : Prisma.sql``;
+    // Batch 139 BE-API1 (item 105): hasil search showcase DIPERKAYA menjadi
+    // rich card (dukung I079) — harga, cover image, counter like/save.
+    // Nama field selaras tipe FE `ShowcaseSocialItem` (priceMin/priceMax,
+    // coverImageUrl, likeCount, saveCount). Bentuk minimal lama tetap
+    // subset dari ini (additive-only). Cover = media pertama (video →
+    // thumbnail, pola serializeShowcase).
     if (tsQuery) {
       try {
         // DC-009: join users untuk `userId` PUBLIK (kolom user_showcases."userId"
         // adalah FK internal cuid — jangan diekspos mentah).
-        const rows = await this.prisma.$queryRaw<Array<{ id: string; title: string | null; description: string | null; userId: string; createdAt: Date }>>`
+        const rows = await this.prisma.$queryRaw<Array<{ id: string; title: string | null; description: string | null; userId: string; createdAt: Date; priceMin: bigint | null; priceMax: bigint | null; likeCount: number; saveCount: number; coverImageUrl: string | null }>>`
           SELECT sc.id, sc.title, sc.description, u."userId" AS "userId", sc."createdAt",
+                 sc."priceMin", sc."priceMax", sc."likeCount", sc."saveCount",
+                 (SELECT CASE WHEN si.kind = 'video' AND si."thumbnailUrl" IS NOT NULL
+                              THEN si."thumbnailUrl" ELSE si."imageUrl" END
+                  FROM showcase_images si
+                  WHERE si."showcaseId" = sc.id
+                  ORDER BY si."sortOrder" ASC, si."createdAt" ASC
+                  LIMIT 1) AS "coverImageUrl",
                  ts_rank(to_tsvector('simple', COALESCE(sc.title,'') || ' ' || COALESCE(sc.description,'')), to_tsquery('simple', ${tsQuery})) AS rank
           FROM user_showcases sc
           JOIN users u ON u.id = sc."userId"
@@ -498,7 +513,18 @@ export class SearchService {
             AND to_tsvector('simple', COALESCE(sc.title,'') || ' ' || COALESCE(sc.description,'')) @@ to_tsquery('simple', ${tsQuery})
         `.catch(() => [{ count: BigInt(0) }]);
         return {
-          results: rows.map((r) => ({ id: r.id, title: r.title, description: r.description, userId: r.userId, createdAt: r.createdAt })),
+          results: rows.map((r) => ({
+            id: r.id,
+            title: r.title,
+            description: r.description,
+            userId: r.userId,
+            createdAt: r.createdAt,
+            priceMin: r.priceMin === null ? null : Number(r.priceMin),
+            priceMax: r.priceMax === null ? null : Number(r.priceMax),
+            coverImageUrl: r.coverImageUrl,
+            likeCount: r.likeCount,
+            saveCount: r.saveCount,
+          })),
           total: Number(countResult[0]?.count ?? 0),
         };
       } catch {}
@@ -523,11 +549,40 @@ export class SearchService {
       } as any;
       const [rows, total] = await Promise.all([
         // DC-009: ambil userId PUBLIK via relasi user (bukan FK internal).
-        this.prisma.userShowcase.findMany({ where, select: { id: true, title: true, description: true, createdAt: true, user: { select: { userId: true } } }, take, orderBy: { createdAt: 'desc' } }),
+        // Batch 139 BE-API1 (item 105): rich card — harga, cover image,
+        // counter like/save (paritas dengan jalur raw SQL di atas).
+        this.prisma.userShowcase.findMany({
+          where,
+          select: {
+            id: true, title: true, description: true, createdAt: true,
+            priceMin: true, priceMax: true, likeCount: true, saveCount: true,
+            user: { select: { userId: true } },
+            images: { select: { imageUrl: true, thumbnailUrl: true, kind: true }, orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }], take: 1 },
+          },
+          take,
+          orderBy: { createdAt: 'desc' },
+        }),
         this.prisma.userShowcase.count({ where }),
       ]);
       return {
-        results: rows.map((r) => ({ id: r.id, title: r.title, description: r.description, userId: r.user.userId, createdAt: r.createdAt })),
+        results: rows.map((r) => {
+          const first = r.images[0];
+          const coverImageUrl = first
+            ? first.kind === 'video' && first.thumbnailUrl ? first.thumbnailUrl : first.imageUrl
+            : null;
+          return {
+            id: r.id,
+            title: r.title,
+            description: r.description,
+            userId: r.user.userId,
+            createdAt: r.createdAt,
+            priceMin: r.priceMin === null ? null : Number(r.priceMin),
+            priceMax: r.priceMax === null ? null : Number(r.priceMax),
+            coverImageUrl,
+            likeCount: r.likeCount,
+            saveCount: r.saveCount,
+          };
+        }),
         total,
       };
     } catch {

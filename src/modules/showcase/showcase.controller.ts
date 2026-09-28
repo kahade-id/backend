@@ -12,6 +12,7 @@ import { Public } from '../../common/decorators/public.decorator';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import { ParseIdPipe } from '../../common/pipes/parse-id.pipe';
+import { ParseQueryStringPipe } from '../../common/pipes/parse-query-string.pipe';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 import { ShowcaseFeedQueryDto } from './dto/showcase-feed-query.dto';
 import { CreateShowcaseCommentDto, UpdateShowcaseCommentDto } from './dto/showcase-comment.dto';
@@ -270,12 +271,17 @@ export class ShowcaseController {
     @Param('showcaseId', ParseIdPipe) showcaseId: string,
     @CurrentUser('sub') viewerId: string | null,
     @Query() pagination: PaginationDto,
+    @Query('sort', new ParseQueryStringPipe('sort', 10)) sort?: string,
   ): Promise<object> {
+    // Batch 139 BE-API1 (item 103): `sort=newest|oldest` (default `newest`).
+    // Nilai tak dikenal → `newest` (toleran, kontrak lama tak berubah).
+    const commentSort = sort === 'oldest' ? 'oldest' : 'newest';
     return this.showcaseService.listComments(
       showcaseId,
       viewerId ?? undefined,
       pagination.page ?? 1,
       pagination.limit ?? 20,
+      commentSort,
     );
   }
 

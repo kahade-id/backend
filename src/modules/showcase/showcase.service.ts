@@ -435,7 +435,7 @@ export class ShowcaseService {
    */
   private serializeShowcase(
     row: ShowcaseRow,
-    options: { isLiked?: boolean; isSaved?: boolean; isOwner?: boolean; authorBadges?: Array<{ type: string }> } = {},
+    options: { isLiked?: boolean; isSaved?: boolean; isOwner?: boolean; authorBadges?: Array<{ type: string }>; followedAuthorIds?: Set<string> } = {},
   ): Record<string, unknown> {
     // Batch 19 TIM A (item 1 & 2): media etalase bisa image/video/spin360.
     // Field lama (id/imageUrl/sortOrder) tetap — kontrak lama tidak berubah.
@@ -535,6 +535,12 @@ export class ShowcaseService {
         // R1 (audit 2026-09-26): sealTier disematkan di payload agar frontend
         // bisa render <VerifiedSeal> tanpa N+1 request badge per author.
         sealTier: getSealTierFromTypes((options.authorBadges ?? []).map((b) => b.type)),
+        // Batch 139 BE-API1 (item 102): apakah viewer mengikuti author etalase.
+        // Dihitung dari SATU batch query di serializeFeedPage (bukan N+1 per
+        // kartu — dukung I056). false bila viewer anonim, viewer == author,
+        // atau tidak follow. Pemanggil lain yang tidak meneruskan
+        // `followedAuthorIds` tetap mendapat false (kontrak lama tak berubah).
+        isFollowing: options.followedAuthorIds?.has(row.user.id) ?? false,
       },
       orderLink: {
         title: row.title.slice(0, 100),
@@ -1490,6 +1496,11 @@ export class ShowcaseService {
       andClauses.push({ user: { averageRating: { gte: query.minSellerRating } } });
     }
 
+    // Batch 139 BE-API2 (item 121): filter tipe produk.
+    if (query.productType !== undefined) {
+      andClauses.push({ productType: query.productType });
+    }
+
     // Sort "foryou": ranking personal dihitung di aplikasi (butuh sinyal
     // viewer), jadi jalurnya terpisah dari keyset SQL latest/popular.
     if (sort === 'foryou') {
@@ -1741,6 +1752,9 @@ export class ShowcaseService {
     const savedIds = await this.getSavedShowcaseIds(viewerId, pageRows.map((row) => row.id));
     // S1: badge 3-tier author (satu batch, cached di Redis).
     const badgeMap = await this.getAuthorBadgeMap(pageRows.map((row) => row.user.id));
+    // Batch 139 BE-API1 (item 102): id author yang di-follow viewer — satu
+    // batch query supaya FE tidak perlu N+1 request follow-status per kartu.
+    const followedAuthorIds = await this.getFollowedAuthorIds(viewerId, pageRows.map((row) => row.user.id));
 
     return {
       items: pageRows.map((row) =>
@@ -1748,6 +1762,7 @@ export class ShowcaseService {
           isLiked: likedIds.has(row.id),
           isSaved: savedIds.has(row.id),
           authorBadges: badgeMap.get(row.user.id) ?? [],
+          followedAuthorIds,
         }),
       ),
       sort: opts.sort,
@@ -1755,6 +1770,23 @@ export class ShowcaseService {
       hasMore: opts.hasMore,
       nextCursor: opts.nextCursor,
     };
+  }
+
+  /**
+   * Batch 139 BE-API1 (item 102): himpunan id author (User.id internal) yang
+   * di-follow viewer — SATU query untuk satu halaman feed, bukan N+1.
+   * Viewer anonim → himpunan kosong (semua `author.isFollowing` = false).
+   * Diri sendiri dikecualikan (mengikuti diri sendiri tidak mungkin).
+   */
+  private async getFollowedAuthorIds(viewerId: string | undefined, authorIds: string[]): Promise<Set<string>> {
+    if (!viewerId) return new Set();
+    const unique = [...new Set(authorIds.filter((id) => id && id !== viewerId))];
+    if (unique.length === 0) return new Set();
+    const rows = await this.prisma.follow.findMany({
+      where: { followerId: viewerId, followingId: { in: unique } },
+      select: { followingId: true },
+    });
+    return new Set(rows.map((row) => row.followingId));
   }
 
   /**
@@ -2123,7 +2155,7 @@ export class ShowcaseService {
    * Komentar tersembunyi disaring, kecuali untuk pemilik showcase yang memang
    * perlu melihat apa yang ia sembunyikan.
    */
-  async listComments(showcaseId: string, viewerId: string | undefined, page: number, limit: number): Promise<object> {
+  async listComments(showcaseId: string, viewerId: string | undefined, page: number, limit: number, sort: 'newest' | 'oldest' = 'newest'): Promise<object> {
     const visible = await this.findVisibleShowcase(showcaseId, viewerId);
     if (!visible) {
       throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
@@ -2132,6 +2164,10 @@ export class ShowcaseService {
     const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 50) : 20;
     const skip = (safePage - 1) * safeLimit;
+    // Batch 139 BE-API1 (item 103): urutan komentar root bisa dipilih —
+    // `newest` (default, perilaku lama) atau `oldest`. Balasan di dalam tiap
+    // thread TETAP kronologis menaik (percakapan dibaca dari atas).
+    const rootOrder: 'asc' | 'desc' = sort === 'oldest' ? 'asc' : 'desc';
 
     const excludedIds = await this.getViewerExcludedIds(viewerId);
     // R-5: konsisten dengan feed — komentar dari user yang memprivatkan
@@ -2154,7 +2190,7 @@ export class ShowcaseService {
       this.prisma.showcaseComment
         .findMany({
           where,
-          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          orderBy: [{ createdAt: rootOrder }, { id: rootOrder }],
           skip,
           take: safeLimit,
           include: COMMENT_INCLUDE,
@@ -2231,6 +2267,8 @@ export class ShowcaseService {
       totalPages,
       hasNext: safePage < totalPages,
       hasPrev: safePage > 1,
+      // Batch 139 BE-API1 (item 103): gema sort yang dipakai (additive).
+      sort: sort === 'oldest' ? 'oldest' : 'newest',
     };
   }
 

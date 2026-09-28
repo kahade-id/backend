@@ -45,8 +45,11 @@ export class WalletController {
     @Query('type', new ParseQueryStringPipe('type', 50)) type?: string,
     @Query('from', new ParseDateQueryPipe('from')) from?: string,
     @Query('to', new ParseDateQueryPipe('to')) to?: string,
+    // Batch 139 BE-API1 (item 106): filter status server-side (dukung chip
+    // "Dalam proses" I015 — FE mengirim `status=PENDING`).
+    @Query('status', new ParseQueryStringPipe('status', 20)) status?: string,
   ): Promise<object> {
-    return this.walletService.getTransactions(userId, page, limit, type, from, to);
+    return this.walletService.getTransactions(userId, page, limit, type, from, to, status);
   }
 
   @Get('transactions/:txId')
@@ -128,7 +131,7 @@ export class WalletController {
   async getTopupStatus(
     @CurrentUser('sub') userId: string,
     @Param('paymentTxId', ParseIdPipe) paymentTxId: string,
-  ): Promise<{ status: string; txId: string; amount: number }> {
+  ): Promise<{ status: string; txId: string; amount: number; expiresAt: string | null; expiredAt: string | null }> {
     return this.walletService.getTopupStatus(userId, paymentTxId);
   }
 

@@ -15,6 +15,11 @@ export class ResetPasswordDto {
   @IsNotEmpty()
   tempToken!: string;
 
+  @ApiProperty({ description: 'Device ID — wajib cocok dengan deviceId saat OTP diverifikasi (binding perangkat)' })
+  @IsString()
+  @IsNotEmpty()
+  deviceId!: string;
+
   @ApiProperty({ description: 'New password (min 8 karakter)', minLength: 8, maxLength: 72 })
   @IsString()
   @MinLength(8, { message: 'Password minimal 8 karakter' })

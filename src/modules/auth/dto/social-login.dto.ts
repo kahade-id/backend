@@ -21,7 +21,7 @@ export class SocialLoginDto {
   @IsString()
   deviceInfo?: string;
 
-  @ApiPropertyOptional({ description: 'Nonce yang dikirim saat otorisasi Apple (wajib untuk Apple, anti-replay G011)' })
+  @ApiPropertyOptional({ description: 'WAJIB untuk Apple: nonce yang diterbitkan server via POST /v1/auth/apple/nonce (sekali pakai, TTL 600 dtk). Nonce buatan klien ditolak.' })
   @IsOptional()
   @IsString()
   nonce?: string;

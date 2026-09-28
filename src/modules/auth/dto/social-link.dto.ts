@@ -16,7 +16,7 @@ export class LinkSocialProviderDto {
   @IsNotEmpty()
   idToken!: string;
 
-  @ApiPropertyOptional({ description: 'Nonce Apple (wajib untuk Apple)' })
+  @ApiPropertyOptional({ description: 'WAJIB untuk Apple: nonce yang diterbitkan server via POST /v1/auth/apple/nonce (sekali pakai, TTL 600 dtk). Nonce buatan klien ditolak.' })
   @IsOptional()
   @IsString()
   nonce?: string;

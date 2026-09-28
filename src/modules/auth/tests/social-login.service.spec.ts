@@ -118,7 +118,7 @@ describe('AuthService.socialLogin (GAP-A G001–G025)', () => {
       providers: [
         AuthService,
         { provide: PrismaService, useValue: mockPrisma },
-        { provide: RedisService, useValue: { setNx: jest.fn().mockResolvedValue(true), setex: jest.fn(), get: jest.fn(), releaseLock: jest.fn() } },
+        { provide: RedisService, useValue: { setNx: jest.fn().mockResolvedValue(true), setex: jest.fn(), get: jest.fn(), releaseLock: jest.fn(), set: jest.fn(), getAndDelete: jest.fn() } },
         { provide: TokenService, useValue: mockTokenService },
         { provide: OtpService, useValue: {} },
         { provide: OtpGatewayService, useValue: {} },
@@ -425,7 +425,10 @@ describe('AuthService.socialLogin (GAP-A G001–G025)', () => {
       expect(mockAppleAuth.verifyIdentityToken).not.toHaveBeenCalled();
     });
 
-    it('meneruskan nonce ke verifikasi Apple (G011)', async () => {
+    it('meneruskan nonce SERVER ke verifikasi Apple (G011 + SEC round-2)', async () => {
+      // Nonce wajib diterbitkan server: seed Redis agar konsumsi lolos.
+      const redis = (service as any).redis;
+      redis.getAndDelete.mockResolvedValue(JSON.stringify({ issuedAt: Date.now(), deviceId: 'dev-1' }));
       mockAppleAuth.verifyIdentityToken.mockResolvedValue({ sub: 'apple-sub-1', email: 'a@x.id', emailVerified: true });
       mockPrisma.socialAccount.findUnique.mockResolvedValue({ id: 'sa-1', user: { ...baseUser } });
       mockPrisma.socialAccount.update.mockResolvedValue({});
@@ -433,7 +436,104 @@ describe('AuthService.socialLogin (GAP-A G001–G025)', () => {
       mockPrisma.user.update.mockResolvedValue({});
 
       await service.socialLogin('apple', 'id-token', 'dev-1', 'agent', '127.0.0.1', 'nonce-xyz');
+      expect(redis.getAndDelete).toHaveBeenCalledWith('apple:nonce:nonce-xyz', expect.anything());
       expect(mockAppleAuth.verifyIdentityToken).toHaveBeenCalledWith('id-token', 'nonce-xyz');
+    });
+
+    it('apple dengan nonce buatan klien (tidak diterbitkan server) → APPLE_NONCE_INVALID', async () => {
+      const redis = (service as any).redis;
+      redis.getAndDelete.mockResolvedValue(null); // tidak ada di Redis
+
+      await expect(
+        service.socialLogin('apple', 'id-token', 'dev-1', 'agent', '127.0.0.1', 'nonce-palsu'),
+      ).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: 'APPLE_NONCE_INVALID' }) }),
+      );
+      expect(mockAppleAuth.verifyIdentityToken).not.toHaveBeenCalled();
+    });
+
+    it('apple tanpa nonce → APPLE_NONCE_REQUIRED', async () => {
+      await expect(
+        service.socialLogin('apple', 'id-token', 'dev-1', 'agent', '127.0.0.1', undefined),
+      ).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: 'APPLE_NONCE_REQUIRED' }) }),
+      );
+      expect(mockAppleAuth.verifyIdentityToken).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Apple server-issued nonce (SEC round-2)', () => {
+    /** Redis fake in-memory: set menyimpan, getAndDelete atomik hapus. */
+    const seedRedisFake = () => {
+      const redis = (service as any).redis;
+      const store = new Map<string, string>();
+      redis.set.mockImplementation(async (k: string, v: string) => { store.set(k, v); });
+      redis.getAndDelete.mockImplementation(async (k: string) => {
+        const v = store.get(k) ?? null;
+        store.delete(k);
+        return v;
+      });
+      return { redis, store };
+    };
+
+    const seedLinkedAppleAccount = () => {
+      mockAppleAuth.verifyIdentityToken.mockResolvedValue({ sub: 'apple-sub-1', email: 'a@x.id', emailVerified: true });
+      mockPrisma.socialAccount.findUnique.mockResolvedValue({ id: 'sa-1', user: { ...baseUser } });
+      mockPrisma.socialAccount.update.mockResolvedValue({});
+      mockPrisma.twoFactorAuth.findUnique.mockResolvedValue(null);
+      mockPrisma.user.update.mockResolvedValue({});
+    };
+
+    it('issueAppleNonce: nonce 64-hex acak, disimpan di Redis dengan TTL 600', async () => {
+      const { redis } = seedRedisFake();
+      const { nonce, expiresIn } = await service.issueAppleNonce('dev-1');
+      expect(nonce).toMatch(/^[0-9a-f]{64}$/);
+      expect(expiresIn).toBe(600);
+      expect(redis.set).toHaveBeenCalledWith(
+        `apple:nonce:${nonce}`,
+        expect.stringContaining('"deviceId":"dev-1"'),
+        600,
+        expect.anything(),
+      );
+      // Dua penerbitan → dua nonce berbeda.
+      const second = await service.issueAppleNonce('dev-1');
+      expect(second.nonce).not.toBe(nonce);
+    });
+
+    it('issueAppleNonce: Apple belum dikonfigurasi → SOCIAL_PROVIDER_NOT_SUPPORTED', async () => {
+      mockAppleAuth.isConfigured.mockReturnValue(false);
+      await expect(service.issueAppleNonce()).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: 'SOCIAL_PROVIDER_NOT_SUPPORTED' }) }),
+      );
+    });
+
+    it('alur penuh: issue → socialLogin sukses; nonce TIDAK bisa dipakai ulang (replay)', async () => {
+      seedRedisFake();
+      seedLinkedAppleAccount();
+      const { nonce } = await service.issueAppleNonce('dev-1');
+
+      await service.socialLogin('apple', 'id-token', 'dev-1', 'agent', '127.0.0.1', nonce);
+      expect(mockAppleAuth.verifyIdentityToken).toHaveBeenCalledWith('id-token', nonce);
+
+      // Replay dengan nonce yang sama → ditolak, token tidak diverifikasi.
+      mockAppleAuth.verifyIdentityToken.mockClear();
+      await expect(
+        service.socialLogin('apple', 'id-token', 'dev-1', 'agent', '127.0.0.1', nonce),
+      ).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: 'APPLE_NONCE_INVALID' }) }),
+      );
+      expect(mockAppleAuth.verifyIdentityToken).not.toHaveBeenCalled();
+    });
+
+    it('nonce untuk device lain → APPLE_NONCE_DEVICE_MISMATCH', async () => {
+      seedRedisFake();
+      const { nonce } = await service.issueAppleNonce('dev-A');
+      await expect(
+        service.socialLogin('apple', 'id-token', 'dev-B', 'agent', '127.0.0.1', nonce),
+      ).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: 'APPLE_NONCE_DEVICE_MISMATCH' }) }),
+      );
+      expect(mockAppleAuth.verifyIdentityToken).not.toHaveBeenCalled();
     });
   });
 

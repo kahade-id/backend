@@ -81,6 +81,8 @@ let _dummyHash: string | undefined;
 void bcryptHash(_cryptoRandomBytes(32).toString('hex'), getBcryptRounds()).then((h: string) => {
   _dummyHash = h;
 });
+// Fallback bila prewarm belum selesai — hash bcrypt valid agar timing sebanding.
+const DUMMY_BCRYPT_HASH_FALLBACK = '$2b$12$K4GH.2PFn0b3bVkYe3klq.ScFT2MXqHWMzIxB/yLc8A7EEpzlJxHy';
 
 const TWO_FA_MAX_ATTEMPTS = 5;
 
@@ -1898,6 +1900,7 @@ export class AuthService {
   async resetPassword(
     dto: {
       tempToken: string;
+      deviceId: string;
       newPassword: string;
       confirmPassword?: string;
       location?: LocationDto;
@@ -1926,6 +1929,19 @@ export class AuthService {
       throw new UnauthorizedException({
         code: ErrorCodes.UNAUTHORIZED,
         message: 'Invalid token scope',
+      });
+    }
+
+    // SEC (round-2): temp token terikat ke deviceId saat OTP diverifikasi —
+    // tolak bila device berbeda. Cek SEBELUM claimTempTokenOnce agar token
+    // valid tidak terbakar oleh request dari device yang salah.
+    if (!payload.deviceId || payload.deviceId !== dto.deviceId) {
+      this.logger.warn(
+        `[SECURITY] resetPassword ditolak: deviceId tidak cocok (token untuk device terikat, request dari device lain).`,
+      );
+      throw new UnauthorizedException({
+        code: ErrorCodes.TEMP_TOKEN_EXPIRED,
+        message: 'Reset token is not valid for this device. Please verify your phone number again.',
       });
     }
 
@@ -2245,8 +2261,7 @@ export class AuthService {
     const user = await this.findUserByIdentifier(dto.identifier.trim());
 
     if (!user) {
-      const fallbackHash =
-        _dummyHash || '$2b$12$K4GH.2PFn0b3bVkYe3klq.ScFT2MXqHWMzIxB/yLc8A7EEpzlJxHy';
+      const fallbackHash = _dummyHash || DUMMY_BCRYPT_HASH_FALLBACK;
       await bcryptCompare(dto.password, fallbackHash);
       const elapsed = Date.now() - loginStart;
       const pad = Math.max(0, 250 - elapsed) + _cryptoRandomInt(50, 200);
@@ -2260,9 +2275,16 @@ export class AuthService {
     // Always run bcryptCompare before any status checks to prevent timing side-channels.
     // Without this, an attacker can distinguish "inactive account" (~1ms) from "wrong password" (~100ms)
     // revealing that the account exists and its status — even before a password is submitted.
-    const isPasswordValid = user.password
-      ? await bcryptCompare(dto.password, user.password)
-      : false;
+    // SEC (round-2): akun passwordless (user.password null — cth. hanya login
+    // sosial/OTP) tetap menjalani dummy bcrypt agar timing-nya identik dengan
+    // password salah (anti-enumeration); hasilnya selalu false.
+    let isPasswordValid: boolean;
+    if (user.password) {
+      isPasswordValid = await bcryptCompare(dto.password, user.password);
+    } else {
+      await bcryptCompare(dto.password, _dummyHash || DUMMY_BCRYPT_HASH_FALLBACK);
+      isPasswordValid = false;
+    }
 
     if (!user.isActive || user.isBanned) {
       throw new UnauthorizedException({
@@ -2282,6 +2304,16 @@ export class AuthService {
     }
 
     if (!isPasswordValid) {
+      // SEC (round-2): akun TANPA password tidak boleh menaikkan
+      // failedLoginAttempts / lockout permanen — tidak ada password yang bisa
+      // di-brute-force, dan lockout permanen (isActive=false) akan menjadi DoS
+      // terhadap pemilik akun yang sah. Tetap tolak dengan error generik.
+      if (!user.password) {
+        throw new UnauthorizedException({
+          code: ErrorCodes.INVALID_CREDENTIALS,
+          message: 'Invalid credentials',
+        });
+      }
       const updated = await this.prisma.user.update({
         where: { id: user.id },
         data: { failedLoginAttempts: { increment: 1 } },
@@ -2823,7 +2855,26 @@ export class AuthService {
       where: { jti: payload.jti },
     });
 
-    if (!session || session.isRevoked || session.expiresAt < new Date()) {
+    // SEC (round-2): JWT refresh VALID (signature lolos) tetapi jti tidak ada
+    // di DB — sesi mungkin terhapus (eviiksi/cleanup) ATAU token hasil
+    // kompromi. Bedakan dari revoked/expired: catat security event TANPA
+    // token mentah, kirim notifikasi dugaan pencurian ke pemilik akun, dan
+    // tetap tolak (fail-closed).
+    if (!session) {
+      this.logger.warn(
+        `[SECURITY] Refresh token bersignature valid tetapi jti tidak dikenal di DB ` +
+          `(userId=${payload.sub}, jti=${payload.jti}). Dugaan pencurian/penyalahgunaan token — request ditolak.`,
+      );
+      this.notifyUnknownRefreshSession(payload.sub).catch(err => {
+        this.logger.error('[SECURITY] Failed to notify user about unknown refresh session', err);
+      });
+      throw new UnauthorizedException({
+        code: ErrorCodes.SESSION_REVOKED,
+        message: 'Session has been revoked',
+      });
+    }
+
+    if (session.isRevoked || session.expiresAt < new Date()) {
       throw new UnauthorizedException({
         code: ErrorCodes.SESSION_REVOKED,
         message: 'Session has been revoked',
@@ -4177,6 +4228,32 @@ export class AuthService {
     }
   }
 
+  /**
+   * SEC (round-2): notifikasi dugaan pencurian saat JWT refresh valid tetapi
+   * jti tidak dikenal DB. TIDAK mencabut semua sesi (kemungkinan besar sesi
+   * terhapus oleh eviksi/cleanup) — hanya menolak request + memberi tahu user.
+   */
+  private async notifyUnknownRefreshSession(userId: string): Promise<void> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { email: true },
+    });
+    const title = 'Aktivitas sesi mencurigakan terdeteksi';
+    const body =
+      'Ada upaya memakai kredensial sesi yang tidak kami kenali pada akun Anda. ' +
+      'Permintaan tersebut ditolak dan sesi aktif Anda tidak terpengaruh. ' +
+      'Jika ini bukan Anda, segera ganti kata sandi dan periksa perangkat tertaut.';
+    await this.createSecurityNotification(userId, title, body);
+    if (user?.email) {
+      await this.dispatchEmail({
+        to: user.email,
+        subject: 'Security Alert: Unrecognized Session Credential',
+        templateName: 'refresh-session-unknown',
+        templateContext: {},
+      });
+    }
+  }
+
   private async saveSession(
     userId: string,
     refreshToken: string,
@@ -4380,7 +4457,10 @@ export class AuthService {
         message: `Social provider ${provider} is not yet configured. Please use phone OTP login.`,
       });
     }
-    const identity = await this.verifyAppleIdentity(idToken, nonce);
+    // SEC (round-2): nonce Apple wajib diterbitkan server — konsumsi sekali
+    // pakai dari Redis SEBELUM verifikasi token (tolak nonce buatan klien).
+    const serverNonce = await this.consumeAppleNonce(nonce, deviceId);
+    const identity = await this.verifyAppleIdentity(idToken, serverNonce);
     return this.loginWithSocialIdentity('APPLE', identity, deviceId, deviceInfo, ipAddress);
   }
 
@@ -4432,6 +4512,96 @@ export class AuthService {
       this.logger.warn(`Apple identity token verification failed: ${e instanceof Error ? e.message : String(e)}`);
       throw new BadRequestException({ code: 'INVALID_SOCIAL_TOKEN', message: 'Invalid Apple identity token' });
     }
+  }
+
+  /**
+   * SEC (round-2): nonce Apple DITERBITKAN SERVER, bukan dibuat klien.
+   *
+   * Alur: aplikasi panggil POST /v1/auth/apple/nonce → pakai nilai nonce di
+   * Apple authorization request → kirim nonce yang sama di social-login /
+   * social-link. Backend mengonsumsi nonce dari Redis (sekali pakai, TTL
+   * pendek) SEBELUM verifikasi token — nonce buatan klien / replay ditolak.
+   */
+  private static readonly APPLE_NONCE_TTL_SECONDS = 600; // 10 menit
+  private static readonly APPLE_NONCE_KEY_PREFIX = 'apple:nonce:';
+
+  /** Terbitkan nonce Apple sekali-pakai (disimpan di Redis, TTL pendek). */
+  async issueAppleNonce(deviceId?: string): Promise<{ nonce: string; expiresIn: number }> {
+    if (!this.appleAuth.isConfigured()) {
+      throw new BadRequestException({
+        code: 'SOCIAL_PROVIDER_NOT_SUPPORTED',
+        message: 'Apple login is not yet configured. Please use phone OTP login.',
+      });
+    }
+    const nonce = _cryptoRandomBytes(32).toString('hex');
+    const payload = JSON.stringify({
+      issuedAt: Date.now(),
+      deviceId: deviceId ?? null,
+    });
+    await this.redis.set(
+      `${AuthService.APPLE_NONCE_KEY_PREFIX}${nonce}`,
+      payload,
+      AuthService.APPLE_NONCE_TTL_SECONDS,
+      { throwOnError: true },
+    );
+    // G024: jangan log nilai nonce (secret sekali-pakai).
+    this.logger.log('social_login_step provider=apple step=nonce_issued');
+    return { nonce, expiresIn: AuthService.APPLE_NONCE_TTL_SECONDS };
+  }
+
+  /**
+   * Konsumsi nonce Apple secara atomik (getAndDelete → sekali pakai).
+   * Melempar BadRequestException bila nonce tidak dikenal / kedaluwarsa /
+   * sudah dipakai / deviceId tidak cocok.
+   * Mengembalikan nonce yang sama untuk dicocokkan ke klaim token Apple.
+   */
+  private async consumeAppleNonce(
+    nonce: string | undefined,
+    deviceId: string | undefined,
+  ): Promise<string> {
+    if (!nonce || typeof nonce !== 'string' || nonce.length === 0) {
+      throw new BadRequestException({
+        code: 'APPLE_NONCE_REQUIRED',
+        message: 'Nonce Apple wajib diterbitkan server via POST /v1/auth/apple/nonce.',
+      });
+    }
+    const raw = await this.redis.getAndDelete(`${AuthService.APPLE_NONCE_KEY_PREFIX}${nonce}`, {
+      throwOnError: true,
+    });
+    if (!raw) {
+      // Nonce tidak dikenal / kedaluwarsa / sudah dipakai (replay).
+      this.logger.warn('social_login_step provider=apple step=nonce_rejected reason=unknown_or_reused');
+      throw new BadRequestException({
+        code: 'APPLE_NONCE_INVALID',
+        message: 'Nonce Apple tidak valid, kedaluwarsa, atau sudah dipakai. Minta nonce baru.',
+      });
+    }
+    let parsed: { issuedAt?: number; deviceId?: string | null };
+    try {
+      parsed = JSON.parse(raw) as { issuedAt?: number; deviceId?: string | null };
+    } catch {
+      throw new BadRequestException({
+        code: 'APPLE_NONCE_INVALID',
+        message: 'Nonce Apple tidak valid, kedaluwarsa, atau sudah dipakai. Minta nonce baru.',
+      });
+    }
+    // Defense in depth: Redis TTL sudah menangani kedaluwarsa; cek umur juga.
+    const ageMs = Date.now() - (parsed.issuedAt ?? 0);
+    if (!parsed.issuedAt || ageMs > AuthService.APPLE_NONCE_TTL_SECONDS * 1000) {
+      throw new BadRequestException({
+        code: 'APPLE_NONCE_INVALID',
+        message: 'Nonce Apple tidak valid, kedaluwarsa, atau sudah dipakai. Minta nonce baru.',
+      });
+    }
+    // Ikat nonce ke device penerbit bila keduanya tersedia.
+    if (parsed.deviceId && deviceId && parsed.deviceId !== deviceId) {
+      this.logger.warn('social_login_step provider=apple step=nonce_rejected reason=device_mismatch');
+      throw new BadRequestException({
+        code: 'APPLE_NONCE_DEVICE_MISMATCH',
+        message: 'Nonce Apple diterbitkan untuk perangkat lain. Minta nonce baru.',
+      });
+    }
+    return nonce;
   }
 
   /**
@@ -4760,7 +4930,13 @@ export class AuthService {
     await this.assertPasskeyReauthenticated(userId, reauth);
 
     const identity =
-      provider === 'google' ? await this.verifyGoogleIdentity(idToken) : await this.verifyAppleIdentity(idToken, nonce);
+      provider === 'google'
+        ? await this.verifyGoogleIdentity(idToken)
+        : await this.verifyAppleIdentity(
+            idToken,
+            // SEC (round-2): nonce Apple wajib diterbitkan server (sekali pakai).
+            await this.consumeAppleNonce(nonce, undefined),
+          );
     const providerEnum: SocialProvider = provider === 'google' ? 'GOOGLE' : 'APPLE';
     const providerLabel = provider === 'google' ? 'Google' : 'Apple';
 

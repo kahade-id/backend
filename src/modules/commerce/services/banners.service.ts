@@ -37,6 +37,13 @@ export class BannersService {
     return createPaginatedResponse(rows, total, page, limit);
   }
 
+  /** Wave 2 integritas-139: detail satu banner (admin) — dipakai halaman detail banner admin. */
+  async getAdminBanner(id: string) {
+    const banner = await this.prisma.banner.findUnique({ where: { id } });
+    if (!banner) throw new NotFoundException({ code: ErrorCodes.BANNER_NOT_FOUND, message: 'Banner tidak ditemukan' });
+    return banner;
+  }
+
   async updateBanner(id: string, dto: UpdateBannerDto) {
     const existing = await this.prisma.banner.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException({ code: ErrorCodes.BANNER_NOT_FOUND, message: 'Banner tidak ditemukan' });

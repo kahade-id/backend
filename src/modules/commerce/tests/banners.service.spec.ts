@@ -59,4 +59,16 @@ describe('BannersService', () => {
     await expect(service.deleteBanner('nope')).rejects.toThrow('tidak ditemukan');
     expect(mockPrisma.banner.delete).not.toHaveBeenCalled();
   });
+
+  it('getAdminBanner: banner hilang → 404 BANNER_NOT_FOUND', async () => {
+    mockPrisma.banner.findUnique.mockResolvedValue(null);
+    await expect(service.getAdminBanner('nope')).rejects.toThrow('tidak ditemukan');
+    expect(mockPrisma.banner.findUnique).toHaveBeenCalledWith({ where: { id: 'nope' } });
+  });
+
+  it('getAdminBanner: mengembalikan banner apa adanya', async () => {
+    const row = { id: 'b-1', title: 'Promo 9.9', isActive: true };
+    mockPrisma.banner.findUnique.mockResolvedValue(row);
+    await expect(service.getAdminBanner('b-1')).resolves.toBe(row);
+  });
 });

@@ -204,3 +204,35 @@ export class DecideRefundDto {
   @IsString() @IsOptional() @MaxLength(500)
   note?: string;
 }
+
+/**
+ * Wave 2 integritas-139: body PATCH /v1/admin/courier/providers/:providerCode.
+ * Operasional provider: on/off global, daftar wilayah allow/block, prioritas.
+ */
+export class UpdateAdminProviderFlagDto {
+  @IsBoolean() @IsOptional()
+  enabled?: boolean;
+
+  @IsArray() @IsString({ each: true }) @MaxLength(20, { each: true }) @ArrayMaxSize(200) @IsOptional()
+  regionWhitelist?: string[];
+
+  @IsArray() @IsString({ each: true }) @MaxLength(20, { each: true }) @ArrayMaxSize(200) @IsOptional()
+  regionBlacklist?: string[];
+
+  @IsInt() @Min(0) @Max(1000) @IsOptional()
+  priority?: number;
+}
+
+/**
+ * Wave 2 integritas-139: body POST
+ * /v1/admin/courier/shipments/:id/refunds/approve.
+ * amountSen dalam rupiah-penuh (bukan sen pecahan) konsisten dengan
+ * RequestRefundDto (BigInt Math.round di service).
+ */
+export class ApproveShippingRefundDto {
+  @IsInt() @Min(1)
+  amountSen!: number;
+
+  @IsString() @IsNotEmpty() @MinLength(5) @MaxLength(500)
+  reason!: string;
+}

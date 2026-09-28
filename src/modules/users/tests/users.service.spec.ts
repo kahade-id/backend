@@ -275,6 +275,37 @@ describe('UsersService', () => {
     });
   });
 
+  describe('removeFollower (I065)', () => {
+    it('throws NotFound when follower username missing', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(null);
+      await expect(service.removeFollower('me', 'ghost')).rejects.toThrow(NotFoundException);
+    });
+
+    it('throws BadRequest when removing self', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'me' });
+      await expect(service.removeFollower('me', 'me')).rejects.toThrow(BadRequestException);
+    });
+
+    it('throws BadRequest when target is not a follower', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'other' });
+      mockPrisma.follow.deleteMany.mockResolvedValue({ count: 0 });
+      await expect(service.removeFollower('me', 'other')).rejects.toThrow(BadRequestException);
+      expect(mockPrisma.follow.deleteMany).toHaveBeenCalledWith({
+        where: { followerId: 'other', followingId: 'me' },
+      });
+    });
+
+    it('deletes the follow row when target follows me', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'other' });
+      mockPrisma.follow.deleteMany.mockResolvedValue({ count: 1 });
+      const res = await service.removeFollower('me', 'other');
+      expect(res.message).toContain('removed');
+      expect(mockPrisma.follow.deleteMany).toHaveBeenCalledWith({
+        where: { followerId: 'other', followingId: 'me' },
+      });
+    });
+  });
+
   describe('getFollowers / getFollowing', () => {
     it('throws NotFound when user missing (followers)', async () => {
       mockPrisma.user.findUnique.mockResolvedValue(null);

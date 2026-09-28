@@ -757,6 +757,17 @@ export class UsersController {
     return this.usersService.unfollowUser(userId, username);
   }
 
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @UseGuards(UserThrottleGuard)
+  @Delete(':username/followers')
+  @ApiOperation({ summary: 'Remove a follower from your own followers (I065)' })
+  async removeFollower(
+    @CurrentUser('sub') userId: string,
+    @Param('username', ParseUsernamePipe) username: string,
+  ): Promise<{ message: string }> {
+    return this.usersService.removeFollower(userId, username);
+  }
+
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 20 } })
   @Get(':username/followers')

@@ -28,7 +28,7 @@ import { NotificationQueueService } from '../queue/notification-queue.service';
 import { NotificationType } from '@prisma/client';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { CourierRegistry } from './providers/courier-registry';
-import { CourierConfigService } from './courier.config';
+import { CourierConfigService, KNOWN_COURIER_CODES } from './courier.config';
 import {
   CourierAddress,
   CourierTimeoutError,
@@ -37,6 +37,7 @@ import {
 } from './providers/courier-provider.interface';
 import { maskLocation } from './providers/mock-courier.provider';
 import {
+  ApproveShippingRefundDto,
   BookShipmentDto,
   CreateBillDto,
   CreateShipmentDto,
@@ -45,6 +46,7 @@ import {
   QuoteRequestDto,
   RequestRefundDto,
   ToggleFlagDto,
+  UpdateAdminProviderFlagDto,
   UpdateCatalogDto,
   VoidShipmentDto,
 } from './dto/courier.dto';
@@ -509,6 +511,26 @@ export class CourierService {
 
   async refreshTracking(userId: string, shipmentId: string): Promise<{ status: ShipmentStatus; events: number; timeout: boolean }> {
     const shipment = await this.assertParticipant(userId, shipmentId);
+    return this.refreshTrackingForShipment(shipment, 'user');
+  }
+
+  /**
+   * Wave 2 integritas-139: refresh tracking oleh admin (tanpa cek partisipan;
+   * guard admin ada di controller). Logika provider IDENTIK dengan jalur user.
+   */
+  async refreshShipmentTrackingAdmin(shipmentId: string, adminId: string): Promise<{ status: ShipmentStatus; events: number; timeout: boolean }> {
+    const shipment = await this.prisma.shipment.findUnique({ where: { id: shipmentId } });
+    if (!shipment) {
+      throw new NotFoundException({ code: ErrorCodes.SHIPMENT_NOT_FOUND, message: 'Pengiriman tidak ditemukan' });
+    }
+    this.logger.log(`Refresh tracking admin=${adminId} shipment=${shipment.id}`);
+    return this.refreshTrackingForShipment(shipment, 'admin');
+  }
+
+  private async refreshTrackingForShipment(
+    shipment: { id: string; trackingNumber: string | null; isManual: boolean; providerCode: string; status: ShipmentStatus },
+    _actor: 'user' | 'admin',
+  ): Promise<{ status: ShipmentStatus; events: number; timeout: boolean }> {
     if (!shipment.trackingNumber || shipment.isManual) {
       throw new BadRequestException({ code: ErrorCodes.COURIER_TRACKING_UNAVAILABLE, message: 'Belum ada nomor resi provider' });
     }
@@ -1154,6 +1176,232 @@ export class CourierService {
     ]);
     this.logger.log(`Refund ongkir ${refundId} ditandai PAID oleh admin=${adminId}`);
     return { ...updated, amount: updated.amount.toString() };
+  }
+
+  // -------------------------------------------------------------------------
+  // Wave 2 integritas-139: endpoint yang dipanggil halaman admin kurir aktif.
+  // Guard role di controller; semua mutasi finansial memakai state machine
+  // refund yang sudah ada (REQUESTED → APPROVED → PAID) dan TIDAK menyentuh
+  // wallet langsung.
+  // -------------------------------------------------------------------------
+
+  /** Daftar shipment untuk halaman admin (filter bookingState/status/provider/stale/search). */
+  async listAdminShipments(query: {
+    page?: number; limit?: number; bookingState?: string; status?: string;
+    providerCode?: string; staleHours?: number; search?: string;
+  }): Promise<{ data: MaskedShipment[]; total: number; page: number; limit: number; totalPages: number; hasNext: boolean; hasPrev: boolean }> {
+    const page = Math.max(1, Math.floor(query.page ?? 1));
+    const limit = Math.min(100, Math.max(1, Math.floor(query.limit ?? 20)));
+    const where: Prisma.ShipmentWhereInput = {};
+    if (query.bookingState) {
+      if (!(query.bookingState in ShipmentBookingState)) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'bookingState tidak dikenal' });
+      }
+      where.bookingState = query.bookingState as ShipmentBookingState;
+    }
+    if (query.status) {
+      if (!(query.status in ShipmentStatus)) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'status tidak dikenal' });
+      }
+      where.status = query.status as ShipmentStatus;
+    }
+    if (query.providerCode) where.providerCode = query.providerCode.toLowerCase();
+    const andClauses: Prisma.ShipmentWhereInput[] = [];
+    if (query.staleHours !== undefined && query.staleHours > 0) {
+      const cutoff = new Date(Date.now() - Math.min(query.staleHours, 24 * 90) * 3600 * 1000);
+      andClauses.push({ OR: [{ lastEventAt: { lt: cutoff } }, { lastEventAt: null, createdAt: { lt: cutoff } }] });
+    }
+    const search = query.search?.trim();
+    if (search) {
+      andClauses.push({
+        OR: [
+          { trackingNumber: { contains: search, mode: 'insensitive' } },
+          { orderId: { contains: search, mode: 'insensitive' } },
+        ],
+      });
+    }
+    if (andClauses.length > 0) where.AND = andClauses;
+    const [total, rows] = await Promise.all([
+      this.prisma.shipment.count({ where }),
+      this.prisma.shipment.findMany({ where, orderBy: { updatedAt: 'desc' }, skip: (page - 1) * limit, take: limit }),
+    ]);
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    return {
+      data: rows.map((r) => this.toMaskedShipment(r)),
+      total, page, limit, totalPages,
+      hasNext: page < totalPages,
+      hasPrev: page > 1,
+    };
+  }
+
+  /** Daftar provider untuk halaman admin: on/off, whitelist/blacklist wilayah, prioritas. */
+  async listAdminProviders(): Promise<Array<{
+    providerCode: string; name: string; enabled: boolean;
+    regionWhitelist: string[]; regionBlacklist: string[]; priority: number;
+  }>> {
+    const configs = this.courierConfig.getAllProviderConfigs();
+    const [flags, sortOrders] = await Promise.all([
+      this.prisma.courierRegionFlag.findMany(),
+      this.prisma.courierService.groupBy({ by: ['providerCode'], _min: { sortOrder: true } }),
+    ]);
+    const minSortByCode = new Map(sortOrders.map((s) => [s.providerCode, s._min.sortOrder ?? 0]));
+    const flagByKey = new Map(flags.map((f) => [`${f.providerCode}:${f.region}`, f]));
+    return configs.map((cfg) => {
+      const registryProvider = this.registry.get(cfg.code);
+      const regionFlags = flags.filter((f) => f.providerCode === cfg.code && f.region !== '*');
+      return {
+        providerCode: cfg.code,
+        name: registryProvider?.displayName ?? cfg.code.toUpperCase(),
+        enabled: flagByKey.get(`${cfg.code}:*`)?.enabled ?? cfg.enabled,
+        regionWhitelist: regionFlags.filter((f) => f.enabled).map((f) => f.region),
+        regionBlacklist: regionFlags.filter((f) => !f.enabled).map((f) => f.region),
+        priority: minSortByCode.get(cfg.code) ?? 0,
+      };
+    });
+  }
+
+  /** Ubah flag operasional provider (SUPER_ADMIN). Fail-closed: provider tidak dikenal → 400. */
+  async updateAdminProviderFlag(providerCode: string, dto: UpdateAdminProviderFlagDto, adminId: string) {
+    const code = providerCode.toLowerCase();
+    if (!(KNOWN_COURIER_CODES as readonly string[]).includes(code)) {
+      throw new BadRequestException({ code: ErrorCodes.COURIER_WEBHOOK_UNKNOWN_PROVIDER, message: 'Provider kurir tidak dikenal' });
+    }
+    if (dto.enabled !== undefined) {
+      await this.prisma.courierRegionFlag.upsert({
+        where: { providerCode_region: { providerCode: code, region: '*' } },
+        update: { enabled: dto.enabled },
+        create: { id: randomUUID(), providerCode: code, region: '*', enabled: dto.enabled },
+      });
+    }
+    if (dto.regionWhitelist !== undefined) {
+      // Whitelist = daftar definitif: hapus flag wilayah lama, tulis ulang yang diizinkan.
+      await this.prisma.courierRegionFlag.deleteMany({ where: { providerCode: code, NOT: { region: '*' } } });
+      if (dto.regionWhitelist.length > 0) {
+        await this.prisma.courierRegionFlag.createMany({
+          data: dto.regionWhitelist.map((region) => ({
+            id: randomUUID(), providerCode: code, region, enabled: true,
+          })),
+          skipDuplicates: true,
+        });
+      }
+    }
+    if (dto.regionBlacklist !== undefined) {
+      for (const region of dto.regionBlacklist) {
+        await this.prisma.courierRegionFlag.upsert({
+          where: { providerCode_region: { providerCode: code, region } },
+          update: { enabled: false },
+          create: { id: randomUUID(), providerCode: code, region, enabled: false },
+        });
+      }
+    }
+    if (dto.priority !== undefined) {
+      await this.prisma.courierService.updateMany({
+        where: { providerCode: code },
+        data: { sortOrder: dto.priority },
+      });
+    }
+    this.logger.log(`Flag provider kurir diubah admin=${adminId}: ${code}`);
+    const updated = await this.listAdminProviders();
+    return updated.find((p) => p.providerCode === code);
+  }
+
+  /**
+   * Coba ulang booking yang GAGAL (fail-closed: hanya bookingState FAILED).
+   * Reuse penuh logika bookShipment — tidak ada jalur booking paralel.
+   */
+  async retryShipmentBookingAdmin(shipmentId: string, adminId: string): Promise<MaskedShipment> {
+    const shipment = await this.prisma.shipment.findUnique({ where: { id: shipmentId } });
+    if (!shipment) {
+      throw new NotFoundException({ code: ErrorCodes.SHIPMENT_NOT_FOUND, message: 'Pengiriman tidak ditemukan' });
+    }
+    if (shipment.bookingState !== ShipmentBookingState.FAILED) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: `Hanya booking yang GAGAL yang bisa dicoba ulang (saat ini: ${shipment.bookingState})`,
+      });
+    }
+    this.logger.log(`Retry booking shipment=${shipment.id} oleh admin=${adminId}`);
+    return this.bookShipment(shipment.sellerId, shipmentId, {});
+  }
+
+  /**
+   * Rekonsiliasi estimasi vs aktual per shipment (halaman admin).
+   * diffSen = actualCost − estimatedCost, dihitung di SQL agar bisa difilter
+   * (onlyMismatch) dan dipaginasi di DB tanpa full-scan ke aplikasi.
+   */
+  async getShippingReconciliation(query: { page?: number; limit?: number; onlyMismatch?: boolean }): Promise<{
+    data: Array<{ shipmentId: string; orderId: string; providerCode: string; estimatedCostSen: string; actualCostSen: string; diffSen: string }>;
+    total: number; page: number; limit: number; totalPages: number; hasNext: boolean; hasPrev: boolean;
+  }> {
+    const page = Math.max(1, Math.floor(query.page ?? 1));
+    const limit = Math.min(100, Math.max(1, Math.floor(query.limit ?? 20)));
+    const mismatchOnly = query.onlyMismatch === true;
+    // Kolom DB mengikuti nama field Prisma (tanpa @map): "orderId",
+    // "providerCode", "estimatedCost", "actualCost", "updatedAt".
+    const baseWhere = Prisma.sql`FROM "shipments" WHERE "actualCost" IS NOT NULL`;
+    const mismatchWhere = mismatchOnly ? Prisma.sql` AND ("actualCost" - "estimatedCost") <> 0` : Prisma.sql``;
+    const [countRows, rows] = await Promise.all([
+      this.prisma.$queryRaw<Array<{ count: bigint }>>(
+        Prisma.sql`SELECT COUNT(*)::bigint AS count ${baseWhere} ${mismatchWhere}`,
+      ),
+      this.prisma.$queryRaw<Array<{
+        shipmentId: string; orderId: string; providerCode: string;
+        estimatedCostSen: string; actualCostSen: string; diffSen: string;
+      }>>(
+        Prisma.sql`SELECT "id" AS "shipmentId", "orderId", "providerCode",
+          "estimatedCost"::text AS "estimatedCostSen",
+          "actualCost"::text AS "actualCostSen",
+          ("actualCost" - "estimatedCost")::text AS "diffSen"
+          ${baseWhere} ${mismatchWhere}
+          ORDER BY "updatedAt" DESC
+          LIMIT ${limit} OFFSET ${(page - 1) * limit}`,
+      ),
+    ]);
+    const total = Number(countRows[0]?.count ?? 0n);
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    return { data: rows, total, page, limit, totalPages, hasNext: page < totalPages, hasPrev: page > 1 };
+  }
+
+  /**
+   * Setujui refund ongkir dari halaman admin (SUPER_ADMIN/FINANCE_ADMIN).
+   * Reuse state machine refund: REQUESTED → APPROVED dalam satu transaksi.
+   * Fail-closed: nominal tidak boleh melebihi sisa biaya aktual yang belum
+   * di-refund. TIDAK menyentuh wallet (payout mengikuti alur markRefundPaid).
+   */
+  async approveShippingRefund(shipmentId: string, dto: ApproveShippingRefundDto, adminId: string) {
+    const shipment = await this.prisma.shipment.findUnique({ where: { id: shipmentId } });
+    if (!shipment) {
+      throw new NotFoundException({ code: ErrorCodes.SHIPMENT_NOT_FOUND, message: 'Pengiriman tidak ditemukan' });
+    }
+    const amount = BigInt(dto.amountSen);
+    const costBase = shipment.actualCost ?? shipment.estimatedCost;
+    const remaining = costBase - shipment.refundedAmount;
+    if (amount > remaining) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: `Nominal refund (${amount}) melebihi sisa biaya yang bisa di-refund (${remaining})`,
+      });
+    }
+    const now = new Date();
+    const refund = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.shippingCostRefund.create({
+        data: {
+          id: randomUUID(),
+          shipmentId,
+          orderId: shipment.orderId,
+          amount,
+          reason: dto.reason,
+          requestedBy: adminId,
+          status: ShippingRefundStatus.REQUESTED,
+        },
+      });
+      return tx.shippingCostRefund.update({
+        where: { id: created.id },
+        data: { status: ShippingRefundStatus.APPROVED, decidedBy: adminId, decidedAt: now },
+      });
+    });
+    this.logger.log(`Refund ongkir disetujui admin=${adminId}: shipment=${shipmentId} amount=${amount}`);
+    return { ...refund, amount: refund.amount.toString() };
   }
 }
 

@@ -5,16 +5,18 @@ import { OrderStateService } from '../../orders/order-state.service';
 import { PatunganMode, PatunganStatus, PatunganParticipantStatus, OrderStatus } from '@prisma/client';
 
 const mockTx: Record<string, any> = {
-  patunganParticipant: { update: jest.fn(), updateMany: jest.fn(), aggregate: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn(), count: jest.fn(), create: jest.fn() },
+  patunganParticipant: { update: jest.fn(), updateMany: jest.fn(), aggregate: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), findUnique: jest.fn(), count: jest.fn(), create: jest.fn() },
   patunganGroup: { update: jest.fn(), updateMany: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn() },
   jastipParticipant: { findFirst: jest.fn() },
+  order: { count: jest.fn() },
+  dispute: { count: jest.fn() },
   $executeRawUnsafe: jest.fn(),
   $queryRaw: jest.fn(),
 };
 
 const mockPrisma: Record<string, any> = {
   patunganGroup: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), findUnique: jest.fn(), count: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
-  patunganParticipant: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), findUnique: jest.fn(), update: jest.fn(), updateMany: jest.fn(), count: jest.fn(), delete: jest.fn(), aggregate: jest.fn() },
+  patunganParticipant: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), findUnique: jest.fn(), update: jest.fn(), updateMany: jest.fn(), count: jest.fn(), delete: jest.fn(), deleteMany: jest.fn(), aggregate: jest.fn() },
   user: { findMany: jest.fn() },
   order: { findFirst: jest.fn(), findUnique: jest.fn() },
   $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
@@ -121,14 +123,17 @@ describe('PatunganService', () => {
     );
   });
 
-  it('LOW: joinGroup MENGABAIKAN dto.orderId (anti squatting) — link wajib via linkOrder', async () => {
+  // LOW (SEC-B ronde 2): orderId DIHAPUS dari JoinPatunganDto — penautan order
+  // WAJIB via linkOrder. Penolakan field asing diuji di
+  // commerce-dto-validation.spec.ts (forbidNonWhitelisted).
+  it('LOW: joinGroup tidak pernah menyimpan orderId (create selalu orderId: null)', async () => {
     mockTx.patunganGroup.findFirst.mockResolvedValue({
       id: 'g1', hostId: 'h1', status: PatunganStatus.OPEN,
       deadlineAt: new Date(Date.now() + 86400000), mode: PatunganMode.BAGI_RATA,
       perPersonAmount: 25000000n, targetAmount: 100000000n, slotTotal: 0,
     });
     mockTx.patunganParticipant.create.mockResolvedValue({ id: 'pp1', status: PatunganParticipantStatus.PENDING, orderId: null });
-    await service.joinGroup('u2', 'g1', { orderId: 'order-milik-orang' } as never);
+    await service.joinGroup('u2', 'g1', {} as never);
     expect(mockTx.patunganParticipant.create).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ orderId: null }) }),
     );
@@ -347,6 +352,8 @@ describe('PatunganService', () => {
     mockPrisma.patunganGroup.findMany
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([{ id: 'g1' }, { id: 'g2' }]);
+    // LOW #3: tidak ada order tertaut → tidak ada sengketa → jalur rilis.
+    mockTx.patunganParticipant.findMany.mockResolvedValue([]);
     mockTx.patunganGroup.updateMany
       .mockResolvedValueOnce({ count: 1 }) // g1: masih CONTEST
       .mockResolvedValueOnce({ count: 0 }); // g2: sudah berpindah (dispute)
@@ -356,6 +363,61 @@ describe('PatunganService', () => {
     expect(mockTx.patunganGroup.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({ id: 'g1', status: PatunganStatus.CONTEST }),
+        data: expect.objectContaining({ status: PatunganStatus.RELEASED }),
+      }),
+    );
+  });
+
+  it('LOW #3: CONTEST → RELEASED DITAHAN bila order peserta berstatus DISPUTED', async () => {
+    mockPrisma.patunganGroup.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'g1' }]);
+    mockTx.patunganParticipant.findMany.mockResolvedValue([{ orderId: 'o1' }]);
+    mockTx.order.count.mockResolvedValue(1); // o1 DISPUTED
+    mockTx.dispute.count.mockResolvedValue(0);
+    mockTx.patunganGroup.updateMany.mockResolvedValue({ count: 1 });
+    const res = await service.processDeadlines();
+    expect(res.released).toBe(0);
+    // Masa sanggah diperpanjang, BUKAN release.
+    expect(mockTx.patunganGroup.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'g1', status: PatunganStatus.CONTEST }),
+        data: expect.objectContaining({ contestEndsAt: expect.any(Date) }),
+      }),
+    );
+    expect(mockTx.patunganGroup.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: PatunganStatus.RELEASED }) }),
+    );
+  });
+
+  it('LOW #3: CONTEST → RELEASED DITAHAN bila ada baris dispute non-final', async () => {
+    mockPrisma.patunganGroup.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'g1' }]);
+    mockTx.patunganParticipant.findMany.mockResolvedValue([{ orderId: 'o1' }]);
+    mockTx.order.count.mockResolvedValue(0);
+    mockTx.dispute.count.mockResolvedValue(2); // 2 dispute OPEN/ESCALATED
+    mockTx.patunganGroup.updateMany.mockResolvedValue({ count: 1 });
+    const res = await service.processDeadlines();
+    expect(res.released).toBe(0);
+    expect(mockTx.dispute.count).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ orderId: { in: ['o1'] } }) }),
+    );
+  });
+
+  it('LOW #3: CONTEST → RELEASED bila order tertaut tanpa sengketa', async () => {
+    mockPrisma.patunganGroup.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'g1' }]);
+    mockTx.patunganParticipant.findMany.mockResolvedValue([{ orderId: 'o1' }, { orderId: 'o2' }]);
+    mockTx.order.count.mockResolvedValue(0);
+    mockTx.dispute.count.mockResolvedValue(0);
+    mockTx.patunganGroup.updateMany.mockResolvedValue({ count: 1 });
+    mockTx.patunganParticipant.updateMany.mockResolvedValue({ count: 2 });
+    const res = await service.processDeadlines();
+    expect(res.released).toBe(1);
+    expect(mockTx.patunganGroup.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
         data: expect.objectContaining({ status: PatunganStatus.RELEASED }),
       }),
     );
@@ -417,5 +479,58 @@ describe('PatunganService', () => {
     expect(res.hostName).toBe('Host A');
     expect(res.participants[0]).toMatchObject({ userId: 'u1', userName: 'User Satu', hasPaid: true, amount: 250000 });
     expect(res.splitMode).toBe(PatunganMode.BAGI_RATA);
+  });
+
+  // ── LOW #1: endpoint leave ────────────────────────────────────────────
+
+  it('LOW #1: leaveGroup — peserta PENDING bisa keluar', async () => {
+    mockPrisma.patunganParticipant.findFirst.mockResolvedValue({
+      id: 'pp1', userId: 'u1', groupId: 'g1',
+      status: PatunganParticipantStatus.PENDING,
+      group: { status: PatunganStatus.OPEN },
+    });
+    mockPrisma.patunganParticipant.deleteMany.mockResolvedValue({ count: 1 });
+    const res = await service.leaveGroup('u1', 'pp1');
+    expect(res).toEqual({ left: true, participantId: 'pp1', groupId: 'g1' });
+    // Predicate delete: hanya baris yang masih PENDING.
+    expect(mockPrisma.patunganParticipant.deleteMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ id: 'pp1', status: PatunganParticipantStatus.PENDING }) }),
+    );
+  });
+
+  it('LOW #1: leaveGroup — peserta PAID ditolak (wajib alur order)', async () => {
+    mockPrisma.patunganParticipant.findFirst.mockResolvedValue({
+      id: 'pp1', userId: 'u1', groupId: 'g1',
+      status: PatunganParticipantStatus.PAID,
+      group: { status: PatunganStatus.OPEN },
+    });
+    await expect(service.leaveGroup('u1', 'pp1')).rejects.toThrow('PENDING');
+    expect(mockPrisma.patunganParticipant.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('LOW #1: leaveGroup — peserta milik user lain → 404', async () => {
+    mockPrisma.patunganParticipant.findFirst.mockResolvedValue(null);
+    await expect(service.leaveGroup('u2', 'pp1')).rejects.toThrow('tidak ditemukan');
+    expect(mockPrisma.patunganParticipant.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('LOW #1: leaveGroup — grup RELEASED ditolak', async () => {
+    mockPrisma.patunganParticipant.findFirst.mockResolvedValue({
+      id: 'pp1', userId: 'u1', groupId: 'g1',
+      status: PatunganParticipantStatus.PENDING,
+      group: { status: PatunganStatus.RELEASED },
+    });
+    await expect(service.leaveGroup('u1', 'pp1')).rejects.toThrow('dicairkan');
+    expect(mockPrisma.patunganParticipant.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('LOW #1: leaveGroup — kalah race dengan linkOrder (delete 0) → Conflict fail-closed', async () => {
+    mockPrisma.patunganParticipant.findFirst.mockResolvedValue({
+      id: 'pp1', userId: 'u1', groupId: 'g1',
+      status: PatunganParticipantStatus.PENDING,
+      group: { status: PatunganStatus.OPEN },
+    });
+    mockPrisma.patunganParticipant.deleteMany.mockResolvedValue({ count: 0 });
+    await expect(service.leaveGroup('u1', 'pp1')).rejects.toThrow('berubah');
   });
 });

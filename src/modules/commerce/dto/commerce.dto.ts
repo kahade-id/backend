@@ -15,7 +15,7 @@ import {
   ArrayMinSize,
   ValidateNested,
 } from 'class-validator';
-import { Type } from 'class-transformer';
+import { Type, Transform } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   ProductType,
@@ -395,16 +395,19 @@ export class JoinPatunganDto {
   @Min(1000)
   amountIdr?: number;
 
-  @ApiPropertyOptional({ description: 'orderId publik escrow order (opsional, bisa disusulkan)' })
-  @IsOptional()
-  @IsString()
-  orderId?: string;
+  // LOW (SEC-B ronde 2): orderId DIHAPUS dari DTO join. Penautan order WAJIB
+  // lewat POST /participants/:id/link-order yang memvalidasi kepemilikan,
+  // seller, nilai, dan status — menerima orderId di join membuka squatting
+  // (mengklaim order milik orang lain). Klien yang mengirim orderId kini
+  // ditolak ValidationPipe (forbidNonWhitelisted).
 }
 
 // SEC-C I1: linkOrder patungan sebelumnya memakai `@Body() body: { orderId: string }`
 // literal tanpa validasi — samakan dengan LinkJastipOrderDto (validasi non-empty).
+// Wave 3: trim dulu agar orderId berisi spasi saja ikut ditolak (bukan 500 Prisma).
 export class LinkPatunganOrderDto {
   @ApiProperty({ description: 'orderId publik dari escrow order yang sudah dibayar' })
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
   @IsString()
   @IsNotEmpty()
   orderId!: string;

@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, Logger } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { PatunganStatus, PatunganMode, PatunganParticipantStatus, OrderStatus, Prisma } from '@prisma/client';
+import { PatunganStatus, PatunganMode, PatunganParticipantStatus, OrderStatus, DisputeStatus, Prisma } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { toSen, toIdr } from '../../../common/utils/currency.util';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
@@ -227,10 +227,10 @@ export class PatunganService {
   // ── Peserta ─────────────────────────────────────────────────────────────
 
   async joinGroup(userId: string, groupId: string, dto: JoinPatunganDto) {
-    // LOW #1 (SEC-B ronde 2): dto.orderId TIDAK disimpan saat join — nilai
-    // orderId yang dikirim user tanpa validasi membuka celah squatting
-    // (mengklaim order milik orang lain). Penautan order WAJIB lewat
-    // linkOrder yang memvalidasi kepemilikan, seller, nilai, dan status.
+    // LOW #1 (SEC-B ronde 2): orderId TIDAK ADA di JoinPatunganDto — penautan
+    // order WAJIB lewat linkOrder yang memvalidasi kepemilikan, seller, nilai,
+    // dan status. Menerima orderId mentah di join membuka squatting
+    // (mengklaim order milik orang lain).
     return this.prisma.$transaction(async (tx) => {
       const group = await tx.patunganGroup.findFirst({ where: { id: groupId } });
       if (!group) throw new NotFoundException({ code: ErrorCodes.PATUNGAN_GROUP_NOT_FOUND, message: 'Grup patungan tidak ditemukan' });
@@ -389,6 +389,43 @@ export class PatunganService {
   }
 
   /**
+   * Keluar dari grup patungan (LOW #1 SEC-B ronde 2: endpoint leave).
+   *
+   * Hanya peserta PENDING (belum menautkan order berbayar) yang bisa keluar —
+   * belum ada dana bergerak sehingga aman tanpa refund. Peserta PAID+ WAJIB
+   * lewat alur order normal (cancel/refund/dispute); keluar diam-diam akan
+   * memutus rantai akuntabilitas dana escrow. Grup yang sudah RELEASED tidak
+   * bisa ditinggalkan (riwayat final).
+   */
+  async leaveGroup(userId: string, participantId: string) {
+    const participant = await this.prisma.patunganParticipant.findFirst({
+      where: { id: participantId, userId },
+      include: { group: { select: { status: true } } },
+    });
+    if (!participant) {
+      throw new NotFoundException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Data peserta tidak ditemukan' });
+    }
+    if (participant.status !== PatunganParticipantStatus.PENDING) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Hanya peserta yang belum menautkan order (PENDING) yang bisa keluar — order berbayar ikuti alur cancel/refund/dispute',
+      });
+    }
+    if (participant.group.status === PatunganStatus.RELEASED) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Grup sudah dicairkan — tidak bisa keluar' });
+    }
+    // Predicate delete: balapan dengan linkOrder (PENDING → PAID) — bila
+    // kalah race, count=0 → peserta sudah membayar, tolak keluar (fail closed).
+    const deleted = await this.prisma.patunganParticipant.deleteMany({
+      where: { id: participant.id, status: PatunganParticipantStatus.PENDING },
+    });
+    if (deleted.count === 0) {
+      throw new ConflictException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Status peserta berubah saat keluar — coba lagi' });
+    }
+    return { left: true, participantId: participant.id, groupId: participant.groupId };
+  }
+
+  /**
    * Host inisiasi pencairan → masa sanggah 24 jam (CONTEST). Selama masa
    * sanggah, peserta yang keberatan membuka dispute via alur existing.
    */
@@ -471,22 +508,54 @@ export class PatunganService {
       select: { id: true },
     });
     for (const group of contestDone) {
-      // M4: transisi CONTEST → RELEASED kondisional (predicate status) —
-      // grup yang sudah berpindah (mis. dispute membatalkan contest) tidak
-      // ditimpa; bila predicate gagal, lewati tanpa refund ganda.
-      const claimed = await this.prisma.$transaction(async (tx) => {
+      // LOW #3 (SEC-B ronde 2): CONTEST → RELEASED WAJIB cek sengketa peserta
+      // terbuka. Status RELEASED berbohong bila order peserta sedang
+      // disengketakan (pencairan aktual per-order tetap aman, tapi klaim grup
+      // menyesatkan host/peserta). Bila ada sengketa terbuka → TAHAN
+      // (fail closed): perpanjang masa sanggah 24 jam agar dispute sempat
+      // selesai lewat alur existing, JANGAN release.
+      // M4: transisi kondisional (predicate status) — grup yang sudah
+      // berpindah (mis. dispute membatalkan contest) tidak ditimpa; bila
+      // predicate gagal, lewati tanpa refund ganda.
+      const outcome = await this.prisma.$transaction(async (tx) => {
+        const linkedOrderIds = (
+          await tx.patunganParticipant.findMany({
+            where: { groupId: group.id, orderId: { not: null } },
+            select: { orderId: true },
+          })
+        ).map((p) => p.orderId as string);
+        let openDisputes = 0;
+        if (linkedOrderIds.length > 0) {
+          const [disputedOrders, openDisputeRows] = await Promise.all([
+            tx.order.count({ where: { id: { in: linkedOrderIds }, status: OrderStatus.DISPUTED } }),
+            tx.dispute.count({ where: { orderId: { in: linkedOrderIds }, status: { not: DisputeStatus.RESOLVED } } }),
+          ]);
+          openDisputes = disputedOrders + openDisputeRows;
+        }
+        if (openDisputes > 0) {
+          const held = await tx.patunganGroup.updateMany({
+            where: { id: group.id, status: PatunganStatus.CONTEST },
+            data: { contestEndsAt: new Date(Date.now() + PATUNGAN_CONTEST_HOURS * 60 * 60 * 1000) },
+          });
+          if (held.count > 0) {
+            this.logger.warn(
+              `[SECURITY] Rilis patungan ${group.id} DITAHAN: ${openDisputes} sengketa peserta terbuka — masa sanggah diperpanjang ${PATUNGAN_CONTEST_HOURS} jam`,
+            );
+          }
+          return 'held' as const;
+        }
         const moved = await tx.patunganGroup.updateMany({
           where: { id: group.id, status: PatunganStatus.CONTEST },
           data: { status: PatunganStatus.RELEASED, releasedAt: new Date() },
         });
-        if (moved.count === 0) return 0;
+        if (moved.count === 0) return 'skipped' as const;
         await tx.patunganParticipant.updateMany({
           where: { groupId: group.id, status: PatunganParticipantStatus.PAID },
           data: { status: PatunganParticipantStatus.RELEASED },
         });
-        return 1;
+        return 'released' as const;
       });
-      released += claimed;
+      if (outcome === 'released') released++;
     }
     return { failed, released };
   }

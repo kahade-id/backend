@@ -31,7 +31,7 @@ const nanoid = customAlphabet('1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLM
 // AVATAR & SHOWCASE_IMAGE tetap tanpa HEIC: keduanya dirender langsung oleh
 // browser/<Image> dan browser tidak merender HEIC — klaim itu tetap valid
 // untuk konten yang tampil publik.
-const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
+export const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
   [UploadPurpose.KYC_KTP]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'],
   [UploadPurpose.KYC_SELFIE]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'],
   [UploadPurpose.KYC_PASSPORT]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'],
@@ -78,7 +78,7 @@ const DETECTED_MIME_TO_EXTENSION: Record<string, string> = {
   'audio/mp4': '.m4a',
 };
 
-const MAX_FILE_SIZE: Record<UploadPurpose, number> = {
+export const MAX_FILE_SIZE: Record<UploadPurpose, number> = {
   [UploadPurpose.KYC_KTP]: 5 * 1024 * 1024,
   [UploadPurpose.KYC_SELFIE]: 5 * 1024 * 1024,
   [UploadPurpose.KYC_PASSPORT]: 5 * 1024 * 1024,

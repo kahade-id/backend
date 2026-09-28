@@ -6,7 +6,7 @@ import { UploadController } from '../upload.controller';
 import { UploadPurpose } from '../dto/presigned-url.dto';
 
 describe('UploadController — SS-016 deprecated presigned endpoints', () => {
-  const controller = new UploadController({} as never);
+  const controller = new UploadController({} as never, {} as never);
 
   it('POST /upload/presigned-url melempar 410 Gone', async () => {
     const err = await controller

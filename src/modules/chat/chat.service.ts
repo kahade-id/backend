@@ -635,6 +635,27 @@ export class ChatService implements OnModuleInit {
     return createPaginatedResponse(mappedRooms, total, safePage, safeLimit);
   }
 
+  /**
+   * NS-006 (perf-fix, 2026-09-29): total unread chat viewer — SATU query
+   * aggregate ringan di counter yang didenormalisasi (`chat_room_members.unreadCount`,
+   * lihat BD-004), bukan `GET /v1/chat/rooms` (50 room penuh tiap 60 detik hanya
+   * untuk badge tab Pesan). Dipakai endpoint `GET /v1/chat/unread-count`.
+   *
+   * Semantik SAMA dengan room list lama (default non-arsip): membership yang
+   * diarsipkan (`isArchived: true`) TIDAK dihitung — badge tab Pesan tidak
+   * berubah makna.
+   *
+   * Additive-only: tidak mengubah perilaku finansial apa pun.
+   */
+  async getTotalUnreadCount(userId: string): Promise<{ unreadCount: number }> {
+    const agg = await this.prisma.chatRoomMember.aggregate({
+      where: { userId, isArchived: false },
+      _sum: { unreadCount: true },
+    });
+    const total = agg._sum.unreadCount ?? 0;
+    return { unreadCount: Math.max(0, total) };
+  }
+
   private async loadOnlineVisibility(userIds: string[]): Promise<Record<string, boolean>> {
     if (userIds.length === 0) return {};
     try {

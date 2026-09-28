@@ -105,16 +105,20 @@ export class ShowcaseController {
       'showcase publik (bentuk sama seperti feed) + `savedAt` per item. ' +
       'Pagination offset (?page&limit, maks 100) + tiebreak id agar stabil. ' +
       'Item yang sudah nonaktif/terhapus tetap dikembalikan supaya klien bisa ' +
-      'membersihkan bookmark lokalnya.',
+      'membersihkan bookmark lokalnya. ' +
+      'NP-008 (perf-fix): `?cursor=` (keyset, dari `nextCursor` respons) ' +
+      'menggantikan offset — tanpa `skip` besar; tanpa cursor, offset lama dipakai.',
   })
   async listSavedShowcases(
     @CurrentUser('sub') userId: string,
     @Query() pagination: PaginationDto,
+    @Query('cursor', new ParseQueryStringPipe('cursor', 200)) cursor?: string,
   ): Promise<object> {
     return this.showcaseService.listSavedShowcases(
       userId,
       pagination.page ?? 1,
       pagination.limit ?? 20,
+      cursor,
     );
   }
 
@@ -262,7 +266,8 @@ export class ShowcaseController {
   @ApiOperation({
     summary: 'List comments of a showcase item (nested replies)',
     description:
-      'Komentar root dipaginasi (offset + tiebreak { id } agar halaman stabil) dan ' +
+      'Komentar root dipaginasi (offset + tiebreak { id } agar halaman stabil; ' +
+      'atau keyset `?cursor=` dari `nextCursor` — NP-008, tanpa `skip` besar) dan ' +
       'tiap root menyertakan `replies` satu tingkat. Komentar dari user yang saling ' +
       'blokir dengan viewer serta komentar tersembunyi disaring, kecuali untuk ' +
       'pemilik item yang tetap melihat komentar tersembunyi beserta alasannya.',
@@ -272,6 +277,7 @@ export class ShowcaseController {
     @CurrentUser('sub') viewerId: string | null,
     @Query() pagination: PaginationDto,
     @Query('sort', new ParseQueryStringPipe('sort', 10)) sort?: string,
+    @Query('cursor', new ParseQueryStringPipe('cursor', 200)) cursor?: string,
   ): Promise<object> {
     // Batch 139 BE-API1 (item 103): `sort=newest|oldest` (default `newest`).
     // Nilai tak dikenal → `newest` (toleran, kontrak lama tak berubah).
@@ -282,6 +288,7 @@ export class ShowcaseController {
       pagination.page ?? 1,
       pagination.limit ?? 20,
       commentSort,
+      cursor,
     );
   }
 
@@ -363,18 +370,21 @@ export class ShowcaseController {
     summary: 'List users who liked a showcase item (public, paginated)',
     description:
       'Batch 19 TIM A (item 3). Publik — item PRIVATE / tidak visible → 404. ' +
-      'Pagination offset (?page&limit, maks 100) + tiebreak id agar stabil.',
+      'Pagination offset (?page&limit, maks 100) + tiebreak id agar stabil. ' +
+      'NP-008 (perf-fix): `?cursor=` keyset (dari `nextCursor`) — tanpa `skip` besar.',
   })
   async listLikers(
     @Param('showcaseId', ParseIdPipe) showcaseId: string,
     @CurrentUser('sub') viewerId: string | null,
     @Query() pagination: PaginationDto,
+    @Query('cursor', new ParseQueryStringPipe('cursor', 200)) cursor?: string,
   ): Promise<object> {
     return this.showcaseService.listLikers(
       showcaseId,
       viewerId ?? undefined,
       pagination.page ?? 1,
       pagination.limit ?? 20,
+      cursor,
     );
   }
 
@@ -385,18 +395,21 @@ export class ShowcaseController {
     summary: 'List users who saved a showcase item (owner only)',
     description:
       'Batch 19 TIM A (item 3). PRIVASI: hanya pemilik produk. ' +
-      'Bukan pemilik → 403 SHOWCASE_FORBIDDEN. Bentuk respons sama seperti likers (savedAt).',
+      'Bukan pemilik → 403 SHOWCASE_FORBIDDEN. Bentuk respons sama seperti likers (savedAt). ' +
+      'NP-008 (perf-fix): `?cursor=` keyset (dari `nextCursor`) — tanpa `skip` besar.',
   })
   async listSavers(
     @CurrentUser('sub') userId: string,
     @Param('showcaseId', ParseIdPipe) showcaseId: string,
     @Query() pagination: PaginationDto,
+    @Query('cursor', new ParseQueryStringPipe('cursor', 200)) cursor?: string,
   ): Promise<object> {
     return this.showcaseService.listSavers(
       userId,
       showcaseId,
       pagination.page ?? 1,
       pagination.limit ?? 20,
+      cursor,
     );
   }
 

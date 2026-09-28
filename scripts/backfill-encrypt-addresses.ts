@@ -53,7 +53,13 @@ async function main(): Promise<void> {
     console.error('ERROR: AES_SECRET_KEY (atau PII_ENCRYPTION_KEY) dan HMAC_SECRET_KEY harus di-set');
     process.exit(1);
   }
-  initializeCrypto({ aesSecretKey: aesKey, hmacSecretKey: hmacKey });
+  initializeCrypto({
+    aesSecretKey: aesKey,
+    hmacSecretKey: hmacKey,
+    kycNikEncryptionKey: process.env.KYC_NIK_ENCRYPTION_KEY,
+    kycKtpEncryptionKey: process.env.KYC_KTP_ENCRYPTION_KEY,
+    kycSelfieEncryptionKey: process.env.KYC_SELFIE_ENCRYPTION_KEY,
+  });
 
   await ensureTextColumns();
 

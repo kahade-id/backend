@@ -37,6 +37,9 @@ async function main(): Promise<void> {
   initializeCrypto({
     aesSecretKey: process.env.AES_SECRET_KEY ?? 'unused-by-location-backfill',
     hmacSecretKey: hmacKey,
+    kycNikEncryptionKey: process.env.KYC_NIK_ENCRYPTION_KEY,
+    kycKtpEncryptionKey: process.env.KYC_KTP_ENCRYPTION_KEY,
+    kycSelfieEncryptionKey: process.env.KYC_SELFIE_ENCRYPTION_KEY,
   });
 
   const BATCH = 200;

@@ -401,6 +401,15 @@ export class JoinPatunganDto {
   orderId?: string;
 }
 
+// SEC-C I1: linkOrder patungan sebelumnya memakai `@Body() body: { orderId: string }`
+// literal tanpa validasi — samakan dengan LinkJastipOrderDto (validasi non-empty).
+export class LinkPatunganOrderDto {
+  @ApiProperty({ description: 'orderId publik dari escrow order yang sudah dibayar' })
+  @IsString()
+  @IsNotEmpty()
+  orderId!: string;
+}
+
 // ── Item 15: banner ──────────────────────────────────────────────────────────
 
 export class CreateBannerDto {

@@ -52,6 +52,8 @@ export class TemplateService implements OnModuleInit {
     'password-changed-notification', 'phone-changed-notification',
     'two-fa-enabled-notification', 'two-fa-disabled-notification',
     'backup-codes-regenerated-notification', 'refresh-token-reuse-detected',
+    // SEC (round-2): jti refresh tidak dikenal DB (dugaan pencurian token).
+    'refresh-session-unknown',
     'kyc-revoked',
     // GAP-A: konfirmasi permintaan penghapusan akun.
     'account-deletion',

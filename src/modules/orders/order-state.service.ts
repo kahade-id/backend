@@ -21,6 +21,7 @@ import { withSpan } from '../../common/tracing/tracing';
 // GAP-C (G176): aktivasi milestone setelah escrow lock — no-op untuk order
 // satu tahap existing.
 import { activateMilestonesForOrderTx } from '../milestones/milestone-activation';
+import { computePatunganRebateTx, createPatunganRebateLedgerTx } from '../commerce/patungan-rebate';
 // GAP-D (G256/G257): hook reservasi stok — @Optional(), best-effort post-commit,
 // no-op untuk order tanpa order lines katalog. Tidak mengubah perilaku order existing.
 import { Optional } from '@nestjs/common';
@@ -565,6 +566,14 @@ export class OrderStateService {
       if (cashbackSerial === null) cashbackSerial = await this.getNextWalletTxSerial();
       return cashbackSerial;
     };
+    // M6: serial ledger rebate overfunding patungan — kondisional (hanya bila
+    // order yang selesai ditautkan ke peserta patungan & ada overfunding),
+    // jadi digambar lazy seperti fee/cashback agar tidak membakar nomor urut.
+    let rebateSerial: number | null = null;
+    const nextRebateTxSerial = async (): Promise<number> => {
+      if (rebateSerial === null) rebateSerial = await this.getNextWalletTxSerial();
+      return rebateSerial;
+    };
     // SP-047: tandai bila referral reward dikreditkan agar cache leaderboard
     // diinvalidasi SETELAH tx commit (di luar retry loop).
     let referralRewardCredited = false;
@@ -682,14 +691,26 @@ export class OrderStateService {
       const buyerBalanceBefore = buyerWallet.escrowBalance;
       const buyerBalanceAfter = buyerWallet.escrowBalance - order.buyerPayAmount;
       const sellerBalanceBefore = sellerWallet.availableBalance;
-      const sellerBalanceAfter = sellerWallet.availableBalance + order.sellerReceiveAmount;
+      // M6: rebate overfunding patungan — kelebihan dana grup dibagi rata ke
+      // tiap peserta sebagai pengurang nyata: pembeli terima kembali `rebate`,
+      // host terima sellerReceiveAmount − rebate. Dihitung di dalam tx (setelah
+      // row lock dompet) dari himpunan peserta PAID/RELEASED yang final.
+      const patunganRebate = await computePatunganRebateTx(tx, order.id);
+      let rebate = patunganRebate?.rebateSen ?? 0n;
+      // Fail-safe: rebate tidak boleh melebihi penerimaan seller — jangan
+      // pernah membuat kredit negatif ke host.
+      if (rebate > order.sellerReceiveAmount) rebate = order.sellerReceiveAmount;
+      const sellerBalanceAfter = sellerWallet.availableBalance + order.sellerReceiveAmount - rebate;
       // Batch 1-money (EO-005): cashback dikredit terpisah via creditCashbackIfEligible
       // setelah update escrow utama — tidak lagi dilipat di sini.
       const buyerWalletData: Prisma.WalletUpdateManyMutationInput = {
         escrowBalance: { decrement: order.buyerPayAmount },
-        totalBalance: { decrement: order.buyerPayAmount },
+        totalBalance: { decrement: order.buyerPayAmount - rebate },
         version: { increment: 1 },
       };
+      if (rebate > 0n) {
+        buyerWalletData.availableBalance = { increment: rebate };
+      }
 
       const buyerUpdated = await tx.wallet.updateMany({
         where: { id: buyerWallet.id, version: buyerWallet.version, escrowBalance: { gte: order.buyerPayAmount } },
@@ -702,8 +723,8 @@ export class OrderStateService {
       const sellerUpdated = await tx.wallet.updateMany({
         where: { id: sellerWallet.id, version: sellerWallet.version },
         data: {
-          availableBalance: { increment: order.sellerReceiveAmount },
-          totalBalance: { increment: order.sellerReceiveAmount },
+          availableBalance: { increment: order.sellerReceiveAmount - rebate },
+          totalBalance: { increment: order.sellerReceiveAmount - rebate },
           version: { increment: 1 },
         },
       });
@@ -733,13 +754,29 @@ export class OrderStateService {
           walletId: sellerWallet.id,
           type: WalletTransactionType.ORDER_RELEASE,
           status: WalletTransactionStatus.SUCCESS,
-          amount: order.sellerReceiveAmount,
+          amount: order.sellerReceiveAmount - rebate,
           balanceBefore: sellerBalanceBefore,
           balanceAfter: sellerBalanceAfter,
           orderId: order.id,
           description: `Payment received for completed order ${order.orderId}`,
         },
       });
+
+      // M6: baris ledger rebate overfunding patungan (idempoten via guard di
+      // computePatunganRebateTx) — bukti bahwa kelebihan dibagi rata dan
+      // benar-benar mengurangi beban peserta.
+      if (rebate > 0n && patunganRebate) {
+        const rebateTxId = generateWalletTxId(await nextRebateTxSerial());
+        await createPatunganRebateLedgerTx(tx, {
+          txId: rebateTxId,
+          buyerWalletId: buyerWallet.id,
+          orderDbId: order.id,
+          orderPublicId: order.orderId,
+          groupId: patunganRebate.groupId,
+          rebateSen: rebate,
+          buyerAvailableBefore: buyerWallet.availableBalance,
+        });
+      }
 
       // Batch 1-money (EO-005): kredit cashback via helper bersama idempoten.
       // Dijalankan setelah update escrow utama agar balanceBefore ledger konsisten.

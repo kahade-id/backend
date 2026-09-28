@@ -356,6 +356,7 @@ export class MilestonesService {
         message: 'Rencana tahap hanya dapat dibuat sebelum order dibayar.',
       });
     }
+    // Validasi awal (fast-path); yang otoritatif diulang di dalam tx (M5).
     const existing = await this.prisma.orderMilestone.count({ where: { orderId } });
     if (existing > 0) {
       throw new ConflictException({
@@ -382,6 +383,33 @@ export class MilestonesService {
     const splits = splitMilestoneFunds(amounts, order.buyerPayAmount, order.sellerReceiveAmount);
 
     const result = await this.prisma.$transaction(async (tx) => {
+      // M5 (SEC-B ronde 2): validasi status + seller + hitungan milestone
+      // dilakukan DI DALAM tx dengan baca ulang — pengecekan di luar tx bisa
+      // basi bila payOrder menang balapan: milestone tidak boleh dibuat
+      // setelah order dibayar.
+      const fresh = await tx.order.findUnique({
+        where: { id: order.id },
+        select: { sellerId: true, status: true },
+      });
+      if (!fresh || fresh.sellerId !== sellerId) {
+        throw new ForbiddenException({
+          code: 'FORBIDDEN',
+          message: 'Hanya penjual yang dapat membuat rencana tahap order.',
+        });
+      }
+      if (fresh.status !== 'WAITING_PAYMENT') {
+        throw new BadRequestException({
+          code: ErrorCodes.INVALID_ORDER_STATUS,
+          message: 'Rencana tahap hanya dapat dibuat sebelum order dibayar.',
+        });
+      }
+      const existing = await tx.orderMilestone.count({ where: { orderId } });
+      if (existing > 0) {
+        throw new ConflictException({
+          code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT,
+          message: 'Order ini sudah memiliki rencana tahap.',
+        });
+      }
       const created: { id: string }[] = [];
       for (let i = 0; i < dto.milestones.length; i++) {
         const item = dto.milestones[i];

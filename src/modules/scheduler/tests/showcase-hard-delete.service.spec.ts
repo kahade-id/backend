@@ -31,7 +31,13 @@ describe('ShowcaseHardDeleteService — audit Batch 5', () => {
     renewLock: jest.fn(),
     releaseLock: jest.fn(),
   };
-  const uploadService = { cleanupFileKeys: jest.fn() };
+  const uploadService = {
+    cleanupFileKeys: jest.fn(),
+    fileKeyFromPublicUrl: jest.fn((url: string) => {
+      const m = /\/uploads\/(.+)$/.exec(url);
+      return m ? `uploads/${m[1]}` : null;
+    }),
+  };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -107,5 +113,31 @@ describe('ShowcaseHardDeleteService — audit Batch 5', () => {
     await makeService().hardDeleteExpiredShowcases();
 
     expect(prisma.userShowcase.findMany).not.toHaveBeenCalled();
+  });
+
+  it('LOW (SEC-D): thumbnailUrl video ikut dibersihkan (konversi ke fileKey)', async () => {
+    const item = {
+      id: 'item-vid',
+      userId: 'owner-5',
+      images: [
+        {
+          fileKey: 'uploads/showcase-videos/owner-5/v.mp4',
+          thumbnailUrl: 'https://api.kahade.id/uploads/showcase-images/owner-5/t.jpg',
+        },
+        { fileKey: 'uploads/showcase-images/owner-5/i.jpg', thumbnailUrl: null },
+      ],
+    };
+    prisma.userShowcase.findMany
+      .mockResolvedValueOnce([item])
+      .mockResolvedValueOnce([]);
+
+    await makeService().hardDeleteExpiredShowcases();
+
+    expect(uploadService.cleanupFileKeys).toHaveBeenCalledWith('owner-5', [
+      'uploads/showcase-videos/owner-5/v.mp4',
+      'uploads/showcase-images/owner-5/i.jpg',
+      'uploads/showcase-images/owner-5/t.jpg',
+    ]);
+    expect(prisma.userShowcase.delete).toHaveBeenCalledWith({ where: { id: 'item-vid' } });
   });
 });

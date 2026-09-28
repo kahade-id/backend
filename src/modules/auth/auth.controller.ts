@@ -382,7 +382,8 @@ export class AuthController {
     const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
     const deviceInfo = dto.deviceInfo || req.headers['user-agent'] || 'unknown';
     try {
-      // G011: nonce diteruskan untuk verifikasi Apple (anti-replay).
+      // SEC (round-2): nonce Apple wajib diterbitkan server via POST
+      // /v1/auth/apple/nonce — dikonsumsi sekali pakai di AuthService.
       const result = await this.authService.socialLogin(
         dto.provider, dto.idToken, dto.deviceId, deviceInfo, ipAddress, dto.nonce,
       );
@@ -416,6 +417,26 @@ export class AuthController {
     providers: { provider: 'GOOGLE' | 'APPLE'; enabled: boolean; appId: string | null }[];
   }> {
     return this.authService.getSocialProviders();
+  }
+
+  /**
+   * SEC (round-2): terbitkan nonce Apple sekali-pakai dari server.
+   *
+   * Alur baru (wajib untuk Apple):
+   * 1. Aplikasi panggil endpoint ini → dapat { nonce, expiresIn }.
+   * 2. Pakai `nonce` di Apple authorization request.
+   * 3. Kirim `nonce` yang sama di POST /v1/auth/social-login (atau
+   *    /v1/auth/social/link) — backend mengonsumsi dari Redis (sekali
+   *    pakai, TTL 600 dtk) sebelum verifikasi token.
+   *
+   * Nonce buatan klien / replay DITOLAK. Public + throttled ketat.
+   */
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Post('apple/nonce')
+  @HttpCode(HttpStatus.OK)
+  async issueAppleNonce(@Body() body: { deviceId?: string }): Promise<{ nonce: string; expiresIn: number }> {
+    return this.authService.issueAppleNonce(body?.deviceId);
   }
 
   /**
@@ -914,6 +935,7 @@ export class AuthController {
     return this.authService.resetPassword(
       {
         tempToken: dto.tempToken,
+        deviceId: dto.deviceId,
         newPassword: dto.newPassword,
         confirmPassword: dto.confirmPassword,
         location: dto.location,

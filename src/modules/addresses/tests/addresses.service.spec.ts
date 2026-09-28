@@ -2,6 +2,9 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { AddressesService } from '../addresses.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AddressLabel } from '@prisma/client';
+import { initializeCrypto } from '../../../common/utils/crypto.util';
+
+initializeCrypto({ aesSecretKey: 'test-aes-secret-h2', hmacSecretKey: 'test-hmac-secret-h2' });
 
 const mockPrisma: Record<string, any> = {
   address: {
@@ -87,6 +90,58 @@ describe('AddressesService', () => {
       expect(mockPrisma.address.update).toHaveBeenCalledWith(
         expect.objectContaining({ where: { id: 'a2' }, data: { isDefault: true } }),
       );
+    });
+  });
+
+  describe('H2: enkripsi PII saat rest', () => {
+    it('createAddress menyimpan ciphertext (bukan plaintext)', async () => {
+      mockPrisma.address.count.mockResolvedValue(0);
+      mockPrisma.address.create.mockImplementation(async ({ data }: any) => ({ id: 'a1', ...data }));
+      const result = await service.createAddress('user-1', baseDto as never);
+      const saved = mockPrisma.address.create.mock.calls[0][0].data;
+      for (const f of ['recipientName', 'phone', 'addressLine', 'city', 'postalCode'] as const) {
+        expect(saved[f]).toMatch(/^v1:/);
+        expect(saved[f]).not.toContain(baseDto[f]);
+      }
+      // Response ke pemanggil tetap plaintext (terdekripsi).
+      expect(result.recipientName).toBe('Budi');
+      expect(result.phone).toBe('08123456789');
+      expect(result.city).toBe('Jakarta');
+    });
+
+    it('getAddress mendekripsi ciphertext', async () => {
+      mockPrisma.address.count.mockResolvedValue(0);
+      mockPrisma.address.create.mockImplementation(async ({ data }: any) => ({ id: 'a1', ...data }));
+      await service.createAddress('user-1', baseDto as never);
+      const saved = mockPrisma.address.create.mock.calls[0][0].data;
+      mockPrisma.address.findFirst.mockResolvedValue({ id: 'a1', ...saved });
+      const got = await service.getAddress('user-1', 'a1');
+      expect(got.recipientName).toBe('Budi');
+      expect(got.addressLine).toBe('Jl. Mawar No. 1');
+    });
+
+    it('baca dua arah: legacy plaintext tetap terbaca (fallback pra-backfill)', async () => {
+      mockPrisma.address.findFirst.mockResolvedValue({
+        id: 'a9',
+        recipientName: 'Siti',
+        phone: '0811111111',
+        addressLine: 'Jl. Kenanga 2',
+        city: 'Bandung',
+        province: null,
+        postalCode: '40111',
+      });
+      const got = await service.getAddress('user-1', 'a9');
+      expect(got.recipientName).toBe('Siti');
+      expect(got.province).toBeNull();
+    });
+
+    it('updateAddress mengenkripsi field yang diubah', async () => {
+      mockPrisma.address.findFirst.mockResolvedValue({ id: 'a1', label: AddressLabel.RUMAH, customLabel: null });
+      mockPrisma.address.update.mockImplementation(async ({ data }: any) => ({ id: 'a1', ...data }));
+      await service.updateAddress('user-1', 'a1', { city: 'Surabaya' } as never);
+      const saved = mockPrisma.address.update.mock.calls[0][0].data;
+      expect(saved.city).toMatch(/^v1:/);
+      expect(saved.city).not.toContain('Surabaya');
     });
   });
 });

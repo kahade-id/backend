@@ -236,6 +236,41 @@ describe('MilestonesService lifecycle (G200)', () => {
     ).rejects.toThrow();
   });
 
+  it('M5: balapan payOrder — order dibayar setelah validasi luar → tx menolak, tanpa milestone tercipta', async () => {
+    const { svc, prisma, db } = makeService();
+    seedOrder(db);
+    // payOrder menang race: status DB sudah PROCESSING saat tx berjalan,
+    // tetapi bacaan assertParty di luar tx masih basi (WAITING_PAYMENT).
+    db.order[0].status = 'PROCESSING';
+    prisma.order.findUnique.mockResolvedValueOnce({ ...db.order[0], status: 'WAITING_PAYMENT' });
+    await expect(
+      svc.createMilestones('order-1', 'seller-1', {
+        milestones: [
+          { title: 'Tahap A', amountIdr: 150000 },
+          { title: 'Tahap B', amountIdr: 150000 },
+        ],
+      }),
+    ).rejects.toMatchObject({ message: expect.stringContaining('sebelum order dibayar') });
+    expect(db.orderMilestone).toHaveLength(0);
+  });
+
+  it('M5: balapan create ganda — hitungan milestone dibaca ulang di dalam tx', async () => {
+    const { svc, prisma, db } = makeService();
+    seedOrder(db);
+    // Request lain sudah membuat 1 milestone; bacaan count di luar tx basi (0).
+    db.orderMilestone.push({ id: 'm-rival', orderId: 'order-1', seq: 1 });
+    prisma.orderMilestone.count.mockResolvedValueOnce(0);
+    await expect(
+      svc.createMilestones('order-1', 'seller-1', {
+        milestones: [
+          { title: 'Tahap A', amountIdr: 150000 },
+          { title: 'Tahap B', amountIdr: 150000 },
+        ],
+      }),
+    ).rejects.toMatchObject({ message: expect.stringContaining('sudah memiliki rencana tahap') });
+    expect(db.orderMilestone).toHaveLength(1);
+  });
+
   async function fullSetup() {
     const { svc, prisma, db } = makeService();
     // SEC-102: submit/accept hanya sah saat order PROCESSING/IN_DELIVERY —

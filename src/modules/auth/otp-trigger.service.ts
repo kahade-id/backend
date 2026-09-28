@@ -265,27 +265,26 @@ export class OtpTriggerService {
   // ── Webhook pesan masuk Fonnte ───────────────────────────────────
 
   /**
-   * 03-#7: bila FONNTE_WEBHOOK_SECRET tidak diset, webhook DITERIMA dengan
-   * warning KERAS (fail-open sementara). JANGAN diam-diam membiarkannya:
-   * langkah produksi = set FONNTE_WEBHOOK_SECRET di .env + update URL
-   * webhook di dashboard Fonnte. Setelah itu, ubah ke fail-closed
-   * (return false di sini) agar webhook tanpa secret ditolak.
+   * SEC-A M1 (fail-closed): bila FONNTE_WEBHOOK_SECRET belum dikonfigurasi,
+   * webhook DITOLAK. Fail-open sebelumnya memungkinkan siapa pun mengirim
+   * webhook palsu ke /v1/auth/webhooks/fonnte dan memicu alur OTP.
+   * Produksi WAJIB set FONNTE_WEBHOOK_SECRET via admin panel (Pengaturan
+   * Operasional) atau production .env.
    */
   verifyWebhookSecret(provided?: string): boolean {
     // OPS: secret dibaca via OpsSettingsService (DB panel > .env) agar bisa
     // diset dari admin panel tanpa SSH ke server.
     const expected = this.opsSettings.getSecret('FONNTE_WEBHOOK_SECRET');
     if (!expected) {
-      // Secret belum dikonfigurasi: izinkan dengan peringatan KERAS. Gate utama
-      // tetap pencocokan refCode (48-bit, TTL 10 mnt) + nomor pengirim.
+      // Secret belum dikonfigurasi: TOLAK webhook (fail-closed). Jangan
+      // pernah menerima webhook tanpa verifikasi secret.
       this.logger.error(
-        '[SECURITY] FONNTE_WEBHOOK_SECRET is not set — accepting Fonnte webhook without secret verification (fail-open). ' +
+        '[SECURITY] FONNTE_WEBHOOK_SECRET is not set — rejecting Fonnte webhook (fail-closed). ' +
           'ACTION REQUIRED: set FONNTE_WEBHOOK_SECRET via admin panel (Pengaturan Operasional) or production .env. ' +
           'Kirim secret via header x-fonnte-secret (disarankan) atau field body webhookSecret — JANGAN via query param ?webhookSecret= ' +
-          'karena URL tercatat di nginx access log (SEC-003). Webhook URL di dashboard Fonnte: https://api.kahade.id/v1/auth/webhooks/fonnte. ' +
-          'Then switch verifyWebhookSecret to fail-closed (return false when !expected).',
+          'karena URL tercatat di nginx access log (SEC-003). Webhook URL di dashboard Fonnte: https://api.kahade.id/v1/auth/webhooks/fonnte.',
       );
-      return true;
+      return false;
     }
     if (!provided) return false;
     const a = Buffer.from(provided);

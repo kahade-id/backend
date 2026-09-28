@@ -6102,12 +6102,15 @@ model Address {
 
   label         AddressLabel @default(RUMAH)
   customLabel   String?      @db.VarChar(40) // diisi bila label=LAINNYA
-  recipientName String       @db.VarChar(100)
-  phone         String       @db.VarChar(20)
-  addressLine   String       @db.VarChar(300)
-  city          String       @db.VarChar(100)
-  province      String?      @db.VarChar(100)
-  postalCode    String       @db.VarChar(10)
+  // H2 (SEC-D ronde 2): PII terenkripsi AES-GCM saat rest — kolom TEXT agar
+  // muat ciphertext (`v1:salt:iv:tag:data`). DDL via skrip backfill
+  // (scripts/backfill-encrypt-addresses.ts), BUKAN migrasi Prisma.
+  recipientName String       @db.Text
+  phone         String       @db.Text
+  addressLine   String       @db.Text
+  city          String       @db.Text
+  province      String?      @db.Text
+  postalCode    String       @db.Text
   isDefault     Boolean      @default(false)
 
   createdAt DateTime  @default(now())

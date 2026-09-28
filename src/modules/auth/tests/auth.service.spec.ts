@@ -588,6 +588,32 @@ describe('AuthService', () => {
       );
     });
 
+    it('SEC round-2: akun passwordless TIDAK menaikkan failedLoginAttempts (tetap INVALID_CREDENTIALS generik)', async () => {
+      // Akun hanya-sosial/OTP: password null — upaya login password tidak
+      // boleh memicu lockout permanen (DoS terhadap pemilik sah).
+      mockPrisma.user.findUnique.mockResolvedValue({
+        ...mockUser,
+        password: null,
+        failedLoginAttempts: 0,
+      });
+
+      await expect(
+        service.login({ ...loginDto, password: 'TebakanAcak123!' }, '127.0.0.1'),
+      ).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: 'INVALID_CREDENTIALS' }) }),
+      );
+
+      // TIDAK ada increment counter / lockout / penonaktifan akun.
+      expect(mockPrisma.user.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ failedLoginAttempts: expect.anything() }),
+        }),
+      );
+      expect(mockPrisma.user.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ isActive: false }) }),
+      );
+    });
+
     it('should return tokens for valid credentials without 2FA', async () => {
       const bcryptHash = require('bcrypt');
       const hashedPassword = await bcryptHash.hash('CorrectPassword123!', 12);
@@ -713,6 +739,71 @@ describe('AuthService', () => {
     });
   });
 
+  describe('refresh token dengan jti tidak dikenal DB (SEC round-2)', () => {
+    it('JWT valid + jti hilang → tolak + notifikasi dugaan pencurian (bukan revoke massal)', async () => {
+      mockTokenService.verifyRefreshToken.mockReturnValue({ sub: 'db-id-1', jti: 'jti-hilang' });
+      mockPrisma.userSession.findUnique.mockResolvedValue(null); // jti tidak ada di DB
+      mockPrisma.user.findUnique.mockResolvedValue({ email: 'user@example.com' });
+
+      await expect(service.refreshToken('refresh-token-valid-signature')).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: 'SESSION_REVOKED' }) }),
+      );
+      // Notifikasi async fire-and-forget — flush dulu.
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(mockPrisma.notification.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ title: 'Aktivitas sesi mencurigakan terdeteksi' }),
+      }));
+      expect(mockEmailQueue.add).toHaveBeenCalledWith('send', expect.objectContaining({
+        subject: 'Security Alert: Unrecognized Session Credential',
+        templateName: 'refresh-session-unknown',
+      }), expect.any(Object));
+      // TIDAK ada revoke massal untuk kasus ini (kemungkinan sesi ter-eviksi).
+      expect(mockPrisma.userSession.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('sesi revoked tetap ditolak TANPA notifikasi pencurian', async () => {
+      mockTokenService.verifyRefreshToken.mockReturnValue({ sub: 'db-id-1', jti: 'refresh-jti-1' });
+      mockPrisma.userSession.findUnique.mockResolvedValue({
+        id: 'session-revoked',
+        userId: 'db-id-1',
+        isRevoked: true,
+        expiresAt: new Date(Date.now() + 60_000),
+        refreshToken: 'stored-hash',
+      });
+
+      await expect(service.refreshToken('refresh-token')).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: 'SESSION_REVOKED' }) }),
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(mockPrisma.notification.create).not.toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ title: 'Aktivitas sesi mencurigakan terdeteksi' }),
+      }));
+      expect(mockPrisma.userSession.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('sesi kedaluwarsa tetap ditolak TANPA notifikasi pencurian', async () => {
+      mockTokenService.verifyRefreshToken.mockReturnValue({ sub: 'db-id-1', jti: 'refresh-jti-1' });
+      mockPrisma.userSession.findUnique.mockResolvedValue({
+        id: 'session-expired',
+        userId: 'db-id-1',
+        isRevoked: false,
+        expiresAt: new Date(Date.now() - 60_000),
+        refreshToken: 'stored-hash',
+      });
+
+      await expect(service.refreshToken('refresh-token')).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: 'SESSION_REVOKED' }) }),
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(mockPrisma.notification.create).not.toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ title: 'Aktivitas sesi mencurigakan terdeteksi' }),
+      }));
+    });
+  });
+
   describe('phoneRegister temp token', () => {
     const baseDto = {
       tempToken: 'temp-token',
@@ -832,7 +923,7 @@ describe('AuthService', () => {
       mockPrisma.passwordHistory.findMany.mockResolvedValue([]);
 
       await expect(service.resetPassword(
-        { tempToken: 'temp-token', newPassword: 'ExistingPassword123', confirmPassword: 'ExistingPassword123' },
+        { tempToken: 'temp-token', deviceId: 'device-1', newPassword: 'ExistingPassword123', confirmPassword: 'ExistingPassword123' },
         '127.0.0.1',
       )).rejects.toThrow(BadRequestException);
 
@@ -843,7 +934,7 @@ describe('AuthService', () => {
       mockTokenService.verifyTempToken.mockReturnValue(resetPayload({ scope: '2fa_verify' }));
 
       await expect(service.resetPassword(
-        { tempToken: 'temp-token', newPassword: 'NewPassword123' },
+        { tempToken: 'temp-token', deviceId: 'device-1', newPassword: 'NewPassword123' },
         '127.0.0.1',
       )).rejects.toThrow('Invalid token scope');
       expect(mockPrisma.user.update).not.toHaveBeenCalled();
@@ -861,7 +952,7 @@ describe('AuthService', () => {
       mockPrisma.$transaction.mockImplementation(async (callback: (client: typeof mockPrisma) => unknown) => callback(mockPrisma));
 
       await expect(service.resetPassword(
-        { tempToken: 'temp-token', newPassword: 'NewPassword123' },
+        { tempToken: 'temp-token', deviceId: 'device-1', newPassword: 'NewPassword123' },
         '127.0.0.1',
       )).resolves.toEqual(expect.objectContaining({ message: expect.any(String) }));
 
@@ -888,7 +979,7 @@ describe('AuthService', () => {
       mockRedis.setex.mockRejectedValue(new Error('redis unavailable'));
 
       await expect(service.resetPassword(
-        { tempToken: 'temp-token', newPassword: 'NewPassword123' },
+        { tempToken: 'temp-token', deviceId: 'device-1', newPassword: 'NewPassword123' },
         '127.0.0.1',
       )).resolves.toEqual(expect.objectContaining({ message: expect.any(String) }));
       expect(mockPrisma.userSession.updateMany).toHaveBeenCalledWith(expect.objectContaining({
@@ -898,6 +989,30 @@ describe('AuthService', () => {
         where: { userId: mockUser.id, isTrusted: true },
         data: { isTrusted: false, trustedAt: null },
       });
+    });
+
+    it('SEC round-2: menolak bila deviceId tidak cocok — token TIDAK terbakar (bisa dipakai ulang di device benar)', async () => {
+      mockTokenService.verifyTempToken.mockReturnValue(resetPayload({ deviceId: 'device-1' }));
+
+      await expect(service.resetPassword(
+        { tempToken: 'temp-token', deviceId: 'device-LAIN', newPassword: 'NewPassword123' },
+        '127.0.0.1',
+      )).rejects.toThrow('not valid for this device');
+
+      // claimTempTokenOnce (redis.setNx TEMP_TOKEN_USED) tidak boleh terpanggil:
+      // token valid milik device-1 tetap bisa dipakai setelahnya.
+      expect(mockRedis.setNx).not.toHaveBeenCalled();
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('SEC round-2: menolak bila token tidak membawa binding deviceId', async () => {
+      mockTokenService.verifyTempToken.mockReturnValue(resetPayload({ deviceId: undefined }));
+
+      await expect(service.resetPassword(
+        { tempToken: 'temp-token', deviceId: 'device-1', newPassword: 'NewPassword123' },
+        '127.0.0.1',
+      )).rejects.toThrow('not valid for this device');
+      expect(mockRedis.setNx).not.toHaveBeenCalled();
     });
   });
 

@@ -227,54 +227,56 @@ export class PatunganService {
   // ── Peserta ─────────────────────────────────────────────────────────────
 
   async joinGroup(userId: string, groupId: string, dto: JoinPatunganDto) {
-    const group = await this.prisma.patunganGroup.findFirst({ where: { id: groupId } });
-    if (!group) throw new NotFoundException({ code: ErrorCodes.PATUNGAN_GROUP_NOT_FOUND, message: 'Grup patungan tidak ditemukan' });
-    if (group.status !== PatunganStatus.OPEN) {
-      throw new BadRequestException({ code: ErrorCodes.PATUNGAN_NOT_OPEN, message: 'Grup tidak sedang dibuka' });
-    }
-    if (group.deadlineAt.getTime() <= Date.now()) {
-      throw new BadRequestException({ code: ErrorCodes.PATUNGAN_NOT_OPEN, message: 'Deadline patungan sudah lewat' });
-    }
-    if (group.hostId === userId) {
-      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Host otomatis peserta — tidak perlu join' });
-    }
-    let amount: bigint;
-    if (group.mode === PatunganMode.BAGI_RATA) {
-      amount = group.perPersonAmount!;
-    } else {
-      if (dto.amountIdr === undefined) {
-        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Mode custom wajib mengisi amountIdr' });
+    // LOW #1 (SEC-B ronde 2): dto.orderId TIDAK disimpan saat join — nilai
+    // orderId yang dikirim user tanpa validasi membuka celah squatting
+    // (mengklaim order milik orang lain). Penautan order WAJIB lewat
+    // linkOrder yang memvalidasi kepemilikan, seller, nilai, dan status.
+    return this.prisma.$transaction(async (tx) => {
+      const group = await tx.patunganGroup.findFirst({ where: { id: groupId } });
+      if (!group) throw new NotFoundException({ code: ErrorCodes.PATUNGAN_GROUP_NOT_FOUND, message: 'Grup patungan tidak ditemukan' });
+      if (group.status !== PatunganStatus.OPEN) {
+        throw new BadRequestException({ code: ErrorCodes.PATUNGAN_NOT_OPEN, message: 'Grup tidak sedang dibuka' });
       }
-      amount = toSen(dto.amountIdr);
-      if (amount <= 0n || amount > group.targetAmount) {
-        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Nominal custom harus > 0 dan ≤ target' });
+      if (group.deadlineAt.getTime() <= Date.now()) {
+        throw new BadRequestException({ code: ErrorCodes.PATUNGAN_NOT_OPEN, message: 'Deadline patungan sudah lewat' });
       }
-    }
-    try {
-      const participant = await this.prisma.patunganParticipant.create({
-        data: { groupId: group.id, userId, amount, orderId: dto.orderId ?? null, status: PatunganParticipantStatus.PENDING },
-      });
+      if (group.hostId === userId) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Host otomatis peserta — tidak perlu join' });
+      }
+      let amount: bigint;
+      if (group.mode === PatunganMode.BAGI_RATA) {
+        amount = group.perPersonAmount!;
+      } else {
+        if (dto.amountIdr === undefined) {
+          throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Mode custom wajib mengisi amountIdr' });
+        }
+        amount = toSen(dto.amountIdr);
+        if (amount <= 0n || amount > group.targetAmount) {
+          throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Nominal custom harus > 0 dan ≤ target' });
+        }
+      }
       if (group.slotTotal > 0) {
-        const count = await this.prisma.patunganParticipant.count({ where: { groupId: group.id } });
-        if (count > group.slotTotal) {
-          await this.prisma.patunganParticipant.delete({ where: { id: participant.id } });
+        // LOW #3 (SEC-B ronde 2): kunci baris grup agar hitungan slot
+        // konsisten antar request konkuren — pola lama create→count→delete
+        // di luar tx bisa membuat dua request sama-sama lolos (over-capacity)
+        // atau sama-sama terlempar. Update kosong tetap mengambil row lock.
+        await tx.patunganGroup.update({ where: { id: group.id }, data: {} });
+        const count = await tx.patunganParticipant.count({ where: { groupId: group.id } });
+        if (count >= group.slotTotal) {
           throw new ConflictException({ code: ErrorCodes.PATUNGAN_SLOT_FULL, message: 'Slot grup penuh' });
         }
       }
-      return participant;
-    } catch (e) {
-      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
-        const target = (e.meta?.target as string[]) ?? [];
-        if (target.includes('orderId')) {
-          throw new BadRequestException({
-            code: ErrorCodes.ORDER_ALREADY_LINKED,
-            message: 'Order ini sudah ditautkan ke peserta patungan lain',
-          });
+      try {
+        return await tx.patunganParticipant.create({
+          data: { groupId: group.id, userId, amount, orderId: null, status: PatunganParticipantStatus.PENDING },
+        });
+      } catch (e) {
+        if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+          throw new ConflictException({ code: ErrorCodes.PATUNGAN_ALREADY_JOINED, message: 'Kamu sudah join grup ini' });
         }
-        throw new ConflictException({ code: ErrorCodes.PATUNGAN_ALREADY_JOINED, message: 'Kamu sudah join grup ini' });
+        throw e;
       }
-      throw e;
-    }
+    });
   }
 
   /**
@@ -310,31 +312,65 @@ export class PatunganService {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Order belum dibayar' });
     }
     const updated = await this.prisma.$transaction(async (tx) => {
+      // LOW #2 (SEC-B ronde 2): kunci advisory per order agar linkOrder
+      // patungan vs jastip untuk order yang SAMA terserialisasi — menutup
+      // race double-link lintas tabel yang tak bisa dijangkau unique
+      // constraint per tabel. Lock dilepas otomatis saat tx selesai.
+      await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `commerce_link_order:${order.id}`);
       // Satu order berbayar TIDAK BOLEH ditautkan ke 2 peserta (cegah
-      // TARGET_REACHED palsu lewat double-counting dana escrow yang sama).
-      const alreadyLinked = await tx.patunganParticipant.findFirst({
-        where: { orderId: order.id, id: { not: participant.id } },
-        select: { id: true },
-      });
-      if (alreadyLinked) {
+      // TARGET_REACHED palsu lewat double-counting dana escrow yang sama) —
+      // cek di DALAM tx: peserta patungan lain + peserta jastip.
+      const [alreadyLinked, linkedJastip] = await Promise.all([
+        tx.patunganParticipant.findFirst({
+          where: { orderId: order.id, id: { not: participant.id } },
+          select: { id: true },
+        }),
+        tx.jastipParticipant.findFirst({ where: { orderId: order.id }, select: { id: true } }),
+      ]);
+      if (alreadyLinked || linkedJastip) {
         throw new BadRequestException({
           code: ErrorCodes.ORDER_ALREADY_LINKED,
-          message: 'Order ini sudah ditautkan ke peserta patungan lain',
+          message: 'Order ini sudah ditautkan ke peserta lain',
         });
       }
-      const p = await tx.patunganParticipant.update({
-        where: { id: participant.id },
+      // M4: peserta hanya boleh transisi PENDING → PAID (predicate status).
+      // Dua linkOrder konkuren untuk peserta yang sama: satu menang, satu
+      // mendapat count=0 → BadRequest, bukan double-link.
+      const marked = await tx.patunganParticipant.updateMany({
+        where: { id: participant.id, status: PatunganParticipantStatus.PENDING },
         data: { orderId: order.id, paidAt: new Date(), status: PatunganParticipantStatus.PAID },
       });
+      if (marked.count === 0) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Peserta sudah dalam proses / selesai' });
+      }
+      // M4: baca ulang grup DI DALAM tx — snapshot di luar tx bisa basi
+      // (balapan dengan processDeadlines).
+      const freshGroup = await tx.patunganGroup.findUnique({
+        where: { id: participant.groupId },
+        select: { status: true, targetAmount: true },
+      });
+      if (!freshGroup || freshGroup.status !== PatunganStatus.OPEN) {
+        throw new BadRequestException({ code: ErrorCodes.PATUNGAN_NOT_OPEN, message: 'Grup tidak sedang dibuka' });
+      }
       const agg = await tx.patunganParticipant.aggregate({
         where: { groupId: participant.groupId, status: PatunganParticipantStatus.PAID },
         _sum: { amount: true },
       });
       const totalPaid = agg._sum.amount ?? 0n;
-      if (totalPaid >= participant.group.targetAmount && participant.group.status === PatunganStatus.OPEN) {
-        await tx.patunganGroup.update({ where: { id: participant.groupId }, data: { status: PatunganStatus.TARGET_REACHED } });
+      if (totalPaid >= freshGroup.targetAmount) {
+        // M4: transisi OPEN → TARGET_REACHED kondisional. Bila kalah balapan
+        // dengan processDeadlines (grup sudah FAILED), lempar agar SELURUH
+        // tx rollback — peserta tidak boleh tertinggal PAID di grup FAILED
+        // tanpa refund; refund ditangani sisi deadline.
+        const claimed = await tx.patunganGroup.updateMany({
+          where: { id: participant.groupId, status: PatunganStatus.OPEN },
+          data: { status: PatunganStatus.TARGET_REACHED },
+        });
+        if (claimed.count === 0) {
+          throw new ConflictException({ code: ErrorCodes.PATUNGAN_NOT_OPEN, message: 'Grup berubah status saat pembayaran diproses' });
+        }
       }
-      return p;
+      return tx.patunganParticipant.findUnique({ where: { id: participant.id } });
     }).catch((e) => {
       // Race antar-request: unique constraint DB (orderId) menolak link ganda
       // → sampaikan sebagai BadRequest yang sama, bukan error mentah.
@@ -359,10 +395,16 @@ export class PatunganService {
       throw new BadRequestException({ code: ErrorCodes.PATUNGAN_TARGET_NOT_REACHED, message: 'Target belum tercapai' });
     }
     const contestEndsAt = new Date(Date.now() + PATUNGAN_CONTEST_HOURS * 60 * 60 * 1000);
-    return this.prisma.patunganGroup.update({
-      where: { id: group.id },
+    // M4: transisi TARGET_REACHED → CONTEST kondisional (predicate status) —
+    // balapan dengan processDeadlines tidak boleh menimpa status.
+    const claimed = await this.prisma.patunganGroup.updateMany({
+      where: { id: group.id, status: PatunganStatus.TARGET_REACHED },
       data: { status: PatunganStatus.CONTEST, contestEndsAt },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException({ code: ErrorCodes.PATUNGAN_TARGET_NOT_REACHED, message: 'Status grup berubah saat inisiasi pencairan' });
+    }
+    return this.prisma.patunganGroup.findUnique({ where: { id: group.id } });
   }
 
   // ── Cron ────────────────────────────────────────────────────────────────
@@ -382,18 +424,42 @@ export class PatunganService {
 
     const expiredOpen = await this.prisma.patunganGroup.findMany({
       where: { status: PatunganStatus.OPEN, deadlineAt: { lt: now } },
-      include: { participants: true },
+      select: { id: true, hostId: true },
     });
-    for (const group of expiredOpen) {
-      const totalPaid = group.participants
-        .filter((p) => p.status === PatunganParticipantStatus.PAID)
-        .reduce((a, p) => a + p.amount, 0n);
-      if (totalPaid >= group.targetAmount) {
-        await this.prisma.patunganGroup.update({ where: { id: group.id }, data: { status: PatunganStatus.TARGET_REACHED } });
-        continue;
-      }
-      await this.prisma.patunganGroup.update({ where: { id: group.id }, data: { status: PatunganStatus.FAILED } });
-      await this.refundParticipants(group.participants, group.hostId);
+    for (const g of expiredOpen) {
+      // M4: klaim status + baca ulang agregat DALAM SATU tx pendek.
+      // - Grup yang sudah berpindah (linkOrder menang → TARGET_REACHED) → lewati.
+      // - Target tercapai tepat di garis deadline → TARGET_REACHED kondisional.
+      // - Selain itu → FAILED kondisional; bila predicate gagal (kalah race),
+      //   JANGAN refund — pemenang race yang menangani.
+      // Refund (cancelOrder = tx + efek eksternal sendiri) dilakukan DI LUAR
+      // tx setelah klaim berhasil, dengan peserta dibaca fresh.
+      const outcome = await this.prisma.$transaction(async (tx) => {
+        const fresh = await tx.patunganGroup.findUnique({
+          where: { id: g.id },
+          select: { status: true, targetAmount: true },
+        });
+        if (!fresh || fresh.status !== PatunganStatus.OPEN) return 'skipped' as const;
+        const agg = await tx.patunganParticipant.aggregate({
+          where: { groupId: g.id, status: PatunganParticipantStatus.PAID },
+          _sum: { amount: true },
+        });
+        const totalPaid = agg._sum.amount ?? 0n;
+        if (totalPaid >= fresh.targetAmount) {
+          await tx.patunganGroup.updateMany({
+            where: { id: g.id, status: PatunganStatus.OPEN },
+            data: { status: PatunganStatus.TARGET_REACHED },
+          });
+          return 'reached' as const;
+        }
+        const claimed = await tx.patunganGroup.updateMany({
+          where: { id: g.id, status: PatunganStatus.OPEN },
+          data: { status: PatunganStatus.FAILED },
+        });
+        return claimed.count > 0 ? ('failed' as const) : ('skipped' as const);
+      });
+      if (outcome !== 'failed') continue;
+      await this.refundParticipants(g.id, g.hostId);
       failed++;
     }
 
@@ -402,32 +468,49 @@ export class PatunganService {
       select: { id: true },
     });
     for (const group of contestDone) {
-      await this.prisma.$transaction(async (tx) => {
-        await tx.patunganGroup.update({ where: { id: group.id }, data: { status: PatunganStatus.RELEASED, releasedAt: new Date() } });
+      // M4: transisi CONTEST → RELEASED kondisional (predicate status) —
+      // grup yang sudah berpindah (mis. dispute membatalkan contest) tidak
+      // ditimpa; bila predicate gagal, lewati tanpa refund ganda.
+      const claimed = await this.prisma.$transaction(async (tx) => {
+        const moved = await tx.patunganGroup.updateMany({
+          where: { id: group.id, status: PatunganStatus.CONTEST },
+          data: { status: PatunganStatus.RELEASED, releasedAt: new Date() },
+        });
+        if (moved.count === 0) return 0;
         await tx.patunganParticipant.updateMany({
           where: { groupId: group.id, status: PatunganParticipantStatus.PAID },
           data: { status: PatunganParticipantStatus.RELEASED },
         });
+        return 1;
       });
-      released++;
+      released += claimed;
     }
     return { failed, released };
   }
 
-  private async refundParticipants(
-    participants: Array<{ id: string; orderId: string | null; status: PatunganParticipantStatus }>,
-    hostId: string,
-  ): Promise<void> {
+  private async refundParticipants(groupId: string, hostId: string): Promise<void> {
+    // Peserta dibaca FRESH setelah klaim FAILED — snapshot lama bisa basi
+    // (balapan dengan linkOrder yang kalah dan rollback).
+    const participants = await this.prisma.patunganParticipant.findMany({
+      where: { groupId },
+      select: { id: true, orderId: true, status: true },
+    });
     for (const p of participants) {
       if (p.status === PatunganParticipantStatus.PENDING) {
-        await this.prisma.patunganParticipant.update({ where: { id: p.id }, data: { status: PatunganParticipantStatus.REFUNDED } });
+        await this.prisma.patunganParticipant.updateMany({
+          where: { id: p.id, status: PatunganParticipantStatus.PENDING },
+          data: { status: PatunganParticipantStatus.REFUNDED },
+        });
         continue;
       }
       if (p.status !== PatunganParticipantStatus.PAID) continue;
       if (!p.orderId) {
         // Data inkonsisten (PAID tanpa order): fail closed — tandai
-        // REFUND_REQUIRED agar ops menindaklanjuti manual, jangan diam.
-        await this.prisma.patunganParticipant.update({ where: { id: p.id }, data: { status: PatunganParticipantStatus.REFUND_REQUIRED } });
+        // REFUND_REQUIRED agar dieksekusi scheduler auto-refund / ops.
+        await this.prisma.patunganParticipant.updateMany({
+          where: { id: p.id, status: PatunganParticipantStatus.PAID },
+          data: { status: PatunganParticipantStatus.REFUND_REQUIRED },
+        });
         continue;
       }
       const order = await this.prisma.order.findUnique({ where: { id: p.orderId }, select: { orderId: true, status: true } });
@@ -438,10 +521,14 @@ export class PatunganService {
           refunded = true;
         } catch (e) {
           this.logger.warn(`Cancel order patungan gagal participant=${p.id}: ${(e as Error).message}`);
+          // Race: order ter-cancel jalur lain di tengah jalan → refund sudah
+          // ditangani pemenang race; jangan turunkan ke REFUND_REQUIRED.
+          const fresh = await this.prisma.order.findUnique({ where: { id: p.orderId }, select: { status: true } });
+          if (fresh?.status === OrderStatus.CANCELLED) refunded = true;
         }
       }
-      await this.prisma.patunganParticipant.update({
-        where: { id: p.id },
+      await this.prisma.patunganParticipant.updateMany({
+        where: { id: p.id, status: PatunganParticipantStatus.PAID },
         data: { status: refunded ? PatunganParticipantStatus.REFUNDED : PatunganParticipantStatus.REFUND_REQUIRED },
       });
     }

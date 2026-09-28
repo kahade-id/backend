@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RealtimeService } from '../realtime/realtime.service';
+import { UploadService } from '../upload/upload.service';
 
 /**
  * Batch 43 BE-CHAT: worker purge pesan sementara (ephemeral) & sekali lihat.
@@ -21,6 +22,7 @@ export class ChatEphemeralPurgeService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtime: RealtimeService,
+    private readonly uploadService: UploadService,
   ) {}
 
   @Cron(CronExpression.EVERY_MINUTE)
@@ -48,24 +50,65 @@ export class ChatEphemeralPurgeService {
       return { purged: 0, skippedDisputed };
     }
 
-    const ids = toPurge.map((c) => c.id);
+    // LOW (SEC-D): hapus file fisik lampiran DULU (pola SS-014) — tabel
+    // chat_attachments tidak menyimpan fileKey, jadi ekstrak dari URL
+    // tersimpan (publik/signed). Pesan yang file-nya gagal dihapus dilewati
+    // (retry menit berikutnya) agar tidak ada file yatim di disk.
+    const purgeIds = toPurge.map((c) => c.id);
+    const attachments = await this.prisma.chatAttachment.findMany({
+      where: { messageId: { in: purgeIds } },
+      select: { messageId: true, fileUrl: true, thumbnailUrl: true },
+    });
+    const filesByMessage = new Map<string, string[]>();
+    for (const att of attachments) {
+      const keys = [att.fileUrl, att.thumbnailUrl]
+        .map((url) => (url ? this.uploadService.fileKeyFromStoredUrl(url) : null))
+        .filter((k): k is string => !!k);
+      if (keys.length > 0) filesByMessage.set(att.messageId, [...(filesByMessage.get(att.messageId) ?? []), ...keys]);
+    }
+    const ids: string[] = [];
+    for (const c of toPurge) {
+      const keys = filesByMessage.get(c.id) ?? [];
+      let filesOk = true;
+      for (const key of new Set(keys)) {
+        const deleted = await this.uploadService.deleteStoredFile(key).catch(() => false);
+        if (!deleted) {
+          this.logger.error(
+            `[SECURITY] Gagal hapus file lampiran ${key} untuk pesan ephemeral ${c.id} — pesan dipertahankan untuk retry`,
+          );
+          filesOk = false;
+        }
+      }
+      if (filesOk) ids.push(c.id);
+    }
+    const skippedFiles = toPurge.length - ids.length;
+    if (ids.length === 0) {
+      return { purged: 0, skippedDisputed };
+    }
     // Hard delete: pesan ephemeral memang dirancang untuk hilang. Lampiran,
     // reaksi, riwayat edit, dan bintang ikut terhapus via onDelete: Cascade.
     const result = await this.prisma.chatMessage.deleteMany({ where: { id: { in: ids } } });
 
     // Beri tahu klien yang sedang membuka room agar menghapus bubble-nya.
+    // Hanya untuk pesan yang benar-benar ter-purge (bukan yang diskip karena
+    // file gagal dihapus).
+    const roomById = new Map(toPurge.map((c) => [c.id, c.roomId]));
     const byRoom = new Map<string, string[]>();
-    for (const c of toPurge) {
-      const list = byRoom.get(c.roomId) ?? [];
-      list.push(c.id);
-      byRoom.set(c.roomId, list);
+    for (const id of ids) {
+      const roomId = roomById.get(id);
+      if (!roomId) continue;
+      const list = byRoom.get(roomId) ?? [];
+      list.push(id);
+      byRoom.set(roomId, list);
     }
     for (const [roomId, messageIds] of byRoom) {
       this.realtime.emitToChatRoom(roomId, 'chat.messages_expired', { roomId, messageIds });
     }
 
-    if (skippedDisputed > 0) {
-      this.logger.log(`Ephemeral purge: ${result.count} purged, ${skippedDisputed} skipped (disputed orders)`);
+    if (skippedDisputed > 0 || skippedFiles > 0) {
+      this.logger.log(
+        `Ephemeral purge: ${result.count} purged, ${skippedDisputed} skipped (disputed orders), ${skippedFiles} skipped (file cleanup gagal, retry berikutnya)`,
+      );
     }
     return { purged: result.count, skippedDisputed };
   }

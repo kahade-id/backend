@@ -6,13 +6,15 @@ import { JastipTripStatus, JastipParticipantStatus, OrderStatus } from '@prisma/
 
 const mockTx: Record<string, any> = {
   jastipTrip: { updateMany: jest.fn(), update: jest.fn() },
-  jastipParticipant: { create: jest.fn(), update: jest.fn() },
+  jastipParticipant: { create: jest.fn(), update: jest.fn(), updateMany: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn() },
+  patunganParticipant: { findFirst: jest.fn() },
+  $executeRawUnsafe: jest.fn(),
 };
 
 const mockPrisma: Record<string, any> = {
-  jastipTrip: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), update: jest.fn(), count: jest.fn() },
+  jastipTrip: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), findUnique: jest.fn(), update: jest.fn(), updateMany: jest.fn(), count: jest.fn() },
   jastipItem: { create: jest.fn(), findMany: jest.fn() },
-  jastipParticipant: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), update: jest.fn() },
+  jastipParticipant: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
   user: { findMany: jest.fn() },
   order: { findFirst: jest.fn(), findUnique: jest.fn() },
   $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
@@ -34,6 +36,7 @@ describe('JastipService', () => {
     jest.resetAllMocks();
     mockOrderState.cancelOrder.mockResolvedValue({ ok: true });
     mockPrisma.$transaction.mockImplementation((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx));
+    mockTx.$executeRawUnsafe.mockResolvedValue(0);
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         JastipService,
@@ -107,23 +110,46 @@ describe('JastipService', () => {
     mockPrisma.order.findFirst.mockResolvedValue({
       id: 'o1', buyerId: 'buyer-1', sellerId: 'host-1', status: OrderStatus.PROCESSING, orderValue: 125000_00n,
     });
-    mockPrisma.jastipParticipant.update.mockResolvedValue({ id: 'p1', status: JastipParticipantStatus.PAID });
+    mockTx.jastipParticipant.findFirst.mockResolvedValue(null);
+    mockTx.patunganParticipant.findFirst.mockResolvedValue(null);
+    mockTx.jastipParticipant.updateMany.mockResolvedValue({ count: 1 });
+    mockTx.jastipParticipant.findUnique.mockResolvedValue({ id: 'p1', status: JastipParticipantStatus.PAID });
     const res = await service.linkOrder('buyer-1', 'p1', { orderId: 'o1' } as never);
-    expect(res.status).toBe(JastipParticipantStatus.PAID);
+    expect(res!.status).toBe(JastipParticipantStatus.PAID);
+    expect(mockTx.jastipParticipant.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'p1', status: JastipParticipantStatus.PRICE_LOCKED }),
+        data: expect.objectContaining({ orderId: 'o1', status: JastipParticipantStatus.PAID }),
+      }),
+    );
   });
 
   it('linkOrder menolak order yang sudah ditautkan ke peserta lain (anti double-link)', async () => {
-    mockPrisma.jastipParticipant.findFirst
-      .mockResolvedValueOnce({
-        id: 'p1', buyerId: 'buyer-1', status: JastipParticipantStatus.PRICE_LOCKED, totalLocked: 125000_00n,
-        trip: { hostId: 'host-1' },
-      })
-      .mockResolvedValueOnce({ id: 'p9' }); // peserta lain sudah memakai order ini
+    mockPrisma.jastipParticipant.findFirst.mockResolvedValue({
+      id: 'p1', buyerId: 'buyer-1', status: JastipParticipantStatus.PRICE_LOCKED, totalLocked: 125000_00n,
+      trip: { hostId: 'host-1' },
+    });
     mockPrisma.order.findFirst.mockResolvedValue({
       id: 'o1', buyerId: 'buyer-1', sellerId: 'host-1', status: OrderStatus.PROCESSING, orderValue: 125000_00n,
     });
+    mockTx.jastipParticipant.findFirst.mockResolvedValue({ id: 'p9' }); // peserta lain sudah memakai order ini
+    mockTx.patunganParticipant.findFirst.mockResolvedValue(null);
     await expect(service.linkOrder('buyer-1', 'p1', { orderId: 'o1' } as never)).rejects.toThrow('sudah ditautkan');
-    expect(mockPrisma.jastipParticipant.update).not.toHaveBeenCalled();
+    expect(mockTx.jastipParticipant.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('LOW: linkOrder menolak order yang sudah ditautkan ke peserta PATUNGAN (lintas modul)', async () => {
+    mockPrisma.jastipParticipant.findFirst.mockResolvedValue({
+      id: 'p1', buyerId: 'buyer-1', status: JastipParticipantStatus.PRICE_LOCKED, totalLocked: 125000_00n,
+      trip: { hostId: 'host-1' },
+    });
+    mockPrisma.order.findFirst.mockResolvedValue({
+      id: 'o1', buyerId: 'buyer-1', sellerId: 'host-1', status: OrderStatus.PROCESSING, orderValue: 125000_00n,
+    });
+    mockTx.jastipParticipant.findFirst.mockResolvedValue(null);
+    mockTx.patunganParticipant.findFirst.mockResolvedValue({ id: 'pp1' }); // order dipakai patungan
+    await expect(service.linkOrder('buyer-1', 'p1', { orderId: 'o1' } as never)).rejects.toThrow('sudah ditautkan');
+    expect(mockTx.jastipParticipant.updateMany).not.toHaveBeenCalled();
   });
 
   it('linkOrder menolak bila harga belum dikunci', async () => {
@@ -149,11 +175,21 @@ describe('JastipService', () => {
       id: 't1', hostId: 'host-1', status: JastipTripStatus.OPEN,
       participants: [{ id: 'p1', status: JastipParticipantStatus.PAID, orderId: null }],
     });
-    mockPrisma.jastipTrip.update.mockResolvedValue({});
-    mockPrisma.jastipParticipant.update.mockResolvedValue({});
+    mockPrisma.jastipTrip.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.jastipParticipant.findMany.mockResolvedValue([
+      { id: 'p1', status: JastipParticipantStatus.PAID, orderId: null },
+    ]);
+    mockPrisma.jastipParticipant.updateMany.mockResolvedValue({ count: 1 });
     const res = await service.failTrip('host-1', 't1');
     expect(res.status).toBe(JastipTripStatus.CANCELLED);
     expect(res.results[0].outcome).toBe('REFUND_REQUIRED');
+    // M3: transisi trip memakai predicate status (conditional update).
+    expect(mockPrisma.jastipTrip.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 't1', status: expect.objectContaining({ notIn: expect.any(Array) }) }),
+        data: { status: JastipTripStatus.CANCELLED },
+      }),
+    );
   });
 
   it('failTrip: order masih cancellable → di-cancel via OrderStateService', async () => {
@@ -161,12 +197,72 @@ describe('JastipService', () => {
       id: 't1', hostId: 'host-1', status: JastipTripStatus.OPEN,
       participants: [{ id: 'p1', status: JastipParticipantStatus.PAID, orderId: 'oid1' }],
     });
-    mockPrisma.jastipTrip.update.mockResolvedValue({});
+    mockPrisma.jastipTrip.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.jastipParticipant.findMany.mockResolvedValue([
+      { id: 'p1', status: JastipParticipantStatus.PAID, orderId: 'oid1' },
+    ]);
     mockPrisma.order.findUnique.mockResolvedValue({ orderId: 'ORD-1', status: OrderStatus.WAITING_PAYMENT });
-    mockPrisma.jastipParticipant.update.mockResolvedValue({});
+    mockPrisma.jastipParticipant.updateMany.mockResolvedValue({ count: 1 });
     const res = await service.failTrip('host-1', 't1', 'barang habis');
     expect(mockOrderState.cancelOrder).toHaveBeenCalled();
     expect(res.results[0].outcome).toBe('REFUNDED');
+  });
+
+  it('M3: retry setelah crash (trip sudah CANCELLED) → TIDAK ditolak, sisa peserta diproses', async () => {
+    mockPrisma.jastipTrip.findFirst.mockResolvedValue({
+      id: 't1', hostId: 'host-1', status: JastipTripStatus.CANCELLED, participants: [],
+    });
+    mockPrisma.jastipTrip.updateMany.mockResolvedValue({ count: 0 }); // sudah diklaim percobaan sebelumnya
+    mockPrisma.jastipTrip.findUnique.mockResolvedValue({ status: JastipTripStatus.CANCELLED });
+    mockPrisma.jastipParticipant.findMany.mockResolvedValue([
+      { id: 'p1', status: JastipParticipantStatus.PAID, orderId: 'oid1' },
+      { id: 'p2', status: JastipParticipantStatus.REFUNDED, orderId: 'oid2' }, // sudah selesai → dilewati
+    ]);
+    mockPrisma.order.findUnique.mockResolvedValue({ orderId: 'ORD-1', status: OrderStatus.PROCESSING });
+    mockPrisma.jastipParticipant.updateMany.mockResolvedValue({ count: 1 });
+    const res = await service.failTrip('host-1', 't1');
+    expect(res.status).toBe(JastipTripStatus.CANCELLED);
+    expect(res.results).toHaveLength(2);
+    expect(res.results[0]).toEqual({ participantId: 'p1', outcome: 'REFUND_REQUIRED' });
+    expect(res.results[1]).toEqual({ participantId: 'p2', outcome: 'REFUNDED' });
+    expect(mockOrderState.cancelOrder).not.toHaveBeenCalled(); // p2 tidak diproses ulang
+  });
+
+  it('M3: trip COMPLETED tetap ditolak', async () => {
+    mockPrisma.jastipTrip.findFirst.mockResolvedValue({
+      id: 't1', hostId: 'host-1', status: JastipTripStatus.COMPLETED, participants: [],
+    });
+    await expect(service.failTrip('host-1', 't1')).rejects.toThrow('sudah selesai');
+    expect(mockPrisma.jastipTrip.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('M3: cancelOrder balapan (order ter-cancel jalur lain) → peserta REFUNDED bukan REFUND_REQUIRED', async () => {
+    mockPrisma.jastipTrip.findFirst.mockResolvedValue({
+      id: 't1', hostId: 'host-1', status: JastipTripStatus.OPEN, participants: [],
+    });
+    mockPrisma.jastipTrip.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.jastipParticipant.findMany.mockResolvedValue([
+      { id: 'p1', status: JastipParticipantStatus.PAID, orderId: 'oid1' },
+    ]);
+    mockPrisma.order.findUnique
+      .mockResolvedValueOnce({ orderId: 'ORD-1', status: OrderStatus.WAITING_PAYMENT })
+      .mockResolvedValueOnce({ status: OrderStatus.CANCELLED }); // baca ulang pasca-gagal
+    mockOrderState.cancelOrder.mockRejectedValueOnce(new Error('Order status has already changed'));
+    mockPrisma.jastipParticipant.updateMany.mockResolvedValue({ count: 1 });
+    const res = await service.failTrip('host-1', 't1');
+    expect(res.results[0].outcome).toBe('REFUNDED');
+  });
+
+  it('M3: closeExpiredTrips tidak menimpa trip yang sudah CANCELLED via failTrip', async () => {
+    mockPrisma.jastipTrip.findMany.mockResolvedValue([{ id: 't1' }]);
+    const res = await service.closeExpiredTrips();
+    expect(res).toBe(1);
+    expect(mockTx.jastipTrip.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 't1', status: JastipTripStatus.OPEN }),
+        data: { status: JastipTripStatus.CLOSED },
+      }),
+    );
   });
 
   it('listAdminTrips mengembalikan shape admin + hostName', async () => {

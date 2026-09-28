@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { BullModule } from '@nestjs/bull';
 import { PrismaModule } from '../../prisma/prisma.module';
 import { RedisModule } from '../../redis/redis.module';
 import { MilestonesModule } from '../milestones/milestones.module';
@@ -15,6 +16,8 @@ import { JastipService } from './services/jastip.service';
 import { PatunganService } from './services/patungan.service';
 import { BannersService } from './services/banners.service';
 import { CommerceSchedulerService } from './services/commerce-scheduler.service';
+import { CommerceRefundService } from './services/commerce-refund.service';
+import { CommerceRefundProcessor, COMMERCE_REFUND_QUEUE } from './processors/commerce-refund.processor';
 
 import { ProductCommerceController } from './controllers/product-commerce.controller';
 import { SearchTrendsController } from './controllers/search-trends.controller';
@@ -30,6 +33,7 @@ import { AdminBannersController } from './controllers/admin-banners.controller';
 import { AdminGroupBuyingController } from './controllers/admin-group-buying.controller';
 import { AdminJastipTripsController } from './controllers/admin-jastip-trips.controller';
 import { AdminSellerVouchersController } from './controllers/admin-seller-vouchers.controller';
+import { AdminCommerceRefundsController } from './controllers/admin-commerce-refunds.controller';
 
 /**
  * BE-COMMERCE (2026-10-01): modul commerce mega-batch.
@@ -44,7 +48,22 @@ import { AdminSellerVouchersController } from './controllers/admin-seller-vouche
  * logika uang/escrow baru di modul ini.
  */
 @Module({
-  imports: [PrismaModule, RedisModule, MilestonesModule, OrdersModule],
+  imports: [
+    PrismaModule,
+    RedisModule,
+    MilestonesModule,
+    OrdersModule,
+    // M2: antrean Bull untuk auto-refund REFUND_REQUIRED (repeatable tiap 5 menit).
+    BullModule.registerQueue({
+      name: COMMERCE_REFUND_QUEUE,
+      defaultJobOptions: {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 5000 },
+        removeOnComplete: 20,
+        removeOnFail: 20,
+      },
+    }),
+  ],
   controllers: [
     ProductCommerceController,
     SearchTrendsController,
@@ -60,6 +79,7 @@ import { AdminSellerVouchersController } from './controllers/admin-seller-vouche
     AdminGroupBuyingController,
     AdminJastipTripsController,
     AdminSellerVouchersController,
+    AdminCommerceRefundsController,
   ],
   providers: [
     ProductCommerceService,
@@ -73,6 +93,8 @@ import { AdminSellerVouchersController } from './controllers/admin-seller-vouche
     PatunganService,
     BannersService,
     CommerceSchedulerService,
+    CommerceRefundService,
+    CommerceRefundProcessor,
   ],
   exports: [ProductCommerceService, SearchTrendsService, BannersService],
 })

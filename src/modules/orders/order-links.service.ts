@@ -6,6 +6,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { FeeCalculatorService } from './fee-calculator.service';
 import { CreateOrderLinkDto } from './dto/create-order-link.dto';
+import { AcceptOrderLinkDto } from './dto/accept-order-link.dto';
 import { generateOrderLinkId, generateOrderLinkToken, generateOrderId } from '../../common/utils/id-generator.util';
 import { ORDER_SERIAL, ORDER_LINK_SERIAL } from '../../common/constants/redis-keys';
 import { KYC_THRESHOLD, CONFIRMATION_DEADLINE_DAYS_MAP, ORDER_MIN_VALUE, ORDER_MAX_VALUE, DELIVERY_DEADLINE_DAYS_MIN, DELIVERY_DEADLINE_DAYS_MAX } from '../../common/constants/app.constants';
@@ -185,6 +186,30 @@ export class OrderLinksService {
     const expiresAt = new Date();
     expiresAt.setHours(expiresAt.getHours() + ORDER_LINK_EXPIRY_HOURS);
 
+    // TRX-009: link PHYSICAL_GOODS yang dibuat dengan peran BUYER — pembuat
+    // adalah pembeli, jadi alamat pengiriman wajib diisi SEKARANG (fail-closed,
+    // sama seperti createOrder). Link SELLER: alamat diisi penerima saat accept.
+    let linkShippingAddressId: string | undefined;
+    if (dto.orderType === 'PHYSICAL_GOODS' && dto.role === 'BUYER') {
+      const shippingAddressId = typeof dto.shippingAddressId === 'string' ? dto.shippingAddressId.trim() : '';
+      if (!shippingAddressId) {
+        throw new BadRequestException({
+          code: ErrorCodes.SHIPPING_ADDRESS_REQUIRED,
+          message: 'Alamat pengiriman wajib diisi untuk order link barang fisik.',
+        });
+      }
+      const address = await this.prisma.address.findFirst({
+        where: { id: shippingAddressId, userId, deletedAt: null },
+      });
+      if (!address) {
+        throw new BadRequestException({
+          code: ErrorCodes.SHIPPING_ADDRESS_REQUIRED,
+          message: 'Alamat pengiriman tidak ditemukan di buku alamat Anda.',
+        });
+      }
+      linkShippingAddressId = address.id;
+    }
+
     const link = await this.prisma.orderLink.create({
       data: {
         linkId,
@@ -201,6 +226,7 @@ export class OrderLinksService {
         counterpartUsername: normalizedCounterpartUsername,
         expiresAt,
         ...(showcaseId ? { showcaseId, priceSnapshot } : {}),
+        ...(linkShippingAddressId ? { shippingAddressId: linkShippingAddressId } : {}),
       },
     });
 
@@ -266,7 +292,7 @@ export class OrderLinksService {
     };
   }
 
-  async acceptLink(token: string, userId: string): Promise<object> {
+  async acceptLink(token: string, userId: string, dto: AcceptOrderLinkDto = {}): Promise<object> {
     const link = await this.prisma.orderLink.findUnique({ where: { token } });
 
     if (!link) {
@@ -356,6 +382,55 @@ export class OrderLinksService {
 
     const orderSerial = await this.getNextOrderSerial();
     const orderId = generateOrderId(orderSerial);
+
+    // TRX-009: PHYSICAL_GOODS wajib punya alamat pengiriman milik BUYER
+    // (fail-closed). Buyer = penerima (link dibuat SELLER) -> alamat dari body
+    // accept; buyer = pembuat (link dibuat BUYER) -> alamat dari link, tapi
+    // divalidasi ulang kepemilikannya di sini karena alamat bisa dihapus/
+    // diubah setelah link dibuat. Snapshot = ciphertext dari tabel Address.
+    let shippingSnapshot: {
+      addressId: string;
+      recipientName: string;
+      phone: string;
+      addressLine: string;
+      city: string;
+      province: string | null;
+      postalCode: string;
+    } | null = null;
+    if (link.orderType === 'PHYSICAL_GOODS') {
+      const buyerIsAcceptor = link.creatorRole === 'SELLER';
+      const rawAddressId = buyerIsAcceptor
+        ? (typeof dto.shippingAddressId === 'string' ? dto.shippingAddressId.trim() : '')
+        : (typeof (link as { shippingAddressId?: string | null }).shippingAddressId === 'string'
+            ? ((link as { shippingAddressId?: string | null }).shippingAddressId as string).trim()
+            : '');
+      if (!rawAddressId) {
+        throw new BadRequestException({
+          code: ErrorCodes.SHIPPING_ADDRESS_REQUIRED,
+          message: buyerIsAcceptor
+            ? 'Pilih alamat pengiriman dari buku alamat Anda untuk menerima order barang fisik ini.'
+            : 'Link ini tidak memiliki alamat pengiriman yang valid. Minta pembuat link membuat ulang tautannya.',
+        });
+      }
+      const address = await this.prisma.address.findFirst({
+        where: { id: rawAddressId, userId: buyerId, deletedAt: null },
+      });
+      if (!address) {
+        throw new BadRequestException({
+          code: ErrorCodes.SHIPPING_ADDRESS_REQUIRED,
+          message: 'Alamat pengiriman tidak ditemukan di buku alamat pembeli.',
+        });
+      }
+      shippingSnapshot = {
+        addressId: address.id,
+        recipientName: address.recipientName,
+        phone: address.phone,
+        addressLine: address.addressLine,
+        city: address.city,
+        province: address.province,
+        postalCode: address.postalCode,
+      };
+    }
 
     /*
      * C-23: this transaction is Serializable and creates the order, its chat room and its
@@ -448,6 +523,19 @@ export class OrderLinksService {
             showcaseId: link.showcaseId ?? undefined,
             priceSnapshot: link.priceSnapshot ?? undefined,
             confirmationDeadlineAt: toWIB().add(CONFIRMATION_DEADLINE_DAYS_MAP[link.orderType] ?? 3, 'day').toDate(),
+            // TRX-009: snapshot alamat pengiriman buyer (ciphertext dari tabel
+            // Address) — hanya untuk PHYSICAL_GOODS.
+            ...(shippingSnapshot
+              ? {
+                  shippingAddressId: shippingSnapshot.addressId,
+                  shippingRecipientName: shippingSnapshot.recipientName,
+                  shippingPhone: shippingSnapshot.phone,
+                  shippingAddressLine: shippingSnapshot.addressLine,
+                  shippingCity: shippingSnapshot.city,
+                  shippingProvince: shippingSnapshot.province,
+                  shippingPostalCode: shippingSnapshot.postalCode,
+                }
+              : {}),
           },
         });
 

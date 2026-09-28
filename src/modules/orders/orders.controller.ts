@@ -24,6 +24,7 @@ import { Public } from '../../common/decorators/public.decorator';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { CreateOrderLinkDto } from './dto/create-order-link.dto';
+import { AcceptOrderLinkDto } from './dto/accept-order-link.dto';
 import { GetOrdersQueryDto } from './dto/get-orders-query.dto';
 import {
   CalculateFeeDto,
@@ -377,8 +378,9 @@ export class OrdersController {
   async acceptOrderLink(
     @CurrentUser('sub') userId: string,
     @Param('token', ParseTokenPipe) token: string,
+    @Body() dto: AcceptOrderLinkDto,
   ): Promise<object> {
-    return this.orderLinksService.acceptLink(token, userId);
+    return this.orderLinksService.acceptLink(token, userId, dto);
   }
 
   /*

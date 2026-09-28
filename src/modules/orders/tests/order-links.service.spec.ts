@@ -29,6 +29,8 @@ const mockPrisma = {
   order: { create: jest.fn() },
   chatRoom: { create: jest.fn() },
   orderStatusHistory: { create: jest.fn() },
+  // TRX-009: buku alamat untuk validasi shippingAddressId.
+  address: { findFirst: jest.fn() },
   $transaction: jest.fn(),
 };
 
@@ -422,6 +424,179 @@ describe('OrderLinksService — acceptLink', () => {
         response: { code: 'USER_BLOCKED' },
       });
       expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('OrderLinksService — TRX-009 shipping address on order links', () => {
+  let service: OrderLinksService;
+
+  const MOCK_ADDRESS = {
+    id: 'addr-1',
+    recipientName: 'Budi',
+    phone: '081234567890',
+    addressLine: 'Jl. Mawar No. 1',
+    city: 'Jakarta',
+    province: 'DKI Jakarta',
+    postalCode: '10110',
+  };
+
+  const PHYSICAL_LINK = {
+    ...LINK,
+    orderType: 'PHYSICAL_GOODS',
+    title: 'Sepatu lari',
+    description: 'Sepatu lari ukuran 42, warna hitam, kondisi baru.',
+  };
+
+  beforeEach(async () => {
+    mockPrisma.$transaction.mockReset();
+    mockRedisClient.eval.mockReset();
+    mockQueue.enqueue.mockReset();
+    // orderLink.create dipakai lintas describe di file ini tanpa reset —
+    // bersihkan hitungan panggilan agar asersi per-test valid.
+    mockPrisma.orderLink.create.mockReset();
+
+    mockPrisma.orderLink.findUnique.mockResolvedValue({ ...PHYSICAL_LINK });
+    mockPrisma.orderLink.update.mockResolvedValue({});
+    mockPrisma.orderLink.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.orderLink.create.mockImplementation(({ data }: { data: Record<string, unknown> }) =>
+      Promise.resolve({ id: 'link-row-2', ...data }),
+    );
+    mockPrisma.blockList.findFirst.mockResolvedValue(null);
+    mockPrisma.user.findFirst.mockResolvedValue({ id: 'counterpart-1', isActive: true, isBanned: false });
+    mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string } }) => {
+      if (where.id === 'creator') return Promise.resolve({ id: 'creator', username: 'seller', isActive: true, isBanned: false });
+      return Promise.resolve({ kycStatus: 'APPROVED', isKahadePlus: false, isActive: true, isBanned: false, username: 'acceptor' });
+    });
+    mockPrisma.subscription.findFirst.mockResolvedValue(null);
+    mockPrisma.address.findFirst.mockResolvedValue(null);
+    mockPrisma.order.create.mockResolvedValue(CREATED_ORDER);
+    mockPrisma.chatRoom.create.mockResolvedValue({});
+    mockPrisma.orderStatusHistory.create.mockResolvedValue({});
+    mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => fn(mockPrisma));
+    mockRedisClient.eval.mockResolvedValue(7);
+    mockQueue.enqueue.mockResolvedValue(undefined);
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        OrderLinksService,
+        { provide: PrismaService, useValue: mockPrisma },
+        { provide: RedisService, useValue: mockRedis },
+        { provide: FeeCalculatorService, useValue: mockFeeCalculator },
+        { provide: NotificationQueueService, useValue: mockQueue },
+      ],
+    }).compile();
+    service = module.get<OrderLinksService>(OrderLinksService);
+  });
+
+  function physicalLinkDto(overrides: Record<string, unknown> = {}) {
+    return {
+      role: 'BUYER',
+      title: 'Sepatu lari',
+      description: 'Sepatu lari ukuran 42, warna hitam, kondisi baru.',
+      orderType: 'PHYSICAL_GOODS',
+      orderValue: 500000,
+      feeResponsibility: 'BUYER',
+      deliveryDeadlineDays: 7,
+      ...overrides,
+    } as never;
+  }
+
+  it('createLink: rejects PHYSICAL_GOODS link with role BUYER when shippingAddressId is missing', async () => {
+    await expect(service.createLink('creator', physicalLinkDto())).rejects.toMatchObject({
+      response: { code: 'SHIPPING_ADDRESS_REQUIRED' },
+    });
+    expect(mockPrisma.orderLink.create).not.toHaveBeenCalled();
+  });
+
+  it('createLink: rejects when the address is not owned by the creator', async () => {
+    mockPrisma.address.findFirst.mockResolvedValue(null);
+
+    await expect(
+      service.createLink('creator', physicalLinkDto({ shippingAddressId: 'addr-x' })),
+    ).rejects.toMatchObject({ response: { code: 'SHIPPING_ADDRESS_REQUIRED' } });
+    expect(mockPrisma.address.findFirst).toHaveBeenCalledWith({
+      where: { id: 'addr-x', userId: 'creator', deletedAt: null },
+    });
+  });
+
+  it('createLink: stores shippingAddressId for PHYSICAL_GOODS link with role BUYER', async () => {
+    mockPrisma.address.findFirst.mockResolvedValue(MOCK_ADDRESS);
+
+    await service.createLink('creator', physicalLinkDto({ shippingAddressId: 'addr-1' }));
+
+    expect(mockPrisma.orderLink.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ shippingAddressId: 'addr-1' }) }),
+    );
+  });
+
+  it('createLink: does not require shippingAddressId for PHYSICAL_GOODS link with role SELLER', async () => {
+    await service.createLink('creator', physicalLinkDto({ role: 'SELLER' }));
+
+    expect(mockPrisma.orderLink.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.not.objectContaining({ shippingAddressId: expect.anything() }) }),
+    );
+  });
+
+  it('acceptLink: rejects PHYSICAL_GOODS link (seller-created) when the acceptor provides no address', async () => {
+    await expect(service.acceptLink('tok-1', 'acceptor', {})).rejects.toMatchObject({
+      response: { code: 'SHIPPING_ADDRESS_REQUIRED' },
+    });
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('acceptLink: snapshots the acceptor address onto the order for seller-created physical links', async () => {
+    mockPrisma.address.findFirst.mockResolvedValue(MOCK_ADDRESS);
+
+    await service.acceptLink('tok-1', 'acceptor', { shippingAddressId: 'addr-1' });
+
+    expect(mockPrisma.address.findFirst).toHaveBeenCalledWith({
+      where: { id: 'addr-1', userId: 'acceptor', deletedAt: null },
+    });
+    expect(mockPrisma.order.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          shippingAddressId: 'addr-1',
+          shippingRecipientName: 'Budi',
+          shippingAddressLine: 'Jl. Mawar No. 1',
+          shippingCity: 'Jakarta',
+          shippingPostalCode: '10110',
+        }),
+      }),
+    );
+  });
+
+  it('acceptLink: uses and re-validates the link address for buyer-created physical links', async () => {
+    mockPrisma.orderLink.findUnique.mockResolvedValue({
+      ...PHYSICAL_LINK,
+      creatorRole: 'BUYER',
+      shippingAddressId: 'addr-1',
+    });
+    mockPrisma.address.findFirst.mockResolvedValue(MOCK_ADDRESS);
+
+    await service.acceptLink('tok-1', 'acceptor', {});
+
+    // Buyer = creator: alamat milik creator, divalidasi ulang di sini.
+    expect(mockPrisma.address.findFirst).toHaveBeenCalledWith({
+      where: { id: 'addr-1', userId: 'creator', deletedAt: null },
+    });
+    expect(mockPrisma.order.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ shippingAddressId: 'addr-1' }),
+      }),
+    );
+  });
+
+  it('acceptLink: rejects when the link address no longer belongs to the buyer', async () => {
+    mockPrisma.orderLink.findUnique.mockResolvedValue({
+      ...PHYSICAL_LINK,
+      creatorRole: 'BUYER',
+      shippingAddressId: 'addr-1',
+    });
+    mockPrisma.address.findFirst.mockResolvedValue(null);
+
+    await expect(service.acceptLink('tok-1', 'acceptor', {})).rejects.toMatchObject({
+      response: { code: 'SHIPPING_ADDRESS_REQUIRED' },
     });
   });
 });

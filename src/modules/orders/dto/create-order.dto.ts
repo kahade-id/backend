@@ -2,6 +2,7 @@ import {
   IsEnum,
   IsString,
   IsInt,
+  IsNumber,
   IsOptional,
   Min,
   Max,
@@ -23,6 +24,40 @@ import {
 function sanitizeText(value: unknown): unknown {
   if (typeof value !== 'string') return value;
   return value.replace(/[<>]/g, '').trim();
+}
+
+/**
+ * Lokasi presisi buyer saat order dibuat (kontrak disepakati dengan tim frontend).
+ * Selalu OPSIONAL — null/absent bila user menolak izin lokasi.
+ */
+export class BuyerLocationDto {
+  @ApiProperty({ description: 'Latitude (-90 s.d. 90)', example: -6.2088 })
+  @IsNumber()
+  @Min(-90)
+  @Max(90)
+  @Type(() => Number)
+  latitude!: number;
+
+  @ApiProperty({ description: 'Longitude (-180 s.d. 180)', example: 106.8456 })
+  @IsNumber()
+  @Min(-180)
+  @Max(180)
+  @Type(() => Number)
+  longitude!: number;
+
+  @ApiPropertyOptional({ description: 'Akurasi dalam meter (bila dilaporkan OS)', example: 12.5 })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(100000)
+  @Type(() => Number)
+  accuracy?: number;
+
+  @ApiPropertyOptional({ description: 'Waktu pengambilan lokasi (ISO 8601)', example: '2026-09-28T22:30:00+07:00' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  capturedAt?: string;
 }
 
 export class CreateOrderDto {
@@ -87,6 +122,15 @@ export class CreateOrderDto {
   @MaxLength(50)
   voucherCode?: string;
 
+  @ApiPropertyOptional({
+    description: 'ID alamat pengiriman dari buku alamat pembuat order. WAJIB untuk orderType PHYSICAL_GOODS (server menolak tanpa ini); diabaikan untuk tipe lain.',
+    maxLength: 100,
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  shippingAddressId?: string;
+
   @ApiPropertyOptional({ description: 'Reference attachment URLs (R2 CDN) for order spec — max 5', type: [String] })
   @IsOptional()
   @IsString({ each: true })
@@ -104,4 +148,13 @@ export class CreateOrderDto {
   @ValidateNested()
   @Type(() => LocationDto)
   deviceLocation?: LocationDto | null;
+
+  @ApiPropertyOptional({
+    description: 'Lokasi presisi buyer saat order dibuat (opsional — null/absent bila user menolak izin lokasi). Disimpan terenkripsi, tampil di detail order admin untuk fraud checking.',
+    type: () => BuyerLocationDto,
+  })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => BuyerLocationDto)
+  buyerLocation?: BuyerLocationDto | null;
 }

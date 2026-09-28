@@ -460,6 +460,23 @@ export class DataCleanupService implements OnModuleInit {
             where: { userId: { in: batch } },
             data: { pushToken: null, ipAddress: '0.0.0.0' },
           }),
+          // H2 (SEC-D ronde 2): buku alamat adalah PII — jangan awet
+          // selamanya. Nilai 'DELETED' plaintext terdeteksi sebagai
+          // non-ciphertext oleh AddressesService (prefix v1:).
+          tx.address.updateMany({
+            where: { userId: { in: batch } },
+            data: {
+              recipientName: 'DELETED',
+              phone: 'DELETED',
+              addressLine: 'DELETED',
+              city: 'DELETED',
+              province: null,
+              postalCode: 'DELETED',
+              customLabel: null,
+              isDefault: false,
+              deletedAt: new Date(),
+            },
+          }),
         ]);
 
         for (const id of batch) {

@@ -1219,4 +1219,78 @@ describe('OrdersService', () => {
       expect(result.limit).toBe(100);
     });
   });
+
+  // ─── M1 (SEC-B ronde 2): voucher seller terikat ke seller ────────────────
+
+  describe('M1: seller voucher binding saat redeem', () => {
+    const dto: CreateOrderDto = {
+      role: 'BUYER' as const,
+      counterpartUsername: 'seller01',
+      title: 'Test Order',
+      description: 'Test description',
+      orderType: OrderType.PHYSICAL_GOODS,
+      orderValue: 100_000,
+      deliveryDeadlineDays: 7,
+      feeResponsibility: FeeResponsibility.BUYER,
+      voucherCode: 'SELLER10',
+    };
+
+    const sellerVoucherRow = (sellerId: string | null) => ({
+      id: 'voucher-s1',
+      code: 'SELLER10',
+      isActive: true,
+      voucherType: 'FEE_DISCOUNT_PERCENT',
+      discountPercent: 10,
+      discountAmount: null,
+      maxUsageTotal: null,
+      currentUsage: 0,
+      maxUsagePerUser: null,
+      campaignId: null,
+      validFrom: new Date(0),
+      validUntil: new Date(Date.now() + 86400000),
+      applicableTo: 'ALL',
+      assignedToUserId: null,
+      sellerId,
+      minOrderValue: null,
+      maxDiscountAmount: null,
+    });
+
+    function mockVoucherFlow(sellerId: string | null) {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      mockPrisma.$queryRaw.mockResolvedValue([sellerVoucherRow(sellerId)]);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
+        mockPrisma.order.create.mockResolvedValue(mockOrder);
+        mockPrisma.chatRoom.create.mockResolvedValue({ id: 'chat-1' });
+        return fn(mockPrisma);
+      });
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+    }
+
+    it('menolak voucher seller S dipakai di order seller T', async () => {
+      mockVoucherFlow('user-db-9'); // voucher milik seller lain
+      await expect(service.createOrder('user-db-1', dto)).rejects.toThrow(
+        'only valid for orders from the issuing seller',
+      );
+      expect(mockPrisma.order.create).not.toHaveBeenCalled();
+    });
+
+    it('mengizinkan voucher seller S di order seller S', async () => {
+      mockVoucherFlow('user-db-2'); // voucher milik counterpart (seller order ini)
+      const result = (await service.createOrder('user-db-1', dto)) as Record<string, unknown>;
+      expect(result).toHaveProperty('orderId');
+      expect(mockPrisma.order.create).toHaveBeenCalled();
+    });
+
+    it('voucher platform (sellerId null) tetap bisa dipakai di order mana pun', async () => {
+      mockVoucherFlow(null);
+      const result = (await service.createOrder('user-db-1', dto)) as Record<string, unknown>;
+      expect(result).toHaveProperty('orderId');
+    });
+  });
 });

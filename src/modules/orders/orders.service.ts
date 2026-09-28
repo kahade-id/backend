@@ -134,11 +134,24 @@ export class OrdersService {
     user: { totalOrdersCompleted: number },
     userId: string,
     role: 'BUYER' | 'SELLER',
+    orderSellerId?: string,
   ): Promise<void> {
     if (voucher.assignedToUserId && voucher.assignedToUserId !== userId) {
       throw new BadRequestException({
         code: ErrorCodes.VOUCHER_NOT_APPLICABLE,
         message: 'This voucher is assigned to a different user',
+      });
+    }
+    // M1 (SEC-B ronde 2): voucher seller (sellerId != null) HANYA boleh
+    // dipakai di order yang seller-nya = pemilik voucher. Tanpa cek ini,
+    // voucher seller S bisa dipakai di order seller T → promo/kuota S
+    // terkuras + platform kehilangan fee/cashback.
+    // orderSellerId undefined = konteks estimasi tanpa seller (calculateFee):
+    // cek dilewati di preview, ditegakkan saat create order.
+    if (voucher.sellerId && orderSellerId !== undefined && voucher.sellerId !== orderSellerId) {
+      throw new BadRequestException({
+        code: ErrorCodes.VOUCHER_NOT_APPLICABLE,
+        message: 'This voucher is only valid for orders from the issuing seller',
       });
     }
     if (voucher.voucherType === VoucherType.TOPUP_BONUS) {
@@ -528,7 +541,7 @@ export class OrdersService {
                 throw new BadRequestException({ code: ErrorCodes.VOUCHER_USAGE_LIMIT_REACHED, message: 'Voucher has reached its maximum usage limit' });
               }
 
-              await this.validateOrderVoucherAudience(tx, voucher, txUser, userId, dto.role);
+              await this.validateOrderVoucherAudience(tx, voucher, txUser, userId, dto.role, sellerId);
 
               if (voucher.minOrderValue !== null && toSen(dto.orderValue) < voucher.minOrderValue) {
                 throw new BadRequestException({ code: ErrorCodes.VOUCHER_NOT_APPLICABLE, message: 'Order value does not meet the minimum requirement for this voucher' });

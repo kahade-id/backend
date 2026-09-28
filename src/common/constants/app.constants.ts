@@ -31,6 +31,13 @@ export const DELIVERY_DEADLINE_DAYS_MIN = 1;
 // Keep API validation and Prisma storage aligned to avoid a late DB constraint error.
 export const DELIVERY_DEADLINE_DAYS_MAX = 14;
 export const CONFIRMATION_DEADLINE_DAYS = 1;
+/**
+ * Wave 3 P0 (2026-09-28) — batas kirim penjual: order PROCESSING yang belum
+ * dikirim (belum IN_DELIVERY) melewati paidAt + N hari otomatis di-cancel +
+ * refund penuh ke buyer via sweep expire-unshipped-orders (5 menit).
+ * Disimpan ke orders.processingDeadlineAt saat pembayaran sukses.
+ */
+export const PROCESSING_DEADLINE_DAYS = 2;
 export const CONFIRMATION_DEADLINE_DAYS_MAP: Record<string, number> = {
   PRODUCT: 1,
   SERVICE: 2,

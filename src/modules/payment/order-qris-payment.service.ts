@@ -17,10 +17,10 @@ import {
   WalletTransactionType,
 } from '@prisma/client';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { MAX_ESCROW_BALANCE } from '../../common/constants/app.constants';
+import { MAX_ESCROW_BALANCE, PROCESSING_DEADLINE_DAYS } from '../../common/constants/app.constants';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { toIdr, toSen } from '../../common/utils/currency.util';
-import { resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
+import { addDays, resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
 import { generatePaymentTxId, generateWalletTxId } from '../../common/utils/id-generator.util';
 import { PrismaService } from '../../prisma/prisma.service';
 // GAP-C (G176): aktivasi milestone setelah QRIS escrow lock — no-op untuk
@@ -450,14 +450,17 @@ export class OrderQrisPaymentService {
         // dalam transaksi yang sama. No-op untuk order tanpa milestone.
         await activateMilestonesForOrderTx(tx, order.id);
 
+        const paidAt = new Date();
         const orderUpdated = await tx.order.updateMany({
           where: { id: order.id, status: OrderStatus.WAITING_PAYMENT, deletedAt: null }, // AUDIT-16
           data: {
             status: OrderStatus.PROCESSING,
-            paidAt: new Date(),
-            processedAt: new Date(),
+            paidAt,
+            processedAt: paidAt,
             // T3: hormati tanggal eksplisit pilihan user bila masih di masa depan.
             deliveryDeadlineAt: resolveDeliveryDeadlineAt(order.deliveryDeadlineAt, order.deliveryDeadlineDays ?? 3),
+            // Wave 3 P0: batas kirim penjual — dipakai sweep expire-unshipped-orders.
+            processingDeadlineAt: addDays(paidAt, PROCESSING_DEADLINE_DAYS),
           },
         });
         if (orderUpdated.count !== 1) {

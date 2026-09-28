@@ -10,6 +10,7 @@ import { RedisService } from '../../../redis/redis.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
 import { creditCashbackIfEligible } from '../../../common/utils/cashback-credit.util';
 import { OrderStateService } from '../../orders/order-state.service';
+import { UnshippedOrderCancelService } from '../../orders/unshipped-order-cancel.service';
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
@@ -42,6 +43,7 @@ export class AdminOrdersService {
     private auditLog: AuditLogService,
     private redis: RedisService,
     private orderStateService: OrderStateService,
+    private unshippedCancelService: UnshippedOrderCancelService,
     private feeCalculator: FeeCalculatorService,
     private walletTxSerialService: WalletTxSerialService,
     private referralService: ReferralService,
@@ -196,6 +198,48 @@ export class AdminOrdersService {
     await this.dashboard.invalidateSummaryCache();
 
     return { orderId: order.orderId, status: OrderStatus.CANCELLED };
+  }
+
+  /**
+   * Wave 3 P0 (2026-09-28) — SLA fallback manual untuk sweep
+   * expire-unshipped-orders: admin memicu cancel + auto-refund untuk SATU
+   * order yang melewati batas kirim tanpa pengiriman.
+   *
+   * Guard sama persis seperti sweep (status PROCESSING + belum dikirim +
+   * lewat batas kirim + tanpa dispute berjalan) — fail closed. Bukan
+   * force-cancel buta: order yang belum due / sudah dikirim / dispute
+   * ditolak dengan 400.
+   */
+  async cancelUnshipped(orderId: string, adminId: string, dto: ForceActionDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: string; outcome: string; detail?: string }> {
+    const result = await this.unshippedCancelService.cancelUnshippedOrder(
+      orderId,
+      `admin:${adminId}`,
+      dto.reason || 'Admin manual cancel: order melewati batas kirim tanpa pengiriman (SLA fallback)',
+    );
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ORDER_FORCE_CANCEL,
+      targetType: 'Order',
+      targetId: result.orderId,
+      description: `Admin cancel-unshipped order ${result.orderId} (outcome=${result.outcome})`,
+      after: { reason: dto.reason, outcome: result.outcome, detail: result.detail },
+      ipAddress,
+    });
+
+    this.logger.log(`[SECURITY] Admin ${adminId} cancel-unshipped order ${result.orderId}: ${result.outcome}`);
+
+    // AW-018: activeOrders di summary dashboard berubah bila benar ter-cancel.
+    if (result.outcome === 'CANCELLED_REFUNDED') {
+      await this.dashboard.invalidateSummaryCache();
+    }
+
+    return {
+      orderId: result.orderId,
+      status: result.outcome === 'CANCELLED_REFUNDED' ? OrderStatus.CANCELLED : 'UNCHANGED',
+      outcome: result.outcome,
+      detail: result.detail,
+    };
   }
 
   async forceComplete(orderId: string, adminId: string, dto: ForceActionDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: OrderStatus }> {

@@ -588,6 +588,12 @@ export class ChatService implements OnModuleInit {
         // Batch 139 BE-API2 (item 116): flag pin per room — urutan/sort daftar
         // tidak berubah, pin hanya memengaruhi tampilan di klien.
         isPinned: pinnedRoomIds.has(r.room_id),
+        // Wave 3 P0: tandai room "Pesan tersimpan" (initiator = counterpart =
+        // viewer) agar klien/E2E tidak salah membaca sebagai anomali self-pair.
+        isSelf:
+          r.initiator_internal_id != null &&
+          r.initiator_internal_id === userId &&
+          r.counterpart_internal_id === userId,
         initiator: {
           userId: r.initiator_user_id,
           fullName: r.initiator_full_name,

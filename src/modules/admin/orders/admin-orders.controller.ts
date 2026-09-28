@@ -61,6 +61,30 @@ export class AdminOrdersController {
     return this.service.forceCancel(orderId, admin.sub, admin.role, dto, req.ip || 'unknown');
   }
 
+  @Post(':orderId/cancel-unshipped')
+  @Idempotency()
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN')
+  @ApiOperation({
+    summary: 'Cancel unshipped order (SLA fallback)',
+    description:
+      'Wave 3 P0: pemicu manual untuk SATU order yang melewati batas kirim tanpa pengiriman — ' +
+      'cancel + auto-refund penuh ke wallet buyer. Guard sama seperti sweep otomatis ' +
+      '(PROCESSING + belum dikirim + lewat batas kirim + tanpa dispute berjalan); ' +
+      'order yang belum due / sudah dikirim / dalam dispute ditolak (fail closed).',
+  })
+  @ApiResponse({ status: 200, description: 'Cancel-unshipped dieksekusi (lihat outcome).' })
+  @ApiResponse({ status: 400, description: 'Order tidak memenuhi syarat cancel-unshipped.' })
+  @ApiResponse({ status: 404, description: 'Order tidak ditemukan.' })
+  cancelUnshipped(
+    @Param('orderId', ParseIdPipe) orderId: string,
+    @Body() dto: ForceActionDto,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<{ orderId: string; status: string; outcome: string; detail?: string }> {
+    return this.service.cancelUnshipped(orderId, admin.sub, dto, req.ip || 'unknown');
+  }
+
   @Post(':orderId/force-complete')
   @Idempotency()
   @UseGuards(UserThrottleGuard)

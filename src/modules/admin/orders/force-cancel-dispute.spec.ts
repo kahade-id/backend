@@ -22,6 +22,7 @@ function makeService(deps: {
     auditLog as never,
     {} as never, // redis
     orderStateService as never,
+    {} as never, // unshippedCancelService
     {} as never, // feeCalculator
     {} as never, // walletTxSerialService
     {} as never, // referralService

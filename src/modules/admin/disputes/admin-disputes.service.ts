@@ -110,7 +110,7 @@ export class AdminDisputesService {
     throw new Error(`${label}: unreachable`);
   }
 
-  async listDisputes(page = 1, limit = 20, status?: string, search?: string, category?: string): Promise<object> {
+  async listDisputes(page = 1, limit = 20, status?: string, search?: string, category?: string, unassigned?: boolean): Promise<object> {
     // DP-013: 'CANCELLED' bukan nilai enum DisputeStatus — jangan izinkan di filter.
     if (status !== undefined && !['OPEN', 'ASSIGNED', 'UNDER_REVIEW', 'WAITING_RESPONSE', 'ESCALATED', 'RESOLVED'].includes(status)) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid dispute status' });
@@ -124,6 +124,9 @@ export class AdminDisputesService {
     const where: Prisma.DisputeWhereInput = {};
     if (status) where.status = status as Prisma.EnumDisputeStatusFilter;
     if (category) where.category = category as DisputeCategory;
+    // AW-001 (perf-fix): filter server-side "belum ditugaskan" — dipakai admin
+    // sebagai pengganti fetch-all + filter client-side.
+    if (unassigned === true) where.assignedAdminId = null;
     const normalizedSearch = search?.trim();
     if (normalizedSearch) {
       where.OR = [

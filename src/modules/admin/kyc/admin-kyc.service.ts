@@ -1330,13 +1330,7 @@ export class AdminKycService {
     return { resumed: true, kycRequestId: request.id, pausedAccumMs: accumMs };
   }
 
-  /** nearest-rank percentile dari array yang sudah terurut. */
-  private percentile(sorted: number[], p: number): number | null {
-    if (sorted.length === 0) return null;
-    const rank = Math.ceil((p / 100) * sorted.length);
-    return sorted[Math.min(sorted.length - 1, Math.max(0, rank - 1))];
-  }
-
+  /** Pembulatan 2 desimal untuk metrik. */
   private round2(n: number | null): number | null {
     return n === null ? null : Math.round(n * 100) / 100;
   }
@@ -1355,38 +1349,50 @@ export class AdminKycService {
       });
     }
 
-    const reviewed = await this.prisma.kycRequest.findMany({
-      where: {
-        reviewedAt: { gte: fromDate, lte: toDate },
-        status: { in: ['APPROVED', 'REJECTED', 'REVOKED'] },
-      },
-      select: { status: true, reviewedAt: true, slaStartedAt: true, createdAt: true },
-      orderBy: { reviewedAt: 'asc' },
-      take: 5000,
-    });
-
-    const byStatus = new Map<string, number[]>();
-    for (const r of reviewed) {
-      if (!r.reviewedAt) continue;
-      const start = r.slaStartedAt ?? r.createdAt;
-      const hours = (r.reviewedAt.getTime() - start.getTime()) / 3_600_000;
-      if (hours < 0) continue;
-      const arr = byStatus.get(r.status) ?? [];
-      arr.push(hours);
-      byStatus.set(r.status, arr);
-    }
+    // AW-005 (perf-fix): agregat + persentil dihitung di SQL via
+    // percentile_cont — tidak lagi menarik hingga 5000 baris ke memori Node.
+    // Baris berdurasi negatif (reviewedAt < start) dikecualikan, paritas
+    // dengan logika lama. Kolom fisik: "reviewedAt"/"createdAt" camelCase,
+    // "sla_started_at" via @map.
+    const metricRows = await this.prisma.$queryRaw<
+      Array<{
+        status: string;
+        count: bigint;
+        p50: number | null;
+        p95: number | null;
+        avg: number | null;
+        min: number | null;
+        max: number | null;
+      }>
+    >`
+      SELECT status,
+             COUNT(*) AS "count",
+             percentile_cont(0.5) WITHIN GROUP (ORDER BY hours) AS "p50",
+             percentile_cont(0.95) WITHIN GROUP (ORDER BY hours) AS "p95",
+             AVG(hours) AS "avg",
+             MIN(hours) AS "min",
+             MAX(hours) AS "max"
+      FROM (
+        SELECT status,
+               EXTRACT(EPOCH FROM ("reviewedAt" - COALESCE("sla_started_at", "createdAt"))) / 3600.0 AS hours
+        FROM "kyc_requests"
+        WHERE "reviewedAt" >= ${fromDate}
+          AND "reviewedAt" <= ${toDate}
+          AND status IN ('APPROVED', 'REJECTED', 'REVOKED')
+          AND "reviewedAt" >= COALESCE("sla_started_at", "createdAt")
+      ) AS t
+      GROUP BY status
+    `;
 
     const reviewTimeHours: Record<string, unknown> = {};
-    for (const [status, arr] of byStatus) {
-      arr.sort((a, b) => a - b);
-      const sum = arr.reduce((s, v) => s + v, 0);
-      reviewTimeHours[status] = {
-        count: arr.length,
-        p50: this.round2(this.percentile(arr, 50)),
-        p95: this.round2(this.percentile(arr, 95)),
-        avg: this.round2(sum / arr.length),
-        min: this.round2(arr[0] ?? null),
-        max: this.round2(arr[arr.length - 1] ?? null),
+    for (const r of metricRows) {
+      reviewTimeHours[r.status] = {
+        count: Number(r.count),
+        p50: this.round2(r.p50),
+        p95: this.round2(r.p95),
+        avg: this.round2(r.avg),
+        min: this.round2(r.min),
+        max: this.round2(r.max),
       };
     }
 

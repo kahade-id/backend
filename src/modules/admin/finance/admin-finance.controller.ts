@@ -48,6 +48,18 @@ export class AdminFinanceController {
     return this.service.listTransactions(query);
   }
 
+  // AW-002 (perf-fix): agregat server-side untuk halaman Keuangan — DIDAFTARKAN
+  // SEBELUM 'transactions/:txId' agar 'summary' tidak ditangkap sebagai :txId.
+  @Get('transactions/summary')
+  @ApiOperation({
+    summary: 'Transaction aggregate (masuk/keluar)',
+    description: 'AW-002: server-side SUM of wallet transaction amounts grouped by flow direction (masuk/keluar), using the SAME filters as the list endpoint (type, status, date range, search). No row fetching, no limit clamp — the numbers are exact. Fail-closed: errors are thrown, never silently wrong numbers.',
+  })
+  @ApiResponse({ status: 200, description: 'Aggregate returned: { masuk, keluar, bersih, count }.' })
+  getTransactionsSummary(@Query() query: FinanceTransactionQueryDto): Promise<object> {
+    return this.service.getTransactionsAggregate(query);
+  }
+
   @Get('transactions/:txId')
   @ApiOperation({ summary: 'Get transaction detail', description: 'Returns full transaction detail including wallet owner and related entities.' })
   @ApiResponse({ status: 200, description: 'Transaction detail returned.' })

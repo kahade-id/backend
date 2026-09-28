@@ -44,6 +44,24 @@ describe('AdminDisputesService round-two boundaries', () => {
     expect(where.OR[1].order.orderId.contains).toBe('ORD-123');
   });
 
+  it('AW-001: unassigned=true memfilter assignedAdminId IS NULL di SQL (tanpa filter client-side)', async () => {
+    prisma.dispute.findMany.mockResolvedValue([]);
+    prisma.dispute.count.mockResolvedValue(0);
+    await service.listDisputes(1, 20, undefined, undefined, undefined, true);
+    const findManyWhere = prisma.dispute.findMany.mock.calls[0][0].where;
+    const countWhere = prisma.dispute.count.mock.calls[0][0].where;
+    expect(findManyWhere.assignedAdminId).toBeNull();
+    expect(countWhere.assignedAdminId).toBeNull();
+  });
+
+  it('AW-001: tanpa unassigned, filter assignedAdminId TIDAK ditambahkan', async () => {
+    prisma.dispute.findMany.mockResolvedValue([]);
+    prisma.dispute.count.mockResolvedValue(0);
+    await service.listDisputes(1, 20, undefined, undefined, undefined, false);
+    const where = prisma.dispute.findMany.mock.calls[0][0].where;
+    expect(where).not.toHaveProperty('assignedAdminId');
+  });
+
   it('rejects an inactive or otherwise ineligible target admin before writing assignment', async () => {
     prisma.dispute.findFirst.mockResolvedValue({ id: 'disp-1', disputeId: 'D-1', status: 'OPEN' });
     prisma.adminUser.findUnique.mockResolvedValue({ role: 'SUPER_ADMIN' });

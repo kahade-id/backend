@@ -13,7 +13,7 @@ describe('AdminManagementService — GAP-E admin ops', () => {
   const prisma = {
     adminUser: { findFirst: jest.fn(), update: jest.fn(), count: jest.fn() },
     adminSession: { findMany: jest.fn(), findFirst: jest.fn(), update: jest.fn() },
-    emergencyAccessGrant: { findFirst: jest.fn(), findMany: jest.fn(), create: jest.fn(), update: jest.fn() },
+    emergencyAccessGrant: { findFirst: jest.fn(), findMany: jest.fn(), create: jest.fn(), update: jest.fn(), count: jest.fn() },
   };
   const auditLog = { logAdminAction: jest.fn() };
   const redis = { setex: jest.fn().mockResolvedValue(undefined), get: jest.fn() };
@@ -125,11 +125,24 @@ describe('AdminManagementService — GAP-E admin ops', () => {
     prisma.emergencyAccessGrant.findMany.mockResolvedValue([
       { id: 'g1', revokedAt: new Date(), admin: { id: 'a1' } },
     ]);
-    const result = (await service.listEmergencyGrants(false)) as { data: unknown[]; total: number };
+    prisma.emergencyAccessGrant.count.mockResolvedValue(1);
+    const result = (await service.listEmergencyGrants(false)) as { data: unknown[]; total: number; hasMore: boolean };
     expect(prisma.emergencyAccessGrant.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: {} }),
+      expect.objectContaining({ where: {}, take: 500 }),
     );
     expect(result.total).toBe(1);
+    expect(result.hasMore).toBe(false);
+  });
+
+  it('AW-004: listEmergencyGrants membatasi findMany (take 500) dan total jujur via count', async () => {
+    prisma.emergencyAccessGrant.findMany.mockResolvedValue(new Array(500).fill({ id: 'g' }));
+    prisma.emergencyAccessGrant.count.mockResolvedValue(1200);
+    const result = (await service.listEmergencyGrants(false)) as { data: unknown[]; total: number; hasMore: boolean };
+    expect(prisma.emergencyAccessGrant.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 500 }),
+    );
+    expect(result.total).toBe(1200);
+    expect(result.hasMore).toBe(true);
   });
 
   it('listEmergencyGrants(true) memfilter hanya yang aktif', async () => {

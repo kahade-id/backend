@@ -205,6 +205,75 @@ function toNumber(value: bigint | null): number | null {
   return value === null || value === undefined ? null : Number(value);
 }
 
+// ============================================================================
+// NP-008 (perf-fix, 2026-09-29): keyset cursor untuk LIST DALAM (likers,
+// savers, saved, comments). Offset (`skip` besar) memaksa Postgres memindai +
+// membuang baris — makin dalam halaman makin lambat. Kursor opak =
+// base64url(JSON { t: epochMs, i: id }) dengan keyset WHERE pada urutan
+// (createdAt, id) — tiebreak id ganda menjaga stabilitas walau ada baris
+// baru di tengah paginasi. Kompatibel mundur: tanpa `cursor`, perilaku
+// offset lama tetap dipakai.
+// ============================================================================
+
+type NestedListDirection = 'desc' | 'asc';
+
+interface NestedCursor {
+  t: number;
+  i: string;
+}
+
+function encodeNestedCursor(createdAt: Date, id: string): string {
+  return Buffer.from(JSON.stringify({ t: createdAt.getTime(), i: id }), 'utf8').toString('base64url');
+}
+
+function decodeNestedCursor(cursor: string): NestedCursor {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+  } catch {
+    parsed = null;
+  }
+  const p = parsed as { t?: unknown; i?: unknown } | null;
+  if (
+    !p ||
+    typeof p.t !== 'number' ||
+    !Number.isFinite(p.t) ||
+    typeof p.i !== 'string' ||
+    p.i.length === 0 ||
+    p.i.length > 64
+  ) {
+    throw new BadRequestException({ code: ErrorCodes.INVALID_CURSOR, message: 'Invalid pagination cursor' });
+  }
+  return { t: p.t, i: p.i };
+}
+
+/**
+ * Kondisi keyset WHERE untuk urutan (createdAt, id). `direction` harus
+ * mencerminkan orderBy query pemanggil — desc: baris SETELAH kursor =
+ * (createdAt < t) ATAU (createdAt = t DAN id < i); asc sebaliknya.
+ */
+function nestedKeysetWhere(cursor: NestedCursor, direction: NestedListDirection): object {
+  const op = direction === 'desc' ? 'lt' : 'gt';
+  const at = new Date(cursor.t);
+  return {
+    OR: [{ createdAt: { [op]: at } }, { createdAt: at, id: { [op]: cursor.i } }],
+  };
+}
+
+// NP-008: diekspor murni untuk unit test (tidak dipakai modul lain).
+export const __cursorTestHooks = { encodeNestedCursor, decodeNestedCursor, nestedKeysetWhere };
+
+// NP-007: hook test untuk kontrak feed — `serializeShowcase` tidak memakai
+// `this`, jadi bisa dipanggil lewat prototype tanpa DI.
+export function __serializeForTest(
+  row: Record<string, unknown>,
+  options: { excerpt?: boolean; isOwner?: boolean } = {},
+): Record<string, unknown> {
+  return (ShowcaseService.prototype as unknown as {
+    serializeShowcase: (r: unknown, o: unknown) => Record<string, unknown>;
+  }).serializeShowcase(row, options);
+}
+
 /** Profil afinitas viewer untuk sort "foryou" (tab "Untuk Anda"). */
 interface ForYouSignals {
   /** kategori (lowercase) → jumlah item yang di-like viewer di kategori itu. */
@@ -496,16 +565,24 @@ export class ShowcaseService {
       // frontend wajib mensanitasi sebelum render).
       descriptionHtml: options.excerpt ? null : (row.descriptionHtml ?? null),
       category: row.category,
-      visibility: row.visibility,
-      isActive: row.isActive,
-      sortOrder: row.sortOrder,
+      // NP-007 (perf-fix, 2026-09-29): field manajemen pemilik (visibility,
+      // isActive, sortOrder item, updatedAt) TIDAK dikirim di feed (excerpt) —
+      // kartu publik tidak memakainya; hanya ada di detail/owner response.
+      // Alias deprecated `imageUrl` (= coverImageUrl) DIHAPUS — satu sumber
+      // kebenaran gambar: `images[]` + `coverImageUrl`. Client lama yang masih
+      // membaca `imageUrl` top-level harus migrasi ke `coverImageUrl`.
+      ...(options.excerpt
+        ? {}
+        : {
+            visibility: row.visibility,
+            isActive: row.isActive,
+            sortOrder: row.sortOrder,
+            updatedAt: row.updatedAt,
+          }),
       // Batch 19 TIM A (item 6): kondisi barang (BARU/BEKAS/null).
       condition: row.condition ?? null,
       images,
       coverImageUrl,
-      // Alias deprecated: kolom tunggal `imageUrl` sudah diganti ShowcaseImage.
-      // Dipertahankan supaya client lama tidak putus selama migrasi.
-      imageUrl: coverImageUrl,
       priceMin,
       priceMax,
       // Batch 43 commerce (item 1 & 10): tipe produk + harga coret diserialkan
@@ -532,7 +609,8 @@ export class ShowcaseService {
       isSaved: Boolean(options.isSaved),
       isOwner: Boolean(options.isOwner),
       createdAt: row.createdAt,
-      updatedAt: row.updatedAt,
+      // NP-007: updatedAt juga field manajemen — hanya di detail/owner.
+      ...(options.excerpt ? {} : { updatedAt: row.updatedAt }),
       author: {
         userId: row.user.userId,
         username: row.user.username,
@@ -2093,6 +2171,7 @@ export class ShowcaseService {
     viewerId: string | undefined,
     page: number,
     limit: number,
+    cursor?: string,
   ): Promise<object> {
     const visible = await this.findVisibleShowcase(showcaseId, viewerId);
     if (!visible) {
@@ -2100,28 +2179,49 @@ export class ShowcaseService {
     }
     const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 100) : 20;
-    const skip = (safePage - 1) * safeLimit;
+    // NP-008 (perf-fix): keyset cursor bila diminta — tanpa `skip` besar.
+    // Tanpa cursor: perilaku offset lama (kompatibel mundur).
+    const decoded = cursor ? decodeNestedCursor(cursor) : null;
+    const baseWhere = { showcaseId };
+    const where = decoded ? { ...baseWhere, ...nestedKeysetWhere(decoded, 'desc') } : baseWhere;
+    const take = decoded ? safeLimit + 1 : safeLimit;
     const [rows, total] = await Promise.all([
       this.prisma.showcaseLike.findMany({
-        where: { showcaseId },
+        where,
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        skip,
-        take: safeLimit,
+        ...(decoded ? {} : { skip: (safePage - 1) * safeLimit }),
+        take,
         select: {
+          id: true,
           createdAt: true,
           user: { select: { id: true, userId: true, username: true, fullName: true, avatarUrl: true } },
         },
       }),
-      this.prisma.showcaseLike.count({ where: { showcaseId } }),
+      this.prisma.showcaseLike.count({ where: baseWhere }),
     ]);
-    const data = rows.map((row) => ({
+    const pageRows = decoded && rows.length > safeLimit ? rows.slice(0, safeLimit) : rows;
+    const hasMore = decoded
+      ? rows.length > safeLimit
+      : safePage * safeLimit < total;
+    const nextCursor =
+      hasMore && pageRows.length > 0
+        ? encodeNestedCursor(pageRows[pageRows.length - 1].createdAt, pageRows[pageRows.length - 1].id)
+        : null;
+    const data = pageRows.map((row) => ({
       userId: row.user.userId,
       username: row.user.username,
       fullName: row.user.fullName,
       avatarUrl: row.user.avatarUrl,
       likedAt: row.createdAt,
     }));
-    return createPaginatedResponse(data, total, safePage, safeLimit);
+    return {
+      ...createPaginatedResponse(data, total, safePage, safeLimit),
+      // NP-008: `hasNext` dikoreksi untuk mode cursor (page selalu 1 di
+      // mode itu); `nextCursor` selalu dikembalikan bila ada lanjutan —
+      // client boleh mulai dari offset lalu beralih ke cursor.
+      hasNext: hasMore,
+      nextCursor,
+    };
   }
 
   /**
@@ -2135,6 +2235,7 @@ export class ShowcaseService {
     showcaseId: string,
     page: number,
     limit: number,
+    cursor?: string,
   ): Promise<object> {
     const item = await this.prisma.userShowcase.findFirst({
       where: { id: showcaseId, deletedAt: null },
@@ -2151,28 +2252,45 @@ export class ShowcaseService {
     }
     const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 100) : 20;
-    const skip = (safePage - 1) * safeLimit;
+    // NP-008 (perf-fix): keyset cursor bila diminta — tanpa `skip` besar.
+    const decoded = cursor ? decodeNestedCursor(cursor) : null;
+    const baseWhere = { showcaseId };
+    const where = decoded ? { ...baseWhere, ...nestedKeysetWhere(decoded, 'desc') } : baseWhere;
+    const take = decoded ? safeLimit + 1 : safeLimit;
     const [rows, total] = await Promise.all([
       this.prisma.showcaseSave.findMany({
-        where: { showcaseId },
+        where,
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        skip,
-        take: safeLimit,
+        ...(decoded ? {} : { skip: (safePage - 1) * safeLimit }),
+        take,
         select: {
+          id: true,
           createdAt: true,
           user: { select: { id: true, userId: true, username: true, fullName: true, avatarUrl: true } },
         },
       }),
-      this.prisma.showcaseSave.count({ where: { showcaseId } }),
+      this.prisma.showcaseSave.count({ where: baseWhere }),
     ]);
-    const data = rows.map((row) => ({
+    const pageRows = decoded && rows.length > safeLimit ? rows.slice(0, safeLimit) : rows;
+    const hasMore = decoded
+      ? rows.length > safeLimit
+      : safePage * safeLimit < total;
+    const nextCursor =
+      hasMore && pageRows.length > 0
+        ? encodeNestedCursor(pageRows[pageRows.length - 1].createdAt, pageRows[pageRows.length - 1].id)
+        : null;
+    const data = pageRows.map((row) => ({
       userId: row.user.userId,
       username: row.user.username,
       fullName: row.user.fullName,
       avatarUrl: row.user.avatarUrl,
       savedAt: row.createdAt,
     }));
-    return createPaginatedResponse(data, total, safePage, safeLimit);
+    return {
+      ...createPaginatedResponse(data, total, safePage, safeLimit),
+      hasNext: hasMore,
+      nextCursor,
+    };
   }
 
   /**
@@ -2192,21 +2310,34 @@ export class ShowcaseService {
     userId: string,
     page: number,
     limit: number,
+    cursor?: string,
   ): Promise<object> {
     const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 100) : 20;
-    const skip = (safePage - 1) * safeLimit;
+    // NP-008 (perf-fix): keyset cursor bila diminta — tanpa `skip` besar.
+    const decoded = cursor ? decodeNestedCursor(cursor) : null;
+    const baseWhere = { userId };
+    const where = decoded ? { ...baseWhere, ...nestedKeysetWhere(decoded, 'desc') } : baseWhere;
+    const take = decoded ? safeLimit + 1 : safeLimit;
     const [rows, total] = await Promise.all([
       this.prisma.showcaseSave.findMany({
-        where: { userId },
+        where,
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        skip,
-        take: safeLimit,
+        ...(decoded ? {} : { skip: (safePage - 1) * safeLimit }),
+        take,
         include: { showcase: { include: SHOWCASE_INCLUDE } },
       }),
-      this.prisma.showcaseSave.count({ where: { userId } }),
+      this.prisma.showcaseSave.count({ where: baseWhere }),
     ]);
-    const showcaseRows = rows.map((row) => row.showcase) as unknown as ShowcaseRow[];
+    const pageRows = decoded && rows.length > safeLimit ? rows.slice(0, safeLimit) : rows;
+    const hasMore = decoded
+      ? rows.length > safeLimit
+      : safePage * safeLimit < total;
+    const nextCursor =
+      hasMore && pageRows.length > 0
+        ? encodeNestedCursor(pageRows[pageRows.length - 1].createdAt, pageRows[pageRows.length - 1].id)
+        : null;
+    const showcaseRows = pageRows.map((row) => row.showcase) as unknown as ShowcaseRow[];
     const likedIds = await this.getLikedShowcaseIds(userId, showcaseRows.map((row) => row.id));
     const badgeMap = await this.getAuthorBadgeMap(showcaseRows.map((row) => row.user.id));
     const items = showcaseRows.map((item, index) => ({
@@ -2216,9 +2347,13 @@ export class ShowcaseService {
         isOwner: item.user.id === userId,
         authorBadges: badgeMap.get(item.user.id) ?? [],
       }),
-      savedAt: rows[index].createdAt,
+      savedAt: pageRows[index].createdAt,
     }));
-    return createPaginatedResponse(items, total, safePage, safeLimit);
+    return {
+      ...createPaginatedResponse(items, total, safePage, safeLimit),
+      hasNext: hasMore,
+      nextCursor,
+    };
   }
 
 
@@ -2229,12 +2364,13 @@ export class ShowcaseService {
   /**
    * Daftar komentar ber-nesting (root + balasan satu tingkat).
    *
-   * Offset pagination di sini aman karena daftar komentar satu item tidak
-   * di-infinite-scroll lintas filter; tiebreak { id } menjaga halaman stabil.
-   * Komentar tersembunyi disaring, kecuali untuk pemilik showcase yang memang
-   * perlu melihat apa yang ia sembunyikan.
+   * NP-008 (perf-fix): mendukung keyset cursor (`?cursor=`) — tanpa `skip`
+   * besar. Tanpa cursor, offset lama tetap dipakai (kompatibel mundur);
+   * tiebreak { id } menjaga halaman stabil. Komentar tersembunyi disaring,
+   * kecuali untuk pemilik showcase yang memang perlu melihat apa yang ia
+   * sembunyikan.
    */
-  async listComments(showcaseId: string, viewerId: string | undefined, page: number, limit: number, sort: 'newest' | 'oldest' = 'newest'): Promise<object> {
+  async listComments(showcaseId: string, viewerId: string | undefined, page: number, limit: number, sort: 'newest' | 'oldest' = 'newest', cursor?: string): Promise<object> {
     const visible = await this.findVisibleShowcase(showcaseId, viewerId);
     if (!visible) {
       throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
@@ -2242,7 +2378,6 @@ export class ShowcaseService {
 
     const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 50) : 20;
-    const skip = (safePage - 1) * safeLimit;
     // Batch 139 BE-API1 (item 103): urutan komentar root bisa dipilih —
     // `newest` (default, perilaku lama) atau `oldest`. Balasan di dalam tiap
     // thread TETAP kronologis menaik (percakapan dibaca dari atas).
@@ -2258,25 +2393,41 @@ export class ShowcaseService {
       profileVisible: true,
       ...(excludedIds.length > 0 ? { id: { notIn: excludedIds } } : {}),
     };
-    const where: Prisma.ShowcaseCommentWhereInput = {
+    const baseWhere: Prisma.ShowcaseCommentWhereInput = {
       showcaseId,
       parentId: null,
       user: authorFilter,
       ...(visible.isOwner ? {} : { isHidden: false }),
     };
+    // NP-008 (perf-fix): keyset cursor bila diminta — tanpa `skip` besar.
+    // Arah keyset mengikuti rootOrder (newest=desc, oldest=asc).
+    const decoded = cursor ? decodeNestedCursor(cursor) : null;
+    const where: Prisma.ShowcaseCommentWhereInput = decoded
+      ? { ...baseWhere, ...nestedKeysetWhere(decoded, rootOrder) }
+      : baseWhere;
+    const take = decoded ? safeLimit + 1 : safeLimit;
 
-    const [roots, total] = await Promise.all([
+    const [rootRows, total] = await Promise.all([
       this.prisma.showcaseComment
         .findMany({
           where,
           orderBy: [{ createdAt: rootOrder }, { id: rootOrder }],
-          skip,
-          take: safeLimit,
+          ...(decoded ? {} : { skip: (safePage - 1) * safeLimit }),
+          take,
           include: COMMENT_INCLUDE,
         })
         .then((rows) => rows as unknown as CommentRow[]),
-      this.prisma.showcaseComment.count({ where }),
+      this.prisma.showcaseComment.count({ where: baseWhere }),
     ]);
+    // NP-008: potong baris probe (+1) di mode cursor.
+    const roots = decoded && rootRows.length > safeLimit ? rootRows.slice(0, safeLimit) : rootRows;
+    const hasMore = decoded
+      ? rootRows.length > safeLimit
+      : safePage * safeLimit < total;
+    const nextCursor =
+      hasMore && roots.length > 0
+        ? encodeNestedCursor(roots[roots.length - 1].createdAt, roots[roots.length - 1].id)
+        : null;
 
     // S-3: Balasan diambil per root dengan batas SHOWCASE_REPLY_LIMIT supaya satu
     // root viral tidak menghasilkan response raksasa. replyCount total tiap root
@@ -2344,8 +2495,12 @@ export class ShowcaseService {
       page: safePage,
       limit: safeLimit,
       totalPages,
-      hasNext: safePage < totalPages,
-      hasPrev: safePage > 1,
+      // NP-008: `hasNext` dikoreksi untuk mode cursor (page selalu 1 di mode
+      // itu); `nextCursor` selalu dikembalikan bila ada lanjutan.
+      hasNext: hasMore,
+      // NP-008: paginasi cursor hanya maju — hasPrev false di mode cursor.
+      hasPrev: decoded ? false : safePage > 1,
+      nextCursor,
       // Batch 139 BE-API1 (item 103): gema sort yang dipakai (additive).
       sort: sort === 'oldest' ? 'oldest' : 'newest',
     };

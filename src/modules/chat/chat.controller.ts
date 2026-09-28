@@ -51,6 +51,22 @@ export class ChatController {
     private uploadService: UploadService,
   ) {}
 
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @Get('unread-count')
+  @ApiOperation({
+    summary: 'Total unread chat messages for current user (lightweight badge)',
+    description:
+      'NS-006 (perf-fix): SATU angka agregat dari counter `chat_room_members.unreadCount` ' +
+      '(lihat BD-004) — bukan daftar room penuh. Pengganti ringan pemakaian ' +
+      '`GET /v1/chat/rooms?limit=50` tiap 60 detik hanya untuk badge tab Pesan. ' +
+      'Additive-only: endpoint baru, tidak mengubah endpoint lain.',
+  })
+  async getUnreadCount(
+    @CurrentUser('sub') userId: string,
+  ): Promise<{ unreadCount: number }> {
+    return this.chatService.getTotalUnreadCount(userId);
+  }
+
   @Get('rooms')
   @ApiOperation({
     summary: 'List chat rooms for current user',

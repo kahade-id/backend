@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Body, Query, UseInterceptors, UploadedFile, BadRequestException, ForbiddenException, GoneException, HttpCode, UseGuards, StreamableFile, Header } from '@nestjs/common';
+import { Controller, Post, Get, Body, Query, Param, ParseIntPipe, UseInterceptors, UploadedFile, BadRequestException, ForbiddenException, GoneException, HttpCode, UseGuards, StreamableFile, Header } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiBearerAuth, ApiOperation, ApiConsumes, ApiBody } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
@@ -18,6 +18,8 @@ interface MulterFile {
   buffer: Buffer;
 }
 import { UploadService, DirectUploadResult } from './upload.service';
+import { ChunkedUploadService, ChunkedInitResult, ChunkStatusResult } from './chunked-upload.service';
+import { InitChunkedUploadDto } from './dto/chunked-upload.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { PresignedUrlDto, UploadPurpose } from './dto/presigned-url.dto';
 import { ConfirmUploadDto } from './dto/confirm-upload.dto';
@@ -36,7 +38,10 @@ class CleanupFilesDto {
 @UseGuards(PhoneVerifiedGuard)
 @Controller('upload')
 export class UploadController {
-  constructor(private uploadService: UploadService) {}
+  constructor(
+    private uploadService: UploadService,
+    private chunkedUploadService: ChunkedUploadService,
+  ) {}
 
   @UseGuards(UserThrottleGuard)
   @Post('presigned-url')
@@ -129,6 +134,89 @@ export class UploadController {
     @Body() dto: CleanupFilesDto,
   ): Promise<{ deleted: number; errors: { fileKey: string; reason: string }[] }> {
     return this.uploadService.cleanupFileKeys(userId, dto.fileKeys);
+  }
+
+  // ── NP-006 (perf-fix, 2026-09-29): upload chunked/resumable ──
+  // Protokol 4 langkah untuk file besar (video showcase s/d 100 MiB):
+  // init → chunk* → status (resume) → complete. Gagal di tengah = lanjutkan
+  // dari chunk terakhir yang diterima, BUKAN dari nol. Additive-only:
+  // endpoint baru; `POST /v1/upload/direct` tidak berubah.
+
+  @UseGuards(UserThrottleGuard)
+  @Post('chunked/init')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Start a resumable chunked upload session',
+    description:
+      'NP-006: validasi purpose/batas ukuran/MIME di awal (gagal cepat). ' +
+      'Mengembalikan sessionId + chunkSize/totalChunks yang disepakati server. ' +
+      'Sesi kedaluwarsa 24 jam.',
+  })
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  async initChunkedUpload(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: InitChunkedUploadDto,
+  ): Promise<ChunkedInitResult> {
+    return this.chunkedUploadService.initiate(userId, dto);
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Post('chunked/:sessionId/chunk')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Upload one chunk of a resumable session',
+    description:
+      'NP-006: multipart `chunk` (biner) + field `chunkIndex`. Idempoten — ' +
+      'kirim ulang chunk yang sama (byte identik) mengembalikan 200.',
+  })
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(FileInterceptor('chunk', { limits: { fileSize: 8 * 1024 * 1024 + 64 * 1024 } }))
+  @Throttle({ default: { ttl: 60000, limit: 120 } })
+  async uploadChunk(
+    @CurrentUser('sub') userId: string,
+    @Param('sessionId') sessionId: string,
+    @Body('chunkIndex', ParseIntPipe) chunkIndex: number,
+    @UploadedFile() file: MulterFile,
+  ): Promise<ChunkStatusResult> {
+    if (!file) {
+      throw new BadRequestException({ code: 'VALIDATION_ERROR', message: 'Chunk file is required' });
+    }
+    return this.chunkedUploadService.uploadChunk(userId, sessionId, chunkIndex, {
+      buffer: file.buffer,
+      size: file.size,
+    });
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Get('chunked/:sessionId/status')
+  @ApiOperation({
+    summary: 'List received chunks of a session (for resume)',
+    description: 'NP-006: client memakai `received` untuk mengirim HANYA chunk yang hilang.',
+  })
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  async chunkedStatus(
+    @CurrentUser('sub') userId: string,
+    @Param('sessionId') sessionId: string,
+  ): Promise<ChunkStatusResult> {
+    return this.chunkedUploadService.status(userId, sessionId);
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Post('chunked/:sessionId/complete')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Assemble chunks and run the normal upload pipeline',
+    description:
+      'NP-006: merakit chunk terurut lalu memanggil pipeline `uploadDirect` ' +
+      'yang SAMA (validasi magic-byte, batas purpose, thumbnail ffmpeg). ' +
+      'Semua chunk harus sudah diterima.',
+  })
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  async completeChunkedUpload(
+    @CurrentUser('sub') userId: string,
+    @Param('sessionId') sessionId: string,
+  ): Promise<DirectUploadResult> {
+    return this.chunkedUploadService.complete(userId, sessionId);
   }
 
   // ── Batch 1A (ST-002/ST-006/03-#1): download file privat ──

@@ -629,7 +629,7 @@ describe('Audit fixes — SH-S-004 downloadOwnFile validates key shape first', (
     // Instansiasi langsung: method yang diuji tidak memakai guard/DI lain
     // (@UseGuards(PhoneVerifiedGuard) di level class butuh PrismaService —
     // tidak relevan untuk unit test validasi key ini).
-    controller = new UploadController(mockUploadService);
+    controller = new UploadController(mockUploadService, {} as never);
   });
 
   it('rejects a traversal key with controlled 400 (VALIDATION_ERROR), not a crash', async () => {

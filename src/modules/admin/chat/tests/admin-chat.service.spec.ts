@@ -12,6 +12,9 @@ const mockPrisma = {
     groupBy: jest.fn(),
     update: jest.fn(),
   },
+  chatMessage: {
+    findUnique: jest.fn(),
+  },
 };
 
 const mockAuditLog = { logAdminAction: jest.fn() };
@@ -166,5 +169,82 @@ describe('AdminChatService — moderation queue', () => {
 
     expect(result.total).toBe(3);
     expect(result.circumventionCount).toBe(2);
+  });
+
+  describe('H1 — privasi DM: admin tidak boleh baca isi DM privat (INQUIRY)', () => {
+    const baseEvent = {
+      id: 'cme-1',
+      eventId: 'CME-1',
+      kind: 'PROFANITY',
+      severity: 'LOW',
+      action: 'FLAGGED',
+      matchers: ['badword'],
+      snippet: 'ini cuplikan isi pesan rahasia user',
+      status: 'PENDING',
+      createdAt: new Date(),
+      user: { userId: 'u1', fullName: 'User Satu', username: 'user1', flaggedForReview: false },
+    };
+    const baseMessage = {
+      id: 'm1',
+      content: 'isi pesan DM privat yang sangat rahasia',
+      messageType: 'TEXT',
+      isDeleted: false,
+      isEdited: false,
+      createdAt: new Date(),
+    };
+
+    it('LIST: snippet di-null-kan untuk room INQUIRY', async () => {
+      mockPrisma.chatModerationEvent.findMany.mockResolvedValue([
+        { ...baseEvent, room: { id: 'r1', type: 'INQUIRY', order: null } },
+        { ...baseEvent, id: 'cme-2', room: { id: 'r2', type: 'ORDER', order: null } },
+      ]);
+      mockPrisma.chatModerationEvent.count.mockResolvedValue(2);
+
+      const result = (await service.listModerationEvents({ page: 1, limit: 20 })) as {
+        data: Array<{ id: string; snippet: string | null }>;
+      };
+
+      expect(result.data[0].snippet).toBeNull();
+      expect(result.data[1].snippet).toBe('ini cuplikan isi pesan rahasia user');
+    });
+
+    it('DETAIL: INQUIRY hanya mengembalikan metadata (tanpa snippet & content)', async () => {
+      mockPrisma.chatModerationEvent.findFirst.mockResolvedValue({
+        ...baseEvent,
+        messageId: 'm1',
+        room: { id: 'r1', type: 'INQUIRY', subject: null, initiatorId: 'u1', counterpartId: 'u2', order: null },
+      });
+      mockPrisma.chatMessage.findUnique.mockResolvedValue(baseMessage);
+
+      const result = (await service.getModerationEventDetail('CME-1')) as {
+        snippet: string | null;
+        message: { content: string | null; messageType: string } | null;
+        room: { type: string };
+      };
+
+      expect(result.snippet).toBeNull();
+      expect(result.message).not.toBeNull();
+      expect(result.message!.content).toBeNull();
+      // Metadata tetap ada untuk keperluan moderasi.
+      expect(result.message!.messageType).toBe('TEXT');
+      expect(result.room.type).toBe('INQUIRY');
+    });
+
+    it('DETAIL: ORDER tetap menampilkan snippet & content (dispute)', async () => {
+      mockPrisma.chatModerationEvent.findFirst.mockResolvedValue({
+        ...baseEvent,
+        messageId: 'm1',
+        room: { id: 'r2', type: 'ORDER', subject: null, initiatorId: 'u1', counterpartId: 'u2', order: null },
+      });
+      mockPrisma.chatMessage.findUnique.mockResolvedValue(baseMessage);
+
+      const result = (await service.getModerationEventDetail('CME-1')) as {
+        snippet: string | null;
+        message: { content: string | null } | null;
+      };
+
+      expect(result.snippet).toBe('ini cuplikan isi pesan rahasia user');
+      expect(result.message!.content).toBe('isi pesan DM privat yang sangat rahasia');
+    });
   });
 });

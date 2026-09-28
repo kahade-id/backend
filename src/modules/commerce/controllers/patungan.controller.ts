@@ -2,7 +2,7 @@ import { Controller, Get, Post, Body, Param, Query, HttpCode } from '@nestjs/com
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { PatunganService } from '../services/patungan.service';
-import { CreatePatunganGroupDto, JoinPatunganDto } from '../dto/commerce.dto';
+import { CreatePatunganGroupDto, JoinPatunganDto, LinkPatunganOrderDto } from '../dto/commerce.dto';
 import { CurrentUser } from '../../../common/decorators/current-user.decorator';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
 import { PatunganStatus } from '@prisma/client';
@@ -48,9 +48,9 @@ export class PatunganController {
   linkOrder(
     @CurrentUser('sub') userId: string,
     @Param('participantId') participantId: string,
-    @Body() body: { orderId: string },
+    @Body() dto: LinkPatunganOrderDto,
   ) {
-    return this.service.linkOrder(userId, participantId, body.orderId);
+    return this.service.linkOrder(userId, participantId, dto.orderId);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 20 } })

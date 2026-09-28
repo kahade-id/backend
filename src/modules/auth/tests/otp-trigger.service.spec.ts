@@ -114,12 +114,12 @@ describe('OtpTriggerService', () => {
       expect(service.verifyWebhookSecret(undefined)).toBe(false);
     });
 
-    it('mengizinkan dengan peringatan bila secret server belum diset (fail-open terdokumentasi)', () => {
+    it('MENOLAK bila secret server belum diset (SEC-A M1 fail-closed)', () => {
       mockConfig.get.mockReturnValue(undefined);
       mockOpsSettings.getSecret.mockReturnValue(undefined);
       mockOpsSettings.get.mockReturnValue(undefined);
-      expect(service.verifyWebhookSecret('test-secret')).toBe(true);
-      expect(service.verifyWebhookSecret(undefined)).toBe(true);
+      expect(service.verifyWebhookSecret('test-secret')).toBe(false);
+      expect(service.verifyWebhookSecret(undefined)).toBe(false);
     });
   });
 

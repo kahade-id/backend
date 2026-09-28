@@ -117,11 +117,13 @@ export class JastipService {
     if (!trip) throw new NotFoundException({ code: ErrorCodes.JASTIP_TRIP_NOT_FOUND, message: 'Trip jastip tidak ditemukan' });
     const isHost = trip.hostId === userId;
     const isParticipant = trip.participants.some((p) => p.buyerId === userId);
-    // Harga terkunci hanya transparan ke host + peserta bersangkutan.
+    // Harga terkunci + ringkasan item hanya transparan ke host + peserta
+    // bersangkutan. SEC-C L1: itemSummary sebelumnya terlihat semua viewer —
+    // samakan aturan masking-nya dengan harga terkunci.
     const participants = trip.participants.map((p) => {
       if (isHost || p.buyerId === userId) return p;
-      const { goodsAmount, jastipFee, shippingCost, totalLocked, ...rest } = p;
-      void goodsAmount; void jastipFee; void shippingCost; void totalLocked;
+      const { goodsAmount, jastipFee, shippingCost, totalLocked, itemSummary, ...rest } = p;
+      void goodsAmount; void jastipFee; void shippingCost; void totalLocked; void itemSummary;
       return rest;
     });
     return { ...trip, participants, isHost, isParticipant };

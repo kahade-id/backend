@@ -88,7 +88,14 @@ export class AdminChatService {
       this.prisma.chatModerationEvent.count({ where }),
     ]);
 
-    return createPaginatedResponse(events, total, safePage, safeLimit);
+    // H1 (aturan keras privasi DM): room INQUIRY adalah DM privat — admin
+    // hanya boleh melihat METADATA (tanpa snippet isi pesan). Room ORDER
+    // (chat transaksi/dispute) tetap menampilkan snippet untuk moderasi.
+    const sanitized = events.map((event) =>
+      event.room?.type === 'INQUIRY' ? { ...event, snippet: null } : event,
+    );
+
+    return createPaginatedResponse(sanitized, total, safePage, safeLimit);
   }
 
   /** Ringkasan untuk kartu dashboard Trust & Safety. */
@@ -181,6 +188,16 @@ export class AdminChatService {
           },
         })
       : null;
+    // H1 (aturan keras privasi DM): room INQUIRY adalah DM privat — admin
+    // hanya boleh melihat METADATA (tanpa snippet & tanpa content pesan).
+    // Room ORDER (chat transaksi/dispute) tetap menampilkan isi untuk moderasi.
+    if (event.room?.type === 'INQUIRY') {
+      return {
+        ...event,
+        snippet: null,
+        message: message ? { ...message, content: null } : null,
+      };
+    }
     return { ...event, message };
   }
 

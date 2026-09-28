@@ -13,10 +13,13 @@ import { KycStatus, FeeResponsibility, OrderStatus, OrderType } from '@prisma/cl
 
 // TRX-009: pii.util di-mock agar decryptPiiSafe deterministik (ciphertext
 // "enc(x)" -> "enc(x)" apa adanya; pola sama seperti admin-users.service.spec).
+// CATATAN: jest.resetAllMocks() di beforeEach menghapus implementasi ini —
+// dipasang ulang di beforeEach (lihat di bawah).
 jest.mock('../../../common/utils/pii.util', () => ({
   decryptPiiSafe: jest.fn(async (value: string | null) => value ?? null),
   encryptPii: jest.fn(async (value: string) => value),
 }));
+import { decryptPiiSafe, encryptPii } from '../../../common/utils/pii.util';
 
 const mockUser = {
   id: 'user-db-1',
@@ -254,6 +257,10 @@ describe('OrdersService', () => {
     mockPrisma.campaign.updateMany.mockResolvedValue({ count: 1 });
     mockPrisma.voucher.updateMany.mockResolvedValue({ count: 1 });
     mockPrisma.$queryRaw.mockResolvedValue([]);
+    // TRX-009: resetAllMocks juga menghapus implementasi mock pii.util di
+    // atas — pasang ulang agar decryptPiiSafe deterministik per test.
+    (decryptPiiSafe as unknown as jest.Mock).mockImplementation(async (value: string | null) => value ?? null);
+    (encryptPii as unknown as jest.Mock).mockImplementation(async (value: string) => value);
     // TRX-009: default — alamat milik user-db-1 ditemukan di buku alamat.
     mockPrisma.address.findFirst.mockResolvedValue(mockAddress);
     mockPrisma.$transaction.mockImplementation(async (fn: unknown) => typeof fn === 'function' ? (fn as (tx: typeof mockPrisma) => Promise<unknown>)(mockPrisma) : undefined);
@@ -662,6 +669,91 @@ describe('OrdersService', () => {
       expect(mockPrisma.address.findFirst).not.toHaveBeenCalled();
       const createCall = mockPrisma.order.create.mock.calls[0][0].data;
       expect(createCall.shippingAddressId).toBeNull();
+    });
+
+    it('buyerLocation: persists encrypted coordinates when the buyer grants location', async () => {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
+        mockPrisma.order.create.mockResolvedValue(mockOrder);
+        mockPrisma.chatRoom.create.mockResolvedValue({ id: 'chat-1' });
+        return fn(mockPrisma);
+      });
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+      const { shippingAddressId: _drop, ...serviceDto } = { ...dto, orderType: OrderType.SERVICE };
+      const dtoWithLocation = {
+        ...serviceDto,
+        buyerLocation: { latitude: -6.2088, longitude: 106.8456, accuracy: 12.5, capturedAt: '2026-09-28T22:30:00+07:00' },
+      };
+
+      const result = await service.createOrder('user-db-1', dtoWithLocation) as Record<string, unknown>;
+
+      expect(result).toHaveProperty('orderId');
+      const createCall = mockPrisma.order.create.mock.calls[0][0].data;
+      // encryptPii di-mock sebagai identity -> kolom menyimpan "ciphertext" apa adanya.
+      expect(createCall.buyerLatitude).toBe('-6.2088');
+      expect(createCall.buyerLongitude).toBe('106.8456');
+      expect(createCall.buyerLocationAccuracy).toBe('12.5');
+      expect(createCall.buyerLocationCapturedAt).toBeInstanceOf(Date);
+      expect((createCall.buyerLocationCapturedAt as Date).toISOString()).toBe('2026-09-28T15:30:00.000Z');
+    });
+
+    it('buyerLocation: order is still created when the buyer denies location (fail-open)', async () => {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
+        mockPrisma.order.create.mockResolvedValue(mockOrder);
+        mockPrisma.chatRoom.create.mockResolvedValue({ id: 'chat-1' });
+        return fn(mockPrisma);
+      });
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+      const { shippingAddressId: _drop, ...serviceDto } = { ...dto, orderType: OrderType.SERVICE };
+
+      const result = await service.createOrder('user-db-1', { ...serviceDto, buyerLocation: null }) as Record<string, unknown>;
+
+      expect(result).toHaveProperty('orderId');
+      const createCall = mockPrisma.order.create.mock.calls[0][0].data;
+      expect(createCall.buyerLatitude).toBeNull();
+      expect(createCall.buyerLongitude).toBeNull();
+      expect(createCall.buyerLocationAccuracy).toBeNull();
+      expect(createCall.buyerLocationCapturedAt).toBeNull();
+    });
+
+    it('buyerLocation: out-of-range coordinates are ignored without failing the order', async () => {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
+        mockPrisma.order.create.mockResolvedValue(mockOrder);
+        mockPrisma.chatRoom.create.mockResolvedValue({ id: 'chat-1' });
+        return fn(mockPrisma);
+      });
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+      const { shippingAddressId: _drop, ...serviceDto } = { ...dto, orderType: OrderType.SERVICE };
+
+      const result = await service.createOrder('user-db-1', {
+        ...serviceDto,
+        buyerLocation: { latitude: 999, longitude: 106.8456 },
+      }) as Record<string, unknown>;
+
+      expect(result).toHaveProperty('orderId');
+      const createCall = mockPrisma.order.create.mock.calls[0][0].data;
+      expect(createCall.buyerLatitude).toBeNull();
+      expect(createCall.buyerLongitude).toBeNull();
     });
 
     it('should allow a voucher with per-user limit when no locked usage row exists', async () => {

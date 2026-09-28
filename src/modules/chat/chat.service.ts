@@ -399,10 +399,12 @@ export class ChatService implements OnModuleInit {
 
     // Batch 139 BE-API2 (item 116): himpunan room yang di-pin viewer — urutan
     // dan sort daftar TIDAK diubah, hanya flag per baris.
-    const pinnedRows = await this.prisma.chatPinnedRoom.findMany({
-      where: { userId },
-      select: { roomId: true },
-    }).catch(() => [] as { roomId: string }[]);
+    // Guard `?.`: mock prisma lama yang belum mengenal delegate ini (maupun
+    // DB yang tabelnya belum ada) → pin dianggap kosong, bukan error.
+    const pinnedRows: Array<{ roomId: string }> =
+      (await this.prisma.chatPinnedRoom
+        ?.findMany({ where: { userId }, select: { roomId: true } })
+        .catch((): Array<{ roomId: string }> => [])) ?? [];
     const pinnedRoomIds = new Set(pinnedRows.map((p) => p.roomId));
 
     const [roomRows, countResult] = await Promise.all([

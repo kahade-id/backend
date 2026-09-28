@@ -8,6 +8,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
 import { creditCashbackIfEligible } from '../../../common/utils/cashback-credit.util';
+import { computePatunganRebateTx, createPatunganRebateLedgerTx } from '../../commerce/patungan-rebate';
 import { DisputeDecisionDto, validateSplitPercents } from './dispute-decision.dto';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { toIdr } from '../../../common/utils/currency.util';
@@ -393,6 +394,14 @@ export class AdminDisputesService {
     const buyerTxSerial = buyerAmount > BigInt(0) ? await this.walletTxSerialService.getNext() : null;
     const sellerTxSerial = sellerAmount > BigInt(0) ? await this.walletTxSerialService.getNext() : null;
     const feeTxSerial = platformRetainAmount > BigInt(0) ? await this.walletTxSerialService.getNext() : null;
+    // M6 follow-up (Wave 2): serial ledger rebate overfunding patungan —
+    // lazy agar tidak membakar nomor urut bila verdict tidak memicu rebate
+    // (pola sama seperti serial cashback di completeOrder).
+    let disputeRebateSerial: number | null = null;
+    const nextDisputeRebateTxSerial = async (): Promise<number> => {
+      if (disputeRebateSerial === null) disputeRebateSerial = await this.walletTxSerialService.getNext();
+      return disputeRebateSerial;
+    };
 
     const result = await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.$queryRaw`SELECT id FROM disputes WHERE id = ${dispute.id} FOR UPDATE`;
@@ -607,13 +616,31 @@ export class AdminDisputesService {
         }
 
         if (sellerAmount > BigInt(0)) {
+          // M6 follow-up (Wave 2): order patungan yang selesai lewat verdict
+          // sengketa (dana diteruskan ke host) juga mendapat pengurang
+          // overfunding — disamakan dengan completeOrder. Rebate mengurangi
+          // penerimaan host dan dikredit ke availableBalance buyer.
+          // - Fail-safe: rebate di-cap sellerAmount (penerimaan host tidak
+          //   pernah negatif).
+          // - Idempoten: guard baris ledger di computePatunganRebateTx.
+          // - Sengketa PASCA-completion tidak kena rebate: sudah diterapkan
+          //   saat completeOrder (cabang ini hanya untuk pra-completion).
+          const patunganRebate = await computePatunganRebateTx(tx, dispute.orderId);
+          let disputeRebate = patunganRebate?.rebateSen ?? 0n;
+          if (disputeRebate > sellerAmount) disputeRebate = sellerAmount;
+          const sellerNetAmount = sellerAmount - disputeRebate;
           const freshBuyerWalletForSeller = await tx.wallet.findUnique({ where: { id: buyerWallet.id } });
           if (!freshBuyerWalletForSeller) {
             throw new ConflictException({ code: ErrorCodes.NOT_FOUND, message: 'Buyer wallet disappeared during dispute resolution' });
           }
           const buyerResult2 = await tx.wallet.updateMany({
             where: { id: buyerWallet.id, version: freshBuyerWalletForSeller.version },
-            data: { escrowBalance: { decrement: sellerAmount }, totalBalance: { decrement: sellerAmount }, version: { increment: 1 } },
+            data: {
+              escrowBalance: { decrement: sellerAmount },
+              totalBalance: { decrement: sellerNetAmount },
+              ...(disputeRebate > 0n ? { availableBalance: { increment: disputeRebate } } : {}),
+              version: { increment: 1 },
+            },
           });
           if (buyerResult2.count === 0) {
             throw new ConflictException({ code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT, message: 'Concurrent wallet update during dispute resolution (buyer escrow decrement), please retry' });
@@ -624,7 +651,7 @@ export class AdminDisputesService {
           }
           const sellerResult = await tx.wallet.updateMany({
             where: { id: freshSellerWallet.id, version: freshSellerWallet.version },
-            data: { availableBalance: { increment: sellerAmount }, totalBalance: { increment: sellerAmount }, version: { increment: 1 } },
+            data: { availableBalance: { increment: sellerNetAmount }, totalBalance: { increment: sellerNetAmount }, version: { increment: 1 } },
           });
           if (sellerResult.count === 0) {
             throw new ConflictException({ code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT, message: 'Concurrent wallet update during dispute resolution (seller credit), please retry' });
@@ -634,11 +661,24 @@ export class AdminDisputesService {
             data: {
               txId: sellerTxId, walletId: freshSellerWallet.id,
               type: WalletTransactionType.DISPUTE_RELEASE, status: WalletTransactionStatus.SUCCESS,
-              amount: sellerAmount, balanceBefore: freshSellerWallet.availableBalance, balanceAfter: freshSellerWallet.availableBalance + sellerAmount,
+              amount: sellerNetAmount, balanceBefore: freshSellerWallet.availableBalance, balanceAfter: freshSellerWallet.availableBalance + sellerNetAmount,
               orderId: dispute.orderId, description: `Dispute resolved: payment to seller (order ${dispute.orderId})`,
             },
           });
-          this.logger.log(`Dispute ${disputeId}: released ${sellerAmount} to seller wallet ${sellerWallet.id}`);
+          this.logger.log(`Dispute ${disputeId}: released ${sellerNetAmount} to seller wallet ${sellerWallet.id}`);
+          if (disputeRebate > 0n && patunganRebate) {
+            const rebateTxId = generateWalletTxId(await nextDisputeRebateTxSerial());
+            await createPatunganRebateLedgerTx(tx, {
+              txId: rebateTxId,
+              buyerWalletId: buyerWallet.id,
+              orderDbId: dispute.orderId,
+              orderPublicId: order.orderId,
+              groupId: patunganRebate.groupId,
+              rebateSen: disputeRebate,
+              buyerAvailableBefore: freshBuyerWalletForSeller.availableBalance,
+            });
+            this.logger.log(`Dispute ${disputeId}: patungan overfunding rebate ${disputeRebate} to buyer wallet ${buyerWallet.id}`);
+          }
         }
 
         if (platformRetainAmount > BigInt(0)) {

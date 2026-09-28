@@ -1,5 +1,7 @@
-import { IsString, IsNotEmpty, IsOptional, IsEnum, IsIn } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsEnum, IsIn, ValidateNested } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
+import { LocationDto } from './location.dto';
 
 export class SocialLoginDto {
   @ApiProperty({ description: 'Social provider', enum: ['google', 'apple'] })
@@ -30,4 +32,10 @@ export class SocialLoginDto {
   @IsOptional()
   @IsString()
   accessToken?: string;
+
+  @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional; konsisten dengan LoginDto)' })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LocationDto)
+  location?: LocationDto;
 }

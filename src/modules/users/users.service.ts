@@ -1680,6 +1680,31 @@ export class UsersService {
     return { message: 'Unfollowed successfully' };
   }
 
+  /**
+   * I065 (Wave 2) — hapus follower dari daftar pengikut sendiri ("remove
+   * follower"). Kebalikan unfollow: baris follow yang dihapus adalah
+   * (followerId = target, followingId = pemilik sesi). Idempotent-aman via
+   * unique compound; tanpa tx serializable karena delete satu baris.
+   */
+  async removeFollower(ownerId: string, followerUsername: string): Promise<{ message: string }> {
+    const follower = await this.prisma.user.findUnique({
+      where: { username: followerUsername.toLowerCase() },
+      select: { id: true },
+    });
+    if (!follower) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    if (follower.id === ownerId) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Tidak bisa menghapus diri sendiri dari pengikut' });
+    }
+
+    const deleted = await this.prisma.follow.deleteMany({
+      where: { followerId: follower.id, followingId: ownerId },
+    });
+    if (deleted.count === 0) {
+      throw new BadRequestException({ code: ErrorCodes.NOT_FOLLOWING, message: 'User tersebut bukan pengikutmu' });
+    }
+    return { message: 'Follower removed successfully' };
+  }
+
   async getFollowers(username: string, page: number, limit: number, search?: string, viewerId?: string | null): Promise<object> {
     const user = await this.prisma.user.findUnique({ where: { username: username.toLowerCase() }, select: { id: true, profileVisible: true, isActive: true, isBanned: true, deletedAt: true } });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });

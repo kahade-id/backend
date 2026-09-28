@@ -27,6 +27,13 @@ export class AdminBannersController {
     return this.service.listAdminBanners(pagination.page ?? 1, pagination.limit ?? 20);
   }
 
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @Get(':id')
+  @ApiOperation({ summary: 'Detail satu banner (admin)' })
+  detail(@Param('id') id: string) {
+    return this.service.getAdminBanner(id);
+  }
+
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Post()
   @ApiOperation({ summary: 'Buat banner promo (admin)' })

@@ -256,11 +256,14 @@ export class PatunganService {
         }
       }
       if (group.slotTotal > 0) {
-        // LOW #3 (SEC-B ronde 2): kunci baris grup agar hitungan slot
-        // konsisten antar request konkuren — pola lama create→count→delete
-        // di luar tx bisa membuat dua request sama-sama lolos (over-capacity)
-        // atau sama-sama terlempar. Update kosong tetap mengambil row lock.
-        await tx.patunganGroup.update({ where: { id: group.id }, data: {} });
+        // Wave 2 (LOW slot race): kunci baris grup secara EKSPLISIT via
+        // SELECT ... FOR UPDATE — pola yang sama dipakai di dispute
+        // resolution & Wave 1 (conditional update / row lock). Update kosong
+        // (`data: {}`) tidak dijamin menerbitkan UPDATE oleh Prisma sehingga
+        // tidak bisa diandalkan sebagai row lock; tanpa lock yang nyata, dua
+        // join konkuren bisa sama-sama lolos hitungan slot (peserta terhitung
+        // ganda / over-capacity).
+        await tx.$queryRaw`SELECT id FROM patungan_groups WHERE id = ${group.id} FOR UPDATE`;
         const count = await tx.patunganParticipant.count({ where: { groupId: group.id } });
         if (count >= group.slotTotal) {
           throw new ConflictException({ code: ErrorCodes.PATUNGAN_SLOT_FULL, message: 'Slot grup penuh' });

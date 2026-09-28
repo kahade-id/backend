@@ -9,6 +9,7 @@ const mockTx: Record<string, any> = {
   patunganGroup: { update: jest.fn(), updateMany: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn() },
   jastipParticipant: { findFirst: jest.fn() },
   $executeRawUnsafe: jest.fn(),
+  $queryRaw: jest.fn(),
 };
 
 const mockPrisma: Record<string, any> = {
@@ -139,13 +140,28 @@ describe('PatunganService', () => {
       deadlineAt: new Date(Date.now() + 86400000), mode: PatunganMode.BAGI_RATA,
       perPersonAmount: 25000000n, targetAmount: 100000000n, slotTotal: 2,
     });
-    mockTx.patunganGroup.update.mockResolvedValue({});
     mockTx.patunganParticipant.count.mockResolvedValue(2);
     await expect(service.joinGroup('u2', 'g1', {} as never)).rejects.toThrow('Slot grup penuh');
-    expect(mockTx.patunganGroup.update).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: 'g1' } }),
-    );
+    // Wave 2: row lock eksplisit SELECT ... FOR UPDATE (bukan update kosong).
+    expect(mockTx.$queryRaw).toHaveBeenCalled();
+    const rawSql = String(mockTx.$queryRaw.mock.calls[0][0]?.strings?.join(' ') ?? mockTx.$queryRaw.mock.calls[0][0]);
+    expect(rawSql).toMatch(/FOR UPDATE/i);
     expect(mockTx.patunganParticipant.create).not.toHaveBeenCalled();
+  });
+
+  it('Wave 2: joinGroup mengunci baris grup SEBELUM menghitung slot (urutan lock → count → create)', async () => {
+    mockTx.patunganGroup.findFirst.mockResolvedValue({
+      id: 'g1', hostId: 'h1', status: PatunganStatus.OPEN,
+      deadlineAt: new Date(Date.now() + 86400000), mode: PatunganMode.BAGI_RATA,
+      perPersonAmount: 25000000n, targetAmount: 100000000n, slotTotal: 5,
+    });
+    mockTx.patunganParticipant.count.mockResolvedValue(3);
+    mockTx.patunganParticipant.create.mockResolvedValue({ id: 'pp1', status: PatunganParticipantStatus.PENDING });
+    await service.joinGroup('u2', 'g1', {} as never);
+    const order = mockTx.$queryRaw.mock.invocationCallOrder[0];
+    expect(order).toBeLessThan(mockTx.patunganParticipant.count.mock.invocationCallOrder[0]);
+    expect(order).toBeLessThan(mockTx.patunganParticipant.create.mock.invocationCallOrder[0]);
+    expect(mockTx.patunganParticipant.create).toHaveBeenCalled();
   });
 
   it('initiateRelease menolak bila target belum tercapai (fail closed)', async () => {

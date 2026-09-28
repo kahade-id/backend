@@ -379,6 +379,33 @@ export class AuthController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<Record<string, unknown>> {
+    return this.handleSocialLogin(dto, req, res);
+  }
+
+  /**
+   * Wave 2 integritas-139: alias `POST /v1/auth/social/login` — aplikasi
+   * mobile memanggil path ini (lib/api/social.ts), sedangkan route kanonis
+   * adalah `POST /v1/auth/social-login`. Tanpa alias, login sosial 404 di
+   * UI live. Kedua route berbagi handler & guard yang sama persis.
+   */
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Post('social/login')
+  @HttpCode(HttpStatus.OK)
+  @AllowResponseFields('refreshToken')
+  async socialLoginAlias(
+    @Body() dto: SocialLoginDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<Record<string, unknown>> {
+    return this.handleSocialLogin(dto, req, res);
+  }
+
+  private async handleSocialLogin(
+    dto: SocialLoginDto,
+    req: Request,
+    res: Response,
+  ): Promise<Record<string, unknown>> {
     const ipAddress = req.ip || req.socket?.remoteAddress || 'unknown';
     const deviceInfo = dto.deviceInfo || req.headers['user-agent'] || 'unknown';
     try {

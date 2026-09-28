@@ -12,6 +12,7 @@ export { DailyReconciliationService } from './daily-reconciliation.service';
 export { WithdrawalReconciliationService } from './withdrawal-reconciliation.service';
 export { ExpireUnpaidOrdersService } from './expire-unpaid-orders.service';
 export { ExpireUnconfirmedOrdersService } from './expire-unconfirmed-orders.service';
+export { ExpireUnshippedOrdersService } from './expire-unshipped-orders.service';
 export { ExpireDisputeCallsService } from './expire-dispute-calls.service';
 export { NotificationArchivalService } from './notification-archival.service';
 export { OrphanedUploadCleanupService } from './orphaned-upload-cleanup.service';

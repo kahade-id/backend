@@ -80,8 +80,9 @@ describe('Batch 8 money — EO-008 force-complete ORDER_RELEASE balance basis', 
       prisma as never,
       auditLog as never,
       redis as never,
-      {} as never,
-      {} as never,
+      {} as never, // orderStateService
+      {} as never, // unshippedCancelService
+      {} as never, // feeCalculator
       walletTxSerialService as never,
       referralService as never,
       membershipRankService as never,

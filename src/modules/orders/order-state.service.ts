@@ -16,7 +16,7 @@ import { FeeCalculatorService } from './fee-calculator.service';
 import { NotificationQueueService } from '../queue/notification-queue.service';
 import { OrderQrisPaymentService } from '../payment/order-qris-payment.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { PAYMENT_DEADLINE_DAYS, MAX_ESCROW_BALANCE } from '../../common/constants/app.constants';
+import { PAYMENT_DEADLINE_DAYS, PROCESSING_DEADLINE_DAYS, MAX_ESCROW_BALANCE } from '../../common/constants/app.constants';
 import { withSpan } from '../../common/tracing/tracing';
 // GAP-C (G176): aktivasi milestone setelah escrow lock — no-op untuk order
 // satu tahap existing.
@@ -495,14 +495,17 @@ export class OrderStateService {
       // transaksi yang sama. No-op untuk order tanpa milestone — jalur escrow
       // satu tahap existing tidak berubah.
       await activateMilestonesForOrderTx(tx, order.id);
+      const paidAt = new Date();
       const orderUpdated = await tx.order.updateMany({
         where: { id: order.id, status: OrderStatus.WAITING_PAYMENT, deletedAt: null }, // AUDIT-16
         data: {
           status: OrderStatus.PROCESSING,
-          paidAt: new Date(),
-          processedAt: new Date(),
+          paidAt,
+          processedAt: paidAt,
           // T3: hormati tanggal eksplisit pilihan user bila masih di masa depan.
           deliveryDeadlineAt: resolveDeliveryDeadlineAt(order.deliveryDeadlineAt, order.deliveryDeadlineDays ?? 3),
+          // Wave 3 P0: batas kirim penjual — dipakai sweep expire-unshipped-orders.
+          processingDeadlineAt: addDays(paidAt, PROCESSING_DEADLINE_DAYS),
         },
       });
       if (orderUpdated.count === 0) {
@@ -992,6 +995,7 @@ export class OrderStateService {
     orderId: string,
     adminId: string,
     reason: string,
+    cancelReason: OrderCancelReason = OrderCancelReason.ADMIN_FORCE_CANCEL,
   ): Promise<void> {
     const preflightOrder = await this.prisma.order.findUnique({
       where: { orderId },
@@ -1043,7 +1047,7 @@ export class OrderStateService {
         data: {
           status: OrderStatus.CANCELLED,
           cancelledAt: new Date(),
-          cancelReason: 'ADMIN_FORCE_CANCEL',
+          cancelReason,
           cancelNote: reason,
         },
       });

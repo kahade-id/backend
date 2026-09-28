@@ -10,6 +10,7 @@ import { DeliveryProofService } from './delivery-proof.service';
 import { InvoiceService } from './invoice.service';
 import { ReceiptService } from './receipt.service';
 import { MembershipRankService } from './membership-rank.service';
+import { UnshippedOrderCancelService } from './unshipped-order-cancel.service';
 import { WalletModule } from '../wallet/wallet.module';
 import { RedisModule } from '../../redis/redis.module';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
@@ -28,7 +29,7 @@ import { InventoryModule } from '../inventory/inventory.module';
 @Module({
   imports: [ConfigModule, WalletModule, RedisModule, ReferralModule, forwardRef(() => DisputesModule), RealtimeModule, UploadModule, AuditLogModule, QueueModule, PaymentModule, SubscriptionsModule, InventoryModule],
   controllers: [OrdersController],
-  providers: [OrdersService, FeeCalculatorService, OrderStateService, OrderExtensionsService, OrderLinksService, DeliveryProofService, InvoiceService, ReceiptService, MembershipRankService, WalletTxSerialService],
-  exports: [OrdersService, FeeCalculatorService, OrderStateService, OrderExtensionsService, OrderLinksService, DeliveryProofService, InvoiceService, ReceiptService, MembershipRankService],
+  providers: [OrdersService, FeeCalculatorService, OrderStateService, OrderExtensionsService, OrderLinksService, DeliveryProofService, InvoiceService, ReceiptService, MembershipRankService, WalletTxSerialService, UnshippedOrderCancelService],
+  exports: [OrdersService, FeeCalculatorService, OrderStateService, OrderExtensionsService, OrderLinksService, DeliveryProofService, InvoiceService, ReceiptService, MembershipRankService, UnshippedOrderCancelService],
 })
 export class OrdersModule {}

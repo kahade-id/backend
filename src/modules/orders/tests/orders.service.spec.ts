@@ -810,9 +810,58 @@ describe('OrdersService', () => {
       const result = await service.getOrders('user-db-1', 1, 10) as Record<string, unknown>;
 
       expect(result).toHaveProperty('orders');
-      expect(result).toHaveProperty('total', 1);
+      // BD-008: tanpa COUNT — `total` dihapus, diganti hasNext/totalPages.
+      expect(result).not.toHaveProperty('total');
+      expect(result).toHaveProperty('hasNext', false);
+      expect(result).toHaveProperty('totalPages', 1);
       expect(result).toHaveProperty('page', 1);
       expect(result).toHaveProperty('limit', 10);
+      expect(mockPrisma.order.count).not.toHaveBeenCalled();
+    });
+
+    it('should excerpt long descriptions in the list (BD-007)', async () => {
+      const longDescription = 'x'.repeat(500);
+      const ordersWithRelations = [
+        { ...mockOrder, description: longDescription, buyer: { username: 'buyer01', fullName: 'Buyer One', avatarUrl: null }, seller: { username: 'seller01', fullName: 'Seller One', avatarUrl: null } },
+      ];
+      mockPrisma.order.findMany.mockResolvedValue(ordersWithRelations);
+
+      const result = await service.getOrders('user-db-1', 1, 10) as {
+        orders: Array<{ description: string }>;
+      };
+
+      expect(result.orders[0].description).toHaveLength(200);
+      expect(result.orders[0].description).toBe(longDescription.slice(0, 200));
+    });
+
+    it('should keep short descriptions intact in the list (BD-007)', async () => {
+      const ordersWithRelations = [
+        { ...mockOrder, description: 'Deskripsi pendek', buyer: { username: 'buyer01', fullName: 'Buyer One', avatarUrl: null }, seller: { username: 'seller01', fullName: 'Seller One', avatarUrl: null } },
+      ];
+      mockPrisma.order.findMany.mockResolvedValue(ordersWithRelations);
+
+      const result = await service.getOrders('user-db-1', 1, 10) as {
+        orders: Array<{ description: string }>;
+      };
+
+      expect(result.orders[0].description).toBe('Deskripsi pendek');
+    });
+
+    it('should set hasNext=true and slice the probe row when more pages exist (BD-008)', async () => {
+      const ordersWithRelations = Array.from({ length: 11 }, (_, i) => ({
+        ...mockOrder,
+        id: `order-internal-${i}`,
+        orderId: `ORD-20260101-${String(i).padStart(3, '0')}`,
+        buyer: { username: 'buyer01', fullName: 'Buyer One', avatarUrl: null },
+        seller: { username: 'seller01', fullName: 'Seller One', avatarUrl: null },
+      }));
+      mockPrisma.order.findMany.mockResolvedValue(ordersWithRelations);
+
+      const result = await service.getOrders('user-db-1', 1, 10) as Record<string, unknown>;
+
+      expect(result).toHaveProperty('hasNext', true);
+      expect(result).toHaveProperty('totalPages', 2);
+      expect((result.orders as unknown[])).toHaveLength(10);
     });
 
     it('should filter by BUYER role — only include orders where user is buyer', async () => {

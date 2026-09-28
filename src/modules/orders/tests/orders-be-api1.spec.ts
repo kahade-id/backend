@@ -70,8 +70,8 @@ describe('Batch 139 BE-API1 — item 110: deadline bayar & konfirmasi di GET /v1
   it('daftar order memuat paymentDeadlineAt + confirmationDeadlineAt', async () => {
     const prisma = {
       order: {
+        // BD-008: getOrders tidak lagi COUNT — hanya findMany (take limit+1).
         findMany: jest.fn(async () => [orderRow()]),
-        count: jest.fn(async () => 1),
       },
     };
     const service = makeService(prisma);

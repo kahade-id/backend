@@ -53,18 +53,36 @@ describe('NotificationsService', () => {
   describe('listNotifications', () => {
     it('returns paginated list with safe page/limit', async () => {
       mockPrisma.notification.findMany.mockResolvedValue([]);
-      mockPrisma.notification.count.mockResolvedValue(0);
       await service.listNotifications('u1', 0, 999);
-      expect(mockPrisma.notification.findMany).toHaveBeenCalledWith(expect.objectContaining({ skip: 0, take: 100 }));
+      // BD-008: take = safeLimit + 1 (probe hasNext, tanpa COUNT).
+      expect(mockPrisma.notification.findMany).toHaveBeenCalledWith(expect.objectContaining({ skip: 0, take: 101 }));
+      expect(mockPrisma.notification.count).not.toHaveBeenCalled();
     });
 
     it('filters by isRead and category', async () => {
       mockPrisma.notification.findMany.mockResolvedValue([]);
-      mockPrisma.notification.count.mockResolvedValue(0);
       await service.listNotifications('u1', 1, 10, false, NotificationCategory.TRANSAKSI);
       expect(mockPrisma.notification.findMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ isRead: false, category: NotificationCategory.TRANSAKSI }),
       }));
+    });
+
+    it('sets hasNext=true and slices the probe row when a further page exists (BD-008)', async () => {
+      const rows = Array.from({ length: 11 }, (_, i) => ({ id: `n${i}`, notifId: `NTF-${i}` }));
+      mockPrisma.notification.findMany.mockResolvedValue(rows);
+      const result = await service.listNotifications('u1', 1, 10);
+      expect(result.hasNext).toBe(true);
+      expect(result.data).toHaveLength(10);
+      expect(result.totalPages).toBe(2);
+      expect(result).not.toHaveProperty('total');
+    });
+
+    it('sets hasNext=false on the last page (BD-008)', async () => {
+      mockPrisma.notification.findMany.mockResolvedValue([{ id: 'n1', notifId: 'NTF-1' }]);
+      const result = await service.listNotifications('u1', 2, 10);
+      expect(result.hasNext).toBe(false);
+      expect(result.totalPages).toBe(2);
+      expect(result.data).toHaveLength(1);
     });
   });
 

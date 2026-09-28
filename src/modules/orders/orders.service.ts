@@ -26,6 +26,20 @@ import type { BuyerLocationDto } from './dto/create-order.dto';
 
 const ORDER_COUNTERPART_COOLDOWN_SECONDS = 60;
 
+/**
+ * BD-007 (perf-fix 2026-09-29): excerpt deskripsi untuk response DAFTAR
+ * (maks 200 char, pola NP-007 di showcase). Detail (`GET /v1/orders/:id`)
+ * tetap mengirim deskripsi full. Tidak ada layar list yang me-render
+ * deskripsi full (kartu transaksi hanya pakai judul/status).
+ */
+const ORDER_LIST_DESCRIPTION_EXCERPT = 200;
+function toExcerpt(description: string | null | undefined): string {
+  if (!description) return '';
+  return description.length > ORDER_LIST_DESCRIPTION_EXCERPT
+    ? description.slice(0, ORDER_LIST_DESCRIPTION_EXCERPT)
+    : description;
+}
+
 function getConfirmationDeadlineDays(orderType: OrderType): number {
   return CONFIRMATION_DEADLINE_DAYS_MAP[orderType] ?? CONFIRMATION_DEADLINE_DAYS;
 }
@@ -925,7 +939,11 @@ export class OrdersService {
       paymentDeadlineAt: Date | null;
       confirmationDeadlineAt: Date | null;
     }[];
-    total: number;
+    // BD-008 (perf-fix 2026-09-29): tanpa COUNT(*) — `total` dihapus.
+    // Klien memakai `hasNext`/`totalPages` (halaman terkonfirmasi) untuk
+    // load-more; pola limit+1 seperti feed showcase.
+    hasNext: boolean;
+    totalPages: number;
     page: number;
     limit: number;
   }> {
@@ -997,21 +1015,24 @@ export class OrdersService {
     if (sortField !== 'createdAt') orderBy.push({ createdAt: 'desc' });
     orderBy.push({ id: 'desc' });
 
-    const [orders, total] = await Promise.all([
-      this.prisma.order.findMany({
-        where, orderBy, skip, take: safeLimit,
-        include: {
-          buyer: { select: { userId: true, username: true, fullName: true, avatarUrl: true } },
-          seller: { select: { userId: true, username: true, fullName: true, avatarUrl: true } },
-        },
-      }),
-      this.prisma.order.count({ where }),
-    ]);
+    // BD-008: ambil limit + 1 untuk menentukan hasNext tanpa COUNT(*)
+    // (COUNT memindai index range linear mengikuti riwayat user).
+    const fetched = await this.prisma.order.findMany({
+      where, orderBy, skip, take: safeLimit + 1,
+      include: {
+        buyer: { select: { userId: true, username: true, fullName: true, avatarUrl: true } },
+        seller: { select: { userId: true, username: true, fullName: true, avatarUrl: true } },
+      },
+    });
+    const hasNext = fetched.length > safeLimit;
+    const orders = hasNext ? fetched.slice(0, safeLimit) : fetched;
 
     return {
       orders: orders.map((order) => ({
         orderId: order.orderId, orderNumber: order.orderId,
-        title: order.title, description: order.description, status: order.status,
+        // BD-007: daftar hanya kirim excerpt (maks 200 char, pola NP-007) —
+        // deskripsi full (s.d. 500 char) hanya di GET /v1/orders/:id.
+        title: order.title, description: toExcerpt(order.description), status: order.status,
         orderType: order.orderType,
         orderValue: toIdr(order.orderValue),
         buyerPayAmount: toIdr(order.buyerPayAmount),
@@ -1028,7 +1049,10 @@ export class OrdersService {
         paymentDeadlineAt: order.paymentDeadlineAt ?? null,
         confirmationDeadlineAt: order.confirmationDeadlineAt ?? null,
       })),
-      total, page: safePage, limit: safeLimit,
+      hasNext,
+      // Halaman terkonfirmasi (bukan total sebenarnya) — cukup untuk load-more.
+      totalPages: hasNext ? safePage + 1 : safePage,
+      page: safePage, limit: safeLimit,
     };
   }
 

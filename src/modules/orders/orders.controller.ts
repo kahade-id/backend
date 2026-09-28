@@ -169,7 +169,9 @@ export class OrdersController {
       role: 'BUYER' | 'SELLER';
       createdAt: Date;
     }[];
-    total: number;
+    // BD-008: tanpa COUNT — `total` dihapus; klien pakai hasNext/totalPages.
+    hasNext: boolean;
+    totalPages: number;
     page: number;
     limit: number;
   }> {

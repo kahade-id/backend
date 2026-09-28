@@ -1,6 +1,11 @@
 import { validate } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
-import { PaginationDto, createPaginatedResponse } from './pagination.dto';
+import {
+  PaginationDto,
+  createPaginatedResponse,
+  createHasNextPaginatedResponse,
+  sliceLimitPlusOne,
+} from './pagination.dto';
 
 describe('PaginationDto', () => {
   async function validateDto(data: Record<string, unknown>) {
@@ -96,5 +101,56 @@ describe('createPaginatedResponse', () => {
     const result = createPaginatedResponse([], 100, 5, 20);
     expect(result.page).toBe(5);
     expect(result.limit).toBe(20);
+  });
+});
+
+describe('sliceLimitPlusOne (BD-008)', () => {
+  it('returns hasNext=false and all rows when fetched <= limit', () => {
+    const { rows, hasNext } = sliceLimitPlusOne(['a', 'b'], 10);
+    expect(hasNext).toBe(false);
+    expect(rows).toEqual(['a', 'b']);
+  });
+
+  it('returns hasNext=false when fetched exactly equals limit', () => {
+    const fetched = Array.from({ length: 10 }, (_, i) => i);
+    const { rows, hasNext } = sliceLimitPlusOne(fetched, 10);
+    expect(hasNext).toBe(false);
+    expect(rows).toHaveLength(10);
+  });
+
+  it('slices the extra probe row and returns hasNext=true when fetched > limit', () => {
+    const fetched = Array.from({ length: 11 }, (_, i) => i);
+    const { rows, hasNext } = sliceLimitPlusOne(fetched, 10);
+    expect(hasNext).toBe(true);
+    expect(rows).toHaveLength(10);
+    expect(rows).toEqual(fetched.slice(0, 10));
+  });
+});
+
+describe('createHasNextPaginatedResponse (BD-008)', () => {
+  it('omits total and reports totalPages = page + 1 when hasNext', () => {
+    const result = createHasNextPaginatedResponse(['a'], 2, 10, true);
+    expect(result).toEqual({
+      data: ['a'],
+      page: 2,
+      limit: 10,
+      totalPages: 3,
+      hasNext: true,
+      hasPrev: true,
+    });
+    expect('total' in result).toBe(false);
+  });
+
+  it('reports totalPages = page when no more pages', () => {
+    const result = createHasNextPaginatedResponse(['a'], 3, 10, false);
+    expect(result.totalPages).toBe(3);
+    expect(result.hasNext).toBe(false);
+    expect(result.hasPrev).toBe(true);
+  });
+
+  it('hasPrev is false on first page', () => {
+    const result = createHasNextPaginatedResponse([], 1, 10, false);
+    expect(result.hasPrev).toBe(false);
+    expect(result.totalPages).toBe(1);
   });
 });

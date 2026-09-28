@@ -11,7 +11,7 @@ import { FeeCalculatorService } from '../fee-calculator.service';
 import { RealtimeService } from '../../realtime/realtime.service';
 import { MembershipRankService } from '../membership-rank.service';
 import { NotificationQueueService } from '../../queue/notification-queue.service';
-import { OrderStatus, FeeResponsibility, OrderType, Prisma } from '@prisma/client';
+import { OrderStatus, FeeResponsibility, OrderType, Prisma, WalletTransactionType } from '@prisma/client';
 
 const mockOrder = {
   id: 'order-internal-1',
@@ -113,6 +113,14 @@ const mockPrisma = {
   orderMilestone: {
     count: jest.fn().mockResolvedValue(0),
     findMany: jest.fn().mockResolvedValue([]),
+  },
+  // M6: rebate overfunding patungan — default null = order normal tanpa rebate.
+  patunganParticipant: {
+    findUnique: jest.fn().mockResolvedValue(null),
+    findMany: jest.fn().mockResolvedValue([]),
+  },
+  patunganGroup: {
+    findUnique: jest.fn().mockResolvedValue(null),
   },
   $transaction: jest.fn(),
   $queryRaw: jest.fn().mockResolvedValue([]),
@@ -712,8 +720,84 @@ describe('OrderStateService', () => {
       expect(mockPrisma.walletTransaction.create).toHaveBeenCalledTimes(3); // ORDER_RELEASE (buyer) + ORDER_RELEASE (seller) + FEE_DEDUCT
     });
 
-    it('should throw ConflictException on optimistic lock conflict during escrow release', async () => {
+    it('M6: completeOrder order patungan dengan overfunding → rebate nyata ke buyer, host terima dikurangi', async () => {
+      // Angka konkret: 5 peserta × Rp100.000 (orderValue 10_000_000 sen),
+      // target Rp400.000 (40_000_000 sen) → overfunding Rp100.000 / 5 = Rp20.000/orang.
       mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
+        mockPrisma.order.findUnique.mockResolvedValue({
+          ...mockOrder,
+          id: 'order-db-1',
+          status: OrderStatus.IN_DELIVERY,
+          buyerId: 'buyer-id',
+          sellerId: 'seller-id',
+          orderValue: BigInt(10_000_000),
+          buyerPayAmount: BigInt(10_150_000),
+          sellerReceiveAmount: BigInt(10_000_000),
+          feeAmount: BigInt(150_000),
+        });
+        mockPrisma.wallet.findUnique
+          .mockResolvedValueOnce({ id: mockBuyerWallet.id })
+          .mockResolvedValueOnce({ id: mockSellerWallet.id })
+          .mockResolvedValueOnce(mockBuyerWallet)
+          .mockResolvedValueOnce(mockSellerWallet);
+        mockPrisma.wallet.updateMany.mockResolvedValue({ count: 1 });
+        mockPrisma.patunganParticipant.findUnique.mockResolvedValue({
+          id: 'pp1', groupId: 'g1', status: 'PAID',
+        });
+        mockPrisma.patunganGroup.findUnique.mockResolvedValue({
+          status: 'TARGET_REACHED', targetAmount: BigInt(40_000_000),
+        });
+        mockPrisma.patunganParticipant.findMany.mockResolvedValue(
+          Array.from({ length: 5 }, () => ({ amount: BigInt(10_000_000) })),
+        );
+        mockPrisma.walletTransaction.findFirst.mockImplementation((args: any) =>
+          Promise.resolve(
+            args?.where?.type === WalletTransactionType.ORDER_REFUND
+              ? null // guard idempoten rebate: belum pernah
+              : { amount: BigInt(10_150_000) }, // escrow lock check
+          ),
+        );
+        return fn(mockPrisma);
+      });
+
+      await service.completeOrder('ORD-001', 'buyer-id');
+
+      // Seller hanya menerima sellerReceive − rebate (10_000_000 − 2_000_000).
+      expect(mockPrisma.wallet.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 'wallet-2' }),
+          data: expect.objectContaining({
+            availableBalance: { increment: BigInt(8_000_000) },
+            totalBalance: { increment: BigInt(8_000_000) },
+          }),
+        }),
+      );
+      // Buyer: escrow berkurang penuh, available +rebate, total −(buyerPay − rebate).
+      expect(mockPrisma.wallet.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 'wallet-1' }),
+          data: expect.objectContaining({
+            availableBalance: { increment: BigInt(2_000_000) },
+            totalBalance: { decrement: BigInt(8_150_000) },
+          }),
+        }),
+      );
+      // Ledger: 2× ORDER_RELEASE + FEE_DEDUCT + 1× ORDER_REFUND (rebate).
+      expect(mockPrisma.walletTransaction.create).toHaveBeenCalledTimes(4);
+      expect(mockPrisma.walletTransaction.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          walletId: 'wallet-1',
+          type: WalletTransactionType.ORDER_REFUND,
+          amount: BigInt(2_000_000),
+          balanceBefore: BigInt(20_000_000),
+          balanceAfter: BigInt(22_000_000),
+          orderId: 'order-db-1',
+          description: expect.stringContaining('group=g1'),
+        }),
+      });
+    });
+
+    it('should throw ConflictException on optimistic lock conflict during escrow release', async () => {      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
         mockPrisma.order.findUnique.mockResolvedValue({
           ...mockOrder,
           status: OrderStatus.IN_DELIVERY,

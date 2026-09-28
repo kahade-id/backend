@@ -15,7 +15,6 @@ import {
 
 /** Union penuh agar `.includes(status)` menerima semua nilai enum. */
 const EDITABLE_TRIP_STATUSES: JastipTripStatus[] = [JastipTripStatus.DRAFT, JastipTripStatus.OPEN];
-const CLOSED_TRIP_STATUSES: JastipTripStatus[] = [JastipTripStatus.CANCELLED, JastipTripStatus.COMPLETED];
 const PAID_ORDER_STATUSES: OrderStatus[] = [OrderStatus.PROCESSING, OrderStatus.IN_DELIVERY, OrderStatus.COMPLETED];
 const CANCELLABLE_ORDER_STATUSES: OrderStatus[] = [OrderStatus.WAITING_CONFIRMATION, OrderStatus.WAITING_PAYMENT];
 const PREPAID_PARTICIPANT_STATUSES: JastipParticipantStatus[] = [
@@ -338,21 +337,39 @@ export class JastipService {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Order belum dibayar' });
     }
     // Satu order berbayar TIDAK BOLEH ditautkan ke 2 peserta/trip (cegah
-    // pelunasan palsu lewat double-link escrow order yang sama).
-    const alreadyLinked = await this.prisma.jastipParticipant.findFirst({
-      where: { orderId: order.id, id: { not: participant.id } },
-      select: { id: true },
-    });
-    if (alreadyLinked) {
-      throw new BadRequestException({
-        code: ErrorCodes.ORDER_ALREADY_LINKED,
-        message: 'Order ini sudah ditautkan ke peserta jastip lain',
-      });
-    }
+    // pelunasan palsu lewat double-link escrow order yang sama) — cek di
+    // DALAM tx: peserta jastip lain + peserta patungan (lintas modul).
     try {
-      return await this.prisma.jastipParticipant.update({
-        where: { id: participant.id },
-        data: { orderId: order.id, status: JastipParticipantStatus.PAID },
+      return await this.prisma.$transaction(async (tx) => {
+        // LOW #2: kunci advisory per order — serialisasi linkOrder jastip vs
+        // patungan untuk order yang sama; menutup race lintas tabel.
+        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `commerce_link_order:${order.id}`);
+        const [linkedJastip, linkedPatungan] = await Promise.all([
+          tx.jastipParticipant.findFirst({
+            where: { orderId: order.id, id: { not: participant.id } },
+            select: { id: true },
+          }),
+          tx.patunganParticipant.findFirst({ where: { orderId: order.id }, select: { id: true } }),
+        ]);
+        if (linkedJastip || linkedPatungan) {
+          throw new BadRequestException({
+            code: ErrorCodes.ORDER_ALREADY_LINKED,
+            message: 'Order ini sudah ditautkan ke peserta lain',
+          });
+        }
+        // Predicate status: PRICE_LOCKED → PAID atomik; dua linkOrder konkuren
+        // untuk peserta yang sama tidak bisa double-link.
+        const marked = await tx.jastipParticipant.updateMany({
+          where: { id: participant.id, status: JastipParticipantStatus.PRICE_LOCKED },
+          data: { orderId: order.id, status: JastipParticipantStatus.PAID },
+        });
+        if (marked.count === 0) {
+          throw new BadRequestException({
+            code: ErrorCodes.VALIDATION_ERROR,
+            message: 'Peserta sudah dalam proses / selesai',
+          });
+        }
+        return tx.jastipParticipant.findUnique({ where: { id: participant.id } });
       });
     } catch (e) {
       // Race antar-request: unique constraint DB (orderId) menolak link ganda.
@@ -370,47 +387,117 @@ export class JastipService {
    * Host gagal dapat barang → trip dibatalkan + refund otomatis SEJAUH
    * dimungkinkan alur existing: order yang masih cancellable di-cancel via
    * OrderStateService; order yang sudah dibayar → REFUND_REQUIRED (fail
-   * closed, dieksekusi via alur return/dispute existing).
+   * closed, dieksekusi scheduler auto-refund M2).
+   *
+   * M3 (SEC-B ronde 2): atomik + idempoten + retry-safe.
+   * - Transisi trip → CANCELLED memakai conditional updateMany (predicate
+   *   status): dua pemanggil konkuren tidak saling menimpa.
+   * - Bila trip SUDAH CANCELLED (retry pasca-crash di tengah loop), JANGAN
+   *   tolak — lanjutkan memproses sisa peserta.
+   * - Setiap peserta dibaca FRESH dan statusnya diubah via updateMany
+   *   ber-predicate; peserta yang sudah terminal (REFUNDED/REFUND_REQUIRED/
+   *   CANCELLED) tidak diproses ulang.
+   * - cancelOrder (memiliki transaksi + efek eksternal sendiri) tidak bisa
+   *   masuk satu tx dengan update status: urutannya cancel dulu, lalu tandai
+   *   status; bila cancel melempar karena order sudah ter-cancel jalur lain,
+   *   peserta tetap ditandai REFUNDED (bukan REFUND_REQUIRED).
    */
   async failTrip(hostId: string, tripId: string, reason?: string) {
     const trip = await this.assertHostTrip(hostId, tripId);
-    if (CLOSED_TRIP_STATUSES.includes(trip.status)) {
-      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Trip sudah selesai/dibatalkan' });
+    if (trip.status === JastipTripStatus.COMPLETED) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Trip sudah selesai' });
     }
-    await this.prisma.jastipTrip.update({ where: { id: trip.id }, data: { status: JastipTripStatus.CANCELLED } });
-
-    const results: Array<{ participantId: string; outcome: string }> = [];
-    for (const p of trip.participants) {
-      if (p.status === JastipParticipantStatus.PAID) {
-        if (!p.orderId) {
-          // Data inkonsisten (PAID tanpa order): fail closed — tandai
-          // REFUND_REQUIRED agar ops menindaklanjuti manual, jangan diam.
-          await this.prisma.jastipParticipant.update({ where: { id: p.id }, data: { status: JastipParticipantStatus.REFUND_REQUIRED } });
-          results.push({ participantId: p.id, outcome: 'REFUND_REQUIRED' });
-          continue;
-        }
-        const order = await this.prisma.order.findUnique({
-          where: { id: p.orderId },
-          select: { orderId: true, status: true },
-        });
-        if (order && CANCELLABLE_ORDER_STATUSES.includes(order.status)) {
-          try {
-            await this.orderStateService.cancelOrder(order.orderId, hostId, 'OTHER', `Jastip gagal: ${reason ?? 'host tidak mendapatkan barang'}`.slice(0, 200));
-            await this.prisma.jastipParticipant.update({ where: { id: p.id }, data: { status: JastipParticipantStatus.REFUNDED } });
-            results.push({ participantId: p.id, outcome: 'REFUNDED' });
-            continue;
-          } catch (e) {
-            this.logger.warn(`Cancel order jastip gagal participant=${p.id}: ${(e as Error).message}`);
-          }
-        }
-        await this.prisma.jastipParticipant.update({ where: { id: p.id }, data: { status: JastipParticipantStatus.REFUND_REQUIRED } });
-        results.push({ participantId: p.id, outcome: 'REFUND_REQUIRED' });
-      } else if (PREPAID_PARTICIPANT_STATUSES.includes(p.status)) {
-        await this.prisma.jastipParticipant.update({ where: { id: p.id }, data: { status: JastipParticipantStatus.CANCELLED } });
-        results.push({ participantId: p.id, outcome: 'CANCELLED' });
+    const claimed = await this.prisma.jastipTrip.updateMany({
+      where: { id: trip.id, status: { notIn: [JastipTripStatus.CANCELLED, JastipTripStatus.COMPLETED] } },
+      data: { status: JastipTripStatus.CANCELLED },
+    });
+    if (claimed.count === 0) {
+      // Retry pasca-crash (trip sudah CANCELLED oleh percobaan sebelumnya)
+      // atau balapan dengan penutupan lain — verifikasi via baca ulang.
+      const fresh = await this.prisma.jastipTrip.findUnique({ where: { id: trip.id }, select: { status: true } });
+      if (!fresh || fresh.status !== JastipTripStatus.CANCELLED) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Trip sudah selesai/dibatalkan' });
       }
     }
+
+    // Baca ulang peserta FRESH — snapshot assertHostTrip bisa basi saat retry.
+    const participants = await this.prisma.jastipParticipant.findMany({
+      where: { tripId: trip.id },
+      select: { id: true, status: true, orderId: true },
+    });
+
+    const results: Array<{ participantId: string; outcome: string }> = [];
+    for (const p of participants) {
+      results.push({ participantId: p.id, outcome: await this.failTripParticipant(p, hostId, reason) });
+    }
     return { tripId: trip.id, status: JastipTripStatus.CANCELLED, results };
+  }
+
+  /** Satu peserta dalam failTrip — idempoten, aman di-retry. */
+  private async failTripParticipant(
+    p: { id: string; status: JastipParticipantStatus; orderId: string | null },
+    hostId: string,
+    reason?: string,
+  ): Promise<string> {
+    // Guard retry: yang sudah terminal tidak diproses ulang.
+    if (
+      p.status === JastipParticipantStatus.REFUNDED ||
+      p.status === JastipParticipantStatus.REFUND_REQUIRED ||
+      p.status === JastipParticipantStatus.CANCELLED ||
+      p.status === JastipParticipantStatus.COMPLETED
+    ) {
+      return p.status;
+    }
+    if (p.status === JastipParticipantStatus.PAID) {
+      if (!p.orderId) {
+        // Data inkonsisten (PAID tanpa order): fail closed — tandai
+        // REFUND_REQUIRED agar dieksekusi scheduler auto-refund / ops.
+        await this.prisma.jastipParticipant.updateMany({
+          where: { id: p.id, status: JastipParticipantStatus.PAID },
+          data: { status: JastipParticipantStatus.REFUND_REQUIRED },
+        });
+        return 'REFUND_REQUIRED';
+      }
+      const order = await this.prisma.order.findUnique({
+        where: { id: p.orderId },
+        select: { orderId: true, status: true },
+      });
+      if (order && CANCELLABLE_ORDER_STATUSES.includes(order.status)) {
+        try {
+          await this.orderStateService.cancelOrder(order.orderId, hostId, 'OTHER', `Jastip gagal: ${reason ?? 'host tidak mendapatkan barang'}`.slice(0, 200));
+          await this.prisma.jastipParticipant.updateMany({
+            where: { id: p.id, status: JastipParticipantStatus.PAID },
+            data: { status: JastipParticipantStatus.REFUNDED },
+          });
+          return 'REFUNDED';
+        } catch (e) {
+          this.logger.warn(`Cancel order jastip gagal participant=${p.id}: ${(e as Error).message}`);
+          // Race: order ter-cancel jalur lain di tengah jalan → refund sudah
+          // ditangani pemenang race; jangan turunkan ke REFUND_REQUIRED.
+          const fresh = await this.prisma.order.findUnique({ where: { id: p.orderId }, select: { status: true } });
+          if (fresh?.status === OrderStatus.CANCELLED) {
+            await this.prisma.jastipParticipant.updateMany({
+              where: { id: p.id, status: JastipParticipantStatus.PAID },
+              data: { status: JastipParticipantStatus.REFUNDED },
+            });
+            return 'REFUNDED';
+          }
+        }
+      }
+      await this.prisma.jastipParticipant.updateMany({
+        where: { id: p.id, status: JastipParticipantStatus.PAID },
+        data: { status: JastipParticipantStatus.REFUND_REQUIRED },
+      });
+      return 'REFUND_REQUIRED';
+    }
+    if (PREPAID_PARTICIPANT_STATUSES.includes(p.status)) {
+      await this.prisma.jastipParticipant.updateMany({
+        where: { id: p.id, status: p.status },
+        data: { status: JastipParticipantStatus.CANCELLED },
+      });
+      return 'CANCELLED';
+    }
+    return p.status;
   }
 
   /** Cron: trip OPEN yang deadline-nya lewat → CLOSED; peserta belum bayar → CANCELLED. */
@@ -422,7 +509,12 @@ export class JastipService {
     });
     for (const t of expired) {
       await this.prisma.$transaction(async (tx) => {
-        await tx.jastipTrip.update({ where: { id: t.id }, data: { status: JastipTripStatus.CLOSED } });
+        // M3/M4: predicate status — trip yang sudah CANCELLED via failTrip
+        // (balapan dengan cron) TIDAK ditimpa menjadi CLOSED.
+        await tx.jastipTrip.updateMany({
+          where: { id: t.id, status: JastipTripStatus.OPEN },
+          data: { status: JastipTripStatus.CLOSED },
+        });
         await tx.jastipParticipant.updateMany({
           where: { tripId: t.id, status: { in: [JastipParticipantStatus.JOINED, JastipParticipantStatus.PRICE_LOCKED] } },
           data: { status: JastipParticipantStatus.CANCELLED },

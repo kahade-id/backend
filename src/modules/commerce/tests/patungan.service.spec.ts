@@ -5,13 +5,15 @@ import { OrderStateService } from '../../orders/order-state.service';
 import { PatunganMode, PatunganStatus, PatunganParticipantStatus, OrderStatus } from '@prisma/client';
 
 const mockTx: Record<string, any> = {
-  patunganParticipant: { update: jest.fn(), aggregate: jest.fn(), findFirst: jest.fn() },
-  patunganGroup: { update: jest.fn() },
+  patunganParticipant: { update: jest.fn(), updateMany: jest.fn(), aggregate: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn(), count: jest.fn(), create: jest.fn() },
+  patunganGroup: { update: jest.fn(), updateMany: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn() },
+  jastipParticipant: { findFirst: jest.fn() },
+  $executeRawUnsafe: jest.fn(),
 };
 
 const mockPrisma: Record<string, any> = {
-  patunganGroup: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn(), update: jest.fn() },
-  patunganParticipant: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), update: jest.fn(), count: jest.fn(), delete: jest.fn(), aggregate: jest.fn() },
+  patunganGroup: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), findUnique: jest.fn(), count: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
+  patunganParticipant: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), findUnique: jest.fn(), update: jest.fn(), updateMany: jest.fn(), count: jest.fn(), delete: jest.fn(), aggregate: jest.fn() },
   user: { findMany: jest.fn() },
   order: { findFirst: jest.fn(), findUnique: jest.fn() },
   $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
@@ -32,6 +34,7 @@ describe('PatunganService', () => {
     jest.resetAllMocks();
     mockOrderState.cancelOrder.mockResolvedValue({ ok: true });
     mockPrisma.$transaction.mockImplementation((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx));
+    mockTx.$executeRawUnsafe.mockResolvedValue(0);
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         PatunganService,
@@ -86,7 +89,7 @@ describe('PatunganService', () => {
   });
 
   it('joinGroup menolak host join sendiri', async () => {
-    mockPrisma.patunganGroup.findFirst.mockResolvedValue({
+    mockTx.patunganGroup.findFirst.mockResolvedValue({
       id: 'g1', hostId: 'h1', status: PatunganStatus.OPEN,
       deadlineAt: new Date(Date.now() + 86400000), mode: PatunganMode.BAGI_RATA,
       perPersonAmount: 25000000n, targetAmount: 100000000n, slotTotal: 0,
@@ -95,7 +98,7 @@ describe('PatunganService', () => {
   });
 
   it('joinGroup menolak deadline lewat', async () => {
-    mockPrisma.patunganGroup.findFirst.mockResolvedValue({
+    mockTx.patunganGroup.findFirst.mockResolvedValue({
       id: 'g1', hostId: 'h1', status: PatunganStatus.OPEN,
       deadlineAt: new Date(Date.now() - 1000), mode: PatunganMode.BAGI_RATA,
       perPersonAmount: 25000000n, targetAmount: 100000000n, slotTotal: 0,
@@ -104,17 +107,45 @@ describe('PatunganService', () => {
   });
 
   it('joinGroup sukses (bagi rata) → PENDING', async () => {
-    mockPrisma.patunganGroup.findFirst.mockResolvedValue({
+    mockTx.patunganGroup.findFirst.mockResolvedValue({
       id: 'g1', hostId: 'h1', status: PatunganStatus.OPEN,
       deadlineAt: new Date(Date.now() + 86400000), mode: PatunganMode.BAGI_RATA,
       perPersonAmount: 25000000n, targetAmount: 100000000n, slotTotal: 0,
     });
-    mockPrisma.patunganParticipant.create.mockResolvedValue({ id: 'pp1', status: PatunganParticipantStatus.PENDING });
+    mockTx.patunganParticipant.create.mockResolvedValue({ id: 'pp1', status: PatunganParticipantStatus.PENDING });
     const res = await service.joinGroup('u2', 'g1', {} as never);
-    expect(res.status).toBe(PatunganParticipantStatus.PENDING);
-    expect(mockPrisma.patunganParticipant.create).toHaveBeenCalledWith(
+    expect(res!.status).toBe(PatunganParticipantStatus.PENDING);
+    expect(mockTx.patunganParticipant.create).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ amount: 25000000n }) }),
     );
+  });
+
+  it('LOW: joinGroup MENGABAIKAN dto.orderId (anti squatting) — link wajib via linkOrder', async () => {
+    mockTx.patunganGroup.findFirst.mockResolvedValue({
+      id: 'g1', hostId: 'h1', status: PatunganStatus.OPEN,
+      deadlineAt: new Date(Date.now() + 86400000), mode: PatunganMode.BAGI_RATA,
+      perPersonAmount: 25000000n, targetAmount: 100000000n, slotTotal: 0,
+    });
+    mockTx.patunganParticipant.create.mockResolvedValue({ id: 'pp1', status: PatunganParticipantStatus.PENDING, orderId: null });
+    await service.joinGroup('u2', 'g1', { orderId: 'order-milik-orang' } as never);
+    expect(mockTx.patunganParticipant.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ orderId: null }) }),
+    );
+  });
+
+  it('LOW: joinGroup slot penuh ditolak; hitungan di bawah row lock grup', async () => {
+    mockTx.patunganGroup.findFirst.mockResolvedValue({
+      id: 'g1', hostId: 'h1', status: PatunganStatus.OPEN,
+      deadlineAt: new Date(Date.now() + 86400000), mode: PatunganMode.BAGI_RATA,
+      perPersonAmount: 25000000n, targetAmount: 100000000n, slotTotal: 2,
+    });
+    mockTx.patunganGroup.update.mockResolvedValue({});
+    mockTx.patunganParticipant.count.mockResolvedValue(2);
+    await expect(service.joinGroup('u2', 'g1', {} as never)).rejects.toThrow('Slot grup penuh');
+    expect(mockTx.patunganGroup.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'g1' } }),
+    );
+    expect(mockTx.patunganParticipant.create).not.toHaveBeenCalled();
   });
 
   it('initiateRelease menolak bila target belum tercapai (fail closed)', async () => {
@@ -125,16 +156,18 @@ describe('PatunganService', () => {
     await expect(service.initiateRelease('h1', 'g1')).rejects.toThrow('Target belum tercapai');
   });
 
-  it('initiateRelease sukses → CONTEST + contestEndsAt +24j', async () => {
+  it('initiateRelease sukses → CONTEST + contestEndsAt +24j (predicate TARGET_REACHED)', async () => {
     mockPrisma.patunganGroup.findFirst.mockResolvedValue({
       id: 'g1', hostId: 'h1', targetAmount: 100000000n,
       status: PatunganStatus.TARGET_REACHED, participants: [],
     });
-    mockPrisma.patunganGroup.update.mockResolvedValue({ id: 'g1', status: PatunganStatus.CONTEST });
+    mockPrisma.patunganGroup.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.patunganGroup.findUnique.mockResolvedValue({ id: 'g1', status: PatunganStatus.CONTEST });
     const res = await service.initiateRelease('h1', 'g1');
-    expect(res.status).toBe(PatunganStatus.CONTEST);
-    expect(mockPrisma.patunganGroup.update).toHaveBeenCalledWith(
+    expect(res!.status).toBe(PatunganStatus.CONTEST);
+    expect(mockPrisma.patunganGroup.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
+        where: expect.objectContaining({ id: 'g1', status: PatunganStatus.TARGET_REACHED }),
         data: expect.objectContaining({ status: PatunganStatus.CONTEST, contestEndsAt: expect.any(Date) }),
       }),
     );
@@ -151,12 +184,22 @@ describe('PatunganService', () => {
       id: 'o1', buyerId: 'u1', sellerId: 'h1', orderValue: 25000000n, status: OrderStatus.PROCESSING,
     });
     mockTx.patunganParticipant.findFirst.mockResolvedValue(null);
-    mockTx.patunganParticipant.update.mockResolvedValue({ ...participant, status: PatunganParticipantStatus.PAID });
+    mockTx.jastipParticipant.findFirst.mockResolvedValue(null);
+    mockTx.patunganParticipant.updateMany.mockResolvedValue({ count: 1 });
+    mockTx.patunganGroup.findUnique.mockResolvedValue({ status: PatunganStatus.OPEN, targetAmount: 100000000n });
     mockTx.patunganParticipant.aggregate.mockResolvedValue({ _sum: { amount: 25000000n } });
+    mockTx.patunganParticipant.findUnique.mockResolvedValue({ ...participant, status: PatunganParticipantStatus.PAID });
     const res = await service.linkOrder('u1', 'pp1', 'o1');
-    expect(res.status).toBe(PatunganParticipantStatus.PAID);
-    expect(mockTx.patunganParticipant.update).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ orderId: 'o1' }) }),
+    expect(res!.status).toBe(PatunganParticipantStatus.PAID);
+    expect(mockTx.patunganParticipant.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'pp1', status: PatunganParticipantStatus.PENDING }),
+        data: expect.objectContaining({ orderId: 'o1' }),
+      }),
+    );
+    // M4: grup dibaca ulang di dalam tx.
+    expect(mockTx.patunganGroup.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'g1' } }),
     );
   });
 
@@ -171,8 +214,135 @@ describe('PatunganService', () => {
       id: 'o1', buyerId: 'u1', sellerId: 'h1', orderValue: 25000000n, status: OrderStatus.PROCESSING,
     });
     mockTx.patunganParticipant.findFirst.mockResolvedValue({ id: 'pp9' }); // peserta lain
+    mockTx.jastipParticipant.findFirst.mockResolvedValue(null);
     await expect(service.linkOrder('u1', 'pp1', 'o1')).rejects.toThrow('sudah ditautkan');
-    expect(mockTx.patunganParticipant.update).not.toHaveBeenCalled();
+    expect(mockTx.patunganParticipant.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('LOW: linkOrder menolak order yang sudah ditautkan ke peserta JASTIP (lintas modul)', async () => {
+    const participant = {
+      id: 'pp1', userId: 'u1', groupId: 'g1', amount: 25000000n,
+      status: PatunganParticipantStatus.PENDING,
+      group: { id: 'g1', hostId: 'h1', status: PatunganStatus.OPEN, targetAmount: 100000000n },
+    };
+    mockPrisma.patunganParticipant.findFirst.mockResolvedValue(participant);
+    mockPrisma.order.findFirst.mockResolvedValue({
+      id: 'o1', buyerId: 'u1', sellerId: 'h1', orderValue: 25000000n, status: OrderStatus.PROCESSING,
+    });
+    mockTx.patunganParticipant.findFirst.mockResolvedValue(null);
+    mockTx.jastipParticipant.findFirst.mockResolvedValue({ id: 'jp1' }); // order dipakai jastip
+    await expect(service.linkOrder('u1', 'pp1', 'o1')).rejects.toThrow('sudah ditautkan');
+    expect(mockTx.patunganParticipant.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('M4: linkOrder menolak bila peserta sudah PAID (race antar-request)', async () => {
+    const participant = {
+      id: 'pp1', userId: 'u1', groupId: 'g1', amount: 25000000n,
+      status: PatunganParticipantStatus.PENDING,
+      group: { id: 'g1', hostId: 'h1', status: PatunganStatus.OPEN, targetAmount: 100000000n },
+    };
+    mockPrisma.patunganParticipant.findFirst.mockResolvedValue(participant);
+    mockPrisma.order.findFirst.mockResolvedValue({
+      id: 'o1', buyerId: 'u1', sellerId: 'h1', orderValue: 25000000n, status: OrderStatus.PROCESSING,
+    });
+    mockTx.patunganParticipant.findFirst.mockResolvedValue(null);
+    mockTx.jastipParticipant.findFirst.mockResolvedValue(null);
+    mockTx.patunganParticipant.updateMany.mockResolvedValue({ count: 0 }); // kalah race
+    await expect(service.linkOrder('u1', 'pp1', 'o1')).rejects.toThrow('sudah dalam proses');
+  });
+
+  it('M4: linkOrder rollback bila grup berubah status di tengah tx (kalah race vs deadline)', async () => {
+    const participant = {
+      id: 'pp1', userId: 'u1', groupId: 'g1', amount: 25000000n,
+      status: PatunganParticipantStatus.PENDING,
+      group: { id: 'g1', hostId: 'h1', status: PatunganStatus.OPEN, targetAmount: 25000000n },
+    };
+    mockPrisma.patunganParticipant.findFirst.mockResolvedValue(participant);
+    mockPrisma.order.findFirst.mockResolvedValue({
+      id: 'o1', buyerId: 'u1', sellerId: 'h1', orderValue: 25000000n, status: OrderStatus.PROCESSING,
+    });
+    mockTx.patunganParticipant.findFirst.mockResolvedValue(null);
+    mockTx.jastipParticipant.findFirst.mockResolvedValue(null);
+    mockTx.patunganParticipant.updateMany.mockResolvedValue({ count: 1 });
+    mockTx.patunganGroup.findUnique.mockResolvedValue({ status: PatunganStatus.OPEN, targetAmount: 25000000n });
+    mockTx.patunganParticipant.aggregate.mockResolvedValue({ _sum: { amount: 25000000n } });
+    mockTx.patunganGroup.updateMany.mockResolvedValue({ count: 0 }); // grup sudah FAILED oleh deadline
+    await expect(service.linkOrder('u1', 'pp1', 'o1')).rejects.toThrow('berubah status');
+  });
+
+  it('M4: processDeadlines — target tercapai → TARGET_REACHED kondisional, tanpa refund', async () => {
+    mockPrisma.patunganGroup.findMany
+      .mockResolvedValueOnce([{ id: 'g1', hostId: 'h1' }]) // expiredOpen
+      .mockResolvedValueOnce([]); // contestDone
+    mockTx.patunganGroup.findUnique.mockResolvedValue({ status: PatunganStatus.OPEN, targetAmount: 100000000n });
+    mockTx.patunganParticipant.aggregate.mockResolvedValue({ _sum: { amount: 100000000n } });
+    mockTx.patunganGroup.updateMany.mockResolvedValue({ count: 1 });
+    const res = await service.processDeadlines();
+    expect(res.failed).toBe(0);
+    expect(mockTx.patunganGroup.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'g1', status: PatunganStatus.OPEN }),
+        data: { status: PatunganStatus.TARGET_REACHED },
+      }),
+    );
+    expect(mockOrderState.cancelOrder).not.toHaveBeenCalled();
+  });
+
+  it('M4: processDeadlines — target tak tercapai → FAILED kondisional + refund peserta', async () => {
+    mockPrisma.patunganGroup.findMany
+      .mockResolvedValueOnce([{ id: 'g1', hostId: 'h1' }])
+      .mockResolvedValueOnce([]);
+    mockTx.patunganGroup.findUnique.mockResolvedValue({ status: PatunganStatus.OPEN, targetAmount: 100000000n });
+    mockTx.patunganParticipant.aggregate.mockResolvedValue({ _sum: { amount: 25000000n } });
+    mockTx.patunganGroup.updateMany.mockResolvedValue({ count: 1 }); // klaim FAILED berhasil
+    mockPrisma.patunganParticipant.findMany.mockResolvedValue([
+      { id: 'pp1', orderId: 'o1', status: PatunganParticipantStatus.PAID },
+      { id: 'pp2', orderId: null, status: PatunganParticipantStatus.PENDING },
+    ]);
+    mockPrisma.order.findUnique.mockResolvedValue({ orderId: 'ORD-1', status: OrderStatus.WAITING_PAYMENT });
+    mockPrisma.patunganParticipant.updateMany.mockResolvedValue({ count: 1 });
+    const res = await service.processDeadlines();
+    expect(res.failed).toBe(1);
+    expect(mockTx.patunganGroup.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'g1', status: PatunganStatus.OPEN }),
+        data: { status: PatunganStatus.FAILED },
+      }),
+    );
+    expect(mockOrderState.cancelOrder).toHaveBeenCalledWith('ORD-1', 'h1', 'OTHER', expect.any(String));
+    // Peserta PAID → REFUNDED, PENDING → REFUNDED, semua via predicate status.
+    expect(mockPrisma.patunganParticipant.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ status: PatunganParticipantStatus.PAID }) }),
+    );
+  });
+
+  it('M4: processDeadlines — kalah race (grup sudah berpindah) → lewati tanpa refund', async () => {
+    mockPrisma.patunganGroup.findMany
+      .mockResolvedValueOnce([{ id: 'g1', hostId: 'h1' }])
+      .mockResolvedValueOnce([]);
+    mockTx.patunganGroup.findUnique.mockResolvedValue({ status: PatunganStatus.TARGET_REACHED, targetAmount: 100000000n });
+    const res = await service.processDeadlines();
+    expect(res).toEqual({ failed: 0, released: 0 });
+    expect(mockOrderState.cancelOrder).not.toHaveBeenCalled();
+    expect(mockPrisma.patunganParticipant.findMany).not.toHaveBeenCalled();
+  });
+
+  it('M4: processDeadlines — CONTEST → RELEASED kondisional; predicate gagal → lewati', async () => {
+    mockPrisma.patunganGroup.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'g1' }, { id: 'g2' }]);
+    mockTx.patunganGroup.updateMany
+      .mockResolvedValueOnce({ count: 1 }) // g1: masih CONTEST
+      .mockResolvedValueOnce({ count: 0 }); // g2: sudah berpindah (dispute)
+    mockTx.patunganParticipant.updateMany.mockResolvedValue({ count: 1 });
+    const res = await service.processDeadlines();
+    expect(res.released).toBe(1);
+    expect(mockTx.patunganGroup.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'g1', status: PatunganStatus.CONTEST }),
+        data: expect.objectContaining({ status: PatunganStatus.RELEASED }),
+      }),
+    );
   });
 
   it('linkOrder menolak order yang belum dibayar', async () => {

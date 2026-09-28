@@ -57,13 +57,20 @@ export const VERIFICATION_BADGE_TYPES = [
 export type VerificationBadgeType = (typeof VERIFICATION_BADGE_TYPES)[number];
 
 /**
- * TTL cache badge. Sengaja beberapa detik saja: cukup untuk meredam N pembacaan
- * profil per request halaman, tapi tidak cukup lama untuk membuat badge yang
- * sudah di-revoke tetap tampil. Setiap titik revoke juga memanggil
- * {@link VerificationBadgeService.invalidate} post-commit, jadi jalur normalnya
- * adalah invalid, bukan tunggu TTL.
+ * TTL cache badge. PERF-FIX BD-001: dinaikkan dari 5 detik ke 600 detik
+ * (10 menit). TTL 5 detik membuat hit rate Redis praktis 0% (audit:
+ * 8,08% dalam 19 hari) — setiap halaman feed memicu ~20 query DB yang
+ * tidak perlu. Data badge berubah jarang (status KYC/VIP/langganan),
+ * dan SETIAP titik yang mengubah sumber kebenaran badge memanggil
+ * {@link VerificationBadgeService.invalidate} post-commit (admin-kyc,
+ * admin-badges, admin-business-verification, admin-subscriptions,
+ * admin-users, business-verification, subscription-expiry,
+ * subscription-auto-resume, subscriptions), jadi jalur normalnya adalah
+ * invalidasi eksplisit, bukan tunggu TTL. Staleness maksimum 10 menit
+ * hanya untuk perubahan yang tidak lewat titik-titik tersebut (mis.
+ * pengisian alamat profil — kosmetik, bukan keamanan).
  */
-export const VERIFICATION_BADGE_CACHE_TTL_SECONDS = 5;
+export const VERIFICATION_BADGE_CACHE_TTL_SECONDS = 600;
 
 export interface VerificationBadge {
   /** Identifier stabil untuk logika UI (jangan pakai label untuk branching). */
@@ -254,7 +261,7 @@ export function computeVerificationBadges(
   // Urutan prioritas tampil sudah eksplisit; sort stabil agar UI bisa langsung
   // render tanpa mengurutkan sendiri.
   return badges.sort((a, b) => a.priority - b.priority);
-  }
+}
 
 @Injectable()
 export class VerificationBadgeService {
@@ -279,29 +286,120 @@ export class VerificationBadgeService {
   }
 
   /**
-   * Batch seal tier untuk banyak user sekaligus (dipakai feed, search, chat).
-   * Memakai getBadges yang read-through Redis cache, jadi tidak N+1 ke DB
-   * bila cache hangat. Return Map userId -> tier (null bila tidak ada seal).
+   * Batch badge untuk banyak user sekaligus (dipakai feed, search, chat).
+   * PERF-FIX BD-002: cache dibaca paralel per key; untuk SEMUA cache miss
+   * hanya SATU `user.findMany` + SATU `businessVerification.findMany`
+   * (bukan N `findFirst`). Dipadukan dengan TTL 600 dtk (BD-001), miss
+   * menjadi langka dan kalaupun miss biayanya 2 query, bukan 20-40.
+   *
+   * User yang tidak ada di DB (soft-deleted) DIABAIKAN dari map hasil —
+   * pemanggil yang butuh tier memakai {@link getSealTierMap} (null),
+   * pemanggil yang butuh daftar badge memakai `?? []`.
+   * Gagal batch load tidak melempar — yang hit cache tetap terlayani.
    */
-  async getSealTierMap(userIds: string[]): Promise<Map<string, SealTier | null>> {
+  async getBadgesBatch(userIds: string[]): Promise<Map<string, VerificationBadge[]>> {
     const unique = [...new Set(userIds.filter(Boolean))];
-    const entries = await Promise.all(
-      unique.map(async (userId): Promise<[string, SealTier | null]> => {
+    const result = new Map<string, VerificationBadge[]>();
+    if (unique.length === 0) return result;
+
+    // 1) Read-through cache, paralel (1 RTT Redis per key, bukan per query DB).
+    const cached = await Promise.all(
+      unique.map(async (userId): Promise<[string, VerificationBadge[] | null]> => {
         try {
-          const badges = await this.getBadges(userId);
-          return [userId, getSealTierFromTypes(badges.map((b) => b.type))];
+          const raw = await this.redis.get(PROFILE_VERIFICATION_BADGES(userId));
+          if (!raw) return [userId, null];
+          const badges = await this.parseCachedBadges(raw, userId);
+          return [userId, badges];
         } catch {
           return [userId, null];
         }
       }),
     );
-    return new Map(entries);
+    const missed: string[] = [];
+    for (const [userId, badges] of cached) {
+      if (badges) {
+        result.set(userId, badges);
+      } else {
+        missed.push(userId);
+      }
+    }
+
+    // 2) Cache miss → batch load SATU kali untuk semua, lalu hangatkan cache.
+    if (missed.length > 0) {
+      let badgeMap: Map<string, VerificationBadge[]>;
+      try {
+        badgeMap = await this.loadBadgesBatch(missed);
+      } catch (err) {
+        this.logger.warn(
+          `getBadgesBatch batch load failed for ${missed.length} users: ${(err as Error).message}`,
+        );
+        return result;
+      }
+      await Promise.all(
+        missed.map(async (userId) => {
+          const badges = badgeMap.get(userId);
+          // User tidak ada / soft-deleted → diabaikan (konsisten dengan
+          // perilaku lama loadBadges yang throw NotFoundException).
+          if (!badges) return;
+          result.set(userId, badges);
+          await this.redis
+            .setex(PROFILE_VERIFICATION_BADGES(userId), VERIFICATION_BADGE_CACHE_TTL_SECONDS, JSON.stringify(badges))
+            .catch((err: unknown) =>
+              this.logger.warn(
+                `Failed to cache verification badges for ${userId}: ${err instanceof Error ? err.message : String(err)}`,
+              ),
+            );
+        }),
+      );
+    }
+    return result;
   }
 
   /**
-   * Ambil badge aktif untuk satu user (read-through cache, TTL beberapa detik).
-   * Cache di-invalidate eksplisit oleh setiap titik revoke — lihat
-   * admin-kyc.service, subscription-expiry.service, dan admin-business-verification.service.
+   * Batch seal tier untuk banyak user sekaligus (dipakai feed, search, chat).
+   * Dibangun di atas {@link getBadgesBatch} — user yang tidak ada di DB
+   * (soft-deleted) mendapat tier null, bukan error.
+   */
+  async getSealTierMap(userIds: string[]): Promise<Map<string, SealTier | null>> {
+    const unique = [...new Set(userIds.filter(Boolean))];
+    const badgeMap = await this.getBadgesBatch(unique);
+    return new Map(unique.map((userId) => {
+      const badges = badgeMap.get(userId);
+      return [userId, badges ? getSealTierFromTypes(badges.map((b) => b.type)) : null] as [string, SealTier | null];
+    }));
+  }
+
+  /**
+   * Parse isi cache badge. Return null bila kosong/korup (pemanggil
+   * menghapus key korup supaya dihitung ulang, bukan 500).
+   */
+  private async parseCachedBadges(raw: string, userId: string): Promise<VerificationBadge[] | null> {
+    try {
+      const parsed = JSON.parse(raw) as Array<Omit<VerificationBadge, 'earnedAt'> & { earnedAt: string | null }>;
+      if (!Array.isArray(parsed)) {
+        await this.redis.del(PROFILE_VERIFICATION_BADGES(userId));
+        return null;
+      }
+      return parsed.map((badge) => ({
+        ...badge,
+        earnedAt: badge.earnedAt ? new Date(badge.earnedAt) : null,
+      }));
+    } catch (err) {
+      // Cache korup bukan alasan untuk 500 — buang dan hitung ulang.
+      this.logger.warn(`Corrupt verification-badge cache for ${userId}: ${(err as Error).message}`);
+      await this.redis.del(PROFILE_VERIFICATION_BADGES(userId));
+      return null;
+    }
+  }
+
+  /**
+   * Ambil badge aktif untuk satu user (read-through cache, TTL 10 menit —
+   * lihat BD-001). Cache di-invalidate eksplisit oleh setiap titik yang
+   * mengubah sumber kebenaran badge — lihat admin-kyc.service,
+   * admin-badges.service, subscription-expiry.service,
+   * admin-business-verification.service, admin-subscriptions.service,
+   * admin-users.service, business-verification.service, dan
+   * subscriptions.service.
    */
   async getBadges(userId: string, opts?: { skipCache?: boolean }): Promise<VerificationBadge[]> {
     const cacheKey = PROFILE_VERIFICATION_BADGES(userId);
@@ -309,19 +407,8 @@ export class VerificationBadgeService {
     if (!opts?.skipCache) {
       const cached = await this.redis.get(cacheKey);
       if (cached) {
-        try {
-          const parsed = JSON.parse(cached) as Array<Omit<VerificationBadge, 'earnedAt'> & { earnedAt: string | null }>;
-          if (Array.isArray(parsed)) {
-            return parsed.map((badge) => ({
-              ...badge,
-              earnedAt: badge.earnedAt ? new Date(badge.earnedAt) : null,
-            }));
-          }
-        } catch (err) {
-          // Cache korup bukan alasan untuk 500 — buang dan hitung ulang.
-          this.logger.warn(`Corrupt verification-badge cache for ${userId}: ${(err as Error).message}`);
-          await this.redis.del(cacheKey);
-        }
+        const badges = await this.parseCachedBadges(cached, userId);
+        if (badges) return badges;
       }
     }
 
@@ -336,11 +423,20 @@ export class VerificationBadgeService {
     return badges;
   }
 
-  /** Baca state dari DB dan hitung badge. Tidak menyentuh cache. */
-  async loadBadges(userId: string, now: Date = new Date()): Promise<VerificationBadge[]> {
-    const user = await this.prisma.user.findFirst({
+  /**
+   * Baca state dari DB dan hitung badge untuk BANYAK user sekaligus.
+   * PERF-FIX BD-002: satu `user.findMany({ id: { in } })` + satu
+   * `businessVerification.findMany` untuk akun BUSINESS — menggantikan N
+   * `findFirst` per user. Tidak menyentuh cache.
+   */
+  async loadBadgesBatch(userIds: string[], now: Date = new Date()): Promise<Map<string, VerificationBadge[]>> {
+    const unique = [...new Set(userIds.filter(Boolean))];
+    const result = new Map<string, VerificationBadge[]>();
+    if (unique.length === 0) return result;
+
+    const users = await this.prisma.user.findMany({
       // Soft-delete guard: badge user terhapus tidak boleh tampil.
-      where: { id: userId, deletedAt: null },
+      where: { id: { in: unique }, deletedAt: null },
       select: {
         id: true,
         accountType: true,
@@ -361,22 +457,45 @@ export class VerificationBadgeService {
         deletedAt: true,
       },
     });
-    if (!user) {
-      throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+
+    // Baris APPROVED paling baru per user. Satu query untuk semua akun
+    // BUSINESS. Diurutkan eksplisit di aplikasi (approvedAt desc, id desc)
+    // agar tidak bergantung pada urutan kembalian DB; baris pertama per
+    // userId = hasil yang sama dengan findFirst per user.
+    const businessIds = users.filter((u) => u.accountType === UserAccountType.BUSINESS).map((u) => u.id);
+    const bvByUser = new Map<string, BadgeSourceBusinessVerification>();
+    if (businessIds.length > 0) {
+      const bvRows = await this.prisma.businessVerification.findMany({
+        where: { userId: { in: businessIds }, status: BusinessVerificationStatus.APPROVED },
+        orderBy: [{ approvedAt: 'desc' }, { id: 'desc' }],
+        select: { userId: true, status: true, approvedAt: true },
+      });
+      const sorted = [...bvRows].sort((a, b) => {
+        const at = a.approvedAt ? new Date(a.approvedAt).getTime() : 0;
+        const bt = b.approvedAt ? new Date(b.approvedAt).getTime() : 0;
+        if (bt !== at) return bt - at;
+        return String((b as { id?: unknown }).id ?? '').localeCompare(String((a as { id?: unknown }).id ?? ''));
+      });
+      for (const row of sorted) {
+        if (!bvByUser.has(row.userId)) {
+          bvByUser.set(row.userId, { status: row.status, approvedAt: row.approvedAt });
+        }
+      }
     }
 
-    // Baris APPROVED paling baru. approvedAt dipertahankan walau nanti REVOKED,
-    // jadi filter status di sini yang menentukan badge — bukan approvedAt.
-    const businessVerification =
-      user.accountType === UserAccountType.BUSINESS
-        ? await this.prisma.businessVerification.findFirst({
-            where: { userId, status: BusinessVerificationStatus.APPROVED },
-            orderBy: [{ approvedAt: 'desc' }, { id: 'desc' }],
-            select: { status: true, approvedAt: true },
-          })
-        : null;
+    for (const user of users) {
+      result.set(user.id, this.computeBadges(user, bvByUser.get(user.id) ?? null, now));
+    }
+    return result;
+  }
 
-    return this.computeBadges(user, businessVerification, now);
+  /** Baca state dari DB dan hitung badge. Tidak menyentuh cache. */
+  async loadBadges(userId: string, now: Date = new Date()): Promise<VerificationBadge[]> {
+    const badges = (await this.loadBadgesBatch([userId], now)).get(userId);
+    if (!badges) {
+      throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    }
+    return badges;
   }
 
   /**
@@ -384,8 +503,8 @@ export class VerificationBadgeService {
    * yang mengubah sumber kebenaran badge (approve/revoke KYC, subscribe/expire
    * Kahade+, approve/revoke business verification, grant/revoke trust admin).
    *
-   * Gagal invalidate TIDAK boleh membatalkan aksi utamanya — TTL pendek sudah
-   * membatasi staleness, jadi cukup log.
+   * Gagal invalidate TIDAK boleh membatalkan aksi utamanya — TTL 600 dtk
+   * membatasi staleness maksimum, jadi cukup log.
    */
   async invalidate(userId: string): Promise<void> {
     await this.redis.del(PROFILE_VERIFICATION_BADGES(userId)).catch((err: unknown) =>

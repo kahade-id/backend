@@ -1043,13 +1043,16 @@ export class ChatService implements OnModuleInit {
       }
     }
 
+    // BD-006: satu cache signing per request — lampiran yang sama di pesan
+    // berbeda tidak di-signing ulang.
+    const signCache = new Map<string, { url: string; urlExpiresAt: string | null }>();
     const responseMessages = await Promise.all(messages.map(async (message) => ({
       ...message,
       attachments: await Promise.all(message.attachments.map(async (attachment) => {
         // Batch 139 BE-API2 (item 122): urlExpiresAt — kapan signed URL
         // lampiran ini kedaluwarsa (ISO absolut).
-        const file = await this.toReadableAttachment(attachment.fileUrl);
-        const thumb = attachment.thumbnailUrl ? await this.toReadableAttachment(attachment.thumbnailUrl) : null;
+        const file = await this.toReadableAttachment(attachment.fileUrl, signCache);
+        const thumb = attachment.thumbnailUrl ? await this.toReadableAttachment(attachment.thumbnailUrl, signCache) : null;
         return {
           ...attachment,
           fileUrl: file.url,
@@ -2304,8 +2307,18 @@ export class ChatService implements OnModuleInit {
    */
   private static readonly ATTACHMENT_URL_TTL_SECONDS = 300;
 
-  private async toReadableAttachment(rawUrl: string): Promise<{ url: string; urlExpiresAt: string | null }> {
+  /**
+   * BD-006 (perf-fix): cache signed URL per-request. `cache` diisi pemanggil
+   * (satu Map per request daftar pesan/lampiran) — URL yang sama tidak
+   * di-signing ulang berkali-kali dalam satu request.
+   */
+  private async toReadableAttachment(
+    rawUrl: string,
+    cache?: Map<string, { url: string; urlExpiresAt: string | null }>,
+  ): Promise<{ url: string; urlExpiresAt: string | null }> {
     if (!rawUrl || !this.uploadService) return { url: rawUrl, urlExpiresAt: null };
+    const cached = cache?.get(rawUrl);
+    if (cached) return cached;
     try {
       // URL signing is intentionally performed at read time, not persisted with
       // the message. Persisted chat records must remain readable after expiry.
@@ -2316,10 +2329,12 @@ export class ChatService implements OnModuleInit {
       if (!fileKey) return { url: rawUrl, urlExpiresAt: null };
       const url = await this.uploadService.generateDownloadUrl(fileKey, ChatService.ATTACHMENT_URL_TTL_SECONDS);
       if (!url) return { url: '', urlExpiresAt: null };
-      return {
+      const signed = {
         url,
         urlExpiresAt: new Date(Date.now() + ChatService.ATTACHMENT_URL_TTL_SECONDS * 1000).toISOString(),
       };
+      cache?.set(rawUrl, signed);
+      return signed;
     } catch (error) {
       this.logger.warn(`Unable to sign chat attachment URL: ${(error as Error).message}`);
       return { url: '', urlExpiresAt: null };
@@ -2359,10 +2374,12 @@ export class ChatService implements OnModuleInit {
       }),
     ]);
 
+    // BD-006: satu cache signing per request.
+    const signCache = new Map<string, { url: string; urlExpiresAt: string | null }>();
     const readableAttachments = await Promise.all(attachments.map(async (attachment) => {
       // Batch 139 BE-API2 (item 122): urlExpiresAt — konsisten dengan daftar pesan.
-      const file = await this.toReadableAttachment(attachment.fileUrl);
-      const thumb = attachment.thumbnailUrl ? await this.toReadableAttachment(attachment.thumbnailUrl) : null;
+      const file = await this.toReadableAttachment(attachment.fileUrl, signCache);
+      const thumb = attachment.thumbnailUrl ? await this.toReadableAttachment(attachment.thumbnailUrl, signCache) : null;
       return {
         ...attachment,
         fileUrl: file.url,

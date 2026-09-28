@@ -115,6 +115,28 @@ export class SearchService {
     return { cleared: true };
   }
 
+  /**
+   * BE-IMP (item 75): hapus SATU entri riwayat pencarian.
+   *
+   * Riwayat disimpan sebagai Redis list berisi string query mentah, jadi
+   * identitas satu item = teks query-nya (frontend mengirim URL-encoded via
+   * path param `:id`). `LREM key 0 query` menghapus SEMUA kemunculan teks
+   * yang sama — konsisten dengan saveSearchHistory yang men-dedupe via
+   * LREM sebelum LPUSH, sehingga satu teks query maksimal muncul sekali.
+   */
+  async removeSearchHistoryItem(userId: string, query: string): Promise<{ removed: boolean }> {
+    const q = (query ?? '').trim();
+    if (!q) return { removed: false };
+    const key = `search_history:${userId}`;
+    try {
+      const client = this.redis.getClient();
+      const removed = await client.lrem(key, 0, q);
+      return { removed: removed > 0 };
+    } catch {
+      return { removed: false };
+    }
+  }
+
   async suggestions(userId: string, query: string, limit?: number): Promise<object> {
     const q = this.normalizeQuery(query);
     if (!q || q.length < 2) return { suggestions: [] };

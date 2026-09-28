@@ -3,6 +3,7 @@ import { BadRequestException } from '@nestjs/common';
 import { AdminSupportService } from '../admin-support.service';
 import { PrismaService } from '../../../../prisma/prisma.service';
 import { AuditLogService } from '../../../../common/services/audit-log.service';
+import { UploadService } from '../../../upload/upload.service';
 
 const mockPrisma = {
   supportTicket: { findMany: jest.fn(), count: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
@@ -12,6 +13,7 @@ const mockPrisma = {
   $transaction: jest.fn(),
 };
 const mockAuditLog = { logAdminAction: jest.fn() };
+const mockUpload = { verifyUserFileKeys: jest.fn().mockResolvedValue(undefined) };
 
 describe('AdminSupportService', () => {
   let service: AdminSupportService;
@@ -24,6 +26,7 @@ describe('AdminSupportService', () => {
         AdminSupportService,
         { provide: PrismaService, useValue: mockPrisma },
         { provide: AuditLogService, useValue: mockAuditLog },
+        { provide: UploadService, useValue: mockUpload },
       ],
     }).compile();
     service = module.get(AdminSupportService);
@@ -59,6 +62,18 @@ describe('AdminSupportService', () => {
     await service.replyToTicket('t1', 'admin-1', 'reply', '127.0.0.1');
     expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
     expect(mockPrisma.supportTicketReply.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ senderType: 'ADMIN' }) }));
+  });
+
+  it('BE-IMP (item 130): balasan admin menyimpan attachments yang sudah diverifikasi', async () => {
+    mockPrisma.supportTicket.findUnique.mockResolvedValue({ id: 't1', userId: 'u1', status: 'OPEN' });
+    mockPrisma.supportTicketReply.create.mockResolvedValue({ id: 'r1' });
+    mockPrisma.supportTicket.update.mockResolvedValue({});
+    const keys = ['uploads/chat-attachment/admin-1/screenshot.png'];
+    await service.replyToTicket('t1', 'admin-1', 'silakan lihat lampiran', '127.0.0.1', keys);
+    expect(mockUpload.verifyUserFileKeys).toHaveBeenCalledWith('admin-1', keys, expect.anything());
+    expect(mockPrisma.supportTicketReply.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ attachments: keys }),
+    }));
   });
 
   it.each(['RESOLVED', 'CLOSED'])('rejects reopening a %s ticket', async (status) => {

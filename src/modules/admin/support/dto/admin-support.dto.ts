@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsIn, IsBoolean, MinLength, MaxLength, IsInt, Min, Matches } from 'class-validator';
+import { IsString, IsOptional, IsIn, IsBoolean, IsArray, MinLength, MaxLength, IsInt, Min, Matches, ArrayMaxSize } from 'class-validator';
 import { Type, Transform } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -30,6 +30,12 @@ export class AdminTicketQueryDto {
 
 export class AdminTicketReplyDto {
   @ApiProperty() @IsString() @MinLength(1) @MaxLength(4000) @Matches(/\S/, { message: 'message cannot be blank' }) message!: string;
+
+  // BE-IMP (item 130): lampiran pada balasan tiket oleh admin. Validasi sama
+  // dengan balasan user (maks 5, format file key uploads/...).
+  @ApiPropertyOptional({ description: 'Attachment file keys (max 5)', type: [String] })
+  @IsOptional() @IsArray() @ArrayMaxSize(5, { message: 'Maximum 5 attachments per ticket reply' }) @IsString({ each: true }) @MaxLength(512, { each: true }) @Matches(/^uploads\/[a-z-]+\/[A-Za-z0-9_-]+\/[\w.-]+$/, { each: true, message: 'Invalid attachment file key' })
+  attachments?: string[];
 }
 
 export class AdminTicketStatusDto {

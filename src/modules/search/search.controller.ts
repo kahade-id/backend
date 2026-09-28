@@ -1,4 +1,4 @@
-import { Controller, Get, Delete, Query, UseGuards, BadRequestException } from '@nestjs/common';
+import { Controller, Delete, Get, Param, Query, UseGuards, BadRequestException } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { SearchService } from './search.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -88,6 +88,27 @@ export class SearchController {
   @ApiOperation({ summary: 'Clear search history' })
   async clearHistory(@CurrentUser('sub') userId: string): Promise<object> {
     return this.searchService.clearSearchHistory(userId);
+  }
+
+  /**
+   * BE-IMP (item 75): hapus satu entri riwayat pencarian.
+   *
+   * `:id` = teks query yang di-URL-encode (identitas item di Redis list).
+   * Contoh: `DELETE /v1/search/history/kopi%20susu` menghapus "kopi susu".
+   */
+  @Delete('history/:id')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @ApiOperation({ summary: 'Delete one search history entry (13.2)' })
+  async deleteHistoryItem(
+    @CurrentUser('sub') userId: string,
+    @Param('id') id: string,
+  ): Promise<object> {
+    const query = (id ?? '').trim();
+    if (!query || query.length > 200) {
+      throw new BadRequestException({ code: 'SEARCH_HISTORY_INVALID', message: 'Invalid search history entry' });
+    }
+    return this.searchService.removeSearchHistoryItem(userId, query);
   }
 
   /**

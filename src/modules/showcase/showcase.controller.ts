@@ -89,6 +89,67 @@ export class ShowcaseController {
   }
 
   // ------------------------------------------------------------------
+  // Karya tersimpan — koleksi pribadi (BE-IMP, item 54)
+  // Path statis 'saved' HARUS di sini (sebelum :showcaseId), kalau tidak
+  // "saved" ditangkap sebagai id showcase.
+  // ------------------------------------------------------------------
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @Get('saved')
+  @ApiOperation({
+    summary: 'List your saved showcase items (newest first)',
+    description:
+      'BE-IMP (item 54): sinkronisasi "Karya tersimpan". Mengembalikan kartu ' +
+      'showcase publik (bentuk sama seperti feed) + `savedAt` per item. ' +
+      'Pagination offset (?page&limit, maks 100) + tiebreak id agar stabil. ' +
+      'Item yang sudah nonaktif/terhapus tetap dikembalikan supaya klien bisa ' +
+      'membersihkan bookmark lokalnya.',
+  })
+  async listSavedShowcases(
+    @CurrentUser('sub') userId: string,
+    @Query() pagination: PaginationDto,
+  ): Promise<object> {
+    return this.showcaseService.listSavedShowcases(
+      userId,
+      pagination.page ?? 1,
+      pagination.limit ?? 20,
+    );
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Post('saved/:showcaseId')
+  @Idempotency()
+  @ApiOperation({
+    summary: 'Save (bookmark) a showcase item',
+    description:
+      'BE-IMP (item 54): alias koleksi dari `POST :showcaseId/save`. ' +
+      'Sudah save → 409 SHOWCASE_ALREADY_SAVED.',
+  })
+  async saveShowcaseViaCollection(
+    @CurrentUser('sub') userId: string,
+    @Param('showcaseId', ParseIdPipe) showcaseId: string,
+  ): Promise<object> {
+    return this.showcaseService.saveShowcase(userId, showcaseId);
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Delete('saved/:showcaseId')
+  @Idempotency()
+  @ApiOperation({
+    summary: 'Remove a showcase item from your saved collection',
+    description: 'BE-IMP (item 54): alias koleksi dari `DELETE :showcaseId/save`.',
+  })
+  async unsaveShowcaseViaCollection(
+    @CurrentUser('sub') userId: string,
+    @Param('showcaseId', ParseIdPipe) showcaseId: string,
+  ): Promise<object> {
+    return this.showcaseService.unsaveShowcase(userId, showcaseId);
+  }
+
+  // ------------------------------------------------------------------
   // Moderasi komentar (dideklarasikan sebelum :showcaseId)
   // ------------------------------------------------------------------
 

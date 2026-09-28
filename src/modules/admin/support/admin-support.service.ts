@@ -5,6 +5,8 @@ import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditAction, Prisma, SupportTicketStatus, SupportTicketCategory, SupportTicketSenderType, NotificationType } from '@prisma/client';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
 import { getCategoryForType } from '../../notifications/notification-category.map';
+import { UploadService } from '../../upload/upload.service';
+import { UploadPurpose } from '../../upload/dto/presigned-url.dto';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { escapeLikePattern } from '../../../common/utils/search.util';
 
@@ -15,6 +17,7 @@ export class AdminSupportService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditLog: AuditLogService,
+    private readonly uploadService: UploadService,
   ) {}
 
   async listTickets(page: number, limit: number, status?: string, category?: string, search?: string, priority?: boolean): Promise<object> {
@@ -86,7 +89,18 @@ export class AdminSupportService {
     };
   }
 
-  async replyToTicket(ticketId: string, adminId: string, message: string, ipAddress: string): Promise<object> {
+  async replyToTicket(
+    ticketId: string,
+    adminId: string,
+    message: string,
+    ipAddress: string,
+    attachments: string[] = [],
+  ): Promise<object> {
+    // BE-IMP (item 130): lampiran balasan admin diverifikasi seperti balasan
+    // user — key harus milik admin yang mengunggah, purpose CHAT_ATTACHMENT.
+    // Verifikasi di luar transaksi supaya kegagalan validasi tidak membuka
+    // transaksi DB sia-sia.
+    await this.uploadService.verifyUserFileKeys(adminId, attachments, UploadPurpose.CHAT_ATTACHMENT);
     const reply = await this.prisma.$transaction(async (tx) => {
       const ticket = await tx.supportTicket.findUnique({ where: { id: ticketId } });
       if (!ticket) throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Ticket not found' });
@@ -94,7 +108,7 @@ export class AdminSupportService {
         throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'Cannot reply to a closed or resolved ticket' });
       }
       const created = await tx.supportTicketReply.create({
-        data: { ticketId, senderId: adminId, senderType: SupportTicketSenderType.ADMIN, message: message.trim() },
+        data: { ticketId, senderId: adminId, senderType: SupportTicketSenderType.ADMIN, message: message.trim(), attachments },
       });
       await tx.supportTicket.update({
         where: { id: ticketId },

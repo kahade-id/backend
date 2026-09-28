@@ -102,6 +102,12 @@ export class SupportService {
   }
 
   async replyToTicket(userId: string, ticketId: string, dto: ReplyTicketDto): Promise<object> {
+    // BE-IMP (item 130): lampiran balasan diverifikasi seperti lampiran tiket
+    // utama — key harus milik user, purpose CHAT_ATTACHMENT, maks 5 file.
+    // Verifikasi di luar transaksi (pola createTicket) supaya kegagalan
+    // validasi tidak membuka transaksi DB sia-sia.
+    const attachments = dto.attachments ?? [];
+    await this.uploadService.verifyUserFileKeys(userId, attachments, UploadPurpose.CHAT_ATTACHMENT);
     const reply = await this.prisma.$transaction(async (tx) => {
       const ticket = await tx.supportTicket.findUnique({ where: { id: ticketId } });
       if (!ticket) throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Ticket not found' });
@@ -110,7 +116,7 @@ export class SupportService {
         throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'Cannot reply to a closed or resolved ticket' });
       }
       const created = await tx.supportTicketReply.create({
-        data: { ticketId, senderId: userId, senderType: 'USER', message: dto.message.trim() },
+        data: { ticketId, senderId: userId, senderType: 'USER', message: dto.message.trim(), attachments },
       });
       await tx.supportTicket.update({ where: { id: ticketId }, data: { updatedAt: new Date() } });
       return created;

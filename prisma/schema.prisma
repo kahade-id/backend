@@ -3657,6 +3657,9 @@ model SupportTicketReply {
   senderId   String
   senderType SupportTicketSenderType @default(USER)
   message    String                  @db.Text
+  // BE-IMP (item 130): lampiran pada balasan tiket (maks 5 file key,
+  // diverifikasi via UploadService seperti lampiran tiket utama).
+  attachments Json @default("[]")
 
   createdAt DateTime @default(now())
 

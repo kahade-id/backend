@@ -58,7 +58,7 @@ sejak 2026-09-26) — BUKAN bagian dari backup rutin; aksesnya read-only.
 
 | Tanggal | Cakupan | Pelaku | Hasil | Temuan |
 |---|---|---|---|---|
-| (belum ada) | | | | |
+| 2026-09-28 ~20:20 WIB | Restore DB penuh (pertama) | Agen otonom (Wave 3) | BERHASIL | Backup `kahade_prod_20260928_020002.dump.gpg` (02:00 WIB, AES256, passphrase-file OK) → decrypt OK → `pg_restore` ke DB staging `kahade_restore_test` 2 detik tanpa error → 144 tabel, 103 migrasi prisma, row count vs produksi: users 6=6, orders 15 vs 17, wallet_tx 82 vs 83, payments 52 vs 53 (selisih = drift wajar, backup 18,5 jam lebih tua) → kolom PII terenkripsi utuh (6/6 non-null) → DB staging di-DROP, file decrypt di-shred. Produksi tidak tersentuh. |
 
 ## Larangan
 

@@ -53,6 +53,14 @@ export class PatunganController {
     return this.service.linkOrder(userId, participantId, dto.orderId);
   }
 
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Post('participants/:participantId/leave')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Keluar dari grup patungan (hanya peserta PENDING)' })
+  leaveGroup(@CurrentUser('sub') userId: string, @Param('participantId') participantId: string) {
+    return this.service.leaveGroup(userId, participantId);
+  }
+
   @Throttle({ default: { ttl: 60000, limit: 20 } })
   @Post('groups/:id/initiate-release')
   @HttpCode(200)

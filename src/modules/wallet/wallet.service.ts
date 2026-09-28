@@ -72,7 +72,7 @@ import {
 } from '../../common/constants/app.constants';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
-import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
+import { createHasNextPaginatedResponse, PaginatedResponse, sliceLimitPlusOne } from '../../common/dto/pagination.dto';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { MidtransService } from '../payment/midtrans.service';
 import { OtpService } from '../auth/otp.service';
@@ -412,18 +412,20 @@ export class WalletService implements OnModuleInit {
       }
     }
 
-    const [transactions, total] = await Promise.all([
-      this.prisma.walletTransaction.findMany({
-        where,
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
-        skip,
-        take: safeLimit,
-        include: { order: { select: { orderId: true, title: true } } },
-      }),
-      this.prisma.walletTransaction.count({ where }),
-    ]);
+    // BD-008 (perf-fix 2026-09-29): tanpa COUNT(*) per halaman — limit+1
+    // menentukan hasNext (COUNT memindai index range linear mengikuti
+    // pertumbuhan riwayat user). Bukan perubahan finansial: where & mapping
+    // tidak berubah, hanya metadata paginasi.
+    const fetched = await this.prisma.walletTransaction.findMany({
+      where,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
+      skip,
+      take: safeLimit + 1,
+      include: { order: { select: { orderId: true, title: true } } },
+    });
+    const { rows: transactions, hasNext } = sliceLimitPlusOne(fetched, safeLimit);
 
-    return createPaginatedResponse(
+    return createHasNextPaginatedResponse(
       transactions.map(tx => ({
         id: tx.id,
         txId: tx.txId,
@@ -436,9 +438,9 @@ export class WalletService implements OnModuleInit {
         createdAt: tx.createdAt,
         order: tx.order,
       })),
-      total,
       safePage,
       safeLimit,
+      hasNext,
     );
   }
 

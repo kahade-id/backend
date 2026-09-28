@@ -873,7 +873,7 @@ describe('WalletService', () => {
   // ─── getTransactions ─────────────────────────────────────────────
 
   describe('getTransactions', () => {
-    it('should return paginated transactions', async () => {
+    it('should return paginated transactions without COUNT (BD-008)', async () => {
       mockPrisma.wallet.findUnique.mockResolvedValue(mockWallet);
       mockPrisma.walletTransaction.findMany.mockResolvedValue([]);
       mockPrisma.walletTransaction.count.mockResolvedValue(0);
@@ -884,8 +884,40 @@ describe('WalletService', () => {
       >;
 
       expect(result).toHaveProperty('data');
-      expect(result.total).toBe(0);
+      expect(result).not.toHaveProperty('total');
       expect(result.page).toBe(1);
+      expect(result.hasNext).toBe(false);
+      expect(mockPrisma.walletTransaction.count).not.toHaveBeenCalled();
+      // take = limit + 1 untuk probe hasNext.
+      expect(mockPrisma.walletTransaction.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 11 }),
+      );
+    });
+
+    it('should set hasNext=true and slice the probe row when more pages exist (BD-008)', async () => {
+      mockPrisma.wallet.findUnique.mockResolvedValue(mockWallet);
+      const rows = Array.from({ length: 11 }, (_, i) => ({
+        id: `tx-${i}`,
+        txId: `TX-${i}`,
+        type: 'TOP_UP',
+        status: 'COMPLETED',
+        amount: BigInt(10000),
+        description: 'topup',
+        balanceBefore: BigInt(0),
+        balanceAfter: BigInt(10000),
+        createdAt: new Date(),
+        order: null,
+      }));
+      mockPrisma.walletTransaction.findMany.mockResolvedValue(rows);
+
+      const result = (await service.getTransactions('user-1', 1, 10)) as unknown as Record<
+        string,
+        unknown
+      >;
+
+      expect(result.hasNext).toBe(true);
+      expect((result.data as unknown[])).toHaveLength(10);
+      expect(result.totalPages).toBe(2);
     });
 
     it('should throw NotFoundException when wallet not found', async () => {

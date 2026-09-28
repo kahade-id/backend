@@ -1,7 +1,7 @@
 import { Injectable, Logger, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { Prisma, Notification, NotificationPreference, NotificationCategory, NotificationType } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
-import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
+import { createHasNextPaginatedResponse, PaginatedResponse, sliceLimitPlusOne } from '../../common/dto/pagination.dto';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { UpdatePreferencesDto } from './dto/update-preferences.dto';
 import { customAlphabet } from 'nanoid';
@@ -182,21 +182,22 @@ export class NotificationsService {
       where.category = category;
     }
 
-    const [rows, total] = await Promise.all([
-      this.prisma.notification.findMany({
-        where,
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
-        skip: (safePage - 1) * safeLimit,
-        take: safeLimit,
-        select: PUBLIC_NOTIFICATION_SELECT,
-      }),
-      this.prisma.notification.count({ where }),
-    ]);
+    // BD-008 (perf-fix 2026-09-29): tanpa COUNT(*) per halaman — limit+1
+    // menentukan hasNext. Metadata JSONB berat sudah dihapus dari list oleh
+    // NP-011; tinggal pajak COUNT yang dihapus di sini.
+    const fetched = await this.prisma.notification.findMany({
+      where,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
+      skip: (safePage - 1) * safeLimit,
+      take: safeLimit + 1,
+      select: PUBLIC_NOTIFICATION_SELECT,
+    });
+    const { rows, hasNext } = sliceLimitPlusOne(fetched, safeLimit);
 
     // Batch 139 BE-API2 (item 114): sematkan imageUrl opsional per item.
     const data = rows.map(withImageUrl);
 
-    return createPaginatedResponse(data, total, safePage, safeLimit);
+    return createHasNextPaginatedResponse(data, safePage, safeLimit, hasNext);
   }
 
   async getNotification(userId: string, notifId: string): Promise<PublicNotification> {

@@ -3290,6 +3290,12 @@ model OrderLink {
   showcase      UserShowcase? @relation("OrderLinkShowcase", fields: [showcaseId], references: [id], onDelete: SetNull)
   priceSnapshot BigInt?
 
+  // TRX-009: ID alamat pengiriman (buku alamat milik pembuat) untuk link
+  // PHYSICAL_GOODS yang dibuat dengan peran BUYER. Link SELLER: alamat
+  // diisi penerima via body accept. Divalidasi ulang + di-snapshot
+  // terenkripsi ke Order.shipping* saat accept.
+  shippingAddressId String? @db.Text
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

@@ -66,6 +66,18 @@ export class CreateOrderLinkDto {
 
   @ApiPropertyOptional({
     description:
+      'TRX-009: ID alamat pengiriman dari buku alamat milik pembuat link. ' +
+      'WAJIB bila orderType PHYSICAL_GOODS dan role=BUYER (backend fail-closed); ' +
+      'diabaikan bila role=SELLER (alamat diisi penerima saat accept link).',
+    maxLength: 100,
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  shippingAddressId?: string;
+
+  @ApiPropertyOptional({
+    description:
       'SH-B-011: id item etalase milik pembuat link. Bila diisi, harus item milik sendiri ' +
       'yang belum dihapus; backend mencatat priceSnapshot (harga etalase saat link dibuat, rupiah). ' +
       'Tanpa ini, link tidak terhubung ke etalase mana pun.',

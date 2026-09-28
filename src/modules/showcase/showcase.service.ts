@@ -442,7 +442,7 @@ export class ShowcaseService {
    */
   private serializeShowcase(
     row: ShowcaseRow,
-    options: { isLiked?: boolean; isSaved?: boolean; isOwner?: boolean; authorBadges?: Array<{ type: string }>; followedAuthorIds?: Set<string> } = {},
+    options: { isLiked?: boolean; isSaved?: boolean; isOwner?: boolean; authorBadges?: Array<{ type: string }>; followedAuthorIds?: Set<string>; excerpt?: boolean } = {},
   ): Record<string, unknown> {
     // Batch 19 TIM A (item 1 & 2): media etalase bisa image/video/spin360.
     // Field lama (id/imageUrl/sortOrder) tetap — kontrak lama tidak berubah.
@@ -482,13 +482,19 @@ export class ShowcaseService {
         ? description.slice(0, 500)
         : `Pesan "${row.title}" dari @${counterpartUsername} di Kahade.`.slice(0, 500);
 
+    // NP-007 (perf-fix): mode excerpt (daftar feed) — deskripsi dipotong
+    // 200 karakter dan descriptionHtml (HTML penuh, bisa besar) tidak dikirim.
+    // Detail memakai endpoint tersendiri dengan field penuh.
+    const descriptionOut = options.excerpt && row.description && row.description.length > 200
+      ? row.description.slice(0, 200)
+      : row.description;
     return {
       id: row.id,
       title: row.title,
-      description: row.description,
+      description: descriptionOut,
       // Benefit 7 Kahade+: deskripsi HTML subscriber (disimpan apa adanya;
       // frontend wajib mensanitasi sebelum render).
-      descriptionHtml: row.descriptionHtml ?? null,
+      descriptionHtml: options.excerpt ? null : (row.descriptionHtml ?? null),
       category: row.category,
       visibility: row.visibility,
       isActive: row.isActive,
@@ -1770,6 +1776,7 @@ export class ShowcaseService {
           isSaved: savedIds.has(row.id),
           authorBadges: badgeMap.get(row.user.id) ?? [],
           followedAuthorIds,
+          excerpt: true,
         }),
       ),
       sort: opts.sort,

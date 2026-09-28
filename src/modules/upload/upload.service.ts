@@ -6,11 +6,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 import { customAlphabet } from 'nanoid';
+import sharp from 'sharp';
 import { UploadPurpose } from './dto/presigned-url.dto';
 import { RedisService } from '../../redis/redis.service';
 import { LocalStorageService } from './local-storage.service';
 import { VideoProcessingService } from './video-processing.service';
 import {
+  SHOWCASE_IMAGE_THUMBNAIL_WIDTH,
   SHOWCASE_VIDEO_MAX_BYTES,
   SHOWCASE_VIDEO_MAX_DURATION_SEC,
   SHOWCASE_VIDEO_MIN_DURATION_SEC,
@@ -260,13 +262,22 @@ export function isPublicFileKey(fileKey: string): boolean {
  * Batch 19 TIM A (item 1): hasil upload direct. Field tambahan (thumbnail,
  * durasi, dimensi) HANYA diisi untuk purpose SHOWCASE_VIDEO — respons purpose
  * lain tidak berubah bentuknya (aditif).
+ *
+ * PERF-FIX (NP-001): `thumbnailFileKey`/`thumbnailUrl` JUGA diisi untuk
+ * purpose SHOWCASE_IMAGE (thumbnail JPEG ~640px via sharp) — respons tetap
+ * aditif (field opsional yang sebelumnya selalu undefined untuk gambar).
  */
 export interface DirectUploadResult {
   fileKey: string;
   fileUrl: string;
-  /** SHOWCASE_VIDEO: key thumbnail JPEG hasil ffmpeg (sudah terkonfirmasi). */
+  /**
+   * SHOWCASE_VIDEO: key thumbnail JPEG hasil ffmpeg (sudah terkonfirmasi).
+   * SHOWCASE_IMAGE (PERF-FIX NP-001): key thumbnail JPEG hasil sharp (sudah
+   * terkonfirmasi) — dilampirkan sebagai `thumbnailFileKey` saat membuat
+   * media etalase supaya `thumbnailUrl` terisi di respons feed.
+   */
   thumbnailFileKey?: string;
-  /** SHOWCASE_VIDEO: URL publik thumbnail. */
+  /** SHOWCASE_VIDEO: URL publik thumbnail. SHOWCASE_IMAGE: URL publik thumbnail. */
   thumbnailUrl?: string;
   /** SHOWCASE_VIDEO: durasi detik (dibulatkan). */
   durationSec?: number;
@@ -1005,6 +1016,16 @@ export class UploadService {
       videoMeta = await this.processShowcaseVideo(userId, fileKey);
     }
 
+    // PERF-FIX (NP-001): SHOWCASE_IMAGE — thumbnail JPEG ~640px via sharp.
+    // Sengaja FAIL-OPEN (beda dengan video): thumbnail foto adalah optimasi
+    // kuota, bukan persyaratan kontrak — upload foto tidak boleh gagal hanya
+    // karena pembuatan thumbnail bermasalah. Kegagalan dicatat di log dan
+    // field thumbnail tetap undefined (frontend fallback ke imageUrl penuh).
+    let imageThumbMeta: Pick<DirectUploadResult, 'thumbnailFileKey' | 'thumbnailUrl'> | undefined;
+    if (purpose === UploadPurpose.SHOWCASE_IMAGE) {
+      imageThumbMeta = await this.processShowcaseImage(userId, fileKey, fileBuffer);
+    }
+
     // Batch 1A (ST-004): purpose PRIVAT (KYC/dokumen/bukti) mendapat signed URL
     // kedaluwarsa, bukan URL publik permanen. Purpose publik (avatar/showcase)
     // tetap mendapat URL publik via nginx.
@@ -1012,7 +1033,7 @@ export class UploadService {
       ? this.buildSignedDownloadUrl(fileKey, 900)
       : this.localStorage.getPublicUrl(fileKey);
 
-    return { fileKey, fileUrl, ...videoMeta };
+    return { fileKey, fileUrl, ...videoMeta, ...imageThumbMeta };
   }
 
   /**
@@ -1103,6 +1124,57 @@ export class UploadService {
       durationSec: Math.round(probe.durationSec),
       width: probe.width,
       height: probe.height,
+    };
+  }
+
+  /**
+   * PERF-FIX (NP-001): pasca-pemrosesan foto showcase — thumbnail JPEG
+   * ~640px via sharp.
+   *
+   * Alur (cerminan `processShowcaseVideo`, disesuaikan untuk foto):
+   * 1. Resize buffer ASLI (`fileBuffer`, bukan hasil strip metadata) supaya
+   *    `.rotate()` bisa menerapkan orientasi EXIF — file yang tersimpan
+   *    sudah kehilangan tag orientasi (SEC-D strip EXIF lossless).
+   * 2. Thumbnail disimpan di folder SHOWCASE_IMAGE milik user yang sama dan
+   *    DITANDAI terkonfirmasi (confirmed_upload), supaya langsung bisa
+   *    dilampirkan sebagai `thumbnailFileKey` media etalase.
+   * 3. Thumbnail juga bebas metadata (sharp tidak menyalin EXIF ke output
+   *    bila tidak diminta) — tidak ada kebocoran GPS lewat varian kecil.
+   *
+   * FAIL-OPEN (disengaja): bila sharp gagal, upload FOTO TETAP BERHASIL
+   * tanpa thumbnail — kegagalan dicatat di log. Berbeda dengan video yang
+   * fail-closed karena thumbnail-nya persyaratan kontrak. Tidak ada file
+   * setengah-jadi yang bertahan: thumbnail yang gagal ditulis dihapus.
+   */
+  private async processShowcaseImage(
+    userId: string,
+    fileKey: string,
+    fileBuffer: Buffer,
+  ): Promise<Pick<DirectUploadResult, 'thumbnailFileKey' | 'thumbnailUrl'>> {
+    const thumbKey = `uploads/showcase-images/${userId}/${Date.now()}-thumb-${nanoid()}.jpg`;
+    try {
+      const destPath = this.localStorage.resolvePath(thumbKey);
+      await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+      await sharp(fileBuffer)
+        .rotate() // terapkan orientasi EXIF ke piksel (lihat docblock)
+        .resize({ width: SHOWCASE_IMAGE_THUMBNAIL_WIDTH, withoutEnlargement: true })
+        .jpeg({ quality: 80, mozjpeg: true })
+        .toFile(destPath);
+    } catch (error) {
+      this.logger.warn(
+        `Gagal membuat thumbnail foto showcase untuk key=${fileKey}; upload dilanjutkan tanpa thumbnail`,
+        error instanceof Error ? error.message : error,
+      );
+      await this.localStorage.deleteFile(thumbKey).catch(() => undefined);
+      return {};
+    }
+
+    // Tandai thumbnail sebagai confirmed (dibuat server-side, bukan oleh user).
+    await this.redis.setNx(`confirmed_upload:${userId}:${thumbKey}`, '1', CONFIRMED_KEY_TTL_SECONDS);
+
+    return {
+      thumbnailFileKey: thumbKey,
+      thumbnailUrl: this.localStorage.getPublicUrl(thumbKey),
     };
   }
 

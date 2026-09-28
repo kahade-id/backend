@@ -1,5 +1,5 @@
-import { ArrayMaxSize, ArrayMinSize, ArrayUnique, IsArray, IsString } from 'class-validator';
-import { ApiProperty } from '@nestjs/swagger';
+import { ArrayMaxSize, ArrayMinSize, ArrayUnique, IsArray, IsObject, IsOptional, IsString } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { SHOWCASE_MAX_IMAGES_ABSOLUTE } from '../../../common/constants/app.constants';
 
 /**
@@ -17,6 +17,25 @@ export class AttachShowcaseImagesDto {
   @ArrayUnique()
   @IsString({ each: true })
   fileKeys!: string[];
+
+  /**
+   * PERF-FIX (NP-001): peta fileKey gambar → thumbnailFileKey. Thumbnail
+   * adalah confirmed upload SHOWCASE_IMAGE milik user yang sama (auto-generate
+   * sharp ~640px saat upload). Opsional & aditif — klien lama tidak
+   * mengirim; gambar tanpa entri tetap valid (feed fallback ke imageUrl
+   * penuh).
+   */
+  @ApiPropertyOptional({
+    description: 'Peta fileKey gambar → thumbnailFileKey (opsional).',
+    example: {
+      'uploads/showcase-images/u1/1700000000000-a1b2c3d4e5-foto.jpg':
+        'uploads/showcase-images/u1/1700000000001-thumb-f6g7h8i9j0.jpg',
+    },
+  })
+  @IsOptional()
+  @IsObject()
+  @IsString({ each: true })
+  thumbnails?: Record<string, string>;
 }
 
 export class ReorderShowcaseImagesDto {

@@ -15,7 +15,8 @@ export enum ShowcaseMediaKind {
 /**
  * Satu entri media pada create/update etalase.
  *
- * - `image`: fileKey = upload confirmed purpose SHOWCASE_IMAGE.
+ * - `image`: fileKey = upload confirmed purpose SHOWCASE_IMAGE; thumbnailFileKey
+ *   opsional (auto-generate sharp ~640px saat upload — PERF-FIX NP-001).
  * - `video`: fileKey = upload confirmed purpose SHOWCASE_VIDEO; thumbnailFileKey
  *   = upload confirmed SHOWCASE_IMAGE milik user (boleh yang auto-generate saat
  *   upload video); durationSec/width/height diambil dari respons upload.
@@ -34,7 +35,9 @@ export class ShowcaseMediaInputDto {
   kind!: ShowcaseMediaKind;
 
   @ApiPropertyOptional({
-    description: 'Wajib untuk kind=video: key thumbnail (confirmed SHOWCASE_IMAGE milik user).',
+    description:
+      'Wajib untuk kind=video: key thumbnail (confirmed SHOWCASE_IMAGE milik user). ' +
+      'Opsional untuk kind=image (thumbnail foto auto-generate server-side, PERF-FIX NP-001).',
   })
   @IsOptional()
   @IsString()

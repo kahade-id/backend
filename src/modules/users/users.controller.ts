@@ -504,7 +504,8 @@ export class UsersController {
     @Param('id', ParseIdPipe) itemId: string,
     @Body() dto: AttachShowcaseImagesDto,
   ): Promise<object> {
-    return this.showcaseService.attachImages(userId, itemId, dto.fileKeys);
+    // PERF-FIX (NP-001): teruskan peta thumbnail foto (opsional, aditif).
+    return this.showcaseService.attachImages(userId, itemId, dto.fileKeys, dto.thumbnails);
   }
 
   @Put('me/showcase/:id/images/order')

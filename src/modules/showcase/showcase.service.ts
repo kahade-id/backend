@@ -410,20 +410,27 @@ export class ShowcaseService {
    * dipakai feed/detail supaya <VerifiedSeal> 3-tier konsisten dengan profil.
    * Gagal ambil untuk satu user → badge kosong (fallback `verified` boolean
    * di klien), bukan error.
+   *
+   * PERF-FIX BD-002: satu batch call — cache dibaca paralel, semua miss
+   * di-load dengan SATU `findMany` via getBadgesBatch (bukan N getBadges
+   * paralel yang masing-masing bisa memicu query DB).
    */
   private async getAuthorBadgeMap(userIds: string[]): Promise<Map<string, Array<{ type: string }>>> {
     const unique = [...new Set(userIds.filter(Boolean))];
-    const entries = await Promise.all(
-      unique.map(async (userId): Promise<[string, Array<{ type: string }>]> => {
-        try {
-          const badges = await this.verificationBadgeService.getBadges(userId);
-          return [userId, badges.map((b) => ({ type: b.type }))];
-        } catch {
-          return [userId, []];
-        }
-      }),
-    );
-    return new Map(entries);
+    try {
+      const batch = await this.verificationBadgeService.getBadgesBatch(unique);
+      return new Map(
+        unique.map(
+          (userId) =>
+            [userId, (batch.get(userId) ?? []).map((b) => ({ type: b.type }))] as [
+              string,
+              Array<{ type: string }>,
+            ],
+        ),
+      );
+    } catch {
+      return new Map(unique.map((userId) => [userId, []] as [string, Array<{ type: string }>]));
+    }
   }
 
   /**

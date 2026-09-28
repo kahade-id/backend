@@ -41,11 +41,11 @@ export class ShowcaseMediaInputDto {
   @MaxLength(512)
   thumbnailFileKey?: string;
 
-  @ApiPropertyOptional({ description: 'Durasi video detik (1–180).', minimum: 1, maximum: SHOWCASE_VIDEO_MAX_DURATION_SEC })
+  @ApiPropertyOptional({ description: 'Durasi video detik (1–180). Batas resmi: maksimal 180 detik.', minimum: 1, maximum: SHOWCASE_VIDEO_MAX_DURATION_SEC })
   @IsOptional()
   @IsInt()
   @Min(1)
-  @Max(SHOWCASE_VIDEO_MAX_DURATION_SEC)
+  @Max(SHOWCASE_VIDEO_MAX_DURATION_SEC, { message: 'Durasi video melebihi batas maksimal 180 detik' })
   durationSec?: number;
 
   @ApiPropertyOptional({ description: 'Lebar video (px).', minimum: 1 })

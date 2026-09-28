@@ -47,6 +47,8 @@ import { ActionLocationModule } from './modules/action-location/action-location.
 import { UploadModule } from './modules/upload/upload.module';
 import { PublicModule } from './modules/public/public.module';
 import { BadgesModule } from './modules/badges/badges.module';
+import { AddressesModule } from './modules/addresses/addresses.module';
+import { CommerceModule } from './modules/commerce/commerce.module';
 import { PaymentModule } from './modules/payment/payment.module';
 import { WebhooksModule } from './modules/webhooks/webhooks.module';
 import { QueueModule } from './modules/queue/queue.module';
@@ -170,6 +172,8 @@ const runtimeEnvFile = getRuntimeEnvFile();
     UploadModule,
     PublicModule,
     BadgesModule,
+    AddressesModule,
+    CommerceModule,
     PaymentModule,
     WebhooksModule,
     QueueModule,

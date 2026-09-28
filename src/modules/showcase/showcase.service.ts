@@ -443,6 +443,10 @@ export class ShowcaseService {
       id: image.id,
       kind: image.kind ?? 'image',
       imageUrl: image.imageUrl,
+      // Keputusan user 2026-09-28: `fileKey` hanya untuk OWNER — dipakai saat
+      // PUT replace media untuk mereferensikan media existing tanpa upload
+      // ulang. Response publik/non-owner tidak berubah.
+      ...(options.isOwner ? { fileKey: image.fileKey ?? null } : {}),
       thumbnailUrl: image.thumbnailUrl ?? null,
       durationSec: image.durationSec ?? null,
       width: image.width ?? null,

@@ -62,6 +62,83 @@ enum OrderType {
   OTHER
 }
 
+// --- BE-COMMERCE batch (2026-10-01): tipe produk & entitas commerce -----------
+/// Tipe produk untuk UserShowcase & Product. Dipakai untuk validasi:
+/// resi/ongkir hanya FISIK (sudah ditegakkan di orders.updateShipping via
+/// OrderType), JASA wajib tenggat pengerjaan, DIGITAL punya payload
+/// pengiriman digital.
+enum ProductType {
+  JASA
+  FISIK
+  DIGITAL
+  LAINNYA
+}
+
+enum AddressLabel {
+  RUMAH
+  KANTOR
+  LAINNYA
+}
+
+enum SlotBookingStatus {
+  BOOKED
+  CANCELLED
+  COMPLETED
+}
+
+enum AgreementStatus {
+  DRAFT
+  WAITING_COUNTERPART
+  AGREED
+  CANCELLED
+}
+
+enum DigitalAssetType {
+  FILE
+  LINK
+  LICENSE
+}
+
+enum JastipTripStatus {
+  DRAFT
+  OPEN
+  CLOSED
+  COMPLETED
+  CANCELLED
+}
+
+enum JastipParticipantStatus {
+  JOINED
+  PRICE_LOCKED
+  PAID
+  REFUNDED
+  REFUND_REQUIRED
+  COMPLETED
+  CANCELLED
+}
+
+enum PatunganMode {
+  BAGI_RATA
+  CUSTOM
+}
+
+enum PatunganStatus {
+  OPEN
+  TARGET_REACHED
+  CONTEST
+  RELEASED
+  FAILED
+  REFUNDED
+}
+
+enum PatunganParticipantStatus {
+  PENDING
+  PAID
+  REFUNDED
+  REFUND_REQUIRED
+  RELEASED
+}
+
 enum OrderCancelReason {
   TIMEOUT_CONFIRMATION
   TIMEOUT_PAYMENT
@@ -1215,10 +1292,6 @@ model NotificationPreference {
 
   // Item 8 (batch 2026-09-28): frekuensi ringkasan notifikasi digest.
   // 'off' = mati (default, perilaku lama), 'daily' = harian, 'weekly' = mingguan.
-  // @map eksplisit: migrasi 20260928030000 memakai snake_case, sedangkan
-  // konvensi tabel ini camelCase tanpa @map — tanpa ini Prisma P2022
-  // (mencari "digestFrequency" yang tidak ada). Ditemukan 2026-09-28 dari
-  // 500 di GET /v1/notifications/unread-count.
   digestFrequency String @default("off") @map("digest_frequency")
   // Kapan digest terakhir dikirim (dipakai cron untuk hitung jatuh tempo).
   lastDigestSentAt DateTime? @map("last_digest_sent_at")
@@ -2498,6 +2571,9 @@ model Voucher {
   campaign         Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
   // Soft FK ke users.id untuk voucher personal; NULL berarti voucher publik.
   assignedToUserId String?
+  /// BE-COMMERCE (2026-10-01): soft FK ke users.id PEMILIK voucher (seller).
+  /// NULL = voucher platform/admin (perilaku lama tidak berubah).
+  sellerId         String?
   deactivatedBy    String? // Admin ID (soft FK ke admin_users.id)
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
@@ -2513,6 +2589,7 @@ model Voucher {
   @@index([createdBy]) // index untuk admin voucher lookup
   @@index([campaignId]) // tracing voucher hasil campaign tanpa hard FK
   @@index([assignedToUserId, isActive, validUntil]) // list voucher personal user
+  @@index([sellerId, isActive]) // BE-COMMERCE: voucher milik seller
   @@map("vouchers")
 }
 
@@ -3680,32 +3757,51 @@ model UserShowcase {
   /// Counter denormalisasi. Selalu di-update lewat Prisma atomic increment
   /// ({ increment } / { decrement }) di dalam transaksi yang sama dengan
   /// mutasi barisnya — pola TransactionTemplatesService.recordUsage.
-  likeCount    Int @default(0)
-  commentCount Int @default(0)
-  viewCount    Int @default(0)
+  likeCount    Int       @default(0)
+  commentCount Int       @default(0)
+  viewCount    Int       @default(0)
   /// Batch 19 TIM A (item 3): jumlah user yang menyimpan (save) item ini.
-  saveCount    Int @default(0)
+  saveCount    Int       @default(0)
   /// Jumlah kali deep link share dibuka/dibagikan. Di-increment atomik saat
   /// GET /v1/showcase/:id/share (pola atomic counter seperti likeCount).
-  shareCount   Int @default(0)
+  shareCount   Int       @default(0)
   /// View pada hari kalender berjalan (zona Asia/Jakarta) — sumber ranking
   /// sort feed "popular" (populer harian). Di-update atomik di recordView:
   /// naik bila bucket hari masih sama, reset ke 1 bila hari berganti (satu
   /// statement CASE — tanpa cron). Bukan bagian financial core.
-  hotViews Int @default(0)
+  hotViews     Int       @default(0)
   /// Tanggal (WIB) terakhir hotViews dihitung. Null = belum pernah dihitung.
-  hotViewDate DateTime? @db.Date
+  hotViewDate  DateTime? @db.Date
 
-  images     ShowcaseImage[]
-  likes      ShowcaseLike[]
-  saves      ShowcaseSave[]
+  /// BE-COMMERCE (2026-10-01): tipe produk JASA/FISIK/DIGITAL/LAINNYA.
+  /// Nullable: item lama tanpa tipe tetap tampil.
+  productType         ProductType?
+  /// Jadwal publish etalase: item dengan isActive=false + scheduledAt di masa
+  /// depan akan dipublish otomatis oleh cron ScheduledShowcasePublishService.
+  scheduledAt         DateTime?
+  /// Harga coret (dalam sen, rupiah*100). Validasi: harus > harga jual bila diisi.
+  originalPrice       BigInt?
+  /// Tenggat pengerjaan dalam hari — WAJIB bila productType=JASA.
+  serviceDeadlineDays Int?
+  /// Info/payload pengiriman digital untuk productType=DIGITAL (mis. instruksi
+  /// redeem, format file). File/link/lisensi aktual dikelola DigitalAsset.
+  digitalDeliveryInfo String?      @db.Text
+  /// Hit klik produk (mis. tap tombol beli dari etalase). Atomic increment.
+  clickCount          Int          @default(0)
+  /// Hit pembelian: dihitung on-read dari order (lihat ProductCommerceService),
+  /// kolom ini cadangan denormalisasi bila dibutuhkan kelak.
+  purchaseCount       Int          @default(0)
+
+  images         ShowcaseImage[]
+  likes          ShowcaseLike[]
+  saves          ShowcaseSave[]
   highlightItems UserHighlightItem[]
-  comments   ShowcaseComment[]
-  reports    ShowcaseReport[]
-  dailyStats ShowcaseDailyStat[]
+  comments       ShowcaseComment[]
+  reports        ShowcaseReport[]
+  dailyStats     ShowcaseDailyStat[]
   // SH-B-011: back-relation asal etalase (nullable di sisi Order/OrderLink).
-  orders     Order[]           @relation("OrderShowcase")
-  orderLinks OrderLink[]       @relation("OrderLinkShowcase")
+  orders         Order[]             @relation("OrderShowcase")
+  orderLinks     OrderLink[]         @relation("OrderLinkShowcase")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -4978,6 +5074,13 @@ model Product {
   priceSen BigInt
   currency String @default("IDR")
 
+  /// BE-COMMERCE (2026-10-01): tipe produk JASA/FISIK/DIGITAL/LAINNYA.
+  productType         ProductType?
+  /// Harga coret dalam sen — harus > priceSen bila diisi.
+  originalPriceSen    BigInt?
+  /// Tenggat pengerjaan (hari) — wajib bila productType=JASA.
+  serviceDeadlineDays Int?
+
   // G254: stok tingkat produk — dipakai untuk produk TANPA varian.
   // Produk bervarian memakai stok per varian; stok efektif katalog =
   // Σ varian bila varian ada.
@@ -5980,4 +6083,270 @@ model AppSettingAudit {
 
   @@index([key, createdAt])
   @@map("app_setting_audits")
+}
+
+// ============================================================================
+// BE-COMMERCE batch (2026-10-01) — model-model commerce baru.
+// Semua relasi ke User/Order/UserShowcase memakai soft FK (kolom String tanpa
+// back-relation) mengikuti pola Product.sellerId — additive-only, tanpa
+// menyentuh model inti yang dipakai tim lain.
+// ============================================================================
+
+/// Buku alamat user: label RUMAH/KANTOR/custom, satu default per user.
+model Address {
+  id     String @id @default(cuid())
+  userId String // soft FK users.id
+
+  label         AddressLabel @default(RUMAH)
+  customLabel   String?      @db.VarChar(40) // diisi bila label=LAINNYA
+  recipientName String       @db.VarChar(100)
+  phone         String       @db.VarChar(20)
+  addressLine   String       @db.VarChar(300)
+  city          String       @db.VarChar(100)
+  province      String?      @db.VarChar(100)
+  postalCode    String       @db.VarChar(10)
+  isDefault     Boolean      @default(false)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([userId, deletedAt])
+  @@map("addresses")
+}
+
+/// Agregat kata kunci pencarian TANPA PII — sumber endpoint trending publik.
+model SearchKeyword {
+  keyword        String   @id @db.VarChar(80) // lowercase, sudah disanitasi
+  searchCount    Int      @default(0)
+  lastSearchedAt DateTime @default(now())
+  createdAt      DateTime @default(now())
+
+  @@map("search_keywords")
+}
+
+/// Slot ketersediaan untuk produk JASA (booking jasa via kalender).
+model ServiceSlot {
+  id         String @id @default(cuid())
+  showcaseId String // soft FK user_showcases.id (produk bertipe JASA)
+  sellerId   String // soft FK users.id
+
+  /// Tanggal slot (YYYY-MM-DD, zona WIB) + jam mulai/selesai "HH:mm".
+  slotDate    DateTime @db.Date
+  startTime   String   @db.VarChar(5)
+  endTime     String   @db.VarChar(5)
+  capacity    Int      @default(1)
+  bookedCount Int      @default(0)
+  isActive    Boolean  @default(true)
+  note        String?  @db.VarChar(200)
+
+  bookings ServiceSlotBooking[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([showcaseId, slotDate, isActive])
+  @@index([sellerId, slotDate])
+  @@map("service_slots")
+}
+
+model ServiceSlotBooking {
+  id      String      @id @default(cuid())
+  slotId  String
+  slot    ServiceSlot @relation(fields: [slotId], references: [id], onDelete: Cascade)
+  userId  String // soft FK users.id (pemesan)
+  orderId String? // soft FK orders.id — diisi saat order dibuat dari booking
+
+  status SlotBookingStatus @default(BOOKED)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([slotId, userId]) // satu user satu booking aktif per slot
+  @@index([userId, status])
+  @@map("service_slot_bookings")
+}
+
+/// SPK digital RINGAN per order: teks kesepakatan + tap setuju kedua pihak.
+/// Bukan e-sign korporat — persetujuan tercatat sebagai timestamp per pihak.
+model OrderAgreement {
+  id      String @id @default(cuid())
+  orderId String @unique // soft FK orders.id — satu SPK per order
+
+  text   String          @db.Text
+  status AgreementStatus @default(DRAFT)
+
+  sellerAgreedAt DateTime?
+  buyerAgreedAt  DateTime?
+
+  createdBy String // soft FK users.id pembuat SPK
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([createdBy])
+  @@map("order_agreements")
+}
+
+/// Aset pengiriman digital milik seller: file/link/lisensi.
+/// Otomatis terlihat buyer SETELAH order berstatus dibayar (lihat
+/// DigitalDeliveryService.canBuyerView).
+model DigitalAsset {
+  id         String @id @default(cuid())
+  showcaseId String // soft FK user_showcases.id (produk bertipe DIGITAL)
+  sellerId   String // soft FK users.id
+
+  assetType DigitalAssetType
+  /// FILE: fileKey privat dari POST /v1/upload/direct. LINK: URL. LICENSE:
+  /// kode lisensi/plain text (disimpan apa adanya; bukan secret platform).
+  payload   String           @db.Text
+  label     String?          @db.VarChar(120)
+  sortOrder Int              @default(0)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([showcaseId, deletedAt, sortOrder])
+  @@map("digital_assets")
+}
+
+/// Trip jastip: etalase khusus trip (judul, deadline order, slot, katalog).
+model JastipTrip {
+  id     String @id @default(cuid())
+  hostId String // soft FK users.id (host)
+
+  title         String   @db.VarChar(120)
+  description   String?  @db.Text
+  orderDeadline DateTime
+  slotTotal     Int      @default(0) // 0 = tanpa batas slot
+  slotUsed      Int      @default(0)
+
+  status JastipTripStatus @default(DRAFT)
+
+  items        JastipItem[]
+  participants JastipParticipant[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([hostId, status])
+  @@index([status, orderDeadline])
+  @@map("jastip_trips")
+}
+
+/// Katalog/request bebas per trip jastip (harga estimasi, dikunci per buyer).
+model JastipItem {
+  id     String     @id @default(cuid())
+  tripId String
+  trip   JastipTrip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+
+  name           String  @db.VarChar(150)
+  estimatedPrice BigInt? // sen; estimasi sebelum harga dikunci
+  note           String? @db.VarChar(300)
+
+  createdAt DateTime @default(now())
+
+  @@index([tripId])
+  @@map("jastip_items")
+}
+
+/// Peserta jastip: harga DIKUNCI (barang + fee jastip + ongkir terpisah
+/// transparan) baru buyer bayar via escrow order normal (orderId).
+model JastipParticipant {
+  id      String     @id @default(cuid())
+  tripId  String
+  trip    JastipTrip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  buyerId String // soft FK users.id
+
+  itemSummary   String    @db.VarChar(300)
+  /// Komponen harga terkunci (sen): transparan & terpisah.
+  goodsAmount   BigInt?
+  jastipFee     BigInt?
+  shippingCost  BigInt?
+  totalLocked   BigInt?
+  priceLockedAt DateTime?
+
+  orderId String? // soft FK orders.id — escrow order setelah buyer bayar
+  status  JastipParticipantStatus @default(JOINED)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([tripId, buyerId])
+  @@index([buyerId, status])
+  @@map("jastip_participants")
+}
+
+/// Patungan grup: escrow per peserta, cair bila target tercapai,
+/// auto-refund bila gagal. TANPA logika uang baru — modul ini hanya
+/// mencatat SYARAT pelepasan; pergerakan dana tetap lewat order escrow
+/// normal (participant.orderId) + alur refund/complete yang sudah ada.
+model PatunganGroup {
+  id     String @id @default(cuid())
+  hostId String // soft FK users.id (host)
+
+  title           String       @db.VarChar(120)
+  description     String?      @db.Text
+  targetAmount    BigInt // sen
+  deadlineAt      DateTime
+  slotTotal       Int          @default(0) // 0 = tanpa batas
+  mode            PatunganMode @default(BAGI_RATA)
+  /// Nominal per peserta untuk mode BAGI_RATA (sen).
+  perPersonAmount BigInt?
+
+  status        PatunganStatus @default(OPEN)
+  /// Diisi saat host inisiasi cair: masa sanggah 24 jam peserta.
+  contestEndsAt DateTime?
+  releasedAt    DateTime?
+
+  participants PatunganParticipant[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([hostId, status])
+  @@index([status, deadlineAt])
+  @@map("patungan_groups")
+}
+
+model PatunganParticipant {
+  id      String        @id @default(cuid())
+  groupId String
+  group   PatunganGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  userId  String // soft FK users.id
+
+  /// Nominal kontribusi peserta (sen). Mode CUSTOM: bebas (batas wajar di service).
+  amount  BigInt
+  orderId String? // soft FK orders.id — escrow order peserta
+  paidAt  DateTime?
+
+  status PatunganParticipantStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([groupId, userId])
+  @@index([userId, status])
+  @@map("patungan_participants")
+}
+
+/// Banner/carousel promo — CRUD admin, endpoint publik banner aktif.
+model Banner {
+  id String @id @default(cuid())
+
+  title     String    @db.VarChar(120)
+  imageUrl  String    @db.VarChar(500)
+  linkUrl   String?   @db.VarChar(500)
+  position  String    @default("home_top") @db.VarChar(40)
+  sortOrder Int       @default(0)
+  isActive  Boolean   @default(true)
+  startsAt  DateTime?
+  endsAt    DateTime?
+
+  createdBy String // soft FK admin_users.id
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive, position, sortOrder])
+  @@map("banners")
 }

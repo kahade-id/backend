@@ -27,6 +27,11 @@ const config: Config = {
     '^@config/(.*)$': '<rootDir>/config/$1',
     '^@modules/(.*)$': '<rootDir>/modules/$1',
     '^@prisma-service/(.*)$': '<rootDir>/prisma/$1',
+    // Prisma memakai require('.prisma/client/default') di dalam paketnya —
+    // pola dot-dir ini tidak ter-resolve andal oleh jest-resolve (jatuh ke
+    // node_modules worktree lain bila node_modules di-share via symlink).
+    // Petakan langsung ke build node hasil `prisma generate` worktree ini.
+    '^@prisma/client$': '<rootDir>/../node_modules/.prisma/client/index.js',
   },
   coverageThreshold: {
     global: {

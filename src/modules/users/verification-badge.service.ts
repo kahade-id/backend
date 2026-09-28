@@ -181,6 +181,81 @@ function latest(...dates: Array<Date | null | undefined>): Date | null {
   return result;
 }
 
+/**
+ * Batch 139 BE-API2 (item 115): versi murni module-level dari logika
+ * `VerificationBadgeService.computeBadges` — tanpa I/O dan tanpa `this`,
+ * sehingga bisa dipakai modul lain (mis. wallet transfer lookup) tanpa
+ * menambah dependency antar-modul. Perilaku identik dengan method aslinya.
+ */
+export function computeVerificationBadges(
+  user: BadgeSourceUser,
+  businessVerification: BadgeSourceBusinessVerification | null,
+  now: Date = new Date(),
+): VerificationBadge[] {
+  const badges: VerificationBadge[] = [];
+
+  const push = (type: VerificationBadgeType, earnedAt: Date | null): void => {
+    badges.push({
+      type,
+      ...BADGE_META[type],
+      earnedAt,
+      priority: BADGE_PRIORITY[type],
+    });
+  };
+
+  // (b) KYC terverifikasi
+  if (user.kycStatus === KycStatus.APPROVED) {
+    push('KYC_VERIFIED', user.kycApprovedAt);
+  }
+
+  // (d) Business terverifikasi — domain terpisah dari KYC personal dan hanya
+  // untuk akun BUSINESS.
+  if (
+    user.accountType === UserAccountType.BUSINESS &&
+    businessVerification?.status === BusinessVerificationStatus.APPROVED
+  ) {
+    push('BUSINESS_VERIFIED', businessVerification.approvedAt);
+  }
+
+  // (c) Kahade+ — flag denormalized bisa saja basi sebentar setelah expiry cron
+  // jalan, jadi subscriptionExpiresAt ikut diperiksa sebagai guard kedua.
+  const plusStillValid = !user.subscriptionExpiresAt || user.subscriptionExpiresAt > now;
+  if (user.isKahadePlus && plusStillValid) {
+    push('KAHADE_PLUS', user.kahadePlusSince);
+  }
+
+  // (e) Trust admin-manual — reuse isVip/vipGrantedAt, TIDAK ada field baru.
+  if (user.isVip) {
+    push('TRUSTED_BY_KAHADE', user.vipGrantedAt);
+  }
+
+  // (a) Email & nomor HP terverifikasi — kombinasi keduanya.
+  if (user.emailVerified && user.phoneVerified) {
+    push('CONTACT_VERIFIED', latest(user.emailVerifiedAt, user.phoneVerifiedAt));
+  }
+
+  // (f) Verifikasi penuh — TIER ABU: KYC + email + HP + alamat terisi +
+  // Kahade+ aktif, DAN tidak sedang di-revoke manual oleh admin.
+  // earnedAt = yang paling belakang, karena badge baru lengkap saat itu.
+  // Definisi "Kahade+ aktif" sama dengan badge KAHADE_PLUS (plusStillValid).
+  if (
+    user.kycStatus === KycStatus.APPROVED &&
+    user.emailVerified &&
+    user.phoneVerified &&
+    user.address != null &&
+    user.address.trim().length > 0 &&
+    user.isKahadePlus &&
+    plusStillValid &&
+    user.grayVerifiedRevokedAt == null
+  ) {
+    push('FULLY_VERIFIED', latest(user.kycApprovedAt, user.emailVerifiedAt, user.phoneVerifiedAt, user.kahadePlusSince));
+  }
+
+  // Urutan prioritas tampil sudah eksplisit; sort stabil agar UI bisa langsung
+  // render tanpa mengurutkan sendiri.
+  return badges.sort((a, b) => a.priority - b.priority);
+  }
+
 @Injectable()
 export class VerificationBadgeService {
   private readonly logger = new Logger(VerificationBadgeService.name);
@@ -200,68 +275,7 @@ export class VerificationBadgeService {
     businessVerification: BadgeSourceBusinessVerification | null,
     now: Date = new Date(),
   ): VerificationBadge[] {
-    const badges: VerificationBadge[] = [];
-
-    const push = (type: VerificationBadgeType, earnedAt: Date | null): void => {
-      badges.push({
-        type,
-        ...BADGE_META[type],
-        earnedAt,
-        priority: BADGE_PRIORITY[type],
-      });
-    };
-
-    // (b) KYC terverifikasi
-    if (user.kycStatus === KycStatus.APPROVED) {
-      push('KYC_VERIFIED', user.kycApprovedAt);
-    }
-
-    // (d) Business terverifikasi — domain terpisah dari KYC personal dan hanya
-    // untuk akun BUSINESS.
-    if (
-      user.accountType === UserAccountType.BUSINESS &&
-      businessVerification?.status === BusinessVerificationStatus.APPROVED
-    ) {
-      push('BUSINESS_VERIFIED', businessVerification.approvedAt);
-    }
-
-    // (c) Kahade+ — flag denormalized bisa saja basi sebentar setelah expiry cron
-    // jalan, jadi subscriptionExpiresAt ikut diperiksa sebagai guard kedua.
-    const plusStillValid = !user.subscriptionExpiresAt || user.subscriptionExpiresAt > now;
-    if (user.isKahadePlus && plusStillValid) {
-      push('KAHADE_PLUS', user.kahadePlusSince);
-    }
-
-    // (e) Trust admin-manual — reuse isVip/vipGrantedAt, TIDAK ada field baru.
-    if (user.isVip) {
-      push('TRUSTED_BY_KAHADE', user.vipGrantedAt);
-    }
-
-    // (a) Email & nomor HP terverifikasi — kombinasi keduanya.
-    if (user.emailVerified && user.phoneVerified) {
-      push('CONTACT_VERIFIED', latest(user.emailVerifiedAt, user.phoneVerifiedAt));
-    }
-
-    // (f) Verifikasi penuh — TIER ABU: KYC + email + HP + alamat terisi +
-    // Kahade+ aktif, DAN tidak sedang di-revoke manual oleh admin.
-    // earnedAt = yang paling belakang, karena badge baru lengkap saat itu.
-    // Definisi "Kahade+ aktif" sama dengan badge KAHADE_PLUS (plusStillValid).
-    if (
-      user.kycStatus === KycStatus.APPROVED &&
-      user.emailVerified &&
-      user.phoneVerified &&
-      user.address != null &&
-      user.address.trim().length > 0 &&
-      user.isKahadePlus &&
-      plusStillValid &&
-      user.grayVerifiedRevokedAt == null
-    ) {
-      push('FULLY_VERIFIED', latest(user.kycApprovedAt, user.emailVerifiedAt, user.phoneVerifiedAt, user.kahadePlusSince));
-    }
-
-    // Urutan prioritas tampil sudah eksplisit; sort stabil agar UI bisa langsung
-    // render tanpa mengurutkan sendiri.
-    return badges.sort((a, b) => a.priority - b.priority);
+    return computeVerificationBadges(user, businessVerification, now);
   }
 
   /**

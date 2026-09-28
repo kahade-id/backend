@@ -90,6 +90,12 @@ const mockPrisma = {
     findUnique: jest.fn(),
     findFirst: jest.fn(),
   },
+  walletFavoriteRecipient: {
+    findUnique: jest.fn(),
+  },
+  businessVerification: {
+    findFirst: jest.fn(),
+  },
   bankAccount: {
     findFirst: jest.fn(),
   },
@@ -1980,6 +1986,63 @@ describe('WalletService', () => {
         response: expect.objectContaining({ code: 'RECIPIENT_NOT_FOUND' }),
       });
       expect(mockPrisma.blockList.findFirst).not.toHaveBeenCalled();
+    });
+  });
+
+  // ============================================================
+  // Batch 139 BE-API2 (item 115) — lookupTransferRecipient:
+  // isFavorite + sealTier
+  // ============================================================
+  describe('lookupTransferRecipient (item 115)', () => {
+    const baseRecipient = {
+      id: 'user-2', userId: 'USR-2', fullName: 'Recipient', username: 'recipient',
+      avatarUrl: null, accountType: 'PERSONAL', emailVerified: true,
+      emailVerifiedAt: new Date(), phoneVerified: true, phoneVerifiedAt: new Date(),
+      kycStatus: 'APPROVED', kycApprovedAt: new Date(), isKahadePlus: false,
+      subscriptionExpiresAt: null, kahadePlusSince: null, isVip: false,
+      vipGrantedAt: null, address: 'Jl. Test', grayVerifiedRevokedAt: null,
+      memberSince: new Date(), deletedAt: null,
+    };
+
+    beforeEach(() => {
+      mockPrisma.user.findFirst.mockResolvedValue(baseRecipient);
+      mockPrisma.walletFavoriteRecipient.findUnique.mockResolvedValue(null);
+      mockPrisma.businessVerification.findFirst.mockResolvedValue(null);
+    });
+
+    it('returns null when recipient not found', async () => {
+      mockPrisma.user.findFirst.mockResolvedValue(null);
+      expect(await service.lookupTransferRecipient('ghost', 'user-1')).toBeNull();
+    });
+
+    it('returns isFavorite=false and sealTier for non-favorite recipient', async () => {
+      const res = await service.lookupTransferRecipient('recipient', 'user-1');
+      expect(res).toMatchObject({ username: 'recipient', isFavorite: false });
+      expect(res!.sealTier).toBeNull();
+      expect(mockPrisma.walletFavoriteRecipient.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { userId_recipientId: { userId: 'user-1', recipientId: 'user-2' } },
+        }),
+      );
+    });
+
+    it('returns isFavorite=true when recipient is in sender favorites', async () => {
+      mockPrisma.walletFavoriteRecipient.findUnique.mockResolvedValue({ id: 'fav-1' });
+      const res = await service.lookupTransferRecipient('recipient', 'user-1');
+      expect(res!.isFavorite).toBe(true);
+    });
+
+    it('returns gold sealTier for trusted (VIP) recipient', async () => {
+      mockPrisma.user.findFirst.mockResolvedValue({ ...baseRecipient, isVip: true, vipGrantedAt: new Date() });
+      const res = await service.lookupTransferRecipient('recipient', 'user-1');
+      expect(res!.sealTier).toBe('gold');
+    });
+
+    it('returns blue sealTier for approved business recipient', async () => {
+      mockPrisma.user.findFirst.mockResolvedValue({ ...baseRecipient, accountType: 'BUSINESS' });
+      mockPrisma.businessVerification.findFirst.mockResolvedValue({ status: 'APPROVED', approvedAt: new Date() });
+      const res = await service.lookupTransferRecipient('recipient', 'user-1');
+      expect(res!.sealTier).toBe('blue');
     });
   });
 });

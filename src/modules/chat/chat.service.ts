@@ -37,6 +37,7 @@ import {
   CHAT_VOICE_MIN_DURATION_SECONDS,
 } from '../../common/constants/app.constants';
 import { createPaginatedResponse } from '../../common/dto/pagination.dto';
+import { escapeLikePattern } from '../../common/utils/search.util';
 import { VerificationBadgeService } from '../users/verification-badge.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { moderateFileName, moderateText, ModerationVerdict, ModerateOptions } from './chat-moderation.util';
@@ -348,6 +349,11 @@ export interface RoomListOptions {
   type?: 'ORDER' | 'INQUIRY';
   /** true = hanya yang diarsipkan, false/undefined = sembunyikan yang diarsipkan. */
   archived?: boolean;
+  /**
+   * Batch 139 BE-API2 (item 117): pencarian server-side — filter subjek room
+   * serta nama/username peserta (initiator & counterpart). Paginasi tetap jalan.
+   */
+  q?: string;
 }
 
 @Injectable()
@@ -385,6 +391,19 @@ export class ChatService implements OnModuleInit {
     const skip = (safePage - 1) * safeLimit;
     const typeFilter = options.type === 'INQUIRY' || options.type === 'ORDER' ? options.type : null;
     const archivedOnly = options.archived === true;
+
+    // Batch 139 BE-API2 (item 117): pola pencarian server-side. escapeLikePattern
+    // memastikan `%`, `_`, `\` dari user diperlakukan literal — bukan wildcard LIKE.
+    const searchText = options.q?.trim();
+    const searchPattern = searchText ? `%${escapeLikePattern(searchText)}%` : null;
+
+    // Batch 139 BE-API2 (item 116): himpunan room yang di-pin viewer — urutan
+    // dan sort daftar TIDAK diubah, hanya flag per baris.
+    const pinnedRows = await this.prisma.chatPinnedRoom.findMany({
+      where: { userId },
+      select: { roomId: true },
+    }).catch(() => [] as { roomId: string }[]);
+    const pinnedRoomIds = new Set(pinnedRows.map((p) => p.roomId));
 
     const [roomRows, countResult] = await Promise.all([
       this.prisma.$queryRaw<Array<{
@@ -468,6 +487,16 @@ export class ChatService implements OnModuleInit {
             OR (cr."initiatorId" IS NULL AND (o."buyerId" = ${userId} OR o."sellerId" = ${userId}))
           )
           AND COALESCE(cm."isArchived", false) = ${archivedOnly}
+          -- Batch 139 BE-API2 (item 117): pencarian server-side atas subjek
+          -- room dan nama/username peserta.
+          AND (
+            ${searchPattern}::text IS NULL
+            OR cr.subject ILIKE ${searchPattern}
+            OR iu.username ILIKE ${searchPattern}
+            OR iu."fullName" ILIKE ${searchPattern}
+            OR cu.username ILIKE ${searchPattern}
+            OR cu."fullName" ILIKE ${searchPattern}
+          )
         ORDER BY cr."updatedAt" DESC
         OFFSET ${skip}
         LIMIT ${safeLimit}
@@ -477,6 +506,8 @@ export class ChatService implements OnModuleInit {
         FROM chat_rooms cr
         LEFT JOIN orders o ON o.id = cr."orderId" AND o."deletedAt" IS NULL
         LEFT JOIN chat_room_members cm ON cm."roomId" = cr.id AND cm."userId" = ${userId}
+        LEFT JOIN users iu ON iu.id = cr."initiatorId"
+        LEFT JOIN users cu ON cu.id = cr."counterpartId"
         WHERE cr."deletedAt" IS NULL
           AND (${typeFilter}::text IS NULL OR cr."type" = ${typeFilter}::"ChatRoomType")
           AND (
@@ -485,6 +516,14 @@ export class ChatService implements OnModuleInit {
             OR (cr."initiatorId" IS NULL AND (o."buyerId" = ${userId} OR o."sellerId" = ${userId}))
           )
           AND COALESCE(cm."isArchived", false) = ${archivedOnly}
+          AND (
+            ${searchPattern}::text IS NULL
+            OR cr.subject ILIKE ${searchPattern}
+            OR iu.username ILIKE ${searchPattern}
+            OR iu."fullName" ILIKE ${searchPattern}
+            OR cu.username ILIKE ${searchPattern}
+            OR cu."fullName" ILIKE ${searchPattern}
+          )
       `,
     ]);
 
@@ -535,6 +574,9 @@ export class ChatService implements OnModuleInit {
         isArchived: r.member_archived ?? r.is_archived,
         isMuted,
         mutedUntil,
+        // Batch 139 BE-API2 (item 116): flag pin per room — urutan/sort daftar
+        // tidak berubah, pin hanya memengaruhi tampilan di klien.
+        isPinned: pinnedRoomIds.has(r.room_id),
         initiator: {
           userId: r.initiator_user_id,
           fullName: r.initiator_full_name,

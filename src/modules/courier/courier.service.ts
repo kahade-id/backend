@@ -1240,11 +1240,10 @@ export class CourierService {
     regionWhitelist: string[]; regionBlacklist: string[]; priority: number;
   }>> {
     const configs = this.courierConfig.getAllProviderConfigs();
-    const flags = await this.prisma.courierRegionFlag.findMany();
-    const sortOrders = await this.prisma.courierService.groupBy({
-      by: ['providerCode'],
-      _min: { sortOrder: true },
-    });
+    const [flags, sortOrders] = await Promise.all([
+      this.prisma.courierRegionFlag.findMany(),
+      this.prisma.courierService.groupBy({ by: ['providerCode'], _min: { sortOrder: true } }),
+    ]);
     const minSortByCode = new Map(sortOrders.map((s) => [s.providerCode, s._min.sortOrder ?? 0]));
     const flagByKey = new Map(flags.map((f) => [`${f.providerCode}:${f.region}`, f]));
     return configs.map((cfg) => {
@@ -1327,7 +1326,8 @@ export class CourierService {
 
   /**
    * Rekonsiliasi estimasi vs aktual per shipment (halaman admin).
-   * diffSen = actualCost − estimatedCost; baris tanpa actualCost dilewati.
+   * diffSen = actualCost − estimatedCost, dihitung di SQL agar bisa difilter
+   * (onlyMismatch) dan dipaginasi di DB tanpa full-scan ke aplikasi.
    */
   async getShippingReconciliation(query: { page?: number; limit?: number; onlyMismatch?: boolean }): Promise<{
     data: Array<{ shipmentId: string; orderId: string; providerCode: string; estimatedCostSen: string; actualCostSen: string; diffSen: string }>;
@@ -1335,30 +1335,31 @@ export class CourierService {
   }> {
     const page = Math.max(1, Math.floor(query.page ?? 1));
     const limit = Math.min(100, Math.max(1, Math.floor(query.limit ?? 20)));
-    const where: Prisma.ShipmentWhereInput = { actualCost: { not: null } };
-    const rows = await this.prisma.shipment.findMany({
-      where,
-      orderBy: { updatedAt: 'desc' },
-      select: { id: true, orderId: true, providerCode: true, estimatedCost: true, actualCost: true },
-    });
-    const all = rows.map((r) => {
-      const actual = r.actualCost ?? 0n;
-      const diff = actual - r.estimatedCost;
-      return {
-        shipmentId: r.id,
-        orderId: r.orderId,
-        providerCode: r.providerCode,
-        estimatedCostSen: r.estimatedCost.toString(),
-        actualCostSen: actual.toString(),
-        diffSen: diff.toString(),
-        _diff: diff,
-      };
-    });
-    const filtered = query.onlyMismatch ? all.filter((r) => r._diff !== 0n) : all;
-    const total = filtered.length;
+    const mismatchOnly = query.onlyMismatch === true;
+    // Kolom DB mengikuti nama field Prisma (tanpa @map): "orderId",
+    // "providerCode", "estimatedCost", "actualCost", "updatedAt".
+    const baseWhere = Prisma.sql`FROM "shipments" WHERE "actualCost" IS NOT NULL`;
+    const mismatchWhere = mismatchOnly ? Prisma.sql` AND ("actualCost" - "estimatedCost") <> 0` : Prisma.sql``;
+    const [countRows, rows] = await Promise.all([
+      this.prisma.$queryRaw<Array<{ count: bigint }>>(
+        Prisma.sql`SELECT COUNT(*)::bigint AS count ${baseWhere} ${mismatchWhere}`,
+      ),
+      this.prisma.$queryRaw<Array<{
+        shipmentId: string; orderId: string; providerCode: string;
+        estimatedCostSen: string; actualCostSen: string; diffSen: string;
+      }>>(
+        Prisma.sql`SELECT "id" AS "shipmentId", "orderId", "providerCode",
+          "estimatedCost"::text AS "estimatedCostSen",
+          "actualCost"::text AS "actualCostSen",
+          ("actualCost" - "estimatedCost")::text AS "diffSen"
+          ${baseWhere} ${mismatchWhere}
+          ORDER BY "updatedAt" DESC
+          LIMIT ${limit} OFFSET ${(page - 1) * limit}`,
+      ),
+    ]);
+    const total = Number(countRows[0]?.count ?? 0n);
     const totalPages = Math.max(1, Math.ceil(total / limit));
-    const data = filtered.slice((page - 1) * limit, page * limit).map(({ _diff, ...rest }) => rest);
-    return { data, total, page, limit, totalPages, hasNext: page < totalPages, hasPrev: page > 1 };
+    return { data: rows, total, page, limit, totalPages, hasNext: page < totalPages, hasPrev: page > 1 };
   }
 
   /**

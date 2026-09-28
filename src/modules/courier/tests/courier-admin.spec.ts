@@ -190,19 +190,34 @@ describe('CourierService — admin Wave 2 (integritas-139)', () => {
   });
 
   describe('getShippingReconciliation', () => {
-    it('menghitung diffSen + filter onlyMismatch', async () => {
-      prisma.shipment.findMany.mockResolvedValue([
-        makeShipment({ id: 's1', estimatedCost: 15000n, actualCost: 16000n }),
-        makeShipment({ id: 's2', estimatedCost: 15000n, actualCost: 15000n }),
-      ]);
-      const all = await service.getShippingReconciliation({ page: 1, limit: 20 });
-      expect(all.total).toBe(2);
-      expect(all.data[0]).toMatchObject({ shipmentId: 's1', estimatedCostSen: '15000', actualCostSen: '16000', diffSen: '1000' });
+    const setupRecon = (rows: Array<Record<string, string>>, total: number) => {
+      prisma.$queryRaw = jest.fn().mockImplementation((sql: unknown) => {
+        const text = String((sql as { sql?: string }).sql ?? sql);
+        if (/COUNT\(\*\)/i.test(text)) return Promise.resolve([{ count: BigInt(total) }]);
+        return Promise.resolve(rows);
+      });
+    };
 
-      const mismatch = await service.getShippingReconciliation({ page: 1, limit: 20, onlyMismatch: true });
-      expect(mismatch.total).toBe(1);
-      expect(mismatch.data[0].shipmentId).toBe('s1');
-      expect(mismatch.totalPages).toBe(1);
+    it('menghitung diffSen di SQL + filter onlyMismatch + pagination DB', async () => {
+      const rows = [
+        { shipmentId: 's1', orderId: 'o1', providerCode: 'jne', estimatedCostSen: '15000', actualCostSen: '16000', diffSen: '1000' },
+      ];
+      setupRecon(rows, 1);
+      const res: any = await service.getShippingReconciliation({ page: 1, limit: 20 });
+      expect(res.total).toBe(1);
+      expect(res.data[0]).toMatchObject({ shipmentId: 's1', diffSen: '1000' });
+      expect(res.totalPages).toBe(1);
+      // COUNT + page query dijalankan paralel.
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
+      const pageSql = String((prisma.$queryRaw.mock.calls[1][0] as { sql: string }).sql);
+      expect(pageSql).toContain('LIMIT');
+      expect(pageSql).toContain('OFFSET');
+
+      // onlyMismatch=true → klausa filter diff di SQL.
+      setupRecon(rows, 1);
+      await service.getShippingReconciliation({ page: 1, limit: 20, onlyMismatch: true });
+      const mismatchSql = String((prisma.$queryRaw.mock.calls[1][0] as { sql: string }).sql);
+      expect(mismatchSql).toMatch(/<>\s*0/);
     });
   });
 

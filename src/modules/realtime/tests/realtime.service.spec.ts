@@ -49,3 +49,49 @@ describe('RealtimeService', () => {
     expect(redis.expire).toHaveBeenCalledWith('presence:user-1', 600);
   });
 });
+
+describe('RealtimeService.getLastSeenMany (BD-003)', () => {
+  const mget = jest.fn();
+  const redis: any = { get: jest.fn(), getPrefix: jest.fn(), getClient: jest.fn() };
+
+  beforeEach(() => {
+    jest.resetAllMocks();
+    redis.getPrefix.mockReturnValue('');
+    redis.getClient.mockReturnValue({ mget });
+  });
+
+  async function buildSvc() {
+    const mod = await Test.createTestingModule({
+      providers: [
+        RealtimeService,
+        { provide: RedisService, useValue: redis },
+        { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
+      ],
+    }).compile();
+    return mod.get(RealtimeService);
+  }
+
+  it('mengambil semua last-seen dalam SATU MGET (bukan N GET)', async () => {
+    mget.mockResolvedValue(['1700000000000', null, 'not-a-number']);
+    const svc = await buildSvc();
+    const out = await svc.getLastSeenMany(['u1', 'u2', 'u3']);
+    expect(mget).toHaveBeenCalledTimes(1);
+    expect(mget).toHaveBeenCalledWith('presence:last:u1', 'presence:last:u2', 'presence:last:u3');
+    expect(out.u1).toEqual(new Date(1700000000000));
+    expect(out.u2).toBeNull();
+    expect(out.u3).toBeNull();
+  });
+
+  it('mengembalikan map kosong untuk input kosong tanpa menyentuh Redis', async () => {
+    const svc = await buildSvc();
+    expect(await svc.getLastSeenMany([])).toEqual({});
+    expect(mget).not.toHaveBeenCalled();
+  });
+
+  it('fail-safe: Redis error → semua null (tidak melempar)', async () => {
+    mget.mockRejectedValue(new Error('redis down'));
+    const svc = await buildSvc();
+    const out = await svc.getLastSeenMany(['u1']);
+    expect(out.u1).toBeNull();
+  });
+});

@@ -4,7 +4,7 @@ import { ParseQueryStringPipe } from '../../common/pipes/parse-query-string.pipe
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { NotificationPreference, NotificationCategory } from '@prisma/client';
-import { NotificationsService, PublicNotification } from './notifications.service';
+import { NotificationsService, PublicNotification, NotificationPreferencesResponse } from './notifications.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { PaginatedResponse } from '../../common/dto/pagination.dto';
 import { ListNotificationsDto } from './dto/list-notifications.dto';
@@ -91,7 +91,7 @@ export class NotificationsController {
 
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Get('preferences')
-  async getPreferences(@CurrentUser('sub') userId: string): Promise<NotificationPreference> {
+  async getPreferences(@CurrentUser('sub') userId: string): Promise<NotificationPreferencesResponse> {
     return this.notificationsService.getPreferences(userId);
   }
 

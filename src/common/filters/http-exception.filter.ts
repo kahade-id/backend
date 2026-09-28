@@ -1,6 +1,30 @@
 import { ExceptionFilter, Catch, ArgumentsHost, HttpException, HttpStatus } from '@nestjs/common';
 import { Response } from 'express';
 
+/**
+ * Batch 139 BE-API2 (item 120): sanitasi atribusi field error validasi sebelum
+ * diteruskan ke klien. Hanya entry `{ field: string, messages: string[] }`
+ * yang dilewatkan — tanpa target/value (data user) atau metadata internal.
+ */
+function sanitizeValidationFields(raw: unknown[]): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  for (const entry of raw.slice(0, 50)) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const e = entry as Record<string, unknown>;
+    if (typeof e.field !== 'string' || e.field.length > 200) continue;
+    const messages = Array.isArray(e.messages)
+      ? e.messages.filter((m): m is string => typeof m === 'string').slice(0, 10)
+      : [];
+    const clean: Record<string, unknown> = { field: e.field, messages };
+    if (Array.isArray(e.children)) {
+      const children = sanitizeValidationFields(e.children);
+      if (children.length > 0) clean.children = children;
+    }
+    out.push(clean);
+  }
+  return out;
+}
+
 @Catch(HttpException)
 export class HttpExceptionFilter implements ExceptionFilter {
   catch(exception: HttpException, host: ArgumentsHost): void {
@@ -13,6 +37,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
     let errorCode: string;
     let message: string;
     let details: string[] | undefined;
+    let fields: Array<Record<string, unknown>> | undefined;
 
     if (typeof exceptionResponse === 'object' && exceptionResponse !== null) {
       const resp = exceptionResponse as Record<string, unknown>;
@@ -23,6 +48,14 @@ export class HttpExceptionFilter implements ExceptionFilter {
         details = resp.message.length > 1 ? (resp.message as string[]) : undefined;
       } else {
         message = (resp.message as string) || this.getDefaultMessage(status);
+      }
+
+      // Batch 139 BE-API2 (item 120): teruskan atribusi field error validasi
+      // (dari validation-exception.factory.ts) dengan sanitasi — hanya field
+      // + messages bertipe aman yang dilewatkan, maksimal 50 field.
+      if (Array.isArray(resp.fields)) {
+        const sanitized = sanitizeValidationFields(resp.fields);
+        if (sanitized.length > 0) fields = sanitized;
       }
     } else if (typeof exceptionResponse === 'string') {
       errorCode = this.getDefaultErrorCode(status);
@@ -38,6 +71,9 @@ export class HttpExceptionFilter implements ExceptionFilter {
     };
     if (details) {
       errorBody.details = details;
+    }
+    if (fields) {
+      errorBody.fields = fields;
     }
     if (requestId) {
       errorBody.requestId = requestId;

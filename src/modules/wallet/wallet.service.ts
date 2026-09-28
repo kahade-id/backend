@@ -28,7 +28,15 @@ import {
   VoucherApplicability,
   OrderStatus,
   CampaignStatus,
+  UserAccountType,
+  BusinessVerificationStatus,
 } from '@prisma/client';
+import {
+  computeVerificationBadges,
+  getSealTierFromTypes,
+  type BadgeSourceUser,
+  type BadgeSourceBusinessVerification,
+} from '../users/verification-badge.service';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import { randomBytes, randomInt } from 'crypto';
 import { toSen, toIdr, percentToBpsBigInt } from '../../common/utils/currency.util';
@@ -2464,10 +2472,54 @@ export class WalletService implements OnModuleInit {
         isBanned: false,
         id: { not: senderId },
       },
-      select: { id: true, userId: true, fullName: true, username: true, avatarUrl: true },
+      // Batch 139 BE-API2 (item 115): field sumber badge ikut dimuat untuk
+      // menghitung sealTier tanpa N+1 / dependency ke UsersModule.
+      select: {
+        id: true, userId: true, fullName: true, username: true, avatarUrl: true,
+        accountType: true, emailVerified: true, emailVerifiedAt: true,
+        phoneVerified: true, phoneVerifiedAt: true, kycStatus: true, kycApprovedAt: true,
+        isKahadePlus: true, subscriptionExpiresAt: true, kahadePlusSince: true,
+        isVip: true, vipGrantedAt: true, address: true, grayVerifiedRevokedAt: true,
+        memberSince: true, deletedAt: true,
+      },
     });
 
     if (!user) return null;
+
+    // Batch 139 BE-API2 (item 115): info penerima untuk peringatan
+    // "bukan favorit" di UI — isFavorite dari daftar favorit pengirim,
+    // sealTier dari badge verifikasi (logika murni yang sama dengan
+    // VerificationBadgeService, tanpa dependency antar-modul).
+    let favorite: { id: string } | null = null;
+    try {
+      favorite =
+        (await (this.prisma as any).walletFavoriteRecipient?.findUnique?.({
+          where: { userId_recipientId: { userId: senderId, recipientId: user.id } },
+          select: { id: true },
+        })) ?? null;
+    } catch {
+      favorite = null;
+    }
+    let businessVerification: BadgeSourceBusinessVerification | null = null;
+    if (user.accountType === UserAccountType.BUSINESS) {
+      try {
+        businessVerification = await this.prisma.businessVerification.findFirst({
+          where: { userId: user.id, status: BusinessVerificationStatus.APPROVED },
+          orderBy: [{ approvedAt: 'desc' }, { id: 'desc' }],
+          select: { status: true, approvedAt: true },
+        });
+      } catch {
+        businessVerification = null;
+      }
+    }
+
+    let sealTier: string | null = null;
+    try {
+      const badges = computeVerificationBadges(user as unknown as BadgeSourceUser, businessVerification);
+      sealTier = getSealTierFromTypes(badges.map((b) => b.type));
+    } catch {
+      sealTier = null;
+    }
 
     return {
       id: user.id,
@@ -2475,6 +2527,8 @@ export class WalletService implements OnModuleInit {
       fullName: user.fullName,
       username: user.username,
       avatarUrl: user.avatarUrl,
+      isFavorite: !!favorite,
+      sealTier,
     };
   }
 

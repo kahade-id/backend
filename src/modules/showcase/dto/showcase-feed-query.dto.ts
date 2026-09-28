@@ -1,7 +1,7 @@
 import { IsOptional, IsString, IsIn, IsInt, IsNumber, IsEnum, Min, Max, MaxLength } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { ShowcaseCondition } from '@prisma/client';
+import { ShowcaseCondition, ProductType } from '@prisma/client';
 import {
   SHOWCASE_CATEGORY_MAX_LENGTH,
   SHOWCASE_FEED_DEFAULT_LIMIT,
@@ -126,4 +126,17 @@ export class ShowcaseFeedQueryDto {
   @Min(0)
   @Max(5)
   minSellerRating?: number;
+
+  @ApiPropertyOptional({
+    enum: ['JASA', 'FISIK', 'DIGITAL', 'LAINNYA'],
+    description:
+      'Filter tipe produk (batch 139 BE-API2, item 121): JASA = jasa/layanan, ' +
+      'FISIK = barang fisik, DIGITAL = produk digital, LAINNYA = lainnya. ' +
+      'Case-insensitive (dinormalisasi ke uppercase).',
+  })
+  @IsOptional()
+  @IsString()
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim().toUpperCase() : value))
+  @IsEnum(ProductType, { message: 'productType must be one of: JASA, FISIK, DIGITAL, LAINNYA' })
+  productType?: ProductType;
 }

@@ -10,7 +10,7 @@ import './instrument';
 
 import { NestFactory, Reflector } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
-import { ValidationPipe, Logger } from '@nestjs/common';
+import { ValidationPipe, Logger, HttpStatus } from '@nestjs/common';
 import helmet from 'helmet';
 import compression from 'compression';
 import cookieParser from 'cookie-parser';
@@ -29,6 +29,7 @@ import { RedisService } from './redis/redis.service';
 import { OpsSettingsService } from './modules/ops-settings/ops-settings.service';
 import { MaintenanceMiddleware } from './modules/ops-settings/maintenance.middleware';
 import { withTimeout } from './common/utils/background-reliability.util';
+import { validationExceptionFactory } from './common/pipes/validation-exception.factory';
 
 const PLACEHOLDER_PATTERNS = ['change_me', 'EXAMPLE', '0123456789abcdef'];
 
@@ -299,6 +300,10 @@ async function bootstrap(): Promise<void> {
       forbidNonWhitelisted: true,
       transform: true,
       transformOptions: { enableImplicitConversion: false },
+      // Batch 139 BE-API2 (item 120): error validasi = 422 dengan atribusi
+      // field (bukan 400 generik) — lihat validation-exception.factory.ts.
+      errorHttpStatusCode: HttpStatus.UNPROCESSABLE_ENTITY,
+      exceptionFactory: validationExceptionFactory,
     }),
   );
 

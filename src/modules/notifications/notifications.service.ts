@@ -27,7 +27,37 @@ function criticalSecurityType(type: NotificationType): boolean {
   return type.startsWith('SECURITY_');
 }
 
-export type PublicNotification = Pick<Notification, 'notifId' | 'type' | 'category' | 'channel' | 'title' | 'body' | 'refType' | 'refId' | 'actionUrl' | 'isRead' | 'readAt' | 'createdAt' | 'expiresAt' | 'metadata'>;
+export type PublicNotification = Pick<Notification, 'notifId' | 'type' | 'category' | 'channel' | 'title' | 'body' | 'refType' | 'refId' | 'actionUrl' | 'isRead' | 'readAt' | 'createdAt' | 'expiresAt' | 'metadata'> & {
+  /**
+   * Batch 139 BE-API2 (item 114): URL gambar opsional untuk notifikasi kaya
+   * (rich notification). Diambil dari `metadata.imageUrl` (fallback
+   * `metadata.image_url`); null bila tidak ada. Tidak ada migrasi — kolom
+   * tidak ditambahkan ke tabel, pembuat notifikasi cukup mengisi metadata.
+   */
+  imageUrl: string | null;
+};
+
+/**
+ * Batch 139 BE-API2 (item 113): preferensi notifikasi + status EFEKTIF quiet
+ * hours yang dihitung server dari setting + waktu sekarang (zona waktu
+ * per-user `quietHoursTimezone`).
+ */
+export type NotificationPreferencesResponse = NotificationPreference & {
+  quietHoursActive: boolean;
+};
+
+function extractNotificationImageUrl(metadata: Prisma.JsonValue | null | undefined): string | null {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
+  const record = metadata as Record<string, unknown>;
+  const candidate = record.imageUrl ?? record.image_url;
+  return typeof candidate === 'string' && candidate.trim().length > 0 ? candidate : null;
+}
+
+function withImageUrl<T extends { metadata?: Prisma.JsonValue | null }>(
+  row: T,
+): T & { imageUrl: string | null } {
+  return { ...row, imageUrl: extractNotificationImageUrl(row.metadata) };
+}
 
 const PUBLIC_NOTIFICATION_SELECT = {
   notifId: true,
@@ -137,7 +167,7 @@ export class NotificationsService {
       where.category = category;
     }
 
-    const [data, total] = await Promise.all([
+    const [rows, total] = await Promise.all([
       this.prisma.notification.findMany({
         where,
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // R2-L: stable page ordering
@@ -147,6 +177,9 @@ export class NotificationsService {
       }),
       this.prisma.notification.count({ where }),
     ]);
+
+    // Batch 139 BE-API2 (item 114): sematkan imageUrl opsional per item.
+    const data = rows.map(withImageUrl);
 
     return createPaginatedResponse(data, total, safePage, safeLimit);
   }
@@ -159,7 +192,7 @@ export class NotificationsService {
     if (!notification) {
       throw new NotFoundException({ code: ErrorCodes.NOTIFICATION_NOT_FOUND, message: 'Notification not found' });
     }
-    return notification;
+    return withImageUrl(notification);
   }
 
   async getUnreadCount(userId: string, category?: NotificationCategory): Promise<{
@@ -214,7 +247,7 @@ export class NotificationsService {
       select: PUBLIC_NOTIFICATION_SELECT,
     });
 
-    return updated;
+    return withImageUrl(updated);
   }
 
   async markBatchAsRead(userId: string, notifIds: string[]): Promise<{ markedCount: number }> {
@@ -277,14 +310,17 @@ export class NotificationsService {
     return { markedCount: totalMarked };
   }
 
-  async getPreferences(userId: string): Promise<NotificationPreference> {
+  async getPreferences(userId: string): Promise<NotificationPreferencesResponse> {
     // Race-safe upsert: previous findUnique→create pattern threw P2002
     // when two concurrent first-time requests landed at the same instant.
-    return this.prisma.notificationPreference.upsert({
+    const prefs = await this.prisma.notificationPreference.upsert({
       where: { userId },
       create: { userId },
       update: {},
     });
+    // Batch 139 BE-API2 (item 113): status efektif quiet hours dihitung
+    // server dari setting + waktu sekarang.
+    return { ...prefs, quietHoursActive: this.computeQuietHoursActive(prefs) };
   }
 
   async updatePreferences(userId: string, dto: UpdatePreferencesDto): Promise<NotificationPreference> {
@@ -301,16 +337,36 @@ export class NotificationsService {
     return prefs;
   }
 
-  // 7.2 Quiet hours check (zona waktu per-user, CN-008) + 7.3 per-category push toggles + language
-  async isInQuietHours(userId: string): Promise<boolean> {
+  /**
+   * Batch 139 BE-API2 (item 113): status efektif quiet hours dari objek
+   * preferensi yang SUDAH dimuat (tanpa query tambahan). Logika identik
+   * dengan `isInQuietHours` — diekstrak agar GET /preferences bisa memakai
+   * hasil upsert langsung.
+   */
+  private computeQuietHoursActive(prefs: {
+    quietHoursEnabled: boolean;
+    quietHoursStart?: string | null;
+    quietHoursEnd?: string | null;
+    quietHoursTimezone?: string | null;
+  }): boolean {
     try {
-      const prefs = await this.prisma.notificationPreference.findUnique({ where: { userId } }) as any;
-      if (!prefs || !prefs.quietHoursEnabled) return false;
+      if (!prefs.quietHoursEnabled) return false;
       const start = prefs.quietHoursStart || '22:00';
       const end = prefs.quietHoursEnd || '07:00';
       // CN-008: zona waktu dari preferensi user, bukan hardcode WIB.
       const currentMinutes = getMinutesInTimezone(new Date(), prefs.quietHoursTimezone);
       return isMinutesInRange(currentMinutes, start, end);
+    } catch {
+      return false;
+    }
+  }
+
+  // 7.2 Quiet hours check (zona waktu per-user, CN-008) + 7.3 per-category push toggles + language
+  async isInQuietHours(userId: string): Promise<boolean> {
+    try {
+      const prefs = await this.prisma.notificationPreference.findUnique({ where: { userId } }) as any;
+      if (!prefs) return false;
+      return this.computeQuietHoursActive(prefs);
     } catch {
       return false;
     }

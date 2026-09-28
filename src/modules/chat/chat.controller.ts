@@ -54,7 +54,7 @@ export class ChatController {
   @Get('rooms')
   @ApiOperation({
     summary: 'List chat rooms for current user',
-    description: 'Includes ORDER rooms and pre-transaction INQUIRY rooms. Archived rooms are hidden unless `archived=true`.',
+    description: 'Includes ORDER rooms and pre-transaction INQUIRY rooms. Archived rooms are hidden unless `archived=true`. Optional `q` searches room subject and participant name/username server-side.',
   })
   async getRooms(
     @CurrentUser('sub') userId: string,
@@ -62,9 +62,10 @@ export class ChatController {
     @Query('limit', new DefaultValuePipe(20), ParseIntPipe, new ClampLimitPipe()) limit: number,
     @Query('type') type?: string,
     @Query('archived', new DefaultValuePipe(false), ParseBoolPipe) archived?: boolean,
+    @Query('q', new ParseQueryStringPipe('q', 100)) q?: string,
   ): Promise<object> {
     const normalizedType = type === 'INQUIRY' ? 'INQUIRY' : type === 'ORDER' ? 'ORDER' : undefined;
-    return this.chatService.getRooms(userId, { page, limit, type: normalizedType, archived });
+    return this.chatService.getRooms(userId, { page, limit, type: normalizedType, archived, q });
   }
 
   @UseGuards(UserThrottleGuard)

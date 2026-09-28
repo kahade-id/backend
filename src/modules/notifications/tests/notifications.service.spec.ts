@@ -185,6 +185,61 @@ describe('NotificationsService', () => {
       await service.updatePreferences('u1', { orderPush: false } as any);
       expect(mockPrisma.notificationPreference.upsert).toHaveBeenCalled();
     });
+
+    // Batch 139 BE-API2 (item 113): quietHoursActive dihitung server.
+    it('returns quietHoursActive=false when quiet hours disabled', async () => {
+      mockPrisma.notificationPreference.upsert.mockResolvedValue({
+        userId: 'u1', quietHoursEnabled: false, quietHoursStart: '22:00', quietHoursEnd: '07:00',
+      });
+      const res = await service.getPreferences('u1');
+      expect(res.quietHoursActive).toBe(false);
+    });
+
+    it('returns quietHoursActive matching server-side quiet-hours logic', async () => {
+      // Rentang 00:00–23:59 selalu aktif kapan pun test dijalankan.
+      const prefs = {
+        userId: 'u1', quietHoursEnabled: true, quietHoursStart: '00:00', quietHoursEnd: '23:59',
+        quietHoursTimezone: 'Asia/Jakarta',
+      };
+      mockPrisma.notificationPreference.upsert.mockResolvedValue(prefs);
+      const res = await service.getPreferences('u1');
+      expect(res.quietHoursActive).toBe(true);
+      mockPrisma.notificationPreference.findUnique.mockResolvedValue(prefs);
+      expect(await service.isInQuietHours('u1')).toBe(true);
+    });
+  });
+
+  describe('imageUrl (item 114)', () => {
+    it('listNotifications attaches imageUrl from metadata.imageUrl', async () => {
+      mockPrisma.notification.findMany.mockResolvedValue([
+        { notifId: 'N1', metadata: { imageUrl: 'https://cdn/x.png' } },
+        { notifId: 'N2', metadata: { image_url: 'https://cdn/y.png' } },
+        { notifId: 'N3', metadata: null },
+        { notifId: 'N4', metadata: { other: 1 } },
+      ]);
+      mockPrisma.notification.count.mockResolvedValue(4);
+      const res = await service.listNotifications('u1', 1, 20);
+      const items = (res as any).data ?? (res as any).items;
+      expect(items[0].imageUrl).toBe('https://cdn/x.png');
+      expect(items[1].imageUrl).toBe('https://cdn/y.png');
+      expect(items[2].imageUrl).toBeNull();
+      expect(items[3].imageUrl).toBeNull();
+    });
+
+    it('getNotification attaches imageUrl', async () => {
+      mockPrisma.notification.findFirst.mockResolvedValue({
+        notifId: 'N1', userId: 'u1', metadata: { imageUrl: 'https://cdn/z.png' },
+      });
+      const res = await service.getNotification('u1', 'N1');
+      expect(res.imageUrl).toBe('https://cdn/z.png');
+    });
+
+    it('markAsRead attaches imageUrl', async () => {
+      mockPrisma.notification.findUnique.mockResolvedValue({ id: 'n1', userId: 'u1', deletedAt: null });
+      mockPrisma.notification.update.mockResolvedValue({ notifId: 'N1', metadata: {} });
+      const res = await service.markAsRead('u1', 'N1');
+      expect(res.imageUrl).toBeNull();
+    });
   });
 
   describe('deleteNotification', () => {

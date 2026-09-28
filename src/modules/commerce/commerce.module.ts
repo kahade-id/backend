@@ -27,6 +27,9 @@ import { JastipController } from './controllers/jastip.controller';
 import { PatunganController } from './controllers/patungan.controller';
 import { BannersController } from './controllers/banners.controller';
 import { AdminBannersController } from './controllers/admin-banners.controller';
+import { AdminGroupBuyingController } from './controllers/admin-group-buying.controller';
+import { AdminJastipTripsController } from './controllers/admin-jastip-trips.controller';
+import { AdminSellerVouchersController } from './controllers/admin-seller-vouchers.controller';
 
 /**
  * BE-COMMERCE (2026-10-01): modul commerce mega-batch.
@@ -54,6 +57,9 @@ import { AdminBannersController } from './controllers/admin-banners.controller';
     PatunganController,
     BannersController,
     AdminBannersController,
+    AdminGroupBuyingController,
+    AdminJastipTripsController,
+    AdminSellerVouchersController,
   ],
   providers: [
     ProductCommerceService,

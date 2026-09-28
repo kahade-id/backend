@@ -6276,6 +6276,7 @@ model JastipParticipant {
   updatedAt DateTime @updatedAt
 
   @@unique([tripId, buyerId])
+  @@unique([orderId]) // satu order escrow hanya boleh ditautkan ke satu peserta
   @@index([buyerId, status])
   @@map("jastip_participants")
 }
@@ -6329,6 +6330,7 @@ model PatunganParticipant {
   updatedAt DateTime @updatedAt
 
   @@unique([groupId, userId])
+  @@unique([orderId]) // satu order escrow hanya boleh ditautkan ke satu peserta
   @@index([userId, status])
   @@map("patungan_participants")
 }

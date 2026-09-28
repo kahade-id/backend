@@ -13,6 +13,7 @@ const mockPrisma: Record<string, any> = {
   jastipTrip: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), update: jest.fn(), count: jest.fn() },
   jastipItem: { create: jest.fn(), findMany: jest.fn() },
   jastipParticipant: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), update: jest.fn() },
+  user: { findMany: jest.fn() },
   order: { findFirst: jest.fn(), findUnique: jest.fn() },
   $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
 };
@@ -97,16 +98,32 @@ describe('JastipService', () => {
   });
 
   it('linkOrder memverifikasi order berbayar milik buyer (nilai = total terkunci)', async () => {
-    mockPrisma.jastipParticipant.findFirst.mockResolvedValue({
-      id: 'p1', buyerId: 'buyer-1', status: JastipParticipantStatus.PRICE_LOCKED, totalLocked: 125000_00n,
-      trip: { hostId: 'host-1' },
-    });
+    mockPrisma.jastipParticipant.findFirst
+      .mockResolvedValueOnce({
+        id: 'p1', buyerId: 'buyer-1', status: JastipParticipantStatus.PRICE_LOCKED, totalLocked: 125000_00n,
+        trip: { hostId: 'host-1' },
+      })
+      .mockResolvedValue(null); // cek double-link: belum ditautkan
     mockPrisma.order.findFirst.mockResolvedValue({
       id: 'o1', buyerId: 'buyer-1', sellerId: 'host-1', status: OrderStatus.PROCESSING, orderValue: 125000_00n,
     });
     mockPrisma.jastipParticipant.update.mockResolvedValue({ id: 'p1', status: JastipParticipantStatus.PAID });
     const res = await service.linkOrder('buyer-1', 'p1', { orderId: 'o1' } as never);
     expect(res.status).toBe(JastipParticipantStatus.PAID);
+  });
+
+  it('linkOrder menolak order yang sudah ditautkan ke peserta lain (anti double-link)', async () => {
+    mockPrisma.jastipParticipant.findFirst
+      .mockResolvedValueOnce({
+        id: 'p1', buyerId: 'buyer-1', status: JastipParticipantStatus.PRICE_LOCKED, totalLocked: 125000_00n,
+        trip: { hostId: 'host-1' },
+      })
+      .mockResolvedValueOnce({ id: 'p9' }); // peserta lain sudah memakai order ini
+    mockPrisma.order.findFirst.mockResolvedValue({
+      id: 'o1', buyerId: 'buyer-1', sellerId: 'host-1', status: OrderStatus.PROCESSING, orderValue: 125000_00n,
+    });
+    await expect(service.linkOrder('buyer-1', 'p1', { orderId: 'o1' } as never)).rejects.toThrow('sudah ditautkan');
+    expect(mockPrisma.jastipParticipant.update).not.toHaveBeenCalled();
   });
 
   it('linkOrder menolak bila harga belum dikunci', async () => {
@@ -150,5 +167,48 @@ describe('JastipService', () => {
     const res = await service.failTrip('host-1', 't1', 'barang habis');
     expect(mockOrderState.cancelOrder).toHaveBeenCalled();
     expect(res.results[0].outcome).toBe('REFUNDED');
+  });
+
+  it('listAdminTrips mengembalikan shape admin + hostName', async () => {
+    mockPrisma.jastipTrip.findMany.mockResolvedValue([{
+      id: 't1', hostId: 'host-1', title: 'Trip Jakarta',
+      orderDeadline: new Date('2026-12-01T00:00:00Z'), slotTotal: 5, slotUsed: 2,
+      status: JastipTripStatus.OPEN,
+      createdAt: new Date('2026-09-28T00:00:00Z'), updatedAt: new Date('2026-09-28T00:00:00Z'),
+      participants: [{ status: JastipParticipantStatus.PAID }, { status: JastipParticipantStatus.JOINED }],
+    }]);
+    mockPrisma.jastipTrip.count.mockResolvedValue(1);
+    mockPrisma.user.findMany.mockResolvedValue([{ id: 'host-1', fullName: 'Host J' }]);
+    const res = await service.listAdminTrips(1, 20);
+    expect(res.total).toBe(1);
+    expect(res.data[0]).toMatchObject({
+      id: 't1', hostName: 'Host J', slotCount: 5, orderCount: 1, status: JastipTripStatus.OPEN,
+    });
+  });
+
+  it('getAdminTripDetail memetakan katalog + peserta (rupiah)', async () => {
+    mockPrisma.jastipTrip.findFirst.mockResolvedValue({
+      id: 't1', hostId: 'host-1', title: 'Trip Jakarta',
+      orderDeadline: new Date('2026-12-01T00:00:00Z'), slotTotal: 5, slotUsed: 2,
+      status: JastipTripStatus.OPEN,
+      createdAt: new Date('2026-09-28T00:00:00Z'), updatedAt: new Date('2026-09-28T00:00:00Z'),
+      items: [{ id: 'i1', name: 'Kopi', estimatedPrice: 5000000n }],
+      participants: [{
+        id: 'p1', buyerId: 'b1', itemSummary: 'Kopi 2kg',
+        goodsAmount: 5000000n, jastipFee: 1000000n, shippingCost: 1500000n, totalLocked: 7500000n,
+        priceLockedAt: new Date('2026-09-28T01:00:00Z'), orderId: 'o1',
+        status: JastipParticipantStatus.PAID, createdAt: new Date('2026-09-27T00:00:00Z'),
+      }],
+    });
+    mockPrisma.user.findMany.mockResolvedValue([
+      { id: 'host-1', fullName: 'Host J' },
+      { id: 'b1', fullName: 'Buyer B' },
+    ]);
+    const res = await service.getAdminTripDetail('t1');
+    expect(res.hostName).toBe('Host J');
+    expect(res.catalog[0]).toMatchObject({ id: 'i1', name: 'Kopi', price: 50000 });
+    expect(res.orders[0]).toMatchObject({
+      buyerId: 'b1', buyerName: 'Buyer B', itemPrice: 50000, jastipFee: 10000, shippingCost: 15000,
+    });
   });
 });

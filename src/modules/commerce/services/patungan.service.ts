@@ -104,6 +104,101 @@ export class PatunganService {
     return this.withComputed(group);
   }
 
+  // ── Admin (monitoring saja, tanpa aksi finansial) ───────────────────────
+
+  /** Nama display user untuk field hostName/userName di response admin. */
+  private async userDisplayNames(userIds: string[]): Promise<Map<string, string | null>> {
+    const uniq = [...new Set(userIds.filter((id) => !!id))];
+    if (uniq.length === 0) return new Map();
+    const users = await this.prisma.user.findMany({
+      where: { id: { in: uniq } },
+      select: { id: true, fullName: true },
+    });
+    return new Map(users.map((u) => [u.id, u.fullName]));
+  }
+
+  /** Daftar grup patungan untuk admin: filter status + pencarian judul/hostId. */
+  async listAdminGroups(page = 1, limit = 20, status?: PatunganStatus, q?: string) {
+    const where: Prisma.PatunganGroupWhereInput = {};
+    if (status && Object.values(PatunganStatus).includes(status)) where.status = status;
+    const keyword = q?.trim();
+    if (keyword) {
+      where.OR = [
+        { title: { contains: keyword, mode: 'insensitive' } },
+        { hostId: { contains: keyword } },
+      ];
+    }
+    const [rows, total] = await Promise.all([
+      this.prisma.patunganGroup.findMany({
+        where,
+        include: { participants: { select: { status: true, amount: true } } },
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.patunganGroup.count({ where }),
+    ]);
+    const names = await this.userDisplayNames(rows.map((g) => g.hostId));
+    const items = await Promise.all(
+      rows.map(async (g) =>
+        this.toAdminItem(await this.withComputed(g as Record<string, any>), names.get(g.hostId) ?? null, g.slotTotal),
+      ),
+    );
+    return createPaginatedResponse(items, total, page, limit);
+  }
+
+  /** Detail grup patungan untuk admin: agregat transparan + daftar peserta. */
+  async getAdminGroupDetail(groupId: string) {
+    const group = await this.prisma.patunganGroup.findFirst({
+      where: { id: groupId },
+      include: {
+        participants: {
+          select: { id: true, userId: true, amount: true, orderId: true, paidAt: true, status: true, createdAt: true },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
+    });
+    if (!group) throw new NotFoundException({ code: ErrorCodes.PATUNGAN_GROUP_NOT_FOUND, message: 'Grup patungan tidak ditemukan' });
+    const enriched = (await this.withComputed(group as Record<string, any>)) as Record<string, any>;
+    const names = await this.userDisplayNames([
+      group.hostId,
+      ...group.participants.map((p) => p.userId),
+    ]);
+    return {
+      ...this.toAdminItem(enriched, names.get(group.hostId) ?? null, group.slotTotal),
+      splitMode: enriched.mode,
+      disbursedAmount: null,
+      participants: group.participants.map((p) => ({
+        userId: p.userId,
+        userName: names.get(p.userId) ?? null,
+        amount: toIdr(p.amount),
+        hasPaid:
+          p.status === PatunganParticipantStatus.PAID ||
+          p.status === PatunganParticipantStatus.RELEASED ||
+          p.paidAt !== null,
+        joinedAt: p.createdAt,
+        paidAt: p.paidAt,
+      })),
+    };
+  }
+
+  private toAdminItem(enriched: Record<string, any>, hostName: string | null, slotTotal: number) {
+    return {
+      id: enriched.id,
+      title: enriched.title,
+      hostId: enriched.hostId,
+      hostName,
+      targetAmount: enriched.targetAmountIdr,
+      collectedAmount: enriched.totalPaidIdr,
+      participantCount: enriched.participantCount,
+      maxParticipants: slotTotal > 0 ? slotTotal : null,
+      status: enriched.status,
+      deadline: enriched.deadlineAt,
+      createdAt: enriched.createdAt,
+      updatedAt: enriched.updatedAt,
+    };
+  }
+
   /** Hitung agregat transparan: total terkumpul, sisa, overfunding per orang. */
   private async withComputed(group: Record<string, any>) {
     const paid = (group.participants ?? []) as Array<{ amount: bigint; status: PatunganParticipantStatus }>;
@@ -169,6 +264,13 @@ export class PatunganService {
       return participant;
     } catch (e) {
       if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        const target = (e.meta?.target as string[]) ?? [];
+        if (target.includes('orderId')) {
+          throw new BadRequestException({
+            code: ErrorCodes.ORDER_ALREADY_LINKED,
+            message: 'Order ini sudah ditautkan ke peserta patungan lain',
+          });
+        }
         throw new ConflictException({ code: ErrorCodes.PATUNGAN_ALREADY_JOINED, message: 'Kamu sudah join grup ini' });
       }
       throw e;
@@ -208,6 +310,18 @@ export class PatunganService {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Order belum dibayar' });
     }
     const updated = await this.prisma.$transaction(async (tx) => {
+      // Satu order berbayar TIDAK BOLEH ditautkan ke 2 peserta (cegah
+      // TARGET_REACHED palsu lewat double-counting dana escrow yang sama).
+      const alreadyLinked = await tx.patunganParticipant.findFirst({
+        where: { orderId: order.id, id: { not: participant.id } },
+        select: { id: true },
+      });
+      if (alreadyLinked) {
+        throw new BadRequestException({
+          code: ErrorCodes.ORDER_ALREADY_LINKED,
+          message: 'Order ini sudah ditautkan ke peserta patungan lain',
+        });
+      }
       const p = await tx.patunganParticipant.update({
         where: { id: participant.id },
         data: { orderId: order.id, paidAt: new Date(), status: PatunganParticipantStatus.PAID },
@@ -221,6 +335,16 @@ export class PatunganService {
         await tx.patunganGroup.update({ where: { id: participant.groupId }, data: { status: PatunganStatus.TARGET_REACHED } });
       }
       return p;
+    }).catch((e) => {
+      // Race antar-request: unique constraint DB (orderId) menolak link ganda
+      // → sampaikan sebagai BadRequest yang sama, bukan error mentah.
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        throw new BadRequestException({
+          code: ErrorCodes.ORDER_ALREADY_LINKED,
+          message: 'Order ini sudah ditautkan ke peserta patungan lain',
+        });
+      }
+      throw e;
     });
     return updated;
   }

@@ -5,13 +5,14 @@ import { OrderStateService } from '../../orders/order-state.service';
 import { PatunganMode, PatunganStatus, PatunganParticipantStatus, OrderStatus } from '@prisma/client';
 
 const mockTx: Record<string, any> = {
-  patunganParticipant: { update: jest.fn(), aggregate: jest.fn() },
+  patunganParticipant: { update: jest.fn(), aggregate: jest.fn(), findFirst: jest.fn() },
   patunganGroup: { update: jest.fn() },
 };
 
 const mockPrisma: Record<string, any> = {
   patunganGroup: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn(), update: jest.fn() },
   patunganParticipant: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), update: jest.fn(), count: jest.fn(), delete: jest.fn(), aggregate: jest.fn() },
+  user: { findMany: jest.fn() },
   order: { findFirst: jest.fn(), findUnique: jest.fn() },
   $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
 };
@@ -149,6 +150,7 @@ describe('PatunganService', () => {
     mockPrisma.order.findFirst.mockResolvedValue({
       id: 'o1', buyerId: 'u1', sellerId: 'h1', orderValue: 25000000n, status: OrderStatus.PROCESSING,
     });
+    mockTx.patunganParticipant.findFirst.mockResolvedValue(null);
     mockTx.patunganParticipant.update.mockResolvedValue({ ...participant, status: PatunganParticipantStatus.PAID });
     mockTx.patunganParticipant.aggregate.mockResolvedValue({ _sum: { amount: 25000000n } });
     const res = await service.linkOrder('u1', 'pp1', 'o1');
@@ -156,6 +158,21 @@ describe('PatunganService', () => {
     expect(mockTx.patunganParticipant.update).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ orderId: 'o1' }) }),
     );
+  });
+
+  it('linkOrder menolak order yang sudah ditautkan ke peserta lain (anti double-link)', async () => {
+    const participant = {
+      id: 'pp1', userId: 'u1', groupId: 'g1', amount: 25000000n,
+      status: PatunganParticipantStatus.PENDING,
+      group: { id: 'g1', hostId: 'h1', status: PatunganStatus.OPEN, targetAmount: 100000000n },
+    };
+    mockPrisma.patunganParticipant.findFirst.mockResolvedValue(participant);
+    mockPrisma.order.findFirst.mockResolvedValue({
+      id: 'o1', buyerId: 'u1', sellerId: 'h1', orderValue: 25000000n, status: OrderStatus.PROCESSING,
+    });
+    mockTx.patunganParticipant.findFirst.mockResolvedValue({ id: 'pp9' }); // peserta lain
+    await expect(service.linkOrder('u1', 'pp1', 'o1')).rejects.toThrow('sudah ditautkan');
+    expect(mockTx.patunganParticipant.update).not.toHaveBeenCalled();
   });
 
   it('linkOrder menolak order yang belum dibayar', async () => {
@@ -169,5 +186,50 @@ describe('PatunganService', () => {
       id: 'o1', buyerId: 'u1', sellerId: 'h1', orderValue: 25000000n, status: OrderStatus.WAITING_PAYMENT,
     });
     await expect(service.linkOrder('u1', 'pp1', 'o1')).rejects.toThrow('belum dibayar');
+  });
+
+  it('listAdminGroups mengembalikan shape admin + hostName', async () => {
+    mockPrisma.patunganGroup.findMany.mockResolvedValue([{
+      id: 'g1', hostId: 'h1', title: 'Patungan A', description: null,
+      targetAmount: 100000000n, deadlineAt: new Date('2026-12-01T00:00:00Z'),
+      slotTotal: 10, mode: PatunganMode.BAGI_RATA, perPersonAmount: 25000000n,
+      status: PatunganStatus.OPEN, contestEndsAt: null, releasedAt: null,
+      createdAt: new Date('2026-09-28T00:00:00Z'), updatedAt: new Date('2026-09-28T00:00:00Z'),
+      participants: [
+        { status: PatunganParticipantStatus.PAID, amount: 25000000n },
+        { status: PatunganParticipantStatus.PENDING, amount: 25000000n },
+      ],
+    }]);
+    mockPrisma.patunganGroup.count.mockResolvedValue(1);
+    mockPrisma.user.findMany.mockResolvedValue([{ id: 'h1', fullName: 'Host A' }]);
+    const res = await service.listAdminGroups(1, 20);
+    expect(res.total).toBe(1);
+    expect(res.data[0]).toMatchObject({
+      id: 'g1', hostName: 'Host A', targetAmount: 1000000, collectedAmount: 250000,
+      participantCount: 2, maxParticipants: 10, status: PatunganStatus.OPEN,
+    });
+  });
+
+  it('getAdminGroupDetail memetakan peserta + hostName', async () => {
+    mockPrisma.patunganGroup.findFirst.mockResolvedValue({
+      id: 'g1', hostId: 'h1', title: 'Patungan A', description: null,
+      targetAmount: 100000000n, deadlineAt: new Date('2026-12-01T00:00:00Z'),
+      slotTotal: 10, mode: PatunganMode.BAGI_RATA, perPersonAmount: 25000000n,
+      status: PatunganStatus.OPEN, contestEndsAt: null, releasedAt: null,
+      createdAt: new Date('2026-09-28T00:00:00Z'), updatedAt: new Date('2026-09-28T00:00:00Z'),
+      participants: [{
+        id: 'pp1', userId: 'u1', amount: 25000000n, orderId: 'o1',
+        paidAt: new Date('2026-09-28T01:00:00Z'), status: PatunganParticipantStatus.PAID,
+        createdAt: new Date('2026-09-27T00:00:00Z'),
+      }],
+    });
+    mockPrisma.user.findMany.mockResolvedValue([
+      { id: 'h1', fullName: 'Host A' },
+      { id: 'u1', fullName: 'User Satu' },
+    ]);
+    const res = await service.getAdminGroupDetail('g1');
+    expect(res.hostName).toBe('Host A');
+    expect(res.participants[0]).toMatchObject({ userId: 'u1', userName: 'User Satu', hasPaid: true, amount: 250000 });
+    expect(res.splitMode).toBe(PatunganMode.BAGI_RATA);
   });
 });

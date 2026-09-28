@@ -2,7 +2,7 @@ import { Injectable, NotFoundException, ForbiddenException, BadRequestException,
 import { PrismaService } from '../../../prisma/prisma.service';
 import { JastipTripStatus, JastipParticipantStatus, OrderStatus, Prisma } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
-import { toSen } from '../../../common/utils/currency.util';
+import { toSen, toIdr } from '../../../common/utils/currency.util';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { OrderStateService } from '../../orders/order-state.service';
 import {
@@ -127,6 +127,111 @@ export class JastipService {
     return { ...trip, participants, isHost, isParticipant };
   }
 
+  // ── Admin (monitoring saja, tanpa aksi finansial) ───────────────────────
+
+  /** Nama display user untuk field hostName/buyerName di response admin. */
+  private async userDisplayNames(userIds: string[]): Promise<Map<string, string | null>> {
+    const uniq = [...new Set(userIds.filter((id) => !!id))];
+    if (uniq.length === 0) return new Map();
+    const users = await this.prisma.user.findMany({
+      where: { id: { in: uniq } },
+      select: { id: true, fullName: true },
+    });
+    return new Map(users.map((u) => [u.id, u.fullName]));
+  }
+
+  /** Daftar trip jastip untuk admin: filter status + pencarian judul/hostId. */
+  async listAdminTrips(page = 1, limit = 20, status?: JastipTripStatus, q?: string) {
+    const where: Prisma.JastipTripWhereInput = {};
+    if (status && Object.values(JastipTripStatus).includes(status)) where.status = status;
+    const keyword = q?.trim();
+    if (keyword) {
+      where.OR = [
+        { title: { contains: keyword, mode: 'insensitive' } },
+        { hostId: { contains: keyword } },
+      ];
+    }
+    const [rows, total] = await Promise.all([
+      this.prisma.jastipTrip.findMany({
+        where,
+        include: { participants: { select: { status: true } } },
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.jastipTrip.count({ where }),
+    ]);
+    const names = await this.userDisplayNames(rows.map((t) => t.hostId));
+    const items = rows.map((t) => ({
+      id: t.id,
+      title: t.title,
+      hostId: t.hostId,
+      hostName: names.get(t.hostId) ?? null,
+      destination: null,
+      orderDeadline: t.orderDeadline,
+      status: t.status,
+      slotCount: t.slotTotal > 0 ? t.slotTotal : null,
+      orderCount: t.participants.filter(
+        (p) => p.status === JastipParticipantStatus.PAID || p.status === JastipParticipantStatus.COMPLETED,
+      ).length,
+      createdAt: t.createdAt,
+      updatedAt: t.updatedAt,
+    }));
+    return createPaginatedResponse(items, total, page, limit);
+  }
+
+  /** Detail trip jastip untuk admin: katalog + daftar peserta (tanpa masking). */
+  async getAdminTripDetail(tripId: string) {
+    const trip = await this.prisma.jastipTrip.findFirst({
+      where: { id: tripId },
+      include: {
+        items: { orderBy: { createdAt: 'asc' } },
+        participants: {
+          select: {
+            id: true, buyerId: true, itemSummary: true, goodsAmount: true, jastipFee: true,
+            shippingCost: true, totalLocked: true, priceLockedAt: true, orderId: true,
+            status: true, createdAt: true,
+          },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
+    });
+    if (!trip) throw new NotFoundException({ code: ErrorCodes.JASTIP_TRIP_NOT_FOUND, message: 'Trip jastip tidak ditemukan' });
+    const names = await this.userDisplayNames([
+      trip.hostId,
+      ...trip.participants.map((p) => p.buyerId),
+    ]);
+    return {
+      id: trip.id,
+      title: trip.title,
+      hostId: trip.hostId,
+      hostName: names.get(trip.hostId) ?? null,
+      destination: null,
+      orderDeadline: trip.orderDeadline,
+      status: trip.status,
+      slotCount: trip.slotTotal > 0 ? trip.slotTotal : null,
+      orderCount: trip.participants.length,
+      createdAt: trip.createdAt,
+      updatedAt: trip.updatedAt,
+      catalog: trip.items.map((i) => ({
+        id: i.id,
+        name: i.name,
+        price: i.estimatedPrice !== null ? toIdr(i.estimatedPrice) : null,
+      })),
+      orders: trip.participants.map((p) => ({
+        id: p.id,
+        buyerId: p.buyerId,
+        buyerName: names.get(p.buyerId) ?? null,
+        itemName: p.itemSummary,
+        itemPrice: p.goodsAmount !== null ? toIdr(p.goodsAmount) : null,
+        jastipFee: p.jastipFee !== null ? toIdr(p.jastipFee) : null,
+        shippingCost: p.shippingCost !== null ? toIdr(p.shippingCost) : null,
+        status: p.status,
+        createdAt: p.createdAt,
+      })),
+    };
+  }
+
   // ── Buyer ───────────────────────────────────────────────────────────────
 
   async joinTrip(buyerId: string, tripId: string, dto: JoinJastipDto) {
@@ -230,10 +335,33 @@ export class JastipService {
     if (!PAID_ORDER_STATUSES.includes(order.status)) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Order belum dibayar' });
     }
-    return this.prisma.jastipParticipant.update({
-      where: { id: participant.id },
-      data: { orderId: order.id, status: JastipParticipantStatus.PAID },
+    // Satu order berbayar TIDAK BOLEH ditautkan ke 2 peserta/trip (cegah
+    // pelunasan palsu lewat double-link escrow order yang sama).
+    const alreadyLinked = await this.prisma.jastipParticipant.findFirst({
+      where: { orderId: order.id, id: { not: participant.id } },
+      select: { id: true },
     });
+    if (alreadyLinked) {
+      throw new BadRequestException({
+        code: ErrorCodes.ORDER_ALREADY_LINKED,
+        message: 'Order ini sudah ditautkan ke peserta jastip lain',
+      });
+    }
+    try {
+      return await this.prisma.jastipParticipant.update({
+        where: { id: participant.id },
+        data: { orderId: order.id, status: JastipParticipantStatus.PAID },
+      });
+    } catch (e) {
+      // Race antar-request: unique constraint DB (orderId) menolak link ganda.
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        throw new BadRequestException({
+          code: ErrorCodes.ORDER_ALREADY_LINKED,
+          message: 'Order ini sudah ditautkan ke peserta jastip lain',
+        });
+      }
+      throw e;
+    }
   }
 
   /**

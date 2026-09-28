@@ -4,8 +4,19 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { VoucherType } from '@prisma/client';
 
 const mockPrisma = {
-  voucher: { findUnique: jest.fn(), findFirst: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn(), update: jest.fn() },
+  voucher: { findUnique: jest.fn(), findUniqueOrThrow: jest.fn(), findFirst: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn(), update: jest.fn() },
   voucherUsage: { count: jest.fn() },
+  user: { findMany: jest.fn() },
+};
+
+const adminVoucherRow = {
+  id: 'v1', code: 'HEMAT10', name: 'Hemat 10rb', description: null,
+  voucherType: 'FEE_DISCOUNT_FLAT', discountAmount: 1000000n, discountPercent: null,
+  maxDiscountAmount: null, maxUsageTotal: 100, maxUsagePerUser: 1, currentUsage: 3,
+  minOrderValue: null, isActive: true,
+  validFrom: new Date('2026-09-01T00:00:00Z'), validUntil: new Date('2026-12-31T00:00:00Z'),
+  sellerId: 'seller-1', createdBy: 'SELLER_seller-1',
+  createdAt: new Date('2026-09-28T00:00:00Z'), updatedAt: new Date('2026-09-28T00:00:00Z'),
 };
 
 const baseDto = {
@@ -110,6 +121,46 @@ describe('SellerVouchersService', () => {
     it('hanya pemilik yang bisa menonaktifkan', async () => {
       mockPrisma.voucher.findFirst.mockResolvedValue(null);
       await expect(service.deactivateVoucher('seller-2', 'v1')).rejects.toThrow('tidak ditemukan');
+    });
+  });
+
+  describe('admin', () => {
+    it('listAdminVouchers mengembalikan shape admin + sellerName', async () => {
+      mockPrisma.voucher.findMany.mockResolvedValue([adminVoucherRow]);
+      mockPrisma.voucher.count.mockResolvedValue(1);
+      mockPrisma.user.findMany.mockResolvedValue([{ id: 'seller-1', fullName: 'Toko A' }]);
+      const res = await service.listAdminVouchers(1, 20, 'true');
+      expect(res.total).toBe(1);
+      expect(res.data[0]).toMatchObject({
+        id: 'v1', code: 'HEMAT10', sellerId: 'seller-1', sellerName: 'Toko A',
+        discountAmount: 10000, usageQuota: 100, usageCount: 3, isActive: true,
+      });
+    });
+
+    it('getAdminVoucherDetail memetakan usages + user', async () => {
+      mockPrisma.voucher.findFirst.mockResolvedValue({
+        ...adminVoucherRow,
+        usages: [{
+          id: 'u1', discountApplied: 1000000n, orderId: 'o1', usedAt: new Date('2026-09-28T02:00:00Z'),
+          user: { id: 'buyer-1', fullName: 'Buyer B', email: 'b@x.id', phoneNumber: '6281' },
+        }],
+      });
+      mockPrisma.user.findMany.mockResolvedValue([{ id: 'seller-1', fullName: 'Toko A' }]);
+      const res = await service.getAdminVoucherDetail('v1');
+      expect(res.sellerName).toBe('Toko A');
+      expect(res.usages[0]).toMatchObject({
+        id: 'u1', discountApplied: 10000, orderId: 'o1',
+        user: { id: 'buyer-1', fullName: 'Buyer B', email: 'b@x.id', phone: '6281' },
+      });
+    });
+
+    it('deactivateAdminVoucher idempoten bila sudah nonaktif', async () => {
+      mockPrisma.voucher.findFirst.mockResolvedValue({ id: 'v1', isActive: false, sellerId: 'seller-1' });
+      mockPrisma.voucher.findUniqueOrThrow = jest.fn().mockResolvedValue({ ...adminVoucherRow, isActive: false });
+      mockPrisma.user.findMany.mockResolvedValue([{ id: 'seller-1', fullName: 'Toko A' }]);
+      const res = await service.deactivateAdminVoucher('v1', 'admin-1');
+      expect(mockPrisma.voucher.update).not.toHaveBeenCalled();
+      expect(res.isActive).toBe(false);
     });
   });
 });

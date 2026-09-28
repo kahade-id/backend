@@ -495,6 +495,19 @@ export class ShowcaseService {
       imageUrl: coverImageUrl,
       priceMin,
       priceMax,
+      // Batch 43 commerce (item 1 & 10): tipe produk + harga coret diserialkan
+      // publik supaya frontend (feed/detail) bisa render badge DISKON dan
+      // logika per tipe (jasa → tenggat). Field sudah ada di DB sejak
+      // migrasi 20261001000000; sebelumnya hanya bisa dibaca via
+      // PATCH /v1/commerce/products/:id response. Additive-only.
+      productType: row.productType ?? null,
+      originalPrice: toNumber(row.originalPrice ?? null),
+      originalPriceValid:
+        row.originalPrice != null &&
+        (priceMin ?? priceMax) != null &&
+        row.originalPrice > BigInt(0) &&
+        row.originalPrice > (row.priceMin ?? row.priceMax)!,
+      serviceDeadlineDays: row.serviceDeadlineDays ?? null,
       likeCount: row.likeCount,
       commentCount: row.commentCount,
       viewCount: row.viewCount,

@@ -171,6 +171,29 @@ export class RealtimeService {
     }
   }
 
+  /**
+   * BD-003 (perf-fix): batch last-seen via satu MGET — menggantikan N GET
+   * berurutan di `ChatService.loadLastSeen`. Pola sama dengan `areUsersOnline`.
+   */
+  async getLastSeenMany(userIds: string[]): Promise<Record<string, Date | null>> {
+    const result: Record<string, Date | null> = {};
+    if (userIds.length === 0) return result;
+    try {
+      const keys = userIds.map((uid) => `${this.redis.getPrefix()}${LAST_SEEN_KEY(uid)}`);
+      const values = await this.redis.getClient().mget(...keys);
+      for (let i = 0; i < userIds.length; i++) {
+        const raw = values[i];
+        const ms = raw ? parseInt(raw as string, 10) : NaN;
+        result[userIds[i]] = Number.isFinite(ms) && (ms as number) > 0 ? new Date(ms as number) : null;
+      }
+    } catch {
+      for (const uid of userIds) {
+        result[uid] = null;
+      }
+    }
+    return result;
+  }
+
   /** Refresh only the expiry of an existing presence counter. This is called
    * from the gateway's periodic authenticated-socket check and must never
    * increment the counter for an already-connected client. */

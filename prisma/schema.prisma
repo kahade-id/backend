@@ -2111,6 +2111,11 @@ model ChatRoomMember {
   mutedUntil DateTime?
   lastReadAt DateTime?
 
+  // BD-004 (perf-fix): counter unread yang didenormalisasi — di-increment
+  // saat pesan masuk (kecuali pengirim), di-reset ke 0 saat markAsRead.
+  // Menggantikan full-scan COUNT per room di daftar chat.
+  unreadCount Int @default(0)
+
   joinedAt  DateTime @default(now())
   updatedAt DateTime @updatedAt
 

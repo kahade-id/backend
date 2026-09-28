@@ -460,7 +460,9 @@ export class ChatService implements OnModuleInit {
           lm_sender."userId" AS last_msg_sender_user_id,
           lm_sender.id AS last_msg_sender_internal_id,
           lm."createdAt" AS last_msg_created_at,
-          COALESCE(uc.unread_count, 0) AS unread_count,
+          -- BD-004 (perf-fix): unread dari counter yang didenormalisasi
+          -- (chat_room_members."unreadCount") — bukan full-scan COUNT per room.
+          COALESCE(cm."unreadCount", 0) AS unread_count,
           COALESCE(pc.pinned_count, 0) AS pinned_count
         FROM chat_rooms cr
         LEFT JOIN orders o ON o.id = cr."orderId" AND o."deletedAt" IS NULL
@@ -475,14 +477,6 @@ export class ChatService implements OnModuleInit {
           LIMIT 1
         ) lm ON true
         LEFT JOIN users lm_sender ON lm_sender.id = lm."senderId"
-        LEFT JOIN LATERAL (
-          SELECT COUNT(*) AS unread_count
-          FROM chat_messages cm3
-          WHERE cm3."roomId" = cr.id
-            AND cm3."isDeleted" = false
-            AND (cm3."senderId" IS NULL OR cm3."senderId" != ${userId})
-            AND (cm3."readAt" IS NULL OR NOT jsonb_exists(cm3."readAt", ${userId}))
-        ) uc ON true
         LEFT JOIN LATERAL (
           SELECT COUNT(*) AS pinned_count
           FROM chat_messages cm4
@@ -657,18 +651,59 @@ export class ChatService implements OnModuleInit {
     }
   }
 
+  /**
+   * BD-004 (perf-fix): increment `unreadCount` untuk semua peserta room kecuali
+   * pengirim. Upsert per penerima (increment bila baris sudah ada, buat dengan
+   * 1 bila belum — menutup room lama yang belum punya baris member).
+   *
+   * WAJIB dipanggil di dalam transaksi yang sama dengan pembuatan pesan
+   * (lihat `createMessage`) agar atomik terhadap `markAsRead` yang konkuren:
+   * dengan kedua sisi atomik, tidak ada phantom unread permanen.
+   */
+  private async bumpUnreadCountersTx(
+    tx: Prisma.TransactionClient,
+    room: RoomContext,
+    senderId: string,
+  ): Promise<void> {
+    const recipients = [...new Set((room.participants ?? []).filter((id) => id && id !== senderId))];
+    if (recipients.length === 0) return;
+    await Promise.all(
+      recipients.map((rid) =>
+        tx.chatRoomMember.upsert({
+          where: { roomId_userId: { roomId: room.id, userId: rid } },
+          create: { roomId: room.id, userId: rid, role: this.roleFor(room, rid), unreadCount: 1 },
+          update: { unreadCount: { increment: 1 } },
+          select: { id: true },
+        }),
+      ),
+    );
+  }
+
+  /**
+   * BD-003 (perf-fix): last-seen diambil via SATU MGET (`getLastSeenMany`),
+   * bukan N GET berurutan — satu round-trip Redis untuk seluruh daftar room.
+   */
   private async loadLastSeen(
     userIds: string[],
     onlineStatuses: Record<string, boolean>,
     privacySettings: Record<string, boolean>,
   ): Promise<Record<string, Date | null>> {
     const result: Record<string, Date | null> = {};
+    const needFetch: string[] = [];
     for (const id of userIds) {
       if (privacySettings[id] === false) {
         result[id] = null;
-        continue;
+      } else if (onlineStatuses[id]) {
+        result[id] = new Date();
+      } else {
+        needFetch.push(id);
       }
-      result[id] = onlineStatuses[id] ? new Date() : await this.realtime.getLastSeen(id);
+    }
+    if (needFetch.length > 0) {
+      const fetched = await this.realtime.getLastSeenMany(needFetch);
+      for (const id of needFetch) {
+        result[id] = fetched[id] ?? null;
+      }
     }
     return result;
   }
@@ -1254,7 +1289,12 @@ export class ChatService implements OnModuleInit {
       ? blindChatLocation(locationData.lat, locationData.lng, messageId)
       : null;
 
-    const message = await this.prisma.chatMessage.create({
+    // BD-004 (perf-fix): pembuatan pesan + update room + increment unread
+    // counter dalam SATU transaksi — atomik terhadap markAsRead yang konkuren
+    // (yang me-reset counter secara atomik dengan update readAt-nya), sehingga
+    // tidak ada phantom unread permanen.
+    const message = await this.prisma.$transaction(async (tx) => {
+      const msg = (await tx.chatMessage.create({
       data: {
         id: messageId,
         roomId: room.id,
@@ -1289,8 +1329,8 @@ export class ChatService implements OnModuleInit {
             }
           : undefined,
       },
-      select: MESSAGE_SELECT,
-    }) as unknown as RawMessage;
+        select: MESSAGE_SELECT,
+      })) as unknown as RawMessage;
 
     if (verdict && verdict.matches.length > 0) {
       // Di luar jalur utama: kegagalan mencatat tidak boleh menggagalkan kirim.
@@ -1299,9 +1339,14 @@ export class ChatService implements OnModuleInit {
       });
     }
 
-    await this.prisma.chatRoom.update({
-      where: { id: room.id },
-      data: { updatedAt: new Date() },
+      await tx.chatRoom.update({
+        where: { id: room.id },
+        data: { updatedAt: new Date() },
+      });
+
+      await this.bumpUnreadCountersTx(tx, room, userId);
+
+      return msg;
     });
 
     // CN-004: serialisasi per penerima — fromUser & reactedByMe dihitung dari
@@ -1751,19 +1796,30 @@ export class ChatService implements OnModuleInit {
     const now = new Date().toISOString();
     const jsonPatch = JSON.stringify({ [userId]: now });
 
-    const markedCount = await this.prisma.$executeRaw(
-      Prisma.sql`
-        UPDATE chat_messages
-        SET "readAt" = COALESCE("readAt", '{}'::jsonb) || ${jsonPatch}::jsonb
-        WHERE "roomId" = ${roomId}
-          AND "isDeleted" = false
-          AND ("senderId" IS NULL OR "senderId" != ${userId})
-          AND (
-            "readAt" IS NULL
-            OR NOT jsonb_exists("readAt", ${userId})
-          )
-      `,
-    );
+    // BD-004 (perf-fix): update readAt + reset unreadCount dalam SATU transaksi
+    // agar atomik terhadap increment dari sendMessage yang konkuren (tidak ada
+    // phantom unread permanen).
+    const [markedCount] = await this.prisma.$transaction([
+      this.prisma.$executeRaw(
+        Prisma.sql`
+          UPDATE chat_messages
+          SET "readAt" = COALESCE("readAt", '{}'::jsonb) || ${jsonPatch}::jsonb
+          WHERE "roomId" = ${roomId}
+            AND "isDeleted" = false
+            AND ("senderId" IS NULL OR "senderId" != ${userId})
+            AND (
+              "readAt" IS NULL
+              OR NOT jsonb_exists("readAt", ${userId})
+            )
+        `,
+      ),
+      this.prisma.chatRoomMember.upsert({
+        where: { roomId_userId: { roomId, userId } },
+        create: { roomId, userId, role: this.roleFor(room, userId), lastReadAt: new Date(), unreadCount: 0 },
+        update: { lastReadAt: new Date(), unreadCount: 0 },
+        select: { id: true },
+      }),
+    ]);
 
     if (markedCount > 0) {
       // Batch 43 BE-CHAT: bila pembaca mengaktifkan hideReadReceipts, centang
@@ -1798,14 +1854,7 @@ export class ChatService implements OnModuleInit {
       this.logger.warn(`Failed to sync chat notification read state for room ${roomId}: ${(error as Error).message}`);
     }
 
-    await this.prisma.chatRoomMember.upsert({
-      where: { roomId_userId: { roomId, userId } },
-      create: { roomId, userId, role: this.roleFor(room, userId), lastReadAt: new Date() },
-      update: { lastReadAt: new Date() },
-      select: { id: true },
-    }).catch(() => undefined);
-
-    return { markedCount };
+    return { markedCount: Number(markedCount) };
   }
 
   // ============================================================
@@ -3341,11 +3390,27 @@ export class ChatService implements OnModuleInit {
       const context = await this.loadRoomContextForSystem(room.id);
       if (!context) return;
 
-      const message = await this.prisma.chatMessage.create({
-        data: { roomId: room.id, senderId: null, messageType: 'SYSTEM', content },
-        select: MESSAGE_SELECT,
+      // BD-004: pesan sistem (senderId null) dihitung unread untuk SEMUA
+      // peserta — bump counter dalam transaksi yang sama dengan pembuatan pesan.
+      const message = await this.prisma.$transaction(async (tx) => {
+        const msg = await tx.chatMessage.create({
+          data: { roomId: room.id, senderId: null, messageType: 'SYSTEM', content },
+          select: MESSAGE_SELECT,
+        });
+        await tx.chatRoom.update({ where: { id: room.id }, data: { updatedAt: new Date() } });
+        const recipients = [...new Set(context.participants ?? [])];
+        await Promise.all(
+          recipients.map((rid) =>
+            tx.chatRoomMember.upsert({
+              where: { roomId_userId: { roomId: room.id, userId: rid } },
+              create: { roomId: room.id, userId: rid, role: 'BUYER', unreadCount: 1 },
+              update: { unreadCount: { increment: 1 } },
+              select: { id: true },
+            }),
+          ),
+        );
+        return msg;
       });
-      await this.prisma.chatRoom.update({ where: { id: room.id }, data: { updatedAt: new Date() } });
 
       const payload = serializeMessage(message as unknown as RawMessage, {});
       this.emitChatEvent(context, 'chat.new_message', payload);
@@ -3645,14 +3710,29 @@ export class ChatService implements OnModuleInit {
     try {
       const context = await this.loadRoomContextForSystem(roomId);
       if (context) {
-        const sysMessage = await this.prisma.chatMessage.create({
-          data: {
-            roomId,
-            senderId: null,
-            messageType: 'SYSTEM',
-            content: `🧾 Order ${result.orderId} dibuat dari chat ini — dana akan dikunci di escrow setelah pembayaran.`,
-          },
-          select: MESSAGE_SELECT,
+        // BD-004: pesan sistem (senderId null) → bump unread untuk semua peserta.
+        const sysMessage = await this.prisma.$transaction(async (tx) => {
+          const msg = await tx.chatMessage.create({
+            data: {
+              roomId,
+              senderId: null,
+              messageType: 'SYSTEM',
+              content: `🧾 Order ${result.orderId} dibuat dari chat ini — dana akan dikunci di escrow setelah pembayaran.`,
+            },
+            select: MESSAGE_SELECT,
+          });
+          const recipients = [...new Set(context.participants ?? [])];
+          await Promise.all(
+            recipients.map((rid) =>
+              tx.chatRoomMember.upsert({
+                where: { roomId_userId: { roomId, userId: rid } },
+                create: { roomId, userId: rid, role: 'BUYER', unreadCount: 1 },
+                update: { unreadCount: { increment: 1 } },
+                select: { id: true },
+              }),
+            ),
+          );
+          return msg;
         });
         this.emitChatEvent(context, 'chat.new_message', serializeMessage(sysMessage as unknown as RawMessage, {}));
       }

@@ -1490,6 +1490,11 @@ export class ShowcaseService {
       andClauses.push({ user: { averageRating: { gte: query.minSellerRating } } });
     }
 
+    // Batch 139 BE-API2 (item 121): filter tipe produk.
+    if (query.productType !== undefined) {
+      andClauses.push({ productType: query.productType });
+    }
+
     // Sort "foryou": ranking personal dihitung di aplikasi (butuh sinyal
     // viewer), jadi jalurnya terpisah dari keyset SQL latest/popular.
     if (sort === 'foryou') {

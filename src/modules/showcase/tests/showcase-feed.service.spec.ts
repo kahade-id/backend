@@ -1,7 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { BadRequestException } from '@nestjs/common';
-import { ShowcaseVisibility } from '@prisma/client';
+import { ShowcaseVisibility, ProductType } from '@prisma/client';
 import { ShowcaseService } from '../showcase.service';
 import { ShowcaseFeedQueryDto } from '../dto/showcase-feed-query.dto';
 import { PrismaService } from '../../../prisma/prisma.service';
@@ -70,6 +70,11 @@ const mockPrisma: any = {
   blockList: { findMany: jest.fn() },
   userShowcase: { findMany: jest.fn() },
   showcaseLike: { findMany: jest.fn() },
+  // Pre-existing fix (batch 139 BE-API2): getSavedShowcaseIds memakai
+  // prisma.showcaseSave & getFollowedAuthorIds (BE-API1 item 102) memakai
+  // prisma.follow — kedua mock ini hilang di HEAD sehingga test viewer gagal.
+  showcaseSave: { findMany: jest.fn() },
+  follow: { findMany: jest.fn() },
 };
 const mockRedis = { setNx: jest.fn() };
 const mockUpload = { verifyUserFileKeys: jest.fn(), buildPublicUrl: jest.fn(), cleanupFileKeys: jest.fn(), uploadDirect: jest.fn() };
@@ -92,6 +97,8 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
     mockPrisma.blockList.findMany.mockResolvedValue([]);
     mockPrisma.userShowcase.findMany.mockResolvedValue([]);
     mockPrisma.showcaseLike.findMany.mockResolvedValue([]);
+    mockPrisma.showcaseSave.findMany.mockResolvedValue([]);
+    mockPrisma.follow.findMany.mockResolvedValue([]);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -505,6 +512,22 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
     it('returns an empty page with hasMore false when nothing matches', async () => {
       const result = (await feed(service, undefined, { search: 'tidak-ada' })) as any;
       expect(result).toMatchObject({ items: [], hasMore: false, nextCursor: null });
+    });
+  });
+
+  // Batch 139 BE-API2 (item 121) — filter productType.
+  describe('productType filter', () => {
+    it('adds a productType clause when the filter is set', async () => {
+      await feed(service, undefined, { productType: ProductType.FISIK });
+      const where = lastQuery().where;
+      expect(where.AND).toEqual(expect.arrayContaining([{ productType: 'FISIK' }]));
+    });
+
+    it('does not add a productType clause when the filter is absent', async () => {
+      await feed(service, undefined, {});
+      const where = lastQuery().where;
+      const clauses: unknown[] = Array.isArray(where.AND) ? where.AND : [];
+      expect(clauses.some((c) => typeof c === 'object' && c !== null && 'productType' in c)).toBe(false);
     });
   });
 });

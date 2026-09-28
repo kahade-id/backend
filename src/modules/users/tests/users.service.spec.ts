@@ -307,6 +307,46 @@ describe('UsersService', () => {
       const res: any = await service.getFollowing('x', 1, 10);
       expect(res.total).toBe(0);
     });
+
+    // Batch 139 BE-API2 (item 118): isFollowingByViewer per baris.
+    it('marks isFollowingByViewer for rows the viewer follows (followers)', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'u1' });
+      mockPrisma.blockList.findMany.mockResolvedValue([]);
+      mockPrisma.follow.findMany
+        .mockResolvedValueOnce([
+          { createdAt: new Date(), follower: { id: 'f1', username: 'a', fullName: 'A', avatarUrl: null, membershipRank: 'BRONZE' } },
+          { createdAt: new Date(), follower: { id: 'f2', username: 'b', fullName: 'B', avatarUrl: null, membershipRank: 'BRONZE' } },
+        ])
+        // getFollowedIdSet: viewer follow f1 saja.
+        .mockResolvedValueOnce([{ followingId: 'f1' }]);
+      mockPrisma.follow.count.mockResolvedValue(2);
+      const res: any = await service.getFollowers('x', 1, 10, undefined, 'viewer-1');
+      expect(res.users[0]).toMatchObject({ username: 'a', isFollowingByViewer: true });
+      expect(res.users[1]).toMatchObject({ username: 'b', isFollowingByViewer: false });
+    });
+
+    it('marks isFollowingByViewer for rows the viewer follows (following)', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'u1' });
+      mockPrisma.blockList.findMany.mockResolvedValue([]);
+      mockPrisma.follow.findMany
+        .mockResolvedValueOnce([
+          { createdAt: new Date(), following: { id: 'g1', username: 'c', fullName: 'C', avatarUrl: null, membershipRank: 'BRONZE' } },
+        ])
+        .mockResolvedValueOnce([]);
+      mockPrisma.follow.count.mockResolvedValue(1);
+      const res: any = await service.getFollowing('x', 1, 10, 'viewer-1');
+      expect(res.users[0]).toMatchObject({ username: 'c', isFollowingByViewer: false });
+    });
+
+    it('returns isFollowingByViewer=false for anonymous viewers', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ id: 'u1' });
+      mockPrisma.follow.findMany.mockResolvedValue([
+        { createdAt: new Date(), follower: { id: 'f1', username: 'a', fullName: 'A', avatarUrl: null, membershipRank: 'BRONZE' } },
+      ]);
+      mockPrisma.follow.count.mockResolvedValue(1);
+      const res: any = await service.getFollowers('x', 1, 10, undefined, null);
+      expect(res.users[0].isFollowingByViewer).toBe(false);
+    });
   });
 
   describe('blockUser', () => {

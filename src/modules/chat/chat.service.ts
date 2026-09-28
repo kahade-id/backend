@@ -1028,11 +1028,18 @@ export class ChatService implements OnModuleInit {
 
     const responseMessages = await Promise.all(messages.map(async (message) => ({
       ...message,
-      attachments: await Promise.all(message.attachments.map(async (attachment) => ({
-        ...attachment,
-        fileUrl: await this.toReadableAttachmentUrl(attachment.fileUrl),
-        thumbnailUrl: attachment.thumbnailUrl ? await this.toReadableAttachmentUrl(attachment.thumbnailUrl) : null,
-      }))),
+      attachments: await Promise.all(message.attachments.map(async (attachment) => {
+        // Batch 139 BE-API2 (item 122): urlExpiresAt — kapan signed URL
+        // lampiran ini kedaluwarsa (ISO absolut).
+        const file = await this.toReadableAttachment(attachment.fileUrl);
+        const thumb = attachment.thumbnailUrl ? await this.toReadableAttachment(attachment.thumbnailUrl) : null;
+        return {
+          ...attachment,
+          fileUrl: file.url,
+          urlExpiresAt: file.urlExpiresAt,
+          thumbnailUrl: thumb ? thumb.url : null,
+        };
+      })),
     })));
 
     return {
@@ -2263,8 +2270,16 @@ export class ChatService implements OnModuleInit {
   // Attachments
   // ============================================================
 
-  private async toReadableAttachmentUrl(rawUrl: string): Promise<string> {
-    if (!rawUrl || !this.uploadService) return rawUrl;
+  /**
+   * Batch 139 BE-API2 (item 122): hasilkan signed URL lampiran + kapan URL
+   * tersebut kedaluwarsa (ISO absolut, dihitung saat response/read-time —
+   * TIDAK dipersist). `urlExpiresAt` = null bila URL tidak di-sign (raw
+   * passthrough) atau signing gagal — jangan pernah memberi expiry palsu.
+   */
+  private static readonly ATTACHMENT_URL_TTL_SECONDS = 300;
+
+  private async toReadableAttachment(rawUrl: string): Promise<{ url: string; urlExpiresAt: string | null }> {
+    if (!rawUrl || !this.uploadService) return { url: rawUrl, urlExpiresAt: null };
     try {
       // URL signing is intentionally performed at read time, not persisted with
       // the message. Persisted chat records must remain readable after expiry.
@@ -2272,11 +2287,16 @@ export class ChatService implements OnModuleInit {
       // (https://api.kahade.id/uploads/chat-attachments/...) — ekstrak fileKey
       // lalu buat signed URL segar. Bentuk raw key lawas tetap didukung.
       const fileKey = this.extractChatFileKey(rawUrl);
-      if (!fileKey) return rawUrl;
-      return await this.uploadService.generateDownloadUrl(fileKey, 300);
+      if (!fileKey) return { url: rawUrl, urlExpiresAt: null };
+      const url = await this.uploadService.generateDownloadUrl(fileKey, ChatService.ATTACHMENT_URL_TTL_SECONDS);
+      if (!url) return { url: '', urlExpiresAt: null };
+      return {
+        url,
+        urlExpiresAt: new Date(Date.now() + ChatService.ATTACHMENT_URL_TTL_SECONDS * 1000).toISOString(),
+      };
     } catch (error) {
       this.logger.warn(`Unable to sign chat attachment URL: ${(error as Error).message}`);
-      return '';
+      return { url: '', urlExpiresAt: null };
     }
   }
 
@@ -2313,11 +2333,17 @@ export class ChatService implements OnModuleInit {
       }),
     ]);
 
-    const readableAttachments = await Promise.all(attachments.map(async (attachment) => ({
-      ...attachment,
-      fileUrl: await this.toReadableAttachmentUrl(attachment.fileUrl),
-      thumbnailUrl: attachment.thumbnailUrl ? await this.toReadableAttachmentUrl(attachment.thumbnailUrl) : null,
-    })));
+    const readableAttachments = await Promise.all(attachments.map(async (attachment) => {
+      // Batch 139 BE-API2 (item 122): urlExpiresAt — konsisten dengan daftar pesan.
+      const file = await this.toReadableAttachment(attachment.fileUrl);
+      const thumb = attachment.thumbnailUrl ? await this.toReadableAttachment(attachment.thumbnailUrl) : null;
+      return {
+        ...attachment,
+        fileUrl: file.url,
+        urlExpiresAt: file.urlExpiresAt,
+        thumbnailUrl: thumb ? thumb.url : null,
+      };
+    }));
     return { data: readableAttachments, total, page: safePage, limit: safeLimit, totalPages: Math.ceil(total / safeLimit) };
   }
 

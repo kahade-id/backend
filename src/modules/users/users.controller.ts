@@ -798,7 +798,9 @@ export class UsersController {
       'selain `total` (jumlah baris yang lolos filter halaman ini, mis. `filter=positive`) ' +
       'karena keduanya memang bisa berbeda. Profil private / nonaktif / banned / terhapus ' +
       'mengembalikan 404 USER_NOT_FOUND; viewer yang terlibat relasi block juga 404, bukan 403, ' +
-      'agar keberadaan rating tidak bocor.',
+      'agar keberadaan rating tidak bocor. Query `sort=highest` mengurutkan ' +
+      'bintang tertinggi dulu (batch 139 BE-API2, item 119); default `latest` ' +
+      '= createdAt desc seperti sebelumnya.',
   })
   async getUserRatings(
     @Param('username', ParseUsernamePipe) username: string,
@@ -806,8 +808,9 @@ export class UsersController {
     @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
     @Query('limit', new DefaultValuePipe(10), ParseIntPipe, new ClampLimitPipe()) limit: number,
     @Query('filter', new ParseQueryStringPipe('filter', 20)) filter: string,
+    @Query('sort', new ParseQueryStringPipe('sort', 20)) sort?: string,
   ): Promise<object> {
-    return this.usersService.getUserRatings(username, page, limit, filter, viewerId);
+    return this.usersService.getUserRatings(username, page, limit, filter, viewerId, sort);
   }
 
   @Public()

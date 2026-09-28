@@ -1493,7 +1493,7 @@ export class UsersService {
     return { data: logs, total, page: safePage, limit: safeLimit, totalPages: Math.ceil(total / safeLimit) };
   }
 
-  async getUserRatings(username: string, page: number, limit: number, filter?: string, viewerId?: string | null): Promise<object> {
+  async getUserRatings(username: string, page: number, limit: number, filter?: string, viewerId?: string | null, sort?: string): Promise<object> {
     const user = await this.prisma.user.findUnique({ where: { username: username.toLowerCase() }, select: { id: true, averageRating: true, totalRatingCount: true, profileVisible: true, isActive: true, isBanned: true, deletedAt: true } });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
     if (user.profileVisible === false && viewerId !== user.id) {
@@ -1522,6 +1522,18 @@ export class UsersService {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Unsupported rating filter' });
     }
 
+    // Batch 139 BE-API2 (item 119): sort=highest → bintang tertinggi dulu.
+    // Default (dan sort=latest) tetap createdAt desc + tiebreak id desc —
+    // perilaku lama tidak berubah.
+    let orderBy: Prisma.RatingOrderByWithRelationInput[];
+    if (sort === 'highest') {
+      orderBy = [{ stars: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }];
+    } else if (sort === undefined || sort === null || sort === '' || sort === 'latest') {
+      orderBy = [{ createdAt: 'desc' }, { id: 'desc' }];
+    } else {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Unsupported rating sort' });
+    }
+
     const [ratings, total] = await Promise.all([
       this.prisma.rating.findMany({
         where,
@@ -1532,7 +1544,7 @@ export class UsersService {
         // sama bisa muncul dua kali atau terlewat saat halaman bergeser. Arah
         // `id: desc` disamakan dengan preview `ratingsReceived` di
         // getPublicProfile supaya halaman pertama list == preview profil.
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        orderBy,
         select: {
           id: true,
           stars: true,
@@ -1575,12 +1587,32 @@ export class UsersService {
       // Batch 19 TIM A (item 5): hitungan per bintang (string key "1".."5").
       distribution,
       filter: filter || null,
+      // Batch 139 BE-API2 (item 119): gema sort yang dipakai.
+      sort: sort || null,
       page: safePage,
       limit: safeLimit,
     };
   }
 
   // ========== FOLLOW ==========
+
+  /**
+   * Batch 139 BE-API2 (item 118): himpunan id yang di-follow viewer dari
+   * daftar kandidat — satu query IN. Viewer anonim/null → himpunan kosong
+   * (semua baris `isFollowingByViewer: false`).
+   */
+  private async getFollowedIdSet(viewerId: string | null | undefined, candidateIds: string[]): Promise<Set<string>> {
+    if (!viewerId || candidateIds.length === 0) return new Set();
+    try {
+      const rows = await this.prisma.follow.findMany({
+        where: { followerId: viewerId, followingId: { in: [...new Set(candidateIds)] } },
+        select: { followingId: true },
+      });
+      return new Set(rows.map((r) => r.followingId));
+    } catch {
+      return new Set();
+    }
+  }
 
   private async withSerializableRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -1715,11 +1747,23 @@ export class UsersService {
       followers.map((f) => f.follower.id),
     );
 
+    // Batch 139 BE-API2 (item 118): state awal follow per baris untuk viewer
+    // (I064) — satu query IN, bukan N+1.
+    const followedByViewer = await this.getFollowedIdSet(
+      viewerId,
+      followers.map((f) => f.follower.id),
+    );
+
     return {
       users: followers.map((f) => {
         // id internal hanya dipakai untuk sealTierMap — jangan dibocorkan.
         const { id: _internalId, ...rest } = f.follower;
-        return { ...rest, sealTier: sealTierMap.get(f.follower.id) ?? null, followedAt: f.createdAt };
+        return {
+          ...rest,
+          sealTier: sealTierMap.get(f.follower.id) ?? null,
+          followedAt: f.createdAt,
+          isFollowingByViewer: followedByViewer.has(f.follower.id),
+        };
       }),
       total,
       page: safePage,
@@ -1784,11 +1828,22 @@ export class UsersService {
       following.map((f) => f.following.id),
     );
 
+    // Batch 139 BE-API2 (item 118): state awal follow per baris untuk viewer.
+    const followedByViewer = await this.getFollowedIdSet(
+      viewerId,
+      following.map((f) => f.following.id),
+    );
+
     return {
       users: following.map((f) => {
         // id internal hanya dipakai untuk sealTierMap — jangan dibocorkan.
         const { id: _internalId, ...rest } = f.following;
-        return { ...rest, sealTier: sealTierMap.get(f.following.id) ?? null, followedAt: f.createdAt };
+        return {
+          ...rest,
+          sealTier: sealTierMap.get(f.following.id) ?? null,
+          followedAt: f.createdAt,
+          isFollowingByViewer: followedByViewer.has(f.following.id),
+        };
       }),
       total,
       page: safePage,

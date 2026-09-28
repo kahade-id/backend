@@ -257,4 +257,37 @@ describe('UsersService — daftar rating publik (Section 5)', () => {
       );
     });
   });
+
+  // Batch 139 BE-API2 (item 119) — query param sort.
+  describe('sort', () => {
+    it('sort=highest orders by stars desc with createdAt/id tiebreak', async () => {
+      const result = (await service.getUserRatings('owner', 1, 10, undefined, undefined, 'highest')) as any;
+      expect(mockPrisma.rating.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ orderBy: [{ stars: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }] }),
+      );
+      expect(result.sort).toBe('highest');
+    });
+
+    it('defaults to createdAt desc when sort is omitted', async () => {
+      const result = (await service.getUserRatings('owner', 1, 10)) as any;
+      expect(mockPrisma.rating.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] }),
+      );
+      expect(result.sort).toBeNull();
+    });
+
+    it('sort=latest is an explicit alias of the default', async () => {
+      await service.getUserRatings('owner', 1, 10, undefined, undefined, 'latest');
+      expect(mockPrisma.rating.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] }),
+      );
+    });
+
+    it('rejects an unknown sort before touching the database', async () => {
+      await expect(service.getUserRatings('owner', 1, 10, undefined, undefined, 'lowest')).rejects.toMatchObject({
+        response: { code: ErrorCodes.VALIDATION_ERROR },
+      });
+      expect(mockPrisma.rating.findMany).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -27,7 +27,9 @@ function criticalSecurityType(type: NotificationType): boolean {
   return type.startsWith('SECURITY_');
 }
 
-export type PublicNotification = Pick<Notification, 'notifId' | 'type' | 'category' | 'channel' | 'title' | 'body' | 'refType' | 'refId' | 'actionUrl' | 'isRead' | 'readAt' | 'createdAt' | 'expiresAt' | 'metadata'> & {
+export type PublicNotification = Pick<Notification, 'notifId' | 'type' | 'category' | 'channel' | 'title' | 'body' | 'refType' | 'refId' | 'actionUrl' | 'isRead' | 'readAt' | 'createdAt' | 'expiresAt'> & {
+  /** NP-011: hanya diisi pada endpoint detail; daftar tidak mengembalikannya. */
+  metadata?: Prisma.JsonValue | null;
   /**
    * Batch 139 BE-API2 (item 114): URL gambar opsional untuk notifikasi kaya
    * (rich notification). Diambil dari `metadata.imageUrl` (fallback
@@ -53,13 +55,12 @@ function extractNotificationImageUrl(metadata: Prisma.JsonValue | null | undefin
   return typeof candidate === 'string' && candidate.trim().length > 0 ? candidate : null;
 }
 
-function withImageUrl<T extends { metadata?: Prisma.JsonValue | null }>(
-  row: T,
-): T & { imageUrl: string | null } {
-  return { ...row, imageUrl: extractNotificationImageUrl(row.metadata) };
+function withImageUrl<T extends object>(row: T): T & { imageUrl: string | null } {
+  const metadata = (row as { metadata?: Prisma.JsonValue | null }).metadata;
+  return { ...row, imageUrl: extractNotificationImageUrl(metadata) };
 }
 
-const PUBLIC_NOTIFICATION_SELECT = {
+const PUBLIC_NOTIFICATION_BASE_SELECT = {
   notifId: true,
   type: true,
   category: true,
@@ -74,6 +75,20 @@ const PUBLIC_NOTIFICATION_SELECT = {
   readAt: true,
   createdAt: true,
   expiresAt: true,
+} satisfies Prisma.NotificationSelect;
+
+/**
+ * NP-011 (perf-fix): daftar notifikasi TIDAK lagi mengembalikan kolom
+ * `metadata` (JSONB penuh) — menghemat transfer per baris. Frontend tidak
+ * memakai metadata dari daftar (verifikasi 2026-09-29).
+ */
+const PUBLIC_NOTIFICATION_SELECT = {
+  ...PUBLIC_NOTIFICATION_BASE_SELECT,
+} satisfies Prisma.NotificationSelect;
+
+/** Detail satu notifikasi tetap menyertakan metadata. */
+const NOTIFICATION_DETAIL_SELECT = {
+  ...PUBLIC_NOTIFICATION_BASE_SELECT,
   metadata: true,
 } satisfies Prisma.NotificationSelect;
 
@@ -187,7 +202,7 @@ export class NotificationsService {
   async getNotification(userId: string, notifId: string): Promise<PublicNotification> {
     const notification = await this.prisma.notification.findFirst({
       where: { userId, notifId, deletedAt: null, AND: [activeNotificationWhere()] },
-      select: PUBLIC_NOTIFICATION_SELECT,
+      select: NOTIFICATION_DETAIL_SELECT,
     });
     if (!notification) {
       throw new NotFoundException({ code: ErrorCodes.NOTIFICATION_NOT_FOUND, message: 'Notification not found' });

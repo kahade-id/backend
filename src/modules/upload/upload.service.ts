@@ -19,6 +19,7 @@ import {
 import { encryptAES, decryptAES } from '../../common/utils/crypto.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { withSpan } from '../../common/tracing/tracing';
+import { stripImageMetadata } from './utils/strip-image-metadata';
 
 const nanoid = customAlphabet('1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ', 10);
 
@@ -779,6 +780,42 @@ export class UploadService {
   }
 
   /**
+   * LOW (SEC-D): ekstrak fileKey dari URL yang tersimpan di DB — baik URL
+   * publik (`.../uploads/<key>`) maupun signed URL privat
+   * (`/v1/upload/s?key=<key>&exp=..&sig=..`). Tabel `chat_attachments` tidak
+   * menyimpan fileKey (additive-only), jadi worker purge ephemeral memakai ini
+   * untuk menghapus file fisik lampiran. Kembalikan null bila tidak dikenali.
+   */
+  fileKeyFromStoredUrl(url: string): string | null {
+    if (typeof url !== 'string' || url.length === 0) return null;
+    const fromPublic = this.fileKeyFromPublicUrl(url);
+    if (fromPublic) return fromPublic;
+    try {
+      const parsed = new URL(url);
+      if (parsed.pathname.endsWith('/v1/upload/s')) {
+        const key = parsed.searchParams.get('key');
+        if (key && isSafeFileKey(key)) return key;
+      }
+    } catch {
+      // Bukan URL absolut — tidak dikenali.
+    }
+    return null;
+  }
+
+  /**
+   * LOW (SEC-D): hapus SATU file fisik by fileKey. Best-effort — kembalikan
+   * false (bukan throw) bila key tidak aman atau penghapusan gagal, agar
+   * worker purge bisa mencatat & me-retry tanpa menggagalkan batch.
+   */
+  async deleteStoredFile(fileKey: string): Promise<boolean> {
+    if (!isSafeFileKey(fileKey)) {
+      this.logger.warn(`[SECURITY] deleteStoredFile menolak fileKey tidak aman: ${String(fileKey).slice(0, 64)}`);
+      return false;
+    }
+    return this.localStorage.deleteFile(fileKey);
+  }
+
+  /**
    * SH-B-007: konsumsi konfirmasi upload one-time TANPA validasi ulang.
    * Dipakai pemanggil yang sudah memvalidasi via `verifyUserFileKeys(...,
    * { consume: false })` dan baru boleh meng-consume SETELAH mutasi DB-nya
@@ -942,8 +979,13 @@ export class UploadService {
     const folder = UploadService.PURPOSE_FOLDER_MAP[purpose];
     const fileKey = `uploads/${folder}/${userId}/${timestamp}-${randomSuffix}-${storedFileName}`;
 
+    // LOW (SEC-D): strip metadata EXIF/XMP (termasuk GPS) dari foto — lossless,
+    // tanpa re-encode. Foto dari HP membawa koordinat GPS di EXIF; tanpa ini
+    // lokasi rumah/user bisa bocor lewat foto profil/etalase/KYC.
+    const storedBuffer = stripImageMetadata(fileBuffer, detectedMime);
+
     try {
-      await this.localStorage.saveFile(fileKey, fileBuffer);
+      await this.localStorage.saveFile(fileKey, storedBuffer);
     } catch (error) {
       this.logger.error(`Direct upload to local storage failed for key=${fileKey}`, error instanceof Error ? error.stack : error);
       throw new BadRequestException({

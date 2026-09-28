@@ -493,7 +493,7 @@ describe('ChatService batch-43', () => {
   // ---------- purge service ----------
 
   describe('ChatEphemeralPurgeService', () => {
-    it('melewati pesan di order DISPUTED; menghormati limit', async () => {
+    const makePurgeDeps = (attachments: Array<{ messageId: string; fileUrl: string | null; thumbnailUrl: string | null }> = []) => {
       const prisma: any = {
         chatMessage: {
           findMany: jest.fn().mockResolvedValue([
@@ -502,13 +502,53 @@ describe('ChatService batch-43', () => {
           ]),
           deleteMany: jest.fn().mockResolvedValue({ count: 1 }),
         },
+        chatAttachment: {
+          findMany: jest.fn().mockResolvedValue(attachments),
+        },
       };
       const realtime: any = { emitToChatRoom: jest.fn() };
-      const purge = new ChatEphemeralPurgeService(prisma as never, realtime as never);
+      const upload: any = {
+        fileKeyFromStoredUrl: jest.fn((url: string) => {
+          const m = /\/uploads\/(.+)$/.exec(url);
+          return m ? `uploads/${m[1]}` : null;
+        }),
+        deleteStoredFile: jest.fn().mockResolvedValue(true),
+      };
+      return { prisma, realtime, upload };
+    };
+
+    it('melewati pesan di order DISPUTED; menghormati limit', async () => {
+      const { prisma, realtime, upload } = makePurgeDeps();
+      const purge = new ChatEphemeralPurgeService(prisma as never, realtime as never, upload as never);
       const result = await purge.purgeNow(10);
       expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 10 }));
       expect(prisma.chatMessage.deleteMany).toHaveBeenCalledWith({ where: { id: { in: ['m1'] } } });
       expect(result).toEqual({ purged: 1, skippedDisputed: 1 });
+    });
+
+    it('LOW (SEC-D): menghapus file fisik lampiran sebelum hard-delete DB', async () => {
+      const { prisma, realtime, upload } = makePurgeDeps([
+        { messageId: 'm1', fileUrl: 'https://api.kahade.id/uploads/chat-attachments/u1/a.mp3', thumbnailUrl: null },
+        { messageId: 'm2', fileUrl: 'https://api.kahade.id/uploads/chat-attachments/u1/b.mp3', thumbnailUrl: null },
+      ]);
+      const purge = new ChatEphemeralPurgeService(prisma as never, realtime as never, upload as never);
+      await purge.purgeNow(10);
+      // m1 (PROCESSING) -> file dihapus; m2 (DISPUTED) -> diskip total.
+      expect(upload.deleteStoredFile).toHaveBeenCalledTimes(1);
+      expect(upload.deleteStoredFile).toHaveBeenCalledWith('uploads/chat-attachments/u1/a.mp3');
+      expect(prisma.chatMessage.deleteMany).toHaveBeenCalledWith({ where: { id: { in: ['m1'] } } });
+    });
+
+    it('LOW (SEC-D): pesan dipertahankan bila file gagal dihapus (retry berikutnya)', async () => {
+      const { prisma, realtime, upload } = makePurgeDeps([
+        { messageId: 'm1', fileUrl: 'https://api.kahade.id/uploads/chat-attachments/u1/a.mp3', thumbnailUrl: null },
+      ]);
+      upload.deleteStoredFile.mockResolvedValue(false);
+      const purge = new ChatEphemeralPurgeService(prisma as never, realtime as never, upload as never);
+      const result = await purge.purgeNow(10);
+      expect(prisma.chatMessage.deleteMany).not.toHaveBeenCalled();
+      expect(realtime.emitToChatRoom).not.toHaveBeenCalled();
+      expect(result).toEqual({ purged: 0, skippedDisputed: 1 });
     });
   });
 

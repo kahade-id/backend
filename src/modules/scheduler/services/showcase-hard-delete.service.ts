@@ -62,7 +62,9 @@ export class ShowcaseHardDeleteService {
           select: {
             id: true,
             userId: true,
-            images: { select: { fileKey: true } },
+            // LOW (SEC-D): thumbnailUrl JUGA dibersihkan — sebelumnya hanya
+            // fileKey sehingga thumbnail video yatim di disk selamanya.
+            images: { select: { fileKey: true, thumbnailUrl: true } },
           },
           take: BATCH_SIZE,
           orderBy: { deletedAt: 'asc' },
@@ -75,7 +77,14 @@ export class ShowcaseHardDeleteService {
             // SS-014: bersihkan storage DULU, baru hapus baris DB.
             // Bila cleanup gagal, baris DB dipertahankan → retry di jalan
             // berikutnya (tidak ada file yatim tanpa catatan).
-            const fileKeys = item.images.map((img) => img.fileKey).filter((k): k is string => Boolean(k));
+            // Termasuk thumbnail video (hanya thumbnailUrl publik yang
+            // tersimpan di DB — konversi ke fileKey via UploadService).
+            const fileKeys = [
+              ...item.images.map((img) => img.fileKey),
+              ...item.images.map((img) =>
+                img.thumbnailUrl ? this.uploadService.fileKeyFromPublicUrl(img.thumbnailUrl) : null,
+              ),
+            ].filter((k): k is string => Boolean(k));
             if (fileKeys.length > 0) {
               const result = await this.uploadService.cleanupFileKeys(item.userId, fileKeys);
               if (result.errors.length > 0) {

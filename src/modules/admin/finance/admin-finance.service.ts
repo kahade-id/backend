@@ -39,6 +39,44 @@ export interface TimelineEvent {
 }
 
 /**
+ * AW-002 (perf-fix): peta tanda arus kas per tipe transaksi — CERMIRAN dari
+ * `TX_META` di admin (`src/lib/tx-labels.ts`). WAJIB dijaga sinkron: bila tipe
+ * baru ditambah di salah satu sisi, sisi lain harus ikut.
+ * - '+' → dana MASUK ke wallet pengguna
+ * - '−' → dana KELUAR dari wallet pengguna
+ * - ''  → netral / tidak dikenal → DIKECUALIKAN dari agregat masuk/keluar
+ *   (paritas dengan perilaku client-side lama).
+ */
+export const TX_AGGREGATE_SIGN: Record<string, '+' | '−' | ''> = {
+  TOP_UP: '+',
+  WITHDRAW: '−',
+  ORDER_LOCK: '−',
+  ORDER_RELEASE: '+',
+  ORDER_REFUND: '+',
+  FEE_DEDUCT: '−',
+  REFERRAL_REWARD: '+',
+  SUBSCRIPTION_PAYMENT: '−',
+  ADMIN_CREDIT: '+',
+  ADMIN_DEBIT: '−',
+  DISPUTE_RELEASE: '+',
+  TRANSFER_SENT: '−',
+  TRANSFER_RECEIVED: '+',
+  CAMPAIGN_CASHBACK: '+',
+  TOPUP_BONUS: '+',
+};
+
+export interface FinanceTransactionAggregate {
+  /** Total dana masuk (IDR) dari SEMUA transaksi yang cocok filter — tanpa clamp. */
+  masuk: number;
+  /** Total dana keluar (IDR) dari SEMUA transaksi yang cocok filter — tanpa clamp. */
+  keluar: number;
+  /** masuk - keluar. */
+  bersih: number;
+  /** Jumlah transaksi yang cocok filter (termasuk tipe netral/tak dikenal). */
+  count: number;
+}
+
+/**
  * ADM-205 — dual control untuk approve withdrawal (maker-checker).
  *
  * Sebelum perbaikan ini, SATU admin FINANCE_ADMIN bisa menyetujui penarikan
@@ -143,10 +181,17 @@ export class AdminFinanceService {
     return [...new Set(rows.map((r) => r.adminId))];
   }
 
-  async listTransactions(query: FinanceTransactionQueryDto): Promise<object> {
-    const { page = 1, limit = 20, type, status, startDate, endDate, q } = query;
-    const safePage = Number.isInteger(page) && page > 0 ? page : 1;
-    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 100) : 20;
+  /**
+   * AW-002 (perf-fix): bangun filter `where` transaksi dari DTO — dipakai
+   * BERSAMA oleh `listTransactions` dan `getTransactionsAggregate` agar
+   * agregat selalu memakai filter yang SAMA persis dengan tabel.
+   */
+  private buildTransactionListFilter(query: FinanceTransactionQueryDto): {
+    where: Prisma.WalletTransactionWhereInput;
+    start: Date;
+    end: Date;
+  } {
+    const { type, status, startDate, endDate, q } = query;
 
     if (!startDate || !endDate) {
       throw new BadRequestException({
@@ -185,11 +230,7 @@ export class AdminFinanceService {
     if (status) {
       where.status = status;
     }
-    if (startDate || endDate) {
-      where.createdAt = {};
-      if (startDate) where.createdAt.gte = start;
-      if (endDate) where.createdAt.lte = end;
-    }
+    where.createdAt = { gte: start, lte: end };
 
     // WF-013: pencarian server-side — digabung AND dengan filter lain.
     // E3: cakupan diperluas ke referensi eksternal (midtransOrderId,
@@ -206,6 +247,16 @@ export class AdminFinanceService {
         { irisRef: { contains: search } },
       ];
     }
+
+    return { where, start, end };
+  }
+
+  async listTransactions(query: FinanceTransactionQueryDto): Promise<object> {
+    const { page = 1, limit = 20 } = query;
+    const safePage = Number.isInteger(page) && page > 0 ? page : 1;
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 100) : 20;
+
+    const { where } = this.buildTransactionListFilter(query);
 
     const [transactions, total] = await Promise.all([
       this.prisma.walletTransaction.findMany({
@@ -236,6 +287,49 @@ export class AdminFinanceService {
     }));
 
     return createPaginatedResponse(serialized, total, safePage, safeLimit);
+  }
+
+  /**
+   * AW-002 (perf-fix): agregat masuk/keluar server-side untuk halaman Keuangan.
+   *
+   * Menggantikan pola lama "fetch massal (limit besar) lalu jumlahkan di
+   * browser" yang SALAH DIAM-DIAM karena backend meng-clamp limit ke 100.
+   * Agregat dihitung di SQL (`GROUP BY type` + SUM) dari SEMUA baris yang
+   * cocok filter — tanpa clamp, tanpa fetch baris.
+   *
+   * Klasifikasi masuk/keluar memakai `TX_AGGREGATE_SIGN` (cermin TX_META
+   * frontend): tipe bertanda '' dikecualikan dari masuk/keluar tetapi tetap
+   * dihitung di `count` — paritas dengan perilaku client-side lama.
+   *
+   * FAIL-CLOSED: tidak ada fallback/tebakan — bila query gagal, exception
+   * dilempar dan admin menampilkan indikator error, BUKAN angka salah.
+   */
+  async getTransactionsAggregate(query: FinanceTransactionQueryDto): Promise<FinanceTransactionAggregate> {
+    const { where } = this.buildTransactionListFilter(query);
+
+    const [groups, count] = await Promise.all([
+      this.prisma.walletTransaction.groupBy({
+        by: ['type'],
+        where,
+        _sum: { amount: true },
+        _count: { _all: true },
+      }),
+      this.prisma.walletTransaction.count({ where }),
+    ]);
+
+    let masukSen = 0n;
+    let keluarSen = 0n;
+    for (const g of groups) {
+      const sumSen = g._sum.amount ?? 0n;
+      const sign = TX_AGGREGATE_SIGN[g.type];
+      if (sign === '+') masukSen += sumSen;
+      else if (sign === '−') keluarSen += sumSen;
+      // sign '' / tipe tak dikenal: dikecualikan dari masuk/keluar (paritas lama).
+    }
+
+    const masuk = toIdr(masukSen);
+    const keluar = toIdr(keluarSen);
+    return { masuk, keluar, bersih: masuk - keluar, count };
   }
 
   async getTransactionDetail(

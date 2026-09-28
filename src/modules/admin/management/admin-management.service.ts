@@ -621,16 +621,26 @@ export class AdminManagementService {
    * GAP-E (G395, kontrak admin web `GET /v1/admin/emergency-grants`) —
    * daftar grant akses darurat; `activeOnly=false` menampilkan riwayat
    * termasuk yang kedaluwarsa/dicabut.
+   *
+   * AW-004 (perf-fix): riwayat grant tumbuh monoton, jadi findMany dibatasi
+   * `take: 500` (grant darurat adalah aksi langka — 500 baris riwayat lebih
+   * dari cukup untuk operasional). `total` dihitung via count terpisah agar
+   * jujur; `hasMore` memberi tahu admin bila riwayat terpotong.
    */
   async listEmergencyGrants(activeOnly = true): Promise<object> {
-    const grants = await this.prisma.emergencyAccessGrant.findMany({
-      where: activeOnly ? { revokedAt: null, expiresAt: { gt: new Date() } } : {},
-      orderBy: { createdAt: 'desc' },
-      include: {
-        admin: { select: { id: true, adminId: true, fullName: true, email: true, role: true } },
-      },
-    });
-    return { data: grants, total: grants.length };
+    const where = activeOnly ? { revokedAt: null, expiresAt: { gt: new Date() } } : {};
+    const [grants, total] = await Promise.all([
+      this.prisma.emergencyAccessGrant.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: 500,
+        include: {
+          admin: { select: { id: true, adminId: true, fullName: true, email: true, role: true } },
+        },
+      }),
+      this.prisma.emergencyAccessGrant.count({ where }),
+    ]);
+    return { data: grants, total, hasMore: grants.length < total };
   }
 
   async revokeEmergencyGrant(grantId: string, revokerId: string, ipAddress: string): Promise<{ message: string }> {
@@ -678,6 +688,14 @@ export class AdminManagementService {
       select: { id: true, adminId: true, fullName: true, email: true, role: true, isActive: true, createdAt: true },
     });
 
+    // AW-007 (perf-fix, dinilai 2026-09-29): take 2000 di sini DINILAI AMAN dan
+    // DIPERTAHANKAN — "pantau" saja. Alasannya: (1) where sudah sempit
+    // (targetType='AdminUser' + 2 action spesifik + targetId IN daftar admin —
+    // jumlah admin hanya belasan/puluhan); (2) halaman review akses dibuka
+    // jarang (sertifikasi periodik 90 hari, bukan operasional harian); (3) take
+    // 2000 adalah batas keras, bukan fetch-all. Bila tim admin tumbuh >500
+    // orang atau halaman ini dibuka harian, pindahkan ke agregasi server-side
+    // (MAX(createdAt) per targetId GROUP BY action).
     const logs = await this.prisma.adminAuditLog.findMany({
       where: {
         targetType: 'AdminUser',

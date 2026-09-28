@@ -32,7 +32,7 @@ export class AdminDisputesController {
   @ApiOperation({ summary: 'List disputes', description: 'Paginated list of all disputes with optional status filter.' })
   @ApiResponse({ status: 200, description: 'Disputes list returned.' })
   listDisputes(@Query() query: DisputeListQueryDto): Promise<object> {
-    return this.service.listDisputes(query.page!, query.limit!, query.status, query.search, query.category);
+    return this.service.listDisputes(query.page!, query.limit!, query.status, query.search, query.category, query.unassigned);
   }
 
   @Get(':disputeId')

@@ -386,6 +386,91 @@ describe('Audit fixes — ShowcaseService (SH-B-001/002/003/004/005/006/007/008/
   });
 
   // ---------------------------------------------------------------
+  // PERF-FIX NP-001: attachImages meneruskan thumbnail foto
+  // ---------------------------------------------------------------
+  describe('PERF-FIX NP-001 attachImages dengan thumbnail foto', () => {
+    const IMG_KEY = `uploads/showcase-images/${OWNER_ID}/1700000002-aaa-foto.jpg`;
+    const THUMB_KEY = `uploads/showcase-images/${OWNER_ID}/1700000003-thumb-bbb.jpg`;
+
+    it('memverifikasi thumbnail, menyimpan thumbnailUrl, dan consume kedua key', async () => {
+      const service = await buildService(mocks, showcaseRow({ images: [] }));
+      mocks.mockPrisma.showcaseImage.count.mockResolvedValue(0);
+      mocks.mockPrisma.showcaseImage.createMany.mockResolvedValue({ count: 1 });
+      mocks.mockPrisma.showcaseImage.findMany.mockResolvedValue([]);
+      await service.attachImages(OWNER_ID, SHOWCASE_ID, [IMG_KEY], { [IMG_KEY]: THUMB_KEY });
+      // Thumbnail = confirmed SHOWCASE_IMAGE milik user (pola sama seperti thumbnail video).
+      expect(mocks.mockUpload.verifyUserFileKeys).toHaveBeenCalledWith(
+        OWNER_ID,
+        [THUMB_KEY],
+        UploadPurpose.SHOWCASE_IMAGE,
+        expect.objectContaining({ consume: false }),
+      );
+      // thumbnailUrl tersimpan di baris gambar.
+      const createData = mocks.mockPrisma.showcaseImage.createMany.mock.calls[0][0].data;
+      expect(createData[0]).toMatchObject({
+        fileKey: IMG_KEY,
+        thumbnailUrl: `https://cdn.test/${THUMB_KEY}`,
+      });
+      // Consume mencakup original + thumbnail.
+      expect(mocks.mockUpload.consumeUploadConfirmations).toHaveBeenCalledWith(
+        OWNER_ID,
+        [IMG_KEY, THUMB_KEY],
+      );
+    });
+
+    it('tanpa thumbnails: thumbnailUrl null dan hanya fileKey yang di-consume', async () => {
+      const service = await buildService(mocks, showcaseRow({ images: [] }));
+      mocks.mockPrisma.showcaseImage.count.mockResolvedValue(0);
+      mocks.mockPrisma.showcaseImage.createMany.mockResolvedValue({ count: 1 });
+      mocks.mockPrisma.showcaseImage.findMany.mockResolvedValue([]);
+      await service.attachImages(OWNER_ID, SHOWCASE_ID, [IMG_KEY]);
+      const createData = mocks.mockPrisma.showcaseImage.createMany.mock.calls[0][0].data;
+      expect(createData[0].thumbnailUrl).toBeNull();
+      expect(mocks.mockUpload.consumeUploadConfirmations).toHaveBeenCalledWith(OWNER_ID, [IMG_KEY]);
+      // verifyUserFileKeys hanya untuk gambar (1x), bukan thumbnail.
+      expect(mocks.mockUpload.verifyUserFileKeys).toHaveBeenCalledTimes(1);
+    });
+
+    it('menolak thumbnailFileKey yang sama dengan fileKey gambar', async () => {
+      const service = await buildService(mocks, showcaseRow({ images: [] }));
+      await expect(
+        service.attachImages(OWNER_ID, SHOWCASE_ID, [IMG_KEY], { [IMG_KEY]: IMG_KEY }),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({ code: ErrorCodes.SHOWCASE_INVALID_MEDIA }),
+      });
+      expect(mocks.mockPrisma.showcaseImage.createMany).not.toHaveBeenCalled();
+    });
+
+    it('menolak satu thumbnail dipakai dua gambar', async () => {
+      const service = await buildService(mocks, showcaseRow({ images: [] }));
+      const IMG2 = `uploads/showcase-images/${OWNER_ID}/1700000004-ccc-foto.jpg`;
+      await expect(
+        service.attachImages(OWNER_ID, SHOWCASE_ID, [IMG_KEY, IMG2], {
+          [IMG_KEY]: THUMB_KEY,
+          [IMG2]: THUMB_KEY,
+        }),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({ code: ErrorCodes.SHOWCASE_INVALID_MEDIA }),
+      });
+      expect(mocks.mockPrisma.showcaseImage.createMany).not.toHaveBeenCalled();
+    });
+
+    it('mengabaikan entri thumbnails untuk fileKey yang tidak dilampirkan', async () => {
+      const service = await buildService(mocks, showcaseRow({ images: [] }));
+      mocks.mockPrisma.showcaseImage.count.mockResolvedValue(0);
+      mocks.mockPrisma.showcaseImage.createMany.mockResolvedValue({ count: 1 });
+      mocks.mockPrisma.showcaseImage.findMany.mockResolvedValue([]);
+      const OTHER = `uploads/showcase-images/${OWNER_ID}/1700000005-ddd-lain.jpg`;
+      await service.attachImages(OWNER_ID, SHOWCASE_ID, [IMG_KEY], { [OTHER]: THUMB_KEY });
+      const createData = mocks.mockPrisma.showcaseImage.createMany.mock.calls[0][0].data;
+      expect(createData[0].thumbnailUrl).toBeNull();
+      // Thumbnail asing tidak diverifikasi / di-consume.
+      expect(mocks.mockUpload.verifyUserFileKeys).toHaveBeenCalledTimes(1);
+      expect(mocks.mockUpload.consumeUploadConfirmations).toHaveBeenCalledWith(OWNER_ID, [IMG_KEY]);
+    });
+  });
+
+  // ---------------------------------------------------------------
   // SH-B-007
   // ---------------------------------------------------------------
   describe('SH-B-007 upload confirmations consumed AFTER db update', () => {

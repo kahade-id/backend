@@ -778,7 +778,12 @@ export class ShowcaseService {
       // di-consume SETELAH update DB sukses — bila update gagal, file tidak
       // yatim dan user tidak perlu upload ulang.
       const imageFileKeys = await this.prepareImageKeys(userId, dto.imageFileKeys, { consume: false });
-      const removedKeys = existing.images.map((image) => image.fileKey).filter((k): k is string => Boolean(k));
+      // PERF-FIX (NP-001): hapus thumbnail foto lama juga — jangan yatim.
+      const removedKeys = existing.images.flatMap((image) =>
+        [image.fileKey, image.thumbnailUrl ? this.uploadService.fileKeyFromPublicUrl(image.thumbnailUrl) : null].filter(
+          (k): k is string => Boolean(k),
+        ),
+      );
       data.images = {
         deleteMany: {},
         create: imageFileKeys.map((image, index) => ({
@@ -960,6 +965,11 @@ export class ShowcaseService {
         spinOrders.set(entry.groupKey, orders);
       } else {
         imageKeys.push(entry.fileKey);
+        // PERF-FIX (NP-001): thumbnail foto server-side (sharp, ~640px)
+        // — opsional untuk kompatibilitas mundur (foto lama tidak punya).
+        // Bila dikirim, wajib confirmed SHOWCASE_IMAGE milik user (verifikasi
+        // di bawah via thumbKeys, sama seperti thumbnail video).
+        if (entry.thumbnailFileKey) thumbKeys.push(entry.thumbnailFileKey);
       }
     }
 
@@ -1007,7 +1017,9 @@ export class ShowcaseService {
 
     const thumbByFileKey = new Map<string, string>();
     for (const entry of entries) {
-      if (entry.kind === ShowcaseMediaKind.VIDEO && entry.thumbnailFileKey) {
+      // Video WAJIB thumbnail; image opsional (PERF-FIX NP-001 — thumbnail
+      // foto server-side; spin360 tidak pakai thumbnail).
+      if ((entry.kind === ShowcaseMediaKind.VIDEO || entry.kind === ShowcaseMediaKind.IMAGE) && entry.thumbnailFileKey) {
         thumbByFileKey.set(entry.fileKey, entry.thumbnailFileKey);
       }
     }
@@ -1041,7 +1053,12 @@ export class ShowcaseService {
       .catch((err) => this.logger.warn(`Showcase image cleanup failed for user=${userId}`, err));
   }
 
-  async attachImages(userId: string, itemId: string, fileKeys: string[]): Promise<object> {
+  async attachImages(
+    userId: string,
+    itemId: string,
+    fileKeys: string[],
+    thumbnails?: Record<string, string>,
+  ): Promise<object> {
     const existing = await this.findOwnedShowcase(userId, itemId);
     const maxImages = await this.subscriptionsService.getMaxShowcaseImages(userId);
     // Pre-check cepat (UX): ditolak SEBELUM konfirmasi upload di-consume,
@@ -1052,6 +1069,34 @@ export class ShowcaseService {
         message: `Maximum ${maxImages} images per showcase item`,
       });
     }
+
+    // PERF-FIX (NP-001): sanitasi peta thumbnail — hanya untuk fileKey yang
+    // memang dilampirkan, thumbnail tidak boleh sama dengan fileKey gambar
+    // itu sendiri, dan satu thumbnail tidak dipakai dua gambar (fail closed).
+    const thumbByFileKey = new Map<string, string>();
+    if (thumbnails && typeof thumbnails === 'object') {
+      const seenThumbKeys = new Set<string>();
+      for (const [imgKey, thumbKey] of Object.entries(thumbnails)) {
+        if (typeof imgKey !== 'string' || typeof thumbKey !== 'string' || thumbKey.length === 0) continue;
+        if (!fileKeys.includes(imgKey)) continue;
+        if (fileKeys.includes(thumbKey)) {
+          throw new BadRequestException({
+            code: ErrorCodes.SHOWCASE_INVALID_MEDIA,
+            message: 'thumbnailFileKey tidak boleh sama dengan fileKey gambar',
+          });
+        }
+        if (seenThumbKeys.has(thumbKey)) {
+          throw new BadRequestException({
+            code: ErrorCodes.SHOWCASE_INVALID_MEDIA,
+            message: 'Satu thumbnail tidak boleh dipakai untuk dua gambar',
+          });
+        }
+        seenThumbKeys.add(thumbKey);
+        thumbByFileKey.set(imgKey, thumbKey);
+      }
+    }
+    const thumbKeys = [...thumbByFileKey.values()];
+
     // SH-B-006: validasi dulu TANPA consume (pola sama seperti SH-B-007);
     // konfirmasi one-time baru di-consume SETELAH transaksi sukses — bila
     // cek otoritatif di dalam transaksi gagal (balapan), file tidak yatim
@@ -1059,6 +1104,15 @@ export class ShowcaseService {
     const prepared = await this.prepareImageKeys(userId, fileKeys, { consume: false });
     if (prepared.length === 0) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'fileKeys must not be empty' });
+    }
+    // Thumbnail = confirmed SHOWCASE_IMAGE milik user (pola sama seperti
+    // thumbnail video di prepareMediaEntries).
+    if (thumbKeys.length > 0) {
+      await this.uploadService.verifyUserFileKeys(userId, thumbKeys, UploadPurpose.SHOWCASE_IMAGE, {
+        maxFiles: maxImages,
+        consume: false,
+        label: 'Showcase image thumbnail',
+      });
     }
 
     const nextSortOrder = existing.images.reduce((max, image) => Math.max(max, image.sortOrder), -1) + 1;
@@ -1075,19 +1129,26 @@ export class ShowcaseService {
         });
       }
       return tx.showcaseImage.createMany({
-        data: prepared.map((image, index) => ({
-          showcaseId: itemId,
-          imageUrl: image.imageUrl,
-          fileKey: image.fileKey,
-          sortOrder: nextSortOrder + index,
-        })),
+        data: prepared.map((image, index) => {
+          // PERF-FIX (NP-001): simpan thumbnail foto bila dikirim.
+          const thumbKey = thumbByFileKey.get(image.fileKey);
+          return {
+            showcaseId: itemId,
+            imageUrl: image.imageUrl,
+            fileKey: image.fileKey,
+            thumbnailUrl: thumbKey ? this.uploadService.buildPublicUrl(thumbKey) : null,
+            sortOrder: nextSortOrder + index,
+          };
+        }),
       });
     });
 
     // SH-B-006: consume SETELAH createMany sukses. Bila consume gagal
     // (sangat jarang — balapan double-submit), baris gambar sudah benar di
     // DB; key yang tersisa kedaluwarsa sendiri via TTL konfirmasi.
-    await this.uploadService.consumeUploadConfirmations(userId, fileKeys);
+    // PERF-FIX (NP-001): consume thumbnail foto juga — jangan sisakan key
+    // terkonfirmasi yang bisa dipakai ulang.
+    await this.uploadService.consumeUploadConfirmations(userId, [...fileKeys, ...thumbKeys]);
 
     return { added: created.count, images: await this.listImages(itemId) };
   }
@@ -1095,7 +1156,7 @@ export class ShowcaseService {
   async removeImage(userId: string, imageId: string): Promise<{ message: string }> {
     const image = await this.prisma.showcaseImage.findFirst({
       where: { id: imageId, showcase: { userId } },
-      select: { id: true, fileKey: true, showcaseId: true },
+      select: { id: true, fileKey: true, thumbnailUrl: true, showcaseId: true },
     });
     if (!image) {
       throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase image not found' });
@@ -1118,7 +1179,11 @@ export class ShowcaseService {
       }
       await tx.showcaseImage.delete({ where: { id: imageId } });
     });
-    if (image.fileKey) this.scheduleImageCleanup(userId, [image.fileKey]);
+    if (image.fileKey) {
+      // PERF-FIX (NP-001): hapus thumbnail foto juga — jangan sisakan yatim.
+      const thumbKey = image.thumbnailUrl ? this.uploadService.fileKeyFromPublicUrl(image.thumbnailUrl) : null;
+      this.scheduleImageCleanup(userId, [image.fileKey, thumbKey].filter((k): k is string => Boolean(k)));
+    }
     return { message: 'Showcase image deleted successfully' };
   }
 

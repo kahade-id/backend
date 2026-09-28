@@ -215,6 +215,10 @@ export const SHOWCASE_VIDEO_MIN_DURATION_SEC = 1;
 export const UPLOAD_DIRECT_MULTER_MAX_BYTES = 105 * 1024 * 1024;
 /** Lebar thumbnail video showcase (px); tinggi mengikuti aspek rasio. */
 export const SHOWCASE_VIDEO_THUMBNAIL_WIDTH = 640;
+/** PERF-FIX (NP-001): lebar thumbnail foto showcase (px); tinggi mengikuti
+ * aspek rasio. Dihasilkan server-side saat upload SHOWCASE_IMAGE via sharp —
+ * feed memuat varian kecil ini, bukan file full-res. */
+export const SHOWCASE_IMAGE_THUMBNAIL_WIDTH = 640;
 /** Jumlah frame minimum & maksimum untuk satu set spin360. */
 export const SHOWCASE_SPIN360_MIN_FRAMES = 8;
 export const SHOWCASE_SPIN360_MAX_FRAMES = 24;

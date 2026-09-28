@@ -16,6 +16,7 @@ import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
 import { AdminOrderQueryDto, ForceActionDto } from './dto/admin-order-query.dto';
 import { toIdr } from '../../../common/utils/currency.util';
+import { decryptPiiSafe } from '../../../common/utils/pii.util';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { escapeLikePattern } from '../../../common/utils/search.util';
@@ -148,7 +149,33 @@ export class AdminOrdersService {
       throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
     }
 
-    return serializeOrder(order as unknown as Record<string, unknown>);
+    const result = serializeOrder(order as unknown as Record<string, unknown>);
+
+    // Lokasi presisi buyer (fraud checking) — dekripsi fail-closed, ciphertext
+    // mentah TIDAK pernah dikirim ke client.
+    const encLat = result.buyerLatitude as string | null | undefined;
+    const encLng = result.buyerLongitude as string | null | undefined;
+    delete result.buyerLatitude;
+    delete result.buyerLongitude;
+    delete result.buyerLocationAccuracy;
+    if (encLat && encLng) {
+      const [lat, lng] = await Promise.all([decryptPiiSafe(encLat), decryptPiiSafe(encLng)]);
+      const acc = await decryptPiiSafe(order.buyerLocationAccuracy as string | null | undefined);
+      result.buyerLocation = lat !== null && lng !== null
+        ? {
+            latitude: lat,
+            longitude: lng,
+            accuracy: acc,
+            capturedAt: order.buyerLocationCapturedAt
+              ? (order.buyerLocationCapturedAt as Date).toISOString()
+              : null,
+          }
+        : null;
+    } else {
+      result.buyerLocation = null;
+    }
+
+    return result;
   }
 
   // ADM-404: DISPUTE_ADMIN hanya boleh force-cancel order yang memiliki dispute AKTIF.

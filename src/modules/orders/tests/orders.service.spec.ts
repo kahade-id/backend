@@ -17,6 +17,10 @@ jest.mock('../../../common/utils/pii.util', () => ({
   decryptPiiSafe: jest.fn(async (value: string | null) => value ?? null),
   encryptPii: jest.fn(async (value: string) => value),
 }));
+// Catatan: jest.mock di-hoist, jadi import ini menerima versi mock (bukan
+// implementasi asli) — dipakai untuk memasang ulang implementasi setelah
+// jest.resetAllMocks() di beforeEach.
+import { decryptPiiSafe, encryptPii } from '../../../common/utils/pii.util';
 
 const mockUser = {
   id: 'user-db-1',
@@ -222,6 +226,12 @@ describe('OrdersService', () => {
     // resetAllMocks menghapus mockImplementation inline di atas — pasang ulang
     // default mock Kahade+ (pass-through tanpa waiver agar ekspektasi fee lama
     // tetap valid; test waiver spesifik meng-override per-test).
+    // TRX-009: resetAllMocks juga menghapus implementasi mock pii.util di atas —
+    // pasang ulang agar decryptPiiSafe deterministik (identity) di semua test.
+    (decryptPiiSafe as unknown as jest.Mock).mockImplementation(
+      async (value: string | null | undefined) => value ?? null,
+    );
+    (encryptPii as unknown as jest.Mock).mockImplementation(async (value: string) => value);
     const subscriptionsMockLocal = module.get(SubscriptionsService) as unknown as typeof subscriptionsMock;
     subscriptionsMock = subscriptionsMockLocal;
     subscriptionsMock.waiveFeeIfEligible.mockImplementation(async (_userId: string, fee: bigint) => fee);

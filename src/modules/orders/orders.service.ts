@@ -14,7 +14,8 @@ import { ORDER_SERIAL, ORDER_AVG_DURATIONS_CACHE } from '../../common/constants/
 import { NotificationQueueService } from '../queue/notification-queue.service';
 import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { CONFIRMATION_DEADLINE_DAYS, KYC_THRESHOLD, CONFIRMATION_DEADLINE_DAYS_MAP, ORDER_MIN_VALUE, ORDER_MAX_VALUE, DELIVERY_DEADLINE_DAYS_MIN, DELIVERY_DEADLINE_DAYS_MAX, POST_COMPLETION_DISPUTE_WINDOW_HOURS } from '../../common/constants/app.constants';
+import { CONFIRMATION_DEADLINE_DAYS, KYC_THRESHOLD, CONFIRMATION_DEADLINE_DAYS_MAP, ORDER_MIN_VALUE, ORDER_MAX_VALUE, DELIVERY_DEADLINE_DAYS_MIN, DELIVERY_DEADLINE_DAYS_MAX, POST_COMPLETION_DISPUTE_WINDOW_HOURS, RATING_WINDOW_DAYS } from '../../common/constants/app.constants';
+import { DEFAULT_RETURN_WINDOW_DAYS } from '../returns/returns.constants';
 import { escapeLikePattern } from '../../common/utils/search.util';
 import { withSpan } from '../../common/tracing/tracing';
 // Batch 43 BE-CHAT: pesan sistem "resi diperbarui" di room order (best-effort,
@@ -807,6 +808,9 @@ export class OrdersService {
       createdAt: Date;
       deliveryDeadlineAt: Date | null;
       autoCompleteAt: Date | null;
+      // Batch 139 BE-API1 (item 110).
+      paymentDeadlineAt: Date | null;
+      confirmationDeadlineAt: Date | null;
     }[];
     total: number;
     page: number;
@@ -905,6 +909,11 @@ export class OrdersService {
         createdAt: order.createdAt,
         deliveryDeadlineAt: order.deliveryDeadlineAt,
         autoCompleteAt: order.status === OrderStatus.IN_DELIVERY && order.deliveryDeadlineAt ? order.deliveryDeadlineAt : null,
+        // Batch 139 BE-API1 (item 110): deadline bayar & konfirmasi di daftar
+        // order (dukung countdown I035) — detail sudah punya keduanya sejak
+        // lama; daftar selama ini hanya punya deliveryDeadlineAt/autoCompleteAt.
+        paymentDeadlineAt: order.paymentDeadlineAt ?? null,
+        confirmationDeadlineAt: order.confirmationDeadlineAt ?? null,
       })),
       total, page: safePage, limit: safeLimit,
     };
@@ -941,6 +950,10 @@ export class OrdersService {
       });
       inquiryContext = inquiryRoom;
     }
+
+    // Batch 139 BE-API1 (item 111/112): dihitung sekali, dipakai field +
+    // availableActions (hindari query policy ganda).
+    const returnWindowUntil = await this.getReturnWindowUntil(order);
 
     return {
       order: {
@@ -991,6 +1004,17 @@ export class OrdersService {
         postCompletionDisputeDeadlineAt: order.completedAt
           ? new Date(order.completedAt.getTime() + POST_COMPLETION_DISPUTE_WINDOW_HOURS * 60 * 60 * 1000)
           : null,
+        // Batch 139 BE-API1 (item 111): batas akhir pengajuan retur — turunan
+        // murni (completedAt + returnWindowDays kebijakan per orderType,
+        // fallback DEFAULT_RETURN_WINDOW_DAYS). null bila order belum
+        // COMPLETED (jendela retur tak berlaku). Pola sama dengan
+        // postCompletionDisputeDeadlineAt di atas. Read-only.
+        returnWindowUntil,
+        // Batch 139 BE-API1 (item 112): daftar aksi yang bisa dilakukan viewer
+        // saat ini (read-only). Nama aksi = suffix UPPER_SNAKE dari prop
+        // `can*` FE (`OrderDetailActionsProps`) agar FE bisa menggantikan
+        // duplikasi state machine-nya dengan sumber kebenaran tunggal ini.
+        availableActions: this.getAvailableActions(order, userId, !!existingRating, returnWindowUntil),
         buyer: order.buyer, seller: order.seller, voucher: order.voucher,
         chatRoomId: order.chatRoom?.id ?? null,
         hasRated: !!existingRating,
@@ -1000,6 +1024,107 @@ export class OrdersService {
         statusHistories: order.statusHistories ?? [],
       },
     };
+  }
+
+  /**
+   * Batch 139 BE-API1 (item 111): `returnWindowUntil` — batas akhir pengajuan
+   * retur = completedAt + returnWindowDays (kebijakan per orderType, fallback
+   * DEFAULT_RETURN_WINDOW_DAYS bila policy belum di-seed; pola sama dengan
+   * ReturnsService.getPolicy). null bila order belum COMPLETED / completedAt
+   * hilang (jendela tak berlaku). Murni turunan — tanpa tulis, tanpa ubah
+   * logika retur/escrow.
+   */
+  private async getReturnWindowUntil(order: {
+    status: OrderStatus;
+    orderType: OrderType;
+    completedAt: Date | null;
+  }): Promise<Date | null> {
+    if (order.status !== OrderStatus.COMPLETED || !order.completedAt) return null;
+    const policy = await this.prisma.returnPolicy.findFirst({
+      where: { orderType: order.orderType, category: null, isActive: true },
+      select: { returnWindowDays: true },
+    });
+    const windowDays = policy?.returnWindowDays ?? DEFAULT_RETURN_WINDOW_DAYS;
+    return new Date(order.completedAt.getTime() + windowDays * 86_400_000);
+  }
+
+  /**
+   * Batch 139 BE-API1 (item 112): `availableActions` — daftar aksi yang bisa
+   * dilakukan viewer pada order ini, dihitung server-side dari status × peran
+   * (sumber kebenaran tunggal; FE saat ini menduplikasi state machine ini di
+   * `app/order/[id].tsx` — rawan drift).
+   *
+   * Nama aksi = suffix UPPER_SNAKE dari prop `can*` di FE
+   * (`components/order-detail-actions.tsx` → `OrderDetailActionsProps`):
+   * PAY←canPay, CONFIRM←canConfirm, SHIP←canShip,
+   * REVIEW_DELIVERY←canReviewDelivery, RATE←canRate, VIEW_PROOF←canViewProof,
+   * RETURN←canReturnPrimary/onReturn, CANCEL←canCancel, DISPUTE←canDispute,
+   * EXTEND←canExtend.
+   *
+   * Gerbang diselaraskan dengan FE (`lib/api/orders-shared.ts`:
+   * isCancellable/isDisputable/isExtendable/isRatingWindowOpen) yang
+   * masing-masing didokumentasikan selaras dengan backend
+   * (order-state.service cancelOrder, order-extensions.service, jendela rating
+   * RATING_WINDOW_DAYS). Read-only: tidak mengubah state machine.
+   */
+  private getAvailableActions(
+    order: {
+      status: OrderStatus;
+      orderType: OrderType;
+      buyerId: string;
+      sellerId: string;
+      completedAt: Date | null;
+    },
+    viewerId: string,
+    alreadyRated: boolean,
+    returnWindowUntil: Date | null,
+  ): string[] {
+    const isBuyer = order.buyerId === viewerId;
+    const isSeller = order.sellerId === viewerId;
+    const knownRole = isBuyer || isSeller;
+    const status = order.status;
+    const actions: string[] = [];
+
+    // canPay: WAITING_PAYMENT + buyer (FE juga mengenali alias legacy
+    // PENDING_PAYMENT yang sudah dinormalisasi ke WAITING_PAYMENT di pintu masuk).
+    if (status === OrderStatus.WAITING_PAYMENT && isBuyer) actions.push('PAY');
+    // canConfirm: WAITING_CONFIRMATION + seller (terima/tolak order).
+    if (status === OrderStatus.WAITING_CONFIRMATION && isSeller) actions.push('CONFIRM');
+    // canShip: PROCESSING + seller (kirim barang).
+    if (status === OrderStatus.PROCESSING && isSeller) actions.push('SHIP');
+    // canReviewDelivery: IN_DELIVERY + buyer (tinjau/konfirmasi terima).
+    if (status === OrderStatus.IN_DELIVERY && isBuyer) actions.push('REVIEW_DELIVERY');
+    // canRate: COMPLETED + belum menilai + dalam jendela rating backend.
+    if (
+      knownRole &&
+      status === OrderStatus.COMPLETED &&
+      !alreadyRated &&
+      order.completedAt &&
+      Date.now() - order.completedAt.getTime() <= RATING_WINDOW_DAYS * 86_400_000
+    ) {
+      actions.push('RATE');
+    }
+    // canViewProof: seller melihat bukti pengiriman saat IN_DELIVERY.
+    if (isSeller && status === OrderStatus.IN_DELIVERY) actions.push('VIEW_PROOF');
+    // canReturnPrimary (item 46): buyer + jendela retur masih terbuka.
+    // Aproksimasi jendela dari returnWindowUntil (eligibilitas penuh —
+    // sengketa aktif/retur aktif — tetap divalidasi endpoint retur saat create).
+    if (isBuyer && returnWindowUntil && Date.now() <= returnWindowUntil.getTime()) {
+      actions.push('RETURN');
+    }
+    // canCancel: WAITING_CONFIRMATION/WAITING_PAYMENT, buyer & seller
+    // (selaras order-state.service#cancelOrder).
+    if (knownRole && (status === OrderStatus.WAITING_CONFIRMATION || status === OrderStatus.WAITING_PAYMENT)) {
+      actions.push('CANCEL');
+    }
+    // canDispute: PROCESSING/IN_DELIVERY (selaras batasan service dispute).
+    if (knownRole && (status === OrderStatus.PROCESSING || status === OrderStatus.IN_DELIVERY)) {
+      actions.push('DISPUTE');
+    }
+    // canExtend: IN_DELIVERY + seller (selaras order-extensions.service).
+    if (isSeller && status === OrderStatus.IN_DELIVERY) actions.push('EXTEND');
+
+    return actions;
   }
 
   async getOrderSummary(userId: string): Promise<{

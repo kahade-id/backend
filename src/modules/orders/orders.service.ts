@@ -17,6 +17,9 @@ import * as ErrorCodes from '../../common/constants/error-codes';
 import { CONFIRMATION_DEADLINE_DAYS, KYC_THRESHOLD, CONFIRMATION_DEADLINE_DAYS_MAP, ORDER_MIN_VALUE, ORDER_MAX_VALUE, DELIVERY_DEADLINE_DAYS_MIN, DELIVERY_DEADLINE_DAYS_MAX, POST_COMPLETION_DISPUTE_WINDOW_HOURS } from '../../common/constants/app.constants';
 import { escapeLikePattern } from '../../common/utils/search.util';
 import { withSpan } from '../../common/tracing/tracing';
+// Batch 43 BE-CHAT: pesan sistem "resi diperbarui" di room order (best-effort,
+// via registry statis — tanpa circular DI ke modul chat).
+import { ChatOrderHooks } from '../chat/chat-order-hooks';
 
 const ORDER_COUNTERPART_COOLDOWN_SECONDS = 60;
 
@@ -1405,6 +1408,14 @@ export class OrdersService {
       });
       return { trackingNumber, courierName };
     }), 'UPDATE_SHIPPING_TX');
+
+    // Batch 43 BE-CHAT: pesan sistem "resi diperbarui" di room order (best-effort).
+    try {
+      ChatOrderHooks.emit(orderId, 'ORDER_TRACKING_UPDATED', {
+        courierName: result.courierName,
+        trackingNumber: result.trackingNumber,
+      });
+    } catch { /* never block shipping update */ }
 
     return { orderId, ...result };
   }

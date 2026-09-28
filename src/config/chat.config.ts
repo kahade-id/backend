@@ -21,4 +21,12 @@ function parseAction(raw: string | undefined): ChatCircumventionAction {
 
 export const chatConfig = registerAs('chat', () => ({
   circumventionAction: parseAction(process.env.CHAT_CIRCUMVENTION_ACTION),
+  // Batch 43 BE-CHAT: terjemahan pesan. Provider interface generik via HTTP —
+  // TIDAK ada credential yang di-hardcode; semuanya dari env. Bila tidak
+  // dikonfigurasi, endpoint translate fail-closed dengan 501 NOT_CONFIGURED.
+  translation: {
+    provider: (process.env.CHAT_TRANSLATION_PROVIDER ?? '').trim().toLowerCase() || null,
+    apiKey: process.env.CHAT_TRANSLATION_API_KEY || null,
+    endpoint: process.env.CHAT_TRANSLATION_ENDPOINT || null,
+  },
 }));

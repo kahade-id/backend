@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Patch, Put, Delete, Body, Param, Query, DefaultValuePipe, ParseIntPipe, ParseBoolPipe, HttpCode, UseGuards, UseInterceptors, UploadedFile, BadRequestException } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Put, Delete, Body, Param, Query, DefaultValuePipe, ParseIntPipe, ParseBoolPipe, HttpCode, UseGuards, UseInterceptors, UploadedFile, BadRequestException, Res } from '@nestjs/common';
 import { ParseIdPipe } from '../../common/pipes/parse-id.pipe';
 import { ClampLimitPipe } from '../../common/pipes/clamp-limit.pipe';
 import { ParseQueryStringPipe } from '../../common/pipes/parse-query-string.pipe';
@@ -17,6 +17,14 @@ import { ForwardMessageDto } from './dto/forward-message.dto';
 import { ArchiveRoomDto, MuteRoomDto } from './dto/room-state.dto';
 import { CreateInquiryDto } from './dto/create-inquiry.dto';
 import { CreateDmDto } from './dto/create-dm.dto';
+// Batch 43 BE-CHAT
+import { Response } from 'express';
+import { TranslateMessageDto } from './dto/translate-message.dto';
+import { CreatePollDto, VotePollDto } from './dto/poll.dto';
+import { CreateReplyTemplateDto, UpdateReplyTemplateDto } from './dto/reply-template.dto';
+import { UpdateChatPrivacyDto } from './dto/chat-privacy.dto';
+import { CreateOrderFromChatDto } from './dto/create-order-from-chat.dto';
+import { PinRoomDto as PinChatRoomDto, ReportRoomDto } from './dto/room-report-pin.dto';
 import { PhoneVerifiedGuard } from '../../common/guards/phone-verified.guard';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import {
@@ -119,6 +127,235 @@ export class ChatController {
       ? excludeIdsRaw.split(',').map(id => id.trim()).filter(id => id.length > 0 && id.length <= 30).slice(0, 200)
       : undefined;
     return this.chatService.getMessages(userId, roomId, cursor, limit, excludeIds);
+  }
+
+  // ============================================================
+  // Batch 43 BE-CHAT
+  // ============================================================
+
+  @Post('rooms/:roomId/messages/:messageId/translate')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Translate a chat message to the target language' })
+  async translateMessage(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+    @Param('messageId', ParseIdPipe) messageId: string,
+    @Body() dto: TranslateMessageDto,
+  ): Promise<object> {
+    return this.chatService.translateMessage(userId, messageId, dto.targetLang);
+  }
+
+  @Get('rooms/:roomId/export')
+  @ApiOperation({ summary: 'Export chat history (txt or json). Room members only.' })
+  async exportRoom(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+    @Query('format', new DefaultValuePipe('txt'), new ParseQueryStringPipe('format', 10)) format: string,
+    @Res({ passthrough: false }) res: Response,
+  ): Promise<void> {
+    const normalized = format.toLowerCase();
+    if (normalized !== 'txt' && normalized !== 'json') {
+      throw new BadRequestException('format must be txt or json');
+    }
+    const result = await this.chatService.exportRoom(userId, roomId, normalized);
+    res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
+    if (result.format === 'json') {
+      res.type('application/json').send(JSON.stringify(result.content, null, 2));
+    } else {
+      res.type('text/plain; charset=utf-8').send(result.content as string);
+    }
+  }
+
+  @Get('privacy')
+  @ApiOperation({ summary: 'Get chat privacy settings (read receipts, DM policy)' })
+  async getChatPrivacy(@CurrentUser('sub') userId: string): Promise<object> {
+    return this.chatService.getChatPrivacy(userId);
+  }
+
+  @Patch('privacy')
+  @ApiOperation({ summary: 'Update chat privacy settings' })
+  async updateChatPrivacy(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: UpdateChatPrivacyDto,
+  ): Promise<object> {
+    return this.chatService.updateChatPrivacy(userId, dto);
+  }
+
+  @Get('rooms/:roomId/starred')
+  @ApiOperation({ summary: 'List starred messages in a room' })
+  async listStarredMessages(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+  ): Promise<object> {
+    return this.chatService.listStarredMessages(userId, roomId);
+  }
+
+  @Post('rooms/:roomId/starred/:messageId')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Star a message' })
+  async starMessage(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+    @Param('messageId', ParseIdPipe) messageId: string,
+  ): Promise<object> {
+    return this.chatService.starMessage(userId, roomId, messageId);
+  }
+
+  @Delete('rooms/:roomId/starred/:messageId')
+  @ApiOperation({ summary: 'Unstar a message' })
+  async unstarMessage(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+    @Param('messageId', ParseIdPipe) messageId: string,
+  ): Promise<object> {
+    return this.chatService.unstarMessage(userId, roomId, messageId);
+  }
+
+  @Post('self')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Get or create the self-chat room (saved messages)' })
+  async getOrCreateSelfRoom(@CurrentUser('sub') userId: string): Promise<object> {
+    return this.chatService.getOrCreateSelfRoom(userId);
+  }
+
+  @Get('rooms/:roomId/polls')
+  @ApiOperation({ summary: 'List polls in a chat room' })
+  async listPolls(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+  ): Promise<object> {
+    return this.chatService.listPolls(userId, roomId);
+  }
+
+  @Post('rooms/:roomId/polls')
+  @ApiOperation({ summary: 'Create a poll in a chat room' })
+  async createPoll(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+    @Body() dto: CreatePollDto,
+  ): Promise<object> {
+    return this.chatService.createPoll(userId, roomId, dto);
+  }
+
+  @Get('rooms/:roomId/polls/:pollId')
+  @ApiOperation({ summary: 'Get poll detail with results' })
+  async getPoll(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+    @Param('pollId', ParseIdPipe) pollId: string,
+  ): Promise<object> {
+    return this.chatService.getPoll(userId, roomId, pollId);
+  }
+
+  @Post('rooms/:roomId/polls/:pollId/vote')
+  @ApiOperation({ summary: 'Vote on a poll' })
+  async votePoll(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+    @Param('pollId', ParseIdPipe) pollId: string,
+    @Body() dto: VotePollDto,
+  ): Promise<object> {
+    return this.chatService.votePoll(userId, roomId, pollId, dto.optionIndexes);
+  }
+
+  @Post('rooms/:roomId/polls/:pollId/close')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Close a poll (creator only)' })
+  async closePoll(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+    @Param('pollId', ParseIdPipe) pollId: string,
+  ): Promise<object> {
+    return this.chatService.closePoll(userId, roomId, pollId);
+  }
+
+  @Get('pinned')
+  @ApiOperation({ summary: 'List pinned chat rooms (synced across devices)' })
+  async listPinnedChatRooms(@CurrentUser('sub') userId: string): Promise<object> {
+    return this.chatService.listPinnedChatRooms(userId);
+  }
+
+  @Post('rooms/:roomId/pin')
+  @ApiOperation({ summary: 'Pin a chat room (backend-synced)' })
+  async pinChatRoom(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+    @Body() dto: PinChatRoomDto,
+  ): Promise<object> {
+    return this.chatService.pinChatRoom(userId, roomId, dto.position);
+  }
+
+  @Delete('rooms/:roomId/pin')
+  @ApiOperation({ summary: 'Unpin a chat room' })
+  async unpinChatRoom(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+  ): Promise<object> {
+    return this.chatService.unpinChatRoom(userId, roomId);
+  }
+
+  @Get('reply-templates')
+  @ApiOperation({ summary: 'List reply templates (synced across devices)' })
+  async listReplyTemplates(@CurrentUser('sub') userId: string): Promise<object> {
+    return this.chatService.listReplyTemplates(userId);
+  }
+
+  @Post('reply-templates')
+  @ApiOperation({ summary: 'Create a reply template' })
+  async createReplyTemplate(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: CreateReplyTemplateDto,
+  ): Promise<object> {
+    return this.chatService.createReplyTemplate(userId, dto);
+  }
+
+  @Patch('reply-templates/:templateId')
+  @ApiOperation({ summary: 'Update a reply template' })
+  async updateReplyTemplate(
+    @CurrentUser('sub') userId: string,
+    @Param('templateId', ParseIdPipe) templateId: string,
+    @Body() dto: UpdateReplyTemplateDto,
+  ): Promise<object> {
+    return this.chatService.updateReplyTemplate(userId, templateId, dto);
+  }
+
+  @Delete('reply-templates/:templateId')
+  @ApiOperation({ summary: 'Delete a reply template' })
+  async deleteReplyTemplate(
+    @CurrentUser('sub') userId: string,
+    @Param('templateId', ParseIdPipe) templateId: string,
+  ): Promise<object> {
+    return this.chatService.deleteReplyTemplate(userId, templateId);
+  }
+
+  @Post('rooms/:roomId/block')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Block the counterpart of this room (from room menu)' })
+  async blockCounterpartFromRoom(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+  ): Promise<object> {
+    return this.chatService.blockCounterpartFromRoom(userId, roomId);
+  }
+
+  @Post('rooms/:roomId/report')
+  @ApiOperation({ summary: 'Report the counterpart of this room (from room menu)' })
+  async reportCounterpartFromRoom(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+    @Body() dto: ReportRoomDto,
+  ): Promise<object> {
+    return this.chatService.reportCounterpartFromRoom(userId, roomId, dto);
+  }
+
+  @Post('rooms/:roomId/order')
+  @ApiOperation({ summary: 'Create an escrow order from a negotiation chat (1-by-1)' })
+  async createOrderFromChat(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+    @Body() dto: CreateOrderFromChatDto,
+  ): Promise<object> {
+    return this.chatService.createOrderFromChat(userId, roomId, dto);
   }
 
   @Get('rooms/:roomId/search')

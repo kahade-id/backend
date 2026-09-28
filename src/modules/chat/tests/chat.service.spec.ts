@@ -16,6 +16,12 @@ const mockPrisma = {
     create: jest.fn(),
     update: jest.fn(),
   },
+  // Batch 43 BE-CHAT: mock untuk privacySetting (DM policy + hideReadReceipts).
+  privacySetting: {
+    findUnique: jest.fn().mockResolvedValue(null),
+    findMany: jest.fn().mockResolvedValue([]),
+    upsert: jest.fn(),
+  },
   chatMessage: {
     findMany: jest.fn(),
     findUnique: jest.fn(),

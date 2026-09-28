@@ -27,6 +27,8 @@ const mockPrisma = {
   dispute: { findFirst: jest.fn().mockResolvedValue(null) },
   user: { findUnique: jest.fn(), findMany: jest.fn().mockResolvedValue([]) },
   notification: { create: jest.fn(), updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
+  // Batch 43 BE-CHAT: mock untuk privacySetting (hideReadReceipts).
+  privacySetting: { findUnique: jest.fn().mockResolvedValue(null), findMany: jest.fn().mockResolvedValue([]) },
   $transaction: jest.fn(),
   $executeRaw: jest.fn().mockResolvedValue(1),
   $queryRaw: jest.fn(),

@@ -26,6 +26,10 @@ import { activateMilestonesForOrderTx } from '../milestones/milestone-activation
 import { Optional } from '@nestjs/common';
 import { InventoryService } from '../inventory/inventory.service';
 import { ActionLocationService, type ActionLocationContext } from '../action-location/action-location.service';
+// Batch 43 BE-CHAT: pesan sistem otomatis di room order (best-effort).
+// Dipanggil via registry statis — bukan import service, agar tidak ada
+// circular DI antara modul orders dan chat.
+import { ChatOrderHooks } from '../chat/chat-order-hooks';
 
 const VALID_CANCEL_REASONS = [
   'CHANGED_MIND',
@@ -199,6 +203,9 @@ export class OrderStateService {
       await this.notificationQueue.enqueue({ userId: order.sellerId, type: NotificationType.ORDER_PAYMENT_RECEIVED, title: 'Payment Received', body: `Payment for order "${order.title}" has been received. Please process the order.`, pushData: { type: 'ORDER_PAYMENT_RECEIVED', orderId } });
     }, 'PAY_ORDER_NOTIFICATION');
 
+    // Batch 43 BE-CHAT: pesan sistem "bayar diterima" di room order.
+    this.runPostCommitBestEffort(() => ChatOrderHooks.emit(orderId, 'ORDER_PAID'), 'CHAT_ORDER_PAID_SYSTEM_MSG');
+
     return { orderId, status: 'PROCESSING', walletTxId };
   }
 
@@ -257,6 +264,9 @@ export class OrderStateService {
       if (!order || !inventoryComplete) return;
       await inventoryComplete.safeDecrementForOrder(order.id);
     }, 'COMPLETE_ORDER_INVENTORY_DECREMENT');
+
+    // Batch 43 BE-CHAT: pesan sistem "dana dicairkan" + arsip otomatis room.
+    this.runPostCommitBestEffort(() => ChatOrderHooks.emit(orderId, 'ORDER_COMPLETED'), 'CHAT_ORDER_COMPLETED_SYSTEM_MSG');
 
     return { orderId, status: 'COMPLETED' };
   }

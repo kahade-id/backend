@@ -25,6 +25,7 @@
     "prisma:seed": "ts-node prisma/seed.ts",
     "db:constraints": "sh scripts/run-constraints.sh",
     "openapi:generate": "ts-node --transpile-only scripts/generate-openapi.ts",
+    "backfill:encrypt-locations": "ts-node --transpile-only scripts/backfill-encrypt-locations.ts",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\"",
     "postprisma:migrate": "sh scripts/run-constraints.sh"
@@ -45,6 +46,7 @@
     "@nestjs/terminus": "^11.1.1",
     "@nestjs/throttler": "^6.5.0",
     "@nestjs/websockets": "^11.1.17",
+    "@paralleldrive/cuid2": "2.3.1",
     "@prisma/client": "^5.22.0",
     "@sentry/nestjs": "^10.44.0",
     "@sentry/node": "^10.44.0",

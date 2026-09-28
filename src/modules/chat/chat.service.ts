@@ -41,6 +41,8 @@ import { escapeLikePattern } from '../../common/utils/search.util';
 import { VerificationBadgeService } from '../users/verification-badge.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { moderateFileName, moderateText, ModerationVerdict, ModerateOptions } from './chat-moderation.util';
+import { createId } from '@paralleldrive/cuid2';
+import { blindChatLocation, unblindChatLocation } from './utils/chat-location-crypto';
 
 function sanitizeText(text: string): string {
   // React Native renders text nodes safely; HTML entity encoding here corrupts
@@ -304,8 +306,15 @@ function serializeMessage(msg: RawMessage, options: SerializeMessageOptions = {}
     viewOnce: msg.viewOnce ?? false,
     viewOnceViewedAt: msg.viewOnceViewedAt ?? null,
     location:
-      msg.messageType === 'LOCATION' && msg.locationLat != null && msg.locationLng != null
-        ? { lat: msg.locationLat, lng: msg.locationLng, label: msg.locationLabel ?? null }
+      msg.messageType === 'LOCATION'
+        ? (() => {
+            // SEC-D: koordinat tersimpan ter-blinding; kembalikan aslinya.
+            // unblindChatLocation = null untuk data korup → sembunyikan.
+            const resolved = unblindChatLocation(msg.locationLat, msg.locationLng, msg.id);
+            return resolved
+              ? { lat: resolved.lat, lng: resolved.lng, label: msg.locationLabel ?? null }
+              : null;
+          })()
         : null,
     card: (msg.cardSnapshot as Record<string, unknown> | null) ?? null,
     createdAt: msg.createdAt,
@@ -1231,8 +1240,17 @@ export class ChatService implements OnModuleInit {
       }
     }
 
+    // SEC-D: id pesan di-generate di aplikasi (bukan default DB) agar koordinat
+    // lokasi bisa di-blinding dengan pad per-messageId SEBELUM tulis ke DB —
+    // koordinat tidak pernah tersimpan plaintext.
+    const messageId = createId();
+    const blindedLocation = locationData
+      ? blindChatLocation(locationData.lat, locationData.lng, messageId)
+      : null;
+
     const message = await this.prisma.chatMessage.create({
       data: {
+        id: messageId,
         roomId: room.id,
         senderId: userId,
         messageType,
@@ -1247,8 +1265,8 @@ export class ChatService implements OnModuleInit {
         ephemeralTtlSeconds,
         expiresAt,
         viewOnce,
-        locationLat: locationData?.lat ?? null,
-        locationLng: locationData?.lng ?? null,
+        locationLat: blindedLocation?.lat ?? null,
+        locationLng: blindedLocation?.lng ?? null,
         locationLabel: locationData?.label ?? null,
         cardSnapshot: (cardSnapshot ?? undefined) as Prisma.InputJsonValue | undefined,
         attachments: dto.attachments?.length

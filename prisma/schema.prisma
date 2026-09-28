@@ -1790,6 +1790,26 @@ model Order {
   courierName    String?
   trackingNotes  String?
 
+  // TRX-009 (UI/UX audit 2026-09-28): alamat pengiriman untuk barang fisik.
+  // Additive-only, semua nullable. Snapshot saat order dibuat — riwayat order
+  // tidak berubah bila buku alamat diedit/dihapus. Kolom PII terenkripsi
+  // AES-GCM saat rest (pola sama seperti model Address).
+  shippingAddressId     String?
+  shippingRecipientName String? @db.Text
+  shippingPhone         String? @db.Text
+  shippingAddressLine   String? @db.Text
+  shippingCity          String? @db.Text
+  shippingProvince      String? @db.Text
+  shippingPostalCode    String? @db.Text
+
+  // Lokasi presisi buyer saat order dibuat (fraud checking di admin).
+  // Koordinat = PII sensitif -> ciphertext AES-GCM (jangan baca langsung;
+  // dekripsi via decryptPiiSafe). capturedAt metadata waktu, plaintext.
+  buyerLatitude           String?   @db.Text
+  buyerLongitude          String?   @db.Text
+  buyerLocationAccuracy   String?   @db.Text
+  buyerLocationCapturedAt DateTime?
+
   // Timestamps per state
   createdAt   DateTime  @default(now())
   confirmedAt DateTime?

@@ -18,9 +18,11 @@ import { CONFIRMATION_DEADLINE_DAYS, KYC_THRESHOLD, CONFIRMATION_DEADLINE_DAYS_M
 import { DEFAULT_RETURN_WINDOW_DAYS } from '../returns/returns.constants';
 import { escapeLikePattern } from '../../common/utils/search.util';
 import { withSpan } from '../../common/tracing/tracing';
+import { decryptPiiSafe, encryptPii } from '../../common/utils/pii.util';
 // Batch 43 BE-CHAT: pesan sistem "resi diperbarui" di room order (best-effort,
 // via registry statis — tanpa circular DI ke modul chat).
 import { ChatOrderHooks } from '../chat/chat-order-hooks';
+import type { BuyerLocationDto } from './dto/create-order.dto';
 
 const ORDER_COUNTERPART_COOLDOWN_SECONDS = 60;
 
@@ -238,6 +240,10 @@ export class OrdersService {
       voucherCode?: string;
       attachments?: string[];
       inquiryRoomId?: string;
+      // TRX-009 (UI/UX audit 2026-09-28): ID alamat pengiriman dari buku alamat.
+      shippingAddressId?: string;
+      // Lokasi presisi buyer saat order dibuat (kontrak FE) — opsional, terenkripsi.
+      buyerLocation?: BuyerLocationDto | null;
     },
     ctx?: ActionLocationContext,
   ): Promise<{
@@ -289,6 +295,10 @@ export class OrdersService {
       voucherCode?: string;
       attachments?: string[];
       inquiryRoomId?: string;
+      // TRX-009 (UI/UX audit 2026-09-28): ID alamat pengiriman dari buku alamat.
+      shippingAddressId?: string;
+      // Lokasi presisi buyer saat order dibuat (kontrak FE) — opsional, terenkripsi.
+      buyerLocation?: BuyerLocationDto | null;
     },
   ): Promise<{
     orderId: string;
@@ -442,9 +452,86 @@ export class OrdersService {
       validatedInquiryRoomId = inquiryRoom.id;
     }
 
+    // TRX-009 (UI/UX audit 2026-09-28): alamat pengiriman WAJIB untuk barang
+    // fisik — fail closed: tolak pembuatan order tanpa alamat. Alamat harus
+    // milik pembuat order (buku alamat sendiri, belum dihapus). Snapshot
+    // kolom terenkripsi APA ADANYA (ciphertext AES-GCM) — riwayat order tidak
+    // berubah bila buku alamat diedit/dihapus.
+    let shippingSnapshot: {
+      addressId: string;
+      recipientName: string;
+      phone: string;
+      addressLine: string;
+      city: string;
+      province: string | null;
+      postalCode: string;
+    } | null = null;
+    if (dto.orderType === OrderType.PHYSICAL_GOODS) {
+      const shippingAddressId =
+        typeof dto.shippingAddressId === 'string' ? dto.shippingAddressId.trim() : '';
+      if (!shippingAddressId) {
+        throw new BadRequestException({
+          code: ErrorCodes.SHIPPING_ADDRESS_REQUIRED,
+          message:
+            'Order barang fisik wajib menyertakan alamat pengiriman (shippingAddressId dari buku alamat).',
+        });
+      }
+      const address = await this.prisma.address.findFirst({
+        where: { id: shippingAddressId, userId, deletedAt: null },
+      });
+      if (!address) {
+        throw new BadRequestException({
+          code: ErrorCodes.SHIPPING_ADDRESS_REQUIRED,
+          message: 'Alamat pengiriman tidak ditemukan di buku alamat Anda.',
+        });
+      }
+      shippingSnapshot = {
+        addressId: address.id,
+        recipientName: address.recipientName,
+        phone: address.phone,
+        addressLine: address.addressLine,
+        city: address.city,
+        province: address.province,
+        postalCode: address.postalCode,
+      };
+    }
+
+    // Lokasi presisi buyer saat order dibuat (kontrak FE: dto.buyerLocation).
+    // Snapshot terenkripsi AES-GCM mengikuti standar PII codebase (model Address).
+    // BEST-EFFORT: kegagalan apapun di sini TIDAK boleh menggagalkan pembuatan order.
+    let buyerLocEncrypted: { lat: string; lng: string; acc: string | null; capturedAt: Date | null } | null = null;
+    const rawBuyerLoc = dto.buyerLocation;
+    if (
+      rawBuyerLoc
+      && Number.isFinite(rawBuyerLoc.latitude) && Number.isFinite(rawBuyerLoc.longitude)
+      && rawBuyerLoc.latitude >= -90 && rawBuyerLoc.latitude <= 90
+      && rawBuyerLoc.longitude >= -180 && rawBuyerLoc.longitude <= 180
+    ) {
+      try {
+        const [encLat, encLng] = await Promise.all([
+          encryptPii(String(rawBuyerLoc.latitude)),
+          encryptPii(String(rawBuyerLoc.longitude)),
+        ]);
+        const encAcc =
+          rawBuyerLoc.accuracy !== undefined && rawBuyerLoc.accuracy !== null && Number.isFinite(rawBuyerLoc.accuracy)
+            ? await encryptPii(String(rawBuyerLoc.accuracy))
+            : null;
+        let capturedAt: Date | null = null;
+        if (typeof rawBuyerLoc.capturedAt === 'string' && rawBuyerLoc.capturedAt.trim() !== '') {
+          const parsed = new Date(rawBuyerLoc.capturedAt.trim());
+          if (!Number.isNaN(parsed.getTime())) capturedAt = parsed;
+        }
+        buyerLocEncrypted = { lat: encLat, lng: encLng, acc: encAcc, capturedAt };
+      } catch (err) {
+        this.logger.warn(
+          `[ORDER-LOCATION] gagal enkripsi lokasi buyer, order tetap dibuat: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        buyerLocEncrypted = null;
+      }
+    }
+
     const cooldownKey = `order_counterpart_cooldown:${[userId, counterpart.id].sort().join(':')}`;
-    const cooldownAcquired = await this.redis.setNx(cooldownKey, '1', ORDER_COUNTERPART_COOLDOWN_SECONDS);
-    if (!cooldownAcquired) {
+    const cooldownAcquired = await this.redis.setNx(cooldownKey, '1', ORDER_COUNTERPART_COOLDOWN_SECONDS);    if (!cooldownAcquired) {
       throw new BadRequestException({
         code: ErrorCodes.ORDER_COUNTERPART_COOLDOWN,
         message: 'Please wait before creating another order with the same counterpart',
@@ -637,6 +724,19 @@ export class OrdersService {
               createdByBuyer: dto.role === 'BUYER',
               attachments: sanitizedAttachments,
               sourceInquiryRoomId: validatedInquiryRoomId,
+              // TRX-009: snapshot alamat pengiriman (hanya untuk barang fisik).
+              shippingAddressId: shippingSnapshot?.addressId ?? null,
+              shippingRecipientName: shippingSnapshot?.recipientName ?? null,
+              shippingPhone: shippingSnapshot?.phone ?? null,
+              shippingAddressLine: shippingSnapshot?.addressLine ?? null,
+              shippingCity: shippingSnapshot?.city ?? null,
+              shippingProvince: shippingSnapshot?.province ?? null,
+              shippingPostalCode: shippingSnapshot?.postalCode ?? null,
+              // Lokasi presisi buyer — snapshot terenkripsi (null bila tidak diberikan).
+              buyerLatitude: buyerLocEncrypted?.lat ?? null,
+              buyerLongitude: buyerLocEncrypted?.lng ?? null,
+              buyerLocationAccuracy: buyerLocEncrypted?.acc ?? null,
+              buyerLocationCapturedAt: buyerLocEncrypted?.capturedAt ?? null,
             },
           });
 
@@ -968,6 +1068,23 @@ export class OrdersService {
     // availableActions (hindari query policy ganda).
     const returnWindowUntil = await this.getReturnWindowUntil(order);
 
+    // TRX-009 (UI/UX audit 2026-09-28): alamat pengiriman — snapshot
+    // terenkripsi (AES-GCM) saat order dibuat, didekripsi untuk buyer/seller
+    // (keduanya pihak order). Null bila order non-fisik / dibuat sebelum
+    // fitur ini.
+    const shippingAddressSnapshotId = (order as any).shippingAddressId as string | null;
+    const shippingAddress = shippingAddressSnapshotId
+      ? {
+          id: shippingAddressSnapshotId,
+          recipientName: await decryptPiiSafe((order as any).shippingRecipientName),
+          phone: await decryptPiiSafe((order as any).shippingPhone),
+          addressLine: await decryptPiiSafe((order as any).shippingAddressLine),
+          city: await decryptPiiSafe((order as any).shippingCity),
+          province: await decryptPiiSafe((order as any).shippingProvince),
+          postalCode: await decryptPiiSafe((order as any).shippingPostalCode),
+        }
+      : null;
+
     return {
       order: {
         orderId: order.orderId, title: order.title, description: order.description,
@@ -1000,6 +1117,9 @@ export class OrdersService {
         processingDeadlineAt: order.processingDeadlineAt ?? null,
         trackingNumber: order.trackingNumber, courierName: order.courierName,
         trackingNotes: order.trackingNotes ?? null,
+        // TRX-009: alamat pengiriman snapshot (didekripsi) — penjual butuh ini
+        // untuk tahu kirim ke mana; null untuk order non-fisik.
+        shippingAddress,
         attachments: (order as any).attachments ?? [],
         sourceInquiryRoomId: (order as any).sourceInquiryRoomId ?? null,
         sourceInquiryRoom: inquiryContext,

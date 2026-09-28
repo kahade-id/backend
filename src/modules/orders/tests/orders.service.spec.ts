@@ -11,6 +11,13 @@ import { NotificationQueueService } from '../../queue/notification-queue.service
 import { SubscriptionsService } from '../../subscriptions/subscriptions.service';
 import { KycStatus, FeeResponsibility, OrderStatus, OrderType } from '@prisma/client';
 
+// TRX-009: pii.util di-mock agar decryptPiiSafe deterministik (ciphertext
+// "enc(x)" -> "enc(x)" apa adanya; pola sama seperti admin-users.service.spec).
+jest.mock('../../../common/utils/pii.util', () => ({
+  decryptPiiSafe: jest.fn(async (value: string | null) => value ?? null),
+  encryptPii: jest.fn(async (value: string) => value),
+}));
+
 const mockUser = {
   id: 'user-db-1',
   userId: 'usr_abc123',
@@ -83,6 +90,22 @@ const mockOrder = {
   voucher: null,
 };
 
+// TRX-009: alamat milik user-db-1 di buku alamat (kolom terenkripsi di DB).
+const mockAddress = {
+  id: 'addr-1',
+  userId: 'user-db-1',
+  label: 'RUMAH',
+  customLabel: null,
+  recipientName: 'enc(recipient)',
+  phone: 'enc(phone)',
+  addressLine: 'enc(line)',
+  city: 'enc(city)',
+  province: 'enc(province)',
+  postalCode: 'enc(postal)',
+  isDefault: true,
+  deletedAt: null,
+};
+
 const mockFeeCalculation = {
   feeRate: 1.5,
   feeAmount: BigInt(150_000),
@@ -107,6 +130,8 @@ const mockPrisma = {
     aggregate: jest.fn().mockResolvedValue({ _count: 0, _sum: { buyerPayAmount: null, sellerReceiveAmount: null } }),
   },
   blockList: { findFirst: jest.fn() },
+  // TRX-009: buku alamat untuk validasi alamat pengiriman order fisik.
+  address: { findFirst: jest.fn() },
   voucher: { findFirst: jest.fn(), findUnique: jest.fn(), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
   voucherUsage: { count: jest.fn(), create: jest.fn() },
   chatRoom: { create: jest.fn() },
@@ -229,6 +254,8 @@ describe('OrdersService', () => {
     mockPrisma.campaign.updateMany.mockResolvedValue({ count: 1 });
     mockPrisma.voucher.updateMany.mockResolvedValue({ count: 1 });
     mockPrisma.$queryRaw.mockResolvedValue([]);
+    // TRX-009: default — alamat milik user-db-1 ditemukan di buku alamat.
+    mockPrisma.address.findFirst.mockResolvedValue(mockAddress);
     mockPrisma.$transaction.mockImplementation(async (fn: unknown) => typeof fn === 'function' ? (fn as (tx: typeof mockPrisma) => Promise<unknown>)(mockPrisma) : undefined);
     mockRedis.del.mockResolvedValue(1);
     mockRedis.set.mockResolvedValue('OK');
@@ -256,6 +283,8 @@ describe('OrdersService', () => {
       orderValue: 100_000,
       deliveryDeadlineDays: 7,
       feeResponsibility: FeeResponsibility.BUYER,
+      // TRX-009: order fisik wajib menyertakan alamat pengiriman.
+      shippingAddressId: 'addr-1',
     };
 
     it('should throw NotFoundException when the requesting user does not exist', async () => {
@@ -548,6 +577,93 @@ describe('OrdersService', () => {
       );
     });
 
+    // ─── TRX-009: alamat pengiriman wajib untuk barang fisik ──────────────
+
+    it('TRX-009: rejects PHYSICAL_GOODS order without shippingAddressId (fail closed)', async () => {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      const { shippingAddressId: _drop, ...noAddressDto } = dto;
+
+      await expect(service.createOrder('user-db-1', noAddressDto)).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'SHIPPING_ADDRESS_REQUIRED' }),
+      });
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('TRX-009: rejects PHYSICAL_GOODS order when the address is not owned by the creator', async () => {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      mockPrisma.address.findFirst.mockResolvedValue(null);
+
+      await expect(service.createOrder('user-db-1', dto)).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'SHIPPING_ADDRESS_REQUIRED' }),
+      });
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('TRX-009: snapshots the encrypted address fields onto the order', async () => {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
+        mockPrisma.order.create.mockResolvedValue(mockOrder);
+        mockPrisma.chatRoom.create.mockResolvedValue({ id: 'chat-1' });
+        return fn(mockPrisma);
+      });
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+
+      await service.createOrder('user-db-1', dto);
+
+      expect(mockPrisma.address.findFirst).toHaveBeenCalledWith({
+        where: { id: 'addr-1', userId: 'user-db-1', deletedAt: null },
+      });
+      const createCall = mockPrisma.order.create.mock.calls[0][0].data;
+      // Snapshot = ciphertext apa adanya (pola enkripsi AES-GCM model Address).
+      expect(createCall.shippingAddressId).toBe('addr-1');
+      expect(createCall.shippingRecipientName).toBe('enc(recipient)');
+      expect(createCall.shippingPhone).toBe('enc(phone)');
+      expect(createCall.shippingAddressLine).toBe('enc(line)');
+      expect(createCall.shippingCity).toBe('enc(city)');
+      expect(createCall.shippingProvince).toBe('enc(province)');
+      expect(createCall.shippingPostalCode).toBe('enc(postal)');
+    });
+
+    it('TRX-009: non-physical orders do not require a shipping address', async () => {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
+        mockPrisma.order.create.mockResolvedValue(mockOrder);
+        mockPrisma.chatRoom.create.mockResolvedValue({ id: 'chat-1' });
+        return fn(mockPrisma);
+      });
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+      const { shippingAddressId: _drop, ...serviceDto } = { ...dto, orderType: OrderType.SERVICE };
+
+      const result = await service.createOrder('user-db-1', serviceDto) as Record<string, unknown>;
+
+      expect(result).toHaveProperty('orderId');
+      expect(mockPrisma.address.findFirst).not.toHaveBeenCalled();
+      const createCall = mockPrisma.order.create.mock.calls[0][0].data;
+      expect(createCall.shippingAddressId).toBeNull();
+    });
+
     it('should allow a voucher with per-user limit when no locked usage row exists', async () => {
       const dtoWithVoucher = { ...dto, voucherCode: 'ONCEONLY' };
       mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
@@ -706,6 +822,40 @@ describe('OrdersService', () => {
       const result = await service.getOrderDetail('user-db-2', 'ORD-20260101-001') as Record<string, unknown>;
 
       expect(result).toHaveProperty('order');
+    });
+
+    it('TRX-009: exposes the decrypted shipping address snapshot to participants', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue({
+        ...mockOrder,
+        shippingAddressId: 'addr-1',
+        shippingRecipientName: 'enc(recipient)',
+        shippingPhone: 'enc(phone)',
+        shippingAddressLine: 'enc(line)',
+        shippingCity: 'enc(city)',
+        shippingProvince: 'enc(province)',
+        shippingPostalCode: 'enc(postal)',
+      });
+
+      const result = await service.getOrderDetail('user-db-2', 'ORD-20260101-001') as Record<string, unknown>;
+      const order = result.order as Record<string, unknown>;
+
+      expect(order.shippingAddress).toMatchObject({
+        id: 'addr-1',
+        recipientName: 'enc(recipient)',
+        phone: 'enc(phone)',
+        addressLine: 'enc(line)',
+        city: 'enc(city)',
+        province: 'enc(province)',
+        postalCode: 'enc(postal)',
+      });
+    });
+
+    it('TRX-009: shippingAddress is null for orders without a snapshot', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue(mockOrder);
+
+      const result = await service.getOrderDetail('user-db-1', 'ORD-20260101-001') as Record<string, unknown>;
+
+      expect((result.order as Record<string, unknown>).shippingAddress).toBeNull();
     });
   });
 
@@ -1233,6 +1383,8 @@ describe('OrdersService', () => {
       deliveryDeadlineDays: 7,
       feeResponsibility: FeeResponsibility.BUYER,
       voucherCode: 'SELLER10',
+      // TRX-009: order fisik wajib menyertakan alamat pengiriman.
+      shippingAddressId: 'addr-1',
     };
 
     const sellerVoucherRow = (sellerId: string | null) => ({

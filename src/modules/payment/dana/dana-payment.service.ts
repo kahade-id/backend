@@ -219,11 +219,13 @@ export class DanaPaymentService {
         order: {
           orderTitle: params.orderTitle ?? 'Kahade Payment',
           scenario: 'API',
-          ...(params.buyerExternalUserId
-            ? { buyer: { externalUserId: params.buyerExternalUserId } }
-            : {}),
+          // DANA menandai buyer sebagai Required — object kosong {} bila tidak ada.
+          buyer: params.buyerExternalUserId ? { externalUserId: params.buyerExternalUserId } : {},
         },
-        envInfo: { sourcePlatform: 'IPG', terminalType: 'SYSTEM' },
+        // Wajib menurut fixture resmi DANA — create order kena 4005401
+        // Invalid Field Format tanpa field-field ini (terbukti di E2E sandbox 2026-09-29).
+        mcc: '5732',
+        envInfo: { sourcePlatform: 'IPG', terminalType: 'SYSTEM', orderTerminalType: 'WEB' },
       },
     };
 

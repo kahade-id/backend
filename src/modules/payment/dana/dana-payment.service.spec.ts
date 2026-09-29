@@ -122,6 +122,41 @@ describe('dana-payment.service', () => {
       expect(sentBody.payOptionDetails[0].payMethod).toBe('BALANCE');
     });
 
+    it('additionalInfo selalu memuat field wajib DANA (buyer, mcc, orderTerminalType)', async () => {
+      // Tanpa ketiga field ini DANA mengembalikan 4005401 Invalid Field Format
+      // (terbukti di E2E sandbox 2026-09-29; buyer boleh object kosong).
+      mockedAxios.post.mockResolvedValueOnce({
+        data: { responseCode: '2005400', referenceNo: 'DANA-REF-4', additionalInfo: { paymentCode: 'X' } },
+      });
+      const svc = makeService();
+      await svc.createOrder({
+        kind: 'VA',
+        partnerReferenceNo: 'DANA-VA-002',
+        amountIdr: 15000,
+        bankCode: 'BRI',
+      });
+      const sentBody = JSON.parse(mockedAxios.post.mock.calls[0][1] as string);
+      expect(sentBody.additionalInfo.order.buyer).toEqual({});
+      expect(sentBody.additionalInfo.mcc).toBe('5732');
+      expect(sentBody.additionalInfo.envInfo.orderTerminalType).toBe('WEB');
+      expect(sentBody.additionalInfo.envInfo.sourcePlatform).toBe('IPG');
+    });
+
+    it('buyer diisi externalUserId bila diberikan', async () => {
+      mockedAxios.post.mockResolvedValueOnce({
+        data: { responseCode: '2005400', referenceNo: 'DANA-REF-5', additionalInfo: {} },
+      });
+      const svc = makeService();
+      await svc.createOrder({
+        kind: 'BALANCE',
+        partnerReferenceNo: 'DANA-B-2',
+        amountIdr: 20000,
+        buyerExternalUserId: 'USER-9',
+      });
+      const sentBody = JSON.parse(mockedAxios.post.mock.calls[0][1] as string);
+      expect(sentBody.additionalInfo.order.buyer).toEqual({ externalUserId: 'USER-9' });
+    });
+
     it('fail-closed bila kredensial belum dikonfigurasi', async () => {
       const svc = makeService({ 'dana.partnerId': '', 'dana.privateKey': '' });
       await expect(

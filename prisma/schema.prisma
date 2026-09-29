@@ -197,6 +197,7 @@ enum WalletTransactionStatus {
 enum PaymentProvider {
   MIDTRANS
   FLASH
+  DANA
 }
 
 enum PaymentPurpose {
@@ -1698,6 +1699,12 @@ model PaymentTransaction {
   // Flash Mobile (MNC) QRIS response
   flashTransactionId String?
   flashQrString      String? @db.Text
+
+  // DANA Enterprise (Gapura) — referensi order DANA.
+  // danaPartnerReferenceNo = partnerReferenceNo yang kita kirim saat Create Order
+  // (kunci idempotency DANA: merchantId + partnerReferenceNo).
+  danaPartnerReferenceNo String? @unique
+  danaReferenceNo        String? // referenceNo dari DANA (sisi DANA)
 
   // Webhook data
   webhookReceivedAt DateTime?

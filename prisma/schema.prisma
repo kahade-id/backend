@@ -1801,6 +1801,7 @@ enum EscrowDisbursementStatus {
   PROCESSING // transfer terkirim, menunggu konfirmasi final
   SUCCESS
   FAILED // gagal provider — bisa retry (idempoten via idempotencyKey)
+  CANCELLED // dibatalkan (mis. legacy payout yang debitnya dikompensasi)
 }
 
 // ============================================================

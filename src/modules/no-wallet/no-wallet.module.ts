@@ -7,6 +7,8 @@ import { QueueModule } from '../queue/queue.module';
 import { DanaDirectPaymentService } from './dana-direct-payment.service';
 import { DanaDirectRefundService } from './dana-direct-refund.service';
 import { EscrowDisbursementService } from './escrow-disbursement.service';
+import { LegacyPayoutService } from './legacy-payout.service';
+import { LegacyPayoutController } from './legacy-payout.controller';
 
 /**
  * Misi "Mode Tanpa Wallet Internal (BI-safe)".
@@ -17,7 +19,9 @@ import { EscrowDisbursementService } from './escrow-disbursement.service';
  * - DanaDirectRefundService: refund ke metode bayar asal via DANA Refund API.
  * - EscrowDisbursementService: pencairan escrow ke rekening bank seller
  *   (DANA transfer, idempoten; HELD_NO_BANK bila seller belum punya rekening).
- * - (menyusul) LegacyPayoutService.
+ * - LegacyPayoutService: payout satu arah saldo wallet lama → rekening bank
+ *   (tetap hidup saat WALLET_ENABLED=false; tanpa top-up/transfer masuk).
+ * - (menyusul) —
  *
  * forwardRef WalletModule: dipakai untuk WalletTxSerialService
  * (serial id pembayaran) — WalletModule TIDAK mengimpor modul ini
@@ -25,7 +29,18 @@ import { EscrowDisbursementService } from './escrow-disbursement.service';
  */
 @Module({
   imports: [ConfigModule, WalletModeModule, DanaModule, QueueModule, forwardRef(() => WalletModule)],
-  providers: [DanaDirectPaymentService, DanaDirectRefundService, EscrowDisbursementService],
-  exports: [DanaDirectPaymentService, DanaDirectRefundService, EscrowDisbursementService],
+  controllers: [LegacyPayoutController],
+  providers: [
+    DanaDirectPaymentService,
+    DanaDirectRefundService,
+    EscrowDisbursementService,
+    LegacyPayoutService,
+  ],
+  exports: [
+    DanaDirectPaymentService,
+    DanaDirectRefundService,
+    EscrowDisbursementService,
+    LegacyPayoutService,
+  ],
 })
 export class NoWalletModule {}

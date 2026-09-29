@@ -1,8 +1,9 @@
-import { Injectable, BadRequestException, ConflictException, Logger } from '@nestjs/common';
+import { Injectable, BadRequestException, ConflictException, ForbiddenException, Logger } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { WalletService } from '../wallet/wallet.service';
+import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { ReferralService } from '../referral/referral.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { MembershipRankService } from './membership-rank.service';
@@ -10,8 +11,11 @@ import { OrderStatus, OrderCancelReason, ActorType, WalletTransactionType, Walle
 import { addDays, resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
 import { rollbackOrderVoucherUsage } from '../../common/utils/voucher-rollback.util';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
-import { creditCashbackIfEligible } from '../../common/utils/cashback-credit.util';
+import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback, DanaCashbackIntent } from '../../common/utils/cashback-credit.util';
+import { EscrowDisbursementService } from '../no-wallet/escrow-disbursement.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
+import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
+import { MilestonesService } from '../milestones/milestones.service';
 import { FeeCalculatorService } from './fee-calculator.service';
 import { NotificationQueueService } from '../queue/notification-queue.service';
 import { OrderQrisPaymentService } from '../payment/order-qris-payment.service';
@@ -80,7 +84,11 @@ export class OrderStateService {
     private prisma: PrismaService,
     private redis: RedisService,
     private walletService: WalletService,
+    private walletMode: WalletModeService,
     private orderQrisPaymentService: OrderQrisPaymentService,
+    @Optional() private danaDirectRefundService: DanaDirectRefundService,
+    // M4 no-wallet: payout cashback via disbursement DANA bila wallet mati.
+    @Optional() private escrowDisbursementService: EscrowDisbursementService | null,
     private walletTxSerialService: WalletTxSerialService,
     private referralService: ReferralService,
     private feeCalculator: FeeCalculatorService,
@@ -91,6 +99,9 @@ export class OrderStateService {
     @Optional() private inventoryService?: InventoryService,
     // Lokasi presisi aksi sensitif — @Optional() mengikuti pola inventory di atas.
     @Optional() private actionLocationService?: ActionLocationService,
+    // M5 no-wallet: order bertahap DANA-direct di-cancel via refund parsial
+    // per tahap (MilestonesService), bukan refundOrderEscrow penuh.
+    @Optional() private milestonesService?: MilestonesService,
   ) {}
 
   private validateTransition(from: OrderStatus, to: OrderStatus): void {
@@ -177,6 +188,14 @@ export class OrderStateService {
   }
 
   async handlePayOrder(orderId: string, userId: string, pin?: string, ip?: string, ctx?: ActionLocationContext): Promise<PayOrderResult> {
+    // Misi BI-safe (defense in depth — guard juga ada di controller):
+    // bayar pakai saldo wallet dilarang saat wallet nonaktif.
+    if (!this.walletMode.isWalletEnabled()) {
+      throw new ForbiddenException({
+        code: 'WALLET_DISABLED',
+        message: 'Pembayaran via saldo wallet nonaktif — bayar escrow langsung via DANA (POST :orderId/pay-dana).',
+      });
+    }
     if (!pin) {
       throw new BadRequestException({
         code: ErrorCodes.UNAUTHORIZED,
@@ -580,6 +599,8 @@ export class OrderStateService {
     // SP-047: tandai bila referral reward dikreditkan agar cache leaderboard
     // diinvalidasi SETELAH tx commit (di luar retry loop).
     let referralRewardCredited = false;
+    // M4 no-wallet: intent payout cashback DANA (dieksekusi post-commit).
+    let danaCashback: { params: { orderDbId: string; orderPublicId: string; source: string }; intent: DanaCashbackIntent } | null = null;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -783,11 +804,18 @@ export class OrderStateService {
 
       // Batch 1-money (EO-005): kredit cashback via helper bersama idempoten.
       // Dijalankan setelah update escrow utama agar balanceBefore ledger konsisten.
-      await creditCashbackIfEligible(tx, nextCashbackTxSerial, {
-        orderDbId: order.id,
-        orderPublicId: order.orderId,
-        source: 'completeOrder',
-      });
+      // M4 no-wallet: wallet mati -> rencanakan payout DANA (dieksekusi post-commit).
+      if (this.walletMode.isWalletEnabled()) {
+        await creditCashbackIfEligible(tx, nextCashbackTxSerial, {
+          orderDbId: order.id,
+          orderPublicId: order.orderId,
+          source: 'completeOrder',
+        });
+      } else {
+        const params = { orderDbId: order.id, orderPublicId: order.orderId, source: 'completeOrder' };
+        const intent = await planDanaCashback(tx, params);
+        danaCashback = intent ? { params, intent } : null;
+      }
 
       // feeAmount = buyerPayAmount − sellerReceiveAmount.
       // The fee amount is removed from the buyer's escrow (already done above via
@@ -880,6 +908,17 @@ export class OrderStateService {
     // (900 dtk) harus diinvalidasi setelah commit.
     if (referralRewardCredited) {
       await this.referralService.invalidateLeaderboardCache();
+    }
+
+    // M4 no-wallet: eksekusi payout cashback DANA post-commit (idempoten,
+    // key CASHBACK:<orderDbId>). Scheduler retryDue() menangani PENDING/FAILED.
+    if (danaCashback && this.escrowDisbursementService) {
+      const { params, intent } = danaCashback;
+      const executor = this.escrowDisbursementService;
+      this.runPostCommitBestEffort(
+        () => { void executeDanaCashback(executor, params, intent); },
+        'cashback-dana',
+      );
     }
 
     // R2-B (audit): completeOrder consumes the Plus fee-savings quota (feeSavingsUsed)
@@ -1013,9 +1052,22 @@ export class OrderStateService {
       },
       select: { id: true },
     });
+    // M3 (no-wallet): order dibayar via DANA-direct (QRIS/VA/BALANCE). Refund
+    // TIDAK lewat wallet — ke metode bayar asal via DANA Refund API.
+    const preflightDanaPayment = await this.prisma.paymentTransaction.findFirst({
+      where: {
+        order: { orderId },
+        purpose: 'ORDER_ESCROW',
+        provider: 'DANA',
+        status: 'SUCCESS',
+        danaPayKind: { not: null },
+      },
+      select: { id: true },
+    });
+    const danaDirectMode = !this.walletMode.isWalletEnabled() && !!preflightDanaPayment;
     const preflightNeedsRefundSerial =
       (preflightOrder.status === OrderStatus.PROCESSING || preflightOrder.status === OrderStatus.IN_DELIVERY) &&
-      preflightOrder.buyerPayAmount > BigInt(0) && !preflightQrisPayment;
+      preflightOrder.buyerPayAmount > BigInt(0) && !preflightQrisPayment && !danaDirectMode;
     let refundTxSerial = preflightNeedsRefundSerial
       ? await this.getNextWalletTxSerial()
       : null;
@@ -1077,7 +1129,9 @@ export class OrderStateService {
       });
 
       const escrowStatuses: OrderStatus[] = [OrderStatus.PROCESSING, OrderStatus.IN_DELIVERY];
-      if (escrowStatuses.includes(order.status) && order.buyerPayAmount > BigInt(0)) {
+      // M3 (no-wallet): DANA-direct tidak punya escrow wallet — refund ke metode
+      // bayar asal ditangani post-commit via DanaDirectRefundService.
+      if (escrowStatuses.includes(order.status) && order.buyerPayAmount > BigInt(0) && !danaDirectMode) {
         const escrowLock = await tx.walletTransaction.findFirst({
           where: { orderId: order.id, type: WalletTransactionType.ORDER_LOCK, status: WalletTransactionStatus.SUCCESS },
           select: { amount: true },
@@ -1168,14 +1222,36 @@ export class OrderStateService {
       }
     }), 'ADMIN_CANCEL_ORDER_TX');
 
-    // Batch 1-money (WF-022): refund provider tetap best-effort di sini agar cancel admin
-    // tidak gagal karena provider. Retry ditangani cron refund-reconciliation
-    // (refund-reconciliation.service.ts): klaim yang gagal dilepas oleh requestRefund
-    // dan dicoba ulang tiap jam; klaim basi yang webhook-nya tak kunjung tiba
-    // direkonsiliasi ke status provider.
-    await this.orderQrisPaymentService.requestRefundForOrder(orderId, `Admin cancelled order: ${reason}`).catch((error: unknown) => {
-      this.logger.error(`ADMIN_CANCEL_QRIS_REFUND_REQUEST_FAILED orderId=${orderId}: ${error instanceof Error ? error.message : String(error)}`);
-    });
+    if (danaDirectMode && this.danaDirectRefundService) {
+      // M3 (no-wallet): refund ke metode bayar asal via DANA Refund API —
+      // best-effort (idempoten per ORDER:<orderDbId>; attempt FAILED dicoba
+      // ulang cron dana-refund-retry tiap jam).
+      const refundService = this.danaDirectRefundService;
+      this.runPostCommitBestEffort(async () => {
+        const cancelled = await this.prisma.order.findFirst({ where: { orderId }, select: { id: true } });
+        if (!cancelled) return;
+        // M5: order bertahap → refund parsial DANA per tahap yang belum cair.
+        // Tahap yang sudah RELEASED tidak disentuh (refund penuh = over-refund).
+        if (this.milestonesService) {
+          const routed = await this.milestonesService.adminCancelMilestonesNoWallet(
+            cancelled.id,
+            adminId,
+            reason,
+          );
+          if (routed.routed) return;
+        }
+        await refundService.refundOrderEscrow(cancelled.id, `Admin cancelled order: ${reason}`);
+      }, 'ADMIN_CANCEL_ORDER_DANA_REFUND');
+    } else {
+      // Batch 1-money (WF-022): refund provider tetap best-effort di sini agar cancel admin
+      // tidak gagal karena provider. Retry ditangani cron refund-reconciliation
+      // (refund-reconciliation.service.ts): klaim yang gagal dilepas oleh requestRefund
+      // dan dicoba ulang tiap jam; klaim basi yang webhook-nya tak kunjung tiba
+      // direkonsiliasi ke status provider.
+      await this.orderQrisPaymentService.requestRefundForOrder(orderId, `Admin cancelled order: ${reason}`).catch((error: unknown) => {
+        this.logger.error(`ADMIN_CANCEL_QRIS_REFUND_REQUEST_FAILED orderId=${orderId}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
 
     this.runRealtimeBestEffort(() => this.realtime.emitToOrder(orderId, 'order.status_changed', { orderId, status: 'CANCELLED' }), 'ADMIN_CANCEL_ORDER_STATUS');
 
@@ -1183,8 +1259,17 @@ export class OrderStateService {
       const adminOrder = await this.prisma.order.findUnique({ where: { orderId }, select: { buyerId: true, sellerId: true, title: true } });
       if (!adminOrder) return;
       for (const recipientId of [adminOrder.buyerId, adminOrder.sellerId]) {
-        await this.notificationQueue.enqueue({ userId: recipientId, type: NotificationType.ORDER_CANCELLED, title: 'Order Cancelled by Admin', body: `Order "${adminOrder.title}" has been cancelled by an administrator.${reason ? ` Reason: ${reason}` : ''}`, pushData: { type: 'ORDER_CANCELLED', orderId } });
+        // M3 (no-wallet): jangan klaim "kembali ke wallet" — refund ke metode
+        // pembayaran asal (DANA Refund API).
+        const refundNote = danaDirectMode && recipientId === adminOrder.buyerId
+          ? ' Dana akan dikembalikan ke metode pembayaran asal Anda.'
+          : '';
+        await this.notificationQueue.enqueue({ userId: recipientId, type: NotificationType.ORDER_CANCELLED, title: 'Order Cancelled by Admin', body: `Order "${adminOrder.title}" has been cancelled by an administrator.${reason ? ` Reason: ${reason}` : ''}${refundNote}`, pushData: { type: 'ORDER_CANCELLED', orderId } });
       }
+      if (danaDirectMode) {
+        // Notifikasi WALLET_REFUND_RECEIVED tidak berlaku — refund ke metode
+        // bayar asal. Webhook DANA/refund-attempt mencatat status final.
+      } else {
       // Buyer wajib tahu dananya kembali ke wallet — tanpa ini user panik
       // mengira uang hangus.
       await this.notificationQueue.enqueue({
@@ -1194,6 +1279,7 @@ export class OrderStateService {
         body: `Refund for order "${adminOrder.title}" has been credited to your wallet.`,
         pushData: { type: 'WALLET_REFUND_RECEIVED', orderId },
       });
+      }
     }, 'ADMIN_CANCEL_ORDER_NOTIFICATION');
   }
 

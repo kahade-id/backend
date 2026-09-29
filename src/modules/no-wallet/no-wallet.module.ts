@@ -1,0 +1,50 @@
+import { Module, forwardRef } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
+import { DanaModule } from '../payment/dana/dana.module';
+import { WalletModeModule } from '../wallet-mode/wallet-mode.module';
+import { WalletModule } from '../wallet/wallet.module';
+import { QueueModule } from '../queue/queue.module';
+import { DanaDirectPaymentService } from './dana-direct-payment.service';
+import { DanaDirectRefundService } from './dana-direct-refund.service';
+import { EscrowDisbursementService } from './escrow-disbursement.service';
+import { LegacyPayoutService } from './legacy-payout.service';
+import { DisputeDanaSettlementService } from './dispute-dana-settlement.service';
+import { LegacyPayoutController } from './legacy-payout.controller';
+
+/**
+ * Misi "Mode Tanpa Wallet Internal (BI-safe)".
+ *
+ * Modul untuk alur uang yang TIDAK menyentuh wallet internal:
+ * - DanaDirectPaymentService: checkout escrow langsung via DANA
+ *   (QRIS / VA / DANA Balance — pilihan buyer, bukan hardcode).
+ * - DanaDirectRefundService: refund ke metode bayar asal via DANA Refund API.
+ * - EscrowDisbursementService: pencairan escrow ke rekening bank seller
+ *   (DANA transfer, idempoten; HELD_NO_BANK bila seller belum punya rekening).
+ * - LegacyPayoutService: payout satu arah saldo wallet lama → rekening bank
+ *   (tetap hidup saat WALLET_ENABLED=false; tanpa top-up/transfer masuk).
+ * - DisputeDanaSettlementService: eksekusi finansial putusan sengketa
+ *   tanpa wallet (refund DANA ke buyer + disbursement ke bank seller).
+ *
+ * forwardRef WalletModule: dipakai untuk WalletTxSerialService
+ * (serial id pembayaran) — WalletModule TIDAK mengimpor modul ini
+ * (guard kill-switch tinggal di WalletModeModule yang bebas siklus).
+ */
+@Module({
+  imports: [ConfigModule, WalletModeModule, DanaModule, QueueModule, forwardRef(() => WalletModule)],
+  controllers: [LegacyPayoutController],
+  providers: [
+    DanaDirectPaymentService,
+    DanaDirectRefundService,
+    EscrowDisbursementService,
+    LegacyPayoutService,
+    DisputeDanaSettlementService,
+  ],
+  exports: [
+    DanaDirectPaymentService,
+    DanaDirectRefundService,
+    EscrowDisbursementService,
+    LegacyPayoutService,
+    DisputeDanaSettlementService,
+  ],
+})
+export class NoWalletModule {}

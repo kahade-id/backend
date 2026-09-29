@@ -8,9 +8,11 @@ import { MilestonesService } from './milestones.service';
 // INTEGRATION-FIX: WalletTxSerialService dipakai dari singleton WalletModule
 // (di-export), bukan didaftarkan ulang — satu instance untuk seluruh aplikasi.
 import { WalletModule } from '../wallet/wallet.module';
+import { WalletModeModule } from '../wallet-mode/wallet-mode.module';
+import { NoWalletModule } from '../no-wallet/no-wallet.module';
 
 @Module({
-  imports: [WalletModule],
+  imports: [WalletModule, WalletModeModule, NoWalletModule],
   controllers: [MilestonesController],
   providers: [MilestonesService],
   exports: [MilestonesService],

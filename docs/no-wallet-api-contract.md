@@ -1,0 +1,197 @@
+# Kontrak API — Mode Tanpa Wallet Internal (BI-safe)
+
+> Branch: `arsitektur/tanpa-wallet`. Dokumen kanonis untuk tim frontend.
+> Semua endpoint di bawah memakai prefix `/v1`.
+
+## Prinsip
+
+- `GET /v1/public/wallet-status` → `{ walletEnabled: boolean }` (tanpa auth).
+  - `false` (default, fail-closed): SEMUA alur uang via DANA langsung.
+    Wallet internal mati: tidak ada top-up, tidak ada debit/kredit wallet.
+  - `true`: perilaku lama (wallet) — hanya bila BI mengizinkan.
+- Aliran uang mode BI-safe: **buyer → DANA → escrow → rekening bank seller**.
+  Escrow "pot"-nya adalah `PaymentTransaction` (DANA, SUCCESS); pencairan via
+  DANA Disbursement ke rekening bank seller yang **terverifikasi**.
+- Seller WAJIB punya rekening bank terverifikasi (bank inquiry + name-match)
+  sebelum menerima payout APAPUN (escrow release, milestone, cashback,
+  referral). Tanpa itu → `HELD_NO_BANK` (fail-closed, dana tidak hangus,
+  seller dinotifikasi).
+- Semua refund → **DANA Refund API ke metode bayar asal** (penuh & parsial),
+  idempoten via `idempotencyKey` (satu refund per key; DANA idempoten per
+  `partnerRefundNo`).
+- Semua payout/disbursement → idempoten via `idempotencyKey` stabil
+  (`ORDER:<id>`, `MILESTONE:<id>`, `CASHBACK:<id>`, `REFERRAL:<id>`,
+  `DISPUTE:<id>:BUYER|SELLER`).
+
+## Endpoint kanonis
+
+### 1. `GET /v1/public/wallet-status` (tanpa auth)
+
+Response:
+```json
+{ "walletEnabled": false }
+```
+
+### 2. `GET /v1/orders/:id/payment-methods` (auth: buyer order itu)
+
+Daftar metode bayar DANA yang didukung — **frontend render apa adanya,
+jangan hardcode QRIS saja**.
+
+Response:
+```json
+{
+  "walletEnabled": false,
+  "methods": [
+    { "kind": "QRIS", "label": "QRIS", "requiresBankCode": false },
+    { "kind": "VA", "label": "Virtual Account", "requiresBankCode": true,
+      "banks": ["BCA", "BNI", "BRI", "MANDIRI", "CIMB", "PERMATA"] },
+    { "kind": "BALANCE", "label": "Saldo DANA", "requiresBankCode": false }
+  ]
+}
+```
+
+### 3. `POST /v1/orders/:id/payments` (auth: buyer, Idempotency-Key didukung)
+
+Buat pembayaran DANA untuk order. Idempoten per order: charge PENDING yang
+masih berlaku dikembalikan ulang (tidak ada charge ganda).
+
+Request:
+```json
+{ "payKind": "QRIS" }
+{ "payKind": "VA", "bankCode": "BCA" }
+{ "payKind": "BALANCE" }
+```
+
+Response (200):
+```json
+{
+  "paymentTxId": "PAY-...",
+  "orderId": "ORD-...",
+  "status": "PENDING",
+  "payKind": "QRIS",
+  "escrowAmount": 150000,
+  "providerFee": 1050,
+  "grossAmount": 151050,
+  "paymentCode": null,
+  "qrString": "000201010212...",
+  "webRedirectUrl": null,
+  "expiryTime": "2026-09-29T15:30:00.000Z"
+}
+```
+- `payKind=VA` → `paymentCode` = kode VA bank.
+- `payKind=BALANCE` → `webRedirectUrl` = URL otorisasi DANA.
+- Webhook DANA finish-notify → settlement: order → PROCESSING, escrow
+  didanai TANPA lewat wallet. Frontend poll
+  `GET /v1/orders/:id/dana-payment-status` atau `:id/status`.
+
+Error codes: `DANA_VA_BANK_REQUIRED`, `ORDER_NOT_FOUND`,
+`NOT_ORDER_PARTICIPANT`, `INVALID_ORDER_STATUS`, `ORDER_PAYMENT_EXPIRED`,
+`DANA_NOT_CONFIGURED`, `DANA_API_ERROR`.
+
+### 4. `POST /v1/legacy-payout` (auth + PIN wallet, Idempotency-Key)
+
+Payout SATU ARAH saldo wallet lama → rekening bank user (program transisi;
+bukan bagian escrow). PIN wajib, idempoten per `idempotencyKey`.
+
+Request: `{ "amountIdr": 50000, "pin": "123456", "idempotencyKey": "uuid" }`
+Response: `{ "payoutId": "...", "status": "PENDING|SUCCESS|HELD_NO_BANK", ... }`
+
+### 5. Subscription Kahade+ (tanpa wallet)
+
+- `POST /v1/subscriptions/subscribe-dana` — body:
+  `{ plan: "MONTHLY"|"YEARLY", payKind: "QRIS"|"VA"|"BALANCE", bankCode?, promoCode? }`
+  → subscription PENDING + data checkout DANA (`qrString` / `paymentCode` /
+  `webRedirectUrl` + `expiredAt`). Webhook DANA finish-notify → ACTIVE.
+  Gagal bayar → subscription tetap PENDING/EXPIRED (fail-closed, tidak aktif
+  setengah jalan). Kode promo gratis / diskon 100% → tetap tanpa bayar
+  (tanpa PIN, tanpa DANA). Idempoten via `Idempotency-Key` + guard PENDING.
+- `GET /v1/subscriptions/dana-status/:id` — polling status (PENDING/ACTIVE)
+  + sinkronisasi ringan ke DANA.
+- `POST /v1/subscriptions/renew-dana` — body: `{ payKind, bankCode? }` →
+  payment DANA renewal; periode diperpanjang webhook setelah bayar sukses.
+- `POST /v1/subscriptions/subscribe-qris` (legacy Flash): saat wallet
+  nonaktif otomatis didelegasikan ke DANA QRIS (tanpa PIN — PIN adalah
+  konsep wallet).
+- `POST /v1/subscriptions/subscribe` & `POST /v1/subscriptions/renew`
+  (debit wallet): DITOLAK saat wallet nonaktif
+  (`WALLET_DISABLED_USE_DANA`).
+- Refund: admin force-cancel → payment DANA SUCCESS di-refund ke metode
+  bayar asal via DANA Refund API (idempoten `ADMIN_SUB_CANCEL:<subId>`).
+
+### 6. Refund & payout lain (tanpa wallet)
+
+| Kejadian | Tujuan dana |
+|---|---|
+| Cancel / auto-cancel 2 hari | DANA Refund → metode bayar asal (penuh) |
+| Dispute buyer menang / split | DANA Refund → buyer (porsi buyer); DANA Disbursement → rekening bank seller (porsi seller) |
+| Retur disetujui | DANA Refund → metode bayar asal (penuh/parsial) |
+| Milestone release | DANA Disbursement → rekening bank seller (per tahap) |
+| Milestone dibatalkan | DANA Refund → metode bayar asal (parsial per tahap) |
+| Cashback / referral | DANA Disbursement → rekening bank terverifikasi; belum ada rekening → PENDING fail-closed (tidak hangus, tidak ke wallet) |
+
+Auto-refund patungan/jastip: sweep Bull tiap 5 menit
+(`commerce-refund`) mengeksekusi refund DANA-direct untuk peserta
+`REFUND_REQUIRED` — konsumen nyata, idempoten.
+
+## Catatan implementasi M3 (2026-09-29)
+
+- `OrderStateService.adminCancelOrder`: bila `WALLET_ENABLED=false` dan ada
+  payment DANA-direct SUCCESS untuk order → lewati seluruh refund escrow
+  wallet, refund ke metode bayar asal via `DanaDirectRefundService.refundOrderEscrow`
+  (idempoten `ORDER:<orderDbId>`, best-effort post-commit). Copy notifikasi
+  buyer menyebut "metode pembayaran asal", bukan wallet. Mencakup auto-cancel
+  2 hari (`UnshippedOrderCancelService`) dan refund patungan/jastip
+  (`CommerceRefundService`) — keduanya mendelegasikan ke `adminCancelOrder`.
+- `AdminDisputesService.resolveDispute`: cabang no-wallet untuk order DANA-direct
+  — state DB sama (RESOLVED, DisputeDecision, DP-014, history, voucher apology)
+  minus wallet; eksekusi finansial post-commit via `DisputeDanaSettlementService`:
+  porsi buyer → DANA Refund (`DISPUTE:<disputeId>:BUYER`), porsi seller →
+  disbursement scope `DISPUTE_RELEASE` (`DISPUTE:<disputeId>:SELLER`).
+  Kebijakan fee tidak berubah (platform fee tertahan di merchant DANA).
+- `MutualResolutionService.respond` (ACCEPT): cabang no-wallet dengan pola sama.
+- `ReturnsService.executeRefundForReturn`: cabang no-wallet — refund DANA
+  full/parsial sesuai approval (`RETURN:<returnDbId>`). PERHATIAN KEPUTUSAN
+  PRODUK/FINANCE: refund provider membayar dari kas merchant DANA platform
+  (tanpa clawback dari seller), sedangkan jalur wallet mendebit wallet seller.
+  Perlu konfirmasi sebelum go-live.
+- Fail-closed pasca-completion: sengketa/retur setelah dana cair ke seller
+  melempar `DISPUTE_POST_COMPLETION_MANUAL_REVIEW` / tidak dieksekusi otomatis —
+  butuh penanganan manual/keputusan operasional.
+- Retry: cron `dana-refund-retry` tiap jam (`50 * * * *`) memanggil
+  `DanaDirectRefundService.retryFailedRefunds()` (attempt FAILED) dan
+  `EscrowDisbursementService.retryDue()` (disbursement PENDING/FAILED) —
+  keduanya idempoten, di bawah redis lock.
+
+## Catatan implementasi M4 (2026-09-29)
+
+- Referral: `ReferralService.creditReward` — wallet mati → reward diklaim
+  (baris `referralReward` idempoten, tanpa lock/credit wallet) dan payout
+  aktual didorong scheduler `payoutPendingReferralRewards()` via disbursement
+  scope `REFERRAL`, kunci stabil `REFERRAL:<rewardId>`. `isCredited=true`
+  hanya setelah disbursement RELEASED; `HELD_NO_BANK`/gagal → tetap pending
+  dan dicoba lagi (fail-closed, tidak hangus).
+- Cashback voucher: pola dua fase money-safe —
+  `planDanaCashback(tx)` (read-only di dalam tx completion: cek voucherUsage
+  + guard idempotensi `CASHBACK:<orderDbId>`, tanpa sentuh wallet) lalu
+  `executeDanaCashback()` post-commit/tx via `releaseFunds` scope `CASHBACK`.
+  Terpasang di 4 jalur completion: `completeOrder`, cron `auto-complete`,
+  admin `forceComplete`, dan verdict sengketa no-wallet (paritas jalur wallet:
+  hanya bila sellerAmount > 0). Tanpa rekening bank → `HELD_NO_BANK`;
+  `retryDue()` scheduler menangani PENDING/FAILED.
+- Rantai refund patungan/jastip terbukti di level unit:
+  `CommerceRefundService` (12 test delegasi) → `OrderStateService.adminCancelOrder`
+  → cabang no-wallet refund DANA ke metode bayar asal (2 test).
+
+## Catatan idempotency & fail-closed
+
+- Semua endpoint tulis uang mendukung header `Idempotency-Key` (atau
+  idempoten alami per order/key stabil).
+- Webhook DANA: verifikasi signature (path `/v1.0/debit/notify`),
+  replay protection, verify-via-API + pencocokan nominal (fail-closed),
+  ack `2005600`.
+- Order bertahap (milestone): checkout SATU pembayaran DANA penuh
+  (invariant `sum(buyerAmount) = buyerPayAmount` tetap); escrow per tahap
+  (`escrowHeld`), release/disbursement per tahap ke bank seller, refund
+  parsial per tahap ke sumber asal.
+- Platform fee: tertahan di akun merchant DANA (tidak dicairkan ke seller).
+  Seller menerima `sellerReceiveAmount`.

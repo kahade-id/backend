@@ -5,9 +5,10 @@ import { AuditLogModule } from '../../../common/services/audit-log.module';
 import { RedisModule } from '../../../redis/redis.module';
 import { PaymentModule } from '../../payment/payment.module';
 import { VerificationBadgeModule } from '../../users/verification-badge.module';
+import { NoWalletModule } from '../../no-wallet/no-wallet.module';
 
 @Module({
-  imports: [AuditLogModule, RedisModule, PaymentModule, VerificationBadgeModule],
+  imports: [AuditLogModule, RedisModule, PaymentModule, VerificationBadgeModule, NoWalletModule],
   controllers: [AdminSubscriptionsController],
   providers: [AdminSubscriptionsService],
 })

@@ -16,6 +16,7 @@ import { AuditLogModule } from '../../common/services/audit-log.module';
 // INTEGRATION-FIX: WalletTxSerialService dipakai dari singleton WalletModule
 // (di-export), bukan didaftarkan ulang.
 import { WalletModule } from '../wallet/wallet.module';
+import { NoWalletModule } from '../no-wallet/no-wallet.module';
 import { ReturnsController } from './returns.controller';
 import { AdminReturnsController } from './admin-returns.controller';
 import { ReturnsService } from './returns.service';
@@ -24,7 +25,7 @@ import { ReturnsRefundService } from './returns-refund.service';
 import { ReturnsSlaService } from './returns-sla.service';
 
 @Module({
-  imports: [PrismaModule, RedisModule, UploadModule, AuditLogModule, WalletModule],
+  imports: [PrismaModule, RedisModule, UploadModule, AuditLogModule, WalletModule, NoWalletModule],
   controllers: [ReturnsController, AdminReturnsController],
   providers: [
     ReturnsService,

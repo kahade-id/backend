@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { PublicService } from '../public.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
+import { OpsSettingsService } from '../../ops-settings/ops-settings.service';
 
 describe('PublicService', () => {
   let svc: PublicService;
@@ -15,6 +16,7 @@ describe('PublicService', () => {
   };
   const redis: any = { get: jest.fn(), setex: jest.fn() };
   const config: any = { get: jest.fn(() => undefined) };
+  const opsSettings: any = { get: jest.fn(() => undefined) };
 
   beforeEach(async () => {
     jest.resetAllMocks();
@@ -24,6 +26,7 @@ describe('PublicService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: RedisService, useValue: redis },
         { provide: ConfigService, useValue: config },
+        { provide: OpsSettingsService, useValue: opsSettings },
       ],
     }).compile();
     svc = mod.get(PublicService);

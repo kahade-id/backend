@@ -4,6 +4,7 @@ import {
   VoucherType,
   WalletTransactionStatus,
   WalletTransactionType,
+  EscrowDisbursementScope,
 } from '@prisma/client';
 import { generateWalletTxId } from './id-generator.util';
 import * as ErrorCodes from '../constants/error-codes';
@@ -119,4 +120,84 @@ export async function creditCashbackIfEligible(
   });
 
   return { credited: true, amount, userId: usage.userId, voucherCode: usage.voucher.code };
+}
+
+/**
+ * M4 no-wallet — payout cashback via disbursement DANA (bukan wallet).
+ *
+ * Pola dua fase agar money-safe:
+ *  1. `planDanaCashback(tx, ...)` — read-only di dalam tx completion pemanggil:
+ *     cek eligibilitas voucher + guard idempotensi (disbursement untuk order
+ *     ini sudah ada → null). TIDAK menyentuh wallet sama sekali.
+ *  2. `executeDanaCashback(...)` — dipanggil pemanggil POST-COMMIT: mengeksekusi
+ *     via EscrowDisbursementService.releaseFunds (idempoten, durable).
+ *
+ * Kunci idempotensi stabil: `CASHBACK:<orderDbId>` — satu cashback per order.
+ * Tanpa rekening bank terverifikasi → HELD_NO_BANK (fail-closed, tidak hangus;
+ * dicoba lagi oleh scheduler via EscrowDisbursementService.retryDue()).
+ */
+export interface DanaCashbackIntent {
+  userId: string;
+  amountSen: bigint;
+  voucherCode: string | null;
+  usageId: string;
+}
+
+export const danaCashbackKey = (orderDbId: string): string => `CASHBACK:${orderDbId}`;
+
+export async function planDanaCashback(
+  tx: Prisma.TransactionClient,
+  params: CashbackCreditParams,
+): Promise<DanaCashbackIntent | null> {
+  const existing = await tx.escrowDisbursement.findUnique({
+    where: { idempotencyKey: danaCashbackKey(params.orderDbId) },
+    select: { id: true },
+  });
+  if (existing) return null;
+
+  const usage = await tx.voucherUsage.findFirst({
+    where: {
+      orderId: params.orderDbId,
+      voucher: { voucherType: VoucherType.WALLET_CASHBACK },
+    },
+    select: {
+      id: true,
+      userId: true,
+      discountApplied: true,
+      voucher: { select: { code: true } },
+    },
+  });
+  const amount = usage?.discountApplied ?? BigInt(0);
+  if (!usage || amount <= BigInt(0)) return null;
+
+  return {
+    userId: usage.userId,
+    amountSen: amount,
+    voucherCode: usage.voucher.code,
+    usageId: usage.id,
+  };
+}
+
+export interface DanaCashbackExecutor {
+  releaseFunds: (params: {
+    idempotencyKey: string;
+    scope: EscrowDisbursementScope;
+    sellerId: string;
+    amountSen: bigint;
+    reason: string;
+  }) => Promise<{ outcome: string }>;
+}
+
+export async function executeDanaCashback(
+  executor: DanaCashbackExecutor,
+  params: CashbackCreditParams,
+  intent: DanaCashbackIntent,
+): Promise<{ outcome: string }> {
+  return executor.releaseFunds({
+    idempotencyKey: danaCashbackKey(params.orderDbId),
+    scope: EscrowDisbursementScope.CASHBACK,
+    sellerId: intent.userId, // penerima payout
+    amountSen: intent.amountSen,
+    reason: `Campaign cashback order ${params.orderPublicId} voucher ${intent.voucherCode ?? '-'}`,
+  });
 }

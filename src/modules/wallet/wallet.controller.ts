@@ -21,10 +21,16 @@ import { TransferDto } from './dto/transfer.dto';
 import { extractLocationContext } from '../action-location/action-location.util';
 import { TopupFeeEstimateDto } from './dto/topup-fee-estimate.dto';
 import { formatWIBDate } from '../../common/utils/date.util';
+import { WalletKillSwitchGuard } from '../wallet-mode/wallet-kill-switch.guard';
 
 @ApiTags('wallet')
 @ApiBearerAuth('access-token')
 @Controller('wallet')
+// Misi BI-safe: kill-switch wallet internal. Saat WALLET_ENABLED=false
+// (default), SEMUA endpoint wallet user-facing fail-closed → 403 WALLET_DISABLED.
+// Pengecualian: payout satu arah saldo lama ke rekening bank
+// (LegacyPayoutController di modul no-wallet, tetap hidup).
+@UseGuards(WalletKillSwitchGuard)
 export class WalletController {
   constructor(
     private walletService: WalletService,

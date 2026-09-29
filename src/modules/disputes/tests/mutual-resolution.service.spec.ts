@@ -1,4 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
+import { DisputeDanaSettlementService } from '../../no-wallet/dispute-dana-settlement.service';
 import { ConflictException, NotFoundException, BadRequestException } from '@nestjs/common';
 import { DisputeStatus, OrderStatus, ActorType, Prisma } from '@prisma/client';
 import { MutualResolutionService } from '../mutual-resolution.service';
@@ -82,6 +84,9 @@ describe('MutualResolutionService', () => {
         { provide: WalletTxSerialService, useValue: mockSerial },
         { provide: FeeCalculatorService, useValue: mockFeeCalculator },
         { provide: RedisService, useValue: { del: jest.fn().mockResolvedValue(undefined) } },
+        // M3 no-wallet: wallet aktif di test ini → jalur wallet lama.
+        { provide: WalletModeService, useValue: { isWalletEnabled: () => true } },
+        { provide: DisputeDanaSettlementService, useValue: {} },
       ],
     }).compile();
     service = module.get<MutualResolutionService>(MutualResolutionService);

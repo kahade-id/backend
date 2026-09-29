@@ -10,12 +10,14 @@ import { OtpGatewayService } from '../auth/otp-gateway.service';
 import { WalletExportService } from './export.service';
 import { RedisModule } from '../../redis/redis.module';
 import { AuditLogModule } from '../../common/services/audit-log.module';
+import { WalletModeModule } from '../wallet-mode/wallet-mode.module';
 import { EMAIL_QUEUE } from '../queue/processors/email.processor';
 
 @Module({
   imports: [
     ConfigModule,
     RedisModule,
+    WalletModeModule,
     // and WITHDRAW_REQUESTED audit events for financial compliance trail.
     AuditLogModule,
     BullModule.registerQueue({

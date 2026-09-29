@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger, Optional } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { OrderStatus, AuditAction, Prisma, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType, DisputeStatus } from '@prisma/client';
@@ -8,7 +8,9 @@ import { AuditLogService } from '../../../common/services/audit-log.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { RedisService } from '../../../redis/redis.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
-import { creditCashbackIfEligible } from '../../../common/utils/cashback-credit.util';
+import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback } from '../../../common/utils/cashback-credit.util';
+import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
+import { EscrowDisbursementService } from '../../no-wallet/escrow-disbursement.service';
 import { OrderStateService } from '../../orders/order-state.service';
 import { UnshippedOrderCancelService } from '../../orders/unshipped-order-cancel.service';
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
@@ -51,6 +53,9 @@ export class AdminOrdersService {
     private membershipRankService: MembershipRankService,
     // AW-018: invalidasi cache summary dashboard (via helper terpusat).
     private readonly dashboard: DashboardService,
+    // M4 no-wallet: payout cashback via disbursement DANA bila wallet mati.
+    @Optional() private walletMode: WalletModeService | null,
+    @Optional() private disbursement: EscrowDisbursementService | null,
   ) {}
 
   private async withSerializableRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
@@ -442,12 +447,19 @@ export class AdminOrdersService {
 
         // Batch 1-money (EO-005): cashback voucher juga dikredit pada force-complete —
         // sebelumnya hangus diam-diam.
-        const cashbackResult = await creditCashbackIfEligible(tx, () => this.walletTxSerialService.getNext(), {
-          orderDbId: order.id,
-          orderPublicId: order.orderId,
-          source: 'force-complete',
-        });
-        return cashbackResult;
+        // M4 no-wallet: wallet mati -> rencanakan payout DANA (eksekusi post-tx).
+        const walletEnabled = this.walletMode?.isWalletEnabled() ?? true;
+        if (walletEnabled) {
+          const cashbackResult = await creditCashbackIfEligible(tx, () => this.walletTxSerialService.getNext(), {
+            orderDbId: order.id,
+            orderPublicId: order.orderId,
+            source: 'force-complete',
+          });
+          return { cashbackResult, danaCashback: null };
+        }
+        const params = { orderDbId: order.id, orderPublicId: order.orderId, source: 'force-complete' };
+        const intent = await planDanaCashback(tx, params);
+        return { cashbackResult: null, danaCashback: intent ? { params, intent } : null };
       }
 
       if (order.feeAmount > BigInt(0) && feeTxSerial !== null) {
@@ -561,13 +573,39 @@ export class AdminOrdersService {
 
     this.logger.log(`Admin ${adminId} force-completed order ${order.orderId}`);
 
+    // M4 no-wallet: eksekusi payout cashback DANA post-tx (idempoten).
+    const forceCompleteDana = forceCompleteCashback?.danaCashback ?? null;
+    const forceCompleteCashbackResult = forceCompleteCashback?.cashbackResult ?? null;
+    if (forceCompleteDana && this.disbursement) {
+      try {
+        const danaRes = await executeDanaCashback(this.disbursement, forceCompleteDana.params, forceCompleteDana.intent);
+        if (danaRes.outcome === 'RELEASED') {
+          const cashbackIdr = toIdr(forceCompleteDana.intent.amountSen).toLocaleString('id-ID');
+          await this.prisma.notification.create({
+            data: {
+              notifId: generateNotifId(),
+              userId: forceCompleteDana.intent.userId,
+              type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
+              category: getCategoryForType(NotificationType.CAMPAIGN_CASHBACK_CREDITED),
+              title: 'Cashback Terkirim',
+              body: `Cashback Rp ${cashbackIdr} dari order "${order.title}" telah dikirim ke rekening bank Anda.`,
+              isRead: false,
+            },
+          }).catch((err: unknown) => this.logger.warn(`silent-catch: admin force-complete DANA cashback notification failed: ${err instanceof Error ? err.message : String(err)}`));
+        }
+      } catch (err) {
+        // Idempoten — scheduler retryDue() akan mencoba lagi.
+        this.logger.warn(`admin force-complete DANA cashback gagal untuk order ${order.orderId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
     // Batch 1-money (EO-005): beritahu penerima bila cashback dikredit.
-    if (forceCompleteCashback?.credited && forceCompleteCashback.userId) {
-      const cashbackIdr = toIdr(forceCompleteCashback.amount).toLocaleString('id-ID');
+    if (forceCompleteCashbackResult?.credited && forceCompleteCashbackResult.userId) {
+      const cashbackIdr = toIdr(forceCompleteCashbackResult.amount).toLocaleString('id-ID');
       this.prisma.notification.create({
         data: {
           notifId: generateNotifId(),
-          userId: forceCompleteCashback.userId,
+          userId: forceCompleteCashbackResult.userId,
           type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
           category: getCategoryForType(NotificationType.CAMPAIGN_CASHBACK_CREDITED),
           title: 'Cashback Credited',

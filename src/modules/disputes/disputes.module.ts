@@ -12,9 +12,10 @@ import { DisputeCallService } from './dispute-call.service';
 import { MutualResolutionService } from './mutual-resolution.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { AuditLogModule } from '../../common/services/audit-log.module';
+import { NoWalletModule } from '../no-wallet/no-wallet.module';
 
 @Module({
-  imports: [PrismaModule, RedisModule, UploadModule, AuditLogModule, forwardRef(() => OrdersModule)],
+  imports: [PrismaModule, RedisModule, UploadModule, AuditLogModule, forwardRef(() => OrdersModule), NoWalletModule],
   controllers: [DisputesController, DisputeQuickEscalationController],
   providers: [DisputesService, DisputeQuickEscalationService, DisputeMessageService, DisputeCallService, MutualResolutionService, WalletTxSerialService],
   exports: [DisputesService],

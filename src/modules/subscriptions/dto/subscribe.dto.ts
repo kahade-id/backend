@@ -58,3 +58,50 @@ export class PauseSubscriptionDto {
   @IsDateString()
   resumeAt?: string;
 }
+
+import { DanaDirectPayKind } from '../../no-wallet/dto/dana-direct-pay.dto';
+
+export class SubscribeDanaDto {
+  @ApiProperty({ enum: SubscriptionPlan, description: 'Subscription plan' })
+  @IsEnum(SubscriptionPlan)
+  plan!: SubscriptionPlan;
+
+  @ApiProperty({
+    enum: DanaDirectPayKind,
+    description: 'Metode bayar DANA: QRIS | VA | BALANCE (jangan hardcode — tampilkan daftar dari payment-methods)',
+  })
+  @IsEnum(DanaDirectPayKind)
+  payKind!: DanaDirectPayKind;
+
+  @ApiPropertyOptional({ description: 'Kode bank untuk VA: BCA | BNI | BRI | MANDIRI | CIMB | PERMATA' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(16)
+  bankCode?: string;
+
+  @ApiPropertyOptional({
+    description: 'Kode promo: kode GRATIS dari admin atau kode campaign SUBSCRIPTION_DISCOUNT',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(32)
+  @Matches(/^[A-Z0-9_-]+$/i, {
+    message: 'promoCode may contain only A-Z, 0-9, underscore, or hyphen',
+  })
+  promoCode?: string;
+}
+
+export class RenewDanaDto {
+  @ApiProperty({
+    enum: DanaDirectPayKind,
+    description: 'Metode bayar DANA: QRIS | VA | BALANCE',
+  })
+  @IsEnum(DanaDirectPayKind)
+  payKind!: DanaDirectPayKind;
+
+  @ApiPropertyOptional({ description: 'Kode bank untuk VA: BCA | BNI | BRI | MANDIRI | CIMB | PERMATA' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(16)
+  bankCode?: string;
+}

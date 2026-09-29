@@ -1,4 +1,5 @@
 import { Module, forwardRef } from '@nestjs/common';
+import { MilestonesModule } from '../milestones/milestones.module';
 import { ConfigModule } from '@nestjs/config';
 import { OrdersController } from './orders.controller';
 import { OrdersService } from './orders.service';
@@ -25,9 +26,11 @@ import { SubscriptionsModule } from '../subscriptions/subscriptions.module';
 // GAP-D (G256/G257): hook reservasi stok katalog — @Optional() di OrderStateService,
 // aman bila modul belum ter-import; tidak mengubah perilaku order existing.
 import { InventoryModule } from '../inventory/inventory.module';
+import { NoWalletModule } from '../no-wallet/no-wallet.module';
+import { WalletModeModule } from '../wallet-mode/wallet-mode.module';
 
 @Module({
-  imports: [ConfigModule, WalletModule, RedisModule, ReferralModule, forwardRef(() => DisputesModule), RealtimeModule, UploadModule, AuditLogModule, QueueModule, PaymentModule, SubscriptionsModule, InventoryModule],
+  imports: [ConfigModule, WalletModule, RedisModule, ReferralModule, forwardRef(() => DisputesModule), RealtimeModule, UploadModule, AuditLogModule, QueueModule, PaymentModule, SubscriptionsModule, InventoryModule, NoWalletModule, WalletModeModule],
   controllers: [OrdersController],
   providers: [OrdersService, FeeCalculatorService, OrderStateService, OrderExtensionsService, OrderLinksService, DeliveryProofService, InvoiceService, ReceiptService, MembershipRankService, WalletTxSerialService, UnshippedOrderCancelService],
   exports: [OrdersService, FeeCalculatorService, OrderStateService, OrderExtensionsService, OrderLinksService, DeliveryProofService, InvoiceService, ReceiptService, MembershipRankService, UnshippedOrderCancelService],

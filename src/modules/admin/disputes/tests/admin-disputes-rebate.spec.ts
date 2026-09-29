@@ -1,4 +1,6 @@
 import { Test } from '@nestjs/testing';
+import { WalletModeService } from '../../../wallet-mode/wallet-mode.service';
+import { DisputeDanaSettlementService } from '../../../no-wallet/dispute-dana-settlement.service';
 import { AdminDisputesService } from '../admin-disputes.service';
 import { PrismaService } from '../../../../prisma/prisma.service';
 import { WalletTxSerialService } from '../../../../common/services/wallet-tx-serial.service';
@@ -102,6 +104,8 @@ describe('AdminDisputesService M6 dispute rebate (Wave 2)', () => {
       adminUser: { findUnique: jest.fn().mockResolvedValue({ role: 'SUPER_ADMIN' }) },
       notification: { create: jest.fn().mockResolvedValue({}) },
       emitNotificationCreated: jest.fn(),
+      // M3 no-wallet: tidak ada payment DANA di test ini → jalur wallet lama.
+      paymentTransaction: { findFirst: jest.fn().mockResolvedValue(null) },
       $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
     };
     const module = await Test.createTestingModule({
@@ -114,6 +118,9 @@ describe('AdminDisputesService M6 dispute rebate (Wave 2)', () => {
         { provide: RealtimeService, useValue: {} },
         { provide: ChatService, useValue: {} },
         { provide: DashboardService, useValue: { invalidateSummaryCache: jest.fn() } },
+        // M3 no-wallet: wallet aktif di test ini → jalur wallet lama.
+        { provide: WalletModeService, useValue: { isWalletEnabled: () => true } },
+        { provide: DisputeDanaSettlementService, useValue: {} },
       ],
     }).compile();
     service = module.get(AdminDisputesService);

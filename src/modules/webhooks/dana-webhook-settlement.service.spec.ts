@@ -39,17 +39,25 @@ function makeDeps(publicPem: string, opts: { danaEnv?: string; test500Once?: str
       return undefined;
     },
   };
-  const danaPaymentService = { getPaymentDetail: jest.fn() };
+  const danaPaymentService = { getPaymentDetail: jest.fn(), refundOrder: jest.fn() };
   const walletService = { handleTopupSuccess: jest.fn() };
   const orderQrisPaymentService = { handleSettlement: jest.fn() };
+  const danaDirectPaymentService = { settleEscrow: jest.fn() };
+  const danaDirectRefundService = { refundPayment: jest.fn() };
+  const walletMode = { isWalletEnabled: jest.fn(() => true) };
+  const subscriptionsService = { activateDanaSubscription: jest.fn(async () => undefined) };
   const svc = new DanaWebhookSettlementService(
     prisma as any,
     config as unknown as ConfigService,
     danaPaymentService as any,
     walletService as any,
     orderQrisPaymentService as any,
+    danaDirectPaymentService as any,
+    danaDirectRefundService as any,
+    walletMode as any,
+    subscriptionsService as any,
   );
-  return { svc, prisma, danaPaymentService, walletService, orderQrisPaymentService };
+  return { svc, prisma, danaPaymentService, walletService, orderQrisPaymentService, danaDirectPaymentService, danaDirectRefundService, walletMode, subscriptionsService };
 }
 
 const notifyBody = {
@@ -98,7 +106,7 @@ describe('dana-webhook-settlement.service', () => {
       id: 'pt-1',
       status: PaymentStatus.PENDING,
       purpose: PaymentPurpose.TOPUP,
-      grossAmount: BigInt(15000),
+      grossAmount: BigInt(1500000),
       midtransOrderId: 'KAHADE-TOP-1',
     });
     danaPaymentService.getPaymentDetail.mockResolvedValue({
@@ -124,7 +132,7 @@ describe('dana-webhook-settlement.service', () => {
       id: 'pt-1',
       status: PaymentStatus.PENDING,
       purpose: PaymentPurpose.TOPUP,
-      grossAmount: BigInt(15000),
+      grossAmount: BigInt(1500000),
       midtransOrderId: 'KAHADE-TOP-1',
     });
     danaPaymentService.getPaymentDetail.mockResolvedValue({
@@ -144,7 +152,7 @@ describe('dana-webhook-settlement.service', () => {
       id: 'pt-1',
       status: PaymentStatus.PENDING,
       purpose: PaymentPurpose.ORDER_ESCROW,
-      grossAmount: BigInt(15000),
+      grossAmount: BigInt(1500000),
       midtransOrderId: 'KAHADE-ORD-1',
     });
     danaPaymentService.getPaymentDetail.mockResolvedValue({ status: 'UNKNOWN', amountIdr: null });
@@ -162,7 +170,7 @@ describe('dana-webhook-settlement.service', () => {
       id: 'pt-1',
       status: PaymentStatus.PENDING,
       purpose: PaymentPurpose.TOPUP,
-      grossAmount: BigInt(15000),
+      grossAmount: BigInt(1500000),
       midtransOrderId: 'KAHADE-TOP-1',
     });
     await svc.handleFinishNotify(
@@ -245,6 +253,111 @@ describe('dana-webhook-settlement.service', () => {
       ).rejects.toThrow(ForbiddenException);
       expect(prisma.webhookLog.upsert).not.toHaveBeenCalled();
     });
+
+    it('hook hanya fire di notif 00 — notif 05 tetap 2005600', async () => {
+      const { svc, prisma } = makeDeps(publicPem, { danaEnv: 'sandbox', test500Once: 'true' });
+      prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: false });
+      prisma.paymentTransaction.findUnique.mockResolvedValue(null);
+      // Notif 05 (expired): hook TIDAK boleh fire — balas normal 2005600.
+      // Body 05 harus di-sign ulang karena signature mengikat isi body.
+      const body05 = JSON.stringify({ ...notifyBody, latestTransactionStatus: '05' });
+      const sig05 = signWebhook(privatePem, body05, timestamp);
+      const out = await svc.handleFinishNotify(
+        body05,
+        { 'x-signature': sig05, 'x-timestamp': timestamp },
+        PATH,
+      );
+      expect(out.responseCode).toBe('2005600');
+      expect(prisma.webhookLog.upsert).toHaveBeenCalledTimes(1);
+    });
   });
 
+  it('DANA-direct ORDER_ESCROW: verify OK → settleEscrow TANPA wallet', async () => {
+    const { svc, prisma, danaPaymentService, danaDirectPaymentService, walletService } = makeDeps(publicPem);
+    prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: false });
+    prisma.paymentTransaction.findUnique.mockResolvedValue({
+      id: 'pt-dana-1',
+      status: PaymentStatus.PENDING,
+      purpose: PaymentPurpose.ORDER_ESCROW,
+      provider: 'DANA',
+      danaPayKind: 'QRIS',
+      grossAmount: BigInt(1500000),
+      midtransOrderId: 'PAY-DANA-1',
+    });
+    danaPaymentService.getPaymentDetail.mockResolvedValue({ status: 'SUCCESS', amountIdr: 15000 });
+    const out = await svc.handleFinishNotify(rawBody, headers, PATH);
+    expect(out.responseCode).toBe('2005600');
+    expect(danaDirectPaymentService.settleEscrow).toHaveBeenCalledWith('pt-dana-1');
+    expect(walletService.handleTopupSuccess).not.toHaveBeenCalled();
+  });
+
+  it('DANA-direct SUBSCRIPTION: verify OK → activateDanaSubscription TANPA wallet', async () => {
+    const { svc, prisma, danaPaymentService, subscriptionsService, walletService } = makeDeps(publicPem);
+    prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: false });
+    prisma.paymentTransaction.findUnique.mockResolvedValue({
+      id: 'pt-sub-1',
+      status: PaymentStatus.PENDING,
+      purpose: PaymentPurpose.SUBSCRIPTION,
+      provider: 'DANA',
+      danaPayKind: 'QRIS',
+      grossAmount: BigInt(2990000),
+      midtransOrderId: 'SUBS-DANA-1',
+    });
+    danaPaymentService.getPaymentDetail.mockResolvedValue({ status: 'SUCCESS', amountIdr: 29900 });
+    const out = await svc.handleFinishNotify(rawBody, headers, PATH);
+    expect(out.responseCode).toBe('2005600');
+    expect(subscriptionsService.activateDanaSubscription).toHaveBeenCalledWith('pt-sub-1');
+    expect(walletService.handleTopupSuccess).not.toHaveBeenCalled();
+  });
+
+  it('mode tanpa-wallet: TOPUP in-flight TIDAK dikredit — refund ke sumber', async () => {
+    const { svc, prisma, danaPaymentService, walletService, danaDirectRefundService, walletMode } =
+      makeDeps(publicPem);
+    walletMode.isWalletEnabled.mockReturnValue(false);
+    prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: false });
+    prisma.paymentTransaction.findUnique.mockResolvedValue({
+      id: 'pt-top-1',
+      status: PaymentStatus.PENDING,
+      purpose: PaymentPurpose.TOPUP,
+      provider: 'DANA',
+      danaPartnerReferenceNo: 'DANA-TOP-001',
+      grossAmount: BigInt(1500000),
+      midtransOrderId: 'KAHADE-TOP-1',
+    });
+    danaPaymentService.getPaymentDetail.mockResolvedValue({ status: 'SUCCESS', amountIdr: 15000 });
+    const out = await svc.handleFinishNotify(rawBody, headers, PATH);
+    expect(out.responseCode).toBe('2005600');
+    expect(walletService.handleTopupSuccess).not.toHaveBeenCalled();
+    // refund ke metode bayar asal (bukan ke wallet)
+    expect(danaPaymentService.refundOrder).toHaveBeenCalledWith(
+      expect.objectContaining({ partnerReferenceNo: 'DANA-TOP-001' }),
+    );
+    expect(danaDirectRefundService.refundPayment).not.toHaveBeenCalled(); // jalur topup pakai refund langsung
+  });
+
+  it('REGRESI (insiden 2026-09-29): triple finish-notify ASLI DANA sandbox terverifikasi', async () => {
+    // Ditangkap via webhook.site 2026-09-29 22:08:36 WIB dari IP DANA
+    // 147.139.135.134 — order demo "Kahade SigCap" Rp10.000.
+    // DANA menandatangani terhadap path URL tujuan notifikasi
+    // (/cd314adb-... = path webhook.site saat itu).
+    const realBody =
+      '{"amount":{"currency":"IDR","value":"10000.00"},"originalReferenceNo":"20260929111230999500166943900569349","merchantId":"216620010010042769401","latestTransactionStatus":"00","additionalInfo":{"paidTime":"2026-09-29T22:08:35+07:00","paymentInfo":{"payOptionInfos":[{"transAmount":{"currency":"IDR","value":"10000.00"},"payAmount":{"currency":"IDR","value":"10000.00"},"payMethod":"BALANCE"}],"extendInfo":"{\\"externalPromoInfos\\":[]}"}},"originalPartnerReferenceNo":"62f9bcf8-71d7-4a38-9ede-629761cd9524","createdTime":"2026-09-29T22:06:19+07:00","finishedTime":"2026-09-29T22:08:35+07:00","transactionStatusDesc":"SUCCESS"}';
+    const realSignature =
+      'iVlMcUpu6PMyj0x10BjFCvu7ww1bZHU6+2dZmn/1tgmOXzLTl+9RCktpJIFozQryIJOG1gBC8dRq0bRMU/6ixCKnSWWtxtMsY7y/VGfX1Mq0/D1SGqbMy67+7XAn2q+rJe41UnSrpmyU8O8zSCaGKVm1oxfdGLHH90/GxZms00r8NZcCps/cVYo5KXChreLoI9nti1Ft8PZeHR4y270a12Bmp/axHUVp0OLkJRQcjYyztgzf7zWRn7NPUUXxLDQ21/d8sJMC9JQcC9VvN2SICfUSI2P6ApRyj+ZxnohdnN9pORTCuqwdCFLRnWvPugiBFFe8qhqst/nXqTw1QfkPnA==';
+    const realTimestamp = '2026-09-29T22:08:35+07:00';
+    const realPath = '/cd314adb-3aec-4e1b-9b7e-e3f414f6c081';
+    // Pakai public key resmi DANA (bukan keypair uji): config tanpa
+    // dana.publicKey agar fallback ke DANA_SANDBOX_WEBHOOK_PUBLIC_KEY.
+    const { svc, prisma } = makeDeps('');
+    // Tandai duplikat agar berhenti tepat setelah verifikasi lolos —
+    // bila signature invalid, sudah throw 403 sebelum menyentuh DB.
+    prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: true });
+    const out = await svc.handleFinishNotify(
+      realBody,
+      { 'x-signature': realSignature, 'x-timestamp': realTimestamp },
+      realPath,
+    );
+    expect(out.responseCode).toBe('2005600');
+    expect(prisma.webhookLog.upsert).toHaveBeenCalled();
+  });
 });

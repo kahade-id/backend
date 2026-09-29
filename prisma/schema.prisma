@@ -347,6 +347,7 @@ enum NotificationType {
   WALLET_REFUND_RECEIVED
   WALLET_TRANSFER_SENT
   WALLET_TRANSFER_RECEIVED
+  ESCROW_HELD_NO_BANK
   KYC_APPROVED
   KYC_REJECTED
   KYC_REVOKED
@@ -947,6 +948,8 @@ model User {
   businessVerifications    BusinessVerification[]
   bankAccounts             BankAccount[]
   wallet                   Wallet?
+  // Misi tanpa-wallet (BI-safe): disbursement escrow langsung ke bank seller.
+  escrowDisbursements      EscrowDisbursement[]    @relation("EscrowDisbursementSeller")
   ordersAsBuyer            Order[]                 @relation("BuyerOrders")
   ordersAsSeller           Order[]                 @relation("SellerOrders")
   chatMessages             ChatMessage[]
@@ -1540,6 +1543,8 @@ model BankAccount {
 
   withdrawTransactions WalletTransaction[]
   scheduledWithdrawals ScheduledWithdrawal[] @relation("BankAccountScheduledWithdrawals")
+  // Misi tanpa-wallet (BI-safe): disbursement escrow langsung ke rekening ini.
+  escrowDisbursements  EscrowDisbursement[]
 
   @@index([userId])
   @@index([irisAccountId]) // Iris webhook lookup "find bank account by Iris ID"
@@ -1705,6 +1710,12 @@ model PaymentTransaction {
   // (kunci idempotency DANA: merchantId + partnerReferenceNo).
   danaPartnerReferenceNo String? @unique
   danaReferenceNo        String? // referenceNo dari DANA (sisi DANA)
+  // Misi tanpa-wallet (BI-safe): metode bayar DANA direct yang dipilih buyer
+  // saat checkout ('QRIS' | 'VA' | 'BALANCE'). Aditif, nullable.
+  danaPayKind            String?
+  // Misi tanpa-wallet: renewal Kahade+ via DANA direct — payment ini
+  // memperpanjang subscription ini (aditif, nullable).
+  renewalForSubscriptionId String?
 
   // Webhook data
   webhookReceivedAt DateTime?
@@ -1725,6 +1736,8 @@ model PaymentTransaction {
   walletTransactions WalletTransaction[]
   subscriptions      Subscription[]
   voucherUsages      VoucherUsage[]
+  // Misi tanpa-wallet: riwayat refund DANA (penuh & parsial) ke metode bayar asal.
+  danaRefundAttempts DanaRefundAttempt[]
 
   @@index([userId])
   @@index([orderId])
@@ -1732,6 +1745,105 @@ model PaymentTransaction {
   @@index([status])
   @@index([createdAt])
   @@map("payment_transactions")
+}
+
+// ============================================================
+// Misi tanpa-wallet (BI-safe): disbursement escrow LANGSUNG ke rekening
+// bank seller via DANA Disbursement — BUKAN kredit wallet.
+// Model 100% ADITIF (tabel baru). Satu baris per upaya pencairan dengan
+// idempotencyKey unik; retry aman tanpa double-transfer.
+// ============================================================
+model EscrowDisbursement {
+  id String @id @default(cuid())
+
+  // Kunci idempotency: stabil per (scope, scopeRefId) — mis.
+  // "ORDER:<orderDbId>", "MILESTONE:<milestoneId>", "LEGACY_PAYOUT:<walletTxId>".
+  idempotencyKey String @unique
+
+  scope      EscrowDisbursementScope
+  scopeRefId String? // order DB id / milestone id / wallet transaction id
+
+  orderId String? // order DB id (bila scope = ORDER_ESCROW)
+  sellerId String
+  seller   User   @relation("EscrowDisbursementSeller", fields: [sellerId], references: [id], onDelete: Restrict)
+
+  bankAccountId String?
+  bankAccount   BankAccount? @relation(fields: [bankAccountId], references: [id], onDelete: SetNull)
+
+  // Nominal dalam sen (IDR x 100).
+  amountSen BigInt
+
+  status EscrowDisbursementStatus @default(PENDING)
+
+  // Referensi DANA Disbursement (transfer-bank).
+  danaPartnerReferenceNo String? @unique // yang kita kirim (idempotency DANA)
+  danaReferenceNo        String? // referenceNo dari DANA (sisi DANA)
+
+  attemptCount Int     @default(0)
+  lastError    String? @db.Text
+
+  heldReason String? // terisi bila status = HELD_NO_BANK
+  releasedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sellerId, status])
+  @@index([orderId])
+  @@index([status])
+  @@map("escrow_disbursements")
+}
+
+// ============================================================
+// Misi tanpa-wallet (BI-safe): idempotency refund DANA (penuh & parsial)
+// ke metode bayar asal. Satu baris per idempotencyKey — retry aman tanpa
+// refund ganda. Model 100% ADITIF (tabel baru).
+// ============================================================
+model DanaRefundAttempt {
+  id String @id @default(cuid())
+
+  // Kunci idempotency stabil dari caller, mis. "ORDER:<orderDbId>:FULL",
+  // "DISPUTE:<disputeId>:BUYER", "RETURN:<returnId>".
+  idempotencyKey String @unique
+
+  paymentTransactionId String
+  paymentTransaction   PaymentTransaction @relation(fields: [paymentTransactionId], references: [id], onDelete: Restrict)
+
+  // Nominal refund dalam sen (IDR x 100).
+  amountSen BigInt
+
+  // Kunci idempotency sisi DANA (merchantId + partnerRefundNo).
+  partnerRefundNo String @unique
+  danaReferenceNo String?
+
+  // PENDING | SUCCESS | FAILED
+  status String @default("PENDING")
+  reason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([paymentTransactionId])
+  @@map("dana_refund_attempts")
+}
+
+enum EscrowDisbursementScope {
+  ORDER_ESCROW
+  MILESTONE
+  LEGACY_WALLET_PAYOUT
+  // Misi tanpa-wallet: payout non-order ke rekening bank terverifikasi.
+  CASHBACK
+  REFERRAL
+  DISPUTE_RELEASE
+}
+
+enum EscrowDisbursementStatus {
+  PENDING // dibuat, belum dieksekusi
+  HELD_NO_BANK // fail-closed: seller belum punya rekening terdaftar
+  PROCESSING // transfer terkirim, menunggu konfirmasi final
+  SUCCESS
+  FAILED // gagal provider — bisa retry (idempoten via idempotencyKey)
+  CANCELLED // dibatalkan (mis. legacy payout yang debitnya dikompensasi)
 }
 
 // ============================================================
@@ -1849,6 +1961,13 @@ model Order {
   showcaseId    String?
   showcase      UserShowcase? @relation("OrderShowcase", fields: [showcaseId], references: [id], onDelete: SetNull)
   priceSnapshot BigInt?
+
+  // Misi tanpa-wallet (BI-safe): referensi DANA untuk escrow yang didanai
+  // LANGSUNG via DANA tanpa lewat wallet internal. Kolom aditif (nullable).
+  // danaPartnerReferenceNo = partnerReferenceNo yang kita kirim saat Create Order
+  // (kunci idempotency DANA: merchantId + partnerReferenceNo).
+  danaPartnerReferenceNo String? @unique
+  danaReferenceNo        String? // referenceNo dari DANA (sisi DANA)
 
   // Relations
   statusHistories     OrderStatusHistory[]

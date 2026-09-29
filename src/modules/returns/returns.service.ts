@@ -20,6 +20,8 @@ import { AuditAction, DisputeStatus, OrderStatus, UserAuditAction } from '@prism
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { PrismaService } from '../../prisma/prisma.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
+import { WalletModeService } from '../wallet-mode/wallet-mode.service';
+import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
 import { UploadService } from '../upload/upload.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { getReturnsDb } from './returns.db';
@@ -98,6 +100,8 @@ export class ReturnsService {
     private auditLog: AuditLogService,
     private notify: ReturnsNotifyService,
     private refundService: ReturnsRefundService,
+    private walletMode: WalletModeService,
+    private danaDirectRefundService: DanaDirectRefundService,
   ) {}
 
   private db() {
@@ -1031,6 +1035,14 @@ export class ReturnsService {
       if (fresh?.status === 'EXECUTED') return;
       throw new ConflictException({ code: 'RETURN_REFUND_IN_PROGRESS', message: 'Refund sedang diproses oleh proses lain.' });
     }
+    // M3 (no-wallet): refund retur ke metode bayar asal via DANA Refund API —
+    // TIDAK debit/kredit wallet. KEPUTUSAN PRODUK/FINANCE yang perlu dikonfirmasi:
+    // refund provider membayar dari kas merchant DANA platform (tidak ada
+    // clawback dari seller), sedangkan jalur wallet mendebit wallet seller.
+    if (!this.walletMode.isWalletEnabled()) {
+      await this.executeRefundForReturnNoWallet(ret, actorId, actorRole, approval);
+      return;
+    }
     try {
       const [sellerWallet, buyerWallet] = await Promise.all([
         this.prisma.wallet.findFirst({ where: { userId: ret.sellerId }, select: { id: true } }),
@@ -1064,6 +1076,70 @@ export class ReturnsService {
           returnDbId: ret.id, returnPublicId: ret.returnId,
         }).catch(() => undefined);
       }
+      throw err;
+    }
+  }
+
+  /**
+   * M3 — eksekusi refund retur TANPA wallet (BI-safe): refund ke metode bayar
+   * asal via DANA Refund API, full/partial sesuai approval. Approval tetap
+   * dipakai sebagai klaim idempoten (sudah di-claim oleh caller).
+   *
+   * Fail-closed: tanpa payment DANA-direct SUCCESS untuk order ini, refund
+   * TIDAK dieksekusi (approval dilepas ke FAILED untuk tindak lanjut manual).
+   */
+  private async executeRefundForReturnNoWallet(
+    ret: ReturnRequestRow,
+    actorId: string,
+    actorRole: ReturnActorType,
+    approval: { id: string; amount: bigint },
+  ): Promise<void> {
+    try {
+      const payment = await this.prisma.paymentTransaction.findFirst({
+        where: {
+          orderId: ret.orderId,
+          purpose: 'ORDER_ESCROW',
+          provider: 'DANA',
+          status: 'SUCCESS',
+          danaPayKind: { not: null },
+        },
+        select: { id: true },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (!payment) {
+        throw new NotFoundException({
+          code: 'RETURN_REFUND_NO_DANA_PAYMENT',
+          message: 'Tidak ada pembayaran DANA-direct untuk order ini — refund retur tanpa wallet tidak dapat dieksekusi.',
+        });
+      }
+      const idempotencyKey = `RETURN:${ret.id}`;
+      const res = await this.danaDirectRefundService.refundAmount({
+        paymentDbId: payment.id,
+        amountSen: approval.amount,
+        reason: `Return ${ret.returnId} approved (${actorRole})`,
+        idempotencyKey,
+      });
+      // Jejak audit: simpan referensi DANA (bukan wallet tx id — kolom legacy).
+      const attempt = await this.prisma.danaRefundAttempt.findUnique({
+        where: { idempotencyKey },
+        select: { partnerRefundNo: true, danaReferenceNo: true },
+      });
+      const danaRef = attempt?.danaReferenceNo ?? attempt?.partnerRefundNo ?? idempotencyKey;
+      await this.refundService.markExecuted(approval.id, [`dana:${danaRef}`]);
+      await this.logTimeline(ret.id, 'REFUND_EXECUTED', {
+        actorId, actorRole,
+        metadata: {
+          amountSen: approval.amount.toString(),
+          channel: 'DANA_REFUND',
+          idempotencyKey,
+          danaReferenceNo: attempt?.danaReferenceNo ?? null,
+          alreadyRefunded: res.refunded && res.already,
+        },
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      await this.refundService.markFailed(approval.id, reason);
+      await this.logTimeline(ret.id, 'REFUND_FAILED', { actorId, actorRole, metadata: { reason, channel: 'DANA_REFUND' } });
       throw err;
     }
   }

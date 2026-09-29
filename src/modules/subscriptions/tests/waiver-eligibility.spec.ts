@@ -17,6 +17,9 @@ function makeService(prisma: any) {
     {} as never,
     {} as never,
     {} as never,
+    {} as never,
+    {} as never,
+    {} as never,
   );
 }
 

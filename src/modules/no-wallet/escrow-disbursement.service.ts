@@ -282,4 +282,50 @@ export class EscrowDisbursementService {
     const clean = idempotencyKey.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
     return `DSB-${clean}`.slice(0, 32);
   }
+
+  /**
+   * Query status disbursement untuk user (cashback, referral, order escrow, dll).
+   * Dipakai frontend untuk menampilkan status pencairan ke user.
+   */
+  async getDisbursementsForUser(
+    userId: string,
+    opts: { scope?: EscrowDisbursementScope; limit?: number } = {},
+  ): Promise<
+    Array<{
+      id: string;
+      scope: EscrowDisbursementScope;
+      scopeRefId: string | null;
+      orderId: string | null;
+      amountSen: string;
+      status: EscrowDisbursementStatus;
+      heldReason: string | null;
+      lastError: string | null;
+      danaReferenceNo: string | null;
+      createdAt: Date;
+      updatedAt: Date;
+    }>
+  > {
+    const rows = await this.prisma.escrowDisbursement.findMany({
+      where: {
+        sellerId: userId,
+        ...(opts.scope ? { scope: opts.scope } : {}),
+      },
+      orderBy: { createdAt: 'desc' },
+      take: Math.min(opts.limit ?? 20, 100),
+      select: {
+        id: true,
+        scope: true,
+        scopeRefId: true,
+        orderId: true,
+        amountSen: true,
+        status: true,
+        heldReason: true,
+        lastError: true,
+        danaReferenceNo: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+    return rows.map((r) => ({ ...r, amountSen: r.amountSen.toString() }));
+  }
 }

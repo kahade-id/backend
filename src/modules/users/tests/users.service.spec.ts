@@ -339,6 +339,28 @@ describe('UsersService', () => {
       expect(res.total).toBe(0);
     });
 
+    // D1-006: getMyFollowingIds — satu query, hanya id/username.
+    it('getMyFollowingIds: satu query follow.findMany, select id/username saja', async () => {
+      mockPrisma.follow.findMany.mockResolvedValue([
+        { following: { userId: 'USR-A', username: 'akun_a' } },
+        { following: { userId: 'USR-B', username: null } },
+      ]);
+      const res = await service.getMyFollowingIds('user-db-1');
+      expect(res).toEqual({
+        following: [
+          { userId: 'USR-A', username: 'akun_a' },
+          { userId: 'USR-B', username: null },
+        ],
+      });
+      const call = mockPrisma.follow.findMany.mock.calls[0][0];
+      expect(call).toEqual({
+        where: { followerId: 'user-db-1' },
+        select: { following: { select: { userId: true, username: true } } },
+      });
+      // Tidak ada query tambahan (count / findUnique / user lookup).
+      expect(mockPrisma.follow.count).not.toHaveBeenCalled();
+    });
+
     // Batch 139 BE-API2 (item 118): isFollowingByViewer per baris.
     it('marks isFollowingByViewer for rows the viewer follows (followers)', async () => {
       mockPrisma.user.findUnique.mockResolvedValue({ id: 'u1' });

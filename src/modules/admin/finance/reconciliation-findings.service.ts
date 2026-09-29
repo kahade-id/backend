@@ -81,42 +81,70 @@ export class ReconciliationFindingsService {
    * Simpan temuan dari hasil rekonsiliasi. Dedup: lewati user yang sudah
    * punya temuan NEW/INVESTIGATING (belum resolved).
    * Mengembalikan temuan yang benar-benar dibuat.
+   *
+   * B1-010 (perf): dedup dalam SATU findMany + SATU createManyAndReturn —
+   * bukan read-then-write per temuan (N+1 + race window duplikat antar proses).
+   * Dedup intra-batch (user yang sama muncul 2x) dipertahankan: hanya yang
+   * pertama dibuat, seperti perilaku loop lama.
    */
   async recordFromDiscrepancies(
     discrepancies: WalletDiscrepancy[],
     batchId: string | null,
     requestedBy: string,
   ): Promise<FindingView[]> {
-    const created: FindingView[] = [];
-    for (const d of discrepancies) {
-      const existing = await this.prisma.reconciliationFinding.findFirst({
-        where: { userId: d.userId, status: { in: UNRESOLVED_STATUSES } },
-        select: { id: true },
-      });
-      if (existing) {
-        this.logger.debug(
-          `Skipping duplicate finding for user ${d.userId} (unresolved ${existing.id})`,
-        );
-        continue;
-      }
+    if (discrepancies.length === 0) return [];
 
-      const differenceSen = toSen(Math.abs(d.discrepancy));
-      const urgent = d.discrepancy !== 0 && differenceSen > toSen(RECONCILIATION_URGENT_THRESHOLD_IDR);
-      const violatedInvariants: string[] = [];
-      if (d.discrepancy !== 0) violatedInvariants.push(LEDGER_MISMATCH_INVARIANT);
-      if (d.invariantViolation) violatedInvariants.push(COMPONENT_MISMATCH_INVARIANT);
-      if (urgent) violatedInvariants.push(URGENT_INVARIANT);
+    const userIds = [...new Set(discrepancies.map((d) => d.userId))];
+    const unresolved = await this.prisma.reconciliationFinding.findMany({
+      where: { userId: { in: userIds }, status: { in: UNRESOLVED_STATUSES } },
+      select: { userId: true },
+    });
+    const hasUnresolved = new Set(unresolved.map((r) => r.userId));
 
-      const row = await this.prisma.reconciliationFinding.create({
-        data: {
+    const seenInBatch = new Set<string>();
+    const prepared = discrepancies
+      .filter((d) => {
+        if (hasUnresolved.has(d.userId) || seenInBatch.has(d.userId)) {
+          this.logger.debug(`Skipping duplicate finding for user ${d.userId}`);
+          return false;
+        }
+        seenInBatch.add(d.userId);
+        return true;
+      })
+      .map((d) => {
+        const differenceSen = toSen(Math.abs(d.discrepancy));
+        const urgent =
+          d.discrepancy !== 0 && differenceSen > toSen(RECONCILIATION_URGENT_THRESHOLD_IDR);
+        const violatedInvariants: string[] = [];
+        if (d.discrepancy !== 0) violatedInvariants.push(LEDGER_MISMATCH_INVARIANT);
+        if (d.invariantViolation) violatedInvariants.push(COMPONENT_MISMATCH_INVARIANT);
+        if (urgent) violatedInvariants.push(URGENT_INVARIANT);
+        return {
           userId: d.userId,
-          recordedBalance: signedToSen(d.actualTotal),
-          computedBalance: signedToSen(d.expectedTotal),
-          difference: signedToSen(d.discrepancy),
-          violatedInvariants,
-          batchId,
-        },
+          discrepancy: d.discrepancy,
+          urgent,
+          data: {
+            userId: d.userId,
+            recordedBalance: signedToSen(d.actualTotal),
+            computedBalance: signedToSen(d.expectedTotal),
+            difference: signedToSen(d.discrepancy),
+            violatedInvariants,
+            batchId,
+          },
+        };
       });
+    if (prepared.length === 0) return [];
+
+    const rows = await this.prisma.reconciliationFinding.createManyAndReturn({
+      data: prepared.map((p) => p.data),
+    });
+    const rowByUserId = new Map(rows.map((r) => [r.userId, r]));
+
+    const created: FindingView[] = [];
+    const urgentAlerts: Promise<void>[] = [];
+    for (const p of prepared) {
+      const row = rowByUserId.get(p.userId);
+      if (!row) continue;
 
       this.auditLog.logAdminAction({
         adminId: requestedBy,
@@ -124,23 +152,24 @@ export class ReconciliationFindingsService {
         targetType: 'ReconciliationFinding',
         targetId: row.id,
         description:
-          `Reconciliation finding for user ${d.userId}: difference Rp${d.discrepancy.toLocaleString('id-ID')}` +
-          (urgent ? ' [URGENT]' : ''),
+          `Reconciliation finding for user ${p.userId}: difference Rp${p.discrepancy.toLocaleString('id-ID')}` +
+          (p.urgent ? ' [URGENT]' : ''),
         after: {
-          userId: d.userId,
-          differenceIdr: d.discrepancy,
-          urgent,
+          userId: p.userId,
+          differenceIdr: p.discrepancy,
+          urgent: p.urgent,
           batchId,
-          violatedInvariants,
+          violatedInvariants: row.violatedInvariants,
         },
         ipAddress: 'internal',
       });
 
-      if (urgent) {
-        await this.raiseUrgentAlert(row.id, d.userId, d.discrepancy);
+      if (p.urgent) {
+        urgentAlerts.push(this.raiseUrgentAlert(row.id, p.userId, p.discrepancy));
       }
       created.push(this.toView(row));
     }
+    await Promise.all(urgentAlerts);
     return created;
   }
 

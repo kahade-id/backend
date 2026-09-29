@@ -193,6 +193,44 @@ export class DisputesService {
     return createPaginatedResponse(signedData, total, safePage, safeLimit);
   }
 
+  /**
+   * D1-010 (perf 2026-09-29): fingerprint ringan untuk poll — SATU query
+   * (select + _count pesan), bukan bundle penuh getDisputeDetail (order +
+   * 50 evidences + signed URLs + calls + decision). Dipakai endpoint
+   * GET /v1/disputes/:disputeId/fingerprint.
+   */
+  async getDisputeFingerprint(
+    disputeId: string,
+    userId: string,
+  ): Promise<{ disputeId: string; status: string; updatedAt: Date; messageCount: number }> {
+    const dispute = await this.prisma.dispute.findFirst({
+      where: { OR: [{ id: disputeId }, { disputeId }] },
+      select: {
+        id: true,
+        disputeId: true,
+        status: true,
+        updatedAt: true,
+        order: { select: { buyerId: true, sellerId: true } },
+        _count: { select: { messages: true } },
+      },
+    });
+
+    if (!dispute) {
+      throw new NotFoundException({ code: ErrorCodes.DISPUTE_NOT_FOUND, message: 'Dispute not found' });
+    }
+
+    if (dispute.order.buyerId !== userId && dispute.order.sellerId !== userId) {
+      throw new ForbiddenException({ code: ErrorCodes.NOT_DISPUTE_PARTICIPANT, message: 'You are not a participant in this dispute' });
+    }
+
+    return {
+      disputeId: dispute.disputeId,
+      status: dispute.status,
+      updatedAt: dispute.updatedAt,
+      messageCount: dispute._count.messages,
+    };
+  }
+
   async getDisputeDetail(disputeId: string, userId: string): Promise<Record<string, unknown>> {
     const dispute = await this.prisma.dispute.findFirst({
       where: { OR: [{ id: disputeId }, { disputeId }] },

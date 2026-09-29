@@ -1,6 +1,6 @@
 import { Injectable, Logger, BadRequestException, NotFoundException, ForbiddenException, ConflictException, GoneException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { ContentHiddenReason, Prisma, ShowcaseVisibility } from '@prisma/client';
+import { ContentHiddenReason, OrderStatus, Prisma, ShowcaseVisibility } from '@prisma/client';
 import { createHash } from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
@@ -21,6 +21,8 @@ import {
   SHOWCASE_FOR_YOU_LIKE_SIGNAL_LIMIT,
   SHOWCASE_FOR_YOU_RECENT_POOL,
   SHOWCASE_FOR_YOU_SCORE_TIME_BUCKET_MS,
+  SHOWCASE_FOR_YOU_SIGNALS_CACHE_TTL_SECONDS,
+  SHOWCASE_FOR_YOU_POOL_CACHE_TTL_SECONDS,
   SHOWCASE_MAX_IMAGES_ABSOLUTE,
   SHOWCASE_MAX_ITEMS,
   SHOWCASE_REPLY_LIMIT,
@@ -32,6 +34,7 @@ import {
   SHOWCASE_VIEW_DEDUPE_TTL_SECONDS,
 } from '../../common/constants/app.constants';
 import { createPaginatedResponse } from '../../common/dto/pagination.dto';
+import { toStorable, fromStorable, stableStringify } from '../../common/utils/json-cache.util';
 import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 import { AdminShowcaseReportsService } from '../admin/showcase-reports/admin-showcase-reports.service';
 import { moderationDb } from '../admin/showcase-reports/moderation-prisma.types';
@@ -42,6 +45,11 @@ import { ShowcaseFeedQueryDto, ShowcaseFeedSort } from './dto/showcase-feed-quer
 import { ReportShowcaseDto } from './dto/report-showcase.dto';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { VerificationBadgeService, getSealTierFromTypes } from '../users/verification-badge.service';
+// D1-001 (perf 2026-09-29): ambang badge commerce dipakai ulang di
+// serializeFeedPage supaya definisi TERLARIS tetap satu sumber kebenaran
+// (product-commerce.service tidak mengimpor showcase.service — aman dari
+// circular import).
+import { BEST_SELLER_MIN_COMPLETED, BEST_SELLER_WINDOW_DAYS } from '../commerce/services/product-commerce.service';
 
 /**
  * Section 3 — Showcase sebagai konten sosial + feed discover.
@@ -505,13 +513,15 @@ export class ShowcaseService {
   /**
    * Bentuk publik satu item showcase.
    *
-   * `orderLink` berisi data siap pakai untuk membuat OrderLink dari item ini
-   * (title/description/orderValue/counterpartUsername sudah ter-prefill) supaya
-   * tombol "Pesan" di feed discover tidak perlu merakit apa pun lagi.
+   * Mode detail/owner: `orderLink` berisi data siap pakai untuk membuat
+   * OrderLink dari item ini (title/description/orderValue/counterpartUsername
+   * sudah ter-prefill) supaya tombol "Pesan" di layar detail tidak perlu
+   * merakit apa pun lagi. Mode excerpt (feed): orderLink TIDAK dikirim
+   * (D1-011) — diganti flag eksplisit `isCommerce` + `badges[]` (D1-001).
    */
   private serializeShowcase(
     row: ShowcaseRow,
-    options: { isLiked?: boolean; isSaved?: boolean; isOwner?: boolean; authorBadges?: Array<{ type: string }>; followedAuthorIds?: Set<string>; excerpt?: boolean } = {},
+    options: { isLiked?: boolean; isSaved?: boolean; isOwner?: boolean; authorBadges?: Array<{ type: string }>; followedAuthorIds?: Set<string>; excerpt?: boolean; bestsellerIds?: Set<string> } = {},
   ): Record<string, unknown> {
     // Batch 19 TIM A (item 1 & 2): media etalase bisa image/video/spin360.
     // Field lama (id/imageUrl/sortOrder) tetap — kontrak lama tidak berubah.
@@ -541,7 +551,23 @@ export class ShowcaseService {
         : firstMedia.imageUrl
       : null;
     const orderValue = priceMin ?? priceMax ?? null;
+    const orderValueValid = orderValue !== null && orderValue >= ORDER_MIN_VALUE && orderValue <= ORDER_MAX_VALUE;
     const counterpartUsername = row.user.username ?? row.user.userId;
+    // D1-001/D1-011 (perf 2026-09-29): flag commerce EKSPLISIT — pengganti
+    // pemicu lama "keberadaan orderLink" yang selalu truthy (orderLink selalu
+    // diserialkan, jadi tiap kartu feed me-render CommerceBadgesCompact dan
+    // menembak GET /v1/commerce/products/:id/badges). Badge commerce kini
+    // diserialkan langsung di payload feed: TERLARIS dari SATU groupBy per
+    // halaman (options.bestsellerIds), DISKON dari originalPriceValid yang
+    // sudah dihitung di sini — N+1 badge hilang total.
+    const originalPriceValid =
+      row.originalPrice != null &&
+      (priceMin ?? priceMax) != null &&
+      row.originalPrice > BigInt(0) &&
+      row.originalPrice > (row.priceMin ?? row.priceMax)!;
+    const commerceBadges: string[] = [];
+    if (options.bestsellerIds?.has(row.id)) commerceBadges.push('TERLARIS');
+    if (originalPriceValid) commerceBadges.push('DISKON');
 
     // Deskripsi OrderLink punya minLength 10; deskripsi showcase boleh kosong,
     // jadi sediakan fallback yang tetap masuk akal.
@@ -580,7 +606,8 @@ export class ShowcaseService {
             updatedAt: row.updatedAt,
           }),
       // Batch 19 TIM A (item 6): kondisi barang (BARU/BEKAS/null).
-      condition: row.condition ?? null,
+      // D1-011: kartu feed tidak merendernya — hanya di detail/owner.
+      ...(options.excerpt ? {} : { condition: row.condition ?? null }),
       images,
       coverImageUrl,
       priceMin,
@@ -590,19 +617,26 @@ export class ShowcaseService {
       // logika per tipe (jasa → tenggat). Field sudah ada di DB sejak
       // migrasi 20261001000000; sebelumnya hanya bisa dibaca via
       // PATCH /v1/commerce/products/:id response. Additive-only.
-      productType: row.productType ?? null,
-      originalPrice: toNumber(row.originalPrice ?? null),
-      originalPriceValid:
-        row.originalPrice != null &&
-        (priceMin ?? priceMax) != null &&
-        row.originalPrice > BigInt(0) &&
-        row.originalPrice > (row.priceMin ?? row.priceMax)!,
-      serviceDeadlineDays: row.serviceDeadlineDays ?? null,
+      // D1-011 (2026-09-29): kartu feed tidak memakai field-field ini —
+      // badge DISKON kini datang dari `badges[]` (D1-001). Hanya detail/owner.
+      ...(options.excerpt
+        ? {}
+        : {
+            productType: row.productType ?? null,
+            originalPrice: toNumber(row.originalPrice ?? null),
+            originalPriceValid,
+            serviceDeadlineDays: row.serviceDeadlineDays ?? null,
+          }),
       likeCount: row.likeCount,
       commentCount: row.commentCount,
-      viewCount: row.viewCount,
-      // S-4: berapa kali deep link share item ini dibuka.
-      shareCount: row.shareCount,
+      // D1-011: viewCount/shareCount tidak dirender kartu feed — hanya detail.
+      ...(options.excerpt
+        ? {}
+        : {
+            viewCount: row.viewCount,
+            // S-4: berapa kali deep link share item ini dibuka.
+            shareCount: row.shareCount,
+          }),
       // Batch 19 TIM A (item 3): save counter + status save viewer.
       saveCount: row.saveCount,
       isLiked: Boolean(options.isLiked),
@@ -612,6 +646,8 @@ export class ShowcaseService {
       // NP-007: updatedAt juga field manajemen — hanya di detail/owner.
       ...(options.excerpt ? {} : { updatedAt: row.updatedAt }),
       author: {
+        // NB: userId TETAP dikirim di excerpt — parser frontend
+        // (parseShowcaseItem) menjadikannya syarat validasi item.
         userId: row.user.userId,
         username: row.user.username,
         fullName: row.user.fullName,
@@ -633,14 +669,28 @@ export class ShowcaseService {
         // `followedAuthorIds` tetap mendapat false (kontrak lama tak berubah).
         isFollowing: options.followedAuthorIds?.has(row.user.id) ?? false,
       },
-      orderLink: {
-        title: row.title.slice(0, 100),
-        description: orderDescription,
-        orderValue,
-        orderValueValid: orderValue !== null && orderValue >= ORDER_MIN_VALUE && orderValue <= ORDER_MAX_VALUE,
-        counterpartUsername,
-      },
-      shareUrl: this.buildShareUrl(row.id),
+      // D1-001 (perf 2026-09-29): badge commerce dari payload feed —
+      // frontend tidak lagi N+1 GET /v1/commerce/products/:id/badges.
+      // Selalu array (bisa kosong) supaya klien lama/baru konsisten.
+      badges: commerceBadges,
+      // D1-011: flag commerce EKSPLISIT — pengganti pemicu lama "orderLink
+      // ada" di CommerceBadgesCompact. true = harga valid & bisa dipesan.
+      isCommerce: orderValueValid,
+      // D1-011 (2026-09-29): orderLink+shareUrl tidak dipakai kartu feed —
+      // prefill transaksi hanya dipakai layar detail (non-excerpt). Payload
+      // feed menghemat ~600 byte/item (title+description duplikat).
+      ...(options.excerpt
+        ? {}
+        : {
+            orderLink: {
+              title: row.title.slice(0, 100),
+              description: orderDescription,
+              orderValue,
+              orderValueValid,
+              counterpartUsername,
+            },
+            shareUrl: this.buildShareUrl(row.id),
+          }),
     };
   }
 
@@ -1510,41 +1560,52 @@ export class ShowcaseService {
       }
       if (!isNew) return false;
     }
-    // Atomic increment + scope id: pola TransactionTemplatesService.recordUsage.
-    // R2 (audit Discovery 2026-09-26): guard status — item yang ter-soft-delete
-    // / nonaktif di antara visibility-check dan increment tidak menambah counter.
-    await this.prisma.userShowcase.updateMany({
-      where: { id: showcaseId, deletedAt: null, isActive: true },
-      data: { viewCount: { increment: 1 } },
-    });
-    // Populer harian: hotViews naik bila bucket hari kalender (WIB) masih
-    // sama, reset ke 1 bila hari sudah berganti — satu statement CASE yang
-    // atomik, tanpa cron. Guard status sama seperti updateMany di atas (R2).
-    const today = wibToday();
-    const touched = await this.prisma.$executeRaw`
-      UPDATE "user_showcases"
-      SET "hotViews" = CASE WHEN "hotViewDate" = ${today}::date THEN "hotViews" + 1 ELSE 1 END,
-          "hotViewDate" = ${today}::date
-      WHERE "id" = ${showcaseId} AND "deletedAt" IS NULL AND "isActive" = TRUE
-    `;
-    // Agregat harian (riwayat popularitas untuk analitik/admin). Best-effort:
-    // metrik non-kritis — kegagalan tulis tidak boleh menggagalkan pencatatan
-    // view (fail-open seperti Redis di atas). Dilewati bila barisnya ternyata
-    // sudah tidak valid di antara check dan tulis (touched = 0).
-    if (touched !== 0) {
-      try {
-        const dayStart = new Date(`${today}T00:00:00Z`);
-        await this.prisma.showcaseDailyStat.upsert({
-          where: { showcaseId_date: { showcaseId, date: dayStart } },
-          update: { views: { increment: 1 } },
-          create: { showcaseId, date: dayStart, views: 1 },
-        });
-      } catch (error) {
-        this.logger.warn(
-          `recordView: agregat harian gagal untuk showcase=${showcaseId}: ${(error as Error)?.message ?? error}`,
-        );
+    // B1-013 (perf): tulis DB fire-and-forget — 2 round-trip keluar dari
+    // request path. Kehilangan sedikit count saat crash = acceptable (metrik).
+    // Dedupe Redis di atas TETAP di-await karena hasilnya dipakai respons
+    // (viewCount optimistis +1).
+    const writes = (async () => {
+      // Atomic increment + scope id: pola TransactionTemplatesService.recordUsage.
+      // R2 (audit Discovery 2026-09-26): guard status — item yang ter-soft-delete
+      // / nonaktif di antara visibility-check dan increment tidak menambah counter.
+      await this.prisma.userShowcase.updateMany({
+        where: { id: showcaseId, deletedAt: null, isActive: true },
+        data: { viewCount: { increment: 1 } },
+      });
+      // Populer harian: hotViews naik bila bucket hari kalender (WIB) masih
+      // sama, reset ke 1 bila hari sudah berganti — satu statement CASE yang
+      // atomik, tanpa cron. Guard status sama seperti updateMany di atas (R2).
+      const today = wibToday();
+      const touched = await this.prisma.$executeRaw`
+        UPDATE "user_showcases"
+        SET "hotViews" = CASE WHEN "hotViewDate" = ${today}::date THEN "hotViews" + 1 ELSE 1 END,
+            "hotViewDate" = ${today}::date
+        WHERE "id" = ${showcaseId} AND "deletedAt" IS NULL AND "isActive" = TRUE
+      `;
+      // Agregat harian (riwayat popularitas untuk analitik/admin). Best-effort:
+      // metrik non-kritis — kegagalan tulis tidak boleh menggagalkan pencatatan
+      // view (fail-open seperti Redis di atas). Dilewati bila barisnya ternyata
+      // sudah tidak valid di antara check dan tulis (touched = 0).
+      if (touched !== 0) {
+        try {
+          const dayStart = new Date(`${today}T00:00:00Z`);
+          await this.prisma.showcaseDailyStat.upsert({
+            where: { showcaseId_date: { showcaseId, date: dayStart } },
+            update: { views: { increment: 1 } },
+            create: { showcaseId, date: dayStart, views: 1 },
+          });
+        } catch (error) {
+          this.logger.warn(
+            `recordView: agregat harian gagal untuk showcase=${showcaseId}: ${(error as Error)?.message ?? error}`,
+          );
+        }
       }
-    }
+    })().catch((error) => {
+      this.logger.warn(
+        `recordView: tulis DB gagal untuk showcase=${showcaseId}: ${(error as Error)?.message ?? error}`,
+      );
+    });
+    void writes;
     return true;
   }
 
@@ -1772,43 +1833,62 @@ export class ShowcaseService {
 
     const where: Prisma.UserShowcaseWhereInput =
       andClauses.length > 0 ? { ...baseWhere, AND: andClauses } : baseWhere;
-    const orderBy: Prisma.UserShowcaseOrderByWithRelationInput[] = [
-      { createdAt: 'desc' },
-      { id: 'desc' },
-    ];
-    const findPool = (poolWhere: Prisma.UserShowcaseWhereInput, take: number) =>
-      this.prisma.userShowcase
-        .findMany({ where: poolWhere, orderBy, take, include: SHOWCASE_INCLUDE })
-        .then((rows) => rows as unknown as ShowcaseRow[]);
 
-    const likedCategories = [...signals.categoryAffinity.keys()];
-    const followedIds = [...signals.followedSellerIds];
-    // Tiga pool kandidat — semuanya menghormati filter feed yang sama
-    // (visibilitas, blokir, kategori/search/harga/lokasi dari query).
-    const [affinityRows, followedRows, recentRows] = await Promise.all([
-      // Pool 1: item terbaru dari kategori yang disukai viewer.
-      likedCategories.length > 0
-        ? findPool({ ...where, category: { in: likedCategories } }, SHOWCASE_FOR_YOU_AFFINITY_POOL)
-        : Promise.resolve([] as ShowcaseRow[]),
-      // Pool 2: item terbaru dari seller yang di-follow viewer.
-      followedIds.length > 0
-        ? findPool({ ...where, userId: { in: followedIds } }, SHOWCASE_FOR_YOU_FOLLOWED_POOL)
-        : Promise.resolve([] as ShowcaseRow[]),
-      // Pool 3: item terbaru secara umum (discovery + keragaman).
-      findPool(where, SHOWCASE_FOR_YOU_RECENT_POOL),
-    ]);
-
-    const merged = new Map<string, ShowcaseRow>();
-    for (const row of [...affinityRows, ...followedRows, ...recentRows]) {
-      if (!merged.has(row.id)) merged.set(row.id, row);
-    }
-
-    // `now` dibulatkan ke bucket 15 menit supaya skor yang dihitung ulang
-    // antar-request identik bit-per-bit (syarat keyset in-memory tetap valid
-    // bila halaman 2 diminta beberapa menit setelah halaman 1).
+    // B1-001 (perf): `now` dibulatkan ke bucket 15 menit supaya skor yang
+    // dihitung ulang antar-request identik bit-per-bit (syarat keyset
+    // in-memory tetap valid bila halaman 2 diminta beberapa menit setelah
+    // halaman 1). Dihitung DI SINI (bukan setelah fetch pool) supaya jadi
+    // bagian dari cache key pool.
     const nowBucket =
       Math.floor(Date.now() / SHOWCASE_FOR_YOU_SCORE_TIME_BUCKET_MS) *
       SHOWCASE_FOR_YOU_SCORE_TIME_BUCKET_MS;
+
+    // B1-001 (perf): cache merged candidate pool per (viewerId, filter hash,
+    // bucket skor), TTL 15 menit. Pool hanya fungsi dari filter + sinyal;
+    // sinyal per viewer di-cache terpisah (TTL 10 mnt) di getForYouSignals.
+    // Skor DIHITUNG ULANG dari pool yang sama persis tiap request — ranking
+    // dan hasil TIDAK berubah, hanya query DB yang dihemat.
+    const filterHash = createHash('sha256')
+      .update(stableStringify({ baseWhere, andClauses }))
+      .digest('hex')
+      .slice(0, 32);
+    const poolCacheKey = `showcase:foryou:pool:${viewerId}:${filterHash}:${nowBucket}`;
+
+    let merged = await this.getCachedForYouPool(poolCacheKey);
+    if (!merged) {
+      const orderBy: Prisma.UserShowcaseOrderByWithRelationInput[] = [
+        { createdAt: 'desc' },
+        { id: 'desc' },
+      ];
+      const findPool = (poolWhere: Prisma.UserShowcaseWhereInput, take: number) =>
+        this.prisma.userShowcase
+          .findMany({ where: poolWhere, orderBy, take, include: SHOWCASE_INCLUDE })
+          .then((rows) => rows as unknown as ShowcaseRow[]);
+
+      const likedCategories = [...signals.categoryAffinity.keys()];
+      const followedIds = [...signals.followedSellerIds];
+      // Tiga pool kandidat — semuanya menghormati filter feed yang sama
+      // (visibilitas, blokir, kategori/search/harga/lokasi dari query).
+      const [affinityRows, followedRows, recentRows] = await Promise.all([
+        // Pool 1: item terbaru dari kategori yang disukai viewer.
+        likedCategories.length > 0
+          ? findPool({ ...where, category: { in: likedCategories } }, SHOWCASE_FOR_YOU_AFFINITY_POOL)
+          : Promise.resolve([] as ShowcaseRow[]),
+        // Pool 2: item terbaru dari seller yang di-follow viewer.
+        followedIds.length > 0
+          ? findPool({ ...where, userId: { in: followedIds } }, SHOWCASE_FOR_YOU_FOLLOWED_POOL)
+          : Promise.resolve([] as ShowcaseRow[]),
+        // Pool 3: item terbaru secara umum (discovery + keragaman).
+        findPool(where, SHOWCASE_FOR_YOU_RECENT_POOL),
+      ]);
+
+      merged = new Map<string, ShowcaseRow>();
+      for (const row of [...affinityRows, ...followedRows, ...recentRows]) {
+        if (!merged.has(row.id)) merged.set(row.id, row);
+      }
+      await this.setCachedForYouPool(poolCacheKey, [...merged.values()]);
+    }
+
     const scored = [...merged.values()].map((row) => ({
       row,
       score: this.scoreForYouItem(row, signals, nowBucket),
@@ -1850,8 +1930,27 @@ export class ShowcaseService {
   /**
    * Profil afinitas viewer: kategori dari item yang di-like + seller yang
    * di-follow. Dua query kecil dan bounded (bukan seluruh riwayat).
+   *
+   * B1-001 (perf): hasil di-cache 10 menit di Redis — 2 query sinyal tidak
+   * lagi diulang tiap halaman feed. Redis down -> fail-open (hitung ulang).
    */
   private async getForYouSignals(viewerId: string): Promise<ForYouSignals> {
+    const cacheKey = `showcase:foryou:signals:${viewerId}`;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) {
+        const parsed = JSON.parse(cached) as { cats: [string, number][]; followed: string[] };
+        return {
+          categoryAffinity: new Map(parsed.cats),
+          followedSellerIds: new Set(parsed.followed),
+        };
+      }
+    } catch (error) {
+      // Fail-open: Redis down / cache corrupt -> hitung ulang seperti biasa.
+      this.logger.warn(
+        `getForYouSignals: cache miss/error untuk viewer=${viewerId}: ${(error as Error)?.message ?? error}`,
+      );
+    }
     const [likes, follows] = await Promise.all([
       this.prisma.showcaseLike.findMany({
         where: { userId: viewerId },
@@ -1872,10 +1971,53 @@ export class ShowcaseService {
       if (!cat) continue;
       categoryAffinity.set(cat, (categoryAffinity.get(cat) ?? 0) + 1);
     }
-    return {
+    const signals: ForYouSignals = {
       categoryAffinity,
       followedSellerIds: new Set(follows.map((f) => f.followingId)),
     };
+    await this.redis.set(
+      cacheKey,
+      JSON.stringify({
+        cats: [...categoryAffinity.entries()],
+        followed: [...signals.followedSellerIds],
+      }),
+      SHOWCASE_FOR_YOU_SIGNALS_CACHE_TTL_SECONDS,
+    ).catch((error) => {
+      this.logger.warn(`getForYouSignals: tulis cache gagal: ${(error as Error)?.message ?? error}`);
+    });
+    return signals;
+  }
+
+  /**
+   * B1-001 (perf): baca merged candidate pool dari Redis. `null` bila miss /
+   * corrupt / Redis down (fail-open — pemanggil fetch ulang dari DB).
+   * Serialisasi aman untuk Date & bigint via json-cache.util.
+   */
+  private async getCachedForYouPool(cacheKey: string): Promise<Map<string, ShowcaseRow> | null> {
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (!cached) return null;
+      const rows = fromStorable<ShowcaseRow[]>(JSON.parse(cached));
+      const merged = new Map<string, ShowcaseRow>();
+      for (const row of rows) merged.set(row.id, row);
+      return merged;
+    } catch (error) {
+      this.logger.warn(`getForYouFeed: pool cache miss/error: ${(error as Error)?.message ?? error}`);
+      return null;
+    }
+  }
+
+  /** B1-001 (perf): tulis merged candidate pool ke Redis (fail-open). */
+  private async setCachedForYouPool(cacheKey: string, rows: ShowcaseRow[]): Promise<void> {
+    try {
+      await this.redis.set(
+        cacheKey,
+        JSON.stringify(toStorable(rows)),
+        SHOWCASE_FOR_YOU_POOL_CACHE_TTL_SECONDS,
+      );
+    } catch (error) {
+      this.logger.warn(`getForYouFeed: tulis pool cache gagal: ${(error as Error)?.message ?? error}`);
+    }
   }
 
   /**
@@ -1911,6 +2053,9 @@ export class ShowcaseService {
     // Batch 139 BE-API1 (item 102): id author yang di-follow viewer — satu
     // batch query supaya FE tidak perlu N+1 request follow-status per kartu.
     const followedAuthorIds = await this.getFollowedAuthorIds(viewerId, pageRows.map((row) => row.user.id));
+    // D1-001 (perf 2026-09-29): badge TERLARIS dihitung batch per halaman —
+    // SATU groupBy order COMPLETED 90 hari, bukan N+1 per kartu.
+    const bestsellerIds = await this.getBestsellerIds(pageRows.map((row) => row.id));
 
     return {
       items: pageRows.map((row) =>
@@ -1919,6 +2064,7 @@ export class ShowcaseService {
           isSaved: savedIds.has(row.id),
           authorBadges: badgeMap.get(row.user.id) ?? [],
           followedAuthorIds,
+          bestsellerIds,
           excerpt: true,
         }),
       ),
@@ -1944,6 +2090,36 @@ export class ShowcaseService {
       select: { followingId: true },
     });
     return new Set(rows.map((row) => row.followingId));
+  }
+
+  /**
+   * D1-001 (perf 2026-09-29): id showcase yang berhak atas badge TERLARIS —
+   * SATU query `groupBy` order COMPLETED dalam 90 hari terakhir untuk satu
+   * halaman feed, menggantikan N request ke
+   * GET /v1/commerce/products/:id/badges (yang tiap request-nya 2 query).
+   * Ambang & jendela waktu memakai konstanta yang SAMA dengan endpoint
+   * badges (BEST_SELLER_MIN_COMPLETED / BEST_SELLER_WINDOW_DAYS) supaya
+   * definisi "terlaris" tidak drift.
+   */
+  private async getBestsellerIds(showcaseIds: string[]): Promise<Set<string>> {
+    const unique = [...new Set(showcaseIds.filter((id) => id))];
+    if (unique.length === 0) return new Set();
+    const since = new Date(Date.now() - BEST_SELLER_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+    const groups = await this.prisma.order.groupBy({
+      by: ['showcaseId'],
+      where: {
+        showcaseId: { in: unique },
+        status: OrderStatus.COMPLETED,
+        deletedAt: null,
+        completedAt: { gte: since },
+      },
+      _count: { _all: true },
+    });
+    return new Set(
+      groups
+        .filter((g) => g.showcaseId && g._count._all >= BEST_SELLER_MIN_COMPLETED)
+        .map((g) => g.showcaseId as string),
+    );
   }
 
   /**

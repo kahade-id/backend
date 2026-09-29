@@ -116,6 +116,19 @@ export class DisputesController {
     return this.disputesService.listMyDisputes(userId, pagination.page!, pagination.limit!);
   }
 
+  @Get(':disputeId/fingerprint')
+  @ApiOperation({
+    summary: 'Get dispute fingerprint (lightweight)',
+    description:
+      'D1-010: fingerprint ringan untuk poll — status + updatedAt + jumlah pesan. Klien me-refresh bundle penuh hanya bila fingerprint berubah.',
+  })
+  async getDisputeFingerprint(
+    @CurrentUser('sub') userId: string,
+    @Param('disputeId', ParseIdPipe) disputeId: string,
+  ): Promise<{ disputeId: string; status: string; updatedAt: Date; messageCount: number }> {
+    return this.disputesService.getDisputeFingerprint(disputeId, userId);
+  }
+
   @Get(':disputeId')
   @ApiOperation({ summary: 'Get dispute detail' })
   async getDisputeDetail(

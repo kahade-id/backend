@@ -9,6 +9,8 @@ export const RECONCILIATION_QUEUE = 'reconciliation';
 export interface ReconciliationJobData {
   requestedBy: string;
   requestedAt: string;
+  /** B1-006: bila true, paksa full scan (default trigger manual admin = full). */
+  full?: boolean;
 }
 
 @Injectable()
@@ -24,7 +26,11 @@ export class ReconciliationProcessor {
   @Process({ name: 'reconcile-all', concurrency: 1 })
   async handleReconcileAll(job: Job<ReconciliationJobData>): Promise<ReconciliationResult> {
     this.logger.log(`Starting reconcile-all job ${job.id} (requested by ${job.data.requestedBy}), attempt ${job.attemptsMade + 1}`);
-    const result = await this.reconciliationService.reconcileAllWallets();
+    // B1-006: trigger manual admin = full scan eksplisit; cron harian memakai
+    // mode 'auto' (incremental + full scan mingguan).
+    const result = await this.reconciliationService.reconcileAllWallets({
+      mode: job.data.full === false ? 'auto' : 'full',
+    });
     this.logger.log(
       `Reconcile-all job ${job.id} complete: ${result.walletsChecked} wallets, ` +
       `${result.discrepancies.length} discrepancies`,

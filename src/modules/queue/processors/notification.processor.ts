@@ -107,7 +107,9 @@ export class NotificationProcessor {
       data: {
         ...pushData,
         notificationId: notification.notifId,
-        ...(resolvedActionUrl ? { actionUrl: resolvedActionUrl } : {}),
+        // B1-004 (perf): actionUrl SELALU ada di payload (fallback /notifications)
+        // supaya enrichPushData short-circuit tanpa findFirst + update.
+        actionUrl: resolvedActionUrl ?? '/notifications',
         notificationType: type,
         notificationCategory: category,
       },

@@ -1982,6 +1982,11 @@ model ChatRoom {
   @@index([type, initiatorId])
   @@index([type, counterpartId])
   @@index([type, status])
+  // B1-002 (perf): inbox default (getRooms) memfilter initiatorId/counterpartId
+  // TANPA filter type + ORDER BY updatedAt — index komposit lama diawali `type`
+  // sehingga tidak terpakai. Index ini melayani filter + sort sekaligus.
+  @@index([initiatorId, updatedAt])
+  @@index([counterpartId, updatedAt])
   @@map("chat_rooms")
 }
 
@@ -2054,7 +2059,8 @@ model ChatMessage {
   editHistory ChatMessageEdit[]
   starredBy   ChatStarredMessage[]
 
-  @@index([roomId])
+  // B1-008 (perf): [roomId] redundan terhadap [roomId, createdAt] — di-drop
+  // di migrasi 20261010000000_perf_b1_indexes.
   @@index([roomId, createdAt]) // cursor-based pagination (ORDER BY createdAt DESC)
   @@index([roomId, isPinned])
   @@index([senderId])
@@ -2535,8 +2541,9 @@ model Notification {
   expiresAt DateTime?
   deletedAt DateTime?
 
-  @@index([userId, isRead])
-  @@index([userId, createdAt])
+  // B1-008 (perf): [userId, isRead] & [userId, createdAt] redundan terhadap
+  // [userId, isRead, createdAt] (aturan left-prefix btree) — di-drop di migrasi
+  // 20261010000000_perf_b1_indexes untuk mengurangi write amplification.
   @@index([userId, isRead, createdAt])
   @@index([userId, category, isRead])
   @@index([refId, refType])
@@ -3223,7 +3230,9 @@ model WebhookLog {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@index([source, isProcessed])
+  // B1-008 (perf): [source, isProcessed] redundan terhadap
+  // [source, isProcessed, nextRetryAt] — di-drop di migrasi
+  // 20261010000000_perf_b1_indexes.
   @@index([source, event])
   @@index([createdAt])
   @@index([transactionId])
@@ -4027,6 +4036,9 @@ model ShowcaseLike {
   @@unique([userId, showcaseId])
   @@index([showcaseId, createdAt, id])
   @@index([userId])
+  // B1-011 (perf): sinyal foryou sort 200 like terakhir per user
+  // (ORDER BY createdAt DESC, id DESC) — index komposit supaya tanpa sort.
+  @@index([userId, createdAt, id])
   @@map("showcase_likes")
 }
 

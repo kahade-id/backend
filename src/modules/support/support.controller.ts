@@ -36,6 +36,20 @@ export class SupportController {
     return this.supportService.createTicket(userId, dto);
   }
 
+  @Get('tickets/:ticketId/fingerprint')
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @ApiOperation({
+    summary: 'Get ticket fingerprint (lightweight)',
+    description:
+      'D1-010: fingerprint ringan untuk poll — status + updatedAt + jumlah balasan. Klien me-refresh bundle penuh hanya bila fingerprint berubah.',
+  })
+  async getTicketFingerprint(
+    @CurrentUser('sub') userId: string,
+    @Param('ticketId', ParseIdPipe) ticketId: string,
+  ): Promise<{ ticketId: string; status: string; updatedAt: Date; replyCount: number }> {
+    return this.supportService.getTicketFingerprint(userId, ticketId);
+  }
+
   @Get('tickets/:ticketId')
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @ApiOperation({ summary: 'Get ticket detail' })

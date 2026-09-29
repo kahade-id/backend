@@ -88,6 +88,36 @@ export class SupportService {
     return { data: mapped, total, page: safePage, limit: safeLimit };
   }
 
+  /**
+   * D1-010 (perf 2026-09-29): fingerprint ringan untuk poll — SATU query
+   * (select + _count balasan), bukan getTicketDetail (tiket + semua balasan).
+   * updatedAt ikut berubah tiap ada balasan (lihat replyToTicket), jadi
+   * balasan baru dari staf ikut terdeteksi.
+   */
+  async getTicketFingerprint(
+    userId: string,
+    ticketId: string,
+  ): Promise<{ ticketId: string; status: string; updatedAt: Date; replyCount: number }> {
+    const ticket = await this.prisma.supportTicket.findUnique({
+      where: { id: ticketId },
+      select: {
+        id: true,
+        userId: true,
+        status: true,
+        updatedAt: true,
+        _count: { select: { replies: true } },
+      },
+    });
+    if (!ticket) throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Ticket not found' });
+    if (ticket.userId !== userId) throw new ForbiddenException({ code: ErrorCodes.FORBIDDEN, message: 'Not authorized' });
+    return {
+      ticketId: ticket.id,
+      status: ticket.status,
+      updatedAt: ticket.updatedAt,
+      replyCount: ticket._count.replies,
+    };
+  }
+
   async getTicketDetail(userId: string, ticketId: string): Promise<object> {
     const ticket = await this.prisma.supportTicket.findUnique({
       where: { id: ticketId },

@@ -1984,14 +1984,16 @@ export class AuthService {
       orderBy: { createdAt: 'desc' },
       take: 5,
     });
-    for (const historical of recentPasswords) {
-      const isReused = await bcryptCompare(dto.newPassword, historical.passwordHash);
-      if (isReused) {
-        throw new BadRequestException({
-          code: ErrorCodes.PASSWORD_RECENTLY_USED,
-          message: 'New password cannot be the same as one of your last 5 passwords',
-        });
-      }
+    // B1-003 (perf): compare history diparalel (bcrypt async, aman) — semantik
+    // identik: tolak bila SALAH SATU cocok. Rounds & perilaku tidak berubah.
+    const reuseChecks = await Promise.all(
+      recentPasswords.map((historical) => bcryptCompare(dto.newPassword, historical.passwordHash)),
+    );
+    if (reuseChecks.some(Boolean)) {
+      throw new BadRequestException({
+        code: ErrorCodes.PASSWORD_RECENTLY_USED,
+        message: 'New password cannot be the same as one of your last 5 passwords',
+      });
     }
 
     const hashedPassword = await bcryptHash(dto.newPassword, getBcryptRounds());
@@ -3135,14 +3137,16 @@ export class AuthService {
       orderBy: { createdAt: 'desc' },
       take: 5,
     });
-    for (const historical of recentPasswords) {
-      const isReused = await bcryptCompare(dto.newPassword, historical.passwordHash);
-      if (isReused) {
-        throw new BadRequestException({
-          code: ErrorCodes.PASSWORD_RECENTLY_USED,
-          message: 'New password cannot be the same as one of your last 5 passwords',
-        });
-      }
+    // B1-003 (perf): compare history diparalel (bcrypt async, aman) — semantik
+    // identik: tolak bila SALAH SATU cocok. Rounds & perilaku tidak berubah.
+    const reuseChecks = await Promise.all(
+      recentPasswords.map((historical) => bcryptCompare(dto.newPassword, historical.passwordHash)),
+    );
+    if (reuseChecks.some(Boolean)) {
+      throw new BadRequestException({
+        code: ErrorCodes.PASSWORD_RECENTLY_USED,
+        message: 'New password cannot be the same as one of your last 5 passwords',
+      });
     }
 
     // Password changes can otherwise turn a stolen password into persistent account

@@ -7,7 +7,7 @@ import { UpdateProductCommerceDto } from '../dto/commerce.dto';
 
 /** Ambang badge TERLARIS: order selesai dalam 90 hari terakhir. */
 export const BEST_SELLER_MIN_COMPLETED = 10;
-const BEST_SELLER_WINDOW_DAYS = 90;
+export const BEST_SELLER_WINDOW_DAYS = 90;
 
 /**
  * BE-COMMERCE (2026-10-01) — item 1, 5, 7, 8:

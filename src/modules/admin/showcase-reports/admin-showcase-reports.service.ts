@@ -13,6 +13,7 @@ import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditAction, Prisma, ReportStatus, NotificationType, UserAuditAction, AdminRole } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
+import { mapWithConcurrency } from '../../../common/utils/bounded-concurrency.util';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { ShowcaseReportAction } from './dto/review-showcase-report.dto';
 import { AppealDecision } from './dto/decide-appeal.dto';
@@ -640,15 +641,19 @@ export class AdminShowcaseReportsService {
       });
     }
     const uniqueIds = [...new Set(ids)].slice(0, 50);
-    const results: Array<{ id: string; ok: boolean; status?: string; error?: string }> = [];
-    for (const id of uniqueIds) {
-      try {
-        const res = await this.reviewShowcaseReport(id, action, resolution, adminId, ipAddress, adminRole);
-        results.push({ id, ok: true, status: res.status });
-      } catch (err) {
-        results.push({ id, ok: false, error: err instanceof Error ? err.message : String(err) });
-      }
-    }
+    // B1-009 (perf): bulk review diparalel bounded (8 worker); hasil per item
+    // tetap terkumpul dalam urutan input. Semantik per item identik.
+    const settled = await mapWithConcurrency(
+      uniqueIds,
+      8,
+      (id) => this.reviewShowcaseReport(id, action, resolution, adminId, ipAddress, adminRole),
+    );
+    const results: Array<{ id: string; ok: boolean; status?: string; error?: string }> =
+      settled.map((s, i) =>
+        s.ok && s.value
+          ? { id: uniqueIds[i], ok: true, status: s.value.status }
+          : { id: uniqueIds[i], ok: false, error: s.error instanceof Error ? s.error.message : String(s.error) },
+      );
     return {
       action,
       total: uniqueIds.length,

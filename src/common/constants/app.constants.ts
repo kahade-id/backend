@@ -246,6 +246,13 @@ export const SHOWCASE_FOR_YOU_FOLLOW_SIGNAL_LIMIT = 500;
  *  ulang antar-halaman identik bit-per-bit (syarat keyset pagination
  *  in-memory tetap valid bila halaman 2 diminta beberapa menit kemudian). */
 export const SHOWCASE_FOR_YOU_SCORE_TIME_BUCKET_MS = 15 * 60 * 1000;
+/** B1-001 (perf): TTL cache Redis untuk sinyal afinitas viewer (like 200 +
+ *  follow 500 terakhir). Sinyal berubah lambat; 10 menit = kompromi wajar. */
+export const SHOWCASE_FOR_YOU_SIGNALS_CACHE_TTL_SECONDS = 600;
+/** B1-001 (perf): TTL cache Redis untuk merged candidate pool per
+ *  (viewerId, filter hash, bucket skor). Disamakan dengan bucket 15 menit —
+ *  skor dihitung ulang dari pool yang sama persis, ranking tidak berubah. */
+export const SHOWCASE_FOR_YOU_POOL_CACHE_TTL_SECONDS = 900;
 /** SH-B-004: satu share nyata dihitung sekali per (viewer, showcase) dalam window ini. */
 export const SHOWCASE_SHARE_DEDUPE_TTL_SECONDS = 86400;
 export const SHOWCASE_SEARCH_MIN_LENGTH = 2;

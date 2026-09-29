@@ -311,6 +311,30 @@ export class DeliveryProofService {
     };
   }
 
+  /**
+   * D1-010 (perf 2026-09-29): fingerprint ringan untuk poll — agregat
+   * (count + max updatedAt), bukan getProofs (findMany + sign URL per file).
+   * Perubahan status maupun bukti baru mengubah max(updatedAt).
+   */
+  async getProofsFingerprint(orderId: string, userId: string): Promise<{ count: number; latestUpdatedAt: Date | null }> {
+    const order = await this.prisma.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
+    if (!order)
+      throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
+    if (order.buyerId !== userId && order.sellerId !== userId) {
+      throw new ForbiddenException({
+        code: ErrorCodes.NOT_ORDER_PARTICIPANT,
+        message: 'Not a participant',
+      });
+    }
+
+    const agg = await this.prisma.deliveryProof.aggregate({
+      where: { orderId: order.id },
+      _count: { _all: true },
+      _max: { updatedAt: true },
+    });
+    return { count: agg._count._all, latestUpdatedAt: agg._max.updatedAt };
+  }
+
   async getProofs(orderId: string, userId: string): Promise<object[]> {
     const order = await this.prisma.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
     if (!order)

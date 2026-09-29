@@ -9,6 +9,9 @@ import { AuditLogService } from '../../../common/services/audit-log.service';
 import { WalletService } from '../../wallet/wallet.service';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { FlashQrisService } from '../../payment/flash-qris.service';
+import { DanaPaymentService } from '../../payment/dana/dana-payment.service';
+import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
+import { DanaDirectRefundService } from '../../no-wallet/dana-direct-refund.service';
 import { SubscriptionPlan, SubscriptionStatus, KycStatus } from '@prisma/client';
 
 const mockPrisma = {
@@ -129,6 +132,9 @@ describe('SubscriptionsService', () => {
         { provide: WalletService, useValue: mockWalletService },
         { provide: VerificationBadgeService, useValue: mockVerificationBadgeService },
         { provide: FlashQrisService, useValue: mockFlashQrisService },
+        { provide: DanaPaymentService, useValue: { createOrder: jest.fn(), getPaymentDetail: jest.fn() } },
+        { provide: WalletModeService, useValue: { isWalletEnabled: jest.fn(() => true) } },
+        { provide: DanaDirectRefundService, useValue: { refundAmount: jest.fn() } },
       ],
     }).compile();
 

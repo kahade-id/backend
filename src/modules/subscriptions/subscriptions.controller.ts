@@ -11,7 +11,7 @@ import { Idempotency } from '../../common/decorators/idempotency.decorator';
 import { KycRequiredGuard } from '../../common/guards/kyc-required.guard';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import { PaginatedResponse } from '../../common/dto/pagination.dto';
-import { SubscribeDto, RenewDto, PauseSubscriptionDto } from './dto/subscribe.dto';
+import { SubscribeDto, RenewDto, PauseSubscriptionDto, SubscribeDanaDto, RenewDanaDto } from './dto/subscribe.dto';
 
 @ApiTags('subscriptions')
 @ApiBearerAuth('access-token')
@@ -66,6 +66,41 @@ export class SubscriptionsController {
     @Param('id') id: string,
   ): Promise<{ status: string; qrString: string | null; expiredAt: Date | null }> {
     return this.subscriptionsService.getQrisStatus(userId, id);
+  }
+
+  @Post('subscribe-dana')
+  @ApiOperation({ summary: 'Start Kahade Plus subscription via DANA direct (QRIS/VA/BALANCE). Tanpa wallet, tanpa PIN. Subscription aktif setelah webhook DANA.' })
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  async subscribeDana(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: SubscribeDanaDto,
+    @Req() req: Request,
+  ): Promise<{ subscriptionId: string; subscription: Subscription; qrString: string | null; paymentCode: string | null; webRedirectUrl: string | null; expiredAt: Date }> {
+    const result = await this.subscriptionsService.subscribeDana(userId, dto.plan, dto.payKind, dto.bankCode, dto.promoCode, req.ip);
+    return { subscriptionId: result.subscription.id, ...result };
+  }
+
+  @Get('dana-status/:id')
+  @ApiOperation({ summary: 'Poll DANA subscription payment status (PENDING/ACTIVE)' })
+  async getDanaStatus(
+    @CurrentUser('sub') userId: string,
+    @Param('id') id: string,
+  ): Promise<{ status: string; qrString: string | null; paymentCode: string | null; webRedirectUrl: string | null; expiredAt: Date | null }> {
+    return this.subscriptionsService.getDanaStatus(userId, id);
+  }
+
+  @Post('renew-dana')
+  @ApiOperation({ summary: 'Renew Kahade Plus via DANA direct (QRIS/VA/BALANCE). Periode diperpanjang setelah webhook DANA sukses.' })
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  async renewDana(
+    @CurrentUser('sub') userId: string,
+    @Body() dto: RenewDanaDto,
+  ): Promise<{ paymentTxId: string; qrString: string | null; paymentCode: string | null; webRedirectUrl: string | null; expiredAt: Date }> {
+    return this.subscriptionsService.renewDana(userId, dto.payKind, dto.bankCode);
   }
 
   @Post('pause')

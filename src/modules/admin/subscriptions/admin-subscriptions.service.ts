@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, BadRequestException, ConflictException, 
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { MidtransService } from '../../payment/midtrans.service';
+import { DanaDirectRefundService } from '../../no-wallet/dana-direct-refund.service';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditAction, Prisma } from '@prisma/client';
 import { toIdr } from '../../../common/utils/currency.util';
@@ -21,6 +22,7 @@ export class AdminSubscriptionsService {
     private prisma: PrismaService,
     private auditLog: AuditLogService,
     private midtransService: MidtransService,
+    private danaDirectRefundService: DanaDirectRefundService,
     private redis: RedisService,
     private verificationBadgeService: VerificationBadgeService,
   ) {}
@@ -247,13 +249,38 @@ export class AdminSubscriptionsService {
 
     let paymentProviderSynced = false;
     let midtransOrderId: string | null = null;
+    let danaRefunded = false;
 
     if (subscription.paymentTxId) {
       const paymentTx = await this.prisma.paymentTransaction.findUnique({
         where: { id: subscription.paymentTxId },
-        select: { midtransOrderId: true },
+        select: { midtransOrderId: true, provider: true, status: true },
       });
       midtransOrderId = paymentTx?.midtransOrderId ?? null;
+      // Misi tanpa-wallet: payment subscription via DANA direct yang SUDAH
+      // terbayar di-refund ke metode bayar asal (idempoten).
+      if (
+        paymentTx?.provider === 'DANA' &&
+        (paymentTx.status === 'SUCCESS' || paymentTx.status === 'PENDING')
+      ) {
+        try {
+          const res = await this.danaDirectRefundService.refundAmount({
+            paymentDbId: subscription.paymentTxId,
+            reason: `Force cancel subscription ${subId} oleh admin — ${reason?.trim() || 'Force cancelled by admin'}`,
+            idempotencyKey: `ADMIN_SUB_CANCEL:${subId}`,
+          });
+          danaRefunded = res.refunded;
+          paymentProviderSynced = res.refunded;
+          this.logger.log(
+            `DANA refund untuk subscription ${subId}: refunded=${res.refunded} already=${'already' in res ? res.already : false}`,
+          );
+        } catch (err) {
+          this.logger.warn(
+            `Gagal DANA refund subscription ${subId}: ${(err as Error).message}. ` +
+              `Manual reconciliation may be required.`,
+          );
+        }
+      }
     }
 
     if (midtransOrderId) {
@@ -281,12 +308,13 @@ export class AdminSubscriptionsService {
       action: AuditAction.ADMIN_ACTION,
       targetType: 'Subscription',
       targetId: subId,
-      description: `Force cancelled subscription ${subId} for user ${subscription.userId}. Payment provider synced: ${paymentProviderSynced}.`,
+      description: `Force cancelled subscription ${subId} for user ${subscription.userId}. Payment provider synced: ${paymentProviderSynced}. DANA refunded: ${danaRefunded}.`,
       after: {
         paymentProviderSynced,
         midtransOrderId,
+        danaRefunded,
         note: paymentProviderSynced
-          ? 'Midtrans transaction cancelled successfully.'
+          ? 'Provider transaction cancelled/refunded successfully.'
           : 'Payment provider sync failed or no linked transaction. Manual reconciliation may be required.',
       },
       ipAddress,

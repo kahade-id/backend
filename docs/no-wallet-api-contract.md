@@ -98,12 +98,25 @@ Response: `{ "payoutId": "...", "status": "PENDING|SUCCESS|HELD_NO_BANK", ... }`
 
 ### 5. Subscription Kahade+ (tanpa wallet)
 
-- `POST /v1/subscriptions/subscribe-dana` — charge langsung via DANA
-  (body: `{ plan, payKind, bankCode?, promoCode? }`) → subscription PENDING +
-  data checkout DANA (format sama seperti §3). Webhook DANA → ACTIVE.
+- `POST /v1/subscriptions/subscribe-dana` — body:
+  `{ plan: "MONTHLY"|"YEARLY", payKind: "QRIS"|"VA"|"BALANCE", bankCode?, promoCode? }`
+  → subscription PENDING + data checkout DANA (`qrString` / `paymentCode` /
+  `webRedirectUrl` + `expiredAt`). Webhook DANA finish-notify → ACTIVE.
   Gagal bayar → subscription tetap PENDING/EXPIRED (fail-closed, tidak aktif
-  setengah jalan). Promo gratis admin → tetap tanpa bayar.
-- Refund subscription → DANA Refund API ke metode bayar asal (idempoten).
+  setengah jalan). Kode promo gratis / diskon 100% → tetap tanpa bayar
+  (tanpa PIN, tanpa DANA). Idempoten via `Idempotency-Key` + guard PENDING.
+- `GET /v1/subscriptions/dana-status/:id` — polling status (PENDING/ACTIVE)
+  + sinkronisasi ringan ke DANA.
+- `POST /v1/subscriptions/renew-dana` — body: `{ payKind, bankCode? }` →
+  payment DANA renewal; periode diperpanjang webhook setelah bayar sukses.
+- `POST /v1/subscriptions/subscribe-qris` (legacy Flash): saat wallet
+  nonaktif otomatis didelegasikan ke DANA QRIS (tanpa PIN — PIN adalah
+  konsep wallet).
+- `POST /v1/subscriptions/subscribe` & `POST /v1/subscriptions/renew`
+  (debit wallet): DITOLAK saat wallet nonaktif
+  (`WALLET_DISABLED_USE_DANA`).
+- Refund: admin force-cancel → payment DANA SUCCESS di-refund ke metode
+  bayar asal via DANA Refund API (idempoten `ADMIN_SUB_CANCEL:<subId>`).
 
 ### 6. Refund & payout lain (tanpa wallet)
 

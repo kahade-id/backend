@@ -1713,6 +1713,9 @@ model PaymentTransaction {
   // Misi tanpa-wallet (BI-safe): metode bayar DANA direct yang dipilih buyer
   // saat checkout ('QRIS' | 'VA' | 'BALANCE'). Aditif, nullable.
   danaPayKind            String?
+  // Misi tanpa-wallet: renewal Kahade+ via DANA direct — payment ini
+  // memperpanjang subscription ini (aditif, nullable).
+  renewalForSubscriptionId String?
 
   // Webhook data
   webhookReceivedAt DateTime?

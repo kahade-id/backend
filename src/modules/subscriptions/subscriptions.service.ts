@@ -33,6 +33,14 @@ import { AuditLogService } from '../../common/services/audit-log.service';
 import { VerificationBadgeService } from '../users/verification-badge.service';
 import { generateWalletTxId, generatePaymentTxId } from '../../common/utils/id-generator.util';
 import { FlashQrisService, FlashQrisPayment } from '../payment/flash-qris.service';
+import { DanaPaymentService } from '../payment/dana/dana-payment.service';
+import { WalletModeService } from '../wallet-mode/wallet-mode.service';
+import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
+import { DanaDirectPayKind } from '../no-wallet/dto/dana-direct-pay.dto';
+import {
+  generateDanaPartnerReferenceNo,
+  DANA_DIRECT_VA_BANKS,
+} from '../no-wallet/dana-direct-payment.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { toIdr, toSen, percentToBpsBigInt } from '../../common/utils/currency.util';
 import { getWibMonthStart } from '../../common/utils/date.util';
@@ -58,6 +66,21 @@ class SubscriptionActivationRaceError extends Error {
     super(`Subscription activation race lost for payment ${paymentTxId}`);
     this.name = 'SubscriptionActivationRaceError';
   }
+}
+
+/**
+ * Validasi bankCode VA → union literal yang diterima DANA.
+ * Fail-closed: bank di luar daftar DANA ditolak.
+ */
+function assertVaBank(bankCode: string | undefined): (typeof DANA_DIRECT_VA_BANKS)[number] {
+  const upper = (bankCode ?? '').toUpperCase();
+  if (!(DANA_DIRECT_VA_BANKS as readonly string[]).includes(upper)) {
+    throw new BadRequestException({
+      code: 'DANA_VA_BANK_REQUIRED',
+      message: `bankCode wajib untuk VA — pilihan: ${DANA_DIRECT_VA_BANKS.join(', ')}`,
+    });
+  }
+  return upper as (typeof DANA_DIRECT_VA_BANKS)[number];
 }
 
 const RANK_ORDER: MembershipRank[] = [MembershipRank.BRONZE, MembershipRank.SILVER, MembershipRank.GOLD, MembershipRank.PLATINUM, MembershipRank.DIAMOND];
@@ -88,6 +111,9 @@ export class SubscriptionsService {
     private auditLogService: AuditLogService,
     private verificationBadgeService: VerificationBadgeService,
     private flashQrisService: FlashQrisService,
+    private danaPaymentService: DanaPaymentService,
+    private walletMode: WalletModeService,
+    private danaDirectRefundService: DanaDirectRefundService,
   ) {
     const monthlyPriceSen =
       this.configService.get<number>('app.subscriptionMonthlyPriceSen') ??
@@ -586,6 +612,14 @@ export class SubscriptionsService {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid subscription price after discount' });
     }
     if (effectivePrice > BigInt(0)) {
+      // Misi tanpa-wallet (BI-safe): debit wallet MATI saat kill-switch mati.
+      // Berbayar harus lewat DANA langsung (POST /v1/subscriptions/subscribe-dana).
+      if (!this.walletMode.isWalletEnabled()) {
+        throw new BadRequestException({
+          code: 'WALLET_DISABLED_USE_DANA',
+          message: 'Wallet payments are disabled — use subscribe-dana',
+        });
+      }
       if (!pin) {
         throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Wallet PIN is required for paid subscriptions' });
       }
@@ -914,6 +948,17 @@ export class SubscriptionsService {
       return { subscription, qrString: '', expiredAt: new Date(), flashTransactionId: '' };
     }
 
+    // Misi tanpa-wallet (BI-safe): jalur Flash+wallet mati — QRIS diproses
+    // via DANA direct. PIN adalah konsep wallet dan tidak dibutuhkan DANA.
+    if (!this.walletMode.isWalletEnabled()) {
+      const dana = await this.subscribeDana(userId, plan, DanaDirectPayKind.QRIS, undefined, promoCode, ip);
+      return {
+        subscription: dana.subscription,
+        qrString: dana.qrString ?? '',
+        expiredAt: dana.expiredAt,
+        flashTransactionId: '',
+      };
+    }
     // Di titik ini pembayaran QRIS pasti terjadi → PIN wajib & valid.
     if (!pin || !/^\d{6}$/.test(pin)) {
       throw new BadRequestException({
@@ -1041,6 +1086,477 @@ export class SubscriptionsService {
       expiredAt: qris.expiredAt,
       flashTransactionId: qris.transactionId,
     };
+  }
+
+  /**
+   * Berlangganan Kahade+ via DANA langsung (mode tanpa-wallet, BI-safe).
+   *
+   * Keputusan 2026-09-29: subscription dibayar via DANA direct (QRIS / VA /
+   * BALANCE — tidak hardcode QRIS). Subscription tetap PENDING sampai webhook
+   * DANA finish-notify sukses (fail-closed: gagal bayar = tidak aktif).
+   * Kode promo gratis / diskon 100% tetap lewat jalur subscribe() gratis.
+   */
+  async subscribeDana(
+    userId: string,
+    plan: SubscriptionPlan,
+    payKind: DanaDirectPayKind,
+    bankCode?: string,
+    promoCode?: string,
+    ip?: string,
+  ): Promise<{
+    subscription: Subscription;
+    qrString: string | null;
+    paymentCode: string | null;
+    webRedirectUrl: string | null;
+    expiredAt: Date;
+  }> {
+    const planInfo = this.planPricing[plan];
+    if (!planInfo) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Invalid subscription plan',
+      });
+    }
+    if (!Object.values(DanaDirectPayKind).includes(payKind)) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Invalid payKind — gunakan daftar dari GET /v1/orders/:id/payment-methods',
+      });
+    }
+    const vaBank = payKind === DanaDirectPayKind.VA ? assertVaBank(bankCode) : undefined;
+    void ip;
+
+    // CW-003: expire PENDING basi dulu agar tidak memblokir subscribe ulang.
+    await this.expireStalePendingSubscriptions(userId);
+
+    const promoGrant = await this.resolvePromoCodeGrant(userId, promoCode);
+    if (promoGrant) {
+      const subscription = await this.subscribe(userId, plan, undefined, undefined, { promoCode });
+      return { subscription, qrString: null, paymentCode: null, webRedirectUrl: null, expiredAt: new Date() };
+    }
+
+    const campaignDiscount = await this.resolveSubscriptionCampaign(userId, promoCode, planInfo.price);
+    const effectivePrice = planInfo.price - campaignDiscount.discountSen;
+    if (effectivePrice <= BigInt(0)) {
+      const subscription = await this.subscribe(userId, plan, undefined, undefined, { promoCode });
+      return { subscription, qrString: null, paymentCode: null, webRedirectUrl: null, expiredAt: new Date() };
+    }
+
+    const durationDays = planInfo.durationDays;
+    const now = new Date();
+    const periodEnd = new Date(now);
+    periodEnd.setDate(periodEnd.getDate() + durationDays);
+    const amountIdr = toIdr(effectivePrice);
+    if (amountIdr <= 0) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid subscription amount' });
+    }
+
+    const partnerReferenceNo = generateDanaPartnerReferenceNo();
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { fullName: true, email: true, phoneNumber: true },
+    });
+
+    // Buat subscription PENDING + payment transaction DANA dulu.
+    const pending = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const existingPending = await tx.subscription.findFirst({
+        where: { userId, status: SubscriptionStatus.PENDING },
+        select: { id: true },
+      });
+      if (existingPending) {
+        throw new ConflictException({
+          code: ErrorCodes.SUBSCRIPTION_ALREADY_ACTIVE,
+          message: 'A subscription payment is already pending',
+        });
+      }
+      const existingActive = await tx.subscription.findFirst({
+        where: {
+          userId,
+          status: { in: [SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELLED, SubscriptionStatus.SUSPENDED, SubscriptionStatus.PAUSED] },
+          currentPeriodEnd: { gt: new Date() },
+        },
+        select: { id: true },
+      });
+      if (existingActive) {
+        throw new ConflictException({
+          code: ErrorCodes.SUBSCRIPTION_ALREADY_ACTIVE,
+          message: 'You already have an active subscription period — use renew instead',
+        });
+      }
+
+      const paymentTx = await tx.paymentTransaction.create({
+        data: {
+          midtransOrderId: `SUBS-DANA-${Date.now()}-${userId.slice(-6)}`,
+          userId,
+          provider: PaymentProvider.DANA,
+          purpose: PaymentPurpose.SUBSCRIPTION,
+          method: payKind === DanaDirectPayKind.VA ? PaymentMethod.VIRTUAL_ACCOUNT_OTHER : payKind === DanaDirectPayKind.BALANCE ? PaymentMethod.DANA : PaymentMethod.QRIS,
+          status: PaymentStatus.PENDING,
+          amount: effectivePrice,
+          grossAmount: effectivePrice,
+          danaPartnerReferenceNo: partnerReferenceNo,
+          danaPayKind: payKind,
+        },
+      });
+
+      const sub = await tx.subscription.create({
+        data: {
+          userId,
+          plan,
+          status: SubscriptionStatus.PENDING,
+          price: effectivePrice,
+          originalPrice: campaignDiscount.discountSen > BigInt(0) ? planInfo.price : null,
+          currentPeriodStart: now,
+          currentPeriodEnd: periodEnd,
+          isAutoRenew: false,
+          paymentMethod: payKind === DanaDirectPayKind.VA ? PaymentMethod.VIRTUAL_ACCOUNT_OTHER : payKind === DanaDirectPayKind.BALANCE ? PaymentMethod.DANA : PaymentMethod.QRIS,
+          paymentTxId: paymentTx.id,
+          promoCodeUsed: promoCode?.trim().toUpperCase() || undefined,
+        },
+      });
+
+      return { sub, paymentTx };
+    });
+
+    // Buat order di DANA (di luar transaksi DB). Gagal → expire PENDING
+    // (fail-closed: tidak mengunci subscribe ulang, guard PENDING).
+    let created;
+    try {
+      created = await this.danaPaymentService.createOrder({
+        kind: payKind,
+        partnerReferenceNo,
+        amountIdr,
+        orderTitle: `${planInfo.label} — Kahade+`,
+        bankCode: vaBank,
+        buyerExternalUserId: userId,
+      });
+    } catch (err) {
+      await this.failPendingQrisSubscription(pending.sub.id, pending.paymentTx.id);
+      throw err;
+    }
+
+    await this.prisma.paymentTransaction.update({
+      where: { id: pending.paymentTx.id },
+      data: {
+        danaReferenceNo: created.referenceNo,
+        providerInstructions: {
+          kind: payKind,
+          qrString: payKind === DanaDirectPayKind.QRIS ? created.paymentCode : undefined,
+          paymentCode: payKind === DanaDirectPayKind.VA ? created.paymentCode : undefined,
+          webRedirectUrl: created.webRedirectUrl,
+        } as Prisma.InputJsonValue,
+        expiredAt: created.expiresAt,
+      },
+    });
+
+    this.auditLogService.logUserAction({
+      userId,
+      action: UserAuditAction.SUBSCRIPTION_STARTED,
+      entityType: 'Subscription',
+      entityId: pending.sub.id,
+      description: `DANA ${payKind} payment initiated for ${plan} plan (${amountIdr} IDR)`,
+    });
+
+    return {
+      subscription: pending.sub,
+      qrString: payKind === DanaDirectPayKind.QRIS ? created.paymentCode : null,
+      paymentCode: payKind === DanaDirectPayKind.VA ? created.paymentCode : null,
+      webRedirectUrl: created.webRedirectUrl ?? null,
+      expiredAt: created.expiresAt,
+    };
+  }
+
+  /**
+   * Dipanggil webhook DANA saat pembayaran subscription sukses — aktivasi.
+   * Menangani DUA kasus:
+   *  - subscribe baru: paymentTx.subscriptions[0] berstatus PENDING → ACTIVE.
+   *  - renewal: paymentTx.renewalForSubscriptionId terisi → perpanjang
+   *    currentPeriodEnd subscription yang ada.
+   * Idempotent: klaim atomik PENDING→SUCCESS + guard status subscription.
+   * Fail-closed: verify-via-API + cek nominal sebelum aktivasi.
+   */
+  async activateDanaSubscription(paymentTxId: string): Promise<void> {
+    const paymentTx = await this.prisma.paymentTransaction.findUnique({
+      where: { id: paymentTxId },
+      include: { subscriptions: true },
+    });
+    if (!paymentTx || paymentTx.provider !== PaymentProvider.DANA || paymentTx.purpose !== PaymentPurpose.SUBSCRIPTION) {
+      this.logger.warn(`Webhook DANA subscription: payment tx tidak eligible (${paymentTxId})`);
+      return;
+    }
+    if (paymentTx.status === PaymentStatus.SUCCESS) return; // sudah diproses
+
+    const detail = await this.danaPaymentService.getPaymentDetail(
+      paymentTx.danaPartnerReferenceNo ?? paymentTxId,
+    );
+    if (detail.status !== 'SUCCESS') {
+      this.logger.warn(`Webhook DANA subscription: status DANA bukan SUCCESS (${detail.status}) untuk ${paymentTx.id}`);
+      return;
+    }
+    const expectedIdr = Math.round(Number(paymentTx.grossAmount) / 100);
+    if (detail.amountIdr === null || detail.amountIdr !== expectedIdr) {
+      this.logger.error(
+        `DANA_AMOUNT_MISMATCH: subscription ${paymentTx.id} dibayar ${detail.amountIdr} IDR, ` +
+        `diharapkan ${expectedIdr} IDR — aktivasi DITOLAK`,
+      );
+      return;
+    }
+
+    const now = new Date();
+    const planInfo = (plan: SubscriptionPlan) => this.planPricing[plan];
+
+    try {
+      await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        const claimedPayment = await tx.paymentTransaction.updateMany({
+          where: { id: paymentTx.id, status: PaymentStatus.PENDING },
+          data: { status: PaymentStatus.SUCCESS, paidAt: now, webhookReceivedAt: now },
+        });
+        if (claimedPayment.count !== 1) {
+          throw new SubscriptionActivationRaceError(paymentTx.id);
+        }
+
+        if (paymentTx.renewalForSubscriptionId) {
+          // RENEWAL: perpanjang periode subscription yang ada.
+          const sub = await tx.subscription.findUnique({ where: { id: paymentTx.renewalForSubscriptionId } });
+          if (!sub) throw new SubscriptionActivationRaceError(paymentTx.id);
+          const info = planInfo(sub.plan);
+          const renewBase = sub.status === SubscriptionStatus.SUSPENDED ? now : new Date(sub.currentPeriodEnd ?? now);
+          const newPeriodEnd = new Date(renewBase);
+          newPeriodEnd.setDate(newPeriodEnd.getDate() + info.durationDays);
+          await tx.subscription.update({
+            where: { id: sub.id },
+            data: {
+              status: SubscriptionStatus.ACTIVE,
+              currentPeriodEnd: newPeriodEnd,
+              lastPaymentAt: now,
+              nextPaymentAt: newPeriodEnd,
+              cancelAtPeriodEnd: false,
+              isAutoRenew: false,
+            },
+          });
+          await tx.user.update({
+            where: { id: sub.userId },
+            data: { isKahadePlus: true, subscriptionExpiresAt: newPeriodEnd },
+          });
+          this.logger.log(`Subscription ${sub.id} renewed via DANA direct sampai ${newPeriodEnd.toISOString()}`);
+        } else {
+          // SUBSCRIBE BARU: aktivasi subscription PENDING.
+          const subscription = paymentTx.subscriptions[0];
+          if (!subscription || subscription.status !== SubscriptionStatus.PENDING) {
+            this.logger.warn(`Webhook DANA subscription: subscription tidak PENDING untuk ${paymentTx.id}`);
+            throw new SubscriptionActivationRaceError(paymentTx.id);
+          }
+          const claimedSub = await tx.subscription.updateMany({
+            where: { id: subscription.id, status: SubscriptionStatus.PENDING },
+            data: {
+              status: SubscriptionStatus.ACTIVE,
+              lastPaymentAt: now,
+              nextPaymentAt: subscription.currentPeriodEnd,
+            },
+          });
+          if (claimedSub.count !== 1) {
+            throw new SubscriptionActivationRaceError(paymentTx.id);
+          }
+          await tx.user.update({
+            where: { id: subscription.userId },
+            data: {
+              isKahadePlus: true,
+              subscriptionExpiresAt: subscription.currentPeriodEnd,
+              ...(await this.buildKahadePlusSinceData(tx, subscription.userId, now)),
+            },
+          });
+          this.logger.log(`Subscription ${subscription.id} activated via DANA direct`);
+        }
+      });
+    } catch (err) {
+      if (err instanceof SubscriptionActivationRaceError) {
+        this.logger.warn(`Webhook DANA subscription: aktivasi ${paymentTx.id} tidak diklaim (sudah diproses konkuren)`);
+        return;
+      }
+      throw err;
+    }
+
+    const targetUserId = paymentTx.renewalForSubscriptionId
+      ? (await this.prisma.subscription.findUnique({ where: { id: paymentTx.renewalForSubscriptionId }, select: { userId: true } }))?.userId
+      : paymentTx.subscriptions[0]?.userId;
+    if (targetUserId) {
+      await this.redis.del(`subscription_status:${targetUserId}`).catch(() => undefined);
+      await this.verificationBadgeService.invalidate(targetUserId);
+      this.auditLogService.logUserAction({
+        userId: targetUserId,
+        action: UserAuditAction.SUBSCRIPTION_STARTED,
+        entityType: 'Subscription',
+        entityId: paymentTx.renewalForSubscriptionId ?? paymentTx.subscriptions[0]?.id ?? paymentTx.id,
+        description: `DANA payment confirmed — subscription ${paymentTx.renewalForSubscriptionId ? 'renewed' : 'activated'}`,
+      });
+    }
+  }
+
+  /**
+   * Renew Kahade+ via DANA langsung (mode tanpa-wallet).
+   * Membuat payment DANA untuk perpanjangan; periode diperpanjang oleh
+   * webhook via activateDanaSubscription (fail-closed sampai bayar sukses).
+   */
+  async renewDana(
+    userId: string,
+    payKind: DanaDirectPayKind,
+    bankCode?: string,
+  ): Promise<{
+    paymentTxId: string;
+    qrString: string | null;
+    paymentCode: string | null;
+    webRedirectUrl: string | null;
+    expiredAt: Date;
+  }> {
+    if (!Object.values(DanaDirectPayKind).includes(payKind)) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid payKind' });
+    }
+    const vaBank = payKind === DanaDirectPayKind.VA ? assertVaBank(bankCode) : undefined;
+
+    const subscription = await this.prisma.subscription.findFirst({
+      where: {
+        userId,
+        status: { in: [SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELLED, SubscriptionStatus.SUSPENDED] },
+        currentPeriodEnd: { gt: new Date() },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    });
+    if (!subscription) {
+      throw new NotFoundException({ code: ErrorCodes.NO_ACTIVE_SUBSCRIPTION, message: 'No active subscription found' });
+    }
+    if (subscription.status === SubscriptionStatus.CANCELLED && subscription.cancelReason === 'Force cancelled by admin') {
+      throw new ConflictException({ code: ErrorCodes.INVALID_STATUS, message: 'This subscription was cancelled by an administrator' });
+    }
+
+    const planInfo = this.planPricing[subscription.plan];
+    const amountIdr = toIdr(planInfo.price);
+    const partnerReferenceNo = generateDanaPartnerReferenceNo();
+
+    const paymentTx = await this.prisma.paymentTransaction.create({
+      data: {
+        midtransOrderId: `SUBS-DANA-RNW-${Date.now()}-${userId.slice(-6)}`,
+        userId,
+        provider: PaymentProvider.DANA,
+        purpose: PaymentPurpose.SUBSCRIPTION,
+        method: payKind === DanaDirectPayKind.VA ? PaymentMethod.VIRTUAL_ACCOUNT_OTHER : payKind === DanaDirectPayKind.BALANCE ? PaymentMethod.DANA : PaymentMethod.QRIS,
+        status: PaymentStatus.PENDING,
+        amount: planInfo.price,
+        grossAmount: planInfo.price,
+        danaPartnerReferenceNo: partnerReferenceNo,
+        danaPayKind: payKind,
+        renewalForSubscriptionId: subscription.id,
+      },
+    });
+
+    let created;
+    try {
+      created = await this.danaPaymentService.createOrder({
+        kind: payKind,
+        partnerReferenceNo,
+        amountIdr,
+        orderTitle: `${planInfo.label} renewal — Kahade+`,
+        bankCode: vaBank,
+        buyerExternalUserId: userId,
+      });
+    } catch (err) {
+      await this.prisma.paymentTransaction.updateMany({
+        where: { id: paymentTx.id, status: PaymentStatus.PENDING },
+        data: { status: PaymentStatus.FAILED, failedAt: new Date() },
+      });
+      throw err;
+    }
+
+    await this.prisma.paymentTransaction.update({
+      where: { id: paymentTx.id },
+      data: {
+        danaReferenceNo: created.referenceNo,
+        providerInstructions: {
+          kind: payKind,
+          qrString: payKind === DanaDirectPayKind.QRIS ? created.paymentCode : undefined,
+          paymentCode: payKind === DanaDirectPayKind.VA ? created.paymentCode : undefined,
+          webRedirectUrl: created.webRedirectUrl,
+        } as Prisma.InputJsonValue,
+        expiredAt: created.expiresAt,
+      },
+    });
+
+    return {
+      paymentTxId: paymentTx.id,
+      qrString: payKind === DanaDirectPayKind.QRIS ? created.paymentCode : null,
+      paymentCode: payKind === DanaDirectPayKind.VA ? created.paymentCode : null,
+      webRedirectUrl: created.webRedirectUrl ?? null,
+      expiredAt: created.expiresAt,
+    };
+  }
+
+  /**
+   * Status pembayaran DANA subscription untuk polling frontend.
+   * Sinkronisasi ringan: tanya DANA bila masih PENDING dan belum kedaluwarsa.
+   */
+  async getDanaStatus(userId: string, subscriptionId: string): Promise<{
+    status: string;
+    qrString: string | null;
+    paymentCode: string | null;
+    webRedirectUrl: string | null;
+    expiredAt: Date | null;
+  }> {
+    const subscription = await this.prisma.subscription.findFirst({
+      where: { id: subscriptionId, userId },
+      include: { paymentTx: true },
+    });
+    if (!subscription) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Subscription not found' });
+    }
+    const pt = subscription.paymentTx;
+    const instructions = (pt?.providerInstructions ?? {}) as Record<string, unknown>;
+    if (
+      subscription.status === SubscriptionStatus.PENDING &&
+      pt?.provider === PaymentProvider.DANA &&
+      pt.danaPartnerReferenceNo &&
+      (!pt.expiredAt || pt.expiredAt > new Date())
+    ) {
+      const detail = await this.danaPaymentService.getPaymentDetail(pt.danaPartnerReferenceNo);
+      if (detail.status === 'SUCCESS') {
+        await this.activateDanaSubscription(pt.id);
+      } else if (detail.status === 'FAILED') {
+        await this.failPendingQrisSubscription(subscription.id, pt.id);
+      }
+      const refreshed = await this.prisma.subscription.findUnique({ where: { id: subscription.id } });
+      const refreshedPt = await this.prisma.paymentTransaction.findUnique({ where: { id: pt.id } });
+      const ri = (refreshedPt?.providerInstructions ?? {}) as Record<string, unknown>;
+      return {
+        status: refreshed?.status ?? subscription.status,
+        qrString: (ri.qrString as string | undefined) ?? null,
+        paymentCode: (ri.paymentCode as string | undefined) ?? null,
+        webRedirectUrl: (ri.webRedirectUrl as string | undefined) ?? null,
+        expiredAt: refreshedPt?.expiredAt ?? null,
+      };
+    }
+    return {
+      status: subscription.status,
+      qrString: (instructions.qrString as string | undefined) ?? null,
+      paymentCode: (instructions.paymentCode as string | undefined) ?? null,
+      webRedirectUrl: (instructions.webRedirectUrl as string | undefined) ?? null,
+      expiredAt: pt?.expiredAt ?? null,
+    };
+  }
+
+  /**
+   * Refund pembayaran subscription DANA ke metode bayar asal (dipakai admin
+   * force-cancel). Idempoten via idempotencyKey stabil.
+   */
+  async refundDanaSubscriptionPayment(subscriptionId: string, reason: string): Promise<boolean> {
+    const subscription = await this.prisma.subscription.findUnique({
+      where: { id: subscriptionId },
+      select: { id: true, paymentTxId: true, userId: true },
+    });
+    if (!subscription?.paymentTxId) return false;
+    const res = await this.danaDirectRefundService.refundAmount({
+      paymentDbId: subscription.paymentTxId,
+      reason,
+      idempotencyKey: `ADMIN_SUB_CANCEL:${subscriptionId}`,
+    });
+    return res.refunded;
   }
 
   /**
@@ -1495,6 +2011,14 @@ export class SubscriptionsService {
   }
 
   async renew(userId: string, pin: string, ip?: string): Promise<Subscription> {
+    // Misi tanpa-wallet (BI-safe): renew via wallet MATI saat kill-switch mati.
+    // Gunakan POST /v1/subscriptions/renew-dana (bayar DANA langsung).
+    if (!this.walletMode.isWalletEnabled()) {
+      throw new BadRequestException({
+        code: 'WALLET_DISABLED_USE_DANA',
+        message: 'Wallet renewal is disabled — use renew-dana',
+      });
+    }
     await this.walletService.verifyPin(userId, pin, ip);
 
     const subscription = await this.prisma.subscription.findFirst({

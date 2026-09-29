@@ -1468,6 +1468,21 @@ export class UsersService {
     return parts.length === 4 ? `${parts[0]}.${parts[1]}.***.***` : '***';
   }
 
+  /**
+   * D1-006 (perf 2026-09-29): SATU query `follow.findMany` — hanya kolom
+   * id/username yang dibutuhkan filter "Mengikuti" di feed. Menggantikan
+   * loop klien hingga 20 halaman `getFollowing`.
+   */
+  async getMyFollowingIds(userId: string): Promise<{ following: { userId: string; username: string | null }[] }> {
+    const rows = await this.prisma.follow.findMany({
+      where: { followerId: userId },
+      select: { following: { select: { userId: true, username: true } } },
+    });
+    return {
+      following: rows.map((r) => ({ userId: r.following.userId, username: r.following.username })),
+    };
+  }
+
   async getActivityLog(userId: string, page: number, limit: number): Promise<object> {
     const { page: safePage, limit: safeLimit, skip } = this.normalizePagination(page, limit);
 

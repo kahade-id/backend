@@ -546,4 +546,43 @@ describe('DisputesService', () => {
       );
     });
   });
+
+  // ============================================================
+  // D1-010: getDisputeFingerprint (fingerprint ringan untuk poll)
+  // ============================================================
+
+  describe('getDisputeFingerprint (D1-010)', () => {
+    const fingerprintRow = {
+      id: 'dsp-1',
+      disputeId: 'DSP-0001',
+      status: 'OPEN',
+      updatedAt: new Date('2026-09-29T10:00:00.000Z'),
+      order: { buyerId: 'buyer', sellerId: 'seller' },
+      _count: { messages: 3 },
+    };
+
+    it('mengembalikan status + updatedAt + messageCount tanpa include berat', async () => {
+      mockPrisma.dispute.findFirst.mockResolvedValue(fingerprintRow);
+      const result = await service.getDisputeFingerprint('DSP-0001', 'buyer');
+      expect(result).toEqual({
+        disputeId: 'DSP-0001',
+        status: 'OPEN',
+        updatedAt: fingerprintRow.updatedAt,
+        messageCount: 3,
+      });
+      const args = mockPrisma.dispute.findFirst.mock.calls[0][0];
+      expect(args.include).toBeUndefined();
+      expect(args.select._count).toEqual({ select: { messages: true } });
+    });
+
+    it('NotFound untuk sengketa tak dikenal', async () => {
+      mockPrisma.dispute.findFirst.mockResolvedValue(null);
+      await expect(service.getDisputeFingerprint('DSP-X', 'buyer')).rejects.toThrow(NotFoundException);
+    });
+
+    it('Forbidden untuk bukan partisipan', async () => {
+      mockPrisma.dispute.findFirst.mockResolvedValue(fingerprintRow);
+      await expect(service.getDisputeFingerprint('DSP-0001', 'orang-asing')).rejects.toThrow(ForbiddenException);
+    });
+  });
 });

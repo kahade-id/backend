@@ -310,6 +310,27 @@ export class OrderExtensionsService {
     return { extensionId, status: newStatus };
   }
 
+  /**
+   * D1-010 (perf 2026-09-29): fingerprint ringan untuk poll — agregat
+   * (total + max updatedAt), bukan halaman penuh getExtensions.
+   * Respons approve/reject maupun pengajuan baru mengubah max(updatedAt).
+   */
+  async getExtensionsFingerprint(
+    orderId: string,
+    userId: string,
+  ): Promise<{ total: number; latestUpdatedAt: Date | null }> {
+    const order = await this.prisma.order.findFirst({ where: { orderId, deletedAt: null } }); // AUDIT-16
+    if (!order) throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
+    if (order.buyerId !== userId && order.sellerId !== userId) throw new ForbiddenException({ code: ErrorCodes.NOT_ORDER_PARTICIPANT, message: 'Not authorized' });
+
+    const agg = await this.prisma.orderExtensionRequest.aggregate({
+      where: { orderId: order.id },
+      _count: { _all: true },
+      _max: { updatedAt: true },
+    });
+    return { total: agg._count._all, latestUpdatedAt: agg._max.updatedAt };
+  }
+
   async getExtensions(orderId: string, userId: string, page: number = 1, limit: number = 20): Promise<{
     data: object[];
     total: number;

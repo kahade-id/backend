@@ -1,6 +1,6 @@
 import { Injectable, Logger, BadRequestException, NotFoundException, ForbiddenException, ConflictException, GoneException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { ContentHiddenReason, Prisma, ShowcaseVisibility } from '@prisma/client';
+import { ContentHiddenReason, OrderStatus, Prisma, ShowcaseVisibility } from '@prisma/client';
 import { createHash } from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
@@ -45,6 +45,11 @@ import { ShowcaseFeedQueryDto, ShowcaseFeedSort } from './dto/showcase-feed-quer
 import { ReportShowcaseDto } from './dto/report-showcase.dto';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { VerificationBadgeService, getSealTierFromTypes } from '../users/verification-badge.service';
+// D1-001 (perf 2026-09-29): ambang badge commerce dipakai ulang di
+// serializeFeedPage supaya definisi TERLARIS tetap satu sumber kebenaran
+// (product-commerce.service tidak mengimpor showcase.service — aman dari
+// circular import).
+import { BEST_SELLER_MIN_COMPLETED, BEST_SELLER_WINDOW_DAYS } from '../commerce/services/product-commerce.service';
 
 /**
  * Section 3 — Showcase sebagai konten sosial + feed discover.
@@ -508,13 +513,15 @@ export class ShowcaseService {
   /**
    * Bentuk publik satu item showcase.
    *
-   * `orderLink` berisi data siap pakai untuk membuat OrderLink dari item ini
-   * (title/description/orderValue/counterpartUsername sudah ter-prefill) supaya
-   * tombol "Pesan" di feed discover tidak perlu merakit apa pun lagi.
+   * Mode detail/owner: `orderLink` berisi data siap pakai untuk membuat
+   * OrderLink dari item ini (title/description/orderValue/counterpartUsername
+   * sudah ter-prefill) supaya tombol "Pesan" di layar detail tidak perlu
+   * merakit apa pun lagi. Mode excerpt (feed): orderLink TIDAK dikirim
+   * (D1-011) — diganti flag eksplisit `isCommerce` + `badges[]` (D1-001).
    */
   private serializeShowcase(
     row: ShowcaseRow,
-    options: { isLiked?: boolean; isSaved?: boolean; isOwner?: boolean; authorBadges?: Array<{ type: string }>; followedAuthorIds?: Set<string>; excerpt?: boolean } = {},
+    options: { isLiked?: boolean; isSaved?: boolean; isOwner?: boolean; authorBadges?: Array<{ type: string }>; followedAuthorIds?: Set<string>; excerpt?: boolean; bestsellerIds?: Set<string> } = {},
   ): Record<string, unknown> {
     // Batch 19 TIM A (item 1 & 2): media etalase bisa image/video/spin360.
     // Field lama (id/imageUrl/sortOrder) tetap — kontrak lama tidak berubah.
@@ -544,7 +551,23 @@ export class ShowcaseService {
         : firstMedia.imageUrl
       : null;
     const orderValue = priceMin ?? priceMax ?? null;
+    const orderValueValid = orderValue !== null && orderValue >= ORDER_MIN_VALUE && orderValue <= ORDER_MAX_VALUE;
     const counterpartUsername = row.user.username ?? row.user.userId;
+    // D1-001/D1-011 (perf 2026-09-29): flag commerce EKSPLISIT — pengganti
+    // pemicu lama "keberadaan orderLink" yang selalu truthy (orderLink selalu
+    // diserialkan, jadi tiap kartu feed me-render CommerceBadgesCompact dan
+    // menembak GET /v1/commerce/products/:id/badges). Badge commerce kini
+    // diserialkan langsung di payload feed: TERLARIS dari SATU groupBy per
+    // halaman (options.bestsellerIds), DISKON dari originalPriceValid yang
+    // sudah dihitung di sini — N+1 badge hilang total.
+    const originalPriceValid =
+      row.originalPrice != null &&
+      (priceMin ?? priceMax) != null &&
+      row.originalPrice > BigInt(0) &&
+      row.originalPrice > (row.priceMin ?? row.priceMax)!;
+    const commerceBadges: string[] = [];
+    if (options.bestsellerIds?.has(row.id)) commerceBadges.push('TERLARIS');
+    if (originalPriceValid) commerceBadges.push('DISKON');
 
     // Deskripsi OrderLink punya minLength 10; deskripsi showcase boleh kosong,
     // jadi sediakan fallback yang tetap masuk akal.
@@ -583,7 +606,8 @@ export class ShowcaseService {
             updatedAt: row.updatedAt,
           }),
       // Batch 19 TIM A (item 6): kondisi barang (BARU/BEKAS/null).
-      condition: row.condition ?? null,
+      // D1-011: kartu feed tidak merendernya — hanya di detail/owner.
+      ...(options.excerpt ? {} : { condition: row.condition ?? null }),
       images,
       coverImageUrl,
       priceMin,
@@ -593,19 +617,26 @@ export class ShowcaseService {
       // logika per tipe (jasa → tenggat). Field sudah ada di DB sejak
       // migrasi 20261001000000; sebelumnya hanya bisa dibaca via
       // PATCH /v1/commerce/products/:id response. Additive-only.
-      productType: row.productType ?? null,
-      originalPrice: toNumber(row.originalPrice ?? null),
-      originalPriceValid:
-        row.originalPrice != null &&
-        (priceMin ?? priceMax) != null &&
-        row.originalPrice > BigInt(0) &&
-        row.originalPrice > (row.priceMin ?? row.priceMax)!,
-      serviceDeadlineDays: row.serviceDeadlineDays ?? null,
+      // D1-011 (2026-09-29): kartu feed tidak memakai field-field ini —
+      // badge DISKON kini datang dari `badges[]` (D1-001). Hanya detail/owner.
+      ...(options.excerpt
+        ? {}
+        : {
+            productType: row.productType ?? null,
+            originalPrice: toNumber(row.originalPrice ?? null),
+            originalPriceValid,
+            serviceDeadlineDays: row.serviceDeadlineDays ?? null,
+          }),
       likeCount: row.likeCount,
       commentCount: row.commentCount,
-      viewCount: row.viewCount,
-      // S-4: berapa kali deep link share item ini dibuka.
-      shareCount: row.shareCount,
+      // D1-011: viewCount/shareCount tidak dirender kartu feed — hanya detail.
+      ...(options.excerpt
+        ? {}
+        : {
+            viewCount: row.viewCount,
+            // S-4: berapa kali deep link share item ini dibuka.
+            shareCount: row.shareCount,
+          }),
       // Batch 19 TIM A (item 3): save counter + status save viewer.
       saveCount: row.saveCount,
       isLiked: Boolean(options.isLiked),
@@ -615,6 +646,8 @@ export class ShowcaseService {
       // NP-007: updatedAt juga field manajemen — hanya di detail/owner.
       ...(options.excerpt ? {} : { updatedAt: row.updatedAt }),
       author: {
+        // NB: userId TETAP dikirim di excerpt — parser frontend
+        // (parseShowcaseItem) menjadikannya syarat validasi item.
         userId: row.user.userId,
         username: row.user.username,
         fullName: row.user.fullName,
@@ -636,14 +669,28 @@ export class ShowcaseService {
         // `followedAuthorIds` tetap mendapat false (kontrak lama tak berubah).
         isFollowing: options.followedAuthorIds?.has(row.user.id) ?? false,
       },
-      orderLink: {
-        title: row.title.slice(0, 100),
-        description: orderDescription,
-        orderValue,
-        orderValueValid: orderValue !== null && orderValue >= ORDER_MIN_VALUE && orderValue <= ORDER_MAX_VALUE,
-        counterpartUsername,
-      },
-      shareUrl: this.buildShareUrl(row.id),
+      // D1-001 (perf 2026-09-29): badge commerce dari payload feed —
+      // frontend tidak lagi N+1 GET /v1/commerce/products/:id/badges.
+      // Selalu array (bisa kosong) supaya klien lama/baru konsisten.
+      badges: commerceBadges,
+      // D1-011: flag commerce EKSPLISIT — pengganti pemicu lama "orderLink
+      // ada" di CommerceBadgesCompact. true = harga valid & bisa dipesan.
+      isCommerce: orderValueValid,
+      // D1-011 (2026-09-29): orderLink+shareUrl tidak dipakai kartu feed —
+      // prefill transaksi hanya dipakai layar detail (non-excerpt). Payload
+      // feed menghemat ~600 byte/item (title+description duplikat).
+      ...(options.excerpt
+        ? {}
+        : {
+            orderLink: {
+              title: row.title.slice(0, 100),
+              description: orderDescription,
+              orderValue,
+              orderValueValid,
+              counterpartUsername,
+            },
+            shareUrl: this.buildShareUrl(row.id),
+          }),
     };
   }
 
@@ -2006,6 +2053,9 @@ export class ShowcaseService {
     // Batch 139 BE-API1 (item 102): id author yang di-follow viewer — satu
     // batch query supaya FE tidak perlu N+1 request follow-status per kartu.
     const followedAuthorIds = await this.getFollowedAuthorIds(viewerId, pageRows.map((row) => row.user.id));
+    // D1-001 (perf 2026-09-29): badge TERLARIS dihitung batch per halaman —
+    // SATU groupBy order COMPLETED 90 hari, bukan N+1 per kartu.
+    const bestsellerIds = await this.getBestsellerIds(pageRows.map((row) => row.id));
 
     return {
       items: pageRows.map((row) =>
@@ -2014,6 +2064,7 @@ export class ShowcaseService {
           isSaved: savedIds.has(row.id),
           authorBadges: badgeMap.get(row.user.id) ?? [],
           followedAuthorIds,
+          bestsellerIds,
           excerpt: true,
         }),
       ),
@@ -2039,6 +2090,36 @@ export class ShowcaseService {
       select: { followingId: true },
     });
     return new Set(rows.map((row) => row.followingId));
+  }
+
+  /**
+   * D1-001 (perf 2026-09-29): id showcase yang berhak atas badge TERLARIS —
+   * SATU query `groupBy` order COMPLETED dalam 90 hari terakhir untuk satu
+   * halaman feed, menggantikan N request ke
+   * GET /v1/commerce/products/:id/badges (yang tiap request-nya 2 query).
+   * Ambang & jendela waktu memakai konstanta yang SAMA dengan endpoint
+   * badges (BEST_SELLER_MIN_COMPLETED / BEST_SELLER_WINDOW_DAYS) supaya
+   * definisi "terlaris" tidak drift.
+   */
+  private async getBestsellerIds(showcaseIds: string[]): Promise<Set<string>> {
+    const unique = [...new Set(showcaseIds.filter((id) => id))];
+    if (unique.length === 0) return new Set();
+    const since = new Date(Date.now() - BEST_SELLER_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+    const groups = await this.prisma.order.groupBy({
+      by: ['showcaseId'],
+      where: {
+        showcaseId: { in: unique },
+        status: OrderStatus.COMPLETED,
+        deletedAt: null,
+        completedAt: { gte: since },
+      },
+      _count: { _all: true },
+    });
+    return new Set(
+      groups
+        .filter((g) => g.showcaseId && g._count._all >= BEST_SELLER_MIN_COMPLETED)
+        .map((g) => g.showcaseId as string),
+    );
   }
 
   /**

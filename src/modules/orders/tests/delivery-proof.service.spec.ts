@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, Logger } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Logger, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { ConfigService } from '@nestjs/config';
 import { DeliveryProofService } from '../delivery-proof.service';
@@ -20,7 +20,7 @@ import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial
 
 const mockPrisma = {
   order: { findFirst: jest.fn(), findUnique: jest.fn(), updateMany: jest.fn() },
-  deliveryProof: { findMany: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn(), count: jest.fn(), updateMany: jest.fn(), create: jest.fn() },
+  deliveryProof: { findMany: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn(), count: jest.fn(), updateMany: jest.fn(), create: jest.fn(), aggregate: jest.fn() },
   dispute: { findUnique: jest.fn(), create: jest.fn() },
   orderStatusHistory: { create: jest.fn() },
   user: { update: jest.fn() },
@@ -323,6 +323,35 @@ describe('DeliveryProofService', () => {
         await expect(service.submitProof('ORD-1', 'seller', { description: 'Bukti pengiriman valid tanpa lampiran' })).rejects.toBeInstanceOf(BadRequestException);
         expect(mockPrisma.$transaction).not.toHaveBeenCalled();
       });
+    });
+  });
+
+  // ============================================================
+  // D1-010: getProofsFingerprint (fingerprint ringan untuk poll)
+  // ============================================================
+
+  describe('getProofsFingerprint (D1-010)', () => {
+    const latest = new Date('2026-09-29T10:00:00.000Z');
+
+    it('mengembalikan count + max(updatedAt) lewat agregat, bukan findMany + sign URL', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue(ORDER);
+      mockPrisma.deliveryProof.aggregate.mockResolvedValue({
+        _count: { _all: 2 },
+        _max: { updatedAt: latest },
+      });
+      const result = await service.getProofsFingerprint('ORD-1', 'buyer');
+      expect(result).toEqual({ count: 2, latestUpdatedAt: latest });
+      expect(mockPrisma.deliveryProof.findMany).not.toHaveBeenCalled();
+    });
+
+    it('NotFound untuk order tak dikenal', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+      await expect(service.getProofsFingerprint('ORD-X', 'buyer')).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('Forbidden untuk bukan partisipan', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue(ORDER);
+      await expect(service.getProofsFingerprint('ORD-1', 'orang-asing')).rejects.toBeInstanceOf(ForbiddenException);
     });
   });
 });

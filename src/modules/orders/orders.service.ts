@@ -1056,6 +1056,24 @@ export class OrdersService {
     };
   }
 
+  /**
+   * D1-005 (perf 2026-09-29): status ringan untuk poll — SATU select 5 kolom
+   * (termasuk buyerId/sellerId untuk cek akses), bukan bundle penuh
+   * getOrderDetail (order + buyer/seller + voucher + 50 riwayat + durasi).
+   * Dipakai endpoint GET /v1/orders/:orderId/status.
+   */
+  async getOrderStatus(userId: string, orderId: string): Promise<{ orderId: string; status: string; updatedAt: Date }> {
+    const order = await this.prisma.order.findFirst({
+      where: { orderId },
+      select: { orderId: true, status: true, updatedAt: true, buyerId: true, sellerId: true },
+    });
+    if (!order) throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
+    if (order.buyerId !== userId && order.sellerId !== userId) {
+      throw new ForbiddenException({ code: ErrorCodes.NOT_ORDER_PARTICIPANT, message: 'Not authorized to view this order' });
+    }
+    return { orderId: order.orderId, status: order.status, updatedAt: order.updatedAt };
+  }
+
   async getOrderDetail(userId: string, orderId: string): Promise<{ order: object }> {
     const order = await this.prisma.order.findFirst({
       where: { orderId },

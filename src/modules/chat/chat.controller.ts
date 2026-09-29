@@ -84,6 +84,19 @@ export class ChatController {
     return this.chatService.getRooms(userId, { page, limit, type: normalizedType, archived, q });
   }
 
+  @Get('rooms/:roomId')
+  @ApiOperation({
+    summary: 'Get a single chat room (lightweight)',
+    description:
+      'D1-003: satu room untuk header layar percakapan — tanpa mengunduh ulang seluruh daftar room. Bentuk payload sama dengan satu entri GET /v1/chat/rooms. 404 bila viewer bukan anggota.',
+  })
+  async getRoom(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
+  ): Promise<object> {
+    return this.chatService.getRoom(userId, roomId);
+  }
+
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 3600000, limit: 10 } })
   @Idempotency()
@@ -139,11 +152,13 @@ export class ChatController {
     @Query('cursor', new ParseQueryStringPipe('cursor', 100)) cursor?: string,
     @Query('limit', new DefaultValuePipe(50), ParseIntPipe) limit?: number,
     @Query('excludeIds') excludeIdsRaw?: string,
+    // D1-004: mode delta — hanya pesan lebih baru dari id ini (untuk poll fallback).
+    @Query('afterMessageId', new ParseQueryStringPipe('afterMessageId', 100)) afterMessageId?: string,
   ): Promise<object> {
     const excludeIds = excludeIdsRaw
       ? excludeIdsRaw.split(',').map(id => id.trim()).filter(id => id.length > 0 && id.length <= 30).slice(0, 200)
       : undefined;
-    return this.chatService.getMessages(userId, roomId, cursor, limit, excludeIds);
+    return this.chatService.getMessages(userId, roomId, cursor, limit, excludeIds, afterMessageId);
   }
 
   // ============================================================

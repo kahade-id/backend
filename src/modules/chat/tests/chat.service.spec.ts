@@ -949,4 +949,63 @@ describe('ChatService.getOrCreateDm (PRF-002)', () => {
     await expect(service.getOrCreateDm('user-a', 'penjual')).rejects.toThrow(BadRequestException);
     expect(mockPrisma.chatRoom.create).not.toHaveBeenCalled();
   });
+
+  // ============================================================
+  // D1-004: mode delta getMessages (afterMessageId)
+  // ============================================================
+
+  describe('getMessages — afterMessageId delta (D1-004)', () => {
+    const anchorAt = new Date('2026-09-29T10:00:00.000Z');
+    const newerAt = new Date('2026-09-29T10:00:05.000Z');
+
+    function seedDelta() {
+      mockPrisma.chatRoom.findUnique.mockResolvedValue(ROOM);
+      mockPrisma.user.findUnique.mockResolvedValue({ isActive: true, isBanned: false });
+      mockPrisma.chatMessage.findFirst.mockResolvedValue({ id: 'msg-anchor', createdAt: anchorAt });
+      mockPrisma.chatMessage.findMany.mockResolvedValue([
+        messageFixture({ id: 'msg-new', createdAt: newerAt, content: 'baru' }),
+      ]);
+      mockPrisma.privacySetting.findMany.mockResolvedValue([]);
+    }
+
+    it('hanya mengembalikan pesan yang lebih baru dari anchor', async () => {
+      seedDelta();
+      const result = (await service.getMessages('buyer', 'room-1', undefined, 30, undefined, 'msg-anchor')) as {
+        messages: { id: string }[];
+        nextCursor: null;
+        hasMore: boolean;
+      };
+      expect(result.messages.map((m) => m.id)).toEqual(['msg-new']);
+      // Mode delta bukan halaman.
+      expect(result.nextCursor).toBeNull();
+      expect(result.hasMore).toBe(false);
+      const where = mockPrisma.chatMessage.findMany.mock.calls[0][0].where;
+      expect(where.OR).toEqual([
+        { createdAt: { gt: anchorAt } },
+        { createdAt: anchorAt, id: { gt: 'msg-anchor' } },
+      ]);
+    });
+
+    it('400 bila afterMessageId bukan milik room ini', async () => {
+      mockPrisma.chatRoom.findUnique.mockResolvedValue(ROOM);
+      mockPrisma.user.findUnique.mockResolvedValue({ isActive: true, isBanned: false });
+      mockPrisma.chatMessage.findFirst.mockResolvedValue(null);
+      await expect(
+        service.getMessages('buyer', 'room-1', undefined, 30, undefined, 'msg-asing'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockPrisma.chatMessage.findMany).not.toHaveBeenCalled();
+    });
+
+    it('tanpa afterMessageId perilaku cursor lama tidak berubah', async () => {
+      seedDelta();
+      const result = (await service.getMessages('buyer', 'room-1')) as {
+        messages: { id: string }[];
+        hasMore: boolean;
+      };
+      expect(result.messages.map((m) => m.id)).toEqual(['msg-new']);
+      expect(result.hasMore).toBe(false);
+      const where = mockPrisma.chatMessage.findMany.mock.calls[0][0].where;
+      expect(where.OR).toBeUndefined();
+    });
+  });
 });

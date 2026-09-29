@@ -636,6 +636,132 @@ export class ChatService implements OnModuleInit {
   }
 
   /**
+   * D1-003 (perf 2026-09-29): SATU room untuk header layar percakapan —
+   * ringan, tanpa mengunduh ulang seluruh daftar room (yang memakai raw SQL
+   * join berat + 30 baris). Bentuk payload SAMA dengan satu entri
+   * `GET /v1/chat/rooms` supaya tipe `ChatRoom` frontend bisa dipakai ulang.
+   *
+   * Hanya lookup berindeks (PK): room + member viewer + pesan terakhir +
+   * hitungan pin + pin viewer. Akses: validateRoomAccess → 404 bila bukan
+   * anggota (tidak membocorkan keberadaan room).
+   */
+  async getRoom(userId: string, roomId: string): Promise<object> {
+    const ctx = await this.validateRoomAccess(userId, roomId);
+    const [room, member, lastMsg, pinnedCount, pinRow] = await Promise.all([
+      this.prisma.chatRoom.findUnique({
+        where: { id: roomId },
+        select: {
+          id: true,
+          type: true,
+          status: true,
+          subject: true,
+          isArchived: true,
+          createdAt: true,
+          updatedAt: true,
+          initiator: { select: { id: true, userId: true, fullName: true, username: true, avatarUrl: true } },
+          counterpart: { select: { id: true, userId: true, fullName: true, username: true, avatarUrl: true } },
+          order: { select: { orderId: true, title: true, status: true } },
+        },
+      }),
+      this.prisma.chatRoomMember.findUnique({
+        where: { roomId_userId: { roomId, userId } },
+        select: { isArchived: true, isMuted: true, mutedUntil: true, unreadCount: true },
+      }),
+      this.prisma.chatMessage.findFirst({
+        where: { roomId, isDeleted: false },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          content: true,
+          messageType: true,
+          createdAt: true,
+          sender: { select: { id: true, userId: true } },
+        },
+      }),
+      this.prisma.chatMessage.count({ where: { roomId, isPinned: true, isDeleted: false } }),
+      this.prisma.chatPinnedRoom
+        ?.findUnique({ where: { userId_roomId: { userId, roomId } }, select: { roomId: true } })
+        .catch((): { roomId: string } | null => null) ?? null,
+    ]);
+    if (!room) {
+      throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Chat room not found' });
+    }
+    const isInitiator = ctx.initiatorId === userId;
+    const other = isInitiator ? room.counterpart : room.initiator;
+    const otherInternalId = other?.id && other.id !== userId ? other.id : null;
+    const mutedUntil = member?.isMuted === true && member.mutedUntil ? new Date(member.mutedUntil) : null;
+    // Presence + sealTier lawan bicara — pola sama seperti daftar room.
+    const [onlineStatuses, privacySettings, sealTierMap]: [
+      Record<string, boolean>,
+      Record<string, boolean>,
+      Map<string, string | null>,
+    ] = otherInternalId
+      ? await Promise.all([
+          this.realtime.areUsersOnline([otherInternalId]),
+          this.loadOnlineVisibility([otherInternalId]),
+          this.verificationBadgeService.getSealTierMap([otherInternalId]),
+        ])
+      : [{}, {}, new Map<string, string | null>()];
+    const lastSeenByUser = await this.loadLastSeen(
+      otherInternalId ? [otherInternalId] : [],
+      onlineStatuses,
+      privacySettings,
+    );
+    return {
+      id: room.id,
+      type: room.type,
+      status: room.status,
+      subject: room.subject,
+      orderId: room.order?.orderId ?? null,
+      orderTitle: room.order?.title ?? null,
+      orderStatus: room.order?.status ?? null,
+      isArchived: member?.isArchived ?? room.isArchived,
+      isMuted: member?.isMuted === true && (!mutedUntil || mutedUntil.getTime() > Date.now()),
+      mutedUntil,
+      isPinned: pinRow != null,
+      isSelf:
+        ctx.initiatorId != null && ctx.initiatorId === userId && ctx.counterpartId === userId,
+      initiator: {
+        userId: room.initiator?.userId ?? null,
+        fullName: room.initiator?.fullName ?? null,
+        username: room.initiator?.username ?? null,
+        avatarUrl: room.initiator?.avatarUrl ?? null,
+      },
+      counterpart: {
+        userId: room.counterpart?.userId ?? null,
+        fullName: room.counterpart?.fullName ?? null,
+        username: room.counterpart?.username ?? null,
+        avatarUrl: room.counterpart?.avatarUrl ?? null,
+      },
+      otherUser: {
+        userId: other?.userId ?? null,
+        fullName: other?.fullName ?? null,
+        username: other?.username ?? null,
+        avatarUrl: other?.avatarUrl ?? null,
+        sealTier: otherInternalId ? (sealTierMap.get(otherInternalId) ?? null) : null,
+        isOnline: otherInternalId
+          ? privacySettings[otherInternalId] !== false && onlineStatuses[otherInternalId] === true
+          : false,
+        lastSeenAt: otherInternalId ? (lastSeenByUser[otherInternalId] ?? null) : null,
+      },
+      lastMessage: lastMsg
+        ? {
+            id: lastMsg.id,
+            content: lastMsg.content,
+            messageType: lastMsg.messageType,
+            senderId: lastMsg.sender?.userId ?? null,
+            fromUser: lastMsg.sender?.id != null && lastMsg.sender.id === userId,
+            createdAt: lastMsg.createdAt,
+          }
+        : null,
+      unreadCount: member?.unreadCount ?? 0,
+      pinnedCount,
+      createdAt: room.createdAt,
+      updatedAt: room.updatedAt,
+    };
+  }
+
+  /**
    * NS-006 (perf-fix, 2026-09-29): total unread chat viewer — SATU query
    * aggregate ringan di counter yang didenormalisasi (`chat_room_members.unreadCount`,
    * lihat BD-004), bukan `GET /v1/chat/rooms` (50 room penuh tiap 60 detik hanya
@@ -1035,13 +1161,32 @@ export class ChatService implements OnModuleInit {
   // Messages
   // ============================================================
 
-  async getMessages(userId: string, roomId: string, cursor?: string, limit: number = 50, excludeIds?: string[]): Promise<object> {
+  async getMessages(userId: string, roomId: string, cursor?: string, limit: number = 50, excludeIds?: string[], afterMessageId?: string): Promise<object> {
     const room = await this.validateRoomAccess(userId, roomId);
 
     const safeLimit = Math.min(Math.max(1, limit), 100);
 
     const whereClause: Record<string, unknown> = { roomId };
-    if (cursor) {
+    // D1-004 (perf 2026-09-29): mode delta untuk poll fallback — hanya pesan
+    // yang LEBIH BARU dari afterMessageId, bukan 30 pesan penuh tiap tick.
+    // Saling eksklusif dengan cursor (delta menang bila keduanya diisi).
+    let deltaMode = false;
+    if (afterMessageId) {
+      const anchor = await this.prisma.chatMessage.findFirst({
+        where: { id: afterMessageId, roomId },
+        select: { id: true, createdAt: true },
+      });
+      if (!anchor) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'afterMessageId does not belong to this room' });
+      }
+      deltaMode = true;
+      // "Lebih baru" mengikuti urutan sort (createdAt desc, id desc):
+      // createdAt lebih besar, atau sama dengan id yang lebih besar.
+      whereClause.OR = [
+        { createdAt: { gt: anchor.createdAt } },
+        { createdAt: anchor.createdAt, id: { gt: afterMessageId } },
+      ];
+    } else if (cursor) {
       const cursorMessage = await this.prisma.chatMessage.findFirst({
         where: { id: cursor, roomId },
         select: { id: true },
@@ -1120,8 +1265,9 @@ export class ChatService implements OnModuleInit {
 
     return {
       messages: responseMessages.map((m) => serializeMessage(m, { viewerId: userId, hiddenReaders })),
-      nextCursor,
-      hasMore,
+      // D1-004: mode delta bukan halaman — tidak ada nextCursor/hasMore.
+      nextCursor: deltaMode ? null : nextCursor,
+      hasMore: deltaMode ? false : hasMore,
     };
   }
 

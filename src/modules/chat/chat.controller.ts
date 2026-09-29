@@ -84,6 +84,19 @@ export class ChatController {
     return this.chatService.getRooms(userId, { page, limit, type: normalizedType, archived, q });
   }
 
+  @Get('rooms/:roomId')
+  @ApiOperation({
+    summary: 'Get a single chat room (lightweight)',
+    description:
+      'D1-003: satu room untuk header layar percakapan — tanpa mengunduh ulang seluruh daftar room. Bentuk payload sama dengan satu entri GET /v1/chat/rooms. 404 bila viewer bukan anggota.',
+  })
+  async getRoom(
+    @CurrentUser('sub') userId: string,
+    @Param('roomId') roomId: string,
+  ): Promise<object> {
+    return this.chatService.getRoom(userId, roomId);
+  }
+
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 3600000, limit: 10 } })
   @Idempotency()

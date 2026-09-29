@@ -5,6 +5,8 @@ import { Decimal } from '@prisma/client/runtime/library';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
+import { WalletModeService } from '../wallet-mode/wallet-mode.service';
+import { DisputeDanaSettlementService } from '../no-wallet/dispute-dana-settlement.service';
 import { FeeCalculatorService } from '../orders/fee-calculator.service';
 import { generateWalletTxId, generateNotifId } from '../../common/utils/id-generator.util';
 import { getCategoryForType } from '../notifications/notification-category.map';
@@ -21,6 +23,8 @@ export class MutualResolutionService {
     private walletTxSerialService: WalletTxSerialService,
     private feeCalculator: FeeCalculatorService,
     private redis: RedisService,
+    private walletMode: WalletModeService,
+    private disputeDanaSettlement: DisputeDanaSettlementService,
   ) {}
 
   async propose(
@@ -255,6 +259,22 @@ export class MutualResolutionService {
 
     const buyerAmount = (sellerReceiveAmount * BigInt(proposal.buyerPercent)) / BigInt(100);
     const sellerAmount = sellerReceiveAmount - buyerAmount;
+
+    // M3 (no-wallet): order dibayar via DANA-direct — accept mutual resolution
+    // dieksekusi TANPA wallet: refund DANA ke buyer + disbursement ke bank seller.
+    const danaPayment = await this.prisma.paymentTransaction.findFirst({
+      where: {
+        orderId: dispute.orderId,
+        purpose: 'ORDER_ESCROW',
+        provider: 'DANA',
+        status: 'SUCCESS',
+        danaPayKind: { not: null },
+      },
+      select: { id: true },
+    });
+    if (!this.walletMode.isWalletEnabled() && danaPayment) {
+      return this.acceptNoWallet(dispute, proposal, userId, isBuyer, responseNote, buyerAmount, sellerAmount);
+    }
 
     // Redis-backed serials are not rolled back with PostgreSQL. Allocate once
     // before the retry loop so a serialization retry reuses the same ledger IDs
@@ -597,6 +617,160 @@ export class MutualResolutionService {
     );
 
     return { proposalId, status: 'ACCEPTED', buyerPercent: proposal.buyerPercent, sellerPercent: proposal.sellerPercent };
+  }
+
+  /**
+   * M3 — accept mutual resolution TANPA wallet (BI-safe).
+   *
+   * State DB sama dengan jalur wallet (proposal ACCEPTED, dispute RESOLVED,
+   * DisputeDecision, order COMPLETED + history) minus semua pergerakan
+   * wallet/ledger. Eksekusi finansial post-commit via DisputeDanaSettlementService:
+   * refund DANA ke buyer + disbursement ke bank seller.
+   * Pasca-completion → fail-closed (dana sudah cair ke seller).
+   */
+  private async acceptNoWallet(
+    dispute: {
+      id: string;
+      order: {
+        id: string; orderId: string; title: string | null; status: string;
+        buyerId: string; sellerId: string;
+        buyerPayAmount: bigint; sellerReceiveAmount: bigint;
+        completedAt: Date | null;
+      };
+    },
+    proposal: { id: string; buyerPercent: number; sellerPercent: number },
+    userId: string,
+    isBuyer: boolean,
+    responseNote: string | undefined,
+    buyerAmount: bigint,
+    sellerAmount: bigint,
+  ): Promise<object> {
+    if (dispute.order.completedAt !== null) {
+      throw new BadRequestException({
+        code: 'DISPUTE_POST_COMPLETION_MANUAL_REVIEW',
+        message: 'Post-completion mutual resolution in no-wallet mode requires manual review — funds already disbursed to seller',
+      });
+    }
+
+    const mutualDecisionType = proposal.buyerPercent === 100
+      ? DisputeDecisionType.FULL_BUYER
+      : proposal.buyerPercent === 0
+        ? DisputeDecisionType.FULL_SELLER
+        : DisputeDecisionType.SPLIT;
+
+    await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const freshProposal = await tx.mutualResolutionProposal.findFirst({
+        where: { id: proposal.id, status: 'PENDING' },
+      });
+      if (!freshProposal) throw new ConflictException({ code: 'PROPOSAL_ALREADY_RESPONDED', message: 'Proposal has already been responded to' });
+
+      const freshDispute = await tx.dispute.findUnique({ where: { id: dispute.id }, select: { status: true } });
+      const freshOrder = await tx.order.findUnique({ where: { id: dispute.order.id }, select: { status: true, completedAt: true } });
+      const activeDisputeStatuses = ['OPEN', 'WAITING_RESPONSE', 'ASSIGNED', 'UNDER_REVIEW'];
+      if (!freshDispute || !activeDisputeStatuses.includes(freshDispute.status)) {
+        throw new ConflictException({ code: 'DISPUTE_STATE_CHANGED', message: 'Dispute state changed during processing' });
+      }
+      if (!freshOrder || freshOrder.status !== OrderStatus.DISPUTED) {
+        throw new ConflictException({ code: 'ORDER_STATE_CHANGED', message: 'Order state changed during processing' });
+      }
+      if (freshOrder.completedAt !== null) {
+        throw new BadRequestException({
+          code: 'DISPUTE_POST_COMPLETION_MANUAL_REVIEW',
+          message: 'Order completed during processing — manual review required (funds already disbursed)',
+        });
+      }
+
+      await tx.mutualResolutionProposal.update({
+        where: { id: proposal.id },
+        data: { status: 'ACCEPTED', respondedAt: new Date(), responseNote: responseNote?.trim() || null },
+      });
+
+      await tx.dispute.update({
+        where: { id: dispute.id },
+        data: { status: DisputeStatus.RESOLVED, resolvedAt: new Date() },
+      });
+
+      const existingDecision = await tx.disputeDecision.findUnique({ where: { disputeId: dispute.id } });
+      if (existingDecision) {
+        throw new ConflictException({ code: 'DISPUTE_ALREADY_RESOLVED', message: 'This dispute already has a decision' });
+      }
+      await tx.disputeDecision.create({
+        data: {
+          disputeId: dispute.id,
+          decidedBy: null,
+          decisionType: mutualDecisionType,
+          decisionNotes: `Mutual resolution accepted by both parties (proposal ${proposal.id}, no-wallet): ` +
+            `${proposal.buyerPercent}% buyer / ${proposal.sellerPercent}% seller. ` +
+            `Buyer receives ${buyerAmount} sen, seller receives ${sellerAmount} sen.`,
+          buyerAmount,
+          sellerAmount,
+          buyerPercent: mutualDecisionType === DisputeDecisionType.SPLIT ? new Decimal(proposal.buyerPercent) : null,
+          sellerPercent: mutualDecisionType === DisputeDecisionType.SPLIT ? new Decimal(proposal.sellerPercent) : null,
+          isExecuted: true,
+        },
+      });
+
+      await tx.order.update({
+        where: { id: dispute.order.id },
+        data: {
+          status: OrderStatus.COMPLETED,
+          ...(freshOrder.completedAt ? {} : { completedAt: new Date() }),
+        },
+      });
+
+      await tx.orderStatusHistory.create({
+        data: {
+          orderId: dispute.order.id,
+          fromStatus: OrderStatus.DISPUTED,
+          toStatus: OrderStatus.COMPLETED,
+          changedBy: userId,
+          changedByType: isBuyer ? ActorType.BUYER : ActorType.SELLER,
+          reason: `Mutual resolution accepted (no-wallet): ${proposal.buyerPercent}% buyer / ${proposal.sellerPercent}% seller`,
+        },
+      });
+    }), 'ACCEPT_MUTUAL_RESOLUTION_NO_WALLET_TX');
+
+    for (const recipientId of [dispute.order.buyerId, dispute.order.sellerId]) {
+      this.runPostCommitBestEffort(() => this.prisma.notification.create({
+        data: {
+          notifId: generateNotifId(),
+          userId: recipientId,
+          type: NotificationType.ORDER_COMPLETED,
+          category: getCategoryForType(NotificationType.ORDER_COMPLETED),
+          title: 'Dispute Resolved',
+          body: `Dispute for order "${dispute.order.title || dispute.order.orderId}" has been resolved by mutual agreement (${proposal.buyerPercent}% buyer / ${proposal.sellerPercent}% seller).`,
+          isRead: false,
+        },
+      }), 'ACCEPT_MUTUAL_RESOLUTION_NO_WALLET_NOTIFICATION');
+      this.runRealtimeBestEffort(() => this.prisma.emitNotificationCreated({
+        userId: recipientId,
+        title: 'Dispute Resolved',
+        body: `Mutual resolution accepted: ${proposal.buyerPercent}% buyer / ${proposal.sellerPercent}% seller.`,
+        data: { type: 'DISPUTE_RESOLVED', disputeId: dispute.id },
+      }), 'ACCEPT_MUTUAL_RESOLUTION_NO_WALLET_REALTIME');
+    }
+
+    this.runPostCommitBestEffort(
+      () => this.redis.del(`subscription_status:${dispute.order.buyerId}`),
+      'ACCEPT_MUTUAL_SUBSCRIPTION_CACHE_INVALIDATION',
+    );
+
+    // Eksekusi finansial post-commit: refund DANA (buyer) + disbursement (seller).
+    const settlement = await this.disputeDanaSettlement.settleDisputeNoWallet({
+      orderDbId: dispute.order.id,
+      disputeDbId: dispute.id,
+      decision: mutualDecisionType,
+      buyerAmountSen: buyerAmount,
+      sellerAmountSen: sellerAmount,
+      reason: `Mutual resolution accepted (proposal ${proposal.id}): ${proposal.buyerPercent}% buyer / ${proposal.sellerPercent}% seller`,
+    }).catch((err: unknown) => {
+      this.logger.error(
+        `MUTUAL_NO_WALLET_SETTLEMENT_FAILED dispute=${dispute.id}: ${err instanceof Error ? err.message : String(err)} — retry via dana-refund-retry cron`,
+      );
+      return null;
+    });
+
+    return { proposalId: proposal.id, status: 'ACCEPTED', buyerPercent: proposal.buyerPercent, sellerPercent: proposal.sellerPercent, settlement };
   }
 
   private runPostCommitBestEffort(task: () => Promise<unknown> | void, label: string): void {

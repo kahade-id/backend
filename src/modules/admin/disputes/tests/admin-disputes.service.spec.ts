@@ -1,4 +1,6 @@
 import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { WalletModeService } from '../../../wallet-mode/wallet-mode.service';
+import { DisputeDanaSettlementService } from '../../../no-wallet/dispute-dana-settlement.service';
 import { Test } from '@nestjs/testing';
 import { AdminDisputesService } from '../admin-disputes.service';
 import { PrismaService } from '../../../../prisma/prisma.service';
@@ -30,6 +32,9 @@ describe('AdminDisputesService round-two boundaries', () => {
         { provide: ChatService, useValue: {} },
         // AW-018: mock helper invalidasi cache dashboard terpusat.
         { provide: DashboardService, useValue: { invalidateSummaryCache: jest.fn() } },
+        // M3 no-wallet: wallet aktif di test ini → jalur wallet lama.
+        { provide: WalletModeService, useValue: { isWalletEnabled: () => true } },
+        { provide: DisputeDanaSettlementService, useValue: {} },
       ],
     }).compile();
     service = module.get(AdminDisputesService);

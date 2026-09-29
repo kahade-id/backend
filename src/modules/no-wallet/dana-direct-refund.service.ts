@@ -229,4 +229,33 @@ export class DanaDirectRefundService {
       throw error;
     }
   }
+
+  /**
+   * M3: retry attempt refund DANA yang FAILED (durable). Klaim atomik
+   * PENDING/FAILED → EXECUTING di refundAmount() menjamin tepat satu
+   * eksekutor per idempotency key — aman dipanggil cron tiap jam.
+   */
+  async retryFailedRefunds(limit = 50): Promise<{ retried: number; succeeded: number }> {
+    const failed = await this.prisma.danaRefundAttempt.findMany({
+      where: { status: 'FAILED' },
+      orderBy: { updatedAt: 'asc' },
+      take: Math.max(1, limit),
+      select: { idempotencyKey: true, paymentTransactionId: true, amountSen: true, reason: true },
+    });
+    let succeeded = 0;
+    for (const a of failed) {
+      try {
+        const res = await this.refundAmount({
+          paymentDbId: a.paymentTransactionId,
+          amountSen: a.amountSen,
+          reason: a.reason ?? 'Retry refund DANA (cron)',
+          idempotencyKey: a.idempotencyKey,
+        });
+        if (res.refunded) succeeded++;
+      } catch (e) {
+        this.logger.warn(`Retry refund DANA gagal key=${a.idempotencyKey}: ${(e as Error).message}`);
+      }
+    }
+    return { retried: failed.length, succeeded };
+  }
 }

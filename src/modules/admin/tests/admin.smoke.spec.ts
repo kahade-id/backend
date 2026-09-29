@@ -6,6 +6,8 @@ import { RedisService } from '../../../redis/redis.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { TokenService } from '../../auth/token.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
+import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
+import { DisputeDanaSettlementService } from '../../no-wallet/dispute-dana-settlement.service';
 import { OrderStateService } from '../../orders/order-state.service';
 import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
@@ -135,6 +137,9 @@ describe('Admin services smoke', () => {
       { provide: WalletTxSerialService, useValue: {} },
       { provide: UploadService, useValue: { generateDownloadUrl: jest.fn() } },
       { provide: RealtimeService, useValue: { emit: jest.fn() } },
+      // M3 no-wallet.
+      { provide: WalletModeService, useValue: { isWalletEnabled: () => true } },
+      { provide: DisputeDanaSettlementService, useValue: {} },
     ]);
     expect(s).toBeDefined();
     const res: any = await s.listDisputes(1, 10);

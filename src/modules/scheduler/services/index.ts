@@ -34,3 +34,4 @@ export { FeedbackGuestContactRedactionService } from './feedback-guest-contact-r
 export { MilestoneReminderService } from './milestone-reminder.service';
 export { ModerationSlaService } from './moderation-sla.service';
 export { NotificationDigestService } from './notification-digest.service';
+export { DanaRefundRetryService } from './dana-refund-retry.service';

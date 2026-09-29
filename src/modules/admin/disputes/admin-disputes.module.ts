@@ -6,9 +6,10 @@ import { AuditLogModule } from '../../../common/services/audit-log.module';
 import { UploadModule } from '../../upload/upload.module';
 import { ChatModule } from '../../chat/chat.module';
 import { DashboardModule } from '../dashboard/dashboard.module';
+import { NoWalletModule } from '../../no-wallet/no-wallet.module';
 
 @Module({
-  imports: [AuditLogModule, UploadModule, ChatModule, DashboardModule],
+  imports: [AuditLogModule, UploadModule, ChatModule, DashboardModule, NoWalletModule],
   controllers: [AdminDisputesController],
   providers: [AdminDisputesService, WalletTxSerialService],
   exports: [AdminDisputesService],

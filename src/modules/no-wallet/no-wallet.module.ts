@@ -8,6 +8,7 @@ import { DanaDirectPaymentService } from './dana-direct-payment.service';
 import { DanaDirectRefundService } from './dana-direct-refund.service';
 import { EscrowDisbursementService } from './escrow-disbursement.service';
 import { LegacyPayoutService } from './legacy-payout.service';
+import { DisputeDanaSettlementService } from './dispute-dana-settlement.service';
 import { LegacyPayoutController } from './legacy-payout.controller';
 
 /**
@@ -21,7 +22,8 @@ import { LegacyPayoutController } from './legacy-payout.controller';
  *   (DANA transfer, idempoten; HELD_NO_BANK bila seller belum punya rekening).
  * - LegacyPayoutService: payout satu arah saldo wallet lama → rekening bank
  *   (tetap hidup saat WALLET_ENABLED=false; tanpa top-up/transfer masuk).
- * - (menyusul) —
+ * - DisputeDanaSettlementService: eksekusi finansial putusan sengketa
+ *   tanpa wallet (refund DANA ke buyer + disbursement ke bank seller).
  *
  * forwardRef WalletModule: dipakai untuk WalletTxSerialService
  * (serial id pembayaran) — WalletModule TIDAK mengimpor modul ini
@@ -35,12 +37,14 @@ import { LegacyPayoutController } from './legacy-payout.controller';
     DanaDirectRefundService,
     EscrowDisbursementService,
     LegacyPayoutService,
+    DisputeDanaSettlementService,
   ],
   exports: [
     DanaDirectPaymentService,
     DanaDirectRefundService,
     EscrowDisbursementService,
     LegacyPayoutService,
+    DisputeDanaSettlementService,
   ],
 })
 export class NoWalletModule {}

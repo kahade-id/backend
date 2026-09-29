@@ -133,6 +133,35 @@ Auto-refund patungan/jastip: sweep Bull tiap 5 menit
 (`commerce-refund`) mengeksekusi refund DANA-direct untuk peserta
 `REFUND_REQUIRED` — konsumen nyata, idempoten.
 
+## Catatan implementasi M3 (2026-09-29)
+
+- `OrderStateService.adminCancelOrder`: bila `WALLET_ENABLED=false` dan ada
+  payment DANA-direct SUCCESS untuk order → lewati seluruh refund escrow
+  wallet, refund ke metode bayar asal via `DanaDirectRefundService.refundOrderEscrow`
+  (idempoten `ORDER:<orderDbId>`, best-effort post-commit). Copy notifikasi
+  buyer menyebut "metode pembayaran asal", bukan wallet. Mencakup auto-cancel
+  2 hari (`UnshippedOrderCancelService`) dan refund patungan/jastip
+  (`CommerceRefundService`) — keduanya mendelegasikan ke `adminCancelOrder`.
+- `AdminDisputesService.resolveDispute`: cabang no-wallet untuk order DANA-direct
+  — state DB sama (RESOLVED, DisputeDecision, DP-014, history, voucher apology)
+  minus wallet; eksekusi finansial post-commit via `DisputeDanaSettlementService`:
+  porsi buyer → DANA Refund (`DISPUTE:<disputeId>:BUYER`), porsi seller →
+  disbursement scope `DISPUTE_RELEASE` (`DISPUTE:<disputeId>:SELLER`).
+  Kebijakan fee tidak berubah (platform fee tertahan di merchant DANA).
+- `MutualResolutionService.respond` (ACCEPT): cabang no-wallet dengan pola sama.
+- `ReturnsService.executeRefundForReturn`: cabang no-wallet — refund DANA
+  full/parsial sesuai approval (`RETURN:<returnDbId>`). PERHATIAN KEPUTUSAN
+  PRODUK/FINANCE: refund provider membayar dari kas merchant DANA platform
+  (tanpa clawback dari seller), sedangkan jalur wallet mendebit wallet seller.
+  Perlu konfirmasi sebelum go-live.
+- Fail-closed pasca-completion: sengketa/retur setelah dana cair ke seller
+  melempar `DISPUTE_POST_COMPLETION_MANUAL_REVIEW` / tidak dieksekusi otomatis —
+  butuh penanganan manual/keputusan operasional.
+- Retry: cron `dana-refund-retry` tiap jam (`50 * * * *`) memanggil
+  `DanaDirectRefundService.retryFailedRefunds()` (attempt FAILED) dan
+  `EscrowDisbursementService.retryDue()` (disbursement PENDING/FAILED) —
+  keduanya idempoten, di bawah redis lock.
+
 ## Catatan idempotency & fail-closed
 
 - Semua endpoint tulis uang mendukung header `Idempotency-Key` (atau

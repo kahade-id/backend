@@ -6,6 +6,8 @@ import { getCategoryForType } from '../../notifications/notification-category.ma
 import { DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE } from '../../../common/constants/app.constants';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
+import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
+import { DisputeDanaSettlementService } from '../../no-wallet/dispute-dana-settlement.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
 import { creditCashbackIfEligible } from '../../../common/utils/cashback-credit.util';
 import { computePatunganRebateTx, createPatunganRebateLedgerTx } from '../../commerce/patungan-rebate';
@@ -31,6 +33,8 @@ export class AdminDisputesService {
   constructor(
     private prisma: PrismaService,
     private walletTxSerialService: WalletTxSerialService,
+    private walletMode: WalletModeService,
+    private disputeDanaSettlement: DisputeDanaSettlementService,
     private auditLog: AuditLogService,
     private uploadService: UploadService,
     private realtime: RealtimeService,
@@ -390,6 +394,24 @@ export class AdminDisputesService {
       totalDisbursement,
       isPostCompletionDispute,
     } = amounts;
+
+    // M3 (no-wallet): order dibayar via DANA-direct (QRIS/VA/BALANCE). Putusan
+    // sengketa dieksekusi TANPA wallet: refund DANA ke metode bayar asal
+    // (buyer) + disbursement ke rekening bank seller. Kebijakan pembagian
+    // (computeDisbursementAmounts) dan DP-014 tidak berubah.
+    const danaPayment = await this.prisma.paymentTransaction.findFirst({
+      where: {
+        orderId: dispute.orderId,
+        purpose: 'ORDER_ESCROW',
+        provider: 'DANA',
+        status: 'SUCCESS',
+        danaPayKind: { not: null },
+      },
+      select: { id: true },
+    });
+    if (!this.walletMode.isWalletEnabled() && danaPayment) {
+      return this.resolveDisputeNoWallet(dispute, adminId, dto, ipAddress, amounts);
+    }
 
     // Redis-backed wallet serials are not rolled back with PostgreSQL. Allocate
     // them before the transaction so a later retry/serialization recovery can
@@ -790,6 +812,218 @@ export class AdminDisputesService {
     await this.dashboard.invalidateSummaryCache();
 
     return result.decision;
+  }
+
+  /**
+   * M3 — resolve dispute TANPA menyentuh wallet internal (BI-safe).
+   *
+   * Perubahan state DB sama dengan jalur wallet (lock, guard, RESOLVED,
+   * DisputeDecision, DP-014, history, voucher apology) minus semua pergerakan
+   * wallet/ledger. Kebijakan pembagian (computeDisbursementAmounts) tidak
+   * berubah — hanya rel uang yang diganti:
+   * - porsi buyer  → DANA Refund API ke metode bayar asal (post-commit),
+   * - porsi seller → DANA Disbursement ke rekening bank seller (post-commit),
+   * - platform fee tertahan di akun merchant DANA.
+   *
+   * Sengketa pasca-completion → fail-closed SEBELUM DB ditulis: dana sudah
+   * dicairkan ke seller; refund provider akan membayar dari kas platform
+   * tanpa clawback — butuh keputusan operasional, jangan ditebak.
+   *
+   * Kegagalan eksekusi finansial post-commit dicatat keras dan dilaporkan di
+   * return value; retry ditangani cron `dana-refund-retry` (attempt FAILED +
+   * disbursement PENDING/FAILED) — idempoten per DISPUTE:<disputeId>:BUYER/:SELLER.
+   */
+  private async resolveDisputeNoWallet(
+    dispute: Prisma.DisputeGetPayload<{ include: { order: true } }>,
+    adminId: string,
+    dto: DisputeDecisionDto,
+    ipAddress: string,
+    amounts: ReturnType<AdminDisputesService['computeDisbursementAmounts']>,
+  ): Promise<object> {
+    const { buyerAmount, sellerAmount, totalDisbursement } = amounts;
+
+    if (amounts.isPostCompletionDispute) {
+      throw new BadRequestException({
+        code: 'DISPUTE_POST_COMPLETION_MANUAL_REVIEW',
+        message: 'Post-completion dispute in no-wallet mode requires manual review — funds already disbursed to seller',
+      });
+    }
+
+    const actingAdmin = await this.prisma.adminUser.findUnique({ where: { id: adminId }, select: { role: true } });
+    const isSuperAdmin = actingAdmin?.role === 'SUPER_ADMIN';
+    const resolvableStatuses: string[] = ['UNDER_REVIEW', 'ESCALATED'];
+
+    const result = await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await tx.$queryRaw`SELECT id FROM disputes WHERE id = ${dispute.id} FOR UPDATE`;
+      const freshDispute = await tx.dispute.findUnique({
+        where: { id: dispute.id },
+        select: { status: true, assignedAdminId: true },
+      });
+      if (!freshDispute || !resolvableStatuses.includes(freshDispute.status as string)) {
+        throw new ConflictException({ code: ErrorCodes.INVALID_STATUS, message: 'Dispute state changed before resolution' });
+      }
+      if (freshDispute.assignedAdminId && freshDispute.assignedAdminId !== adminId && !isSuperAdmin) {
+        throw new ForbiddenException({ code: ErrorCodes.NOT_ASSIGNED_ADMIN, message: 'Assignment changed before resolution; only the assigned admin or a SUPER_ADMIN can resolve' });
+      }
+
+      const order = await tx.order.findUnique({ where: { id: dispute.orderId } });
+      if (!order || order.status !== OrderStatus.DISPUTED) {
+        throw new ConflictException({ code: ErrorCodes.INVALID_STATUS, message: 'Order is no longer DISPUTED; dispute resolution was not applied' });
+      }
+      // Klasifikasi pra/pasca-completion tidak boleh berubah di tengah jalan.
+      if (order.completedAt !== null) {
+        throw new BadRequestException({
+          code: 'DISPUTE_POST_COMPLETION_MANUAL_REVIEW',
+          message: 'Order completed during review — manual review required (funds already disbursed)',
+        });
+      }
+      const freshEscrowedAmount = order.buyerPayAmount;
+      if (freshEscrowedAmount < totalDisbursement) {
+        throw new ConflictException({ code: ErrorCodes.DISPUTE_AMOUNT_EXCEEDS_ESCROW, message: 'Fresh order escrow is lower than the proposed settlement' });
+      }
+
+      const existingDecision = await tx.disputeDecision.findUnique({ where: { disputeId: dispute.id } });
+      if (existingDecision) {
+        throw new ConflictException({ code: ErrorCodes.DISPUTE_ALREADY_RESOLVED, message: 'This dispute has already been resolved' });
+      }
+
+      await tx.dispute.update({
+        where: { id: dispute.id },
+        data: { status: 'RESOLVED', resolvedAt: new Date(), assignedAdminId: adminId },
+      });
+
+      const now = new Date();
+      const firstAdminMessage = await tx.disputeMessage.findFirst({
+        where: { disputeId: dispute.id, adminId: { not: null } },
+        orderBy: { createdAt: 'asc' },
+        select: { createdAt: true },
+      });
+      const timeToFirstResponseMs = firstAdminMessage
+        ? firstAdminMessage.createdAt.getTime() - dispute.createdAt.getTime()
+        : null;
+      const totalResolutionTimeMs = now.getTime() - dispute.createdAt.getTime();
+
+      const decision = await tx.disputeDecision.create({
+        data: {
+          disputeId: dispute.id,
+          decidedBy: adminId,
+          decisionType: dto.decision as DisputeDecisionType,
+          decisionNotes: [
+            dto.decisionNotes,
+            timeToFirstResponseMs != null ? `[timing] firstResponse=${timeToFirstResponseMs}ms` : null,
+            `[timing] totalResolution=${totalResolutionTimeMs}ms`,
+          ].filter(Boolean).join(' | '),
+          buyerAmount,
+          sellerAmount,
+          buyerPercent: dto.decision === 'SPLIT' ? new Decimal(dto.buyerPercent!) : null,
+          sellerPercent: dto.decision === 'SPLIT' ? new Decimal(dto.sellerPercent!) : null,
+        },
+      });
+
+      // DP-014: FULL_BUYER pra-completion = transaksi batal total → CANCELLED.
+      // FULL_SELLER & SPLIT → COMPLETED.
+      const isFullBuyerPreCompletion = dto.decision === 'FULL_BUYER';
+      const resolvedOrderStatus = isFullBuyerPreCompletion ? OrderStatus.CANCELLED : OrderStatus.COMPLETED;
+      await tx.order.update({
+        where: { id: order.id },
+        data: {
+          status: resolvedOrderStatus,
+          ...(isFullBuyerPreCompletion ? { cancelledAt: new Date() } : { completedAt: new Date() }),
+        },
+      });
+      await tx.orderStatusHistory.create({
+        data: {
+          orderId: order.id,
+          fromStatus: OrderStatus.DISPUTED,
+          toStatus: resolvedOrderStatus,
+          changedBy: adminId,
+          changedByType: ActorType.ADMIN,
+          reason: `Dispute resolved: ${dto.decision}${dto.decisionNotes ? ` — ${dto.decisionNotes}` : ''}`,
+        },
+      });
+
+      const apologyVoucherRecipients = this.disputeApologyRecipients(dto.decision, order, buyerAmount, sellerAmount);
+      const apologyVouchers = await this.issueDisputeApologyVouchers(tx, apologyVoucherRecipients, dispute.disputeId);
+
+      const decisionLabel =
+        dto.decision === 'FULL_BUYER' ? 'Full amount refunded to buyer'
+        : dto.decision === 'FULL_SELLER' ? 'Full amount forwarded to seller'
+        : `Funds split ${dto.buyerPercent}% buyer / ${dto.sellerPercent}% seller`;
+
+      const notifyUserIds = [order?.buyerId, order?.sellerId].filter((id): id is string => !!id);
+      const disputeNotifTitle = 'Dispute Decision Made';
+      const sanitizedNotes = dto.decisionNotes ? escapeHtml(dto.decisionNotes) : '';
+      const disputeNotifBody = `The dispute for this order has been resolved by the Kahade team. Decision: ${decisionLabel}.${sanitizedNotes ? ' Notes: ' + sanitizedNotes : ''}`;
+      return {
+        decision,
+        notifyUserIds,
+        disputeNotifTitle,
+        disputeNotifBody,
+        resolvedDisputeId: dispute.id,
+        auditTargetId: dispute.disputeId,
+        auditDescription: `Admin resolved dispute ${dispute.disputeId} with decision ${dto.decision} (no-wallet)`,
+        auditAfter: { decision: dto.decision, buyerPercent: dto.buyerPercent, sellerPercent: dto.sellerPercent, noWallet: true },
+        apologyVouchers,
+      };
+    }), 'ADMIN_DISPUTE_RESOLVE_NO_WALLET_TX');
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.DISPUTE_DECIDED,
+      targetType: 'Dispute',
+      targetId: result.auditTargetId,
+      description: result.auditDescription,
+      after: result.auditAfter,
+      ipAddress,
+    });
+
+    for (const uid of result.notifyUserIds) {
+      this.prisma.notification.create({
+        data: {
+          notifId: generateNotifId(),
+          userId: uid,
+          type: NotificationType.DISPUTE_DECISION,
+          category: getCategoryForType(NotificationType.DISPUTE_DECISION),
+          title: result.disputeNotifTitle,
+          body: result.disputeNotifBody,
+          isRead: false,
+        },
+      }).catch((err: unknown) => this.logger.warn(`silent-catch: dispute decision notification failed: ${err instanceof Error ? err.message : String(err)}`));
+      this.prisma.emitNotificationCreated({ userId: uid, title: result.disputeNotifTitle, body: result.disputeNotifBody, data: { type: 'DISPUTE_RESOLVED', disputeId: result.resolvedDisputeId } });
+    }
+
+    for (const voucher of result.apologyVouchers) {
+      this.prisma.notification.create({
+        data: {
+          notifId: generateNotifId(),
+          userId: voucher.userId,
+          type: NotificationType.VOUCHER_ISSUED,
+          category: getCategoryForType(NotificationType.VOUCHER_ISSUED),
+          title: 'Voucher Apology dari Kahade',
+          body: `Voucher ${voucher.code} telah ditambahkan sebagai permintaan maaf setelah sengketa selesai.`,
+          metadata: { voucherCode: voucher.code, disputeId: result.resolvedDisputeId },
+        },
+      }).catch((err: unknown) => this.logger.warn(`silent-catch: dispute apology voucher notification failed: ${err instanceof Error ? err.message : String(err)}`));
+    }
+
+    await this.dashboard.invalidateSummaryCache();
+
+    // Eksekusi finansial post-commit (bukan bagian transaksi DB).
+    const settlement = await this.disputeDanaSettlement.settleDisputeNoWallet({
+      orderDbId: dispute.orderId,
+      disputeDbId: dispute.id,
+      decision: dto.decision,
+      buyerAmountSen: buyerAmount,
+      sellerAmountSen: sellerAmount,
+      reason: `Dispute ${dispute.disputeId} resolved: ${dto.decision}`,
+    }).catch((err: unknown) => {
+      this.logger.error(
+        `DISPUTE_NO_WALLET_SETTLEMENT_FAILED dispute=${dispute.disputeId}: ${err instanceof Error ? err.message : String(err)} — retry via dana-refund-retry cron`,
+      );
+      return null;
+    });
+
+    return { decision: result.decision, settlement };
   }
 
   async assignAdmin(disputeId: string, requestingAdminId: string, targetAdminId?: string, _ipAddress: string = 'internal'): Promise<object> {

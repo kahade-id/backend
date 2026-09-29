@@ -41,11 +41,13 @@ import {
   MilestoneReminderService,
   ModerationSlaService,
   NotificationDigestService,
+  DanaRefundRetryService,
 } from './services';
 import { AdminFinanceModule } from '../admin/finance/admin-finance.module';
 import { WithdrawalsModule } from '../withdrawals/withdrawals.module';
 import { MidtransService } from '../payment/midtrans.service';
 import { PaymentModule } from '../payment/payment.module';
+import { NoWalletModule } from '../no-wallet/no-wallet.module';
 import { WalletModule } from '../wallet/wallet.module';
 import { VerificationBadgeModule } from '../users/verification-badge.module';
 import { OnApplicationBootstrap } from '@nestjs/common';
@@ -76,7 +78,7 @@ import { AdminFeedbackModule } from '../admin/feedback/admin-feedback.module';
 import { UsersModule } from '../users/users.module';
 
 @Module({
-  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, AdminShowcaseReportsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, AuditLogModule, UploadModule, AdminFeedbackModule, InventoryModule, forwardRef(() => UsersModule)],
+  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, AdminShowcaseReportsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, NoWalletModule, AuditLogModule, UploadModule, AdminFeedbackModule, InventoryModule, forwardRef(() => UsersModule)],
   providers: [
     WalletDailyResetService,
     DataCleanupService,
@@ -110,6 +112,7 @@ import { UsersModule } from '../users/users.module';
     DormantWinbackVoucherService,
     ExpireExtensionRequestsService,
     RefundReconciliationService,
+    DanaRefundRetryService,
     FeedbackGuestContactRedactionService,
     MilestoneReminderService, // GAP-C (G182)
     ModerationSlaService, // GAP-F (G419/G423): terdaftar sebagai provider agar cron SLA moderasi berjalan

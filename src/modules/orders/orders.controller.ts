@@ -17,7 +17,7 @@ import { DeliveryProofService } from './delivery-proof.service';
 import { InvoiceService } from './invoice.service';
 import { ReceiptService } from './receipt.service';
 import { OrderQrisPaymentService, OrderQrisPaymentResult } from '../payment/order-qris-payment.service';
-import { DanaDirectPaymentService, DanaDirectPayResult } from '../no-wallet/dana-direct-payment.service';
+import { DanaDirectPaymentService, DanaDirectPayResult, listDanaDirectPaymentMethods, DanaPaymentMethodInfo } from '../no-wallet/dana-direct-payment.service';
 import { DanaDirectPayDto } from '../no-wallet/dto/dana-direct-pay.dto';
 import { WalletKillSwitchGuard } from '../wallet-mode/wallet-kill-switch.guard';
 import { DisputesService } from '../disputes/disputes.service';
@@ -274,6 +274,52 @@ export class OrdersController {
     @Param('orderId', ParseIdPipe) orderId: string,
   ): Promise<{ payment: DanaDirectPayResult | null }> {
     return { payment: await this.danaDirectPaymentService.getStatus(orderId, userId) };
+  }
+
+  /**
+   * Misi tanpa-wallet (BI-safe) — KONTRAK KANONIS.
+   * Daftar metode bayar DANA yang didukung untuk order ini (QRIS / VA /
+   * BALANCE) — TIDAK hardcode QRIS saja.
+   */
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @Get(':orderId/payment-methods')
+  @ApiOperation({
+    summary: 'Daftar metode bayar DANA yang didukung untuk order ini (kontrak kanonis)',
+    description:
+      'Kontrak kanonis mode tanpa-wallet. Frontend render daftar ini apa adanya; ' +
+      'jangan hardcode QRIS saja di klien.',
+  })
+  async getOrderPaymentMethods(
+    @CurrentUser('sub') userId: string,
+    @Param('orderId', ParseIdPipe) orderId: string,
+  ): Promise<{ walletEnabled: false; methods: DanaPaymentMethodInfo[] }> {
+    // Verifikasi kepesertaan order (lempar 400 bila bukan peserta / tak ada).
+    await this.danaDirectPaymentService.assertOrderPayable(orderId, userId);
+    return { walletEnabled: false, methods: listDanaDirectPaymentMethods() };
+  }
+
+  /**
+   * Misi tanpa-wallet (BI-safe) — KONTRAK KANONIS.
+   * Buat pembayaran DANA untuk order; kembalikan data checkout DANA
+   * (qrString / paymentCode / webRedirectUrl + expiry).
+   */
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 900000, limit: 5 } })
+  @Post(':orderId/payments')
+  @Idempotency()
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Buat pembayaran DANA untuk order (kontrak kanonis)',
+    description:
+      'Kontrak kanonis mode tanpa-wallet. Idempoten per order: charge PENDING ' +
+      'yang masih berlaku dikembalikan ulang (tidak ada charge ganda).',
+  })
+  async createOrderPayment(
+    @CurrentUser('sub') userId: string,
+    @Param('orderId', ParseIdPipe) orderId: string,
+    @Body() dto: DanaDirectPayDto,
+  ): Promise<DanaDirectPayResult> {
+    return this.danaDirectPaymentService.initiate(orderId, userId, dto);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 60 } })

@@ -2,6 +2,7 @@ import { PaymentProvider, PaymentPurpose, PaymentStatus } from '@prisma/client';
 import {
   DanaDirectPaymentService,
   generateDanaPartnerReferenceNo,
+  listDanaDirectPaymentMethods,
 } from './dana-direct-payment.service';
 import { DanaDirectPayKind } from './dto/dana-direct-pay.dto';
 
@@ -265,5 +266,55 @@ describe('DanaDirectPaymentService.settleEscrow', () => {
     expect(txState.paymentTransactionUpdate).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ status: PaymentStatus.SUCCESS }) }),
     );
+  });
+});
+
+describe('DanaDirectPaymentService.assertOrderPayable (GET payment-methods)', () => {
+  const build = (order: unknown) => {
+    const { prisma } = buildPrisma();
+    (prisma.order.findFirst as jest.Mock).mockResolvedValue(order);
+    return new DanaDirectPaymentService(
+      prisma as never,
+      danaPayment as never,
+      config as never,
+      serial as never,
+      walletMode as never,
+    );
+  };
+
+  it('lolos bila order ada dan requester adalah buyer', async () => {
+    const svc = build(baseOrder);
+    await expect(svc.assertOrderPayable('ORD-20260929-000001', 'buyer-1')).resolves.toBeUndefined();
+  });
+
+  it('400 bila order tidak ada', async () => {
+    const svc = build(null);
+    await expect(svc.assertOrderPayable('ORD-X', 'buyer-1')).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'ORDER_NOT_FOUND' }),
+    });
+  });
+
+  it('400 bila requester bukan buyer', async () => {
+    const svc = build(baseOrder);
+    await expect(svc.assertOrderPayable('ORD-20260929-000001', 'orang-lain')).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'NOT_ORDER_PARTICIPANT' }),
+    });
+  });
+});
+
+describe('listDanaDirectPaymentMethods (kontrak kanonis)', () => {
+  it('bukan hardcode QRIS: QRIS + VA + BALANCE tersedia', () => {
+    const methods = listDanaDirectPaymentMethods();
+    const kinds = methods.map((m) => m.kind);
+    expect(kinds).toEqual(expect.arrayContaining([
+      DanaDirectPayKind.QRIS,
+      DanaDirectPayKind.VA,
+      DanaDirectPayKind.BALANCE,
+    ]));
+    const va = methods.find((m) => m.kind === DanaDirectPayKind.VA)!;
+    expect(va.requiresBankCode).toBe(true);
+    expect(va.banks).toContain('BCA');
+    const qris = methods.find((m) => m.kind === DanaDirectPayKind.QRIS)!;
+    expect(qris.requiresBankCode).toBe(false);
   });
 });

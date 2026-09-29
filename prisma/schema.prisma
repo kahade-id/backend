@@ -1733,6 +1733,8 @@ model PaymentTransaction {
   walletTransactions WalletTransaction[]
   subscriptions      Subscription[]
   voucherUsages      VoucherUsage[]
+  // Misi tanpa-wallet: riwayat refund DANA (penuh & parsial) ke metode bayar asal.
+  danaRefundAttempts DanaRefundAttempt[]
 
   @@index([userId])
   @@index([orderId])
@@ -1789,10 +1791,47 @@ model EscrowDisbursement {
   @@map("escrow_disbursements")
 }
 
+// ============================================================
+// Misi tanpa-wallet (BI-safe): idempotency refund DANA (penuh & parsial)
+// ke metode bayar asal. Satu baris per idempotencyKey — retry aman tanpa
+// refund ganda. Model 100% ADITIF (tabel baru).
+// ============================================================
+model DanaRefundAttempt {
+  id String @id @default(cuid())
+
+  // Kunci idempotency stabil dari caller, mis. "ORDER:<orderDbId>:FULL",
+  // "DISPUTE:<disputeId>:BUYER", "RETURN:<returnId>".
+  idempotencyKey String @unique
+
+  paymentTransactionId String
+  paymentTransaction   PaymentTransaction @relation(fields: [paymentTransactionId], references: [id], onDelete: Restrict)
+
+  // Nominal refund dalam sen (IDR x 100).
+  amountSen BigInt
+
+  // Kunci idempotency sisi DANA (merchantId + partnerRefundNo).
+  partnerRefundNo String @unique
+  danaReferenceNo String?
+
+  // PENDING | SUCCESS | FAILED
+  status String @default("PENDING")
+  reason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([paymentTransactionId])
+  @@map("dana_refund_attempts")
+}
+
 enum EscrowDisbursementScope {
   ORDER_ESCROW
   MILESTONE
   LEGACY_WALLET_PAYOUT
+  // Misi tanpa-wallet: payout non-order ke rekening bank terverifikasi.
+  CASHBACK
+  REFERRAL
+  DISPUTE_RELEASE
 }
 
 enum EscrowDisbursementStatus {

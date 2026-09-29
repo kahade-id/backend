@@ -96,7 +96,7 @@ describe('dana-webhook-settlement.service', () => {
       id: 'pt-1',
       status: PaymentStatus.PENDING,
       purpose: PaymentPurpose.TOPUP,
-      grossAmount: BigInt(15000),
+      grossAmount: BigInt(1500000),
       midtransOrderId: 'KAHADE-TOP-1',
     });
     danaPaymentService.getPaymentDetail.mockResolvedValue({
@@ -122,7 +122,7 @@ describe('dana-webhook-settlement.service', () => {
       id: 'pt-1',
       status: PaymentStatus.PENDING,
       purpose: PaymentPurpose.TOPUP,
-      grossAmount: BigInt(15000),
+      grossAmount: BigInt(1500000),
       midtransOrderId: 'KAHADE-TOP-1',
     });
     danaPaymentService.getPaymentDetail.mockResolvedValue({
@@ -142,7 +142,7 @@ describe('dana-webhook-settlement.service', () => {
       id: 'pt-1',
       status: PaymentStatus.PENDING,
       purpose: PaymentPurpose.ORDER_ESCROW,
-      grossAmount: BigInt(15000),
+      grossAmount: BigInt(1500000),
       midtransOrderId: 'KAHADE-ORD-1',
     });
     danaPaymentService.getPaymentDetail.mockResolvedValue({ status: 'UNKNOWN', amountIdr: null });
@@ -160,7 +160,7 @@ describe('dana-webhook-settlement.service', () => {
       id: 'pt-1',
       status: PaymentStatus.PENDING,
       purpose: PaymentPurpose.TOPUP,
-      grossAmount: BigInt(15000),
+      grossAmount: BigInt(1500000),
       midtransOrderId: 'KAHADE-TOP-1',
     });
     await svc.handleFinishNotify(
@@ -191,7 +191,7 @@ describe('dana-webhook-settlement.service', () => {
       purpose: PaymentPurpose.ORDER_ESCROW,
       provider: 'DANA',
       danaPayKind: 'QRIS',
-      grossAmount: BigInt(15000),
+      grossAmount: BigInt(1500000),
       midtransOrderId: 'PAY-DANA-1',
     });
     danaPaymentService.getPaymentDetail.mockResolvedValue({ status: 'SUCCESS', amountIdr: 15000 });
@@ -212,7 +212,7 @@ describe('dana-webhook-settlement.service', () => {
       purpose: PaymentPurpose.TOPUP,
       provider: 'DANA',
       danaPartnerReferenceNo: 'DANA-TOP-001',
-      grossAmount: BigInt(15000),
+      grossAmount: BigInt(1500000),
       midtransOrderId: 'KAHADE-TOP-1',
     });
     danaPaymentService.getPaymentDetail.mockResolvedValue({ status: 'SUCCESS', amountIdr: 15000 });

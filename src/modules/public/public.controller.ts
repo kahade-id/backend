@@ -3,11 +3,15 @@ import { ApiTags, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { Public } from '../../common/decorators/public.decorator';
 import { PublicService, PublicStats } from './public.service';
+import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 
 @ApiTags('public')
 @Controller('public')
 export class PublicController {
-  constructor(private publicService: PublicService) {}
+  constructor(
+    private publicService: PublicService,
+    private walletMode: WalletModeService,
+  ) {}
 
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 30 } })
@@ -84,5 +88,24 @@ export class PublicController {
   })
   getMaintenanceStatus(): { enabled: boolean; message: string | null } {
     return this.publicService.getMaintenanceStatus();
+  }
+
+  /**
+   * Misi tanpa-wallet (BI-safe) — KONTRAK KANONIS.
+   * Tanpa auth: frontend cek kill-switch sebelum menampilkan alur uang.
+   * Response: { walletEnabled: boolean }.
+   */
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @Get('wallet-status')
+  @Header('Cache-Control', 'public, max-age=60, s-maxage=60')
+  @ApiOperation({
+    summary: 'Status kill-switch wallet internal (tanpa auth)',
+    description:
+      'Kontrak kanonis mode tanpa-wallet. false = mode BI-safe: semua alur ' +
+      'uang via DANA langsung (escrow/refund/disbursement), wallet internal mati.',
+  })
+  getWalletStatus(): { walletEnabled: boolean } {
+    return { walletEnabled: this.walletMode.isWalletEnabled() };
   }
 }

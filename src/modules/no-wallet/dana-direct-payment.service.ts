@@ -49,6 +49,33 @@ export interface DanaDirectPayResult {
   expiryTime: Date;
 }
 
+export interface DanaPaymentMethodInfo {
+  kind: DanaDirectPayKind;
+  label: string;
+  requiresBankCode: boolean;
+  banks?: string[];
+}
+
+/**
+ * Daftar metode bayar DANA yang didukung — BUKAN hardcode QRIS.
+ * Daftar bank VA = yang dipetakan mapVaMethod di bawah (DANA auto-generate
+ * kode VA per bank via payOption VIRTUAL_ACCOUNT_<BANK>).
+ */
+export const DANA_DIRECT_VA_BANKS = ['BCA', 'BNI', 'BRI', 'MANDIRI', 'CIMB', 'PERMATA'] as const;
+
+export function listDanaDirectPaymentMethods(): DanaPaymentMethodInfo[] {
+  return [
+    { kind: DanaDirectPayKind.QRIS, label: 'QRIS', requiresBankCode: false },
+    {
+      kind: DanaDirectPayKind.VA,
+      label: 'Virtual Account',
+      requiresBankCode: true,
+      banks: [...DANA_DIRECT_VA_BANKS],
+    },
+    { kind: DanaDirectPayKind.BALANCE, label: 'Saldo DANA', requiresBankCode: false },
+  ];
+}
+
 function mapVaMethod(bankCode: string): PaymentMethod {
   const bank = bankCode.toUpperCase();
   switch (bank) {
@@ -288,8 +315,25 @@ export class DanaDirectPaymentService {
     }
   }
 
-  async getStatus(orderId: string, buyerId: string): Promise<DanaDirectPayResult | null> {
-    const order = await this.prisma.order.findUnique({
+  /**
+   * Verifikasi ringan untuk GET payment-methods: order ada + requester
+   * adalah buyer. Tidak mengubah state apa pun.
+   */
+  async assertOrderPayable(orderId: string, buyerId: string): Promise<void> {
+    const order = await this.prisma.order.findFirst({
+      where: { orderId, deletedAt: null },
+      select: { buyerId: true },
+    });
+    if (!order)
+      throw new BadRequestException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
+    if (order.buyerId !== buyerId)
+      throw new BadRequestException({
+        code: ErrorCodes.NOT_ORDER_PARTICIPANT,
+        message: 'Not authorized to view payment methods for this order',
+      });
+  }
+
+  async getStatus(orderId: string, buyerId: string): Promise<DanaDirectPayResult | null> {    const order = await this.prisma.order.findUnique({
       where: { orderId },
       select: { id: true, buyerId: true },
     });

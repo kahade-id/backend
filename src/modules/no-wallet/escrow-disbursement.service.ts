@@ -65,7 +65,13 @@ export class EscrowDisbursementService {
     private readonly notificationQueue: NotificationQueueService,
   ) {}
 
-  /** Release escrow untuk order yang sudah COMPLETED. Idempoten. */
+  /**
+   * Release escrow untuk order yang sudah COMPLETED. Idempoten.
+   *
+   * PENTING (akuntansi): yang dicairkan = sellerReceiveAmount (nilai order
+   * bersih), BUKAN buyerPayAmount. Selisihnya (platform fee) tertahan di akun
+   * merchant DANA — konsisten dengan wallet-mode (FEE_DEDUCT).
+   */
   async releaseForOrder(orderDbId: string): Promise<ReleaseResult> {
     const order = await this.prisma.order.findUnique({
       where: { id: orderDbId },
@@ -73,18 +79,22 @@ export class EscrowDisbursementService {
         id: true,
         status: true,
         sellerId: true,
-        buyerPayAmount: true,
+        sellerReceiveAmount: true,
       },
     });
     if (!order || (order.status as string) !== 'COMPLETED') {
       throw new Error('ORDER_NOT_RELEASE_ELIGIBLE');
     }
+    // Fail-closed: tanpa sellerReceiveAmount yang valid, jangan cairkan apa pun.
+    if (order.sellerReceiveAmount == null || order.sellerReceiveAmount <= BigInt(0)) {
+      throw new Error('ORDER_NOT_RELEASE_ELIGIBLE');
+    }
     return this.releaseFunds({
       idempotencyKey: `ORDER:${order.id}`,
-      scope: 'ORDER' as EscrowDisbursementScope,
+      scope: EscrowDisbursementScope.ORDER_ESCROW,
       orderId: order.id,
       sellerId: order.sellerId,
-      amountSen: order.buyerPayAmount,
+      amountSen: order.sellerReceiveAmount,
       reason: `Cair escrow order ${order.id}`,
     });
   }

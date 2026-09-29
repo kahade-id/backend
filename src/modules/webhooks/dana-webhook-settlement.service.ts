@@ -227,7 +227,10 @@ export class DanaWebhookSettlementService {
       );
       return;
     }
-    const expectedIdr = Number(pt.grossAmount);
+    // P0 (misi tanpa-wallet): grossAmount tersimpan dalam SEN, sedangkan
+    // DANA melaporkan rupiah. Bandingkan dalam rupiah (fail-closed bila
+    // mismatch) — sebelumnya bug unit membuat SEMUA webhook asli ditolak.
+    const expectedIdr = Math.round(Number(pt.grossAmount) / 100);
     if (detail.amountIdr === null || detail.amountIdr !== expectedIdr) {
       this.logger.error(
         `DANA webhook: nominal mismatch (dana=${detail.amountIdr}, expected=${expectedIdr}) — JANGAN kredit ${pt.id}`,

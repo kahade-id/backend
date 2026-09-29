@@ -57,14 +57,14 @@ describe('EscrowDisbursementService', () => {
 
   it('menolak release bila order bukan COMPLETED', async () => {
     const { svc, prisma } = buildDeps();
-    (prisma.order.findUnique as jest.Mock).mockResolvedValue({ id: 'o-1', status: 'PROCESSING', sellerId: 's-1', buyerPayAmount: BigInt(1500000) });
+    (prisma.order.findUnique as jest.Mock).mockResolvedValue({ id: 'o-1', status: 'PROCESSING', sellerId: 's-1', buyerPayAmount: BigInt(1500000), sellerReceiveAmount: BigInt(1480000) });
     await expect(svc.releaseForOrder('o-1')).rejects.toThrow('ORDER_NOT_RELEASE_ELIGIBLE');
   });
 
   it('release sukses: inquiry terverifikasi + transfer SUCCESS → status SUCCESS', async () => {
     const { svc, prisma, danaDisbursement } = buildDeps();
     (prisma.order.findUnique as jest.Mock).mockResolvedValue({
-      id: 'o-1', status: 'COMPLETED', sellerId: 's-1', buyerPayAmount: BigInt(1500000),
+      id: 'o-1', status: 'COMPLETED', sellerId: 's-1', buyerPayAmount: BigInt(1500000), sellerReceiveAmount: BigInt(1480000),
     });
 
     const res = await svc.releaseForOrder('o-1');
@@ -73,8 +73,12 @@ describe('EscrowDisbursementService', () => {
     expect(res.outcome === 'RELEASED' && res.danaReferenceNo).toBe('DANA-DSB-1');
     // inquiry jalan SEBELUM transfer (anti salah transfer)
     expect(danaDisbursement.bankAccountInquiry).toHaveBeenCalledWith(
-      expect.objectContaining({ beneficiaryBankCode: '014', amountIdr: 15000 }), // BCA → SNAP 014
+      expect.objectContaining({ beneficiaryBankCode: '014', amountIdr: 14800 }), // BCA → SNAP 014
     );
+    // Akuntansi: yang dicairkan = sellerReceiveAmount (14800 IDR), bukan buyerPayAmount —
+    // platform fee tertahan di akun merchant DANA.
+    const creates = (prisma.escrowDisbursement.create as jest.Mock).mock.calls as any[][];
+    expect(creates[0][0].data.amountSen).toBe(BigInt(1480000));
     expect(danaDisbursement.transferToBank as jest.Mock).toHaveBeenCalledTimes(1);
     const tCalls = (danaDisbursement.transferToBank as jest.Mock).mock.calls as any[][];
     const ref1 = tCalls[0][0].partnerReferenceNo;
@@ -87,7 +91,7 @@ describe('EscrowDisbursementService', () => {
   it('idempoten: row SUCCESS existing → tanpa transfer ulang', async () => {
     const { svc, prisma, danaDisbursement } = buildDeps();
     (prisma.order.findUnique as jest.Mock).mockResolvedValue({
-      id: 'o-1', status: 'COMPLETED', sellerId: 's-1', buyerPayAmount: BigInt(1500000),
+      id: 'o-1', status: 'COMPLETED', sellerId: 's-1', buyerPayAmount: BigInt(1500000), sellerReceiveAmount: BigInt(1480000),
     });
     prisma.escrowDisbursement.findUnique.mockResolvedValue({
       id: 'disb-old',
@@ -104,7 +108,7 @@ describe('EscrowDisbursementService', () => {
     const { svc, prisma, danaDisbursement, notificationQueue } = buildDeps();
     (prisma.bankAccount.findFirst as jest.Mock).mockResolvedValue(null);
     (prisma.order.findUnique as jest.Mock).mockResolvedValue({
-      id: 'o-2', status: 'COMPLETED', sellerId: 's-2', buyerPayAmount: BigInt(1500000),
+      id: 'o-2', status: 'COMPLETED', sellerId: 's-2', buyerPayAmount: BigInt(1500000), sellerReceiveAmount: BigInt(1480000),
     });
 
     const res = await svc.releaseForOrder('o-2');
@@ -121,7 +125,7 @@ describe('EscrowDisbursementService', () => {
     const { svc, prisma, danaDisbursement } = buildDeps();
     danaDisbursement.bankAccountInquiry.mockResolvedValue({ verified: true, accountName: 'ORANG LAIN' });
     (prisma.order.findUnique as jest.Mock).mockResolvedValue({
-      id: 'o-3', status: 'COMPLETED', sellerId: 's-1', buyerPayAmount: BigInt(1500000),
+      id: 'o-3', status: 'COMPLETED', sellerId: 's-1', buyerPayAmount: BigInt(1500000), sellerReceiveAmount: BigInt(1480000),
     });
 
     const res = await svc.releaseForOrder('o-3');
@@ -137,7 +141,7 @@ describe('EscrowDisbursementService', () => {
     const { svc, prisma, danaDisbursement } = buildDeps();
     danaDisbursement.transferToBank.mockRejectedValue(new Error('DANA timeout'));
     (prisma.order.findUnique as jest.Mock).mockResolvedValue({
-      id: 'o-4', status: 'COMPLETED', sellerId: 's-1', buyerPayAmount: BigInt(1500000),
+      id: 'o-4', status: 'COMPLETED', sellerId: 's-1', buyerPayAmount: BigInt(1500000), sellerReceiveAmount: BigInt(1480000),
     });
 
     const res = await svc.releaseForOrder('o-4');
@@ -151,7 +155,7 @@ describe('EscrowDisbursementService', () => {
     const { svc, prisma, danaDisbursement } = buildDeps();
     danaDisbursement.transferToBank.mockResolvedValue({ status: 'PROCESSING', referenceNo: 'DANA-P1' });
     (prisma.order.findUnique as jest.Mock).mockResolvedValue({
-      id: 'o-5', status: 'COMPLETED', sellerId: 's-1', buyerPayAmount: BigInt(1500000),
+      id: 'o-5', status: 'COMPLETED', sellerId: 's-1', buyerPayAmount: BigInt(1500000), sellerReceiveAmount: BigInt(1480000),
     });
 
     const res = await svc.releaseForOrder('o-5');
@@ -159,6 +163,15 @@ describe('EscrowDisbursementService', () => {
     expect(res.outcome).toBe('PENDING');
     const updates = (prisma.escrowDisbursement.update as jest.Mock).mock.calls as any[][];
     expect(updates[updates.length - 1][0].data.status).toBe(EscrowDisbursementStatus.PROCESSING);
+  });
+
+  it('fail-closed: tanpa sellerReceiveAmount valid → tolak tanpa transfer', async () => {
+    const { svc, prisma, danaDisbursement } = buildDeps();
+    (prisma.order.findUnique as jest.Mock).mockResolvedValue({
+      id: 'o-6', status: 'COMPLETED', sellerId: 's-1', buyerPayAmount: BigInt(1500000), sellerReceiveAmount: null,
+    });
+    await expect(svc.releaseForOrder('o-6')).rejects.toThrow('ORDER_NOT_RELEASE_ELIGIBLE');
+    expect(danaDisbursement.transferToBank).not.toHaveBeenCalled();
   });
 
   it('retryDue memproses baris PENDING/FAILED', async () => {

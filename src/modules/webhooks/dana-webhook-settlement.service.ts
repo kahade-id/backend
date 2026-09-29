@@ -90,10 +90,17 @@ export class DanaWebhookSettlementService {
    */
   private test5005601Fired = false;
 
-  private maybeFireTestHook5005601(): DanaWebhookOutcome | null {
+  private maybeFireTestHook5005601(
+    latestTransactionStatus: string,
+  ): DanaWebhookOutcome | null {
     if (this.test5005601Fired) return null;
     if (this.config.get<string>('dana.env') !== 'sandbox') return null;
-    if (this.config.get<string>('DANA_WEBHOOK_TEST_5005601_ONCE') !== 'true') return null;
+    if (this.config.get<string>('DANA_WEBHOOK_TEST_5005601_ONCE') !== 'true')
+      return null;
+    // Hanya fire untuk notif sukses (00) — skenario "Internal Server Error"
+    // portal mengirim notif 00 dan mengharapkan respons 5005601. Notif 05
+    // (expired) harus tetap dibalas 2005600 untuk skenario expired.
+    if (latestTransactionStatus !== '00') return null;
     this.test5005601Fired = true;
     this.logger.warn(
       'DANA webhook TEST HOOK 5005601 FIRED (sekali) — hook otomatis nonaktif',
@@ -179,7 +186,10 @@ export class DanaWebhookSettlementService {
     }
 
     // Test hook 5005601 (sandbox-only, satu kali, setelah signature valid).
-    const testHook = this.maybeFireTestHook5005601();
+    // Hanya untuk notif status 00 — notif 05 tetap dibalas normal 2005600.
+    const testHook = this.maybeFireTestHook5005601(
+      notify.latestTransactionStatus,
+    );
     if (testHook) return testHook;
 
     const eventKey =

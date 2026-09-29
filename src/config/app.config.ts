@@ -79,6 +79,11 @@ export const appConfig = registerAs('app', () => ({
   walletDailyTopupLimit: parseInt(process.env.WALLET_DAILY_TOPUP_LIMIT || '50000000', 10),
   walletDailyWithdrawLimit: parseInt(process.env.WALLET_DAILY_WITHDRAW_LIMIT || '50000000', 10),
   walletMinWithdraw: parseInt(process.env.WALLET_MIN_WITHDRAW || '50000', 10),
+  // Misi "Mode Tanpa Wallet Internal (BI-safe)": kill-switch wallet internal.
+  // Default FALSE (fail-closed): wallet hanya hidup bila di-opt-in eksplisit
+  // via WALLET_ENABLED=true (env) atau ops-setting WALLET_ENABLED=true
+  // (admin panel). Kahade belum punya izin BI sebagai penerbit uang elektronik.
+  walletEnabled: process.env.WALLET_ENABLED === 'true',
   walletPinPepper: (() => {
     const pepper = process.env.WALLET_PIN_PEPPER || '';
     const nodeEnv = process.env.NODE_ENV || 'development';

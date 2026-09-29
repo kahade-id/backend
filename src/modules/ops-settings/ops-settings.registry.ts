@@ -75,6 +75,18 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
     isSecret: false,
     testable: false,
   },
+  {
+    key: 'WALLET_ENABLED',
+    label: 'Wallet Internal Aktif',
+    description:
+      'Kill-switch wallet internal (misi BI-safe). "true" = wallet internal ' +
+      '(saldo, top-up, withdraw, PIN) diaktifkan kembali; kosong/"false" = ' +
+      'NONAKTIF (default, fail-closed) — uang hanya numpang lewat via DANA ' +
+      '(buyer → DANA → escrow → rekening bank seller). Setara dengan env ' +
+      'WALLET_ENABLED. Berlaku untuk request berikutnya (maks ~60 detik).',
+    isSecret: false,
+    testable: false,
+  },
 ];
 
 export const MANAGEABLE_SETTING_MAP: Map<string, ManageableSettingDef> = new Map(

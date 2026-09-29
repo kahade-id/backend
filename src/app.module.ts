@@ -27,6 +27,7 @@ import { BusinessVerificationModule } from './modules/business-verification/busi
 import { ShowcaseModule } from './modules/showcase/showcase.module';
 import { BankAccountsModule } from './modules/bank-accounts/bank-accounts.module';
 import { WalletModule } from './modules/wallet/wallet.module';
+import { WalletModeModule } from './modules/wallet-mode/wallet-mode.module';
 import { OrdersModule } from './modules/orders/orders.module';
 // GAP-C (G176–G200): order escrow bertahap (milestone).
 import { MilestonesModule } from './modules/milestones/milestones.module';
@@ -153,6 +154,7 @@ const runtimeEnvFile = getRuntimeEnvFile();
     BusinessVerificationModule,
     BankAccountsModule,
     WalletModule,
+    WalletModeModule, // kill-switch BI-safe (default nonaktif)
     OrdersModule,
     MilestonesModule, // GAP-C (G176–G200)
     CourierModule,

@@ -11,6 +11,7 @@ import { CreateScheduleDto } from './dto/create-schedule.dto';
 import { UpdateScheduleDto } from './dto/update-schedule.dto';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
+import { WalletKillSwitchGuard } from '../wallet-mode/wallet-kill-switch.guard';
 
 export class WithdrawalsControllerBase {
   constructor(protected scheduledWithdrawalService: ScheduledWithdrawalService) {}
@@ -64,4 +65,8 @@ export class WithdrawalsControllerBase {
 @ApiTags('scheduled-withdrawals')
 @ApiBearerAuth('access-token')
 @Controller('scheduled-withdrawals')
+// Misi BI-safe: penarikan terjadwal adalah fungsi wallet — nonaktif saat
+// WALLET_ENABLED=false (saldo lama hanya bisa keluar via payout satu arah
+// LegacyPayoutController).
+@UseGuards(WalletKillSwitchGuard)
 export class ScheduledWithdrawalsController extends WithdrawalsControllerBase {}

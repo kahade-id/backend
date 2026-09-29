@@ -17,6 +17,9 @@ import { DeliveryProofService } from './delivery-proof.service';
 import { InvoiceService } from './invoice.service';
 import { ReceiptService } from './receipt.service';
 import { OrderQrisPaymentService, OrderQrisPaymentResult } from '../payment/order-qris-payment.service';
+import { DanaDirectPaymentService, DanaDirectPayResult } from '../no-wallet/dana-direct-payment.service';
+import { DanaDirectPayDto } from '../no-wallet/dto/dana-direct-pay.dto';
+import { WalletKillSwitchGuard } from '../wallet-mode/wallet-kill-switch.guard';
 import { DisputesService } from '../disputes/disputes.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
@@ -54,6 +57,7 @@ export class OrdersController {
     private invoiceService: InvoiceService,
     private receiptService: ReceiptService,
     private orderQrisPaymentService: OrderQrisPaymentService,
+    private danaDirectPaymentService: DanaDirectPaymentService,
     private disputesService: DisputesService,
   ) {}
 
@@ -200,7 +204,7 @@ export class OrdersController {
     return this.orderStateService.handleConfirmAction(orderId, userId, dto.action, dto.reason);
   }
 
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, WalletKillSwitchGuard)
   @Throttle({ default: { ttl: 900000, limit: 5 } })
   @Post(':orderId/pay')
   @Idempotency()
@@ -213,7 +217,7 @@ export class OrdersController {
     return this.orderStateService.handlePayOrder(orderId, userId, dto.pin, req.ip, extractLocationContext(req, dto));
   }
 
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, WalletKillSwitchGuard)
   @Throttle({ default: { ttl: 900000, limit: 5 } })
   @Post(':orderId/pay-qris')
   @Idempotency()
@@ -223,6 +227,53 @@ export class OrdersController {
     @Param('orderId', ParseIdPipe) orderId: string,
   ): Promise<OrderQrisPaymentResult> {
     return this.orderQrisPaymentService.initiate(orderId, userId);
+  }
+
+  /**
+   * Misi tanpa-wallet (BI-safe): checkout escrow LANGSUNG via DANA.
+   * Buyer bebas pilih metode (QRIS / VA bank / DANA Balance) — diteruskan
+   * ke DANA, bukan hardcode QRIS. Tidak ada top-up, tidak sentuh wallet.
+   */
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 900000, limit: 5 } })
+  @Post(':orderId/pay-dana')
+  @Idempotency()
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Bayar escrow langsung via DANA (mode tanpa wallet)',
+    description:
+      'Membuat order DANA (QRIS/VA/Balance sesuai payKind). Buyer bayar ke DANA; ' +
+      'webhook finish-notify mendanai escrow tanpa lewat wallet internal.',
+  })
+  async initiateDanaDirectPayment(
+    @CurrentUser('sub') userId: string,
+    @Param('orderId', ParseIdPipe) orderId: string,
+    @Body() dto: DanaDirectPayDto,
+  ): Promise<DanaDirectPayResult> {
+    return this.danaDirectPaymentService.initiate(orderId, userId, dto);
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 900000, limit: 5 } })
+  @Post(':orderId/pay-dana/cancel')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Batalkan charge DANA-direct yang masih PENDING' })
+  async cancelDanaDirectPayment(
+    @CurrentUser('sub') userId: string,
+    @Param('orderId', ParseIdPipe) orderId: string,
+  ): Promise<{ cancelled: boolean }> {
+    await this.danaDirectPaymentService.cancelPending(orderId, userId);
+    return { cancelled: true };
+  }
+
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
+  @Get(':orderId/dana-payment-status')
+  @ApiOperation({ summary: 'Status pembayaran DANA-direct untuk order ini' })
+  async getDanaDirectPaymentStatus(
+    @CurrentUser('sub') userId: string,
+    @Param('orderId', ParseIdPipe) orderId: string,
+  ): Promise<{ payment: DanaDirectPayResult | null }> {
+    return { payment: await this.danaDirectPaymentService.getStatus(orderId, userId) };
   }
 
   @Throttle({ default: { ttl: 60000, limit: 60 } })

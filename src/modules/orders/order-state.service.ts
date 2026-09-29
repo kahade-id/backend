@@ -1,8 +1,9 @@
-import { Injectable, BadRequestException, ConflictException, Logger } from '@nestjs/common';
+import { Injectable, BadRequestException, ConflictException, ForbiddenException, Logger } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { WalletService } from '../wallet/wallet.service';
+import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { ReferralService } from '../referral/referral.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { MembershipRankService } from './membership-rank.service';
@@ -80,6 +81,7 @@ export class OrderStateService {
     private prisma: PrismaService,
     private redis: RedisService,
     private walletService: WalletService,
+    private walletMode: WalletModeService,
     private orderQrisPaymentService: OrderQrisPaymentService,
     private walletTxSerialService: WalletTxSerialService,
     private referralService: ReferralService,
@@ -177,6 +179,14 @@ export class OrderStateService {
   }
 
   async handlePayOrder(orderId: string, userId: string, pin?: string, ip?: string, ctx?: ActionLocationContext): Promise<PayOrderResult> {
+    // Misi BI-safe (defense in depth — guard juga ada di controller):
+    // bayar pakai saldo wallet dilarang saat wallet nonaktif.
+    if (!this.walletMode.isWalletEnabled()) {
+      throw new ForbiddenException({
+        code: 'WALLET_DISABLED',
+        message: 'Pembayaran via saldo wallet nonaktif — bayar escrow langsung via DANA (POST :orderId/pay-dana).',
+      });
+    }
     if (!pin) {
       throw new BadRequestException({
         code: ErrorCodes.UNAUTHORIZED,

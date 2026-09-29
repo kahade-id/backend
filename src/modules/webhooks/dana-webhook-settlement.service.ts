@@ -5,11 +5,14 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { PaymentPurpose, PaymentStatus, Prisma } from '@prisma/client';
+import { PaymentProvider, PaymentPurpose, PaymentStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { OrderQrisPaymentService } from '../payment/order-qris-payment.service';
 import { DanaPaymentService } from '../payment/dana/dana-payment.service';
+import { DanaDirectPaymentService } from '../no-wallet/dana-direct-payment.service';
+import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
+import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import {
   DANA_SANDBOX_WEBHOOK_PUBLIC_KEY,
   verifyDanaWebhookSignature,
@@ -59,6 +62,9 @@ export class DanaWebhookSettlementService {
     private readonly danaPaymentService: DanaPaymentService,
     private readonly walletService: WalletService,
     private readonly orderQrisPaymentService: OrderQrisPaymentService,
+    private readonly danaDirectPaymentService: DanaDirectPaymentService,
+    private readonly danaDirectRefundService: DanaDirectRefundService,
+    private readonly walletMode: WalletModeService,
   ) {}
 
   private webhookPublicKey(): string {
@@ -211,8 +217,50 @@ export class DanaWebhookSettlementService {
     }
 
     const grossAmount = String(expectedIdr);
-    if (pt.purpose === PaymentPurpose.TOPUP) {
-      await this.walletService.handleTopupSuccess(pt.midtransOrderId, grossAmount);
+    // Misi tanpa-wallet (BI-safe): escrow DANA-direct — settlement TANPA
+    // menyentuh wallet internal. Uang: buyer → DANA → escrow (pot =
+    // PaymentTransaction). Signature, replay protection, idempotency, dan
+    // verify-via-API + pencocokan nominal di atas tetap berlaku (fail-closed).
+    if (
+      pt.provider === PaymentProvider.DANA &&
+      pt.purpose === PaymentPurpose.ORDER_ESCROW &&
+      pt.danaPayKind
+    ) {
+      try {
+        await this.danaDirectPaymentService.settleEscrow(pt.id);
+      } catch (e) {
+        const code =
+          e instanceof ServiceUnavailableException
+            ? ((e.getResponse() as { code?: string } | undefined)?.code ?? '')
+            : '';
+        if (
+          code === 'DANA_DIRECT_ORDER_INELIGIBLE' ||
+          code === 'DANA_DIRECT_ORDER_MISSING' ||
+          code === 'DANA_DIRECT_MILESTONE_UNSUPPORTED'
+        ) {
+          // Fail-closed: order tak eligible / hilang — uang TIDAK BOLEH
+          // nyangkut dan TIDAK BOLEH masuk wallet: kembalikan ke pembayar
+          // via DANA Refund API (ke metode bayar asal).
+          this.logger.warn(
+            `DANA webhook: order tak eligible untuk ${pt.id} — refund ke sumber`,
+          );
+          await this.danaDirectRefundService.refundPayment(
+            pt.id,
+            'Order tidak eligible menerima escrow — dana dikembalikan',
+          );
+          return;
+        }
+        throw e;
+      }
+    } else if (pt.purpose === PaymentPurpose.TOPUP) {
+      // Mode BI-safe: top-up DANA yang masih in-flight TIDAK BOLEH dikredit
+      // ke wallet. Fail-closed: kembalikan ke metode bayar asal via DANA
+      // Refund API (uang kembali ke pembayar, tidak pernah masuk wallet).
+      if (!this.walletMode.isWalletEnabled()) {
+        await this.refundTopupToSource(pt);
+      } else {
+        await this.walletService.handleTopupSuccess(pt.midtransOrderId, grossAmount);
+      }
     } else if (pt.purpose === PaymentPurpose.ORDER_ESCROW) {
       await this.orderQrisPaymentService.handleSettlement(pt.midtransOrderId, grossAmount);
     } else {
@@ -227,5 +275,53 @@ export class DanaWebhookSettlementService {
         danaReferenceNo: notify.originalReferenceNo || undefined,
       },
     });
+  }
+
+  /**
+   * Fail-closed untuk top-up DANA in-flight saat wallet nonaktif: kembalikan
+   * dana ke metode bayar asal via DANA Refund API (bukan ke wallet).
+   * Idempoten via partnerRefundNo stabil; gagal → lempar agar webhookLog
+   * mencatat (tidak retry tanpa henti, admin rekonsiliasi manual).
+   */
+  private async refundTopupToSource(pt: {
+    id: string;
+    danaPartnerReferenceNo: string | null;
+    grossAmount: bigint;
+  }): Promise<void> {
+    if (!pt.danaPartnerReferenceNo) {
+      this.logger.error(
+        `DANA webhook: topup ${pt.id} tanpa danaPartnerReferenceNo — TIDAK bisa refund otomatis, butuh review manual`,
+      );
+      throw new ServiceUnavailableException({
+        code: 'DANA_TOPUP_REFUND_NO_REFERENCE',
+        message: 'Topup DANA tanpa referensi — butuh review manual',
+      });
+    }
+    const partnerRefundNo = `RFD-${pt.id}-nowallet-topup`;
+    try {
+      await this.danaPaymentService.refundOrder({
+        partnerReferenceNo: pt.danaPartnerReferenceNo,
+        partnerRefundNo,
+        amountIdr: Math.round(Number(pt.grossAmount) / 100),
+        reason: 'Wallet disabled (BI-safe mode) — topup refunded to source',
+      });
+      await this.prisma.paymentTransaction.update({
+        where: { id: pt.id },
+        data: {
+          status: PaymentStatus.REFUNDED,
+          refundReference: partnerRefundNo,
+          refundRequestedAt: new Date(),
+          refundReason: 'Wallet nonaktif (mode BI-safe) — topup dikembalikan ke metode bayar asal',
+        },
+      });
+      this.logger.log(`DANA webhook: topup ${pt.id} di-refund ke sumber (wallet nonaktif)`);
+    } catch (e) {
+      this.logger.error(
+        `DANA webhook: refund topup ${pt.id} gagal — butuh review manual: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+      throw e;
+    }
   }
 }

@@ -30,17 +30,23 @@ function makeDeps(publicPem: string) {
     paymentTransaction: { findUnique: jest.fn(), update: jest.fn() },
   };
   const config = { get: (k: string) => (k === 'dana.publicKey' ? publicPem : undefined) };
-  const danaPaymentService = { getPaymentDetail: jest.fn() };
+  const danaPaymentService = { getPaymentDetail: jest.fn(), refundOrder: jest.fn() };
   const walletService = { handleTopupSuccess: jest.fn() };
   const orderQrisPaymentService = { handleSettlement: jest.fn() };
+  const danaDirectPaymentService = { settleEscrow: jest.fn() };
+  const danaDirectRefundService = { refundPayment: jest.fn() };
+  const walletMode = { isWalletEnabled: jest.fn(() => true) };
   const svc = new DanaWebhookSettlementService(
     prisma as any,
     config as unknown as ConfigService,
     danaPaymentService as any,
     walletService as any,
     orderQrisPaymentService as any,
+    danaDirectPaymentService as any,
+    danaDirectRefundService as any,
+    walletMode as any,
   );
-  return { svc, prisma, danaPaymentService, walletService, orderQrisPaymentService };
+  return { svc, prisma, danaPaymentService, walletService, orderQrisPaymentService, danaDirectPaymentService, danaDirectRefundService, walletMode };
 }
 
 const notifyBody = {
@@ -173,5 +179,49 @@ describe('dana-webhook-settlement.service', () => {
     expect(out.message).toBe('ok');
     expect(walletService.handleTopupSuccess).not.toHaveBeenCalled();
     expect(prisma.webhookLog.update).toHaveBeenCalled(); // tetap ditandai processed
+  });
+
+  it('DANA-direct ORDER_ESCROW: verify OK → settleEscrow TANPA wallet', async () => {
+    const { svc, prisma, danaPaymentService, danaDirectPaymentService, walletService } = makeDeps(publicPem);
+    prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: false });
+    prisma.paymentTransaction.findUnique.mockResolvedValue({
+      id: 'pt-dana-1',
+      status: PaymentStatus.PENDING,
+      purpose: PaymentPurpose.ORDER_ESCROW,
+      provider: 'DANA',
+      danaPayKind: 'QRIS',
+      grossAmount: BigInt(15000),
+      midtransOrderId: 'PAY-DANA-1',
+    });
+    danaPaymentService.getPaymentDetail.mockResolvedValue({ status: 'SUCCESS', amountIdr: 15000 });
+    const out = await svc.handleFinishNotify(rawBody, headers, PATH);
+    expect(out.message).toBe('ok');
+    expect(danaDirectPaymentService.settleEscrow).toHaveBeenCalledWith('pt-dana-1');
+    expect(walletService.handleTopupSuccess).not.toHaveBeenCalled();
+  });
+
+  it('mode tanpa-wallet: TOPUP in-flight TIDAK dikredit — refund ke sumber', async () => {
+    const { svc, prisma, danaPaymentService, walletService, danaDirectRefundService, walletMode } =
+      makeDeps(publicPem);
+    walletMode.isWalletEnabled.mockReturnValue(false);
+    prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: false });
+    prisma.paymentTransaction.findUnique.mockResolvedValue({
+      id: 'pt-top-1',
+      status: PaymentStatus.PENDING,
+      purpose: PaymentPurpose.TOPUP,
+      provider: 'DANA',
+      danaPartnerReferenceNo: 'DANA-TOP-001',
+      grossAmount: BigInt(15000),
+      midtransOrderId: 'KAHADE-TOP-1',
+    });
+    danaPaymentService.getPaymentDetail.mockResolvedValue({ status: 'SUCCESS', amountIdr: 15000 });
+    const out = await svc.handleFinishNotify(rawBody, headers, PATH);
+    expect(out.message).toBe('ok');
+    expect(walletService.handleTopupSuccess).not.toHaveBeenCalled();
+    // refund ke metode bayar asal (bukan ke wallet)
+    expect(danaPaymentService.refundOrder).toHaveBeenCalledWith(
+      expect.objectContaining({ partnerReferenceNo: 'DANA-TOP-001' }),
+    );
+    expect(danaDirectRefundService.refundPayment).not.toHaveBeenCalled(); // jalur topup pakai refund langsung
   });
 });

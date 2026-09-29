@@ -187,38 +187,58 @@ export class PushService implements OnModuleInit {
 
   private async shouldSendPush(userId: string, data?: Record<string, string>): Promise<boolean> {
     const notificationType = data?.notificationType ?? data?.type;
+    // B1-004 (perf): SATU findUnique untuk quiet hours + pref field (sebelumnya
+    // 2x identik per push). Semantik fail-closed dipertahankan: lookup gagal ->
+    // bukan quiet hours (seperti isInQuietHours lama), tapi tolak kirim bila
+    // pref field dibutuhkan (seperti shouldSendPush lama).
+    let prefs: Record<string, unknown> | null = null;
+    let prefsLookupFailed = false;
+    try {
+      prefs = (await this.prisma.notificationPreference.findUnique({ where: { userId } })) as unknown as Record<string, unknown> | null;
+    } catch {
+      prefsLookupFailed = true;
+    }
     // Quiet hours: hanya notifikasi keamanan kritis yang lolos.
-    if (notificationType && await this.isInQuietHours(userId)) {
+    if (notificationType && this.isInQuietHoursFromPrefs(prefs)) {
       return notificationType.startsWith('SECURITY_');
     }
     const prefField = this.getPushPrefFieldForType(notificationType);
     if (!prefField) return true;
 
-    try {
-      const prefs = await this.prisma.notificationPreference.findUnique({ where: { userId } });
-      if (!prefs) return true;
-      return (prefs as Record<string, unknown>)[prefField] !== false;
-    } catch {
+    if (prefsLookupFailed) {
       // The inbox remains durable and can be read when the app next refreshes.
       // Do not risk violating an opt-out merely because preference lookup is
       // temporarily unavailable.
       return false;
     }
+    if (!prefs) return true;
+    return prefs[prefField] !== false;
   }
 
   /**
    * Quiet hours check (zona waktu per-user, CN-008). Di-port dari NotificationsService
    * agar berlaku di jalur pengiriman push yang sebenarnya.
+   *
+   * B1-004 (perf): versi murni dari prefs yang SUDAH di-fetch sekali oleh
+   * shouldSendPush — tidak lagi query DB sendiri.
+   */
+  private isInQuietHoursFromPrefs(prefs: Record<string, unknown> | null): boolean {
+    if (!prefs || !prefs.quietHoursEnabled) return false;
+    const start = prefs.quietHoursStart || '22:00';
+    const end = prefs.quietHoursEnd || '07:00';
+    // CN-008: zona waktu dari preferensi user, bukan hardcode WIB.
+    const currentMinutes = getMinutesInTimezone(new Date(), prefs.quietHoursTimezone as string | undefined);
+    return isMinutesInRange(currentMinutes, String(start), String(end));
+  }
+
+  /**
+   * @deprecated Dipakai hanya bila pemanggil belum memegang prefs (tidak ada
+   * pemanggil tersisa di push.service — dipertahankan untuk kompatibilitas).
    */
   private async isInQuietHours(userId: string): Promise<boolean> {
     try {
       const prefs = await this.prisma.notificationPreference.findUnique({ where: { userId } }) as any;
-      if (!prefs || !prefs.quietHoursEnabled) return false;
-      const start = prefs.quietHoursStart || '22:00';
-      const end = prefs.quietHoursEnd || '07:00';
-      // CN-008: zona waktu dari preferensi user, bukan hardcode WIB.
-      const currentMinutes = getMinutesInTimezone(new Date(), prefs.quietHoursTimezone);
-      return isMinutesInRange(currentMinutes, String(start), String(end));
+      return this.isInQuietHoursFromPrefs(prefs);
     } catch {
       return false;
     }

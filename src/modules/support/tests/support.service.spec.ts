@@ -206,4 +206,42 @@ describe('SupportService', () => {
       expect(String(data.id ?? '')).not.toMatch(/^USR-/);
     });
   });
+
+  // ============================================================
+  // D1-010: getTicketFingerprint (fingerprint ringan untuk poll)
+  // ============================================================
+
+  describe('getTicketFingerprint (D1-010)', () => {
+    const fingerprintRow = {
+      id: 'ticket-1',
+      userId: 'user-1',
+      status: 'OPEN',
+      updatedAt: new Date('2026-09-29T10:00:00.000Z'),
+      _count: { replies: 2 },
+    };
+
+    it('mengembalikan status + updatedAt + replyCount tanpa memuat semua balasan', async () => {
+      mockPrisma.supportTicket.findUnique.mockResolvedValue(fingerprintRow);
+      const result = await service.getTicketFingerprint('user-1', 'ticket-1');
+      expect(result).toEqual({
+        ticketId: 'ticket-1',
+        status: 'OPEN',
+        updatedAt: fingerprintRow.updatedAt,
+        replyCount: 2,
+      });
+      const args = mockPrisma.supportTicket.findUnique.mock.calls[0][0];
+      expect(args.include).toBeUndefined();
+      expect(args.select._count).toEqual({ select: { replies: true } });
+    });
+
+    it('NotFound untuk tiket tak dikenal', async () => {
+      mockPrisma.supportTicket.findUnique.mockResolvedValue(null);
+      await expect(service.getTicketFingerprint('user-1', 'ticket-x')).rejects.toThrow(NotFoundException);
+    });
+
+    it('Forbidden untuk pemilik tiket lain', async () => {
+      mockPrisma.supportTicket.findUnique.mockResolvedValue(fingerprintRow);
+      await expect(service.getTicketFingerprint('user-2', 'ticket-1')).rejects.toThrow(ForbiddenException);
+    });
+  });
 });

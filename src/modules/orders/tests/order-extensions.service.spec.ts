@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, ConflictException, ForbiddenException, Logger } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Logger, NotFoundException } from '@nestjs/common';
 import { DeadlineExtensionStatus, OrderStatus, Prisma } from '@prisma/client';
 import { OrderExtensionsService } from '../order-extensions.service';
 import { PrismaService } from '../../../prisma/prisma.service';
@@ -24,7 +24,7 @@ const mockPrisma = {
     findFirst: jest.fn(),
     update: jest.fn(),
   },
-  orderExtensionRequest: { findUnique: jest.fn(), updateMany: jest.fn(), findFirst: jest.fn(), count: jest.fn(), create: jest.fn(), findMany: jest.fn() },
+  orderExtensionRequest: { findUnique: jest.fn(), updateMany: jest.fn(), findFirst: jest.fn(), count: jest.fn(), create: jest.fn(), findMany: jest.fn(), aggregate: jest.fn() },
   $transaction: jest.fn(),
   $queryRaw: jest.fn(),
 };
@@ -281,6 +281,36 @@ describe('OrderExtensionsService', () => {
         ).rejects.toBeInstanceOf(ConflictException);
         expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
       });
+    });
+  });
+
+  // ============================================================
+  // D1-010: getExtensionsFingerprint (fingerprint ringan untuk poll)
+  // ============================================================
+
+  describe('getExtensionsFingerprint (D1-010)', () => {
+    const ORDER_ROW = { id: 'ord-1', orderId: 'ORD-1', buyerId: 'buyer', sellerId: 'seller' };
+    const latest = new Date('2026-09-29T10:00:00.000Z');
+
+    it('mengembalikan total + max(updatedAt) lewat agregat, bukan findMany', async () => {
+      mockPrisma.order.findUnique.mockResolvedValue(ORDER_ROW);
+      mockPrisma.orderExtensionRequest.aggregate.mockResolvedValue({
+        _count: { _all: 1 },
+        _max: { updatedAt: latest },
+      });
+      const result = await service.getExtensionsFingerprint('ORD-1', 'buyer');
+      expect(result).toEqual({ total: 1, latestUpdatedAt: latest });
+      expect(mockPrisma.orderExtensionRequest.findMany).not.toHaveBeenCalled();
+    });
+
+    it('NotFound untuk order tak dikenal', async () => {
+      mockPrisma.order.findUnique.mockResolvedValue(null);
+      await expect(service.getExtensionsFingerprint('ORD-X', 'buyer')).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('Forbidden untuk bukan partisipan', async () => {
+      mockPrisma.order.findUnique.mockResolvedValue(ORDER_ROW);
+      await expect(service.getExtensionsFingerprint('ORD-1', 'orang-asing')).rejects.toBeInstanceOf(ForbiddenException);
     });
   });
 });

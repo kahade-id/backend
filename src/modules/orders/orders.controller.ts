@@ -322,6 +322,19 @@ export class OrdersController {
     return this.orderExtensionsService.respondExtension(extensionId, userId, dto, orderId);
   }
 
+  @Get(':orderId/extensions/fingerprint')
+  @ApiOperation({
+    summary: 'Get extension requests fingerprint (lightweight)',
+    description:
+      'D1-010: fingerprint ringan untuk poll — total + max(updatedAt). Klien me-refresh bundle penuh hanya bila fingerprint berubah.',
+  })
+  async getExtensionsFingerprint(
+    @CurrentUser('sub') userId: string,
+    @Param('orderId', ParseIdPipe) orderId: string,
+  ): Promise<{ total: number; latestUpdatedAt: Date | null }> {
+    return this.orderExtensionsService.getExtensionsFingerprint(orderId, userId);
+  }
+
   @Get(':orderId/extensions')
   async getExtensions(
     @CurrentUser('sub') userId: string,
@@ -426,6 +439,19 @@ export class OrdersController {
     @Body() dto: SubmitDeliveryProofDto,
   ): Promise<object> {
     return this.deliveryProofService.submitProof(orderId, userId, dto);
+  }
+
+  @Get(':orderId/delivery-proof/fingerprint')
+  @ApiOperation({
+    summary: 'Get delivery proof fingerprint (lightweight)',
+    description:
+      'D1-010: fingerprint ringan untuk poll — count + max(updatedAt). Klien me-refresh bundle penuh hanya bila fingerprint berubah.',
+  })
+  async getDeliveryProofFingerprint(
+    @CurrentUser('sub') userId: string,
+    @Param('orderId', ParseIdPipe) orderId: string,
+  ): Promise<{ count: number; latestUpdatedAt: Date | null }> {
+    return this.deliveryProofService.getProofsFingerprint(orderId, userId);
   }
 
   @Get(':orderId/delivery-proof')

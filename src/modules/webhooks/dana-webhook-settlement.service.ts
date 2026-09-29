@@ -24,8 +24,22 @@ import {
 import { parseDanaAmount } from '../payment/dana/dana-payment.service';
 
 export interface DanaWebhookOutcome {
-  message: string;
+  responseCode: string;
+  responseMessage: string;
 }
+
+/**
+ * Path API DANA yang dipakai DANA saat menandatangani finish-notify.
+ * DANA tidak tahu route internal kita (/v1/webhooks/dana/payment) —
+ * signature X-SIGNATURE selalu dihitung terhadap path API DANA ini.
+ */
+export const DANA_FINISH_NOTIFY_API_PATH = '/v1.0/debit/notify';
+
+/** Ack yang wajib dikembalikan ke DANA agar skenario notify terverifikasi. */
+export const DANA_NOTIFY_ACK: DanaWebhookOutcome = {
+  responseCode: '2005600',
+  responseMessage: 'Successful',
+};
 
 /**
  * Settlement webhook DANA finish-notify.
@@ -101,13 +115,18 @@ export class DanaWebhookSettlementService {
   async handleFinishNotify(
     rawBody: string,
     headers: Record<string, string | string[] | undefined>,
-    path: string,
+    // _path: route lokal TIDAK dipakai untuk verifikasi signature —
+    // DANA menandatangani terhadap DANA_FINISH_NOTIFY_API_PATH.
+    // Param dipertahankan agar call-site tidak berubah.
+    _path: string,
   ): Promise<DanaWebhookOutcome> {
     const signature = String(headers['x-signature'] ?? '');
     const timestamp = String(headers['x-timestamp'] ?? '');
+    // PENTING: verifikasi memakai path API DANA (/v1.0/debit/notify), BUKAN
+    // route lokal — DANA menandatangani notify terhadap path API-nya sendiri.
     const ok = verifyDanaWebhookSignature({
       method: 'POST',
-      path,
+      path: DANA_FINISH_NOTIFY_API_PATH,
       rawBody,
       timestamp,
       signature,
@@ -126,12 +145,12 @@ export class DanaWebhookSettlementService {
       parsed = JSON.parse(rawBody);
     } catch {
       this.logger.warn('DANA webhook: body bukan JSON valid');
-      return { message: 'ignored' };
+      return DANA_NOTIFY_ACK;
     }
     const notify = this.parseFinishNotify(parsed as Record<string, unknown>);
     if (!notify) {
       this.logger.warn('DANA webhook: field kunci hilang — diabaikan');
-      return { message: 'ignored' };
+      return DANA_NOTIFY_ACK;
     }
 
     const eventKey =
@@ -153,7 +172,7 @@ export class DanaWebhookSettlementService {
     });
     if (webhookLog.isProcessed) {
       this.logger.warn(`DANA webhook duplikat — sudah diproses: ${eventKey}`);
-      return { message: 'duplicate' };
+      return DANA_NOTIFY_ACK;
     }
 
     try {
@@ -171,7 +190,7 @@ export class DanaWebhookSettlementService {
       where: { id: webhookLog.id },
       data: { isProcessed: true, processedAt: new Date(), errorMessage: null },
     });
-    return { message: 'ok' };
+    return DANA_NOTIFY_ACK;
   }
 
   private async settle(notify: DanaFinishNotify): Promise<void> {

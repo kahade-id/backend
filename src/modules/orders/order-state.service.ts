@@ -11,7 +11,8 @@ import { OrderStatus, OrderCancelReason, ActorType, WalletTransactionType, Walle
 import { addDays, resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
 import { rollbackOrderVoucherUsage } from '../../common/utils/voucher-rollback.util';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
-import { creditCashbackIfEligible } from '../../common/utils/cashback-credit.util';
+import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback, DanaCashbackIntent } from '../../common/utils/cashback-credit.util';
+import { EscrowDisbursementService } from '../no-wallet/escrow-disbursement.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
 import { FeeCalculatorService } from './fee-calculator.service';
@@ -85,6 +86,8 @@ export class OrderStateService {
     private walletMode: WalletModeService,
     private orderQrisPaymentService: OrderQrisPaymentService,
     @Optional() private danaDirectRefundService: DanaDirectRefundService,
+    // M4 no-wallet: payout cashback via disbursement DANA bila wallet mati.
+    @Optional() private escrowDisbursementService: EscrowDisbursementService | null,
     private walletTxSerialService: WalletTxSerialService,
     private referralService: ReferralService,
     private feeCalculator: FeeCalculatorService,
@@ -592,6 +595,8 @@ export class OrderStateService {
     // SP-047: tandai bila referral reward dikreditkan agar cache leaderboard
     // diinvalidasi SETELAH tx commit (di luar retry loop).
     let referralRewardCredited = false;
+    // M4 no-wallet: intent payout cashback DANA (dieksekusi post-commit).
+    let danaCashback: { params: { orderDbId: string; orderPublicId: string; source: string }; intent: DanaCashbackIntent } | null = null;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -795,11 +800,18 @@ export class OrderStateService {
 
       // Batch 1-money (EO-005): kredit cashback via helper bersama idempoten.
       // Dijalankan setelah update escrow utama agar balanceBefore ledger konsisten.
-      await creditCashbackIfEligible(tx, nextCashbackTxSerial, {
-        orderDbId: order.id,
-        orderPublicId: order.orderId,
-        source: 'completeOrder',
-      });
+      // M4 no-wallet: wallet mati -> rencanakan payout DANA (dieksekusi post-commit).
+      if (this.walletMode.isWalletEnabled()) {
+        await creditCashbackIfEligible(tx, nextCashbackTxSerial, {
+          orderDbId: order.id,
+          orderPublicId: order.orderId,
+          source: 'completeOrder',
+        });
+      } else {
+        const params = { orderDbId: order.id, orderPublicId: order.orderId, source: 'completeOrder' };
+        const intent = await planDanaCashback(tx, params);
+        danaCashback = intent ? { params, intent } : null;
+      }
 
       // feeAmount = buyerPayAmount − sellerReceiveAmount.
       // The fee amount is removed from the buyer's escrow (already done above via
@@ -892,6 +904,17 @@ export class OrderStateService {
     // (900 dtk) harus diinvalidasi setelah commit.
     if (referralRewardCredited) {
       await this.referralService.invalidateLeaderboardCache();
+    }
+
+    // M4 no-wallet: eksekusi payout cashback DANA post-commit (idempoten,
+    // key CASHBACK:<orderDbId>). Scheduler retryDue() menangani PENDING/FAILED.
+    if (danaCashback && this.escrowDisbursementService) {
+      const { params, intent } = danaCashback;
+      const executor = this.escrowDisbursementService;
+      this.runPostCommitBestEffort(
+        () => { void executeDanaCashback(executor, params, intent); },
+        'cashback-dana',
+      );
     }
 
     // R2-B (audit): completeOrder consumes the Plus fee-savings quota (feeSavingsUsed)

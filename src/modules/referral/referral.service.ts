@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
@@ -11,6 +11,7 @@ import {
   KycStatus,
   OrderStatus,
   MembershipRank,
+  EscrowDisbursementScope,
 } from '@prisma/client';
 import { generateWalletTxId, generateReferralCode } from '../../common/utils/id-generator.util';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
@@ -18,6 +19,9 @@ import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pag
 import { toIdr } from '../../common/utils/currency.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { REFERRAL_LEADERBOARD_CACHE } from '../../common/constants/redis-keys';
+// M4 no-wallet: payout referral via disbursement DANA bila wallet mati.
+import { WalletModeService } from '../wallet-mode/wallet-mode.service';
+import { EscrowDisbursementService } from '../no-wallet/escrow-disbursement.service';
 
 const REFERRAL_REWARD_TIERS: Record<MembershipRank, bigint> = {
   BRONZE: BigInt(500_000),
@@ -39,6 +43,9 @@ export class ReferralService {
     private redis: RedisService,
     private walletTxSerialService: WalletTxSerialService,
     private configService: ConfigService,
+    // M4 no-wallet: opsional agar modul lama tanpa wiring tetap jalan (fail-closed di pemakaian).
+    @Optional() private walletMode: WalletModeService | null,
+    @Optional() private disbursement: EscrowDisbursementService | null,
   ) {}
 
   private getRewardAmountForRank(rank: MembershipRank): bigint {
@@ -508,14 +515,19 @@ export class ReferralService {
       return false;
     }
 
-    const walletCount = await tx.wallet.count({
-      where: { userId: { in: [relation.referrerId, relation.refereeId] } },
-    });
-    if (walletCount !== 2) {
-      this.logger.warn(
-        `Referral reward skipped for order ${orderId}: both referral wallets are required before crediting either side`,
-      );
-      return false;
+    // M4 no-wallet: bila wallet mati, reward tidak butuh wallet — payout via
+    // disbursement DANA ke rekening bank. Gate wallet hanya untuk mode lama.
+    const walletEnabled = this.walletMode?.isWalletEnabled() ?? true;
+    if (walletEnabled) {
+      const walletCount = await tx.wallet.count({
+        where: { userId: { in: [relation.referrerId, relation.refereeId] } },
+      });
+      if (walletCount !== 2) {
+        this.logger.warn(
+          `Referral reward skipped for order ${orderId}: both referral wallets are required before crediting either side`,
+        );
+        return false;
+      }
     }
 
     const rewardAmount = this.getRewardAmountForRank(referrer.membershipRank);
@@ -582,9 +594,14 @@ export class ReferralService {
       return existingReward.isCredited;
     }
 
-    const lockedWallets = await tx.$queryRaw<Array<{ id: string; totalBalance: bigint }>>`
-      SELECT id, "totalBalance" FROM wallets WHERE "userId" = ${userId} FOR UPDATE
-    `;
+    // M4 no-wallet: dipindah ke atas — wallet mati → lewati lock wallet.
+    const walletEnabled = this.walletMode?.isWalletEnabled() ?? true;
+
+    const lockedWallets = walletEnabled
+      ? await tx.$queryRaw<Array<{ id: string; totalBalance: bigint }>>`
+        SELECT id, "totalBalance" FROM wallets WHERE "userId" = ${userId} FOR UPDATE
+      `
+      : [{ id: 'no-wallet', totalBalance: BigInt(0) }];
     const lockedWallet = lockedWallets[0];
     if (!lockedWallet) {
       this.logger.warn(`User ${userId} has no wallet — skipping reward credit`);
@@ -602,6 +619,20 @@ export class ReferralService {
         creditedAt: null,
       },
     });
+
+    // M4 no-wallet: wallet mati → TIDAK menyentuh wallet. Reward diklaim
+    // (baris idempoten di atas); payout aktual via disbursement DANA yang
+    // didorong scheduler payoutPendingReferralRewards (durable + idempoten).
+    if (!walletEnabled) {
+      await tx.referralCode.updateMany({
+        where: { userId },
+        data: { totalRewardEarned: { increment: amount } },
+      });
+      this.logger.log(
+        `Referral reward Rp${toIdr(amount).toLocaleString('id-ID')} diklaim untuk user ${userId} (order ${orderId}) — payout DANA dijadwalkan via scheduler`,
+      );
+      return true;
+    }
 
     const walletTxSerial = await this.walletTxSerialService.getNext();
     const walletTxId = generateWalletTxId(walletTxSerial);
@@ -640,5 +671,50 @@ export class ReferralService {
     });
 
     return true;
+  }
+
+  /**
+   * M4 no-wallet — didorong scheduler (cron dana-refund-retry): bayarkan
+   * referralReward yang sudah diklaim tetapi belum cair (`isCredited=false`)
+   * via disbursement DANA scope REFERRAL.
+   *
+   * Idempoten: kunci `REFERRAL:<rewardId>` stabil; `isCredited` hanya menjadi
+   * true setelah disbursement benar-benar RELEASED. Tanpa rekening bank
+   * terverifikasi → HELD_NO_BANK (fail-closed, tidak hangus, dicoba lagi).
+   */
+  async payoutPendingReferralRewards(limit = 50): Promise<{ attempted: number; released: number }> {
+    if (!this.disbursement) {
+      throw new Error('REFERRAL_PAYOUT_UNAVAILABLE');
+    }
+    const pending = await this.prisma.referralReward.findMany({
+      where: { isCredited: false },
+      orderBy: { createdAt: 'asc' },
+      take: limit,
+      select: { id: true, referrerId: true, rewardAmount: true, triggeredByOrderId: true },
+    });
+    let released = 0;
+    for (const reward of pending) {
+      try {
+        const result = await this.disbursement.releaseFunds({
+          idempotencyKey: `REFERRAL:${reward.id}`,
+          scope: EscrowDisbursementScope.REFERRAL,
+          sellerId: reward.referrerId, // penerima payout
+          amountSen: reward.rewardAmount,
+          reason: `Referral reward — order ${reward.triggeredByOrderId}`,
+        });
+        if (result.outcome === 'RELEASED') {
+          await this.prisma.referralReward.update({
+            where: { id: reward.id },
+            data: { isCredited: true, creditedAt: new Date() },
+          });
+          released++;
+        }
+      } catch (e) {
+        this.logger.warn(
+          `Payout referral gagal: reward=${reward.id}: ${(e as Error).message}`,
+        );
+      }
+    }
+    return { attempted: pending.length, released };
   }
 }

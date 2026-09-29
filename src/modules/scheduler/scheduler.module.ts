@@ -48,6 +48,7 @@ import { WithdrawalsModule } from '../withdrawals/withdrawals.module';
 import { MidtransService } from '../payment/midtrans.service';
 import { PaymentModule } from '../payment/payment.module';
 import { NoWalletModule } from '../no-wallet/no-wallet.module';
+import { WalletModeModule } from '../wallet-mode/wallet-mode.module';
 import { WalletModule } from '../wallet/wallet.module';
 import { VerificationBadgeModule } from '../users/verification-badge.module';
 import { OnApplicationBootstrap } from '@nestjs/common';
@@ -78,7 +79,7 @@ import { AdminFeedbackModule } from '../admin/feedback/admin-feedback.module';
 import { UsersModule } from '../users/users.module';
 
 @Module({
-  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, AdminShowcaseReportsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, NoWalletModule, AuditLogModule, UploadModule, AdminFeedbackModule, InventoryModule, forwardRef(() => UsersModule)],
+  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, AdminShowcaseReportsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, NoWalletModule, WalletModeModule, AuditLogModule, UploadModule, AdminFeedbackModule, InventoryModule, forwardRef(() => UsersModule)],
   providers: [
     WalletDailyResetService,
     DataCleanupService,

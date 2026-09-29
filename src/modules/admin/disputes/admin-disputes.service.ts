@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger, Optional } from '@nestjs/common';
 import { Decimal } from '@prisma/client/runtime/library';
 import { randomBytes, randomInt } from 'crypto';
 import { Prisma, DisputeDecisionType, DisputeCategory, DisputeStatus, OrderStatus, ActorType, WalletTransactionType, WalletTransactionStatus, AuditAction, NotificationType, VoucherApplicability, VoucherType } from '@prisma/client';
@@ -9,7 +9,8 @@ import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial
 import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
 import { DisputeDanaSettlementService } from '../../no-wallet/dispute-dana-settlement.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
-import { creditCashbackIfEligible } from '../../../common/utils/cashback-credit.util';
+import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback } from '../../../common/utils/cashback-credit.util';
+import { EscrowDisbursementService } from '../../no-wallet/escrow-disbursement.service';
 import { computePatunganRebateTx, createPatunganRebateLedgerTx } from '../../commerce/patungan-rebate';
 import { DisputeDecisionDto, validateSplitPercents } from './dispute-decision.dto';
 import { AuditLogService } from '../../../common/services/audit-log.service';
@@ -41,6 +42,8 @@ export class AdminDisputesService {
     private chatService: ChatService,
     // AW-018: invalidasi cache summary dashboard (via helper terpusat).
     private readonly dashboard: DashboardService,
+    // M4 no-wallet: payout cashback via disbursement DANA.
+    @Optional() private escrowDisbursement: EscrowDisbursementService | null,
   ) {}
 
   private apologyVoucherCode(disputeId: string): string {
@@ -945,6 +948,18 @@ export class AdminDisputesService {
       const apologyVoucherRecipients = this.disputeApologyRecipients(dto.decision, order, buyerAmount, sellerAmount);
       const apologyVouchers = await this.issueDisputeApologyVouchers(tx, apologyVoucherRecipients, dispute.disputeId);
 
+      // M4 no-wallet: cashback voucher (paritas jalur wallet: sellerAmount > 0) —
+      // rencanakan payout DANA; dieksekusi post-commit bersama settlement.
+      let danaCashback: {
+        params: { orderDbId: string; orderPublicId: string; source: string };
+        intent: { userId: string; amountSen: bigint; voucherCode: string | null; usageId: string };
+      } | null = null;
+      if (sellerAmount > BigInt(0)) {
+        const cashbackParams = { orderDbId: order.id, orderPublicId: order.orderId, source: 'dispute-verdict' };
+        const cashbackIntent = await planDanaCashback(tx, cashbackParams);
+        danaCashback = cashbackIntent ? { params: cashbackParams, intent: cashbackIntent } : null;
+      }
+
       const decisionLabel =
         dto.decision === 'FULL_BUYER' ? 'Full amount refunded to buyer'
         : dto.decision === 'FULL_SELLER' ? 'Full amount forwarded to seller'
@@ -964,6 +979,7 @@ export class AdminDisputesService {
         auditDescription: `Admin resolved dispute ${dispute.disputeId} with decision ${dto.decision} (no-wallet)`,
         auditAfter: { decision: dto.decision, buyerPercent: dto.buyerPercent, sellerPercent: dto.sellerPercent, noWallet: true },
         apologyVouchers,
+        danaCashback,
       };
     }), 'ADMIN_DISPUTE_RESOLVE_NO_WALLET_TX');
 
@@ -1007,6 +1023,17 @@ export class AdminDisputesService {
     }
 
     await this.dashboard.invalidateSummaryCache();
+
+    // M4 no-wallet: eksekusi payout cashback DANA post-commit (idempoten,
+    // key CASHBACK:<orderDbId>). Scheduler retryDue() menangani PENDING/FAILED.
+    if (result.danaCashback && this.escrowDisbursement) {
+      const { params, intent } = result.danaCashback;
+      await executeDanaCashback(this.escrowDisbursement, params, intent).catch((err: unknown) => {
+        this.logger.warn(
+          `DISPUTE_NO_WALLET_CASHBACK_FAILED dispute=${dispute.disputeId}: ${err instanceof Error ? err.message : String(err)} — retry via dana-refund-retry cron`,
+        );
+      });
+    }
 
     // Eksekusi finansial post-commit (bukan bagian transaksi DB).
     const settlement = await this.disputeDanaSettlement.settleDisputeNoWallet({

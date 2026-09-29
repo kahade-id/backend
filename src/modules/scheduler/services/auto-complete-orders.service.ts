@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import {
   OrderStatus,
@@ -18,7 +18,9 @@ import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
-import { creditCashbackIfEligible } from '../../../common/utils/cashback-credit.util';
+import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback } from '../../../common/utils/cashback-credit.util';
+import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
+import { EscrowDisbursementService } from '../../no-wallet/escrow-disbursement.service';
 import { alertMoneyCronSkippedRedisDown, ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { toIdr } from '../../../common/utils/currency.util';
 import { AUTO_COMPLETE_GRACE_PERIOD_HOURS } from '../../../common/constants/app.constants';
@@ -41,6 +43,9 @@ export class AutoCompleteDeliveredOrdersService {
     private referralService: ReferralService,
     private membershipRankService: MembershipRankService,
     private feeCalculator: FeeCalculatorService,
+    // M4 no-wallet: payout cashback via disbursement DANA bila wallet mati.
+    @Optional() private walletMode: WalletModeService | null,
+    @Optional() private disbursement: EscrowDisbursementService | null,
   ) {}
 
   private runRealtimeBestEffort(task: () => void, label: string): void {
@@ -378,15 +383,32 @@ export class AutoCompleteDeliveredOrdersService {
 
                     // Batch 1-money (EO-005): cashback voucher juga dikredit pada
                     // auto-complete — sebelumnya hangus diam-diam.
-                    const cashbackResult = await creditCashbackIfEligible(
-                      tx,
-                      () => this.walletTxSerialService.getNext(),
-                      {
+                    // M4 no-wallet: wallet mati -> rencanakan payout DANA (eksekusi post-tx).
+                    const walletEnabled = this.walletMode?.isWalletEnabled() ?? true;
+                    let danaCashback: {
+                      params: { orderDbId: string; orderPublicId: string; source: string };
+                      intent: { userId: string; amountSen: bigint; voucherCode: string | null; usageId: string };
+                    } | null = null;
+                    const cashbackResult = walletEnabled
+                      ? await creditCashbackIfEligible(
+                          tx,
+                          () => this.walletTxSerialService.getNext(),
+                          {
+                            orderDbId: order.id,
+                            orderPublicId: order.orderId,
+                            source: 'auto-complete',
+                          },
+                        )
+                      : null;
+                    if (!walletEnabled) {
+                      const params = {
                         orderDbId: order.id,
                         orderPublicId: order.orderId,
                         source: 'auto-complete',
-                      },
-                    );
+                      };
+                      const intent = await planDanaCashback(tx, params);
+                      danaCashback = intent ? { params, intent } : null;
+                    }
 
                     if (order.feeAmount > BigInt(0) && feeTxSerial !== null) {
                       const feeBalanceBefore = buyerWallet.totalBalance;
@@ -505,7 +527,7 @@ export class AutoCompleteDeliveredOrdersService {
 
                     this.logger.log(`Auto-completed order ${order.orderId}`);
 
-                    return { completed: true as const, cashback: cashbackResult, referralRewardCredited };
+                    return { completed: true as const, cashback: cashbackResult, danaCashback, referralRewardCredited };
                   },
                   { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
                 ),
@@ -549,6 +571,39 @@ export class AutoCompleteDeliveredOrdersService {
             // leaderboard cache setelah tx commit.
             if (outcome.referralRewardCredited) {
               await this.referralService.invalidateLeaderboardCache();
+            }
+
+            // M4 no-wallet: eksekusi payout cashback DANA post-tx (idempoten).
+            if (outcome.danaCashback && this.disbursement) {
+              const { params, intent } = outcome.danaCashback;
+              try {
+                const danaRes = await executeDanaCashback(this.disbursement, params, intent);
+                if (danaRes.outcome === 'RELEASED') {
+                  const cashbackIdr = toIdr(intent.amountSen).toLocaleString('id-ID');
+                  await this.prisma.notification
+                    .create({
+                      data: {
+                        notifId: generateNotifId(),
+                        userId: intent.userId,
+                        type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
+                        category: getCategoryForType(NotificationType.CAMPAIGN_CASHBACK_CREDITED),
+                        title: 'Cashback Terkirim',
+                        body: `Cashback Rp ${cashbackIdr} dari order "${order.title}" telah dikirim ke rekening bank Anda.`,
+                        isRead: false,
+                      },
+                    })
+                    .catch((notificationError: unknown) =>
+                      this.logger.warn(
+                        `silent-catch: auto-complete DANA cashback notification failed: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`,
+                      ),
+                    );
+                }
+              } catch (err) {
+                // Idempoten — scheduler retryDue() akan mencoba lagi.
+                this.logger.warn(
+                  `auto-complete DANA cashback gagal untuk order ${order.orderId}: ${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
             }
 
             // Batch 1-money (EO-005): notifikasi cashback bila dikredit oleh helper.

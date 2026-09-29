@@ -162,6 +162,26 @@ Auto-refund patungan/jastip: sweep Bull tiap 5 menit
   `EscrowDisbursementService.retryDue()` (disbursement PENDING/FAILED) —
   keduanya idempoten, di bawah redis lock.
 
+## Catatan implementasi M4 (2026-09-29)
+
+- Referral: `ReferralService.creditReward` — wallet mati → reward diklaim
+  (baris `referralReward` idempoten, tanpa lock/credit wallet) dan payout
+  aktual didorong scheduler `payoutPendingReferralRewards()` via disbursement
+  scope `REFERRAL`, kunci stabil `REFERRAL:<rewardId>`. `isCredited=true`
+  hanya setelah disbursement RELEASED; `HELD_NO_BANK`/gagal → tetap pending
+  dan dicoba lagi (fail-closed, tidak hangus).
+- Cashback voucher: pola dua fase money-safe —
+  `planDanaCashback(tx)` (read-only di dalam tx completion: cek voucherUsage
+  + guard idempotensi `CASHBACK:<orderDbId>`, tanpa sentuh wallet) lalu
+  `executeDanaCashback()` post-commit/tx via `releaseFunds` scope `CASHBACK`.
+  Terpasang di 4 jalur completion: `completeOrder`, cron `auto-complete`,
+  admin `forceComplete`, dan verdict sengketa no-wallet (paritas jalur wallet:
+  hanya bila sellerAmount > 0). Tanpa rekening bank → `HELD_NO_BANK`;
+  `retryDue()` scheduler menangani PENDING/FAILED.
+- Rantai refund patungan/jastip terbukti di level unit:
+  `CommerceRefundService` (12 test delegasi) → `OrderStateService.adminCancelOrder`
+  → cabang no-wallet refund DANA ke metode bayar asal (2 test).
+
 ## Catatan idempotency & fail-closed
 
 - Semua endpoint tulis uang mendukung header `Idempotency-Key` (atau

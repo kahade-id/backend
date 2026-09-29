@@ -87,6 +87,8 @@ describe('Batch 8 money — EO-008 force-complete ORDER_RELEASE balance basis', 
       referralService as never,
       membershipRankService as never,
       dashboard as never,
+      { isWalletEnabled: () => true } as never, // M4 no-wallet: wallet aktif → jalur wallet lama
+      null as never, // disbursement (tidak dipakai saat wallet aktif)
     );
 
     const result = await service.forceComplete('ORD-2026-1', 'admin-1', { reason: 'Buyer tidak merespons konfirmasi' } as never);

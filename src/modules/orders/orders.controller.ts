@@ -234,6 +234,20 @@ export class OrdersController {
     return { payment: await this.orderQrisPaymentService.getStatus(orderId, userId) };
   }
 
+  @Throttle({ default: { ttl: 60000, limit: 120 } })
+  @Get(':orderId/status')
+  @ApiOperation({
+    summary: 'Get order status (lightweight)',
+    description:
+      'D1-005: status ringan untuk poll — 3 kolom, bukan bundle penuh getOrderDetail. Klien mem-poll ini tiap 15 detik dan hanya me-refresh bundle penuh bila status berubah.',
+  })
+  async getOrderStatus(
+    @CurrentUser('sub') userId: string,
+    @Param('orderId', ParseIdPipe) orderId: string,
+  ): Promise<{ orderId: string; status: string; updatedAt: Date }> {
+    return this.ordersService.getOrderStatus(userId, orderId);
+  }
+
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 900000, limit: 10 } })
   @Post(':orderId/process')

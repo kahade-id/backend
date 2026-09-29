@@ -1161,13 +1161,32 @@ export class ChatService implements OnModuleInit {
   // Messages
   // ============================================================
 
-  async getMessages(userId: string, roomId: string, cursor?: string, limit: number = 50, excludeIds?: string[]): Promise<object> {
+  async getMessages(userId: string, roomId: string, cursor?: string, limit: number = 50, excludeIds?: string[], afterMessageId?: string): Promise<object> {
     const room = await this.validateRoomAccess(userId, roomId);
 
     const safeLimit = Math.min(Math.max(1, limit), 100);
 
     const whereClause: Record<string, unknown> = { roomId };
-    if (cursor) {
+    // D1-004 (perf 2026-09-29): mode delta untuk poll fallback — hanya pesan
+    // yang LEBIH BARU dari afterMessageId, bukan 30 pesan penuh tiap tick.
+    // Saling eksklusif dengan cursor (delta menang bila keduanya diisi).
+    let deltaMode = false;
+    if (afterMessageId) {
+      const anchor = await this.prisma.chatMessage.findFirst({
+        where: { id: afterMessageId, roomId },
+        select: { id: true, createdAt: true },
+      });
+      if (!anchor) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'afterMessageId does not belong to this room' });
+      }
+      deltaMode = true;
+      // "Lebih baru" mengikuti urutan sort (createdAt desc, id desc):
+      // createdAt lebih besar, atau sama dengan id yang lebih besar.
+      whereClause.OR = [
+        { createdAt: { gt: anchor.createdAt } },
+        { createdAt: anchor.createdAt, id: { gt: afterMessageId } },
+      ];
+    } else if (cursor) {
       const cursorMessage = await this.prisma.chatMessage.findFirst({
         where: { id: cursor, roomId },
         select: { id: true },
@@ -1246,8 +1265,9 @@ export class ChatService implements OnModuleInit {
 
     return {
       messages: responseMessages.map((m) => serializeMessage(m, { viewerId: userId, hiddenReaders })),
-      nextCursor,
-      hasMore,
+      // D1-004: mode delta bukan halaman — tidak ada nextCursor/hasMore.
+      nextCursor: deltaMode ? null : nextCursor,
+      hasMore: deltaMode ? false : hasMore,
     };
   }
 

@@ -332,6 +332,16 @@ export class UsersController {
     return this.usersService.getActivityLog(userId, page, limit);
   }
 
+  @Get('me/following-ids')
+  @ApiOperation({
+    summary: 'Get ids/usernames of users I follow (lightweight)',
+    description:
+      'D1-006: SATU query follow.findMany — gantikan loop klien hingga 20 halaman getFollowing. Dipakai filter tab Mengikuti di feed.',
+  })
+  async getMyFollowingIds(@CurrentUser('sub') userId: string): Promise<object> {
+    return this.usersService.getMyFollowingIds(userId);
+  }
+
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 5 } })
   @Get('availability')

@@ -974,6 +974,46 @@ describe('OrdersService', () => {
       expect(result).toHaveProperty('order');
     });
 
+    // ─── D1-005: getOrderStatus (status ringan untuk poll) ──────────────────
+
+    describe('getOrderStatus', () => {
+      it('mengembalikan status ringan tanpa include berat', async () => {
+        mockPrisma.order.findFirst.mockResolvedValue({
+          orderId: 'ORD-20260101-001',
+          status: OrderStatus.PROCESSING,
+          updatedAt: new Date('2026-09-29T10:00:00.000Z'),
+          buyerId: 'user-db-1',
+          sellerId: 'user-db-2',
+        });
+
+        const result = await service.getOrderStatus('user-db-1', 'ORD-20260101-001');
+
+        expect(result).toMatchObject({ orderId: 'ORD-20260101-001', status: OrderStatus.PROCESSING });
+        expect(result.updatedAt).toBeInstanceOf(Date);
+        const args = mockPrisma.order.findFirst.mock.calls[0][0];
+        expect(Object.keys(args.select).sort()).toEqual(
+          ['buyerId', 'orderId', 'sellerId', 'status', 'updatedAt'].sort(),
+        );
+        expect(args.include).toBeUndefined();
+      });
+
+      it('NotFound untuk order tak dikenal', async () => {
+        mockPrisma.order.findFirst.mockResolvedValue(null);
+        await expect(service.getOrderStatus('user-db-1', 'ORD-INVALID')).rejects.toThrow(NotFoundException);
+      });
+
+      it('Forbidden untuk bukan partisipan', async () => {
+        mockPrisma.order.findFirst.mockResolvedValue({
+          orderId: 'ORD-20260101-001',
+          status: OrderStatus.PROCESSING,
+          updatedAt: new Date(),
+          buyerId: 'user-db-1',
+          sellerId: 'user-db-2',
+        });
+        await expect(service.getOrderStatus('user-db-999', 'ORD-20260101-001')).rejects.toThrow(ForbiddenException);
+      });
+    });
+
     it('TRX-009: exposes the decrypted shipping address snapshot to participants', async () => {
       mockPrisma.order.findFirst.mockResolvedValue({
         ...mockOrder,

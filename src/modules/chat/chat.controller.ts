@@ -92,7 +92,7 @@ export class ChatController {
   })
   async getRoom(
     @CurrentUser('sub') userId: string,
-    @Param('roomId') roomId: string,
+    @Param('roomId', ParseIdPipe) roomId: string,
   ): Promise<object> {
     return this.chatService.getRoom(userId, roomId);
   }
@@ -152,11 +152,13 @@ export class ChatController {
     @Query('cursor', new ParseQueryStringPipe('cursor', 100)) cursor?: string,
     @Query('limit', new DefaultValuePipe(50), ParseIntPipe) limit?: number,
     @Query('excludeIds') excludeIdsRaw?: string,
+    // D1-004: mode delta — hanya pesan lebih baru dari id ini (untuk poll fallback).
+    @Query('afterMessageId', new ParseQueryStringPipe('afterMessageId', 100)) afterMessageId?: string,
   ): Promise<object> {
     const excludeIds = excludeIdsRaw
       ? excludeIdsRaw.split(',').map(id => id.trim()).filter(id => id.length > 0 && id.length <= 30).slice(0, 200)
       : undefined;
-    return this.chatService.getMessages(userId, roomId, cursor, limit, excludeIds);
+    return this.chatService.getMessages(userId, roomId, cursor, limit, excludeIds, afterMessageId);
   }
 
   // ============================================================

@@ -2,9 +2,10 @@ import { createHash, generateKeyPairSync, sign as cryptoSign } from 'crypto';
 import { ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PaymentPurpose, PaymentStatus } from '@prisma/client';
-import { DanaWebhookSettlementService } from './dana-webhook-settlement.service';
+import { DanaWebhookSettlementService, DANA_FINISH_NOTIFY_API_PATH } from './dana-webhook-settlement.service';
 
-const PATH = '/v1/webhooks/dana/payment';
+// Signature webhook DANA dihitung terhadap path API DANA, bukan route lokal.
+const PATH = DANA_FINISH_NOTIFY_API_PATH;
 
 function makeKeypair() {
   const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -76,7 +77,7 @@ describe('dana-webhook-settlement.service', () => {
     const { svc, prisma, walletService } = makeDeps(publicPem);
     prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: true });
     const out = await svc.handleFinishNotify(rawBody, headers, PATH);
-    expect(out.message).toBe('duplicate');
+    expect(out.responseCode).toBe('2005600');
     expect(prisma.paymentTransaction.findUnique).not.toHaveBeenCalled();
     expect(walletService.handleTopupSuccess).not.toHaveBeenCalled();
     expect(prisma.webhookLog.update).not.toHaveBeenCalled();
@@ -97,7 +98,7 @@ describe('dana-webhook-settlement.service', () => {
       amountIdr: 15000,
     });
     const out = await svc.handleFinishNotify(rawBody, headers, PATH);
-    expect(out.message).toBe('ok');
+    expect(out.responseCode).toBe('2005600');
     expect(danaPaymentService.getPaymentDetail).toHaveBeenCalledWith('DANA-TOP-001');
     expect(walletService.handleTopupSuccess).toHaveBeenCalledTimes(1);
     expect(walletService.handleTopupSuccess).toHaveBeenCalledWith('KAHADE-TOP-1', '15000');
@@ -123,7 +124,7 @@ describe('dana-webhook-settlement.service', () => {
       amountIdr: 99999, // mismatch!
     });
     const out = await svc.handleFinishNotify(rawBody, headers, PATH);
-    expect(out.message).toBe('ok');
+    expect(out.responseCode).toBe('2005600');
     expect(walletService.handleTopupSuccess).not.toHaveBeenCalled();
     expect(prisma.paymentTransaction.update).not.toHaveBeenCalled();
   });
@@ -170,7 +171,7 @@ describe('dana-webhook-settlement.service', () => {
     prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: false });
     prisma.paymentTransaction.findUnique.mockResolvedValue(null);
     const out = await svc.handleFinishNotify(rawBody, headers, PATH);
-    expect(out.message).toBe('ok');
+    expect(out.responseCode).toBe('2005600');
     expect(walletService.handleTopupSuccess).not.toHaveBeenCalled();
     expect(prisma.webhookLog.update).toHaveBeenCalled(); // tetap ditandai processed
   });

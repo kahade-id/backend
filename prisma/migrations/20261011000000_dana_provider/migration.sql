@@ -1,7 +1,8 @@
 -- DANA Enterprise (Gapura) — additive-only.
 -- 1. Tambah enum value PaymentProvider.DANA
--- 2. Tambah kolom referensi order DANA di PaymentTransaction
+-- 2. Tambah kolom referensi order DANA di payment_transactions
 --    (danaPartnerReferenceNo = partnerReferenceNo Create Order = kunci idempotency DANA)
+-- CATATAN: nama tabel fisik "payment_transactions" (model PaymentTransaction pakai @@map).
 
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_enum WHERE enumlabel = 'DANA'
@@ -10,13 +11,13 @@ DO $$ BEGIN
   END IF;
 END $$;
 
-ALTER TABLE "PaymentTransaction" ADD COLUMN IF NOT EXISTS "danaPartnerReferenceNo" TEXT;
-ALTER TABLE "PaymentTransaction" ADD COLUMN IF NOT EXISTS "danaReferenceNo" TEXT;
+ALTER TABLE "payment_transactions" ADD COLUMN IF NOT EXISTS "danaPartnerReferenceNo" TEXT;
+ALTER TABLE "payment_transactions" ADD COLUMN IF NOT EXISTS "danaReferenceNo" TEXT;
 
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_indexes
-    WHERE indexname = 'PaymentTransaction_danaPartnerReferenceNo_key') THEN
-    CREATE UNIQUE INDEX "PaymentTransaction_danaPartnerReferenceNo_key"
-      ON "PaymentTransaction"("danaPartnerReferenceNo");
+    WHERE indexname = 'payment_transactions_danaPartnerReferenceNo_key') THEN
+    CREATE UNIQUE INDEX "payment_transactions_danaPartnerReferenceNo_key"
+      ON "payment_transactions"("danaPartnerReferenceNo");
   END IF;
 END $$;

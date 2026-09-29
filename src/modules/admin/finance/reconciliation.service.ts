@@ -1,9 +1,10 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { WalletTransactionStatus, WalletTransactionType, WithdrawStatus } from '@prisma/client';
 import { toIdr } from '../../../common/utils/currency.util';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
 import { resolveUserInternalId } from '../common/resolve-user-id';
+import { mapWithConcurrency } from '../../../common/utils/bounded-concurrency.util';
 
 export interface WalletDiscrepancy {
   walletId: string;
@@ -59,8 +60,33 @@ export interface ReconcileBatchSnapshot {
 const BATCH_SNAPSHOTS_KEY = 'reconciliation.batches';
 const MAX_BATCH_SNAPSHOTS = 20;
 
+// B1-006 (perf): checkpoint rekonsiliasi terakhir yang SUKSES. Incremental harian
+// hanya memeriksa wallet yang bertransaksi sejak checkpoint; full scan mingguan.
+const RECONCILIATION_CHECKPOINT_KEY = 'reconciliation.checkpoint';
+/** B1-006: worker paralel untuk loop wallet (bounded — aman untuk pool DB 20). */
+const RECONCILIATION_WALLET_CONCURRENCY = 6;
+/** B1-006: full scan (semua wallet) tiap N hari; harian = incremental. */
+const RECONCILIATION_FULL_SCAN_INTERVAL_DAYS = 7;
+/** B1-006: bila checkpoint lebih tua dari ini, incremental tidak lagi hemat -> full scan. */
+const RECONCILIATION_INCREMENTAL_MAX_AGE_DAYS = 30;
+
+interface ReconciliationCheckpoint {
+  lastFullRunAt: string | null;
+  lastRunAt: string | null;
+  lastMode: 'full' | 'incremental' | null;
+}
+
+type ReconcilableWallet = {
+  id: string;
+  userId: string;
+  availableBalance: bigint;
+  escrowBalance: bigint;
+  totalBalance: bigint;
+};
+
 @Injectable()
 export class ReconciliationService {
+  private readonly logger = new Logger(ReconciliationService.name);
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -147,20 +173,125 @@ export class ReconciliationService {
     return this.reconcileWallet(wallet);
   }
 
-  async reconcileAllWallets(): Promise<ReconciliationResult> {
-    const BATCH_SIZE = 500;
-    const discrepancies: WalletDiscrepancy[] = [];
-    let totalChecked = 0;
-    let lastId: string | null = null;
+  /**
+   * B1-006 (perf): rekonsiliasi semua wallet.
+   *
+   * - `mode: 'full'` (dipakai trigger manual admin): scan SEMUA wallet.
+   * - `mode: 'incremental'`: hanya wallet yang bertransaksi sejak checkpoint
+   *   sukses terakhir.
+   * - `mode: 'auto'` (default, dipakai cron harian): incremental, kecuali belum
+   *   pernah ada checkpoint atau full scan terakhir >= 7 hari -> full scan.
+   *
+   * Loop wallet diparalel bounded (6 worker). PERHITUNGAN per wallet
+   * (reconcileWallet) TIDAK BERUBAH SAMA SEKALI — hanya cara eksekusinya.
+   * Fail-closed: error di satu wallet menggagalkan run & checkpoint TIDAK
+   * di-update, persis seperti perilaku loop berurutan lama.
+   */
+  async reconcileAllWallets(
+    opts: { mode?: 'auto' | 'full' | 'incremental' } = {},
+  ): Promise<ReconciliationResult> {
+    const mode = opts.mode ?? 'auto';
+    const checkpoint = await this.readCheckpoint();
+    const runStartedAt = new Date();
 
+    let full: boolean;
+    if (mode === 'full') {
+      full = true;
+    } else if (mode === 'incremental') {
+      full = false;
+    } else {
+      const lastFullMs = checkpoint.lastFullRunAt ? new Date(checkpoint.lastFullRunAt).getTime() : 0;
+      full = Date.now() - lastFullMs >= RECONCILIATION_FULL_SCAN_INTERVAL_DAYS * 24 * 3600 * 1000;
+    }
+
+    let wallets: ReconcilableWallet[];
+    let runMode: 'full' | 'incremental';
+    if (full || !checkpoint.lastRunAt) {
+      runMode = 'full';
+      wallets = await this.listAllWallets();
+    } else {
+      const since = new Date(checkpoint.lastRunAt);
+      const ageMs = runStartedAt.getTime() - since.getTime();
+      if (ageMs > RECONCILIATION_INCREMENTAL_MAX_AGE_DAYS * 24 * 3600 * 1000) {
+        // Checkpoint terlalu tua — incremental tidak lagi hemat.
+        runMode = 'full';
+        wallets = await this.listAllWallets();
+      } else {
+        runMode = 'incremental';
+        wallets = await this.listActiveWalletsSince(since);
+      }
+    }
+
+    this.logger.log(
+      `reconcileAllWallets: mode=${runMode} (diminta: ${mode}), ${wallets.length} wallet, concurrency=${RECONCILIATION_WALLET_CONCURRENCY}`,
+    );
+
+    const results = await mapWithConcurrency(
+      wallets,
+      RECONCILIATION_WALLET_CONCURRENCY,
+      (wallet) => this.reconcileWallet(wallet),
+      { captureErrors: false },
+    );
+    const discrepancies: WalletDiscrepancy[] = [];
+    for (const r of results) {
+      if (r.ok && r.value) discrepancies.push(r.value);
+    }
+
+    // Checkpoint hanya di-update bila run SUKSES penuh (fail-closed).
+    await this.writeCheckpoint({
+      lastFullRunAt: runMode === 'full' ? runStartedAt.toISOString() : checkpoint.lastFullRunAt,
+      lastRunAt: runStartedAt.toISOString(),
+      lastMode: runMode,
+    });
+
+    return {
+      reconciledAt: new Date().toISOString(),
+      walletsChecked: wallets.length,
+      discrepancies,
+      clean: discrepancies.length === 0,
+    };
+  }
+
+  /** B1-006: baca checkpoint terakhir yang sukses (null-safe). */
+  private async readCheckpoint(): Promise<ReconciliationCheckpoint> {
+    const empty: ReconciliationCheckpoint = { lastFullRunAt: null, lastRunAt: null, lastMode: null };
+    try {
+      const row = await this.prisma.systemConfig.findUnique({
+        where: { key: RECONCILIATION_CHECKPOINT_KEY },
+        select: { value: true },
+      });
+      if (!row?.value) return empty;
+      const parsed = JSON.parse(row.value) as Partial<ReconciliationCheckpoint>;
+      return {
+        lastFullRunAt: typeof parsed.lastFullRunAt === 'string' ? parsed.lastFullRunAt : null,
+        lastRunAt: typeof parsed.lastRunAt === 'string' ? parsed.lastRunAt : null,
+        lastMode: parsed.lastMode === 'full' || parsed.lastMode === 'incremental' ? parsed.lastMode : null,
+      };
+    } catch {
+      return empty;
+    }
+  }
+
+  /** B1-006: tulis checkpoint (dipanggil hanya setelah run sukses). */
+  private async writeCheckpoint(checkpoint: ReconciliationCheckpoint): Promise<void> {
+    await this.prisma.systemConfig.upsert({
+      where: { key: RECONCILIATION_CHECKPOINT_KEY },
+      create: {
+        key: RECONCILIATION_CHECKPOINT_KEY,
+        value: JSON.stringify(checkpoint),
+        description: 'Checkpoint rekonsiliasi wallet terakhir yang sukses (B1-006 incremental)',
+      },
+      update: { value: JSON.stringify(checkpoint) },
+    });
+  }
+
+  /** B1-006: daftar SEMUA wallet (cursor pagination, batch 500). */
+  private async listAllWallets(): Promise<ReconcilableWallet[]> {
+    const BATCH_SIZE = 500;
+    const wallets: ReconcilableWallet[] = [];
+    let lastId: string | null = null;
     for (;;) {
-      const wallets: Array<{
-        id: string;
-        userId: string;
-        availableBalance: bigint;
-        escrowBalance: bigint;
-        totalBalance: bigint;
-      }> = await this.prisma.wallet.findMany({
+      const batch: ReconcilableWallet[] = await this.prisma.wallet.findMany({
         ...(lastId ? { cursor: { id: lastId }, skip: 1 } : {}),
         take: BATCH_SIZE,
         orderBy: { id: 'asc' as const },
@@ -172,28 +303,37 @@ export class ReconciliationService {
           totalBalance: true,
         },
       });
-
-      if (wallets.length === 0) break;
-
-      for (const wallet of wallets) {
-        const result = await this.reconcileWallet(wallet);
-        if (result) {
-          discrepancies.push(result);
-        }
-      }
-
-      totalChecked += wallets.length;
-      lastId = wallets[wallets.length - 1].id;
-
-      if (wallets.length < BATCH_SIZE) break;
+      if (batch.length === 0) break;
+      wallets.push(...batch);
+      lastId = batch[batch.length - 1].id;
+      if (batch.length < BATCH_SIZE) break;
     }
+    return wallets;
+  }
 
-    return {
-      reconciledAt: new Date().toISOString(),
-      walletsChecked: totalChecked,
-      discrepancies,
-      clean: discrepancies.length === 0,
-    };
+  /**
+   * B1-006: wallet yang punya transaksi (status apapun) sejak `since`.
+   * Perubahan saldo SELALU tercatat sebagai walletTransaction di codebase ini,
+   * jadi wallet tanpa transaksi baru tidak mungkin punya selisih baru vs
+   * checkpoint terakhir. (Full scan mingguan tetap menangkap anomali apapun.)
+   */
+  private async listActiveWalletsSince(since: Date): Promise<ReconcilableWallet[]> {
+    const active = await this.prisma.walletTransaction.findMany({
+      where: { createdAt: { gte: since } },
+      select: { walletId: true },
+      distinct: ['walletId'],
+    });
+    if (active.length === 0) return [];
+    return this.prisma.wallet.findMany({
+      where: { id: { in: active.map((a) => a.walletId) } },
+      select: {
+        id: true,
+        userId: true,
+        availableBalance: true,
+        escrowBalance: true,
+        totalBalance: true,
+      },
+    });
   }
 
   async getFinancialAuditTrail(

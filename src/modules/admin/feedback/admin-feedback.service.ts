@@ -680,23 +680,20 @@ export class AdminFeedbackService {
   }
 
   // Hitung ulang slaDueAt untuk feedback terbuka saat rule berubah.
+  // B1-005 (perf): SATU statement UPDATE — slaDueAt murni fungsi createdAt
+  // (createdAt + hours*3600 detik), tidak butuh loop aplikasi. Rumus identik
+  // dengan versi loop: make_interval(hours => h) = h*3600 detik persis
+  // (microseconds, tanpa pembulatan). Tanpa cap 5000: semua feedback terbuka
+  // kategori ini ikut ter-update (loop lama berhenti di 5000 tanpa order).
   private async recomputeOpenSla(category: string, hours: number): Promise<void> {
-    const open = await this.prisma.feedback.findMany({
-      where: {
-        category,
-        status: { in: [FeedbackStatus.NEW, FeedbackStatus.IN_REVIEW] },
-      },
-      select: { id: true, createdAt: true },
-      take: 5000,
-    });
-    for (const fb of open) {
-      await this.prisma.feedback.update({
-        where: { id: fb.id },
-        data: { slaDueAt: new Date(fb.createdAt.getTime() + hours * 3_600_000) },
-      });
-    }
-    if (open.length > 0) {
-      this.logger.log(`SLA dihitung ulang untuk ${open.length} feedback terbuka kategori="${category}"`);
+    const updated = await this.prisma.$executeRaw`
+      UPDATE "feedback"
+      SET "slaDueAt" = "createdAt" + make_interval(hours => ${hours}::double precision)
+      WHERE "category" = ${category}
+        AND "status" IN ('NEW', 'IN_REVIEW')
+    `;
+    if (Number(updated) > 0) {
+      this.logger.log(`SLA dihitung ulang untuk ${updated} feedback terbuka kategori="${category}"`);
     }
   }
 

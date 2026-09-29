@@ -2,10 +2,11 @@ import { createHash, generateKeyPairSync, sign as cryptoSign } from 'crypto';
 import { ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PaymentPurpose, PaymentStatus } from '@prisma/client';
-import { DanaWebhookSettlementService, DANA_FINISH_NOTIFY_API_PATH } from './dana-webhook-settlement.service';
+import { DanaWebhookSettlementService } from './dana-webhook-settlement.service';
 
-// Signature webhook DANA dihitung terhadap path API DANA, bukan route lokal.
-const PATH = DANA_FINISH_NOTIFY_API_PATH;
+// DANA menandatangani notify terhadap path callback URL milik merchant —
+// untuk server kita: route lokal /v1/webhooks/dana/payment (req.path).
+const PATH = '/v1/webhooks/dana/payment';
 
 function makeKeypair() {
   const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -175,4 +176,27 @@ describe('dana-webhook-settlement.service', () => {
     expect(walletService.handleTopupSuccess).not.toHaveBeenCalled();
     expect(prisma.webhookLog.update).toHaveBeenCalled(); // tetap ditandai processed
   });
+
+  it('REGRESI (insiden 2026-09-29): payload finish-notify ASLI DANA sandbox', async () => {
+    // Struktur payload asli ditangkap via webhook.site 2026-09-29 22:08:36 WIB
+    // dari IP DANA 147.139.135.134 — order demo "Kahade SigCap" Rp10.000.
+    // Signature asli TIDAK dicantumkan di repo (aturan keamanan) — di sini
+    // pakai placeholder agar test memastikan fail-closed (403 + tanpa DB
+    // write) untuk signature yang tidak cocok. Bukti jalur positif (signature
+    // asli terverifikasi dengan path tujuan + public key resmi DANA) sudah
+    // dijalankan offline dan terdokumentasi di laporan insiden.
+    const realBody =
+      '{"amount":{"currency":"IDR","value":"10000.00"},"originalReferenceNo":"20260929111230999500166943900569349","merchantId":"216620010010042769401","latestTransactionStatus":"00","additionalInfo":{"paidTime":"2026-09-29T22:08:35+07:00","paymentInfo":{"payOptionInfos":[{"transAmount":{"currency":"IDR","value":"10000.00"},"payAmount":{"currency":"IDR","value":"10000.00"},"payMethod":"BALANCE"}]}},"originalPartnerReferenceNo":"62f9bcf8-71d7-4a38-9ede-629761cd9524","createdTime":"2026-09-29T22:06:19+07:00","finishedTime":"2026-09-29T22:08:35+07:00","transactionStatusDesc":"SUCCESS"}';
+    const realPath = '/cd314adb-3aec-4e1b-9b7e-e3f414f6c081'; // path URL tujuan notify saat capture
+    const { svc, prisma } = makeDeps('');
+    await expect(
+      svc.handleFinishNotify(
+        realBody,
+        { 'x-signature': 'PLACEHOLDER-BUKAN-SIGNATURE-ASLI', 'x-timestamp': '2026-09-29T22:08:35+07:00' },
+        realPath,
+      ),
+    ).rejects.toThrow('Invalid DANA webhook signature');
+    expect(prisma.webhookLog.upsert).not.toHaveBeenCalled(); // fail-closed: tanpa DB write
+  });
+
 });

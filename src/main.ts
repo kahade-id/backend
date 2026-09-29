@@ -171,14 +171,26 @@ async function bootstrap(): Promise<void> {
   // Prisma transactions, and Bull jobs before the process exits on SIGTERM/SIGINT.
   app.enableShutdownHooks();
 
+  // WAJIB: stash rawBody di SEMUA body parser. NestFactory.create(...,
+  // { rawBody: true }) hanya mendaftarkan parser ber-verify miliknya bila
+  // belum ada jsonParser/urlencodedParser (isMiddlewareApplied) — karena kita
+  // memasang parser sendiri di bawah ini, parser Nest dilewati dan req.rawBody
+  // selalu undefined → SEMUA verifikasi signature webhook (DANA, kurir) yang
+  // memakai raw body gagal. (Root cause insiden webhook DANA 403, 2026-09-29:
+  // sha256('') tidak pernah cocok dengan signature DANA.)
+  const stashRawBody = (req: any, _res: any, buf: Buffer): boolean => {
+    if (Buffer.isBuffer(buf)) req.rawBody = buf;
+    return true;
+  };
+
   // B-033: Tighter body size limits for sensitive endpoints BEFORE global parser
-  const tightBodyLimit = json({ limit: '1kb' });
+  const tightBodyLimit = json({ limit: '1kb', verify: stashRawBody });
   const pinRoutes = ['/v1/wallet/set-pin', '/v1/wallet/verify-pin', '/v1/auth/verify-otp', '/v1/auth/verify-2fa', '/v1/auth/2fa/setup', '/v1/auth/2fa/enable', '/v1/auth/2fa/disable', '/v1/auth/login'];
   app.use(pinRoutes, tightBodyLimit);
 
   // Global body size limit — must come AFTER per-route overrides
-  app.use(json({ limit: '1mb' }));
-  app.use(urlencoded({ extended: true, limit: '1mb' }));
+  app.use(json({ limit: '1mb', verify: stashRawBody }));
+  app.use(urlencoded({ extended: true, limit: '1mb', verify: stashRawBody }));
 
   // B-07 (audit-fix): make CSP `connectSrc` configurable from env so the
   // wildcard subdomain entry is not baked into the binary. The default keeps

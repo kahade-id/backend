@@ -25,8 +25,18 @@ function buildPrisma(overrides: Record<string, unknown> = {}) {
       updateMany: txMocks.paymentTransactionUpdateMany,
       create: txMocks.paymentTransactionCreate,
     },
-    order: { updateMany: txState.orderUpdateMany },
-    orderMilestone: { count: jest.fn(async () => 0) },
+    order: {
+      updateMany: txState.orderUpdateMany,
+      // M5: aktivasi milestone no-wallet membaca order via findUniqueOrThrow.
+      findUniqueOrThrow: jest.fn(),
+    },
+    orderMilestone: {
+      count: jest.fn(async () => 0),
+      // M5: aktivasi milestone no-wallet memakai findMany/updateMany/create event.
+      findMany: jest.fn(async () => []),
+      updateMany: jest.fn(async () => ({ count: 0 })),
+    },
+    milestoneEvent: { create: jest.fn(async () => ({})) },
     orderStatusHistory: { create: txState.orderStatusHistoryCreate },
   };
   const prisma = {
@@ -40,7 +50,7 @@ function buildPrisma(overrides: Record<string, unknown> = {}) {
     $transaction: jest.fn(async (cb: (tx: unknown) => unknown) => cb(tx)),
     ...overrides,
   };
-  return { prisma, txState, txMocks };
+  return { prisma, txState, txMocks, tx };
 }
 
 const danaPayment = {
@@ -234,6 +244,49 @@ describe('DanaDirectPaymentService.settleEscrow', () => {
     );
     // history tercatat
     expect(txState.orderStatusHistoryCreate).toHaveBeenCalled();
+  });
+
+  it('M5: wallet mati + order bertahap DANA → milestone teraktivasi dari payment (tanpa wallet)', async () => {
+    const payment = {
+      id: 'pt-1',
+      purpose: PaymentPurpose.ORDER_ESCROW,
+      status: PaymentStatus.PENDING,
+      amount: BigInt(10000000), // 100.000 IDR dalam sen
+      danaPartnerReferenceNo: 'KDH-ABC',
+      danaReferenceNo: 'DANA-REF-1',
+      danaPayKind: 'QRIS',
+      order: { ...baseOrder, status: 'WAITING_PAYMENT' },
+    };
+    const { prisma, txState, tx } = buildPrisma();
+    txState.paymentTransactionFindUnique.mockResolvedValue(payment);
+    txState.orderUpdateMany.mockResolvedValue({ count: 1 });
+    // Dua tahap DRAFT yang totalnya = buyerPayAmount.
+    (tx.order.findUniqueOrThrow as jest.Mock).mockResolvedValue({
+      buyerPayAmount: BigInt(10000000),
+      buyerId: 'buyer-1',
+      orderId: 'ORD-1',
+    });
+    (tx.orderMilestone.findMany as jest.Mock).mockResolvedValue([
+      { id: 'ms-1', buyerAmount: BigInt(6000000), seq: 1 },
+      { id: 'ms-2', buyerAmount: BigInt(4000000), seq: 2 },
+    ]);
+    (tx.orderMilestone.updateMany as jest.Mock).mockResolvedValue({ count: 1 });
+
+    const svc = new DanaDirectPaymentService(prisma as never, danaPayment as never, config as never, serial as never, walletMode as never);
+    await svc.settleEscrow('pt-1');
+
+    // Kedua tahap diaktivasi dengan escrowHeld = buyerAmount (accounting marker).
+    expect(tx.orderMilestone.updateMany).toHaveBeenCalledTimes(2);
+    expect(tx.orderMilestone.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: 'AWAITING_ACTIVATION', escrowHeld: BigInt(6000000) }),
+      }),
+    );
+    expect(tx.milestoneEvent.create).toHaveBeenCalledTimes(2);
+    // order tetap → PROCESSING (tidak ditolak seperti sebelum M5).
+    expect(txState.orderUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: 'PROCESSING' }) }),
+    );
   });
 
   it('idempoten: payment yang sudah SUCCESS tidak di-settle ulang', async () => {

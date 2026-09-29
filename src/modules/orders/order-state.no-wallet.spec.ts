@@ -85,12 +85,16 @@ function buildService(opts: { walletEnabled: boolean; danaPayment: boolean; lega
     walletMode as never,
     orderQrisPaymentService as never,
     danaDirectRefundService as never,
+    null as never, // escrowDisbursementService (M4)
     walletTxSerialService as never,
     {} as never,
     {} as never,
     realtime as never,
     {} as never,
     notificationQueue as never,
+    undefined as never, // inventoryService
+    undefined as never, // actionLocationService
+    undefined as never, // milestonesService (M5) — tidak di-mock: fallback refundOrderEscrow
   );
   return { svc, prisma, tx, orderRow, walletMode, orderQrisPaymentService, danaDirectRefundService, realtime, notificationQueue };
 }

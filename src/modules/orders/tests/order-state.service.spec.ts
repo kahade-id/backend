@@ -5,6 +5,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { WalletService } from '../../wallet/wallet.service';
 import { OrderQrisPaymentService } from '../../payment/order-qris-payment.service';
+import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { ReferralService } from '../../referral/referral.service';
 import { FeeCalculatorService } from '../fee-calculator.service';
@@ -190,6 +191,9 @@ describe('OrderStateService', () => {
         { provide: RealtimeService, useValue: { sendToUser: jest.fn(), emitOrderUpdate: jest.fn(), emitToOrder: jest.fn() } },
         { provide: MembershipRankService, useValue: mockMembershipRankService },
         { provide: NotificationQueueService, useValue: mockNotificationQueueService },
+        // WalletModeService wajib (constructor non-optional); default mode
+        // wallet-aktif agar ekspektasi existing tidak berubah.
+        { provide: WalletModeService, useValue: { isWalletEnabled: () => true } },
       ],
     }).compile();
 

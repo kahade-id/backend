@@ -19,6 +19,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import {
   ActorType,
@@ -29,6 +30,9 @@ import {
   MilestoneStatus,
   NotificationType,
   OrderStatus,
+  PaymentProvider,
+  PaymentPurpose,
+  PaymentStatus,
   Prisma,
   WalletTransactionStatus,
   WalletTransactionType,
@@ -40,6 +44,11 @@ import { DISPUTE_SLA_HOURS } from '../../common/constants/app.constants';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import { PrismaService } from '../../prisma/prisma.service';
+import { Optional } from '@nestjs/common';
+import { WalletModeService } from '../wallet-mode/wallet-mode.service';
+import { EscrowDisbursementService } from '../no-wallet/escrow-disbursement.service';
+import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
+import { EscrowDisbursementScope, EscrowDisbursementStatus } from '@prisma/client';
 import { activateMilestonesForOrderTx } from './milestone-activation';
 import {
   ChangeRequestDto,
@@ -99,7 +108,58 @@ export class MilestonesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly txSerial: WalletTxSerialService,
+    // M5 no-wallet: release via disbursement DANA + refund parsial per tahap.
+    @Optional() private readonly walletMode?: WalletModeService | null,
+    @Optional() private readonly disbursement?: EscrowDisbursementService | null,
+    @Optional() private readonly danaRefund?: DanaDirectRefundService | null,
   ) {}
+
+  /** Kunci idempotensi disbursement per tahap — stabil. */
+  private milestoneDisbursementKey(milestoneId: string): string {
+    return `MILESTONE:${milestoneId}`;
+  }
+
+  /** Kunci idempotensi refund DANA per tahap yang dibatalkan — stabil. */
+  private milestoneCancelRefundKey(milestoneId: string): string {
+    return `MILESTONE_CANCEL:${milestoneId}`;
+  }
+
+  private isNoWalletMode(): boolean {
+    return !(this.walletMode?.isWalletEnabled() ?? true);
+  }
+
+  /**
+   * M5: post-commit best-effort — jalankan settlement disbursement DANA untuk
+   * satu tahap. Idempoten (kunci disbursement stabil). Bila proses mati sebelum
+   * ini jalan, baris PENDING yang dibuat di dalam tx diambil cron retry.
+   * Kegagalan di sini TIDAK me-rollback state (fail-open terkontrol: record
+   * durable sudah ada, settlement dapat di-retry).
+   */
+  private async runPostCommitMilestoneRelease(d: {
+    key: string;
+    sellerId: string;
+    amountSen: bigint;
+  }): Promise<void> {
+    if (!this.disbursement) {
+      this.logger.error(`Post-commit release tahap ${d.key}: disbursement service tidak tersedia`);
+      return;
+    }
+    try {
+      const res = await this.disbursement.releaseFunds({
+        idempotencyKey: d.key,
+        scope: EscrowDisbursementScope.MILESTONE,
+        sellerId: d.sellerId,
+        amountSen: d.amountSen,
+        reason: `Release tahap ${d.key}`,
+      });
+      if (res.outcome === 'HELD_NO_BANK') {
+        this.logger.warn(`Release tahap ${d.key} HELD_NO_BANK — menunggu rekening seller`);
+      }
+    } catch (e) {
+      // Best-effort: baris PENDING durable → cron retry mengambil alih.
+      this.logger.error(`Post-commit release tahap ${d.key} gagal: ${(e as Error).message}`);
+    }
+  }
 
   // ----------------------------------------------------------------- helpers
 
@@ -829,11 +889,20 @@ export class MilestonesService {
       return this.releaseMilestoneFunds(tx, milestoneId, buyerId);
     });
 
+    // M5: settlement DANA post-commit (best-effort; baris PENDING durable
+    // sudah dibuat di dalam tx bila mode tanpa-wallet).
+    if (!released.skipped && 'danaDisbursement' in released && released.danaDisbursement) {
+      await this.runPostCommitMilestoneRelease(released.danaDisbursement);
+    }
+
+    const noWallet = this.isNoWalletMode();
     await this.notifyUser(
       milestone.order.sellerId,
       NotificationType.MILESTONE_RELEASED,
       'Dana Tahap Cair',
-      `Tahap ${milestone.seq} "${milestone.title}" diterima pembeli. Dana telah dicairkan ke wallet Anda.`,
+      noWallet
+        ? `Tahap ${milestone.seq} "${milestone.title}" diterima pembeli. Dana dicairkan ke rekening bank terdaftar Anda.`
+        : `Tahap ${milestone.seq} "${milestone.title}" diterima pembeli. Dana telah dicairkan ke wallet Anda.`,
       milestoneId,
     );
     return { id: milestoneId, releasedTxId: released.releasedTxId };
@@ -845,6 +914,10 @@ export class MilestonesService {
    * Concurrency guard: updateMany where status=ACCEPTED.
    */
   private async releaseMilestoneFunds(tx: Tx, milestoneId: string, actorId: string) {
+    // M5 (mode tanpa-wallet): cabang DANA — tanpa sentuh wallet.
+    if (this.isNoWalletMode()) {
+      return this.releaseMilestoneFundsNoWallet(tx, milestoneId, actorId);
+    }
     const milestone = await tx.orderMilestone.findUniqueOrThrow({
       where: { id: milestoneId },
       include: { order: true },
@@ -1008,6 +1081,117 @@ export class MilestonesService {
   }
 
   /**
+   * M5 (mode tanpa-wallet): cairkan dana satu tahap via disbursement DANA
+   * ke rekening bank seller (scope MILESTONE).
+   *
+   * Desain durable (fail-closed):
+   * - Di DALAM tx: tandai tahap RELEASED + buat baris escrowDisbursement
+   *   PENDING (kunci `MILESTONE:<milestoneId>`) + event RELEASED. Bila proses
+   *   mati setelah commit, cron retry mengambil baris PENDING ini.
+   * - SETELAH commit: caller menjalankan post-commit best-effort
+   *   `EscrowDisbursementService.releaseFunds()` (idempoten).
+   * - Seller menerima tepat `sellerAmount`; fee platform (buyerAmount -
+   *   sellerAmount) TETAP di merchant DANA, tidak ikut dicairkan.
+   * - Verifikasi rekening (exact normalized account-name match) + hold
+   *   HELD_NO_BANK bila seller belum punya rekening primer — semua ditangani
+   *   EscrowDisbursementService.
+   *
+   * Idempoten: releasedTxId terisi → skip; kunci disbursement unik mencegah
+   * baris ganda; updateMany ber-guard status.
+   */
+  private async releaseMilestoneFundsNoWallet(tx: Tx, milestoneId: string, actorId: string) {
+    const milestone = await tx.orderMilestone.findUniqueOrThrow({
+      where: { id: milestoneId },
+      include: { order: true },
+    });
+    const order = milestone.order;
+
+    // Idempotensi: sudah pernah release → no-op aman.
+    if (milestone.releasedTxId) {
+      this.logger.warn(`Idempotent no-wallet release skip for milestone ${milestoneId} (tx ${milestone.releasedTxId})`);
+      return { releasedTxId: milestone.releasedTxId, skipped: true as const };
+    }
+
+    if (milestone.status !== MilestoneStatus.ACCEPTED) {
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_ORDER_STATUS,
+        message: 'Hanya tahap berstatus ACCEPTED yang dapat dicairkan.',
+      });
+    }
+    if (milestone.escrowHeld < milestone.buyerAmount) {
+      throw new ConflictException({
+        code: 'MILESTONE_INVARIANT_VIOLATION',
+        message: 'Invariant escrow tahap rusak: escrowHeld lebih kecil dari buyerAmount.',
+      });
+    }
+    // Invariant fee: seller tidak boleh menerima lebih dari yang dibayar buyer;
+    // fee platform = buyerAmount - sellerAmount tertahan di merchant DANA.
+    if (milestone.sellerAmount <= 0n || milestone.sellerAmount > milestone.buyerAmount) {
+      throw new ConflictException({
+        code: 'MILESTONE_INVARIANT_VIOLATION',
+        message: 'Invariant nominal tahap rusak: sellerAmount harus dalam (0, buyerAmount].',
+      });
+    }
+    if (!this.disbursement) {
+      throw new ServiceUnavailableException({
+        code: 'NO_WALLET_PROVIDER_UNAVAILABLE',
+        message: 'Layanan disbursement DANA tidak tersedia — release tahap ditahan (fail-closed).',
+      });
+    }
+
+    // Baris disbursement durable (PENDING) — ditemukan cron retry bila
+    // post-commit tidak sempat jalan.
+    const disbKey = this.milestoneDisbursementKey(milestoneId);
+    const existingDisb = await tx.escrowDisbursement.findUnique({
+      where: { idempotencyKey: disbKey },
+      select: { id: true, status: true },
+    });
+    if (!existingDisb) {
+      await tx.escrowDisbursement.create({
+        data: {
+          idempotencyKey: disbKey,
+          scope: EscrowDisbursementScope.MILESTONE,
+          scopeRefId: milestone.id,
+          orderId: order.id,
+          sellerId: order.sellerId,
+          amountSen: milestone.sellerAmount,
+          status: EscrowDisbursementStatus.PENDING,
+        },
+      });
+    }
+
+    // Concurrency guard: hanya satu yang boleh menandai RELEASED.
+    const releasedTxId = `DANA:${disbKey}`;
+    const marked = await tx.orderMilestone.updateMany({
+      where: { id: milestoneId, status: MilestoneStatus.ACCEPTED, releasedTxId: null },
+      data: { status: MilestoneStatus.RELEASED, releasedAt: new Date(), releasedTxId, escrowHeld: 0n },
+    });
+    if (marked.count === 0) {
+      throw new ConflictException({
+        code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT,
+        message: 'Tahap sudah dicairkan oleh proses lain.',
+      });
+    }
+    await this.recordEvent(tx, milestoneId, MilestoneActorType.SYSTEM, MilestoneEventType.RELEASED, actorId, {
+      releasedTxId,
+      disbursementKey: disbKey,
+      buyerAmount: milestone.buyerAmount.toString(),
+      sellerAmount: milestone.sellerAmount.toString(),
+      feeAmount: (milestone.buyerAmount - milestone.sellerAmount).toString(),
+      noWallet: true,
+    } as Prisma.InputJsonValue);
+
+    // Finalisasi order bila semua tahap sudah terminal (tanpa release legacy).
+    await this.maybeFinalizeMilestoneOrder(tx, order.id);
+
+    return {
+      releasedTxId,
+      skipped: false as const,
+      danaDisbursement: { key: disbKey, sellerId: order.sellerId, amountSen: milestone.sellerAmount },
+    };
+  }
+
+  /**
    * Finalisasi order bermilestone (G176): bila SEMUA tahap sudah terminal
    * (RELEASED/CANCELLED), tandai order COMPLETED (bila ada yang released) atau
    * CANCELLED (bila semua dibatalkan) + orderStatusHistory.
@@ -1078,7 +1262,37 @@ export class MilestonesService {
     // order-nya DISPUTED tidak boleh cair via retry publik.
     this.assertOrderAllowsMilestoneAction(milestone.order);
     const result = await this.prisma.$transaction((tx) => this.releaseMilestoneFunds(tx, milestoneId, userId));
+    // M5: re-drive settlement DANA post-commit (idempoten).
+    if (!result.skipped && 'danaDisbursement' in result && result.danaDisbursement) {
+      await this.runPostCommitMilestoneRelease(result.danaDisbursement);
+    }
     return { id: milestoneId, releasedTxId: result.releasedTxId, alreadyReleased: false };
+  }
+
+  /**
+   * M5: re-drive settlement disbursement DANA untuk tahap yang sudah RELEASED
+   * via kunci DANA (mis. crash setelah commit sebelum post-commit jalan, atau
+   * HELD_NO_BANK yang rekeningnya baru ditambahkan). Idempoten.
+   */
+  async redriveMilestoneDisbursement(milestoneId: string, userId: string) {
+    const milestone = await this.getMilestoneForParty(milestoneId, userId);
+    if (this.isNoWalletMode()) {
+      const m = await this.prisma.orderMilestone.findUniqueOrThrow({ where: { id: milestoneId } });
+      if (m.status === MilestoneStatus.RELEASED && m.releasedTxId?.startsWith('DANA:')) {
+        const disb = await this.prisma.escrowDisbursement.findUnique({
+          where: { idempotencyKey: this.milestoneDisbursementKey(milestoneId) },
+        });
+        if (disb) {
+          await this.runPostCommitMilestoneRelease({
+            key: disb.idempotencyKey,
+            sellerId: disb.sellerId,
+            amountSen: disb.amountSen,
+          });
+          return { id: milestoneId, redriven: true };
+        }
+      }
+    }
+    return { id: milestoneId, redriven: false };
   }
 
   // ------------------------------------------------- dispute / cancel (G189/G190)
@@ -1157,6 +1371,12 @@ export class MilestonesService {
     // SEC-102: refund sisa tahap juga di-guard status order — tidak boleh
     // mengembalikan escrowHeld saat order DISPUTED (adjudikasi yang berhak).
     this.assertOrderAllowsMilestoneAction(order);
+
+    // M5 (mode tanpa-wallet): refund parsial DANA per tahap (buyerAmount yang
+    // masih ditahan escrow-nya), tanpa sentuh wallet.
+    if (this.isNoWalletMode()) {
+      return this.cancelRemainingNoWallet(order, orderId, userId, role);
+    }
 
     const result = await this.prisma.$transaction(async (tx) => {
       const remaining = await tx.orderMilestone.findMany({
@@ -1240,6 +1460,134 @@ export class MilestonesService {
       orderId,
     );
     return { orderId: order.orderId, cancelled: result.cancelled, refundedIdr: Number(result.refundedAmount) / 100 };
+  }
+
+  /**
+   * M5 (mode tanpa-wallet): batalkan sisa tahap dengan refund parsial DANA
+   * per tahap ke metode bayar asal (buyerAmount/escrowHeld tahap yang masih
+   * ditahan). Tahap yang sudah RELEASED tidak disentuh.
+   *
+   * Urutan money-first (fail-closed, self-healing):
+   * - Refund DANA parsial per tahap DULU (idempoten via kunci stabil
+   *   `MILESTONE_CANCEL:<milestoneId>`; refundAmount melempar bila gagal).
+   * - Baru tandai CANCELLED di dalam tx. Crash di antara keduanya → retry
+   *   menemukan attempt yang sudah ada (tidak refund ganda) lalu menandai
+   *   CANCELLED.
+   * - Tanpa payment DANA SUCCESS untuk order → tolak (fail-closed), jangan
+   *   tandai CANCELLED.
+   */
+  private async cancelRemainingNoWallet(
+    order: { id: string; orderId: string; buyerId: string; sellerId: string },
+    orderId: string,
+    userId: string,
+    role: MilestoneActorType,
+  ) {
+    if (!this.danaRefund) {
+      throw new ServiceUnavailableException({
+        code: 'NO_WALLET_PROVIDER_UNAVAILABLE',
+        message: 'Layanan refund DANA tidak tersedia — pembatalan tahap ditahan (fail-closed).',
+      });
+    }
+    const payment = await this.prisma.paymentTransaction.findFirst({
+      where: {
+        orderId,
+        purpose: PaymentPurpose.ORDER_ESCROW,
+        provider: PaymentProvider.DANA,
+        status: PaymentStatus.SUCCESS,
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    });
+    if (!payment) {
+      throw new ServiceUnavailableException({
+        code: 'MILESTONE_CANCEL_NO_DANA_PAYMENT',
+        message: 'Payment DANA order tidak ditemukan — pembatalan tahap ditahan agar dana tidak nyangkut.',
+      });
+    }
+
+    const OPEN: MilestoneStatus[] = [
+      MilestoneStatus.DRAFT,
+      MilestoneStatus.AWAITING_ACTIVATION,
+      MilestoneStatus.SUBMITTED,
+      MilestoneStatus.REVISION_REQUESTED,
+    ];
+    const remaining = await this.prisma.orderMilestone.findMany({
+      where: { orderId, status: { in: OPEN } },
+      orderBy: { seq: 'asc' },
+    });
+    if (remaining.length === 0) {
+      return { orderId: order.orderId, cancelled: 0, refundedIdr: 0 };
+    }
+
+    // Money-first: refund parsial per tahap (idempoten). Tahap DRAFT murni
+    // (escrowHeld=0) tidak butuh refund.
+    for (const m of remaining) {
+      if (m.escrowHeld <= 0n) continue;
+      const outcome = await this.danaRefund.refundAmount({
+        paymentDbId: payment.id,
+        amountSen: m.escrowHeld,
+        reason: `Refund tahap ${m.seq} yang dibatalkan (order ${order.orderId})`,
+        idempotencyKey: this.milestoneCancelRefundKey(m.id),
+      });
+      if (!outcome.refunded) {
+        throw new ServiceUnavailableException({
+          code: 'MILESTONE_CANCEL_REFUND_FAILED',
+          message: `Refund DANA tahap ${m.seq} gagal (${outcome.reason}) — pembatalan dibatalkan (fail-closed).`,
+        });
+      }
+    }
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      let refunded = 0n;
+      for (const m of remaining) {
+        await tx.orderMilestone.updateMany({
+          where: { id: m.id, status: { in: OPEN } },
+          data: { status: MilestoneStatus.CANCELLED, escrowHeld: 0n },
+        });
+        if (m.escrowHeld > 0n) refunded += m.escrowHeld;
+        await this.recordEvent(tx, m.id, role, MilestoneEventType.CANCELLED, userId, {
+          refunded: m.escrowHeld.toString(),
+          noWallet: true,
+          danaRefundKey: this.milestoneCancelRefundKey(m.id),
+        } as Prisma.InputJsonValue);
+      }
+      // Finalisasi order bila semua tahap sudah terminal (tanpa release legacy).
+      await this.maybeFinalizeMilestoneOrder(tx, order.id);
+      return { cancelled: remaining.length, refundedAmount: refunded };
+    });
+
+    await this.notifyUser(
+      role === MilestoneActorType.BUYER ? order.sellerId : order.buyerId,
+      NotificationType.MILESTONE_CANCELLED,
+      'Sisa Tahap Dibatalkan',
+      `${result.cancelled} tahap tersisa order "${order.orderId}" dibatalkan. Dana tahap tersebut dikembalikan ke metode pembayaran asal.`,
+      orderId,
+    );
+    return { orderId: order.orderId, cancelled: result.cancelled, refundedIdr: Number(result.refundedAmount) / 100 };
+  }
+
+  /**
+   * M5: dipakai adminCancelOrder (no-wallet) untuk order bertahap — refund
+   * parsial DANA per tahap yang belum cair, TANPA menyentuh wallet.
+   *
+   * Mengembalikan `{ routed: true }` bila order punya milestone (caller TIDAK
+   * boleh lanjut ke refundOrderEscrow penuh — tahap yang sudah RELEASED
+   * dananya sudah di tangan seller; refund penuh akan over-refund).
+   * `{ routed: false }` bila bukan order milestone / bukan mode no-wallet.
+   */
+  async adminCancelMilestonesNoWallet(orderDbId: string, adminId: string, _reason: string) {
+    if (!this.isNoWalletMode()) return { routed: false as const };
+    const order = await this.prisma.order.findUnique({
+      where: { id: orderDbId },
+      select: { id: true, orderId: true, buyerId: true, sellerId: true },
+    });
+    if (!order) {
+      throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order tidak ditemukan.' });
+    }
+    const milestoneCount = await this.prisma.orderMilestone.count({ where: { orderId: orderDbId } });
+    if (milestoneCount === 0) return { routed: false as const };
+    const res = await this.cancelRemainingNoWallet(order, orderDbId, adminId, MilestoneActorType.ADMIN);
+    return { routed: true as const, ...res };
   }
 
   // ------------------------------------------------------ reconcile (G199)

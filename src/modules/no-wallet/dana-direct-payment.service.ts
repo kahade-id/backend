@@ -22,7 +22,7 @@ import { toIdr, toSen } from '../../common/utils/currency.util';
 import { addDays, resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
 import { generatePaymentTxId } from '../../common/utils/id-generator.util';
 import { PrismaService } from '../../prisma/prisma.service';
-import { activateMilestonesForOrderTx } from '../milestones/milestone-activation';
+import { activateMilestonesForOrderTx, activateMilestonesForOrderNoWalletTx } from '../milestones/milestone-activation';
 import { DanaPaymentService } from '../payment/dana/dana-payment.service';
 import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { DanaDirectPayDto, DanaDirectPayKind } from './dto/dana-direct-pay.dto';
@@ -431,28 +431,16 @@ export class DanaDirectPaymentService {
 
         // GAP-C (G176): aktivasi milestone setelah escrow lock — sama seperti
         // jalur QRIS, no-op untuk order satu tahap existing.
-        // MODE TANPA-WALLET: aktivasi milestone butuh invariant escrow di
-        // wallet (activateMilestonesForOrderTx membaca wallet.escrowBalance).
-        // Order bertahap DANA-direct butuh desain escrow bertahap terpisah
-        // (open item) — untuk sekarang order DANA-direct dengan milestone
-        // DRAFT ditolak fail-closed agar dana tidak nyangkut setengah jalan.
+        // M5 (mode tanpa-wallet): aktivasi dari payment escrow DANA SUCCESS —
+        // bukti escrow adalah nominal payment (bukan wallet.escrowBalance);
+        // escrowHeld tetap jadi accounting marker per tahap.
         if (this.walletMode.isWalletEnabled()) {
           await activateMilestonesForOrderTx(tx, order.id);
         } else {
-          const draftCount = await tx.orderMilestone.count({
-            where: { orderId: order.id, status: 'DRAFT' },
+          await activateMilestonesForOrderNoWalletTx(tx, order.id, {
+            paymentId: payment.id,
+            amountSen: payment.amount,
           });
-          if (draftCount > 0) {
-            await tx.paymentTransaction.update({
-              where: { id: payment.id },
-              data: { status: PaymentStatus.SUCCESS, paidAt: new Date(), settledAt: new Date() },
-            });
-            throw new ServiceUnavailableException({
-              code: 'DANA_DIRECT_MILESTONE_UNSUPPORTED',
-              message:
-                'Order bertahap belum didukung di mode tanpa-wallet — settlement ditahan untuk refund via DANA',
-            });
-          }
         }
 
         const paidAt = new Date();

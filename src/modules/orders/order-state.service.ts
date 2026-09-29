@@ -15,6 +15,7 @@ import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback, DanaCa
 import { EscrowDisbursementService } from '../no-wallet/escrow-disbursement.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
+import { MilestonesService } from '../milestones/milestones.service';
 import { FeeCalculatorService } from './fee-calculator.service';
 import { NotificationQueueService } from '../queue/notification-queue.service';
 import { OrderQrisPaymentService } from '../payment/order-qris-payment.service';
@@ -98,6 +99,9 @@ export class OrderStateService {
     @Optional() private inventoryService?: InventoryService,
     // Lokasi presisi aksi sensitif — @Optional() mengikuti pola inventory di atas.
     @Optional() private actionLocationService?: ActionLocationService,
+    // M5 no-wallet: order bertahap DANA-direct di-cancel via refund parsial
+    // per tahap (MilestonesService), bukan refundOrderEscrow penuh.
+    @Optional() private milestonesService?: MilestonesService,
   ) {}
 
   private validateTransition(from: OrderStatus, to: OrderStatus): void {
@@ -1226,6 +1230,16 @@ export class OrderStateService {
       this.runPostCommitBestEffort(async () => {
         const cancelled = await this.prisma.order.findFirst({ where: { orderId }, select: { id: true } });
         if (!cancelled) return;
+        // M5: order bertahap → refund parsial DANA per tahap yang belum cair.
+        // Tahap yang sudah RELEASED tidak disentuh (refund penuh = over-refund).
+        if (this.milestonesService) {
+          const routed = await this.milestonesService.adminCancelMilestonesNoWallet(
+            cancelled.id,
+            adminId,
+            reason,
+          );
+          if (routed.routed) return;
+        }
         await refundService.refundOrderEscrow(cancelled.id, `Admin cancelled order: ${reason}`);
       }, 'ADMIN_CANCEL_ORDER_DANA_REFUND');
     } else {

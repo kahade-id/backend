@@ -265,8 +265,7 @@ export class DanaWebhookSettlementService {
             : '';
         if (
           code === 'DANA_DIRECT_ORDER_INELIGIBLE' ||
-          code === 'DANA_DIRECT_ORDER_MISSING' ||
-          code === 'DANA_DIRECT_MILESTONE_UNSUPPORTED'
+          code === 'DANA_DIRECT_ORDER_MISSING'
         ) {
           // Fail-closed: order tak eligible / hilang — uang TIDAK BOLEH
           // nyangkut dan TIDAK BOLEH masuk wallet: kembalikan ke pembayar

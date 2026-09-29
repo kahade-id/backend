@@ -1,4 +1,5 @@
 import { Module, forwardRef } from '@nestjs/common';
+import { MilestonesModule } from '../milestones/milestones.module';
 import { ConfigModule } from '@nestjs/config';
 import { OrdersController } from './orders.controller';
 import { OrdersService } from './orders.service';

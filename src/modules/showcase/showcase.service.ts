@@ -1889,17 +1889,20 @@ export class ShowcaseService {
    */
   private async getForYouSignals(viewerId: string): Promise<ForYouSignals> {
     const cacheKey = `showcase:foryou:signals:${viewerId}`;
-    const cached = await this.redis.get(cacheKey);
-    if (cached) {
-      try {
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) {
         const parsed = JSON.parse(cached) as { cats: [string, number][]; followed: string[] };
         return {
           categoryAffinity: new Map(parsed.cats),
           followedSellerIds: new Set(parsed.followed),
         };
-      } catch (error) {
-        this.logger.warn(`getForYouSignals: cache corrupt untuk viewer=${viewerId}: ${(error as Error)?.message ?? error}`);
       }
+    } catch (error) {
+      // Fail-open: Redis down / cache corrupt -> hitung ulang seperti biasa.
+      this.logger.warn(
+        `getForYouSignals: cache miss/error untuk viewer=${viewerId}: ${(error as Error)?.message ?? error}`,
+      );
     }
     const [likes, follows] = await Promise.all([
       this.prisma.showcaseLike.findMany({
@@ -1932,7 +1935,9 @@ export class ShowcaseService {
         followed: [...signals.followedSellerIds],
       }),
       SHOWCASE_FOR_YOU_SIGNALS_CACHE_TTL_SECONDS,
-    );
+    ).catch((error) => {
+      this.logger.warn(`getForYouSignals: tulis cache gagal: ${(error as Error)?.message ?? error}`);
+    });
     return signals;
   }
 
@@ -1942,26 +1947,30 @@ export class ShowcaseService {
    * Serialisasi aman untuk Date & bigint via json-cache.util.
    */
   private async getCachedForYouPool(cacheKey: string): Promise<Map<string, ShowcaseRow> | null> {
-    const cached = await this.redis.get(cacheKey);
-    if (!cached) return null;
     try {
+      const cached = await this.redis.get(cacheKey);
+      if (!cached) return null;
       const rows = fromStorable<ShowcaseRow[]>(JSON.parse(cached));
       const merged = new Map<string, ShowcaseRow>();
       for (const row of rows) merged.set(row.id, row);
       return merged;
     } catch (error) {
-      this.logger.warn(`getForYouFeed: pool cache corrupt: ${(error as Error)?.message ?? error}`);
+      this.logger.warn(`getForYouFeed: pool cache miss/error: ${(error as Error)?.message ?? error}`);
       return null;
     }
   }
 
   /** B1-001 (perf): tulis merged candidate pool ke Redis (fail-open). */
   private async setCachedForYouPool(cacheKey: string, rows: ShowcaseRow[]): Promise<void> {
-    await this.redis.set(
-      cacheKey,
-      JSON.stringify(toStorable(rows)),
-      SHOWCASE_FOR_YOU_POOL_CACHE_TTL_SECONDS,
-    );
+    try {
+      await this.redis.set(
+        cacheKey,
+        JSON.stringify(toStorable(rows)),
+        SHOWCASE_FOR_YOU_POOL_CACHE_TTL_SECONDS,
+      );
+    } catch (error) {
+      this.logger.warn(`getForYouFeed: tulis pool cache gagal: ${(error as Error)?.message ?? error}`);
+    }
   }
 
   /**

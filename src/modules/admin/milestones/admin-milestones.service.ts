@@ -5,6 +5,7 @@ import { MilestoneStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { MilestonesService } from '../../milestones/milestones.service';
 import { toIdr } from '../../../common/utils/currency.util';
+import { mapWithConcurrency } from '../../../common/utils/bounded-concurrency.util';
 
 export class AdminMilestoneQueryDto {
   status?: MilestoneStatus;
@@ -134,11 +135,14 @@ export class AdminMilestonesService {
       take: Math.min(500, Math.max(1, limit)),
       orderBy: { updatedAt: 'desc' },
     });
+    // B1-009 (perf): 500x reconcileOrder berurutan -> paralel bounded (5 worker).
+    // Urutan violations = urutan orders (seperti loop lama).
+    const settled = await mapWithConcurrency(orders, 5, (o) => this.milestones.reconcileOrder(o.id));
     const violations: { orderId: string; checks: unknown }[] = [];
-    for (const o of orders) {
-      const r = await this.milestones.reconcileOrder(o.id);
-      if (r.hasMilestones && !r.ok) {
-        violations.push({ orderId: r.orderId, checks: r.checks });
+    for (const s of settled) {
+      const v = s.ok ? s.value : undefined;
+      if (v && v.hasMilestones && !v.ok) {
+        violations.push({ orderId: v.orderId, checks: v.checks });
       }
     }
     return { scanned: orders.length, violations };

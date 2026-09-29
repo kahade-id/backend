@@ -6,8 +6,12 @@
 --   Index baru melayani predicate + sort dalam satu index.
 --
 -- B1-008: drop 3 index REDUNDAN di tabel hot (write amplification tiap INSERT):
---   - notifications: [userId, isRead] & [userId, createdAt] redundan thd
---     [userId, isRead, createdAt] (aturan left-prefix btree)
+--   - notifications: [userId, isRead] redundan thd [userId, isRead, createdAt]
+--     (left-prefix btree). [userId, createdAt] BUKAN prefix persis, tetapi
+--     di-drop sesuai arahan audit: query list notifikasi selalu ber-predicate
+--     userId dan umumnya ber-filter isRead; untuk list TANPA filter isRead,
+--     planner tetap memakai [userId, isRead, createdAt] lewat dua range scan
+--     (isRead true/false) + merge — masih index-backed, biaya minor.
 --   - chat_messages: [roomId] redundan thd [roomId, createdAt]
 --   - webhook_logs: [source, isProcessed] redundan thd [source, isProcessed, nextRetryAt]
 --   Drop index TIDAK menghapus data (aman, tanpa data loss), tapi butuh jendela

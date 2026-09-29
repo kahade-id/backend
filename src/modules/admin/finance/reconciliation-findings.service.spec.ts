@@ -41,6 +41,7 @@ describe('ReconciliationFindingsService', () => {
       findFirst: jest.fn(),
       create: jest.fn(),
       findMany: jest.fn(),
+      createManyAndReturn: jest.fn(),
       count: jest.fn(),
       findUnique: jest.fn(),
       update: jest.fn(),
@@ -54,43 +55,58 @@ describe('ReconciliationFindingsService', () => {
 
   beforeEach(() => jest.clearAllMocks());
 
+  // B1-010: recordFromDiscrepancies kini memakai 1x findMany (dedup batch) +
+  // 1x createManyAndReturn, bukan findFirst/create per temuan.
+  const mockDedupMiss = () => prisma.reconciliationFinding.findMany.mockResolvedValue([]);
+  const mockDedupHit = (userId: string) =>
+    prisma.reconciliationFinding.findMany.mockResolvedValue([{ userId }]);
+  const mockCreateMany = () =>
+    prisma.reconciliationFinding.createManyAndReturn.mockImplementation(
+      ({ data }: { data: Record<string, unknown>[] }) =>
+        data.map((d, i) => ({ ...findingRow({ id: `finding-${i + 1}` }), ...d, status: 'NEW' })),
+    );
+
   it('dedup: tidak membuat temuan duplikat bila user sudah punya temuan NEW', async () => {
-    prisma.reconciliationFinding.findFirst.mockResolvedValue({ id: 'existing-1' });
+    mockDedupHit('user-1');
     const created = await service().recordFromDiscrepancies([discrepancy('user-1', 50000)], 'batch-1', 'admin-1');
     expect(created).toEqual([]);
-    expect(prisma.reconciliationFinding.create).not.toHaveBeenCalled();
+    expect(prisma.reconciliationFinding.createManyAndReturn).not.toHaveBeenCalled();
   });
 
   it('dedup: tidak membuat duplikat untuk temuan INVESTIGATING', async () => {
-    prisma.reconciliationFinding.findFirst.mockResolvedValue({ id: 'existing-2' });
+    mockDedupHit('user-2');
     const created = await service().recordFromDiscrepancies([discrepancy('user-2', 50000)], 'batch-1', 'admin-1');
-    expect(prisma.reconciliationFinding.create).not.toHaveBeenCalled();
+    expect(prisma.reconciliationFinding.createManyAndReturn).not.toHaveBeenCalled();
     expect(created).toEqual([]);
   });
 
   it('membuat temuan baru bila tidak ada temuan yang belum selesai', async () => {
-    prisma.reconciliationFinding.findFirst.mockResolvedValue(null);
-    prisma.reconciliationFinding.create.mockImplementation(({ data }: { data: Record<string, unknown> }) => ({
-      ...findingRow(),
-      ...data,
-      status: 'NEW',
-    }));
+    mockDedupMiss();
+    mockCreateMany();
     const created = await service().recordFromDiscrepancies([discrepancy('user-3', 50000)], 'batch-9', 'admin-1');
     expect(created).toHaveLength(1);
-    expect(prisma.reconciliationFinding.create).toHaveBeenCalledWith(
+    expect(prisma.reconciliationFinding.createManyAndReturn).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ userId: 'user-3', batchId: 'batch-9' }),
+        data: [expect.objectContaining({ userId: 'user-3', batchId: 'batch-9' })],
       }),
     );
   });
 
+  it('dedup intra-batch: user yang sama 2x dalam satu batch hanya dibuat sekali', async () => {
+    mockDedupMiss();
+    mockCreateMany();
+    const created = await service().recordFromDiscrepancies(
+      [discrepancy('user-7', 50000), discrepancy('user-7', 60000)],
+      'batch-1',
+      'admin-1',
+    );
+    expect(created).toHaveLength(1);
+    expect(prisma.reconciliationFinding.createManyAndReturn).toHaveBeenCalledTimes(1);
+  });
+
   it('menandai URGENT + menaikkan alert bila |difference| > ambang', async () => {
-    prisma.reconciliationFinding.findFirst.mockResolvedValue(null);
-    prisma.reconciliationFinding.create.mockImplementation(({ data }: { data: Record<string, unknown> }) => ({
-      ...findingRow(),
-      ...data,
-      status: 'NEW',
-    }));
+    mockDedupMiss();
+    mockCreateMany();
     const big = RECONCILIATION_URGENT_THRESHOLD_IDR + 1_000_000;
     const created = await service().recordFromDiscrepancies([discrepancy('user-4', big)], 'batch-1', 'admin-1');
 
@@ -105,12 +121,8 @@ describe('ReconciliationFindingsService', () => {
   });
 
   it('tidak menandai URGENT bila selisih di bawah ambang', async () => {
-    prisma.reconciliationFinding.findFirst.mockResolvedValue(null);
-    prisma.reconciliationFinding.create.mockImplementation(({ data }: { data: Record<string, unknown> }) => ({
-      ...findingRow(),
-      ...data,
-      status: 'NEW',
-    }));
+    mockDedupMiss();
+    mockCreateMany();
     const created = await service().recordFromDiscrepancies([discrepancy('user-5', 100000)], 'batch-1', 'admin-1');
     expect(created[0].urgent).toBe(false);
     expect(created[0].violatedInvariants).not.toContain(URGENT_INVARIANT);
@@ -118,22 +130,20 @@ describe('ReconciliationFindingsService', () => {
   });
 
   it('menyimpan selisih negatif tanpa melempar (signed difference)', async () => {
-    prisma.reconciliationFinding.findFirst.mockResolvedValue(null);
-    prisma.reconciliationFinding.create.mockImplementation(({ data }: { data: Record<string, unknown> }) => ({
-      ...findingRow(),
-      ...data,
-      status: 'NEW',
-    }));
+    mockDedupMiss();
+    mockCreateMany();
     // discrepancy negatif: computed < recorded (mis. -2_500_000).
     const created = await service().recordFromDiscrepancies([discrepancy('user-6', -2500000)], 'batch-1', 'admin-1');
     expect(created).toHaveLength(1);
     expect(created[0].differenceIdr).toBe(-2500000);
-    expect(prisma.reconciliationFinding.create).toHaveBeenCalledWith(
+    expect(prisma.reconciliationFinding.createManyAndReturn).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({
-          // -2_500_000 IDR = -250_000_000 sen (bigint bertanda).
-          difference: BigInt(-250000000),
-        }),
+        data: [
+          expect.objectContaining({
+            // -2_500_000 IDR = -250_000_000 sen (bigint bertanda).
+            difference: BigInt(-250000000),
+          }),
+        ],
       }),
     );
   });

@@ -19,6 +19,7 @@ import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/
 import { decryptAES, bcryptCompare } from '../../../common/utils/crypto.util';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
 import { escapeHtml } from '../../../common/utils/sanitize.util';
+import { mapWithConcurrency } from '../../../common/utils/bounded-concurrency.util';
 import { EMAIL_QUEUE, EmailJobData } from '../../queue/processors/email.processor';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { DashboardService } from '../dashboard/dashboard.service';
@@ -923,6 +924,12 @@ export class AdminKycService {
     }
   }
 
+  /**
+   * B1-007 (perf): bulk diparalel bounded (8 worker) — hasil per item tetap
+   * terkumpul (approved/failed). Semantik per item identik dengan loop lama.
+   */
+  private static readonly BULK_KYC_CONCURRENCY = 8;
+
   async bulkApproveKyc(
     kycIds: string[],
     adminId: string,
@@ -930,17 +937,22 @@ export class AdminKycService {
     ipAddress: string = 'internal',
     expectedStatus?: string,
   ): Promise<{ approved: string[]; failed: { id: string; reason: string }[] }> {
-    const approved: string[] = [];
-    const failed: { id: string; reason: string }[] = [];
-    for (const id of kycIds.slice(0, 50)) {
-      try {
+    const ids = kycIds.slice(0, 50);
+    const results = await mapWithConcurrency(
+      ids,
+      AdminKycService.BULK_KYC_CONCURRENCY,
+      async (id) => {
         if (expectedStatus) await this.assertExpectedStatus(id, expectedStatus);
         await this.approveKyc(id, adminId, notes, ipAddress);
-        approved.push(id);
-      } catch (e) {
-        failed.push({ id, reason: e instanceof Error ? e.message : String(e) });
-      }
-    }
+        return id;
+      },
+    );
+    const approved: string[] = [];
+    const failed: { id: string; reason: string }[] = [];
+    results.forEach((r, i) => {
+      if (r.ok) approved.push(ids[i]);
+      else failed.push({ id: ids[i], reason: r.error instanceof Error ? r.error.message : String(r.error) });
+    });
     return { approved, failed };
   }
 
@@ -952,17 +964,22 @@ export class AdminKycService {
     ipAddress: string = 'internal',
     expectedStatus?: string,
   ): Promise<{ rejected: string[]; failed: { id: string; reason: string }[] }> {
-    const rejected: string[] = [];
-    const failed: { id: string; reason: string }[] = [];
-    for (const id of kycIds.slice(0, 50)) {
-      try {
+    const ids = kycIds.slice(0, 50);
+    const results = await mapWithConcurrency(
+      ids,
+      AdminKycService.BULK_KYC_CONCURRENCY,
+      async (id) => {
         if (expectedStatus) await this.assertExpectedStatus(id, expectedStatus);
         await this.rejectKyc(id, adminId, reason, notes, ipAddress);
-        rejected.push(id);
-      } catch (e) {
-        failed.push({ id, reason: e instanceof Error ? e.message : String(e) });
-      }
-    }
+        return id;
+      },
+    );
+    const rejected: string[] = [];
+    const failed: { id: string; reason: string }[] = [];
+    results.forEach((r, i) => {
+      if (r.ok) rejected.push(ids[i]);
+      else failed.push({ id: ids[i], reason: r.error instanceof Error ? r.error.message : String(r.error) });
+    });
     return { rejected, failed };
   }
 

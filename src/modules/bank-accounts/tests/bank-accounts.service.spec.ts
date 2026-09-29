@@ -3,7 +3,7 @@ import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { BankAccountsService } from '../bank-accounts.service';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { MidtransService } from '../../payment/midtrans.service';
+import { DanaDisbursementService } from '../../payment/dana/dana-disbursement.service';
 import { PasskeyService } from '../../auth/passkey.service';
 import { BankCode, Prisma } from '@prisma/client';
 import { initializeCrypto } from '../../../common/utils/crypto.util';
@@ -31,14 +31,12 @@ const mockPrisma = {
   $queryRaw: jest.fn(),
 };
 
-const mockMidtrans = {
-  validateBankAccount: jest
-    .fn()
-    .mockResolvedValue({ accountName: 'BUDI SANTOSO', accountNumber: '1234567890' }),
-  inquireBankAccount: jest.fn().mockResolvedValue({
+const mockDanaDisbursement = {
+  bankAccountInquiry: jest.fn().mockResolvedValue({
     accountName: 'BUDI SANTOSO',
-    accountNo: '1234567890',
+    accountNumber: '1234567890',
     bankCode: BankCode.BCA,
+    verified: true,
   }),
 };
 
@@ -66,7 +64,7 @@ describe('BankAccountsService', () => {
       providers: [
         BankAccountsService,
         { provide: PrismaService, useValue: mockPrisma },
-        { provide: MidtransService, useValue: mockMidtrans },
+        { provide: DanaDisbursementService, useValue: mockDanaDisbursement },
         { provide: ConfigService, useValue: mockConfig },
         { provide: PasskeyService, useValue: mockPasskeyService },
       ],
@@ -414,10 +412,11 @@ describe('BankAccountsService', () => {
     it('rejects a provider account-number mismatch before persisting verification', async () => {
       arrangePreChecks();
       arrangeTx({ existing: null });
-      mockMidtrans.inquireBankAccount.mockResolvedValueOnce({
+      mockDanaDisbursement.bankAccountInquiry.mockResolvedValueOnce({
         accountName: 'BUDI SANTOSO',
-        accountNo: '9999999999',
+        accountNumber: '9999999999',
         bankCode: BankCode.BCA,
+        verified: true,
       });
 
       await expect(
@@ -448,7 +447,7 @@ describe('BankAccountsService', () => {
         providers: [
           BankAccountsService,
           { provide: PrismaService, useValue: mockPrisma },
-          { provide: MidtransService, useValue: mockMidtrans },
+          { provide: DanaDisbursementService, useValue: mockDanaDisbursement },
           { provide: ConfigService, useValue: mockConfig },
         ],
       }).compile();

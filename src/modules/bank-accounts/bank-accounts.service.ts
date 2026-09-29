@@ -8,7 +8,7 @@ import {
 import { Injectable, Logger, NotFoundException, BadRequestException, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
-import { MidtransService } from '../payment/midtrans.service';
+import { DanaDisbursementService } from '../payment/dana/dana-disbursement.service';
 import { PasskeyService } from '../auth/passkey.service';
 import { encryptAES, hmacSHA256, decryptAES } from '../../common/utils/crypto.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
@@ -72,7 +72,7 @@ export class BankAccountsService {
 
   constructor(
     private prisma: PrismaService,
-    private midtransService: MidtransService,
+    private danaDisbursementService: DanaDisbursementService,
     private configService: ConfigService,
     // GAP-A G040: gerbang re-auth kuat untuk perubahan rekening.
     // @Optional dipertahankan hanya agar modul bisa di-unit-test tanpa
@@ -194,11 +194,12 @@ export class BankAccountsService {
 
     if (!skipVerification) {
       try {
-        const inquiry = await this.midtransService.inquireBankAccount(
-          bankCode,
-          normalizedAccountNumber,
-        );
-        const returnedAccountNumber = String(inquiry.accountNo ?? '')
+        const inquiry = await this.danaDisbursementService.bankAccountInquiry({
+          partnerReferenceNo: `BANKINQ-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
+          beneficiaryAccountNumber: normalizedAccountNumber,
+          beneficiaryBankCode: bankCode,
+        });
+        const returnedAccountNumber = String(inquiry.accountNumber ?? '')
           .trim()
           .replace(/\s+/g, '');
         if (!returnedAccountNumber || returnedAccountNumber !== normalizedAccountNumber) {
@@ -208,6 +209,15 @@ export class BankAccountsService {
           throw new BadRequestException({
             code: 'BANK_ACCOUNT_NUMBER_MISMATCH',
             message: 'Bank account verification response does not match the requested account.',
+          });
+        }
+        if (!inquiry.accountName) {
+          this.logger.error(
+            `Bank inquiry returned no account name for bank=${bankCode}; refusing verification`,
+          );
+          throw new BadRequestException({
+            code: 'BANK_ACCOUNT_NAME_MISMATCH',
+            message: 'Bank account verification did not return an account name.',
           });
         }
         verifiedAccountName = inquiry.accountName;

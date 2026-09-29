@@ -75,6 +75,32 @@ export const DANA_NOTIFY_ACK: DanaWebhookOutcome = {
 export class DanaWebhookSettlementService {
   private readonly logger = new Logger(DanaWebhookSettlementService.name);
 
+  /**
+   * TEST HOOK sandbox-only untuk skenario portal "Internal Server Error
+   * Response from Partner" (5005601). SYARAT KERAS:
+   * - Hanya aktif bila `dana.env === 'sandbox'` (DANA_ENV). Di production
+   *   hook MATI TOTAL walau env flag ter-set.
+   * - Signature DIVERIFIKASI DULU — invalid tetap 403, hook tidak fire.
+   * - Trigger eksplisit & terkontrol: env DANA_WEBHOOK_TEST_5005601_ONCE='true'.
+   *   Kosong/false = hook mati total.
+   * - SATU KALI: setelah fire, flag in-memory langsung nonaktif. Retry DANA
+   *   berikutnya diproses normal (2005600 / deteksi duplikat).
+   * - Fire SEBELUM webhookLog.upsert: tanpa DB write, idempotency & fail-closed
+   *   tidak tersentuh.
+   */
+  private test5005601Fired = false;
+
+  private maybeFireTestHook5005601(): DanaWebhookOutcome | null {
+    if (this.test5005601Fired) return null;
+    if (this.config.get<string>('dana.env') !== 'sandbox') return null;
+    if (this.config.get<string>('DANA_WEBHOOK_TEST_5005601_ONCE') !== 'true') return null;
+    this.test5005601Fired = true;
+    this.logger.warn(
+      'DANA webhook TEST HOOK 5005601 FIRED (sekali) — hook otomatis nonaktif',
+    );
+    return { responseCode: '5005601', responseMessage: 'Internal Server Error' };
+  }
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
@@ -151,6 +177,10 @@ export class DanaWebhookSettlementService {
       this.logger.warn('DANA webhook: field kunci hilang — diabaikan');
       return DANA_NOTIFY_ACK;
     }
+
+    // Test hook 5005601 (sandbox-only, satu kali, setelah signature valid).
+    const testHook = this.maybeFireTestHook5005601();
+    if (testHook) return testHook;
 
     const eventKey =
       `DANA:${notify.originalReferenceNo || notify.originalPartnerReferenceNo}:` +

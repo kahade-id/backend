@@ -26,12 +26,19 @@ function signWebhook(privatePem: string, rawBody: string, timestamp: string): st
   return signer.toString('base64');
 }
 
-function makeDeps(publicPem: string) {
+function makeDeps(publicPem: string, opts: { danaEnv?: string; test500Once?: string } = {}) {
   const prisma = {
     webhookLog: { upsert: jest.fn(), update: jest.fn() },
     paymentTransaction: { findUnique: jest.fn(), update: jest.fn() },
   };
-  const config = { get: (k: string) => (k === 'dana.publicKey' ? publicPem : undefined) };
+  const config = {
+    get: (k: string) => {
+      if (k === 'dana.publicKey') return publicPem;
+      if (k === 'dana.env') return opts.danaEnv ?? 'sandbox';
+      if (k === 'DANA_WEBHOOK_TEST_5005601_ONCE') return opts.test500Once;
+      return undefined;
+    },
+  };
   const danaPaymentService = { getPaymentDetail: jest.fn() };
   const walletService = { handleTopupSuccess: jest.fn() };
   const orderQrisPaymentService = { handleSettlement: jest.fn() };
@@ -197,6 +204,47 @@ describe('dana-webhook-settlement.service', () => {
       ),
     ).rejects.toThrow('Invalid DANA webhook signature');
     expect(prisma.webhookLog.upsert).not.toHaveBeenCalled(); // fail-closed: tanpa DB write
+  });
+
+  describe('test hook 5005601 (sandbox-only, satu kali)', () => {
+    it('fire 5005601 sekali lalu otomatis nonaktif — tanpa DB write', async () => {
+      const { svc, prisma } = makeDeps(publicPem, { danaEnv: 'sandbox', test500Once: 'true' });
+      prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: false });
+      // Fire pertama: 5005601
+      const out1 = await svc.handleFinishNotify(rawBody, headers, PATH);
+      expect(out1.responseCode).toBe('5005601');
+      expect(out1.responseMessage).toBe('Internal Server Error');
+      expect(prisma.webhookLog.upsert).not.toHaveBeenCalled(); // tanpa DB write
+      // Retry berikutnya: hook sudah nonaktif → diproses normal (ack 2005600)
+      prisma.paymentTransaction.findUnique.mockResolvedValue(null);
+      const out2 = await svc.handleFinishNotify(rawBody, headers, PATH);
+      expect(out2.responseCode).toBe('2005600');
+      expect(prisma.webhookLog.upsert).toHaveBeenCalledTimes(1);
+    });
+
+    it('hook mati bila env flag tidak true', async () => {
+      const { svc, prisma } = makeDeps(publicPem, { danaEnv: 'sandbox' });
+      prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: false });
+      prisma.paymentTransaction.findUnique.mockResolvedValue(null);
+      const out = await svc.handleFinishNotify(rawBody, headers, PATH);
+      expect(out.responseCode).toBe('2005600');
+    });
+
+    it('hook mati total di production walau flag true', async () => {
+      const { svc, prisma } = makeDeps(publicPem, { danaEnv: 'production', test500Once: 'true' });
+      prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: false });
+      prisma.paymentTransaction.findUnique.mockResolvedValue(null);
+      const out = await svc.handleFinishNotify(rawBody, headers, PATH);
+      expect(out.responseCode).toBe('2005600');
+    });
+
+    it('signature invalid tetap 403 — hook tidak fire', async () => {
+      const { svc, prisma } = makeDeps(publicPem, { danaEnv: 'sandbox', test500Once: 'true' });
+      await expect(
+        svc.handleFinishNotify(rawBody, { 'x-signature': 'salah', 'x-timestamp': timestamp }, PATH),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.webhookLog.upsert).not.toHaveBeenCalled();
+    });
   });
 
 });

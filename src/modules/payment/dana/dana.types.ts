@@ -137,3 +137,29 @@ export interface DanaBankAccountInquiryResult {
   /** true bila nama pemilik rekening terverifikasi oleh bank. */
   verified: boolean;
 }
+
+/** Disbursement → saldo DANA (produk "Disburse to Balance"; endpoint sama dengan topup). */
+export interface DanaTopupToBalanceParams {
+  partnerReferenceNo: string;
+  /** Nomor HP akun DANA tujuan (format 628...). */
+  customerNumber: string;
+  amountIdr: number;
+  /** Biaya topup (IDR) — dikirim terpisah sebagai feeAmount (fixture resmi). */
+  feeAmountIdr?: number;
+}
+
+/** IPG Cashier Pay (redirection). */
+export interface DanaCashierPayOrderParams {
+  partnerReferenceNo: string;
+  amountIdr: number;
+  orderTitle?: string;
+  expiryMinutes?: number;
+}
+
+export interface DanaCashierPayOrder {
+  partnerReferenceNo: string;
+  referenceNo: string;
+  webRedirectUrl?: string;
+  amountIdr: number;
+  expiresAt: Date;
+}

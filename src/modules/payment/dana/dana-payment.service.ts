@@ -4,6 +4,8 @@ import axios, { AxiosError } from 'axios';
 import {
   DANA_PAY_METHOD,
   DANA_PAY_OPTION_QRIS,
+  DanaCashierPayOrder,
+  DanaCashierPayOrderParams,
   DanaCreateOrderParams,
   DanaCreatedOrder,
   DanaOrderDetail,
@@ -43,6 +45,7 @@ const PATH_CREATE_ORDER = '/payment-gateway/v1.0/debit/payment-host-to-host.htm'
 const PATH_QUERY = '/payment-gateway/v1.0/debit/status.htm';
 const PATH_REFUND = '/payment-gateway/v1.0/debit/refund.htm';
 const PATH_CANCEL = '/payment-gateway/v1.0/debit/cancel.htm';
+const PATH_CASHIER_PAY = '/rest/redirection/v1.0/debit/payment-host-to-host';
 
 /** latestTransactionStatus → status internal. */
 export function mapDanaTxStatus(code: string | undefined | null): DanaOrderStatus {
@@ -327,5 +330,48 @@ export class DanaPaymentService {
         message: `DANA cancel gagal: ${res.responseMessage ?? responseCode}`,
       });
     }
+  }
+
+  /**
+   * IPG Cashier Pay — order pembayaran via halaman kasir DANA (redirection).
+   * Body mengikuti fixture resmi DANA (IPG.json): TIDAK memakai
+   * payOptionDetails / urlParams / validUpTo — hanya amount + additionalInfo
+   * (envInfo, mcc, order, productCode). expiryMinutes hanya dipakai untuk
+   * menghitung expiresAt di hasil (tidak dikirim ke DANA).
+   */
+  async createCashierPayOrder(params: DanaCashierPayOrderParams): Promise<DanaCashierPayOrder> {
+    this.assertEnabled();
+    const c = this.cfg();
+    const amount = toDanaAmount(params.amountIdr);
+    const expiryMinutes = Math.min(params.expiryMinutes ?? c.orderExpiryMinutes, 30);
+    const body: Record<string, unknown> = {
+      partnerReferenceNo: params.partnerReferenceNo,
+      merchantId: c.merchantId,
+      amount: { value: amount, currency: 'IDR' },
+      additionalInfo: {
+        envInfo: { sourcePlatform: 'IPG', terminalType: 'WEB', orderTerminalType: 'WEB' },
+        mcc: '5732',
+        order: { orderTitle: params.orderTitle ?? 'Kahade Payment' },
+        productCode: '51051000100000000001',
+      },
+    };
+    const res = (await this.post<Record<string, unknown>>(PATH_CASHIER_PAY, body)) as Record<
+      string,
+      any
+    >;
+    const responseCode = String(res.responseCode ?? '');
+    if (!responseCode.startsWith('200')) {
+      throw new ServiceUnavailableException({
+        code: 'DANA_CASHIER_PAY_FAILED',
+        message: `DANA cashier pay gagal: ${res.responseMessage ?? responseCode}`,
+      });
+    }
+    return {
+      partnerReferenceNo: params.partnerReferenceNo,
+      referenceNo: String(res.referenceNo ?? ''),
+      webRedirectUrl: res.webRedirectUrl ? String(res.webRedirectUrl) : undefined,
+      amountIdr: params.amountIdr,
+      expiresAt: new Date(Date.now() + expiryMinutes * 60_000),
+    };
   }
 }

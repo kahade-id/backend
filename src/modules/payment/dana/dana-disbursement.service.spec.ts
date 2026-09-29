@@ -119,16 +119,42 @@ describe('dana-disbursement.service', () => {
     expect(result.accountName).toBeNull();
   });
 
-  it('fail-closed bila kredensial belum dikonfigurasi', async () => {
-    const svc = makeService({ 'dana.privateKey': '' });
+  it('topupToBalance: sukses 2003800 + referenceNo, path /rest/v1.0/emoney/topup', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: { responseCode: '2003800', responseMessage: 'Successful', referenceNo: 'DTB-1' },
+    });
+    const svc = makeService();
+    const result = await svc.topupToBalance({
+      partnerReferenceNo: 'DANA-TB-001',
+      customerNumber: '6281234567890',
+      amountIdr: 50000,
+      feeAmountIdr: 1000,
+    });
+    expect(result.status).toBe('SUCCESS');
+    expect(result.referenceNo).toBe('DTB-1');
+    expect(result.partnerReferenceNo).toBe('DANA-TB-001');
+    expect(mockedAxios.post.mock.calls[0][0]).toBe(
+      'http://api.sandbox.dana.id/rest/v1.0/emoney/topup',
+    );
+    const body = JSON.parse(mockedAxios.post.mock.calls[0][1] as string);
+    expect(body.customerNumber).toBe('6281234567890');
+    expect(body.amount).toEqual({ value: '50000.00', currency: 'IDR' });
+    expect(body.feeAmount).toEqual({ value: '1000.00', currency: 'IDR' });
+    expect(body.additionalInfo.fundType).toBe('AGENT_TOPUP_FOR_USER_SETTLE');
+  });
+
+  it('topupToBalance: melempar saat responseCode non-2xx (4033814)', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: { responseCode: '4033814', responseMessage: 'Unauthorized' },
+    });
+    const svc = makeService();
     await expect(
-      svc.transferToBank({
-        partnerReferenceNo: 'X',
-        beneficiaryAccountNumber: '1',
-        beneficiaryBankCode: '014',
-        amountIdr: 1000,
+      svc.topupToBalance({
+        partnerReferenceNo: 'DANA-TB-002',
+        customerNumber: '6281234567890',
+        amountIdr: 50000,
       }),
     ).rejects.toThrow(ServiceUnavailableException);
-    expect(mockedAxios.post).not.toHaveBeenCalled();
+    expect(mockedAxios.post).toHaveBeenCalledTimes(1);
   });
 });

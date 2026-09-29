@@ -5,6 +5,7 @@ import {
   DanaBankAccountInquiryParams,
   DanaBankAccountInquiryResult,
   DanaOrderStatus,
+  DanaTopupToBalanceParams,
   DanaTransferResult,
   DanaTransferToBankParams,
   DanaTransferToDanaParams,
@@ -199,6 +200,48 @@ export class DanaDisbursementService {
       status: mapDisbursementStatus(
         String(res.latestTransactionStatus ?? res.responseCode ?? ''),
       ),
+    };
+  }
+
+  /**
+   * Disbursement ke saldo DANA (produk "Disburse to Balance" DANA Enterprise).
+   * Endpoint SAMA dengan transferToDana (/rest/v1.0/emoney/topup) — method
+   * terpisah untuk kejelasan semantik produk; body mengikuti fixture resmi
+   * DANA (TopUpCustomerValid: feeAmount + field null eksplisit).
+   */
+  async topupToBalance(params: DanaTopupToBalanceParams): Promise<DanaTransferResult> {
+    this.assertEnabled();
+    const amount = toDanaAmount(params.amountIdr);
+    const res = (await this.post<Record<string, unknown>>(PATH_TOPUP_DANA, {
+      partnerReferenceNo: params.partnerReferenceNo,
+      customerNumber: params.customerNumber,
+      amount: { value: amount, currency: 'IDR' },
+      feeAmount: { value: toDanaAmount(params.feeAmountIdr ?? 0), currency: 'IDR' },
+      transactionDate: jakartaTimestamp(),
+      sessionId: null,
+      categoryId: null,
+      notes: null,
+      additionalInfo: {
+        extendInfo: null,
+        accountType: null,
+        fundType: 'AGENT_TOPUP_FOR_USER_SETTLE',
+        externalDivisionId: null,
+        chargeTarget: null,
+        accessToken: null,
+        customerId: null,
+      },
+    })) as Record<string, any>;
+    const responseCode = String(res.responseCode ?? '');
+    if (!responseCode.startsWith('200') && !responseCode.startsWith('202')) {
+      throw new ServiceUnavailableException({
+        code: 'DANA_TOPUP_BALANCE_FAILED',
+        message: `DANA topup balance gagal: ${res.responseMessage ?? responseCode}`,
+      });
+    }
+    return {
+      partnerReferenceNo: params.partnerReferenceNo,
+      referenceNo: String(res.referenceNo ?? ''),
+      status: mapDisbursementStatus(responseCode),
     };
   }
 

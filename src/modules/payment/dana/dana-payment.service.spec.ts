@@ -176,6 +176,87 @@ describe('dana-payment.service', () => {
     });
   });
 
+  describe('createCashierPayOrder', () => {
+    it('sukses 2005400 → referenceNo; body sesuai fixture resmi IPG.json', async () => {
+      mockedAxios.post.mockResolvedValueOnce({
+        data: {
+          responseCode: '2005400',
+          responseMessage: 'Successful',
+          referenceNo: 'DANA-CP-REF-1',
+          webRedirectUrl: 'https://checkout.sandbox.dana.id/cashier/DANA-CP-REF-1',
+        },
+      });
+      const svc = makeService();
+      const order = await svc.createCashierPayOrder({
+        partnerReferenceNo: 'DANA-CP-001',
+        amountIdr: 75000,
+        orderTitle: 'Escrow Payment',
+      });
+      expect(order.referenceNo).toBe('DANA-CP-REF-1');
+      expect(order.webRedirectUrl).toBe(
+        'https://checkout.sandbox.dana.id/cashier/DANA-CP-REF-1',
+      );
+      expect(order.amountIdr).toBe(75000);
+      expect(order.expiresAt).toBeInstanceOf(Date);
+      expect(mockedAxios.post.mock.calls[0][0]).toBe(
+        'http://api.sandbox.dana.id/rest/redirection/v1.0/debit/payment-host-to-host',
+      );
+      const body = JSON.parse(mockedAxios.post.mock.calls[0][1] as string);
+      expect(body.partnerReferenceNo).toBe('DANA-CP-001');
+      expect(body.merchantId).toBe('MERCHANT-1');
+      expect(body.amount).toEqual({ value: '75000.00', currency: 'IDR' });
+      // Fixture resmi IPG.json: tanpa payOptionDetails / urlParams / validUpTo.
+      expect(body.payOptionDetails).toBeUndefined();
+      expect(body.urlParams).toBeUndefined();
+      expect(body.validUpTo).toBeUndefined();
+      expect(body.additionalInfo.productCode).toBe('51051000100000000001');
+      expect(body.additionalInfo.mcc).toBe('5732');
+      expect(body.additionalInfo.order.orderTitle).toBe('Escrow Payment');
+      expect(body.additionalInfo.envInfo).toEqual({
+        sourcePlatform: 'IPG',
+        terminalType: 'WEB',
+        orderTerminalType: 'WEB',
+      });
+    });
+
+    it('expiryMinutes di-clamp maksimal 30 (hanya untuk expiresAt, tidak dikirim ke DANA)', async () => {
+      mockedAxios.post.mockResolvedValueOnce({
+        data: { responseCode: '2005400', referenceNo: 'DANA-CP-REF-2' },
+      });
+      const svc = makeService();
+      const before = Date.now();
+      const order = await svc.createCashierPayOrder({
+        partnerReferenceNo: 'DANA-CP-002',
+        amountIdr: 10000,
+        expiryMinutes: 120,
+      });
+      const ttl = order.expiresAt.getTime() - before;
+      expect(ttl).toBeGreaterThan(29 * 60_000);
+      expect(ttl).toBeLessThanOrEqual(31 * 60_000);
+    });
+
+    it('melempar bila DANA mengembalikan responseCode non-200', async () => {
+      mockedAxios.post.mockResolvedValueOnce({
+        data: { responseCode: '4005401', responseMessage: 'Invalid Field Format' },
+      });
+      const svc = makeService();
+      await expect(
+        svc.createCashierPayOrder({
+          partnerReferenceNo: 'DANA-CP-003',
+          amountIdr: 10000,
+        }),
+      ).rejects.toThrow(/Invalid Field Format/);
+    });
+
+    it('fail-closed bila kredensial belum dikonfigurasi', async () => {
+      const svc = makeService({ 'dana.merchantId': '', 'dana.privateKey': '' });
+      await expect(
+        svc.createCashierPayOrder({ partnerReferenceNo: 'X', amountIdr: 1000 }),
+      ).rejects.toThrow(ServiceUnavailableException);
+      expect(mockedAxios.post).not.toHaveBeenCalled();
+    });
+  });
+
   describe('getPaymentDetail', () => {
     it('memetakan latestTransactionStatus + amount', async () => {
       mockedAxios.post.mockResolvedValueOnce({

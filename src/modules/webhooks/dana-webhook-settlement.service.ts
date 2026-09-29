@@ -13,6 +13,7 @@ import { DanaPaymentService } from '../payment/dana/dana-payment.service';
 import { DanaDirectPaymentService } from '../no-wallet/dana-direct-payment.service';
 import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
 import { WalletModeService } from '../wallet-mode/wallet-mode.service';
+import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 import {
   DANA_SANDBOX_WEBHOOK_PUBLIC_KEY,
   verifyDanaWebhookSignature,
@@ -29,11 +30,19 @@ export interface DanaWebhookOutcome {
 }
 
 /**
- * Path API DANA yang dipakai DANA saat menandatangani finish-notify.
- * DANA tidak tahu route internal kita (/v1/webhooks/dana/payment) —
- * signature X-SIGNATURE selalu dihitung terhadap path API DANA ini.
+ * DANA menandatangani finish-notify terhadap PATH CALLBACK URL MILIK MERCHANT
+ * (path persis dari URL notifikasi yang DANA POST — bukan path API DANA).
+ * Terbukti empiris 2026-09-29: notify yang dikirim DANA ke
+ * https://webhook.site/<uuid> terverifikasi dengan path `/<uuid>` memakai
+ * public key resmi DANA; semua path lain (termasuk `/v1.0/debit/notify`)
+ * gagal. Untuk server kita DANA POST ke /v1/webhooks/dana/payment, sehingga
+ * verifikasi memakai req.path persis seperti diterima (diteruskan controller).
+ *
+ * CATATAN INSIDEN 2026-09-29: commit 140b981 sempat mengganti path ini menjadi
+ * `/v1.0/debit/notify` (teori yang salah) — notify asli tetap 403. Root cause
+ * sebenarnya adalah req.rawBody yang selalu undefined (lihat stashRawBody di
+ * main.ts), bukan path.
  */
-export const DANA_FINISH_NOTIFY_API_PATH = '/v1.0/debit/notify';
 
 /** Ack yang wajib dikembalikan ke DANA agar skenario notify terverifikasi. */
 export const DANA_NOTIFY_ACK: DanaWebhookOutcome = {
@@ -62,6 +71,7 @@ export const DANA_NOTIFY_ACK: DanaWebhookOutcome = {
  *     lain (tidak ada logika finansial baru):
  *       TOPUP        → walletService.handleTopupSuccess
  *       ORDER_ESCROW → orderQrisPaymentService.handleSettlement
+ *       SUBSCRIPTION (DANA-direct) → subscriptionsService.activateDanaSubscription
  *
  * Selalu balas 200 untuk outcome bisnis agar DANA tidak retry tanpa henti;
  * 4xx/5xx hanya untuk signature invalid atau kegagalan infrastruktur.
@@ -79,6 +89,7 @@ export class DanaWebhookSettlementService {
     private readonly danaDirectPaymentService: DanaDirectPaymentService,
     private readonly danaDirectRefundService: DanaDirectRefundService,
     private readonly walletMode: WalletModeService,
+    private readonly subscriptionsService: SubscriptionsService,
   ) {}
 
   private webhookPublicKey(): string {
@@ -115,18 +126,15 @@ export class DanaWebhookSettlementService {
   async handleFinishNotify(
     rawBody: string,
     headers: Record<string, string | string[] | undefined>,
-    // _path: route lokal TIDAK dipakai untuk verifikasi signature —
-    // DANA menandatangani terhadap DANA_FINISH_NOTIFY_API_PATH.
-    // Param dipertahankan agar call-site tidak berubah.
-    _path: string,
+    // path = req.path dari controller, yaitu path callback URL merchant
+    // (/v1/webhooks/dana/payment) — DANA menandatangani terhadap path ini.
+    path: string,
   ): Promise<DanaWebhookOutcome> {
     const signature = String(headers['x-signature'] ?? '');
     const timestamp = String(headers['x-timestamp'] ?? '');
-    // PENTING: verifikasi memakai path API DANA (/v1.0/debit/notify), BUKAN
-    // route lokal — DANA menandatangani notify terhadap path API-nya sendiri.
     const ok = verifyDanaWebhookSignature({
       method: 'POST',
-      path: DANA_FINISH_NOTIFY_API_PATH,
+      path,
       rawBody,
       timestamp,
       signature,
@@ -285,6 +293,17 @@ export class DanaWebhookSettlementService {
       }
     } else if (pt.purpose === PaymentPurpose.ORDER_ESCROW) {
       await this.orderQrisPaymentService.handleSettlement(pt.midtransOrderId, grossAmount);
+    } else if (
+      pt.provider === PaymentProvider.DANA &&
+      pt.purpose === PaymentPurpose.SUBSCRIPTION &&
+      pt.danaPayKind
+    ) {
+      // Misi tanpa-wallet: subscription Kahade+ via DANA direct — aktivasi
+      // TANPA menyentuh wallet. activateDanaSubscription sudah menandai
+      // payment SUCCESS secara atomik + fail-closed (verify-via-API, cek
+      // nominal). Return awal: skip update SUCCESS generik di bawah.
+      await this.subscriptionsService.activateDanaSubscription(pt.id);
+      return;
     } else {
       this.logger.log(`DANA webhook: purpose ${pt.purpose} belum didukung — tanpa settlement`);
       return;

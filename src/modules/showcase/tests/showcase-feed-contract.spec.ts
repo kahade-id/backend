@@ -104,4 +104,41 @@ describe('NP-007 kontrak feed ringkas', () => {
     const out = __serializeForTest(row, { excerpt: true });
     expect(out.coverImageUrl).toBe('https://cdn/vid-thumb.jpg');
   });
+
+  it('excerpt D1-011: tanpa orderLink/shareUrl/counter & field commerce mentah', () => {
+    const out = __serializeForTest(baseRow, { excerpt: true });
+    // Kartu feed tidak memakai: prefill transaksi hanya di layar detail.
+    expect(out).not.toHaveProperty('orderLink');
+    expect(out).not.toHaveProperty('shareUrl');
+    expect(out).not.toHaveProperty('viewCount');
+    expect(out).not.toHaveProperty('shareCount');
+    // Badge DISKON kini dari `badges[]` (D1-001) — harga coret mentah tak perlu.
+    expect(out).not.toHaveProperty('originalPrice');
+    expect(out).not.toHaveProperty('originalPriceValid');
+    expect(out).not.toHaveProperty('productType');
+    expect(out).not.toHaveProperty('serviceDeadlineDays');
+    expect(out).not.toHaveProperty('condition');
+    expect((out.author as { userId?: string }).userId).toBe('u-1');
+    // D1-001: badge + flag commerce eksplisit TETAP ada di excerpt.
+    expect(out.badges).toEqual([]);
+    expect(out.isCommerce).toBe(true);
+    // Field yang dipakai kartu tetap ada.
+    expect(out.saveCount).toBe(3);
+    expect((out.author as { fullName?: string }).fullName).toBe('Seller');
+  });
+
+  it('detail: orderLink, shareUrl, counter & field commerce tetap lengkap', () => {
+    const out = __serializeForTest(baseRow, { excerpt: false });
+    expect(out.orderLink).toMatchObject({
+      title: 'Tas Kulit',
+      orderValue: 100000,
+      orderValueValid: true,
+      counterpartUsername: 'seller',
+    });
+    expect(out.shareUrl).toContain('/showcase/');
+    expect(out.viewCount).toBe(100);
+    expect(out.shareCount).toBe(1);
+    expect(out.condition).toBe('BARU');
+    expect((out.author as { userId?: string }).userId).toBe('u-1');
+  });
 });

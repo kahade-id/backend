@@ -75,6 +75,8 @@ const mockPrisma: any = {
   // prisma.follow — kedua mock ini hilang di HEAD sehingga test viewer gagal.
   showcaseSave: { findMany: jest.fn() },
   follow: { findMany: jest.fn() },
+  // D1-001 (perf 2026-09-29): badge TERLARIS dihitung satu groupBy per halaman.
+  order: { groupBy: jest.fn() },
 };
 const mockRedis = { setNx: jest.fn() };
 const mockUpload = { verifyUserFileKeys: jest.fn(), buildPublicUrl: jest.fn(), cleanupFileKeys: jest.fn(), uploadDirect: jest.fn() };
@@ -99,6 +101,7 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
     mockPrisma.showcaseLike.findMany.mockResolvedValue([]);
     mockPrisma.showcaseSave.findMany.mockResolvedValue([]);
     mockPrisma.follow.findMany.mockResolvedValue([]);
+    mockPrisma.order.groupBy.mockResolvedValue([]);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -479,7 +482,7 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
       expect(mockPrisma.showcaseLike.findMany).not.toHaveBeenCalled();
     });
 
-    it('exposes cover image, counters, author badges and OrderLink prefill per item', async () => {
+    it('exposes cover image, counters, author badges, commerce badges per item (D1-001/D1-011)', async () => {
       mockPrisma.userShowcase.findMany.mockResolvedValue([feedRow(1)]);
       const result = (await feed(service, undefined, {})) as any;
       const item = result.items[0];
@@ -488,16 +491,49 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
         title: 'Item 1',
         category: 'ilustrasi',
         coverImageUrl: 'https://cdn.test/1.jpg',
-        imageUrl: 'https://cdn.test/1.jpg',
         priceMin: 100001,
         priceMax: null,
         likeCount: 1,
         isLiked: false,
         isOwner: false,
+        // D1-001: badge commerce diserialkan di payload (bukan N+1 fetch).
+        badges: [],
+        isCommerce: true,
       });
       expect(item.author).toMatchObject({ username: 'seller', isKycVerified: true, isVip: true });
-      expect(item.orderLink).toMatchObject({ title: 'Item 1', orderValue: 100001, orderValueValid: true, counterpartUsername: 'seller' });
-      expect(item.shareUrl).toContain('/showcase/');
+      // D1-011: orderLink/shareUrl/viewCount/shareCount TIDAK dikirim di
+      // excerpt feed — prefill transaksi hanya dipakai layar detail.
+      expect(item.orderLink).toBeUndefined();
+      expect(item.shareUrl).toBeUndefined();
+      expect(item.viewCount).toBeUndefined();
+      expect(item.shareCount).toBeUndefined();
+    });
+
+    it('marks TERLARIS via one batched groupBy, not per-card requests (D1-001)', async () => {
+      mockPrisma.userShowcase.findMany.mockResolvedValue([feedRow(1), feedRow(2)]);
+      mockPrisma.order.groupBy.mockResolvedValue([
+        { showcaseId: 'cshowcase000000000000000001', _count: { _all: 12 } },
+        { showcaseId: 'cshowcase000000000000000002', _count: { _all: 3 } },
+      ]);
+      const result = (await feed(service, undefined, {})) as any;
+      // Satu groupBy untuk seluruh halaman (bukan 2 request).
+      expect(mockPrisma.order.groupBy).toHaveBeenCalledTimes(1);
+      const where = mockPrisma.order.groupBy.mock.calls[0][0].where;
+      expect(where.showcaseId.in).toEqual(
+        expect.arrayContaining(['cshowcase000000000000000001', 'cshowcase000000000000000002']),
+      );
+      expect(where.status).toBe('COMPLETED');
+      expect(result.items[0].badges).toEqual(['TERLARIS']);
+      expect(result.items[1].badges).toEqual([]);
+    });
+
+    it('derives DISKON from originalPrice without any extra query (D1-001)', async () => {
+      mockPrisma.userShowcase.findMany.mockResolvedValue([
+        feedRow(1, { originalPrice: BigInt(200000) }),
+      ]);
+      const result = (await feed(service, undefined, {})) as any;
+      expect(result.items[0].badges).toEqual(['DISKON']);
+      expect(result.items[0].originalPrice).toBeUndefined();
     });
 
     it('never leaks the internal owner id or private visibility flags', async () => {
@@ -506,7 +542,8 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
       const item = result.items[0];
       expect(item.author.id).toBeUndefined();
       expect(item.userId).toBeUndefined();
-      expect(item.visibility).toBe(ShowcaseVisibility.PUBLIC);
+      // NP-007: visibility tidak diserialkan di excerpt feed.
+      expect(item.visibility).toBeUndefined();
     });
 
     it('returns an empty page with hasMore false when nothing matches', async () => {

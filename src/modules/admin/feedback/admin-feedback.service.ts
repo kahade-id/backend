@@ -682,13 +682,17 @@ export class AdminFeedbackService {
   // Hitung ulang slaDueAt untuk feedback terbuka saat rule berubah.
   // B1-005 (perf): SATU statement UPDATE — slaDueAt murni fungsi createdAt
   // (createdAt + hours*3600 detik), tidak butuh loop aplikasi. Rumus identik
-  // dengan versi loop: make_interval(hours => h) = h*3600 detik persis
-  // (microseconds, tanpa pembulatan). Tanpa cap 5000: semua feedback terbuka
-  // kategori ini ikut ter-update (loop lama berhenti di 5000 tanpa order).
+  // dengan versi loop: make_interval(secs => h*3600) = h*3600 detik persis
+  // (microseconds, tanpa pembulatan). Parameter `secs` dipakai karena ia
+  // satu-satunya parameter make_interval bertipe double precision — `hours`
+  // bertipe int sehingga `hours => <double>` DITOLAK PostgreSQL
+  // ("function make_interval(hours => double precision) does not exist").
+  // Tanpa cap 5000: semua feedback terbuka kategori ini ikut ter-update
+  // (loop lama berhenti di 5000 tanpa order).
   private async recomputeOpenSla(category: string, hours: number): Promise<void> {
     const updated = await this.prisma.$executeRaw`
       UPDATE "feedback"
-      SET "slaDueAt" = "createdAt" + make_interval(hours => ${hours}::double precision)
+      SET "slaDueAt" = "createdAt" + make_interval(secs => (${hours})::double precision * 3600)
       WHERE "category" = ${category}
         AND "status" IN ('NEW', 'IN_REVIEW')
     `;

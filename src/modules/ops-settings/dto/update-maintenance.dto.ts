@@ -7,7 +7,9 @@ export class UpdateMaintenanceDto {
   enabled!: boolean;
 
   @ApiPropertyOptional({
-    description: 'Pesan untuk user (maks 500 karakter). Kosongkan untuk memakai pesan default / mempertahankan pesan lama.',
+    description:
+      'Pesan untuk user (maks 500 karakter). BAI-105: TIDAK DIKIRIM = pertahankan ' +
+      'pesan lama; STRING KOSONG = hapus pesan kustom (kembali ke pesan default).',
     example: 'Aplikasi sedang upgrade ke versi baru. Kembali dalam ±30 menit.',
   })
   @IsOptional()

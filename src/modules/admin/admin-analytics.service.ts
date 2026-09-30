@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { toIdr } from '../../common/utils/currency.util';
+import { formatWIBDate } from '../../common/utils/date.util';
 
 interface UserGrowthRow {
   day: Date;
@@ -164,7 +165,10 @@ export class AdminAnalyticsService {
     }
 
     return [...buckets.values()].map((b) => ({
-      period: b.period,
+      // BAI-129: bucket tanggal sebagai date-only "YYYY-MM-DD" dalam WIB —
+      // tanpa jam menyesatkan (sebelumnya dikirim sebagai timestamp yang
+      // dirender admin sebagai "07.00 WIB" karena artefak konversi zona).
+      period: formatWIBDate(b.period),
       totalOrders: b.totalOrders,
       completed: b.completed,
       disputed: b.disputed,
@@ -231,8 +235,10 @@ export class AdminAnalyticsService {
       GROUP BY day
       ORDER BY day ASC`;
 
+    // BAI-129: hari sebagai date-only "YYYY-MM-DD" dalam WIB — tanpa jam
+    // menyesatkan (sebelumnya timestamp yang dirender sebagai "07.00 WIB").
     return results.map((row: UserGrowthRow) => ({
-      day: row.day,
+      day: formatWIBDate(row.day),
       newUsers: Number(row.new_users),
       cumulative: Number(row.cumulative),
     }));

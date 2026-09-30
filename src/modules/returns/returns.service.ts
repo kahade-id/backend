@@ -672,7 +672,7 @@ export class ReturnsService {
   }
 
   /** G217 — eskalasi ke sengketa TANPA case ganda: link dispute existing. */
-  async escalateToDispute(returnDbId: string, userId: string, role: ReturnActorType, reason?: string): Promise<ReturnRequestRow> {
+  async escalateToDispute(returnDbId: string, userId: string, role: ReturnActorType, reason?: string): Promise<ReturnRequestRow & { needsManualConversion: boolean }> {
     const ret = await this.mustFind(returnDbId);
     if (role !== 'ADMIN') this.assertParty(ret, userId, role);
     if (!['REQUESTED', 'SELLER_REVIEW', 'CLARIFICATION_NEEDED', 'REJECTED', 'APPROVED', 'RETURN_SHIPPING', 'RECEIVED'].includes(ret.status)) {
@@ -717,10 +717,24 @@ export class ReturnsService {
       `Pengajuan retur ${ret.returnId} diteruskan ke tim sengketa Kahade.`,
       ret.id, ret.returnId,
     ).catch((e) => this.logger.warn(`notif escalate gagal: ${(e as Error).message}`));
-    return updated;
+    // BAI-086: bila tidak ada sengketa aktif yang bisa ditautkan, kembalikan
+    // flag needsManualConversion agar pemanggil (admin UI) menampilkan
+    // peringatan + tombol "buat sengketa dari retur" — retur tidak boleh
+    // nyangkut di ESCALATED tanpa pemilik.
+    const needsManualConversion = !existingDispute;
+    return { ...updated, needsManualConversion };
   }
 
-  // ------------------------------------------------------------- admin queue
+  /**
+   * BAI-086 — konversi manual retur ESCALATED menjadi sengketa baru.
+   *
+   * Dipakai tombol "Buat sengketa dari retur" di admin saat eskalasi tidak
+   * menemukan sengketa aktif (`needsManualConversion: true`). Fail-closed:
+   * - hanya dari status ESCALATED (retur yang memang sudah dieskalasi);
+   * - bila ternyata sudah ada sengketa aktif untuk order ini, tautkan saja
+   *   (idempoten — tidak membuat duplikat);
+   * - sengketa baru lahir OPEN agar masuk antrean assign normal mediator.
+   */
   /** G219 — antrean admin + filter umur kasus. */
   async adminQueue(query: ReturnQueueQueryDto) {
     const page = query.page ?? 1;
@@ -735,9 +749,13 @@ export class ReturnsService {
       where.createdAt = createdAt;
     }
     if (query.search) {
+      // BAI-085: CS memegang ID order publik (ORD-…) — cari juga lewat relasi
+      // order agar tempel order ID menemukan retur (sebelumnya hanya
+      // returnId/no.resi sehingga hasil selalu kosong untuk order ID).
       where.OR = [
         { returnId: { contains: query.search, mode: 'insensitive' } },
         { returnTrackingNumber: { contains: query.search, mode: 'insensitive' } },
+        { order: { orderId: { contains: query.search, mode: 'insensitive' } } },
       ];
     }
     const [items, total] = await Promise.all([

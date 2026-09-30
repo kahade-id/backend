@@ -144,14 +144,20 @@ export class AdminShowcaseReportsController {
     );
   }
 
+  // BAI-026 (audit integrasi 2026-09-30) — export audit HANYA untuk
+  // SUPER_ADMIN (method-level, menimpa guard class-level yang mengizinkan
+  // CUSTOMER_SUPPORT). Data audit kepatuhan tidak boleh diunduh CS.
   @Get('export')
+  @AdminRoles(AdminRole.SUPER_ADMIN)
   @ApiOperation({
     summary: 'Export showcase reports',
     description:
       'G421 — export CSV/JSON teredaksi (tanpa PII pelapor/pemilik) untuk audit ' +
-      'kepatuhan. Setiap baris dicatat sebagai event EXPORTED (G403).',
+      'kepatuhan. Setiap baris dicatat sebagai event EXPORTED (G403). ' +
+      'Hanya SUPER_ADMIN (guard method-level BAI-026).',
   })
   @ApiResponse({ status: 200, description: 'Export file returned.' })
+  @ApiResponse({ status: 403, description: 'Only SUPER_ADMIN can export reports.' })
   async exportShowcaseReports(
     @Query() query: ExportShowcaseReportsQueryDto,
     @CurrentAdmin() admin: AdminJwtPayload,

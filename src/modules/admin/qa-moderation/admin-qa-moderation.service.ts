@@ -916,8 +916,20 @@ export class AdminQaModerationService {
       SET status = ${resolution}::qa_report_status, resolved_at = ${now}, resolved_by = ${adminId}, updated_at = ${now}
       WHERE id = ${reportId}
     `);
-    void note;
-    return { reportId, status: resolution };
+    const trimmedNote = note?.trim() || undefined;
+    // BAI-027 (audit integrasi 2026-09-30): catatan resolusi DISIMPAN ke audit
+    // trail (qa_moderation_events + admin_audit_logs via recordEvent) —
+    // sebelumnya dibuang (`void note`).
+    await this.recordEvent(
+      this.prisma,
+      report.target_type,
+      report.target_id,
+      adminId,
+      'REPORT_RESOLVED',
+      null,
+      trimmedNote,
+    );
+    return { reportId, status: resolution, note: trimmedNote ?? null };
   }
 
   // ==================================================================

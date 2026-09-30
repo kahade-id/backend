@@ -203,6 +203,32 @@ export class AdminFeedbackSlaRuleDto {
   isCritical?: boolean;
 }
 
+// BAI-001: DTO update parsial aturan SLA — validasi identik dengan create,
+// tetapi semua field opsional (PATCH).
+export class UpdateAdminFeedbackSlaRuleDto {
+  @ApiPropertyOptional({ description: 'Kategori feedback', maxLength: 100 })
+  @IsOptional()
+  @Transform(trim)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(100)
+  category?: string;
+
+  @ApiPropertyOptional({ description: 'Batas SLA dalam jam', minimum: 1, maximum: 720 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(720)
+  hours?: number;
+
+  @ApiPropertyOptional({ description: 'Tandai kategori kritis', default: false })
+  @IsOptional()
+  @Transform(toBoolean)
+  @IsBoolean()
+  isCritical?: boolean;
+}
+
 export class AdminFeedbackExportDto {
   @ApiPropertyOptional({ enum: ['json', 'csv'], default: 'json' })
   @IsOptional()

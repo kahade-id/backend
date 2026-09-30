@@ -29,10 +29,18 @@ export class BannersService {
     });
   }
 
-  async listAdminBanners(page = 1, limit = 20): Promise<PaginatedResponse<Record<string, unknown>>> {
+  async listAdminBanners(
+    page = 1,
+    limit = 20,
+    filters: { isActive?: boolean; q?: string } = {},
+  ): Promise<PaginatedResponse<Record<string, unknown>>> {
+    // BAI-013: filter isActive & q yang dikirim admin — sebelumnya diabaikan.
+    const where: Record<string, unknown> = {};
+    if (filters.isActive !== undefined) where.isActive = filters.isActive;
+    if (filters.q) where.title = { contains: filters.q, mode: 'insensitive' };
     const [rows, total] = await Promise.all([
-      this.prisma.banner.findMany({ orderBy: [{ sortOrder: 'asc' }, { createdAt: 'desc' }], skip: (page - 1) * limit, take: limit }),
-      this.prisma.banner.count(),
+      this.prisma.banner.findMany({ where, orderBy: [{ sortOrder: 'asc' }, { createdAt: 'desc' }], skip: (page - 1) * limit, take: limit }),
+      this.prisma.banner.count({ where }),
     ]);
     return createPaginatedResponse(rows, total, page, limit);
   }

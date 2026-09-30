@@ -1,5 +1,6 @@
 import { IsString, IsOptional, IsIn, MaxLength, IsISO8601 } from 'class-validator';
 import { ApiPropertyOptional } from '@nestjs/swagger';
+import { PaginationDto } from '../../../../common/dto/pagination.dto';
 
 /** Jenis event pada timeline moderasi pengguna. */
 export const MODERATION_EVENT_TYPES = [
@@ -18,8 +19,10 @@ export type ModerationEventType = (typeof MODERATION_EVENT_TYPES)[number];
  * GAP-E — query timeline moderasi pengguna.
  * Filter: jenis event, aktor (id admin), rentang waktu.
  * ADM-005: `kind` memfilter sumber event (`system` = otomatis, `admin`).
+ * BAI-061/BAI-073: `page`/`limit` dipaginasi nyata di service (bukan selalu
+ * 200 pertama) — extend PaginationDto.
  */
-export class ModerationEventsQueryDto {
+export class ModerationEventsQueryDto extends PaginationDto {
   @ApiPropertyOptional({
     description: 'Filter sumber event: system (sinyal otomatis) atau admin.',
     enum: ['system', 'admin'],

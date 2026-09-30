@@ -1,12 +1,12 @@
 import { AdminRoute } from '../../common/decorators/public.decorator';
-import { Controller, Get, Put, Post, Param, Body, Query, UseGuards, HttpCode, HttpStatus, BadRequestException } from '@nestjs/common';
+import { Controller, Get, Put, Post, Delete, Param, Body, Query, UseGuards, HttpCode, HttpStatus, BadRequestException, ConflictException } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { JwtAdminGuard } from '../../common/guards/jwt-admin.guard';
 import { AdminRolesGuard } from '../../common/guards/admin-roles.guard';
 import { AdminRoles } from '../../common/decorators/admin-roles.decorator';
 import { CurrentAdmin } from '../../common/decorators/current-admin.decorator';
 import { AdminJwtPayload } from '../../common/types/jwt-payload.types';
-import { OpsSettingsService } from './ops-settings.service';
+import { OpsSettingsService, OpsSettingConflictError } from './ops-settings.service';
 import { isManageableSetting } from './ops-settings.registry';
 import { UpdateOpsSettingDto, TestOpsSettingDto } from './dto/update-ops-setting.dto';
 
@@ -36,6 +36,7 @@ export class AdminOpsSettingsController {
   @Put(':key')
   @ApiOperation({ summary: 'Ubah setting operasional (diaudit)' })
   @ApiResponse({ status: 200, description: 'Setting diperbarui.' })
+  @ApiResponse({ status: 409, description: 'Konflik versi — setting berubah sejak dimuat.' })
   async update(
     @Param('key') key: string,
     @Body() dto: UpdateOpsSettingDto,
@@ -45,10 +46,38 @@ export class AdminOpsSettingsController {
       throw new BadRequestException(`Setting "${key}" tidak bisa dikelola via admin panel.`);
     }
     try {
-      const setting = await this.settings.set(key, dto.value, admin.adminId ?? admin.sub ?? "unknown");
+      const setting = await this.settings.set(
+        key,
+        dto.value,
+        admin.adminId ?? admin.sub ?? "unknown",
+        { expectedVersion: dto.expectedVersion },
+      );
       return { setting };
     } catch (err) {
+      // BAI-118: konflik optimistic locking → 409 agar admin bisa
+      // menampilkan dialog konflik, bukan error generik.
+      if (err instanceof OpsSettingConflictError) {
+        throw new ConflictException(err.message);
+      }
       throw new BadRequestException(err instanceof Error ? err.message : 'Gagal menyimpan setting.');
+    }
+  }
+
+  @Delete(':key')
+  @ApiOperation({ summary: 'Hapus override panel — kembalikan ke default/.env (diaudit)' })
+  @ApiResponse({ status: 200, description: 'Override dihapus; nilai kembali ke default.' })
+  async remove(
+    @Param('key') key: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+  ) {
+    if (!isManageableSetting(key)) {
+      throw new BadRequestException(`Setting "${key}" tidak bisa dikelola via admin panel.`);
+    }
+    try {
+      const setting = await this.settings.delete(key, admin.adminId ?? admin.sub ?? "unknown");
+      return { setting };
+    } catch (err) {
+      throw new BadRequestException(err instanceof Error ? err.message : 'Gagal menghapus setting.');
     }
   }
 

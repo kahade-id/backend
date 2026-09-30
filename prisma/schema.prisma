@@ -628,6 +628,14 @@ enum AuditAction {
   WITHDRAWAL_REJECTED
   // ADM-213 recheck manual withdrawal PROCESSING (append-only; migrasi 20260927180000_recheck_reactivate_audit)
   WITHDRAWAL_RECHECKED
+  // BAI-043/044/045 (2026-10-01, append-only; migrasi
+  // 20261013000000_disbursement_admin_audit): aksi admin atas lifecycle
+  // EscrowDisbursement DANA — recheck status ke provider, review manual
+  // NEEDS_REVIEW, dan requeue HELD_NO_BANK.
+  DISBURSEMENT_VIEWED
+  DISBURSEMENT_RECHECKED
+  DISBURSEMENT_REVIEWED
+  DISBURSEMENT_REQUEUED
   // ADM-406/ADM-430 (2026-09-27, append-only): kode spesifik menggantikan
   // ADMIN_ACTION generik di admin-finance.service & admin-users.service agar
   // filter action= di /admin/activity-log bisa menjawab "siapa menyetujui apa".

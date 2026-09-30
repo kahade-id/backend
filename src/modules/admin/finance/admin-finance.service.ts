@@ -5,6 +5,9 @@ import {
   BadRequestException,
   ConflictException,
   ServiceUnavailableException,
+  GoneException,
+  NotImplementedException,
+  Optional,
 } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { Prisma, AuditAction, WalletTransactionType, WalletTransactionStatus } from '@prisma/client';
@@ -14,6 +17,7 @@ import { WithdrawalApproveDto, WithdrawalRejectDto } from './dto/withdrawal-acti
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { MidtransService } from '../../../modules/payment/midtrans.service';
+import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
 import { decryptAES } from '../../../common/utils/crypto.util';
 import { toIdr } from '../../../common/utils/currency.util';
 import { parseDateBoundaryWIB, startOfDayWIB, toWIB } from '../../../common/utils/date.util';
@@ -134,6 +138,9 @@ export class AdminFinanceService {
     private readonly midtransService: MidtransService,
     // AW-018: invalidasi cache summary dashboard (via helper terpusat).
     private readonly dashboard: DashboardService,
+    // BAI-041/047: mode wallet (opsional agar konstruksi manual di test lama
+    // tetap jalan; DI-inject via WalletModeModule di runtime).
+    @Optional() private readonly walletMode?: WalletModeService,
   ) {}
 
   /**
@@ -1016,6 +1023,22 @@ export class AdminFinanceService {
     adminId: string,
     ipAddress: string = 'internal',
   ): Promise<object> {
+    // BAI-041 (P0) — JALUR PAYOUT MIDTRANS IRIS DI-SUNSET (2026-10-01).
+    // DANA Enterprise adalah satu-satunya provider; antrean withdrawal legacy
+    // (WalletTransaction) TIDAK LAGI dieksekusi via createIrisPayout.
+    // Keputusan keamanan: 410 GONE eksplisit (bukan 403/404 yang ambigu atau
+    // eksekusi diam-diam ke provider yang salah), plus WalletKillSwitchGuard
+    // di controller sebagai pertahanan lapis kedua. Pencairan dana kini
+    // tercatat di EscrowDisbursement — lihat GET /v1/admin/finance/disbursements.
+    // Seluruh badan fungsi di bawah ini dipertahankan sebagai dokumentasi
+    // arkeologis alur lama dan TIDAK PERNAH tercapai.
+    throw new GoneException({
+      code: ErrorCodes.IRIS_PAYOUT_SUNSET,
+      message:
+        'Jalur payout Midtrans Iris sudah dinonaktifkan (410 GONE). ' +
+        'Pencairan dana kini berjalan via disbursement DANA — lihat antrean "Disbursement DANA" ' +
+        '(GET /v1/admin/finance/disbursements).',
+    });
     const adminNote = this.sanitizeAdminNote(dto.adminNote);
     // B-22 (audit-fix): lookup by public txId only -- the OR-by-internal-id
     // was permissive and meant attacker control over the URL parameter could
@@ -1364,6 +1387,22 @@ export class AdminFinanceService {
    *   terjangkau) → tetap PROCESSING, TANPA mutasi uang (fail closed).
    */
   async recheckWithdrawal(txId: string, adminId: string, ipAddress: string): Promise<object> {
+    // BAI-042 (P0) — RECHECK LEGACY DINONAKTIFKAN (2026-10-01).
+    // Implementasi lama men-query Midtrans Iris (getIrisPayoutStatus) — provider
+    // yang SALAH untuk payout era DANA (selalu not_found/UNKNOWN untuk referensi
+    // DANA), sehingga satu-satunya tombol recheck menyesatkan operator.
+    // Keputusan keamanan: 501 NOT_IMPLEMENTED eksplisit daripada query provider
+    // yang salah. Untuk disbursement DANA gunakan
+    // POST /v1/admin/finance/disbursements/:id/recheck (query status DANA yang
+    // aman — tanpa pengiriman transfer baru).
+    // Badan fungsi lama dipertahankan di bawah sebagai dokumentasi dan TIDAK
+    // PERNAH tercapai.
+    throw new NotImplementedException({
+      code: ErrorCodes.LEGACY_WITHDRAWAL_RECHECK_DISABLED,
+      message:
+        'Recheck withdrawal legacy dinonaktifkan (501): jalur ini men-query Midtrans Iris, ' +
+        'bukan DANA. Untuk payout DANA gunakan POST /v1/admin/finance/disbursements/:id/recheck.',
+    });
     const tx = await this.prisma.walletTransaction.findFirst({
       where: { txId, type: 'WITHDRAW' },
       select: {
@@ -1502,26 +1541,51 @@ export class AdminFinanceService {
     });
   }
 
+  /**
+   * BAI-047 (P1): di era tanpa-wallet, dana escrow dipegang DANA (payment
+   * direct), BUKAN kolom wallet.escrowBalance — sehingga SUM wallet selalu
+   * Rp0 sementara order aktif > 0 (kartu "Escrow aktif: Rp0" menyesatkan).
+   * Bila wallet nonaktif: total = SUM(buyerPayAmount) order aktif
+   * (PROCESSING/IN_DELIVERY/DISPUTED) + flag `source: 'ORDER_BASED'` agar UI
+   * melabelinya dengan jelas. Bila wallet aktif: perilaku lama +
+   * `source: 'WALLET_BASED'`.
+   */
   async getEscrowSummary(): Promise<{
     totalEscrowBalance: number;
     walletsWithEscrow: number;
     activeEscrowOrders: number;
+    source: 'WALLET_BASED' | 'ORDER_BASED';
   }> {
-    const [escrowAgg, activeEscrowOrders] = await Promise.all([
-      this.prisma.wallet.aggregate({
-        where: { escrowBalance: { gt: 0 } },
-        _sum: { escrowBalance: true },
-        _count: true,
-      }),
-      this.prisma.order.count({
+    const activeEscrowOrders = await this.prisma.order.count({
+      where: { status: { in: ['PROCESSING', 'IN_DELIVERY', 'DISPUTED'] } },
+    });
+
+    if (this.walletMode && !this.walletMode.isWalletEnabled()) {
+      const orderAgg = await this.prisma.order.aggregate({
         where: { status: { in: ['PROCESSING', 'IN_DELIVERY', 'DISPUTED'] } },
-      }),
-    ]);
+        _sum: { buyerPayAmount: true },
+      });
+      return {
+        // buyerPayAmount = total yang buyer bayar ke escrow DANA (orderValue +
+        // buyerFee). Ini nilai escrow aktual yang ditahan di sisi DANA.
+        totalEscrowBalance: toIdr(orderAgg._sum.buyerPayAmount ?? BigInt(0)),
+        walletsWithEscrow: 0,
+        activeEscrowOrders,
+        source: 'ORDER_BASED',
+      };
+    }
+
+    const escrowAgg = await this.prisma.wallet.aggregate({
+      where: { escrowBalance: { gt: 0 } },
+      _sum: { escrowBalance: true },
+      _count: true,
+    });
 
     return {
       totalEscrowBalance: toIdr(escrowAgg._sum.escrowBalance ?? BigInt(0)),
       walletsWithEscrow: escrowAgg._count,
       activeEscrowOrders,
+      source: 'WALLET_BASED',
     };
   }
 

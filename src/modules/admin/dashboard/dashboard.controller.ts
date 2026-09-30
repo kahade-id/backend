@@ -17,11 +17,18 @@ export class DashboardController {
   constructor(private readonly service: DashboardService) {}
 
   @Get('summary')
-  @ApiOperation({ summary: 'Get dashboard summary', description: 'Returns aggregated stats: user counts, active/completed orders, open disputes, pending KYC, and total wallet balance.' })
+  @ApiOperation({
+    summary: 'Get dashboard summary',
+    description: 'Returns aggregated stats: user counts, active/completed orders, open disputes, pending KYC, and total wallet balance. ' +
+      'BAI-122: "active orders" = semua order yang belum final (WAITING_CONFIRMATION, WAITING_PAYMENT, PROCESSING, IN_DELIVERY). ' +
+      'BAI-125: kirim `refresh=true` untuk melewati cache 5 menit dan menghitung ulang dari DB (mis. tombol "Muat ulang" panel).',
+  })
   @ApiResponse({ status: 200, description: 'Dashboard summary returned.' })
   @ApiResponse({ status: 401, description: 'Invalid or expired admin token.' })
-  getSummary(): Promise<object> {
-    return this.service.getSummary();
+  getSummary(@Query('refresh') refresh?: string): Promise<object> {
+    // Backend yang menginterpretasi flag — query `refresh=true` eksplisit;
+    // nilai lain (termasuk tidak dikirim) = pakai cache normal.
+    return this.service.getSummary(refresh === 'true');
   }
 
   @Get('charts')
@@ -38,8 +45,16 @@ export class DashboardController {
     return this.service.getRecentActivity();
   }
 
+  // BAI-133: DUPLIKAT KONTRAK — endpoint ini tidak dipakai panel admin
+  // (panel memakai GET /v1/admin/analytics/user-growth). Ditandai DEPRECATED
+  // agar tidak ada dua kontrak "user growth" yang hidup tanpa penanda;
+  // kandidat penghapusan setelah semua konsumen migrasi ke endpoint analitik.
   @Get('user-growth')
-  @ApiOperation({ summary: 'Get user growth stats', description: 'Returns user registration statistics over the specified period.' })
+  @ApiOperation({
+    summary: 'Get user growth stats (deprecated)',
+    description: 'DEPRECATED — tidak dipakai panel admin; gunakan GET /v1/admin/analytics/user-growth. ' +
+      'Returns user registration statistics over the specified period.',
+  })
   @ApiResponse({ status: 200, description: 'User growth data returned.' })
   getUserGrowth(@Query() query: ChartQueryDto): Promise<object> {
     return this.service.getUserGrowth(query);

@@ -17,6 +17,7 @@ import {
 } from 'class-validator';
 import { Type, Transform } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { PaginationDto } from '../../../common/dto/pagination.dto';
 import {
   ProductType,
   VoucherType,
@@ -453,6 +454,14 @@ export class CreateBannerDto {
   @IsOptional()
   @IsDateString()
   endsAt?: string;
+
+  // BAI-029 (audit integrasi 2026-09-30) — flag aktif saat create. Sebelumnya
+  // field ini tidak ada di DTO sehingga checkbox "Aktif" di admin di-strip
+  // ValidationPipe dan banner selalu langsung live (default model true).
+  @ApiPropertyOptional({ description: 'Banner aktif saat dibuat (default true)', default: true })
+  @IsOptional()
+  @IsBoolean()
+  isActive?: boolean;
 }
 
 export class UpdateBannerDto {
@@ -499,6 +508,26 @@ export class UpdateBannerDto {
   @IsOptional()
   @IsDateString()
   endsAt?: string;
+}
+
+// BAI-013: filter daftar banner admin — sebelumnya diabaikan backend.
+export class AdminBannerListQueryDto extends PaginationDto {
+  @ApiPropertyOptional({ description: 'Filter status aktif ("true" | "false")' })
+  @IsOptional()
+  @Transform(({ value }) => {
+    if (value === 'true' || value === true) return true;
+    if (value === 'false' || value === false) return false;
+    return value;
+  })
+  @IsBoolean()
+  isActive?: boolean;
+
+  @ApiPropertyOptional({ description: 'Pencarian judul banner' })
+  @IsOptional()
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString()
+  @MaxLength(120)
+  q?: string;
 }
 
 export { AgreementStatus };

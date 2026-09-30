@@ -110,6 +110,19 @@ export const PAYOUT_FAILED = 'PAYOUT_FAILED';
 export const WITHDRAWAL_ALREADY_APPROVED = 'WITHDRAWAL_ALREADY_APPROVED';
 // ADM-213 (recheck manual): hanya withdrawal PROCESSING yang boleh dicek ulang.
 export const WITHDRAWAL_NOT_PROCESSING = 'WITHDRAWAL_NOT_PROCESSING';
+// BAI-041 (P0): jalur payout Midtrans Iris di-SUNSET — approve withdrawal
+// legacy selalu 410 GONE; DANA satu-satunya provider.
+export const IRIS_PAYOUT_SUNSET = 'IRIS_PAYOUT_SUNSET';
+// BAI-042 (P0): recheck withdrawal legacy men-query provider yang salah —
+// 501; gunakan recheck disbursement DANA.
+export const LEGACY_WITHDRAWAL_RECHECK_DISABLED = 'LEGACY_WITHDRAWAL_RECHECK_DISABLED';
+// BAI-054 (P2): koreksi ledger memutasi wallet — ditolak saat wallet nonaktif.
+export const LEDGER_CORRECTION_WALLET_DISABLED = 'LEDGER_CORRECTION_WALLET_DISABLED';
+// BAI-044 (P1): review disbursement NEEDS_REVIEW — keputusan tak valid /
+// status tidak memenuhi syarat.
+export const DISBURSEMENT_INVALID_DECISION = 'DISBURSEMENT_INVALID_DECISION';
+export const DISBURSEMENT_NOT_REVIEWABLE = 'DISBURSEMENT_NOT_REVIEWABLE';
+export const DISBURSEMENT_NOT_REQUEUABLE = 'DISBURSEMENT_NOT_REQUEUABLE';
 // ADM-206 (re-auth kata sandi admin server-side untuk koreksi ledger).
 export const REAUTH_PASSWORD_REQUIRED = 'REAUTH_PASSWORD_REQUIRED';
 export const REAUTH_INVALID_PASSWORD = 'REAUTH_INVALID_PASSWORD';
@@ -411,6 +424,8 @@ export const FEEDBACK_CLOSE_REASON_REQUIRED = 'FEEDBACK_CLOSE_REASON_REQUIRED';
 export const FEEDBACK_CONTACT_CONSENT_REQUIRED = 'FEEDBACK_CONTACT_CONSENT_REQUIRED';
 export const FEEDBACK_CONTACT_NOT_AVAILABLE = 'FEEDBACK_CONTACT_NOT_AVAILABLE';
 export const FEEDBACK_SLA_RULE_NOT_FOUND = 'FEEDBACK_SLA_RULE_NOT_FOUND';
+export const FEEDBACK_SLA_RULE_CATEGORY_CONFLICT = 'FEEDBACK_SLA_RULE_CATEGORY_CONFLICT';
+export const FEEDBACK_SLA_RULE_NO_CHANGES = 'FEEDBACK_SLA_RULE_NO_CHANGES';
 
 // GAP-D integrasi kurir (G226–G250) — kode error modul courier.
 export const SHIPMENT_NOT_FOUND = 'SHIPMENT_NOT_FOUND';

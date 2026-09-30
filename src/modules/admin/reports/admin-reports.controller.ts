@@ -10,6 +10,7 @@ import { AdminRole } from '@prisma/client';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
 import { ReportQueryDto } from './dto/report-query.dto';
 import { ResolveReportDto } from './dto/resolve-report.dto';
+import { DismissReportDto } from './dto/dismiss-report.dto';
 import { AdminJwtPayload } from '../../../common/types/jwt-payload.types';
 import { Request } from 'express';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
@@ -63,15 +64,21 @@ export class AdminReportsController {
   @UseGuards(UserThrottleGuard)
   @Idempotency()
   @Post(':reportId/dismiss')
-  @ApiOperation({ summary: 'Dismiss report', description: 'Dismiss a user report without action.' })
+  @ApiOperation({
+    summary: 'Dismiss report',
+    description: 'Dismiss a user report without action. BAI-127: `notes` (alasan ' +
+      'pengabaian) diterima dan disimpan di kolom `resolution` + audit log — ' +
+      'sebelumnya catatan dibuang diam-diam.',
+  })
   @ApiResponse({ status: 200, description: 'Report dismissed.' })
   @ApiResponse({ status: 404, description: 'Report not found.' })
   @ApiResponse({ status: 400, description: 'Report already resolved or dismissed.' })
   dismissReport(
     @Param('reportId', ParseIdPipe) reportId: string,
+    @Body() dto: DismissReportDto,
     @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<{ message: string; reportId: string }> {
-    return this.service.dismissReport(reportId, admin.sub, req.ip ?? '');
+    return this.service.dismissReport(reportId, admin.sub, req.ip ?? '', dto.notes);
   }
 }

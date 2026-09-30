@@ -13,7 +13,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { UploadPurpose } from './dto/presigned-url.dto';
 import { InitChunkedUploadDto } from './dto/chunked-upload.dto';
-import { ALLOWED_CONTENT_TYPES, DirectUploadResult, MAX_FILE_SIZE, UploadService } from './upload.service';
+import { ALLOWED_CONTENT_TYPES, DirectUploadResult, MAX_FILE_SIZE, UploadService, fileTooLargeException } from './upload.service';
 
 /**
  * NP-006 (perf-fix, 2026-09-29): upload chunked/resumable SEJATI untuk file
@@ -211,10 +211,11 @@ export class ChunkedUploadService {
       throw new BadRequestException({ code: 'VALIDATION_ERROR', message: 'Unsupported upload purpose' });
     }
     if (dto.totalSize > maxBytes) {
-      throw new BadRequestException({
-        code: 'FILE_TOO_LARGE',
-        message: `File exceeds maximum size for ${dto.purpose}`,
-      });
+      // BFI-099: kode SELARAS dengan jalur direct/complete (VIDEO_TOO_LARGE +
+      // pesan Indonesia untuk SHOWCASE_VIDEO; FILE_TOO_LARGE untuk lainnya) —
+      // video yang sama tidak lagi ditolak dengan kode berbeda per jalur.
+      // BFI-060: 413 PayloadTooLargeException (bukan 400).
+      throw fileTooLargeException(dto.purpose, maxBytes);
     }
     const allowed = ALLOWED_CONTENT_TYPES[dto.purpose] ?? [];
     if (!allowed.includes(dto.mimeType)) {

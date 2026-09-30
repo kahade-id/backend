@@ -87,8 +87,9 @@ export class OrderStateService {
     private walletMode: WalletModeService,
     private orderQrisPaymentService: OrderQrisPaymentService,
     @Optional() private danaDirectRefundService: DanaDirectRefundService,
-    // M4 no-wallet: payout cashback via disbursement DANA bila wallet mati.
-    @Optional() private escrowDisbursementService: EscrowDisbursementService | null,
+    // E1 no-wallet (2026-09-30): WAJIB tersedia di mode no-wallet — fail-fast
+    // saat startup bila tidak ter-wire, bukan fail-closed saat transaksi.
+    private escrowDisbursementService: EscrowDisbursementService,
     private walletTxSerialService: WalletTxSerialService,
     private referralService: ReferralService,
     private feeCalculator: FeeCalculatorService,

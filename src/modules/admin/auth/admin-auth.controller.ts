@@ -6,6 +6,11 @@ import { Request, Response } from 'express';
 import { AdminAuthService } from './admin-auth.service';
 import { AdminLoginDto } from './dto/admin-login.dto';
 import { AdminVerify2faDto } from './dto/admin-verify-2fa.dto';
+import { AdminMfaSetupDto } from './dto/admin-mfa-setup.dto';
+import { AdminMfaEnableDto } from './dto/admin-mfa-enable.dto';
+import { AdminChangePasswordDto } from './dto/admin-change-password.dto';
+import { AdminFirstPasswordChangeDto } from './dto/admin-first-password-change.dto';
+import { CaptchaService } from '../../auth/captcha.service';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
 import { Public, AdminRoute } from '../../../common/decorators/public.decorator';
@@ -22,6 +27,8 @@ export class AdminAuthController {
   constructor(
     private readonly adminAuthService: AdminAuthService,
     private readonly configService: ConfigService,
+    // AUT-003: tantangan captcha slider untuk endpoint publik generate.
+    private readonly captchaService: CaptchaService,
   ) {}
 
   private getRefreshCookiePath(): string {
@@ -60,18 +67,47 @@ export class AdminAuthController {
   ): Promise<
     | { requiresMfa: true; tempToken: string }
     | { requiresMfaSetup: true; tempToken: string }
+    | { requiresPasswordChange: true; tempToken: string }
     | { accessToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }
   > {
     const ip = req.ip || 'unknown';
     const userAgent = req.headers['user-agent'];
-    const result = await this.adminAuthService.login(dto.email, dto.password, dto.totpToken, ip, userAgent);
+    // AUT-001: deviceId diikat ke tempToken. AUT-003: captchaId/captchaAnswer
+    // dicek di service (throttle adaptif, pola yang sama dengan mobile).
+    const result = await this.adminAuthService.login(
+      dto.email,
+      dto.password,
+      dto.totpToken,
+      ip,
+      userAgent,
+      dto.deviceId,
+      dto.captchaId,
+      dto.captchaAnswer,
+    );
 
     if ('requiresMfa' in result) return result;
     if ('requiresMfaSetup' in result) return result;
+    if ('requiresPasswordChange' in result) return result;
 
     this.setRefreshCookie(res, result.refreshToken);
     const { refreshToken: _rt, ...body } = result;
     return body;
+  }
+
+  /**
+   * AUT-003: hasilkan tantangan slider captcha (protokol yang sama dengan
+   * mobile — GET challenge {challengeId, targetX} → slider 0–100 → kirim
+   * captchaId + captchaAnswer ke /admin/auth/login).
+   */
+  @Public()
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Post('captcha/generate')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Generate slider captcha challenge (required after repeated failed logins)' })
+  @ApiResponse({ status: 200, description: 'Captcha challenge returned.' })
+  async generateCaptcha(): Promise<{ challengeId: string; targetX: number }> {
+    const challenge = await this.captchaService.generateChallenge();
+    return { challengeId: challenge.challengeId, targetX: challenge.targetX };
   }
 
   @Public()
@@ -88,7 +124,8 @@ export class AdminAuthController {
   ): Promise<{ accessToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }> {
     const ip = req.ip || 'unknown';
     const userAgent = req.headers['user-agent'];
-    const result = await this.adminAuthService.verifyAdmin2fa(dto.tempToken, dto.totpToken, ip, userAgent);
+    // AUT-001: tempToken terikat deviceId — perangkat peminta harus sama.
+    const result = await this.adminAuthService.verifyAdmin2fa(dto.tempToken, dto.totpToken, ip, userAgent, dto.deviceId);
 
     this.setRefreshCookie(res, result.refreshToken);
     const { refreshToken: _rt, ...body } = result;
@@ -182,9 +219,10 @@ export class AdminAuthController {
   }
 
   /**
-   * 03-#8: mulai enroll MFA admin. Body: { tempToken } dari login yang
+   * 03-#8: mulai enroll MFA admin. Body: { tempToken, deviceId? } dari login yang
    * mengembalikan requiresMfaSetup. Mengembalikan otpauthUrl + secret
    * untuk dipindai di aplikasi authenticator.
+   * AUT-001: tempToken terikat deviceId (seperti alur 2FA).
    */
   @Public()
   @Throttle({ default: { ttl: 300000, limit: 5 } })
@@ -193,14 +231,15 @@ export class AdminAuthController {
   @ApiOperation({ summary: 'Admin MFA setup — get TOTP secret (requiresMfaSetup tempToken)' })
   @ApiResponse({ status: 200, description: 'otpauthUrl + secret returned.' })
   async mfaSetup(
-    @Body() dto: { tempToken: string },
+    @Body() dto: AdminMfaSetupDto,
   ): Promise<{ otpauthUrl: string; secret: string }> {
-    return this.adminAuthService.setupMfa(dto.tempToken);
+    return this.adminAuthService.setupMfa(dto.tempToken, dto.deviceId);
   }
 
   /**
-   * 03-#8: selesaikan enroll MFA. Body: { tempToken, totpToken }.
+   * 03-#8: selesaikan enroll MFA. Body: { tempToken, totpToken, deviceId? }.
    * Mengembalikan sesi penuh (accessToken + refresh cookie).
+   * AUT-001: tempToken terikat deviceId (seperti alur 2FA).
    */
   @Public()
   @Throttle({ default: { ttl: 300000, limit: 5 } })
@@ -209,16 +248,56 @@ export class AdminAuthController {
   @ApiOperation({ summary: 'Admin MFA enable — verify TOTP and activate MFA' })
   @ApiResponse({ status: 200, description: 'MFA enabled; session tokens returned.' })
   async mfaEnable(
-    @Body() dto: { tempToken: string; totpToken: string },
+    @Body() dto: AdminMfaEnableDto,
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<{ accessToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }> {
     const ip = req.ip || 'unknown';
     const userAgent = req.headers['user-agent'];
-    const result = await this.adminAuthService.enableMfa(dto.tempToken, dto.totpToken, ip, userAgent);
+    const result = await this.adminAuthService.enableMfa(dto.tempToken, dto.totpToken, ip, userAgent, dto.deviceId);
 
     this.setRefreshCookie(res, result.refreshToken);
     const { refreshToken: _rt, ...body } = result;
     return body;
+  }
+
+  /**
+   * AUT-002: ganti password sendiri (autentikasi ulang password lama).
+   * Butuh JWT admin. Setelah ganti, semua sesi dicabut — klien wajib login
+   * ulang dengan password baru.
+   */
+  @UseGuards(JwtAdminGuard, UserThrottleGuard)
+  @ApiBearerAuth('access-token')
+  @Post('change-password')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Change own admin password (requires current password)' })
+  @ApiResponse({ status: 200, description: 'Password changed; all sessions revoked.' })
+  @ApiResponse({ status: 401, description: 'Current password is incorrect.' })
+  async changePassword(
+    @Body() dto: AdminChangePasswordDto,
+    @CurrentAdmin('sub') adminId: string,
+    @Req() req: Request,
+  ): Promise<{ message: string }> {
+    return this.adminAuthService.changePassword(adminId, dto.currentPassword, dto.newPassword, req.ip || 'unknown');
+  }
+
+  /**
+   * AUT-011: ganti password pertama untuk admin yang flag
+   * mustChangePassword-nya true (dibuat baru / di-reset SUPER_ADMIN).
+   * Public — otorisasi via tempToken scope admin_password_change (terikat
+   * deviceId, AUT-001). Tidak menerbitkan sesi; klien login ulang.
+   */
+  @Public()
+  @Throttle({ default: { ttl: 300000, limit: 5 } })
+  @Post('first-password-change')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'First password change (requiresPasswordChange tempToken from login)' })
+  @ApiResponse({ status: 200, description: 'Password changed; client must log in again.' })
+  @ApiResponse({ status: 401, description: 'TempToken expired or not valid for this device.' })
+  async firstPasswordChange(
+    @Body() dto: AdminFirstPasswordChangeDto,
+    @Req() req: Request,
+  ): Promise<{ message: string }> {
+    return this.adminAuthService.acceptFirstPasswordChange(dto.tempToken, dto.newPassword, req.ip || 'unknown', dto.deviceId);
   }
 }

@@ -3255,6 +3255,11 @@ model AdminUser {
   failedLoginAttempts Int       @default(0)
   lockedUntil         DateTime?
 
+  // AUT-011: true = admin WAJIB mengganti password saat login berikutnya
+  // (dibuat baru / di-reset SUPER_ADMIN). Login menerbitkan tempToken scope
+  // admin_password_change, bukan sesi.
+  mustChangePassword Boolean @default(false)
+
   createdBy String?
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt

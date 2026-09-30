@@ -1,6 +1,7 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger, Optional } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, UnauthorizedException, Logger, Optional } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
+import { bcryptCompare } from '../../../common/utils/crypto.util';
 import { OrderStatus, AuditAction, Prisma, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType, DisputeStatus } from '@prisma/client';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
@@ -16,7 +17,7 @@ import { UnshippedOrderCancelService } from '../../orders/unshipped-order-cancel
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
-import { AdminOrderQueryDto, ForceActionDto } from './dto/admin-order-query.dto';
+import { AdminOrderQueryDto, ForceActionDto, ForceActionWithReauthDto } from './dto/admin-order-query.dto';
 import { toIdr } from '../../../common/utils/currency.util';
 import { decryptPiiSafe } from '../../../common/utils/pii.util';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
@@ -186,7 +187,52 @@ export class AdminOrdersService {
   // ADM-404: DISPUTE_ADMIN hanya boleh force-cancel order yang memiliki dispute AKTIF.
   // SUPER_ADMIN tidak dibatasi. Reason wajib (ForceActionDto, min 10 karakter) dan
   // aksi diaudit sebagai ORDER_FORCE_CANCEL.
-  async forceCancel(orderId: string, adminId: string, adminRole: string, dto: ForceActionDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: OrderStatus }> {
+  /**
+   * AUT-013: re-auth password untuk aksi finansial final (force-cancel /
+   * force-complete). JWT yang dicuri saja tidak cukup — penyerang harus tahu
+   * password admin juga. Kegagalan diaudit (pola yang sama dengan
+   * admin-business-verification.service.ts).
+   */
+  private async verifyAdminPasswordForForceAction(
+    adminId: string,
+    password: string | undefined,
+    action: string,
+    orderId: string,
+    ipAddress: string,
+  ): Promise<void> {
+    if (!password) {
+      throw new UnauthorizedException({
+        code: ErrorCodes.UNAUTHORIZED,
+        message: 'Re-authentication required for this action. Provide your password.',
+      });
+    }
+    const admin = await this.prisma.adminUser.findUnique({ where: { id: adminId } });
+    if (!admin || !admin.isActive || admin.deletedAt) {
+      throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Admin not found' });
+    }
+    const isPasswordValid = await bcryptCompare(password, admin.password);
+    if (!isPasswordValid) {
+      // Kegagalan diaudit (pola yang sama dengan forceCancel/forceComplete:
+      // fire-and-forget agar kegagalan audit tidak menggagalkan penolakan).
+      this.auditLog.logAdminAction({
+        adminId,
+        action: AuditAction.ADMIN_ACTION,
+        targetType: 'Order',
+        targetId: orderId,
+        description: `Failed re-authentication attempt for force ${action} on order ${orderId}`,
+        ipAddress,
+      });
+      throw new UnauthorizedException({
+        code: ErrorCodes.INVALID_CREDENTIALS,
+        message: 'Invalid password for re-authentication',
+      });
+    }
+  }
+
+  async forceCancel(orderId: string, adminId: string, adminRole: string, dto: ForceActionWithReauthDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: OrderStatus }> {
+    // AUT-013: re-auth password SEBELUM menyentuh order.
+    await this.verifyAdminPasswordForForceAction(adminId, dto.password, 'cancel', orderId, ipAddress);
+
     const order = await this.prisma.order.findFirst({
       where: { OR: [{ id: orderId }, { orderId }], deletedAt: null },
     });
@@ -274,7 +320,10 @@ export class AdminOrdersService {
     };
   }
 
-  async forceComplete(orderId: string, adminId: string, dto: ForceActionDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: OrderStatus }> {
+  async forceComplete(orderId: string, adminId: string, dto: ForceActionWithReauthDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: OrderStatus }> {
+    // AUT-013: re-auth password SEBELUM menyentuh order.
+    await this.verifyAdminPasswordForForceAction(adminId, dto.password, 'complete', orderId, ipAddress);
+
     const order = await this.prisma.order.findFirst({
       where: { OR: [{ id: orderId }, { orderId }], deletedAt: null },
       include: {

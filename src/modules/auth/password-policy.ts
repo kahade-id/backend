@@ -8,6 +8,11 @@ import * as ErrorCodes from '../../common/constants/error-codes';
  *   (keputusan produk: mengurangi friksi, kekuatan dijamin oleh
  *   rate-limit, lockout progresif, dan 2FA opsional).
  * - Menolak password yang masuk daftar umum/bocor (blocklist).
+ *
+ * AUT-009 cross-reference: kebijakan ADMIN (min 12 + kompleksitas) hidup di
+ * `src/modules/admin/admin-password-policy.ts` — disengaja lebih ketat
+ * karena privilese tinggi. Bila kebijakan salah satu sisi diubah, perbarui
+ * komentar silang di sisi lain.
  */
 export const PASSWORD_MIN_LENGTH = 8;
 export const PASSWORD_MAX_LENGTH = 72;

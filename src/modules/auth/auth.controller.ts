@@ -901,7 +901,10 @@ export class AuthController {
     }
     let result: { accessToken: string; refreshToken?: string };
     try {
-      result = await this.authService.refreshToken(refreshToken);
+      // AUT-006: teruskan deviceId peminta (bila dikirim di body) agar
+      // binding perangkat refresh token dapat ditegakkan. Alur web-cookie
+      // (body kosong) tetap jalan via klaim JWT + baris sesi.
+      result = await this.authService.refreshToken(refreshToken, body?.deviceId);
     } catch (error) {
       // A rejected refresh must not leave a browser repeatedly sending an invalid,
       // expired, or revoked HTTP-only token cookie on each subsequent request.

@@ -19,4 +19,25 @@ export class AdminLoginDto {
   @IsString()
   @Matches(/^\d{6}$/)
   totpToken?: string;
+
+  // AUT-001: identitas perangkat — diikat ke TempToken 2FA/MFA agar tidak
+  // bisa dipakai dari perangkat lain bila bocor.
+  @ApiPropertyOptional({ description: 'Device identifier bound to the 2FA/MFA tempToken', maxLength: 128 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  deviceId?: string;
+
+  // AUT-003: slider captcha (protokol yang sama dengan mobile) — wajib bila
+  // backend menjawab 401 CAPTCHA_REQUIRED setelah login gagal berulang.
+  @ApiPropertyOptional({ description: 'Captcha challenge id (required when CAPTCHA_REQUIRED)', maxLength: 128 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  captchaId?: string;
+
+  @ApiPropertyOptional({ description: 'Captcha slider answer (required when CAPTCHA_REQUIRED)' })
+  @IsOptional()
+  @IsString()
+  captchaAnswer?: string;
 }

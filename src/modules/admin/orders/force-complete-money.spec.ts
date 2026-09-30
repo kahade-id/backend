@@ -8,6 +8,10 @@
 import { AdminOrdersService } from './admin-orders.service';
 import { WalletTransactionType } from '@prisma/client';
 
+// AUT-013: re-auth password — hash bcrypt (rounds 4) dari 'CorrectAdm1n!Pass'.
+const ADMIN_PASSWORD_HASH = '$2b$04$waM9I26CpDGikc4wm7f./um84AmUcxOOK/U3/vCIlzu10geRiznVS';
+const ADMIN_PASSWORD = 'CorrectAdm1n!Pass';
+
 const SEN = (idr: number) => BigInt(idr) * BigInt(100);
 
 const BUYER_PAY_SEN = SEN(100000); // Rp100.000
@@ -64,6 +68,14 @@ describe('Batch 8 money — EO-008 force-complete ORDER_RELEASE balance basis', 
     };
     const prisma = {
       order: { findFirst: jest.fn().mockResolvedValue(orderRow) },
+      adminUser: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'admin-1',
+          password: ADMIN_PASSWORD_HASH,
+          isActive: true,
+          deletedAt: null,
+        }),
+      },
       $transaction: jest.fn(async (cb: any) => cb(ptx)),
       notification: { create: jest.fn().mockResolvedValue({}) },
       emitNotificationCreated: jest.fn(),
@@ -91,7 +103,7 @@ describe('Batch 8 money — EO-008 force-complete ORDER_RELEASE balance basis', 
       null as never, // disbursement (tidak dipakai saat wallet aktif)
     );
 
-    const result = await service.forceComplete('ORD-2026-1', 'admin-1', { reason: 'Buyer tidak merespons konfirmasi' } as never);
+    const result = await service.forceComplete('ORD-2026-1', 'admin-1', { reason: 'Buyer tidak merespons konfirmasi', password: ADMIN_PASSWORD } as never);
     expect(result.status).toBe('COMPLETED');
 
     const releases = walletTxCreates.filter((c) => c.type === WalletTransactionType.ORDER_RELEASE);

@@ -456,7 +456,13 @@ export class HealthController {
       };
     }
 
-    const result = await this.health.check([
+    // Pemeriksaan penuh tetap dijalankan untuk penentuan status 200/503
+    // (Terminus melempar ServiceUnavailableException bila ada indikator yang
+    // gagal — itu yang dibaca load balancer/monitor), tetapi hasilnya TIDAK
+    // diserialisasi ke publik. Nama provider, path disk, latensi, dan status
+    // konfigurasi adalah info recon internal — tidak ada alasan terlihat di
+    // browser. Respons publik cukup: status + maintenance + release.
+    await this.health.check([
       (): Promise<HealthIndicatorResult> => this.prismaIndicator.pingCheck('database', this.prisma as unknown as PrismaClient),
       (): Promise<HealthIndicatorResult> => this.redisIndicator.isHealthy('redis'),
       (): Promise<HealthIndicatorResult> => this.diskIndicator.isHealthy('disk'),
@@ -465,15 +471,11 @@ export class HealthController {
       (): Promise<HealthIndicatorResult> => this.smtpIndicator.isHealthy('smtp'),
       (): Promise<HealthIndicatorResult> => this.queueIndicator('queues'),
     ]);
-    // G488: status dependensi terperinci (ok/degraded/down + latency) di
-    // samping indikator boolean Terminus — tanpa secret/kredensial.
-    const dependencies = await this.dependencies.getStatuses().catch(() => []);
     return {
-      ...result,
+      status: 'ok',
       maintenance: false,
       // G490: release version di setiap respons health untuk korelasi deploy.
       release: process.env.RELEASE_SHA || process.env.APP_VERSION || 'unknown',
-      dependencies,
     };
   }
 

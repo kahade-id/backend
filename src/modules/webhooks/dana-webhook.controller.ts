@@ -1,8 +1,9 @@
-import { Body, Controller, Headers, HttpCode, Post, Req } from '@nestjs/common';
-import type { Request } from 'express';
+import { Body, Controller, Headers, HttpCode, Post, Req, Res } from '@nestjs/common';
+import type { Request, Response } from 'express';
 import { RawBodyRequest } from '@nestjs/common';
 import { Public } from '../../common/decorators/public.decorator';
 import { Throttle } from '@nestjs/throttler';
+import { jakartaTimestamp } from '../payment/dana/dana-snap.util';
 import { DanaWebhookSettlementService, DanaWebhookOutcome } from './dana-webhook-settlement.service';
 import { DanaWebhookDisbursementService } from './dana-webhook-disbursement.service';
 
@@ -21,6 +22,8 @@ import { DanaWebhookDisbursementService } from './dana-webhook-disbursement.serv
  * URL: POST /v1/webhooks/dana/disbursement
  * (didaftarkan di DANA dashboard sebagai Disbursement Notify URL)
  * Balas 200 + {responseCode: '2004300'} untuk outcome bisnis.
+ *
+ * Kedua endpoint menyetel header respons X-TIMESTAMP (konvensi webhook DANA).
  */
 @Controller('webhooks/dana')
 export class DanaWebhookController {
@@ -37,7 +40,10 @@ export class DanaWebhookController {
     @Req() req: RawBodyRequest<Request>,
     @Headers() headers: Record<string, string | string[] | undefined>,
     @Body() _body: unknown,
+    @Res({ passthrough: true }) res: Response,
   ): Promise<DanaWebhookOutcome> {
+    // Konvensi webhook DANA: respons menyertakan X-TIMESTAMP.
+    res.setHeader('X-TIMESTAMP', jakartaTimestamp());
     // main.ts sudah mengaktifkan rawBody: true.
     const rawBody = (req.rawBody as Buffer | undefined)?.toString('utf8') ?? '';
     return this.settlement.handleFinishNotify(rawBody, headers, req.path);
@@ -51,7 +57,10 @@ export class DanaWebhookController {
     @Req() req: RawBodyRequest<Request>,
     @Headers() headers: Record<string, string | string[] | undefined>,
     @Body() _body: unknown,
+    @Res({ passthrough: true }) res: Response,
   ): Promise<DanaWebhookOutcome> {
+    // Konvensi webhook DANA: respons menyertakan X-TIMESTAMP.
+    res.setHeader('X-TIMESTAMP', jakartaTimestamp());
     const rawBody = (req.rawBody as Buffer | undefined)?.toString('utf8') ?? '';
     return this.disbursement.handleDisbursNotify(rawBody, headers, req.path);
   }

@@ -20,6 +20,7 @@ describe('DanaRefundRetryService (M3 no-wallet)', () => {
     };
     const escrowDisbursementService = {
       retryDue: jest.fn(async () => 3),
+      reconcileProcessing: jest.fn(async () => ({ checked: 1, settled: 1 })),
     };
     const referralService = {
       payoutPendingReferralRewards: jest.fn(async () => ({ attempted: 1, released: 1 })),
@@ -43,6 +44,7 @@ describe('DanaRefundRetryService (M3 no-wallet)', () => {
 
     expect(danaDirectRefundService.retryFailedRefunds).toHaveBeenCalledWith(50);
     expect(escrowDisbursementService.retryDue).toHaveBeenCalledWith(50);
+    expect(escrowDisbursementService.reconcileProcessing).toHaveBeenCalledWith(50);
     expect(referralService.payoutPendingReferralRewards).toHaveBeenCalledWith(50);
     expect(redis.setNx).toHaveBeenCalledWith('cron_lock:dana_refund_retry', expect.any(String), 600);
     expect(redis.del).toHaveBeenCalledWith('cron_lock:dana_refund_retry');

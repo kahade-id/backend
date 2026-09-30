@@ -17,6 +17,8 @@ import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
  *   ulang — klaim atomik di DanaDirectRefundService menjamin tepat satu
  *   eksekutor per idempotency key.
  * - Disbursement PENDING/FAILED dicoba ulang via EscrowDisbursementService.retryDue().
+ * - Disbursement PROCESSING yang macet (notify webhook tidak tiba) direkonsiliasi
+ *   via EscrowDisbursementService.reconcileProcessing() — query status ke DANA.
  * - M4: referralReward yang diklaim tapi belum cair (isCredited=false) dibayar
  *   via disbursement scope REFERRAL — hanya bila wallet mati.
  *
@@ -62,6 +64,12 @@ export class DanaRefundRetryService {
       const disbursed = await this.escrowDisbursementService.retryDue(50);
       if (disbursed > 0) {
         this.logger.log(`dana-refund-retry: disbursement retry settled=${disbursed}`);
+      }
+      const reconciled = await this.escrowDisbursementService.reconcileProcessing(50);
+      if (reconciled.checked > 0) {
+        this.logger.log(
+          `dana-refund-retry: disbursement reconcile checked=${reconciled.checked} settled=${reconciled.settled}`,
+        );
       }
       // M4: payout referral pending — hanya relevan bila wallet mati.
       if (!this.walletMode.isWalletEnabled()) {

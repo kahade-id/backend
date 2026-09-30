@@ -150,6 +150,72 @@ export class EscrowDisbursementService {
     return settled;
   }
 
+  /**
+   * Rekonsiliasi baris PROCESSING via DANA Transfer-to-Bank Status API.
+   *
+   * Tanpa ini, disbursement yang transfernya diterima DANA tapi notify-nya
+   * tidak pernah tiba (webhook miss / URL belum terdaftar) macet di
+   * PROCESSING selamanya. Hanya polling baris yang sudah >15 menit
+   * (beri kesempatan notify webhook tiba dulu; jangan hantam API DANA
+   * untuk transfer yang baru dikirim).
+   *
+   * Money-safe: status query yang ambigu/exception → baris DIBIARKAN
+   * PROCESSING (tidak ditebak jadi SUCCESS/FAILED).
+   */
+  async reconcileProcessing(limit = 50): Promise<{ checked: number; settled: number }> {
+    const staleAfter = new Date(Date.now() - 15 * 60 * 1000);
+    const rows = await this.prisma.escrowDisbursement.findMany({
+      where: {
+        status: EscrowDisbursementStatus.PROCESSING,
+        danaPartnerReferenceNo: { not: null },
+        updatedAt: { lt: staleAfter },
+      },
+      orderBy: { updatedAt: 'asc' },
+      take: limit,
+      select: { id: true, idempotencyKey: true, danaPartnerReferenceNo: true },
+    });
+    let settled = 0;
+    for (const row of rows) {
+      const partnerRef = row.danaPartnerReferenceNo!;
+      try {
+        const st = await this.danaDisbursement.transferToBankStatus(partnerRef);
+        if (st.status === 'SUCCESS') {
+          await this.prisma.escrowDisbursement.update({
+            where: { id: row.id },
+            data: {
+              status: EscrowDisbursementStatus.SUCCESS,
+              danaReferenceNo: st.referenceNo || undefined,
+              lastError: null,
+              releasedAt: new Date(),
+            },
+          });
+          this.logger.log(`Rekonsiliasi disbursement SUCCESS: key=${row.idempotencyKey}`);
+          settled++;
+        } else if (st.status === 'FAILED' || st.status === 'EXPIRED') {
+          await this.prisma.escrowDisbursement.update({
+            where: { id: row.id },
+            data: {
+              status: EscrowDisbursementStatus.FAILED,
+              lastError: `DANA status query: ${st.status} (rekonsiliasi)`.slice(0, 500),
+            },
+          });
+          this.logger.warn(`Rekonsiliasi disbursement FAILED: key=${row.idempotencyKey} dana=${st.status}`);
+          settled++;
+        } else {
+          // PENDING / UNKNOWN → biarkan PROCESSING; dicek lagi jam berikut.
+          this.logger.debug(`Rekonsiliasi disbursement masih ${st.status}: key=${row.idempotencyKey}`);
+        }
+      } catch (e) {
+        // Query gagal (network/timeout) — JANGAN ubah status; transfer
+        // mungkin masih diproses DANA. Webhook/retry berikut yang menentukan.
+        this.logger.warn(
+          `Rekonsiliasi disbursement query gagal key=${row.idempotencyKey}: ${(e as Error).message}`,
+        );
+      }
+    }
+    return { checked: rows.length, settled };
+  }
+
   private async settle(
     row: { id: string; idempotencyKey: string; sellerId: string; amountSen: bigint; danaPartnerReferenceNo: string | null },
   ): Promise<ReleaseResult> {

@@ -202,4 +202,69 @@ describe('EscrowDisbursementService', () => {
       expect.objectContaining({ data: expect.objectContaining({ scope: 'MILESTONE' }) }),
     );
   });
+
+  describe('reconcileProcessing (E2)', () => {
+    const staleRow = (over: Record<string, unknown> = {}) => ({
+      id: 'disb-stale',
+      idempotencyKey: 'ORDER:o-stale',
+      danaPartnerReferenceNo: 'DSB-ORDEROSTALE',
+      ...over,
+    });
+
+    it('PROCESSING basi + DANA SUCCESS → SUCCESS + releasedAt', async () => {
+      const { svc, prisma, danaDisbursement } = buildDeps();
+      (prisma.escrowDisbursement.findMany as jest.Mock).mockResolvedValue([staleRow()]);
+      (danaDisbursement as any).transferToBankStatus = jest.fn(async () => ({
+        partnerReferenceNo: 'DSB-ORDEROSTALE',
+        referenceNo: 'DANA-REF-1',
+        status: 'SUCCESS',
+      }));
+      const out = await svc.reconcileProcessing(50);
+      expect(out).toEqual({ checked: 1, settled: 1 });
+      expect(prisma.escrowDisbursement.update).toHaveBeenCalledWith({
+        where: { id: 'disb-stale' },
+        data: expect.objectContaining({
+          status: EscrowDisbursementStatus.SUCCESS,
+          danaReferenceNo: 'DANA-REF-1',
+          releasedAt: expect.any(Date),
+        }),
+      });
+    });
+
+    it('PROCESSING basi + DANA FAILED → FAILED (bisa retry via retryDue)', async () => {
+      const { svc, prisma, danaDisbursement } = buildDeps();
+      (prisma.escrowDisbursement.findMany as jest.Mock).mockResolvedValue([staleRow()]);
+      (danaDisbursement as any).transferToBankStatus = jest.fn(async () => ({
+        partnerReferenceNo: 'DSB-ORDEROSTALE',
+        referenceNo: '',
+        status: 'FAILED',
+      }));
+      const out = await svc.reconcileProcessing(50);
+      expect(out).toEqual({ checked: 1, settled: 1 });
+      expect(prisma.escrowDisbursement.update).toHaveBeenCalledWith({
+        where: { id: 'disb-stale' },
+        data: expect.objectContaining({ status: EscrowDisbursementStatus.FAILED }),
+      });
+    });
+
+    it('query DANA gagal → status DIBIARKAN PROCESSING (tidak ditebak)', async () => {
+      const { svc, prisma, danaDisbursement } = buildDeps();
+      (prisma.escrowDisbursement.findMany as jest.Mock).mockResolvedValue([staleRow()]);
+      (danaDisbursement as any).transferToBankStatus = jest.fn(async () => {
+        throw new Error('network timeout');
+      });
+      const out = await svc.reconcileProcessing(50);
+      expect(out).toEqual({ checked: 1, settled: 0 });
+      expect(prisma.escrowDisbursement.update).not.toHaveBeenCalled();
+    });
+
+    it('hanya polling baris PROCESSING basi (updatedAt > 15 menit)', async () => {
+      const { svc, prisma } = buildDeps();
+      await svc.reconcileProcessing(50);
+      const where = (prisma.escrowDisbursement.findMany as jest.Mock).mock.calls[0][0].where;
+      expect(where.status).toBe(EscrowDisbursementStatus.PROCESSING);
+      expect(where.danaPartnerReferenceNo).toEqual({ not: null });
+      expect(where.updatedAt.lt.getTime()).toBeLessThanOrEqual(Date.now() - 14 * 60 * 1000);
+    });
+  });
 });

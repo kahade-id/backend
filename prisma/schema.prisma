@@ -1839,11 +1839,14 @@ enum EscrowDisbursementScope {
 
 enum EscrowDisbursementStatus {
   PENDING // dibuat, belum dieksekusi
-  HELD_NO_BANK // fail-closed: seller belum punya rekening terdaftar
+  HELD_NO_BANK // fail-closed: seller belum punya rekening terverifikasi
   PROCESSING // transfer terkirim, menunggu konfirmasi final
   SUCCESS
   FAILED // gagal provider — bisa retry (idempoten via idempotencyKey)
   CANCELLED // dibatalkan (mis. legacy payout yang debitnya dikompensasi)
+  // Status DANA di luar 00–07 (tak dikenal) — JANGAN otomatis FAILED;
+  // butuh review manual sebelum diputuskan (webhook disbursement).
+  NEEDS_REVIEW
 }
 
 // ============================================================

@@ -10,6 +10,7 @@ import {
   ActorType,
   OrderStatus,
   PaymentMethod,
+  PaymentProvider,
   PaymentPurpose,
   PaymentStatus,
   Prisma,
@@ -27,6 +28,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 // order satu tahap existing.
 import { activateMilestonesForOrderTx } from '../milestones/milestone-activation';
 import { MidtransService } from './midtrans.service';
+import { DanaPaymentService } from './dana/dana-payment.service';
 
 const DEFAULT_QRIS_EXPIRY_MINUTES = 30;
 
@@ -51,6 +53,7 @@ export class OrderQrisPaymentService {
     private readonly midtrans: MidtransService,
     private readonly config: ConfigService,
     private readonly walletTxSerialService: WalletTxSerialService,
+    private readonly danaPayment: DanaPaymentService,
   ) {}
 
   private qrisFee(amount: number): number {
@@ -565,16 +568,31 @@ export class OrderQrisPaymentService {
         status: PaymentStatus.PENDING,
       },
       orderBy: { createdAt: 'desc' },
-      select: { midtransOrderId: true },
+      select: {
+        provider: true,
+        midtransOrderId: true,
+        danaPartnerReferenceNo: true,
+      },
     });
     if (!payment) return;
+    // E3 (2026-09-30): cancel harus menyentuh provider yang benar. Sebelumnya
+    // SELALU memanggil midtrans.cancelTransaction — order DANA tetap hidup
+    // di DANA (buyer masih bisa bayar setelah order CANCELLED).
     try {
-      await this.midtrans.cancelTransaction(payment.midtransOrderId);
+      if (payment.provider === PaymentProvider.DANA && payment.danaPartnerReferenceNo) {
+        await this.danaPayment.cancelOrder(
+          payment.danaPartnerReferenceNo,
+          'Order cancelled by merchant',
+        );
+        this.logger.log(`DANA order dibatalkan: ${payment.danaPartnerReferenceNo}`);
+      } else {
+        await this.midtrans.cancelTransaction(payment.midtransOrderId);
+      }
     } catch (error) {
       // Cancellation can race a settlement. The settlement path identifies the already-cancelled
       // order and requests a refund to the original QRIS channel instead of crediting the wallet.
       this.logger.warn(
-        `Provider QRIS cancellation could not be confirmed for ${payment.midtransOrderId}: ${error instanceof Error ? error.message : String(error)}`,
+        `Provider cancellation could not be confirmed for order ${orderId}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }

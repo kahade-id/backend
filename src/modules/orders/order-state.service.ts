@@ -7,7 +7,7 @@ import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { ReferralService } from '../referral/referral.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { MembershipRankService } from './membership-rank.service';
-import { OrderStatus, OrderCancelReason, ActorType, WalletTransactionType, WalletTransactionStatus, SubscriptionStatus, NotificationType, Prisma, VoucherType } from '@prisma/client';
+import { OrderStatus, OrderCancelReason, ActorType, WalletTransactionType, WalletTransactionStatus, SubscriptionStatus, NotificationType, Prisma, VoucherType, EscrowDisbursementScope, EscrowDisbursementStatus } from '@prisma/client';
 import { addDays, resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
 import { rollbackOrderVoucherUsage } from '../../common/utils/voucher-rollback.util';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
@@ -601,6 +601,10 @@ export class OrderStateService {
     let referralRewardCredited = false;
     // M4 no-wallet: intent payout cashback DANA (dieksekusi post-commit).
     let danaCashback: { params: { orderDbId: string; orderPublicId: string; source: string }; intent: DanaCashbackIntent } | null = null;
+    // E1 (2026-09-30): release escrow DANA untuk order single-stage mode
+    // no-wallet — baris PENDING dibuat di dalam tx, settlement dieksekusi
+    // post-commit (pola sama M5 milestone).
+    let danaEscrowRelease: { orderDbId: string; orderPublicId: string } | null = null;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -676,167 +680,207 @@ export class OrderStateService {
         }
       }
 
-      const buyerWalletPreLock = await tx.wallet.findUnique({ where: { userId: order.buyerId }, select: { id: true } });
-      const sellerWalletPreLock = await tx.wallet.findUnique({ where: { userId: order.sellerId }, select: { id: true } });
-
-      if (!buyerWalletPreLock || !sellerWalletPreLock) {
-        throw new BadRequestException({ code: ErrorCodes.NOT_FOUND, message: 'Wallet not found during escrow release' });
-      }
-
-      const [firstId, secondId] = [buyerWalletPreLock.id, sellerWalletPreLock.id].sort();
-      await tx.$queryRaw`SELECT id FROM wallets WHERE id IN (${firstId}, ${secondId}) ORDER BY id FOR UPDATE`;
-
-      const buyerWallet = await tx.wallet.findUnique({ where: { id: buyerWalletPreLock.id } });
-      const sellerWallet = await tx.wallet.findUnique({ where: { id: sellerWalletPreLock.id } });
-
-      if (!buyerWallet || !sellerWallet) {
-        throw new BadRequestException({ code: ErrorCodes.NOT_FOUND, message: 'Wallet not found during escrow release' });
-      }
-
-      const escrowLock = await tx.walletTransaction.findFirst({
-        where: { orderId: order.id, type: WalletTransactionType.ORDER_LOCK, status: WalletTransactionStatus.SUCCESS },
-        select: { amount: true },
-      });
-      if (!escrowLock || escrowLock.amount !== order.buyerPayAmount) {
-        throw new ConflictException({ code: ErrorCodes.ESCROW_LOCK_MISSING, message: 'Escrow lock ledger is missing or does not match this order' });
-      }
-
-      // Batch 1-money (EO-005): kredit cashback kini via helper bersama idempoten
-      // (creditCashbackIfEligible) yang dipanggil setelah update escrow utama di bawah.
-      // Update wallet di sini TIDAK lagi melipat cashback — net effect identik.
-
-      if (buyerWallet.isLocked) {
-        throw new BadRequestException({ code: 'WALLET_LOCKED', message: 'Buyer wallet is locked. Cannot proceed with escrow release.' });
-      }
-      if (sellerWallet.isLocked) {
-        throw new BadRequestException({ code: 'WALLET_LOCKED', message: 'Seller wallet is locked. Cannot proceed with escrow release.' });
-      }
-
-      const buyerBalanceBefore = buyerWallet.escrowBalance;
-      const buyerBalanceAfter = buyerWallet.escrowBalance - order.buyerPayAmount;
-      const sellerBalanceBefore = sellerWallet.availableBalance;
-      // M6: rebate overfunding patungan — kelebihan dana grup dibagi rata ke
-      // tiap peserta sebagai pengurang nyata: pembeli terima kembali `rebate`,
-      // host terima sellerReceiveAmount − rebate. Dihitung di dalam tx (setelah
-      // row lock dompet) dari himpunan peserta PAID/RELEASED yang final.
-      const patunganRebate = await computePatunganRebateTx(tx, order.id);
-      let rebate = patunganRebate?.rebateSen ?? 0n;
-      // Fail-safe: rebate tidak boleh melebihi penerimaan seller — jangan
-      // pernah membuat kredit negatif ke host.
-      if (rebate > order.sellerReceiveAmount) rebate = order.sellerReceiveAmount;
-      const sellerBalanceAfter = sellerWallet.availableBalance + order.sellerReceiveAmount - rebate;
-      // Batch 1-money (EO-005): cashback dikredit terpisah via creditCashbackIfEligible
-      // setelah update escrow utama — tidak lagi dilipat di sini.
-      const buyerWalletData: Prisma.WalletUpdateManyMutationInput = {
-        escrowBalance: { decrement: order.buyerPayAmount },
-        totalBalance: { decrement: order.buyerPayAmount - rebate },
-        version: { increment: 1 },
-      };
-      if (rebate > 0n) {
-        buyerWalletData.availableBalance = { increment: rebate };
-      }
-
-      const buyerUpdated = await tx.wallet.updateMany({
-        where: { id: buyerWallet.id, version: buyerWallet.version, escrowBalance: { gte: order.buyerPayAmount } },
-        data: buyerWalletData,
-      });
-      if (buyerUpdated.count === 0) {
-        throw new ConflictException({ code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT, message: 'Concurrent escrow release detected, please retry' });
-      }
-
-      const sellerUpdated = await tx.wallet.updateMany({
-        where: { id: sellerWallet.id, version: sellerWallet.version },
-        data: {
-          availableBalance: { increment: order.sellerReceiveAmount - rebate },
-          totalBalance: { increment: order.sellerReceiveAmount - rebate },
-          version: { increment: 1 },
-        },
-      });
-      if (sellerUpdated.count === 0) {
-        throw new ConflictException({ code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT, message: 'Concurrent wallet update on seller detected, please retry' });
-      }
-
-      const releaseTxId = generateWalletTxId(releaseTxSerial);
-      await tx.walletTransaction.create({
-        data: {
-          txId: releaseTxId,
-          walletId: buyerWallet.id,
-          type: WalletTransactionType.ORDER_RELEASE,
-          status: WalletTransactionStatus.SUCCESS,
-          amount: order.buyerPayAmount,
-          balanceBefore: buyerBalanceBefore,
-          balanceAfter: buyerBalanceAfter,
-          orderId: order.id,
-          description: `Escrow released for completed order ${order.orderId}`,
-        },
-      });
-
-      const receiveTxId = generateWalletTxId(receiveTxSerial);
-      await tx.walletTransaction.create({
-        data: {
-          txId: receiveTxId,
-          walletId: sellerWallet.id,
-          type: WalletTransactionType.ORDER_RELEASE,
-          status: WalletTransactionStatus.SUCCESS,
-          amount: order.sellerReceiveAmount - rebate,
-          balanceBefore: sellerBalanceBefore,
-          balanceAfter: sellerBalanceAfter,
-          orderId: order.id,
-          description: `Payment received for completed order ${order.orderId}`,
-        },
-      });
-
-      // M6: baris ledger rebate overfunding patungan (idempoten via guard di
-      // computePatunganRebateTx) — bukti bahwa kelebihan dibagi rata dan
-      // benar-benar mengurangi beban peserta.
-      if (rebate > 0n && patunganRebate) {
-        const rebateTxId = generateWalletTxId(await nextRebateTxSerial());
-        await createPatunganRebateLedgerTx(tx, {
-          txId: rebateTxId,
-          buyerWalletId: buyerWallet.id,
-          orderDbId: order.id,
-          orderPublicId: order.orderId,
-          groupId: patunganRebate.groupId,
-          rebateSen: rebate,
-          buyerAvailableBefore: buyerWallet.availableBalance,
-        });
-      }
-
-      // Batch 1-money (EO-005): kredit cashback via helper bersama idempoten.
-      // Dijalankan setelah update escrow utama agar balanceBefore ledger konsisten.
-      // M4 no-wallet: wallet mati -> rencanakan payout DANA (dieksekusi post-commit).
+      // E1 (2026-09-30): pelepasan escrow bercabang mode.
+      // Wallet AKTIF -> blok ledger wallet di bawah (ORDER_LOCK/ORDER_RELEASE/
+      // FEE_DEDUCT). Wallet MATI (DANA-direct) -> lewati seluruh blok wallet
+      // (tidak ada ORDER_LOCK di mode ini; dulu selalu lempar ESCROW_LOCK_MISSING).
+      // Sebagai gantinya buat baris disbursement PENDING yang durable;
+      // settlement DANA dieksekusi post-commit (pola sama M5 milestone).
       if (this.walletMode.isWalletEnabled()) {
-        await creditCashbackIfEligible(tx, nextCashbackTxSerial, {
-          orderDbId: order.id,
-          orderPublicId: order.orderId,
-          source: 'completeOrder',
-        });
-      } else {
-        const params = { orderDbId: order.id, orderPublicId: order.orderId, source: 'completeOrder' };
-        const intent = await planDanaCashback(tx, params);
-        danaCashback = intent ? { params, intent } : null;
-      }
+        const buyerWalletPreLock = await tx.wallet.findUnique({ where: { userId: order.buyerId }, select: { id: true } });
+        const sellerWalletPreLock = await tx.wallet.findUnique({ where: { userId: order.sellerId }, select: { id: true } });
 
-      // feeAmount = buyerPayAmount − sellerReceiveAmount.
-      // The fee amount is removed from the buyer's escrow (already done above via
-      // buyerPayAmount decrement) but not credited to the seller. This FEE_DEDUCT
-      // record provides the audit trail that accounts for the discrepancy, so
-      // the platform revenue is auditable without requiring a separate platform wallet.
-      if (order.feeAmount > BigInt(0)) {
-        const feeTxId = generateWalletTxId(await nextFeeTxSerial());
-        await tx.walletTransaction.create({
+        if (!buyerWalletPreLock || !sellerWalletPreLock) {
+          throw new BadRequestException({ code: ErrorCodes.NOT_FOUND, message: 'Wallet not found during escrow release' });
+        }
+
+        const [firstId, secondId] = [buyerWalletPreLock.id, sellerWalletPreLock.id].sort();
+        await tx.$queryRaw`SELECT id FROM wallets WHERE id IN (${firstId}, ${secondId}) ORDER BY id FOR UPDATE`;
+
+        const buyerWallet = await tx.wallet.findUnique({ where: { id: buyerWalletPreLock.id } });
+        const sellerWallet = await tx.wallet.findUnique({ where: { id: sellerWalletPreLock.id } });
+
+        if (!buyerWallet || !sellerWallet) {
+          throw new BadRequestException({ code: ErrorCodes.NOT_FOUND, message: 'Wallet not found during escrow release' });
+        }
+
+        const escrowLock = await tx.walletTransaction.findFirst({
+          where: { orderId: order.id, type: WalletTransactionType.ORDER_LOCK, status: WalletTransactionStatus.SUCCESS },
+          select: { amount: true },
+        });
+        if (!escrowLock || escrowLock.amount !== order.buyerPayAmount) {
+          throw new ConflictException({ code: ErrorCodes.ESCROW_LOCK_MISSING, message: 'Escrow lock ledger is missing or does not match this order' });
+        }
+
+        // Batch 1-money (EO-005): kredit cashback kini via helper bersama idempoten
+        // (creditCashbackIfEligible) yang dipanggil setelah update escrow utama di bawah.
+        // Update wallet di sini TIDAK lagi melipat cashback — net effect identik.
+
+        if (buyerWallet.isLocked) {
+          throw new BadRequestException({ code: 'WALLET_LOCKED', message: 'Buyer wallet is locked. Cannot proceed with escrow release.' });
+        }
+        if (sellerWallet.isLocked) {
+          throw new BadRequestException({ code: 'WALLET_LOCKED', message: 'Seller wallet is locked. Cannot proceed with escrow release.' });
+        }
+
+        const buyerBalanceBefore = buyerWallet.escrowBalance;
+        const buyerBalanceAfter = buyerWallet.escrowBalance - order.buyerPayAmount;
+        const sellerBalanceBefore = sellerWallet.availableBalance;
+        // M6: rebate overfunding patungan — kelebihan dana grup dibagi rata ke
+        // tiap peserta sebagai pengurang nyata: pembeli terima kembali `rebate`,
+        // host terima sellerReceiveAmount − rebate. Dihitung di dalam tx (setelah
+        // row lock dompet) dari himpunan peserta PAID/RELEASED yang final.
+        const patunganRebate = await computePatunganRebateTx(tx, order.id);
+        let rebate = patunganRebate?.rebateSen ?? 0n;
+        // Fail-safe: rebate tidak boleh melebihi penerimaan seller — jangan
+        // pernah membuat kredit negatif ke host.
+        if (rebate > order.sellerReceiveAmount) rebate = order.sellerReceiveAmount;
+        const sellerBalanceAfter = sellerWallet.availableBalance + order.sellerReceiveAmount - rebate;
+        // Batch 1-money (EO-005): cashback dikredit terpisah via creditCashbackIfEligible
+        // setelah update escrow utama — tidak lagi dilipat di sini.
+        const buyerWalletData: Prisma.WalletUpdateManyMutationInput = {
+          escrowBalance: { decrement: order.buyerPayAmount },
+          totalBalance: { decrement: order.buyerPayAmount - rebate },
+          version: { increment: 1 },
+        };
+        if (rebate > 0n) {
+          buyerWalletData.availableBalance = { increment: rebate };
+        }
+
+        const buyerUpdated = await tx.wallet.updateMany({
+          where: { id: buyerWallet.id, version: buyerWallet.version, escrowBalance: { gte: order.buyerPayAmount } },
+          data: buyerWalletData,
+        });
+        if (buyerUpdated.count === 0) {
+          throw new ConflictException({ code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT, message: 'Concurrent escrow release detected, please retry' });
+        }
+
+        const sellerUpdated = await tx.wallet.updateMany({
+          where: { id: sellerWallet.id, version: sellerWallet.version },
           data: {
-            txId: feeTxId,
-            walletId: buyerWallet.id,
-            type: WalletTransactionType.FEE_DEDUCT,
-            status: WalletTransactionStatus.SUCCESS,
-            amount: order.feeAmount,
-            balanceBefore: buyerWallet.totalBalance,
-            balanceAfter: buyerWallet.totalBalance - order.feeAmount,
-            orderId: order.id,
-            description: `Platform fee for order ${order.orderId}`,
+            availableBalance: { increment: order.sellerReceiveAmount - rebate },
+            totalBalance: { increment: order.sellerReceiveAmount - rebate },
+            version: { increment: 1 },
           },
         });
+        if (sellerUpdated.count === 0) {
+          throw new ConflictException({ code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT, message: 'Concurrent wallet update on seller detected, please retry' });
+        }
+
+        const releaseTxId = generateWalletTxId(releaseTxSerial);
+        await tx.walletTransaction.create({
+          data: {
+            txId: releaseTxId,
+            walletId: buyerWallet.id,
+            type: WalletTransactionType.ORDER_RELEASE,
+            status: WalletTransactionStatus.SUCCESS,
+            amount: order.buyerPayAmount,
+            balanceBefore: buyerBalanceBefore,
+            balanceAfter: buyerBalanceAfter,
+            orderId: order.id,
+            description: `Escrow released for completed order ${order.orderId}`,
+          },
+        });
+
+        const receiveTxId = generateWalletTxId(receiveTxSerial);
+        await tx.walletTransaction.create({
+          data: {
+            txId: receiveTxId,
+            walletId: sellerWallet.id,
+            type: WalletTransactionType.ORDER_RELEASE,
+            status: WalletTransactionStatus.SUCCESS,
+            amount: order.sellerReceiveAmount - rebate,
+            balanceBefore: sellerBalanceBefore,
+            balanceAfter: sellerBalanceAfter,
+            orderId: order.id,
+            description: `Payment received for completed order ${order.orderId}`,
+          },
+        });
+
+        // M6: baris ledger rebate overfunding patungan (idempoten via guard di
+        // computePatunganRebateTx) — bukti bahwa kelebihan dibagi rata dan
+        // benar-benar mengurangi beban peserta.
+        if (rebate > 0n && patunganRebate) {
+          const rebateTxId = generateWalletTxId(await nextRebateTxSerial());
+          await createPatunganRebateLedgerTx(tx, {
+            txId: rebateTxId,
+            buyerWalletId: buyerWallet.id,
+            orderDbId: order.id,
+            orderPublicId: order.orderId,
+            groupId: patunganRebate.groupId,
+            rebateSen: rebate,
+            buyerAvailableBefore: buyerWallet.availableBalance,
+          });
+        }
+
+        // Batch 1-money (EO-005): kredit cashback via helper bersama idempoten.
+        // Dijalankan setelah update escrow utama agar balanceBefore ledger konsisten.
+        // M4 no-wallet: wallet mati -> rencanakan payout DANA (dieksekusi post-commit).
+        if (this.walletMode.isWalletEnabled()) {
+          await creditCashbackIfEligible(tx, nextCashbackTxSerial, {
+            orderDbId: order.id,
+            orderPublicId: order.orderId,
+            source: 'completeOrder',
+          });
+        } else {
+          const params = { orderDbId: order.id, orderPublicId: order.orderId, source: 'completeOrder' };
+          const intent = await planDanaCashback(tx, params);
+          danaCashback = intent ? { params, intent } : null;
+        }
+
+        // feeAmount = buyerPayAmount − sellerReceiveAmount.
+        // The fee amount is removed from the buyer's escrow (already done above via
+        // buyerPayAmount decrement) but not credited to the seller. This FEE_DEDUCT
+        // record provides the audit trail that accounts for the discrepancy, so
+        // the platform revenue is auditable without requiring a separate platform wallet.
+        if (order.feeAmount > BigInt(0)) {
+          const feeTxId = generateWalletTxId(await nextFeeTxSerial());
+          await tx.walletTransaction.create({
+            data: {
+              txId: feeTxId,
+              walletId: buyerWallet.id,
+              type: WalletTransactionType.FEE_DEDUCT,
+              status: WalletTransactionStatus.SUCCESS,
+              amount: order.feeAmount,
+              balanceBefore: buyerWallet.totalBalance,
+              balanceAfter: buyerWallet.totalBalance - order.feeAmount,
+              orderId: order.id,
+              description: `Platform fee for order ${order.orderId}`,
+            },
+          });
+        }
+      } else {
+        if (!this.escrowDisbursementService) {
+          throw new BadRequestException({
+            code: 'DISBURSEMENT_UNAVAILABLE',
+            message: 'Layanan disbursement DANA tidak tersedia — release escrow ditahan (fail-closed).',
+          });
+        }
+        // Fail-closed: tanpa sellerReceiveAmount yang valid, jangan cairkan apa pun.
+        if (order.sellerReceiveAmount == null || order.sellerReceiveAmount <= BigInt(0)) {
+          throw new BadRequestException({
+            code: 'ORDER_NOT_RELEASE_ELIGIBLE',
+            message: 'Nominal pencairan escrow tidak valid — release ditahan (fail-closed).',
+          });
+        }
+        const disbKey = `ORDER:${order.id}`;
+        const existingDisb = await tx.escrowDisbursement.findUnique({
+          where: { idempotencyKey: disbKey },
+          select: { id: true },
+        });
+        if (!existingDisb) {
+          await tx.escrowDisbursement.create({
+            data: {
+              idempotencyKey: disbKey,
+              scope: EscrowDisbursementScope.ORDER_ESCROW,
+              orderId: order.id,
+              sellerId: order.sellerId,
+              amountSen: order.sellerReceiveAmount,
+              status: EscrowDisbursementStatus.PENDING,
+            },
+          });
+        }
+        danaEscrowRelease = { orderDbId: order.id, orderPublicId: order.orderId };
       }
 
       await Promise.all([
@@ -918,6 +962,29 @@ export class OrderStateService {
       this.runPostCommitBestEffort(
         () => { void executeDanaCashback(executor, params, intent); },
         'cashback-dana',
+      );
+    }
+
+    // E1 (2026-09-30): eksekusi release escrow DANA post-commit untuk order
+    // single-stage mode no-wallet (idempoten, key ORDER:<orderDbId>).
+    // Baris PENDING sudah durable di dalam tx -> bila post-commit ini gagal
+    // (atau proses mati), scheduler retryDue() mengambil alih (pola M5).
+    if (danaEscrowRelease && this.escrowDisbursementService) {
+      const { orderDbId, orderPublicId } = danaEscrowRelease;
+      const executor = this.escrowDisbursementService;
+      this.runPostCommitBestEffort(
+        () => {
+          void executor
+            .releaseForOrder(orderDbId)
+            .then((res) => {
+              if (res.outcome === 'HELD_NO_BANK') {
+                this.logger.warn(
+                  `escrow-release-dana ${orderPublicId}: HELD_NO_BANK — menunggu rekening bank seller`,
+                );
+              }
+            });
+        },
+        'escrow-release-dana',
       );
     }
 

@@ -217,7 +217,7 @@ export class EscrowDisbursementService {
   }
 
   private async settle(
-    row: { id: string; idempotencyKey: string; sellerId: string; amountSen: bigint; danaPartnerReferenceNo: string | null },
+    row: { id: string; idempotencyKey: string; sellerId: string; amountSen: bigint; danaPartnerReferenceNo: string | null; orderId: string | null },
   ): Promise<ReleaseResult> {
     // 1) Rekening bank seller wajib ada (primary, tidak dihapus)
     const bank = await this.prisma.bankAccount.findFirst({

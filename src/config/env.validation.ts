@@ -273,6 +273,12 @@ export function validateEnv(env: Env): Env {
   optionalInt(env, 'THROTTLE_GLOBAL_LIMIT', 100, 1, 10000, errors)
   optionalInt(env, 'TOPUP_EXPIRY_HOURS', 24, 1, 168, errors)
   optionalInt(env, 'EXPORT_MAX_DATE_RANGE_DAYS', 90, 7, 365, errors)
+  // DBL-005 (audit integrasi 2026-10-01): env UPLOAD_MAX_*_MB HANYA
+  // divalidasi di sini — TIDAK ditegakkan. Batas aktual yang dipakai
+  // upload.service.ts adalah MAX_FILE_SIZE yang di-hardcode
+  // (avatar 2, chat 50, kyc 5, dispute-evidence 50, report-evidence 10 MB).
+  // Mengubah env ini (mis. UPLOAD_MAX_EVIDENCE_MB default 5) TIDAK
+  // berpengaruh pada penegakan ukuran file — jangan mengandalkannya.
   optionalInt(env, 'UPLOAD_MAX_AVATAR_MB', 2, 1, 10, errors)
   optionalInt(env, 'UPLOAD_MAX_CHAT_MB', 10, 1, 50, errors)
   optionalInt(env, 'UPLOAD_MAX_KYC_MB', 5, 1, 50, errors)

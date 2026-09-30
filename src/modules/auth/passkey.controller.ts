@@ -7,12 +7,14 @@ import {
   Body,
   Param,
   Req,
+  Res,
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { Throttle, SkipThrottle } from '@nestjs/throttler';
-import type { Request } from 'express';
+import { ConfigService } from '@nestjs/config';
+import type { Request, Response } from 'express';
 import { PasskeyService } from './passkey.service';
 import {
   PasskeyRegisterOptionsDto,
@@ -25,6 +27,7 @@ import {
 } from './dto/passkey.dto';
 import { Public } from '../../common/decorators/public.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { AllowResponseFields } from '../../common/decorators/allow-response-fields.decorator';
 
 /**
  * Passkey / WebAuthn (GAP-A: G026–G050).
@@ -96,9 +99,25 @@ export class PasskeyController {
   @Throttle({ default: { ttl: 60000, limit: 5 } })
   @Post('auth/verify')
   @HttpCode(HttpStatus.OK)
+  @AllowResponseFields('refreshToken')
   @ApiOperation({ summary: 'Verifikasi assertion & terbitkan sesi (publik)' })
-  async authVerify(@Body() dto: PasskeyAuthVerifyDto, @Req() req: Request) {
-    return this.passkeyService.verifyAuthentication(dto, this.clientIp(req));
+  async authVerify(
+    @Body() dto: PasskeyAuthVerifyDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const result = await this.passkeyService.verifyAuthentication(dto, this.clientIp(req));
+    // BFI-034: samakan dengan endpoint penerbit token lain di auth.controller
+    // (login/verify-otp/social): refreshToken lolos interceptor + cookie
+    // httpOnly untuk web. Tanpa ini sesi passkey mati tiap 15 menit.
+    const rec = result as unknown as Record<string, unknown> | null;
+    if (rec && typeof rec.refreshToken === 'string' && rec.refreshToken) {
+      this.setRefreshTokenCookie(res, rec.refreshToken);
+      if (typeof rec.accessToken === 'string' && rec.accessToken) {
+        this.setAccessTokenCookie(res, rec.accessToken);
+      }
+    }
+    return result;
   }
 
   // ── Manajemen ─────────────────────────────────────────────────────

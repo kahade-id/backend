@@ -21,6 +21,13 @@ describe('OpsSettingsService', () => {
         store.set(where.key, merged);
         return merged;
       }),
+      // BAI-104: mock delete untuk "kembalikan ke default".
+      delete: jest.fn(async ({ where }: any) => {
+        const row = store.get(where.key);
+        if (!row) throw new Error('Record to delete does not exist.');
+        store.delete(where.key);
+        return row;
+      }),
     },
     appSettingAudit: {
       create: jest.fn(async ({ data }: any) => {
@@ -42,6 +49,12 @@ describe('OpsSettingsService', () => {
     // findMany mock di-clear oleh clearAllMocks — pasang ulang.
     mockPrisma.appSetting.findMany.mockImplementation(async () => [...store.values()]);
     mockPrisma.appSetting.findUnique.mockImplementation(async ({ where }: any) => store.get(where.key) ?? null);
+    mockPrisma.appSetting.delete.mockImplementation(async ({ where }: any) => {
+      const row = store.get(where.key);
+      if (!row) throw new Error('Record to delete does not exist.');
+      store.delete(where.key);
+      return row;
+    });
     mockPrisma.appSetting.upsert.mockImplementation(async ({ where, create, update }: any) => {
       const merged = { ...(store.get(where.key) ?? {}), ...create, ...update };
       store.set(where.key, merged);
@@ -165,5 +178,137 @@ describe('OpsSettingsService', () => {
     } finally {
       (global as any).fetch = origFetch;
     }
+  });
+
+  // ── BAI-104: DELETE / kembalikan ke default ──────────────────────────────
+  it('BAI-104: delete menghapus override panel, audit DELETE, fallback ke .env', async () => {
+    await service.set('FONNTE_COUNTRY_CODE', '1', 'admin1');
+    expect(service.get('FONNTE_COUNTRY_CODE')).toBe('1');
+    const view = await service.delete('FONNTE_COUNTRY_CODE', 'admin1');
+    expect(store.has('FONNTE_COUNTRY_CODE')).toBe(false);
+    expect(view.source).not.toBe('db');
+    expect(view.configured).toBe(false); // tanpa .env di lingkungan test
+    const last = audits[audits.length - 1];
+    expect(last.action).toBe('DELETE');
+    expect(last.key).toBe('FONNTE_COUNTRY_CODE');
+  });
+
+  it('BAI-104: delete menolak key tanpa override panel', async () => {
+    await expect(service.delete('FONNTE_COUNTRY_CODE', 'admin1')).rejects.toThrow(
+      /tidak punya override panel/,
+    );
+  });
+
+  it('BAI-104: delete menolak key yang tidak manageable', async () => {
+    await expect(service.delete('JWT_SECRET', 'admin1')).rejects.toThrow(/tidak bisa dikelola/);
+  });
+
+  // ── BAI-111: validasi ketat MAINTENANCE_MODE ──────────────────────────────
+  it('BAI-111: set MAINTENANCE_MODE menolak "yes"/"1"/"on"', async () => {
+    for (const bad of ['yes', '1', 'on', 'aktif']) {
+      await expect(service.set('MAINTENANCE_MODE', bad, 'admin1')).rejects.toThrow(
+        /hanya menerima "true" atau "false"/,
+      );
+    }
+    expect(store.has('MAINTENANCE_MODE')).toBe(false);
+  });
+
+  it('BAI-111: set MAINTENANCE_MODE menerima "true"/"false" (case-insensitive)', async () => {
+    await service.set('MAINTENANCE_MODE', 'TRUE', 'admin1');
+    expect(service.get('MAINTENANCE_MODE')).toBe('true');
+    await service.set('MAINTENANCE_MODE', 'false', 'admin1');
+    expect(service.get('MAINTENANCE_MODE')).toBe('false');
+  });
+
+  // ── BAI-117: bedakan belum-diset vs gagal-dekripsi ────────────────────────
+  it('BAI-117: status "not_set" bila tidak ada baris DB maupun .env', () => {
+    const views = (service as any).toView(
+      MANAGEABLE_SETTING_MAP.get('FONNTE_API_TOKEN')!,
+    );
+    expect(views.status).toBe('not_set');
+    expect(views.configured).toBe(false);
+  });
+
+  it('BAI-117: status "decrypt_failed" bila baris DB ada tapi gagal didekripsi', async () => {
+    delete process.env.FONNTE_API_TOKEN; // pastikan fallback .env tidak menutupi
+    store.set('FONNTE_API_TOKEN', {
+      key: 'FONNTE_API_TOKEN',
+      value: 'bukan-ciphertext-valid',
+      isSecret: true,
+      label: 'Fonnte API Token',
+      updatedAt: new Date(),
+      updatedBy: 'admin1',
+      version: 2,
+    });
+    await (service as any).reload();
+    const view = (service as any).toView(MANAGEABLE_SETTING_MAP.get('FONNTE_API_TOKEN')!);
+    expect(view.status).toBe('decrypt_failed');
+    expect(view.configured).toBe(false);
+    // Fail-closed: nilai korup tidak dipakai sebagai token.
+    expect(service.getSecret('FONNTE_API_TOKEN')).toBeUndefined();
+  });
+
+  // ── BAI-118: optimistic locking ───────────────────────────────────────────
+  it('BAI-118: set dengan expectedVersion cocok berhasil & menaikkan versi', async () => {
+    const v1 = await service.set('FONNTE_COUNTRY_CODE', '1', 'admin1');
+    expect(v1.version).toBe(1);
+    const v2 = await service.set('FONNTE_COUNTRY_CODE', '44', 'admin1', {
+      expectedVersion: 1,
+    });
+    expect(v2.version).toBe(2);
+    expect(service.get('FONNTE_COUNTRY_CODE')).toBe('44');
+  });
+
+  it('BAI-118: set dengan expectedVersion basi melempar OpsSettingConflictError', async () => {
+    const { OpsSettingConflictError } = await import('../ops-settings.service');
+    await service.set('FONNTE_COUNTRY_CODE', '1', 'admin1');
+    // Simulasi admin B mengubah duluan.
+    await service.set('FONNTE_COUNTRY_CODE', '44', 'admin2');
+    await expect(
+      service.set('FONNTE_COUNTRY_CODE', '81', 'admin1', { expectedVersion: 1 }),
+    ).rejects.toBeInstanceOf(OpsSettingConflictError);
+    // Nilai admin B tetap menang (tidak tertimpa).
+    expect(service.get('FONNTE_COUNTRY_CODE')).toBe('44');
+  });
+
+  it('BAI-118: baris yang belum pernah diset dianggap versi 0', async () => {
+    const { OpsSettingConflictError } = await import('../ops-settings.service');
+    await expect(
+      service.set('FONNTE_COUNTRY_CODE', '1', 'admin1', { expectedVersion: 5 }),
+    ).rejects.toBeInstanceOf(OpsSettingConflictError);
+    const view = await service.set('FONNTE_COUNTRY_CODE', '1', 'admin1', {
+      expectedVersion: 0,
+    });
+    expect(view.version).toBe(1);
+  });
+
+  // ── BAI-101: validasi lunak env ───────────────────────────────────────────
+  it('BAI-101: collectEnvWarnings memberi warning (tanpa throw) untuk token fonnte kosong', async () => {
+    const { collectEnvWarnings, validateEnv } = await import('../../../config/env.validation');
+    const warnings = collectEnvWarnings({
+      OTP_PROVIDER: 'fonnte',
+      NODE_ENV: 'development',
+    } as any);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/FONNTE_API_TOKEN.*admin panel/);
+  });
+
+  it('BAI-101: validateEnv TIDAK memblokir boot karena FONNTE_API_TOKEN kosong (validasi lunak)', async () => {
+    const { validateEnv } = await import('../../../config/env.validation');
+    try {
+      validateEnv({ OTP_PROVIDER: 'fonnte', NODE_ENV: 'development' } as any);
+    } catch (e) {
+      // Boleh tetap gagal karena var WAJIB lain (SMTP dsb. — fail-closed boot
+      // dipertahankan), tapi JANGAN karena token fonnte yang bisa diprovisioning
+      // belakangan via panel.
+      expect(String((e as Error).message)).not.toMatch(/FONNTE_API_TOKEN/);
+    }
+  });
+
+  it('BAI-101: tidak ada warning bila token fonnte terisi', async () => {
+    const { collectEnvWarnings } = await import('../../../config/env.validation');
+    expect(
+      collectEnvWarnings({ OTP_PROVIDER: 'fonnte', FONNTE_API_TOKEN: 'tok' } as any),
+    ).toHaveLength(0);
   });
 });

@@ -1,4 +1,4 @@
-import { IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsBoolean, IsInt, IsOptional, IsString, MaxLength, Min } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class UpdateMaintenanceDto {
@@ -16,4 +16,16 @@ export class UpdateMaintenanceDto {
   @IsString()
   @MaxLength(500)
   message?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'BAI-118: optimistic locking untuk toggle MAINTENANCE_MODE — versi yang ' +
+      'ditampilkan saat admin memuat halaman. Bila versi DB sudah berubah, ' +
+      'request ditolak 409.',
+    example: 3,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  expectedVersion?: number;
 }

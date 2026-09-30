@@ -30,12 +30,14 @@ export class AdminMaintenanceController {
   @ApiResponse({ status: 200, description: 'Status maintenance.' })
   getStatus() {
     // BAI-114: updatedAt/updatedBy diambil dari baris DB (bukan fabrikasi).
+    // BAI-118: version disertakan agar admin bisa optimistic locking.
     const meta = this.settings.getMeta('MAINTENANCE_MODE');
     return {
       enabled: this.settings.get('MAINTENANCE_MODE')?.trim().toLowerCase() === 'true',
       message: this.settings.get('MAINTENANCE_MESSAGE')?.trim() || null,
       updatedAt: meta?.updatedAt ? meta.updatedAt.toISOString() : null,
       updatedBy: meta?.updatedBy ?? null,
+      version: meta?.version ?? 0,
     };
   }
 
@@ -54,11 +56,14 @@ export class AdminMaintenanceController {
 
       // BAI-113: MAINTENANCE_MODE hanya ditulis bila benar-benar berubah —
       // perubahan pesan saja tidak menaikkan version / menulis audit SET.
-      // BAI-118: optimistic locking untuk toggle mode.
+      // BAI-118: optimistic locking untuk toggle mode. Bila klien mengirim
+      // expectedVersion, dipakai apa adanya (konflik nyata antar admin);
+      // bila tidak, fallback ke versi yang baru dibaca (tidak lebih buruk
+      // dari sebelumnya, tapi tidak melindungi dari race antar request).
       if (dto.enabled !== prevEnabled) {
         const modeMeta = this.settings.getMeta('MAINTENANCE_MODE');
         await this.settings.set('MAINTENANCE_MODE', dto.enabled ? 'true' : 'false', adminId, {
-          expectedVersion: modeMeta?.version,
+          expectedVersion: dto.expectedVersion ?? modeMeta?.version,
         });
       }
 
@@ -85,6 +90,9 @@ export class AdminMaintenanceController {
         message: this.settings.get('MAINTENANCE_MESSAGE')?.trim() || null,
         updatedAt: latest ? latest.toISOString() : null,
         updatedBy: modeMeta?.updatedBy ?? null,
+        // BAI-118: kembalikan versi terbaru agar admin tidak perlu GET ulang
+        // untuk optimistic locking berikutnya.
+        version: modeMeta?.version ?? 0,
       };
     } catch (err) {
       if (err instanceof OpsSettingConflictError) {

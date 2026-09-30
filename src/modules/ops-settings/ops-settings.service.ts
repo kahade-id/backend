@@ -216,6 +216,11 @@ export class OpsSettingsService implements OnModuleInit, OnModuleDestroy {
         throw new Error(`FONNTE_API_URL tidak valid: ${reason}`);
       }
     }
+    // BAI-111: simpan flag boolean dalam bentuk kanonis lowercase agar
+    // displayValue & pembanding konsisten ("TRUE" → "true").
+    if (key === 'MAINTENANCE_MODE' || key === 'WALLET_ENABLED') {
+      effectiveValue = trimmed.toLowerCase();
+    }
     const stored = def.isSecret ? await encryptPii(effectiveValue) : effectiveValue;
     const existing = await this.prisma.appSetting.findUnique({ where: { key } });
     // BAI-118: optimistic locking — baris yang belum pernah diset via panel

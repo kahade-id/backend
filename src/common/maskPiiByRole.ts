@@ -95,7 +95,7 @@ export type PiiBearingUser = {
  * Dipakai BAI-076 untuk lastLoginIp di detail user (non-SUPER_ADMIN).
  */
 export function maskIp(ip: string | null | undefined): string | null {
-  if (!ip) return ip ?? null;
+  if (!ip) return null;
   const trimmed = ip.trim();
   if (!trimmed) return null;
   if (trimmed.includes(':')) {

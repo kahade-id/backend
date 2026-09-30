@@ -47,6 +47,7 @@ import {
   SESSION_REVOKED_KEY,
   BACKUP_CODE_USED,
   PHONE_VERIFIED_GUARD,
+  USER_SUSPENDED_KEY,
 } from '../../common/constants/redis-keys';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import {
@@ -429,6 +430,8 @@ export class AuthService {
           message: 'Account has been banned',
         });
       }
+      // BAI-074: suspend ringan ikut diblokir di jalur OTP.
+      await this.assertNotSuspended(existingUser.id);
       if (existingUser.lockedUntil && existingUser.lockedUntil > new Date()) {
         const remainingMs = existingUser.lockedUntil.getTime() - Date.now();
         const remainingSeconds = Math.ceil(remainingMs / 1000);
@@ -544,6 +547,8 @@ export class AuthService {
         message: 'Account has been banned',
       });
     }
+    // BAI-074: cek ulang suspend pasca-verifikasi (perubahan admin konkuren).
+    await this.assertNotSuspended(existingUser.id);
     if (existingUser.lockedUntil && existingUser.lockedUntil > new Date()) {
       const remainingMs = existingUser.lockedUntil.getTime() - Date.now();
       const remainingSeconds = Math.ceil(remainingMs / 1000);
@@ -1053,6 +1058,8 @@ export class AuthService {
         message: 'Invalid credentials',
       });
     }
+    // BAI-074: suspend ringan ikut diblokir di jalur passkey.
+    await this.assertNotSuspended(user.id);
     if (user.lockedUntil && user.lockedUntil > new Date()) {
       const remainingSeconds = Math.ceil((user.lockedUntil.getTime() - Date.now()) / 1000);
       throw new UnauthorizedException({
@@ -2294,6 +2301,8 @@ export class AuthService {
         message: 'Invalid credentials',
       });
     }
+    // BAI-074: suspend ringan ikut diblokir di jalur login password.
+    await this.assertNotSuspended(user.id);
 
     if (user.lockedUntil && user.lockedUntil > new Date()) {
       const remainingMs = user.lockedUntil!.getTime() - Date.now();
@@ -4636,7 +4645,7 @@ export class AuthService {
     });
     if (linked?.user) {
       const user = linked.user;
-      this.assertSocialAccountUsable(user, providerLabel);
+      await this.assertSocialAccountUsable(user, providerLabel);
       await this.prisma.socialAccount.update({
         where: { id: linked.id },
         data: { lastUsedAt: new Date() },
@@ -4692,11 +4701,34 @@ export class AuthService {
     };
   }
 
+  /**
+   * BAI-074: blokir login selama suspend ringan berbatas waktu.
+   * State suspend disimpan di Redis dengan TTL (= auto-unsuspend);
+   * `redis.exists` fail-open (0 saat Redis error) mengikuti pola service.
+   */
+  private async assertNotSuspended(userId: string): Promise<void> {
+    const suspended = await this.redis.exists(USER_SUSPENDED_KEY(userId));
+    if (suspended) {
+      throw new ForbiddenException({
+        code: ErrorCodes.ACCOUNT_SUSPENDED,
+        message: 'Akun ditangguhkan sementara. Silakan coba lagi nanti.',
+      });
+    }
+  }
+
   /** G023: pesan seragam untuk akun nonaktif/dibatasi/dikunci. */
-  private assertSocialAccountUsable(
-    user: { isActive: boolean; isBanned: boolean; lockedUntil: Date | null },
+  private async assertSocialAccountUsable(
+    user: { id: string; isActive: boolean; isBanned: boolean; lockedUntil: Date | null },
     providerLabel: string,
-  ): void {
+  ): Promise<void> {
+    if (!user.isActive || user.isBanned) {
+      throw new ForbiddenException({
+        code: ErrorCodes.ACCOUNT_INACTIVE,
+        message: 'Akun ini nonaktif atau dibatasi. Hubungi support Kahade.',
+      });
+    }
+    // BAI-074: suspend ringan ikut diblokir di jalur login sosial.
+    await this.assertNotSuspended(user.id);
     if (!user.isActive || user.isBanned) {
       throw new ForbiddenException({
         code: ErrorCodes.ACCOUNT_INACTIVE,
@@ -4858,7 +4890,7 @@ export class AuthService {
       });
     }
     const providerLabel = extra.provider === 'GOOGLE' ? 'Google' : 'Apple';
-    this.assertSocialAccountUsable(user, providerLabel);
+    await this.assertSocialAccountUsable(user, providerLabel);
 
     // Re-auth akun lama WAJIB sebelum penautan (anti take-over).
     await this.assertPasskeyReauthenticated(user.id, reauth);

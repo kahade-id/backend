@@ -37,6 +37,11 @@ const mockPrisma: any = {
     count: jest.fn(),
     updateMany: jest.fn(),
   },
+  // BAI-064: approve() sinkronkan user.accountType=BUSINESS dalam transaksi.
+  user: {
+    findUnique: jest.fn(),
+    update: jest.fn(),
+  },
   adminUser: { findUnique: jest.fn() },
 };
 
@@ -55,6 +60,9 @@ describe('AdminBusinessVerificationService', () => {
     mockPrisma.businessVerification.count.mockResolvedValue(0);
     mockPrisma.businessVerification.updateMany.mockResolvedValue({ count: 1 });
     mockPrisma.businessVerification.findUniqueOrThrow.mockResolvedValue({ ...pending, status: BusinessVerificationStatus.APPROVED });
+    // BAI-064: default owner sudah BUSINESS → tidak ada update tambahan.
+    mockPrisma.user.findUnique.mockResolvedValue({ accountType: 'BUSINESS' });
+    mockPrisma.user.update.mockResolvedValue({});
     mockPrisma.$transaction = jest.fn(async (fn: any) => fn(mockPrisma));
     mockNotificationQueue.enqueue.mockResolvedValue(undefined);
     mockBadges.invalidate.mockResolvedValue(undefined);
@@ -214,6 +222,27 @@ describe('AdminBusinessVerificationService', () => {
       expect(mockNotificationQueue.enqueue).toHaveBeenCalledWith(
         expect.objectContaining({ userId: 'user-1', type: NotificationType.BUSINESS_VERIFICATION_APPROVED }),
       );
+    });
+
+    it('BAI-064: upgrades user.accountType PERSONAL -> BUSINESS on approve', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ accountType: 'PERSONAL' });
+      await service.approve('bv-1', 'admin-1');
+      expect(mockPrisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: 'user-1' }, data: { accountType: 'BUSINESS' } }),
+      );
+      expect(mockAuditLog.logAdminAction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: AuditAction.BUSINESS_VERIFICATION_APPROVED,
+          before: { accountType: 'PERSONAL' },
+          after: { accountType: 'BUSINESS' },
+        }),
+      );
+    });
+
+    it('BAI-064: skips accountType update when owner is already BUSINESS', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ accountType: 'BUSINESS' });
+      await service.approve('bv-1', 'admin-1');
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
     });
   });
 

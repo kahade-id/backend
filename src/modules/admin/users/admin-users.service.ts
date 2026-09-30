@@ -8,7 +8,7 @@ import { Prisma, AuditAction, OrderStatus, WalletTransactionType, WalletTransact
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
-import { SESSION_REVOKED_KEY } from '../../../common/constants/redis-keys';
+import { SESSION_REVOKED_KEY, USER_SUSPENDED_KEY } from '../../../common/constants/redis-keys';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { WalletAdjustDto, WalletAdjustType } from './dto/wallet-adjust.dto';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
@@ -31,6 +31,8 @@ import { applyUserMask, PII_UNMASKED_ROLES, maskIp } from '../../../common/maskP
 import { walletTxDirection } from '../../../common/utils/wallet-direction.util';
 import { UserExportQueryDto } from './dto/user-export-query.dto';
 import { ModerationEventsQueryDto, ModerationEventType } from './dto/moderation-events-query.dto';
+import { UpdateUserDto } from './dto/update-user.dto';
+import { SuspendUserDto } from './dto/suspend-user.dto';
 
 @Injectable()
 export class AdminUsersService {
@@ -215,11 +217,15 @@ export class AdminUsersService {
     // BAI-076: lastLoginIp (data lokasi-ish sensitif) di-mask untuk role
     // non-SUPER_ADMIN — konsisten dengan email/nomor HP.
     const isUnmasked = !!adminRole && PII_UNMASKED_ROLES.includes(adminRole);
+    // BAI-074: status suspend ringan (state Redis, auto-unsuspend via TTL) —
+    // dipakai UI untuk menampilkan tombol Tangguhkan/Batalkan yang benar.
+    const suspended = await this.isUserSuspended(user.id);
     return {
       ...userData,
       email: maskedPii.email,
       phoneNumber: maskedPii.phoneNumber,
       lastLoginIp: isUnmasked ? userData.lastLoginIp : maskIp(userData.lastLoginIp),
+      suspended,
       followersCount: _count.followers,
       followingCount: _count.following,
       blockedUsersCount: _count.blockedUsers,
@@ -380,6 +386,139 @@ export class AdminUsersService {
     await this.dashboard.invalidateSummaryCache();
 
     return result;
+  }
+
+  /**
+   * BAI-074 — suspend ringan berbatas waktu (SUPER_ADMIN + audit wajib).
+   *
+   * Beda dari ban: suspend bersifat sementara dan ringan.
+   * - State disimpan di Redis dengan TTL = durasi suspend → auto-unsuspend
+   *   tanpa cron dan tanpa kolom DB baru (additive-only).
+   * - Sesi aktif dicabut saat suspend (kick langsung), pola sama seperti ban:
+   *   `userSession` di-revoke + `SESSION_REVOKED_KEY` agar access token lama
+   *   langsung mati. Sesi yang dicabut TIDAK dipulihkan saat unsuspend —
+   *   user harus login ulang.
+   * - Login diblokir selama suspend via `USER_SUSPENDED_KEY` yang dicek di
+   *   jalur login AuthService (`assertNotSuspended`).
+   */
+  async suspendUser(
+    userId: string,
+    dto: SuspendUserDto,
+    adminId: string,
+    ipAddress: string = 'internal',
+  ): Promise<object> {
+    const user = await this.prisma.user.findFirst({
+      where: { OR: [{ id: userId }, { userId }], deletedAt: null },
+      select: { id: true, userId: true, isBanned: true },
+    });
+    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    if (user.isBanned) {
+      throw new ConflictException({
+        code: ErrorCodes.USER_ALREADY_BANNED,
+        message: 'User is banned; unban first before suspending',
+      });
+    }
+
+    const suspendKey = USER_SUSPENDED_KEY(user.id);
+    const alreadySuspended = await this.redis.exists(suspendKey);
+    if (alreadySuspended) {
+      throw new ConflictException({
+        code: ErrorCodes.USER_ALREADY_SUSPENDED,
+        message: 'User is already suspended',
+      });
+    }
+
+    const reason = dto.reason.trim();
+    const ttlSeconds = dto.durationHours * 3600;
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + ttlSeconds * 1000);
+
+    // Kick: cabut semua sesi aktif (pola sama seperti banUser).
+    const activeSessions = await this.prisma.userSession.findMany({
+      where: { userId: user.id, isRevoked: false },
+      select: { id: true },
+    });
+    if (activeSessions.length > 0) {
+      await this.prisma.userSession.updateMany({
+        where: { userId: user.id, isRevoked: false },
+        data: { isRevoked: true, revokedAt: now, revokedReason: 'user_suspended' },
+      });
+      await Promise.all(
+        activeSessions.map((s) =>
+          this.redis.setex(SESSION_REVOKED_KEY(s.id), this.accessTokenTtlSeconds, 'revoked'),
+        ),
+      );
+    }
+
+    await this.redis.setex(
+      suspendKey,
+      ttlSeconds,
+      JSON.stringify({ reason, adminId, suspendedAt: now.toISOString(), expiresAt: expiresAt.toISOString() }),
+    );
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.USER_SUSPENDED,
+      targetType: 'User',
+      targetId: user.id,
+      description: `Admin suspended user ${user.id} for ${dto.durationHours}h. Reason: ${reason}`,
+      before: { suspended: false },
+      after: { suspended: true, reason, durationHours: dto.durationHours, expiresAt: expiresAt.toISOString() },
+      ipAddress,
+    });
+
+    return {
+      userId: user.userId,
+      suspended: true,
+      reason,
+      durationHours: dto.durationHours,
+      suspendedAt: now.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+      sessionsRevoked: activeSessions.length,
+    };
+  }
+
+  /** BAI-074 — lepas suspend sebelum waktunya. Sesi yang dicabut saat
+   * suspend TIDAK dipulihkan — user harus login ulang. */
+  async unsuspendUser(
+    userId: string,
+    adminId: string,
+    ipAddress: string = 'internal',
+  ): Promise<object> {
+    const user = await this.prisma.user.findFirst({
+      where: { OR: [{ id: userId }, { userId }], deletedAt: null },
+      select: { id: true, userId: true },
+    });
+    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+
+    const suspendKey = USER_SUSPENDED_KEY(user.id);
+    const suspended = await this.redis.exists(suspendKey);
+    if (!suspended) {
+      throw new NotFoundException({
+        code: ErrorCodes.USER_NOT_SUSPENDED,
+        message: 'User is not currently suspended',
+      });
+    }
+
+    await this.redis.del(suspendKey);
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.USER_ACTIVATED,
+      targetType: 'User',
+      targetId: user.id,
+      description: `Admin lifted suspension for user ${user.id} before expiry`,
+      before: { suspended: true },
+      after: { suspended: false },
+      ipAddress,
+    });
+
+    return { userId: user.userId, suspended: false };
+  }
+
+  /** BAI-074 — dipakai jalur login untuk memblokir akun yang di-suspend. */
+  async isUserSuspended(userId: string): Promise<boolean> {
+    return (await this.redis.exists(USER_SUSPENDED_KEY(userId))) > 0;
   }
 
   /**

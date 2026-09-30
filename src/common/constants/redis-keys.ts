@@ -50,6 +50,11 @@ export const ADMIN_REFRESH_BLACKLIST = (jti: string): string => `admin_refresh_b
 
 export const SESSION_REVOKED_KEY = (sessionId: string): string => `session_revoked:${sessionId}`;
 
+// BAI-074: suspend ringan berbatas waktu — state di Redis dengan TTL
+// (= auto-unsuspend tanpa cron/kolom DB baru). Nilai = JSON { reason,
+// adminId, suspendedAt, expiresAt }.
+export const USER_SUSPENDED_KEY = (userId: string): string => `user_suspended:${userId}`;
+
 export const ADMIN_SYSTEM_CONFIGS = `admin:system:configs`;
 export const ADMIN_VOUCHERS_LIST = (isActive: string | undefined, limit: number, search?: string): string =>
   `admin:vouchers:list:${isActive ?? 'all'}:${limit}:${search ? Buffer.from(search).toString('base64url') : 'all'}`;

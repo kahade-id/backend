@@ -37,20 +37,30 @@ export function toIdr(sen: bigint): number {
 }
 
 /**
- * Format IDR to currency string. Example: 100000 -> "Rp 100.000"
+ * Format IDR to currency string. Example: 100000 -> "Rp100.000"
+ *
+ * DBL-002 (audit integrasi 2026-10-01): kanonis "Rp100.000" TANPA SPASI,
+ * selaras kontrak FE §13 (frontend `formatRupiah`, admin `formatIDR`).
+ * Format manual — TIDAK memakai `Intl` currency style yang menghasilkan
+ * "Rp 100.000" (dengan spasi).
+ *
+ * DBL-003: pecahan rupiah DIBULATKAN ke rupiah terdekat (Math.round),
+ * mempertahankan perilaku lama (formatIdr(100000.5) -> "Rp100.001").
  */
 export function formatIdr(amount: number): string {
-  return new Intl.NumberFormat('id-ID', {
-    style: 'currency',
-    currency: 'IDR',
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
-  }).format(amount);
+  const rounded = Math.round(amount);
+  const sign = rounded < 0 ? '-' : '';
+  const grouped = Math.abs(rounded)
+    .toString()
+    .replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+  return `${sign}Rp${grouped}`;
 }
 
 /**
  * Format Sen (BigInt) directly to IDR currency string.
- * Example: 10000000n -> "Rp 100.000"
+ * Example: 10000000n -> "Rp100.000"
+ * DBL-004: sen bukan kelipatan 100 (mis. 1050n = Rp10,5) dibulatkan ke
+ * rupiah terdekat via formatIdr (Math.round), selaras admin.
  */
 export function formatSen(sen: bigint): string {
   return formatIdr(toIdr(sen));

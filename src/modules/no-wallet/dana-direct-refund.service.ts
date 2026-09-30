@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PaymentProvider, PaymentStatus } from '@prisma/client';
-import { randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { DanaPaymentService } from '../payment/dana/dana-payment.service';
 
@@ -24,6 +24,19 @@ export interface DanaRefundAmountParams {
 export type DanaRefundOutcome =
   | { refunded: true; already: boolean; amountSen: bigint }
   | { refunded: false; reason: 'NOT_ELIGIBLE' };
+
+/**
+ * partnerRefundNo DETERMINISTIK per idempotencyKey.
+ *
+ * DANA idempoten per (merchantId, partnerRefundNo): bila refundOrder timeout
+ * SETELAH DANA menerima refund (hasil ambigu), retry HARUS memakai refundNo
+ * yang sama agar DANA mengembalikan hasil refund asli — refundNo baru/acak =
+ * refund KEDUA (double refund, uang sungguhan keluar 2x). Format 16 char,
+ * aman dari batas 25 char partnerReferenceNo DANA.
+ */
+export function deriveDanaRefundNo(idempotencyKey: string): string {
+  return `RFD-${createHash('sha256').update(idempotencyKey, 'utf8').digest('hex').slice(0, 12).toUpperCase()}`;
+}
 
 /**
  * Misi tanpa-wallet (BI-safe): refund DANA ke metode bayar asal.
@@ -136,9 +149,14 @@ export class DanaDirectRefundService {
     // Klaim idempotency: insert dulu — bila key sudah ada, hanya SATU pemenang
     // yang boleh mengeksekusi (klaim atomik PENDING/FAILED → EXECUTING via
     // updateMany). DANA sendiri idempoten per (merchantId, partnerRefundNo).
-    const partnerRefundNo = `RFD-${randomBytes(6).toString('hex').toUpperCase()}`;
+    //
+    // P1 (2026-09-30): partnerRefundNo deterministik dari idempotencyKey
+    // (deriveDanaRefundNo), BUKAN acak. Retry setelah timeout ambigu memakai
+    // refundNo yang sama → DANA dedupe, bukan refund kedua.
+    let partnerRefundNo: string;
     let attempt: { id: string; amountSen: bigint };
     try {
+      partnerRefundNo = deriveDanaRefundNo(idempotencyKey);
       attempt = await this.prisma.danaRefundAttempt.create({
         data: {
           idempotencyKey,
@@ -151,10 +169,17 @@ export class DanaDirectRefundService {
         select: { id: true, amountSen: true },
       });
     } catch (e) {
+      // Baris sudah ada — klaim dan PAKAI partnerRefundNo ASLI dari baris
+      // itu (jangan timpa dengan yang baru): bila attempt pertama timeout
+      // setelah DANA menerima refund, refundNo yang sama membuat DANA
+      // mengembalikan hasil asli, bukan memproses refund kedua.
+      const prior = await this.prisma.danaRefundAttempt.findUnique({
+        where: { idempotencyKey },
+        select: { partnerRefundNo: true },
+      });
       const claimed = await this.prisma.danaRefundAttempt.updateMany({
         where: { idempotencyKey, status: { in: ['PENDING', 'FAILED'] } },
         data: {
-          partnerRefundNo,
           amountSen,
           status: 'EXECUTING',
           reason: reason.slice(0, 500),
@@ -178,6 +203,9 @@ export class DanaDirectRefundService {
         where: { idempotencyKey },
         select: { id: true, amountSen: true },
       });
+      // Pakai refundNo asli baris ini; fallback deterministik bila baris lama
+      // (pra-fix) tidak punya refundNo tersimpan.
+      partnerRefundNo = prior?.partnerRefundNo || deriveDanaRefundNo(idempotencyKey);
     }
 
     try {

@@ -1,5 +1,5 @@
 import { PaymentProvider, PaymentStatus } from '@prisma/client';
-import { DanaDirectRefundService } from './dana-direct-refund.service';
+import { DanaDirectRefundService, deriveDanaRefundNo } from './dana-direct-refund.service';
 
 const danaSuccessPayment = {
   id: 'pt-1',
@@ -25,7 +25,7 @@ function buildPrisma(payment: unknown, attemptStore: Record<string, any> = {}) {
           err.code = 'P2002';
           throw err;
         }
-        const row = { id: 'att-1', status: 'EXECUTING', amountSen: args.data.amountSen };
+        const row = { id: 'att-1', status: 'EXECUTING', amountSen: args.data.amountSen, partnerRefundNo: args.data.partnerRefundNo };
         attemptStore[args.data.idempotencyKey] = row;
         return row;
       }),
@@ -186,5 +186,54 @@ describe('DanaDirectRefundService (refundAmount kanonis)', () => {
     const svc = new DanaDirectRefundService(prisma as never, danaPayment as never);
     expect(await svc.refundOrderEscrow('order-db-x', 'auto-cancel')).toBe(false);
     expect(danaPayment.refundOrder).not.toHaveBeenCalled();
+  });
+
+  describe('P1: partnerRefundNo deterministik (anti double-refund)', () => {
+    it('deriveDanaRefundNo stabil per key, unik antar key, format RFD- + 12 hex', () => {
+      const a1 = deriveDanaRefundNo('ORDER:o-1:FULL');
+      const a2 = deriveDanaRefundNo('ORDER:o-1:FULL');
+      const b = deriveDanaRefundNo('ORDER:o-2:FULL');
+      expect(a1).toBe(a2);
+      expect(a1).not.toBe(b);
+      expect(a1).toMatch(/^RFD-[0-9A-F]{12}$/);
+    });
+
+    it('refundAmount memakai partnerRefundNo deterministik dari idempotencyKey', async () => {
+      const prisma = buildPrisma(danaSuccessPayment);
+      danaPayment.refundOrder.mockResolvedValue({ partnerRefundNo: 'x', referenceNo: 'DANA-RFD-9', status: 'SUCCESS' });
+      const svc = new DanaDirectRefundService(prisma as never, danaPayment as never);
+      await svc.refundAmount({ paymentDbId: 'pt-1', reason: 'x', idempotencyKey: 'ORDER:o-9:FULL' });
+      const expected = deriveDanaRefundNo('ORDER:o-9:FULL');
+      expect(danaPayment.refundOrder).toHaveBeenCalledWith(
+        expect.objectContaining({ partnerRefundNo: expected }),
+      );
+      expect(prisma.danaRefundAttempt.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ partnerRefundNo: expected }) }),
+      );
+    });
+
+    it('retry setelah FAILED memakai partnerRefundNo ASLI (bukan yang baru)', async () => {
+      const store: Record<string, any> = {};
+      const prisma = buildPrisma(danaSuccessPayment, store);
+      const svc = new DanaDirectRefundService(prisma as never, danaPayment as never);
+
+      // Attempt 1: DANA timeout setelah menerima refund (hasil ambigu) → FAILED.
+      danaPayment.refundOrder.mockRejectedValueOnce(new Error('timeout'));
+      await expect(
+        svc.refundAmount({ paymentDbId: 'pt-1', reason: 'x', idempotencyKey: 'ORDER:o-8:FULL' }),
+      ).rejects.toThrow('timeout');
+      const firstRefundNo = store['ORDER:o-8:FULL'].partnerRefundNo;
+      expect(firstRefundNo).toBe(deriveDanaRefundNo('ORDER:o-8:FULL'));
+
+      // Retry: klaim baris FAILED → refundNo yang SAMA dikirim ke DANA
+      // (DANA dedupe per (merchantId, partnerRefundNo) → bukan refund kedua).
+      danaPayment.refundOrder.mockResolvedValue({ partnerRefundNo: 'x', referenceNo: 'DANA-RFD-8', status: 'SUCCESS' });
+      const r2 = await svc.refundAmount({ paymentDbId: 'pt-1', reason: 'x', idempotencyKey: 'ORDER:o-8:FULL' });
+      expect(r2.refunded).toBe(true);
+      const calls = (danaPayment.refundOrder as jest.Mock).mock.calls;
+      expect(calls[1][0].partnerRefundNo).toBe(firstRefundNo);
+      // Baris attempt TIDAK ditimpa refundNo baru.
+      expect(store['ORDER:o-8:FULL'].partnerRefundNo).toBe(firstRefundNo);
+    });
   });
 });

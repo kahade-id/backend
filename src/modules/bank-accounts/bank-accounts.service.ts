@@ -172,7 +172,7 @@ export class BankAccountsService {
     validateBankAccountLength(bankCode, normalizedAccountNumber);
     const accountNumberHash = hmacSHA256(`${bankCode}:${normalizedAccountNumber}`);
 
-    // Cheap pre-check so an obvious duplicate fails before the Midtrans round-trip.
+    // Cheap pre-check so an obvious duplicate fails before the DANA inquiry round-trip.
     // The authoritative check runs inside the transaction below.
     const duplicate = await this.prisma.bankAccount.findFirst({
       where: { accountNumberHash, deletedAt: null },
@@ -251,7 +251,7 @@ export class BankAccountsService {
 
     /*
      * BA-01/BA-02: the cap check, the duplicate resolution and the write have to be one
-     * atomic unit. The Midtrans inquiry above stays outside it — a network round-trip must
+     * atomic unit. The DANA inquiry above stays outside it — a network round-trip must
      * never be held inside a Serializable transaction.
      *
      * BA-01: `accountNumberHash` carries a *global* unique index (no `deletedAt` predicate,

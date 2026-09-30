@@ -22,6 +22,10 @@ export class BannersService {
         linkUrl: dto.linkUrl ?? null,
         position: dto.position ?? 'home_top',
         sortOrder: dto.sortOrder ?? 0,
+        // BAI-029 (audit integrasi 2026-09-30) — hormati checkbox "Aktif" admin.
+        // DTO sudah menerima isActive, tapi service mengabaikannya sehingga
+        // banner selalu langsung live (default model true).
+        isActive: dto.isActive ?? true,
         startsAt: dto.startsAt ? new Date(dto.startsAt) : null,
         endsAt: dto.endsAt ? new Date(dto.endsAt) : null,
         createdBy: adminId,

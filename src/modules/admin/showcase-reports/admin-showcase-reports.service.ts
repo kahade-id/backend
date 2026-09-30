@@ -471,7 +471,7 @@ export class AdminShowcaseReportsService {
     adminId: string,
     ipAddress: string,
     adminRole?: AdminRole,
-  ): Promise<{ message: string; reportId: string; status: ReportStatus }> {
+  ): Promise<{ message: string; reportId: string; status: ReportStatus; relatedReportsResolved?: number }> {
     if (action === 'takedown' && adminRole !== AdminRole.SUPER_ADMIN) {
       throw new ForbiddenException({
         code: 'TAKEDOWN_FORBIDDEN_ROLE',
@@ -565,6 +565,25 @@ export class AdminShowcaseReportsService {
           });
         }
         const snapshot = await this.captureItemSnapshot(report.showcaseId, adminId);
+        // BAI-036 (audit integrasi 2026-09-30) — laporan OPEN lain untuk item
+        // yang sama ikut diselesaikan (RESOLVED_ACTION_TAKEN) dalam transaksi
+        // yang sama. Sebelumnya hanya laporan yang diproses yang selesai;
+        // laporan PENDING lain menggantung dan takedown susulannya gagal 400
+        // SHOWCASE_ALREADY_INACTIVE — antrean terlihat punya backlog semu.
+        const relatedOpen = await this.prisma.showcaseReport.findMany({
+          where: {
+            showcaseId: report.showcaseId,
+            status: { in: OPEN_STATUSES },
+            id: { not: reportId },
+          },
+          select: { id: true, status: true, reporterId: true },
+        });
+        const relatedIds = relatedOpen.map((r) => r.id);
+        const autoResolution = (
+          trimmedResolution
+            ? `${trimmedResolution} (otomatis: item ditakedown via laporan ${reportId})`
+            : `Otomatis: item ditakedown via laporan ${reportId}`
+        ).slice(0, 2000);
         await this.prisma.$transaction([
           this.prisma.userShowcase.updateMany({
             where: { id: report.showcaseId, isActive: true },
@@ -579,6 +598,19 @@ export class AdminShowcaseReportsService {
               reviewedAt: now,
             },
           }),
+          ...(relatedIds.length > 0
+            ? [
+                this.prisma.showcaseReport.updateMany({
+                  where: { id: { in: relatedIds }, status: { in: OPEN_STATUSES } },
+                  data: {
+                    status: ReportStatus.RESOLVED_ACTION_TAKEN,
+                    resolution: autoResolution,
+                    reviewedBy: adminId,
+                    reviewedAt: now,
+                  },
+                }),
+              ]
+            : []),
         ]);
         const reloaded = await this.prisma.showcaseReport.findUnique({
           where: { id: reportId },
@@ -600,15 +632,38 @@ export class AdminShowcaseReportsService {
           note: trimmedResolution,
           metadata: { snapshot },
         });
+        // BAI-036 — jejak audit untuk tiap laporan yang ikut diselesaikan
+        // otomatis oleh takedown ini.
+        for (const rel of relatedOpen) {
+          await this.recordEvent({
+            reportId: rel.id,
+            actorAdminId: adminId,
+            action: 'TAKEDOWN',
+            stateFrom: rel.status,
+            stateTo: ReportStatus.RESOLVED_ACTION_TAKEN,
+            reasonCode,
+            note: autoResolution,
+            metadata: { autoResolvedByTakedownOf: reportId },
+          });
+        }
         this.logAction(
           adminId,
           reportId,
-          `Took down showcase item ${report.showcaseId} ("${report.showcase.title}") via report ${reportId}${trimmedResolution ? `: ${trimmedResolution}` : ''}`,
+          `Took down showcase item ${report.showcaseId} ("${report.showcase.title}") via report ${reportId}${trimmedResolution ? `: ${trimmedResolution}` : ''}${relatedIds.length > 0 ? `; auto-resolved ${relatedIds.length} related open report(s): ${relatedIds.join(', ')}` : ''}`,
           ipAddress,
         );
         this.notifyReporterStatusChange(report.reporterId, report.showcase.title, 'ditindaklanjuti (item dinonaktifkan)');
+        for (const rel of relatedOpen) {
+          this.notifyReporterStatusChange(rel.reporterId, report.showcase.title, 'ditindaklanjuti (item dinonaktifkan)');
+        }
         this.notifyOwnerItemAction(report.showcase.userId, report.showcase.title, false, '');
-        return { message: 'Showcase item taken down; report resolved', reportId, status: ReportStatus.RESOLVED_ACTION_TAKEN };
+        return {
+          message: 'Showcase item taken down; report resolved',
+          reportId,
+          status: ReportStatus.RESOLVED_ACTION_TAKEN,
+          // BAI-036 — jumlah laporan lain se-item yang ikut diselesaikan.
+          relatedReportsResolved: relatedIds.length,
+        };
       }
       default: {
         throw new BadRequestException({

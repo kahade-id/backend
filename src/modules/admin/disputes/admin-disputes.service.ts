@@ -792,6 +792,9 @@ export class AdminDisputesService {
           title: result.disputeNotifTitle,
           body: result.disputeNotifBody,
           isRead: false,
+          // NCC-003: actionUrl + ref agar tap inbox membuka detail sengketa.
+          actionUrl: `/dispute/${encodeURIComponent(result.resolvedDisputeId)}`,
+          refType: 'DISPUTE', refId: result.resolvedDisputeId,
         },
       }).catch((err: unknown) => this.logger.warn(`silent-catch: dispute decision notification failed: ${err instanceof Error ? err.message : String(err)}`));
       this.prisma.emitNotificationCreated({ userId: uid, title: result.disputeNotifTitle, body: result.disputeNotifBody, data: { type: 'DISPUTE_RESOLVED', disputeId: result.resolvedDisputeId } });
@@ -1003,6 +1006,9 @@ export class AdminDisputesService {
           title: result.disputeNotifTitle,
           body: result.disputeNotifBody,
           isRead: false,
+          // NCC-003: actionUrl + ref agar tap inbox membuka detail sengketa.
+          actionUrl: `/dispute/${encodeURIComponent(result.resolvedDisputeId)}`,
+          refType: 'DISPUTE', refId: result.resolvedDisputeId,
         },
       }).catch((err: unknown) => this.logger.warn(`silent-catch: dispute decision notification failed: ${err instanceof Error ? err.message : String(err)}`));
       this.prisma.emitNotificationCreated({ userId: uid, title: result.disputeNotifTitle, body: result.disputeNotifBody, data: { type: 'DISPUTE_RESOLVED', disputeId: result.resolvedDisputeId } });
@@ -1319,6 +1325,9 @@ export class AdminDisputesService {
             title: mediationTitle,
             body: mediationPreview || `Mediator mengirim pesan baru pada sengketa ${dispute.disputeId}.`,
             isRead: false,
+            // NCC-003: actionUrl + ref agar tap inbox membuka detail sengketa.
+            actionUrl: `/dispute/${encodeURIComponent(dispute.disputeId)}`,
+            refType: 'DISPUTE', refId: dispute.disputeId,
           },
         })
         .then(() => {

@@ -237,6 +237,15 @@ export class EscrowDisbursementService {
         userId: row.sellerId,
         title: 'Daftarkan rekening bank',
         body: 'Dana escrow menunggu dicairkan — daftarkan rekening bank Anda agar dana masuk otomatis.',
+        // NCC-008: deep link ke layar rekening bank (FE ROUTES.bankAccounts =
+        // "/bank-accounts") + pushData agar tap push tidak jatuh ke fallback
+        // /notifications.
+        actionUrl: '/bank-accounts',
+        pushData: {
+          type: 'ESCROW_HELD_NO_BANK',
+          // orderId nullable di model — hanya sertakan bila ada.
+          ...(row.orderId ? { orderId: row.orderId } : {}),
+        },
       });
       this.logger.warn(`Disbursement HELD_NO_BANK: seller=${row.sellerId} key=${row.idempotencyKey}`);
       return { outcome: 'HELD_NO_BANK', disbursementId: held.id };

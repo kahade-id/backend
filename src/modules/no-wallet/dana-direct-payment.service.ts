@@ -1,7 +1,9 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   Logger,
+  NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -333,14 +335,20 @@ export class DanaDirectPaymentService {
       });
   }
 
-  async getStatus(orderId: string, buyerId: string): Promise<DanaDirectPayResult | null> {    const order = await this.prisma.order.findUnique({
+  /**
+   * BFI-058: sesi tak valid memakai status HTTP yang tepat — order tidak ada
+   * → 404 (bukan 400), bukan peserta → 403 (bukan 400). Body error tetap
+   * membawa `code` agar klien bisa memetakan.
+   */
+  async getStatus(orderId: string, buyerId: string): Promise<DanaDirectPayResult | null> {
+    const order = await this.prisma.order.findUnique({
       where: { orderId },
       select: { id: true, buyerId: true },
     });
     if (!order)
-      throw new BadRequestException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
+      throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
     if (order.buyerId !== buyerId)
-      throw new BadRequestException({
+      throw new ForbiddenException({
         code: ErrorCodes.NOT_ORDER_PARTICIPANT,
         message: 'Not authorized to view this payment',
       });

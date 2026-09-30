@@ -13,6 +13,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { UploadPurpose } from './dto/presigned-url.dto';
 import { InitChunkedUploadDto } from './dto/chunked-upload.dto';
+import * as ErrorCodes from '../../common/constants/error-codes';
 import { ALLOWED_CONTENT_TYPES, DirectUploadResult, MAX_FILE_SIZE, UploadService } from './upload.service';
 
 /**
@@ -211,15 +212,21 @@ export class ChunkedUploadService {
       throw new BadRequestException({ code: 'VALIDATION_ERROR', message: 'Unsupported upload purpose' });
     }
     if (dto.totalSize > maxBytes) {
+      // UMD-002: konsisten dengan jalur direct (throwFileTooLarge) — SHOWCASE_VIDEO
+      // memakai VIDEO_TOO_LARGE agar kontrak error FE stabil antar endpoint.
+      const code =
+        dto.purpose === UploadPurpose.SHOWCASE_VIDEO
+          ? ErrorCodes.VIDEO_TOO_LARGE
+          : ErrorCodes.FILE_TOO_LARGE;
       throw new BadRequestException({
-        code: 'FILE_TOO_LARGE',
+        code,
         message: `File exceeds maximum size for ${dto.purpose}`,
       });
     }
     const allowed = ALLOWED_CONTENT_TYPES[dto.purpose] ?? [];
     if (!allowed.includes(dto.mimeType)) {
       throw new BadRequestException({
-        code: 'MIME_TYPE_MISMATCH',
+        code: ErrorCodes.MIME_TYPE_MISMATCH,
         message: `Content type ${dto.mimeType} not allowed for ${dto.purpose}`,
       });
     }

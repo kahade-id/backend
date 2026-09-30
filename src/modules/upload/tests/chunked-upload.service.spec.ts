@@ -50,13 +50,24 @@ describe('ChunkedUploadService — NP-006', () => {
       chunkSize,
     });
 
-  it('init: menolak totalSize melebihi batas purpose (FILE_TOO_LARGE)', async () => {
+  it('init: menolak totalSize melebihi batas SHOWCASE_VIDEO dengan VIDEO_TOO_LARGE (UMD-002)', async () => {
     await expect(
       service.initiate('user-1', {
         purpose: UploadPurpose.SHOWCASE_VIDEO,
         fileName: 'v.mp4',
         mimeType: 'video/mp4',
         totalSize: 101 * 1024 * 1024,
+      }),
+    ).rejects.toMatchObject({ response: expect.objectContaining({ code: 'VIDEO_TOO_LARGE' }) });
+  });
+
+  it('init: purpose non-video tetap memakai FILE_TOO_LARGE (UMD-002)', async () => {
+    await expect(
+      service.initiate('user-1', {
+        purpose: UploadPurpose.SHOWCASE_IMAGE,
+        fileName: 'img.png',
+        mimeType: 'image/png',
+        totalSize: 6 * 1024 * 1024,
       }),
     ).rejects.toMatchObject({ response: expect.objectContaining({ code: 'FILE_TOO_LARGE' }) });
   });

@@ -42,6 +42,14 @@ export interface RefreshTokenPayload {
    * rotation. Token admin tanpa anchor ini ditolak (fail-closed).
    */
   sessionStartedAt?: number;
+  /**
+   * AUT-006: identitas perangkat yang memiliki sesi ini (klaim opsional).
+   * Diset saat sesi dibuat dengan deviceId; saat refresh, server menolak
+   * bila klaim ini tidak cocok dengan `deviceId` baris sesi di DB.
+   * Token lama tanpa klaim ini tetap diterima sekali (transisi) lalu
+   * dirotasi menjadi token ber-klaim.
+   */
+  deviceId?: string;
 }
 
 /**
@@ -122,8 +130,13 @@ export class TokenService {
     );
   }
 
-  /** Sign refresh token (7 days) */
-  signRefreshToken(payload: { sub: string }): string {
+  /**
+   * Sign refresh token (7 days).
+   * AUT-006: bila sesi dibuat dengan deviceId, identitas perangkat diikat
+   * ke dalam klaim JWT (`deviceId`) agar `refreshToken()` dapat menolak
+   * mismatch terhadap baris sesi di DB.
+   */
+  signRefreshToken(payload: { sub: string; deviceId?: string }): string {
     const jti = nanoid();
     return this.jwtService.sign(
       { ...payload, jti, iss: TOKEN_ISSUER, aud: REFRESH_TOKEN_AUDIENCE },

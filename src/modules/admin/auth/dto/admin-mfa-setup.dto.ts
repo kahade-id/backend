@@ -1,18 +1,16 @@
 import { IsString, IsOptional, MaxLength, Matches } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
-export class AdminVerify2faDto {
-  @ApiProperty({ description: 'Temporary token issued by /admin/auth/login', maxLength: 512 })
+/**
+ * AUT-001: body untuk POST /v1/admin/auth/mfa/setup — tempToken scope
+ * admin_mfa_setup dari login + deviceId untuk binding perangkat.
+ */
+export class AdminMfaSetupDto {
+  @ApiProperty({ description: 'TempToken scope admin_mfa_setup from /admin/auth/login', maxLength: 512 })
   @IsString()
   @MaxLength(512)
   tempToken!: string;
 
-  @ApiProperty({ description: 'TOTP code from authenticator app', minLength: 6, maxLength: 6 })
-  @IsString()
-  @Matches(/^\d{6}$/)
-  totpToken!: string;
-
-  // AUT-001: perangkat yang sama dengan yang dipakai saat login.
   @ApiPropertyOptional({ description: 'Device identifier bound to the tempToken at login', maxLength: 128 })
   @IsOptional()
   @IsString()

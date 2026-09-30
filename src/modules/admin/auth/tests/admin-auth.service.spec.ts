@@ -39,6 +39,8 @@ describe('AdminAuthService refresh account-state enforcement', () => {
       config as never,
       auditLogService as never,
       tokenService as never,
+      // AUT-003: CaptchaService kini argumen konstruktor ke-6.
+      { shouldRequireLoginCaptcha: jest.fn(), recordLoginFailure: jest.fn(), clearLoginFailures: jest.fn() } as never,
     );
   });
 
@@ -193,6 +195,8 @@ describe('AdminAuthService revokeAllOwnSessions (ADM-420)', () => {
       config as never,
       auditLogService as never,
       tokenService as never,
+      // AUT-003: CaptchaService kini argumen konstruktor ke-6.
+      { shouldRequireLoginCaptcha: jest.fn(), recordLoginFailure: jest.fn(), clearLoginFailures: jest.fn() } as never,
     );
   });
 

@@ -5,9 +5,15 @@ import { AuditAction, AdminRole } from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
-import { bcryptCompare, decryptAES, encryptAES, sha256 } from '../../../common/utils/crypto.util';
+import { bcryptCompare, bcryptHash, decryptAES, encryptAES, sha256 } from '../../../common/utils/crypto.util';
 import { TokenService } from '../../auth/token.service';
 import { ADMIN_SESSION_ABSOLUTE_TTL_SECONDS } from '../../auth/token.service';
+// AUT-003: CaptchaService (protokol slider yang sama dengan mobile) —
+// AuthModule @Global() dan mengekspornya, jadi tidak perlu import modul.
+import { CaptchaService } from '../../auth/captcha.service';
+// AUT-002/AUT-009: kebijakan password admin terpusat.
+import { validateAdminPasswordPolicy } from '../admin-password-policy';
+import { BCRYPT_ROUNDS_ADMIN } from '../../../common/constants/app.constants';
 import { ADMIN_TOKEN_BLACKLIST, ADMIN_REFRESH_BLACKLIST, ADMIN_2FA_ATTEMPT_KEY, ADMIN_MFA_SETUP, TOTP_USED_CODE } from '../../../common/constants/redis-keys';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 
@@ -28,6 +34,8 @@ export class AdminAuthService {
     private configService: ConfigService,
     private auditLogService: AuditLogService,
     private tokenService: TokenService,
+    // AUT-003: login admin kini mengenal captcha slider (throttle adaptif).
+    private captchaService: CaptchaService,
   ) {}
 
   async login(
@@ -36,9 +44,68 @@ export class AdminAuthService {
     totpToken?: string,
     ipAddress?: string,
     userAgent?: string,
+    // AUT-001: identitas perangkat peminta — diikat ke TempToken 2FA/MFA
+    // (pola yang sama dengan mobile) agar tempToken yang bocor tidak bisa
+    // dipakai dari perangkat lain.
+    deviceId?: string,
+    // AUT-003: slider captcha (protokol yang sama dengan mobile): jawaban
+    // adalah posisi X slider 0-100 (sama seperti CaptchaService.verifyChallenge).
+    captchaId?: string,
+    captchaAnswer?: number,
   ): Promise<
     | { requiresMfa: true; tempToken: string }
     | { requiresMfaSetup: true; tempToken: string }
+    | { requiresPasswordChange: true; tempToken: string }
+    | { accessToken: string; refreshToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }
+  > {
+    // AUT-003: throttle adaptif — setelah N login gagal dari IP ini,
+    // peminta WAJIB menyelesaikan slider captcha sebelum kredensial dicek
+    // (pola yang sama dengan login mobile).
+    const ip = ipAddress || 'unknown';
+    const captchaRequired = await this.captchaService.shouldRequireLoginCaptcha(ip);
+    if (captchaRequired) {
+      if (!captchaId || captchaAnswer === undefined) {
+        throw new UnauthorizedException({
+          code: ErrorCodes.CAPTCHA_REQUIRED,
+          message: 'Captcha verification is required after repeated failed login attempts',
+        });
+      }
+      await this.captchaService.verifyChallenge(captchaId, captchaAnswer);
+    }
+
+    let result: Awaited<ReturnType<AdminAuthService['loginInner']>>;
+    try {
+      result = await this.loginInner(email, password, totpToken, ipAddress, userAgent, deviceId);
+    } catch (error) {
+      const response = error instanceof UnauthorizedException ? error.getResponse() : null;
+      const code =
+        typeof response === 'object' && response !== null && 'code' in response
+          ? (response as { code?: unknown }).code
+          : undefined;
+      if (code === ErrorCodes.INVALID_CREDENTIALS) {
+        // AUT-003: hanya kegagalan kredensial yang dihitung (pola mobile).
+        await this.captchaService.recordLoginFailure(ip);
+      }
+      throw error;
+    }
+    await this.captchaService.clearLoginFailures(ip);
+    return result;
+  }
+
+  /**
+   * Inti login admin — dipanggil login() setelah captcha dicek.
+   */
+  private async loginInner(
+    email: string,
+    password: string,
+    totpToken?: string,
+    ipAddress?: string,
+    userAgent?: string,
+    deviceId?: string,
+  ): Promise<
+    | { requiresMfa: true; tempToken: string }
+    | { requiresMfaSetup: true; tempToken: string }
+    | { requiresPasswordChange: true; tempToken: string }
     | { accessToken: string; refreshToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }
   > {
     const normalizedEmail = email.toLowerCase();
@@ -91,20 +158,31 @@ export class AdminAuthService {
       throw new UnauthorizedException({ code: ErrorCodes.INVALID_CREDENTIALS, message: 'Invalid email or password' });
     }
 
+    // AUT-011: admin yang flag mustChangePassword-nya true (dibuat SUPER_ADMIN
+    // / di-reset) WAJIB mengganti password sebelum mendapat sesi apa pun —
+    // tempToken scope admin_password_change, terikat deviceId (AUT-001).
+    if (admin.mustChangePassword) {
+      const tempToken = this.tokenService.signTempToken({ sub: admin.id, scope: 'admin_password_change', deviceId });
+      this.logger.warn(`Admin ${admin.email} must change password before login (first login / reset)`);
+      return { requiresPasswordChange: true, tempToken };
+    }
+
     const mfaRequired = await this.shouldEnforceAdminMfa();
     if (mfaRequired && !admin.isMfaEnabled) {
       // SEC-501: admin tanpa MFA (termasuk admin pertama) TIDAK mendapat
       // sesi penuh — diarahkan ke enrollment via tempToken (scope
       // admin_mfa_setup). Admin menyelesaikan setup di endpoint
       // POST /v1/admin/auth/mfa/setup + /mfa/enable (didukung admin web).
-      const tempToken = this.tokenService.signTempToken({ sub: admin.id, scope: 'admin_mfa_setup' });
+      // AUT-001: tempToken diikat ke deviceId.
+      const tempToken = this.tokenService.signTempToken({ sub: admin.id, scope: 'admin_mfa_setup', deviceId });
       this.logger.warn(`Admin ${admin.email} logged in without MFA — MFA setup required (enrollment path)`);
       return { requiresMfaSetup: true, tempToken };
     }
 
     if (admin.isMfaEnabled) {
       if (!totpToken) {
-        const tempToken = this.tokenService.signTempToken({ sub: admin.id, scope: 'admin_2fa_verify' });
+        // AUT-001: tempToken 2FA diikat ke deviceId (seperti mobile).
+        const tempToken = this.tokenService.signTempToken({ sub: admin.id, scope: 'admin_2fa_verify', deviceId });
         return { requiresMfa: true, tempToken };
       }
       if (!admin.mfaSecret) {
@@ -199,12 +277,15 @@ export class AdminAuthService {
   /**
    * Verify admin 2FA using a tempToken issued by login().
    * No plaintext credentials needed — tempToken proves identity.
+   * AUT-001: tempToken terikat ke deviceId (seperti mobile) — tolak bila
+   * perangkat peminta berbeda (fail-closed).
    */
   async verifyAdmin2fa(
     tempToken: string,
     totpToken: string,
     ipAddress?: string,
     userAgent?: string,
+    deviceId?: string,
   ): Promise<{ accessToken: string; refreshToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }> {
     let payload: import('../../auth/token.service').TempTokenPayload;
     try {
@@ -215,6 +296,13 @@ export class AdminAuthService {
 
     if (payload.scope !== 'admin_2fa_verify') {
       throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Invalid token scope' });
+    }
+
+    // AUT-001: binding perangkat — cerminan persis cek mobile
+    // (auth.service.ts verify2faLogin). TempToken tanpa deviceId (terbit
+    // sebelum AUT-001) maupun dari perangkat lain → tolak.
+    if (!payload.deviceId || payload.deviceId !== deviceId) {
+      throw new UnauthorizedException({ code: ErrorCodes.TEMP_TOKEN_EXPIRED, message: '2FA session is not valid for this device. Please log in again.' });
     }
 
     // Guard against temp-token replay: reject if the JTI has already been consumed
@@ -319,8 +407,8 @@ export class AdminAuthService {
    * Secret disimpan terenkripsi di Redis (TTL 10 menit) hingga diverifikasi
    * di enableMfa — tidak langsung ditulis ke DB.
    */
-  async setupMfa(tempToken: string): Promise<{ otpauthUrl: string; secret: string }> {
-    const admin = await this.verifyMfaSetupToken(tempToken);
+  async setupMfa(tempToken: string, deviceId?: string): Promise<{ otpauthUrl: string; secret: string }> {
+    const admin = await this.verifyMfaSetupToken(tempToken, deviceId);
 
     const secret = speakeasy.generateSecret({ length: 32, name: `Kahade Admin (${admin.email})` });
     const encrypted = await this.encryptMfaSecret(secret.base32);
@@ -349,8 +437,9 @@ export class AdminAuthService {
     totpToken: string,
     ipAddress?: string,
     userAgent?: string,
+    deviceId?: string,
   ): Promise<{ accessToken: string; refreshToken: string; admin: { id: string; adminId: string; fullName: string; email: string; role: string; isActive: boolean; isMfaEnabled: boolean; lastLoginAt: string | null } }> {
-    const admin = await this.verifyMfaSetupToken(tempToken);
+    const admin = await this.verifyMfaSetupToken(tempToken, deviceId);
 
     const stored = await this.redis.get(ADMIN_MFA_SETUP(admin.id), { throwOnError: true });
     if (!stored) {
@@ -389,15 +478,20 @@ export class AdminAuthService {
     return this.issueAdminSession(admin, ipAddress, userAgent);
   }
 
-  private async verifyMfaSetupToken(tempToken: string) {
-    let payload: { sub: string; scope: string };
+  // AUT-001: token setup MFA juga terikat deviceId — ia bermuara ke sesi
+  // penuh via enableMfa, jadi lubang yang sama harus ditutup.
+  private async verifyMfaSetupToken(tempToken: string, deviceId?: string) {
+    let payload: import('../../auth/token.service').TempTokenPayload;
     try {
-      payload = this.tokenService.verifyTempToken(tempToken) as { sub: string; scope: string };
+      payload = this.tokenService.verifyTempToken(tempToken);
     } catch {
       throw new UnauthorizedException({ code: ErrorCodes.TEMP_TOKEN_EXPIRED, message: 'Setup session expired' });
     }
     if (payload.scope !== 'admin_mfa_setup') {
       throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Invalid token scope' });
+    }
+    if (!payload.deviceId || payload.deviceId !== deviceId) {
+      throw new UnauthorizedException({ code: ErrorCodes.TEMP_TOKEN_EXPIRED, message: 'Setup session is not valid for this device. Please log in again.' });
     }
     const admin = await this.prisma.adminUser.findUnique({ where: { id: payload.sub } });
     if (!admin || !admin.isActive || admin.deletedAt) {
@@ -649,6 +743,135 @@ export class AdminAuthService {
     return admin;
   }
 
+  /**
+   * AUT-002: ganti password sendiri (autentikasi ulang password lama).
+   * Fail-closed: password lama salah → 401; password baru lemah → 400.
+   * Setelah ganti, SEMUA sesi dicabut (kecuali sesi aktif pemanggil tetap
+   * valid? — tidak: fail-closed, semua sesi termasuk pemanggil dicabut via
+   * marker; klien wajib login ulang).
+   */
+  async changePassword(
+    adminId: string,
+    currentPassword: string,
+    newPassword: string,
+    ipAddress?: string,
+  ): Promise<{ message: string }> {
+    const admin = await this.prisma.adminUser.findFirst({ where: { id: adminId, deletedAt: null } });
+    if (!admin || !admin.isActive) {
+      throw new UnauthorizedException({ code: ErrorCodes.ADMIN_NOT_FOUND, message: 'Admin not found' });
+    }
+
+    const matches = await bcryptCompare(currentPassword, admin.password);
+    if (!matches) {
+      this.logger.warn(`Admin password change rejected (wrong current password) for ${admin.email}`);
+      throw new UnauthorizedException({ code: ErrorCodes.INVALID_CREDENTIALS, message: 'Current password is incorrect' });
+    }
+
+    if (currentPassword === newPassword) {
+      throw new BadRequestException({ code: ErrorCodes.PASSWORD_TOO_WEAK, message: 'New password must differ from the current password' });
+    }
+
+    // AUT-009: kebijakan admin min 12 + kompleksitas (seperti createAdmin).
+    validateAdminPasswordPolicy(newPassword);
+
+    const hashedPassword = await bcryptHash(newPassword, BCRYPT_ROUNDS_ADMIN);
+    await this.prisma.adminUser.update({
+      where: { id: adminId },
+      data: {
+        password: hashedPassword,
+        mustChangePassword: false,
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+      },
+    });
+
+    // Cabut semua sesi (termasuk yang sedang dipakai — klien login ulang).
+    await this.redis.setex(
+      `admin_revoked:${adminId}`,
+      ADMIN_SESSION_ABSOLUTE_TTL_SECONDS,
+      String(Math.floor(Date.now() / 1000)),
+      { throwOnError: true },
+    );
+
+    this.auditLogService.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'AdminUser',
+      targetId: admin.id,
+      description: `Admin "${admin.fullName}" (${admin.adminId}) changed their own password`,
+      ipAddress: ipAddress ?? 'unknown',
+    });
+
+    return { message: 'Password changed successfully. Please log in again.' };
+  }
+
+  /**
+   * AUT-011: ganti password pertama untuk admin yang flag
+   * `mustChangePassword`-nya true (dibuat baru / di-reset SUPER_ADMIN).
+   * Token: scope `admin_password_change` dari login(), terikat deviceId
+   * (AUT-001) — satu arah saja: tidak menerbitkan sesi, klien wajib login
+   * ulang dengan password baru.
+   */
+  async acceptFirstPasswordChange(
+    tempToken: string,
+    newPassword: string,
+    ipAddress?: string,
+    deviceId?: string,
+  ): Promise<{ message: string }> {
+    let payload: import('../../auth/token.service').TempTokenPayload;
+    try {
+      payload = this.tokenService.verifyTempToken(tempToken);
+    } catch {
+      throw new UnauthorizedException({ code: ErrorCodes.TEMP_TOKEN_EXPIRED, message: 'Session expired, please log in again' });
+    }
+    if (payload.scope !== 'admin_password_change') {
+      throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Invalid token scope' });
+    }
+    if (!payload.deviceId || payload.deviceId !== deviceId) {
+      throw new UnauthorizedException({ code: ErrorCodes.TEMP_TOKEN_EXPIRED, message: 'Session is not valid for this device. Please log in again.' });
+    }
+
+    const admin = await this.prisma.adminUser.findFirst({ where: { id: payload.sub, deletedAt: null } });
+    if (!admin || !admin.isActive) {
+      throw new UnauthorizedException({ code: ErrorCodes.ADMIN_NOT_FOUND, message: 'Admin not found' });
+    }
+    if (!admin.mustChangePassword) {
+      // Token valid tapi flag sudah clear (mis. tab ganda) — tidak ada yang
+      // perlu dilakukan; jangan biarkan endpoint dipakai untuk ganti
+      // password sewenang-wenang tanpa password lama.
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Password change is not required. Use change-password instead.' });
+    }
+
+    validateAdminPasswordPolicy(newPassword);
+    const hashedPassword = await bcryptHash(newPassword, BCRYPT_ROUNDS_ADMIN);
+    await this.prisma.adminUser.update({
+      where: { id: admin.id },
+      data: { password: hashedPassword, mustChangePassword: false, failedLoginAttempts: 0, lockedUntil: null },
+    });
+
+    // Klaim temp token satu-pakai + cabut sesi yang mungkin ada.
+    if (payload.jti) {
+      await this.redis.setNx(ADMIN_TOKEN_BLACKLIST(payload.jti), '1', 10 * 60, { throwOnError: false });
+    }
+    await this.redis.setex(
+      `admin_revoked:${admin.id}`,
+      ADMIN_SESSION_ABSOLUTE_TTL_SECONDS,
+      String(Math.floor(Date.now() / 1000)),
+      { throwOnError: true },
+    );
+
+    this.auditLogService.logAdminAction({
+      adminId: admin.id,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'AdminUser',
+      targetId: admin.id,
+      description: `Admin "${admin.fullName}" (${admin.adminId}) completed first password change`,
+      ipAddress: ipAddress ?? 'unknown',
+    });
+
+    return { message: 'Password changed successfully. Please log in with your new password.' };
+  }
+
   private getAdminAccessTokenTtlSeconds(): number {
     const expiresIn: string = this.configService.get<string>('jwt.adminExpiresIn') ?? '30m';
     const match = expiresIn.match(/^(\d+)([smhd])$/);
@@ -790,6 +1013,17 @@ export class AdminAuthService {
       });
       // 03-#8: default fail-closed — MFA wajib kecuali eksplisit dinonaktifkan.
       // Kunci di-seed 'true' di prisma/seed.ts.
+      //
+      // AUT-010 (audit trail, terverifikasi 2026-10-01): kunci ini dapat
+      // diubah SUPER_ADMIN via PUT /v1/admin/system/configs/:key
+      // (admin-system.service.ts:updateConfig), dan SETIAP perubahan
+      // diaudit via auditLogService.logAdminAction aksi
+      // SYSTEM_CONFIG_CHANGED dengan before/after
+      // (admin-system.service.ts:~203-230) — BUKAN app_setting_audits
+      // (tabel appSetting hanya untuk OpsSettingsModule). Jadi menonaktifkan
+      // MFA wajib = tindakan tercatat (siapa, kapan, nilai lama/baru), tapi
+      // tetap operasi single-actor (bukan konfigurasi finansial — tidak ada
+      // persetujuan ganda).
       if (!config) return true;
       return config.value === 'true';
     } catch (err) {

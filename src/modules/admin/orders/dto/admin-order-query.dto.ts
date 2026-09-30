@@ -53,3 +53,17 @@ export class ForceActionDto {
   @Transform(({ value }) => typeof value === 'string' ? value.trim() : value)
   reason!: string;
 }
+
+/**
+ * AUT-013: force-cancel & force-complete adalah aksi finansial final —
+ * WAJIB re-auth password admin (bukan sekadar JWT). DTO ini dipakai
+ * menggantikan ForceActionDto di kedua endpoint tersebut; cancel-unshipped
+ * (SLA fallback rutin) tetap memakai DTO lama.
+ */
+export class ForceActionWithReauthDto extends ForceActionDto {
+  @ApiProperty({ description: 'Admin password for re-authentication (required for irreversible money-moving action)' })
+  @IsNotEmpty()
+  @IsString()
+  @MaxLength(72)
+  password!: string;
+}

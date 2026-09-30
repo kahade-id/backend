@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException, ConflictException, ForbiddenException, BadRequestException } from '@nestjs/common';
+import { randomInt as cryptoRandomInt } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { RedisService } from '../../../redis/redis.service';
@@ -16,6 +17,8 @@ import { bcryptHash } from '../../../common/utils/crypto.util';
 import { BCRYPT_ROUNDS_ADMIN } from '../../../common/constants/app.constants';
 import { escapeLikePattern } from '../../../common/utils/search.util';
 import { ADMIN_SESSION_ABSOLUTE_TTL_SECONDS } from '../../auth/token.service';
+// AUT-009: kebijakan password admin terpusat (satu-satunya sumber kebenaran).
+import { validateAdminPasswordPolicy } from '../admin-password-policy';
 // ADM-420: epoch `admin_revoked:` harus hidup minimal sepanjang umur maksimum
 // kredensial admin yang masih bisa dihormati. Refresh token dibatasi umur
 // absolut sesi 24 jam (SEC-502); marker 2 jam membuka jendela 2–24 jam di mana
@@ -109,13 +112,8 @@ export class AdminManagementService {
       throw new ConflictException({ code: ErrorCodes.EMAIL_ALREADY_EXISTS, message: 'Email already registered as admin' });
     }
 
-    const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()\-_=+{};:,<.>/?\\|'"`~[\]@])/;
-    if (dto.password.length < 12) {
-      throw new BadRequestException({ code: ErrorCodes.PASSWORD_TOO_WEAK, message: 'Password must be at least 12 characters' });
-    }
-    if (!passwordRegex.test(dto.password)) {
-      throw new BadRequestException({ code: ErrorCodes.PASSWORD_TOO_WEAK, message: 'Password must contain uppercase, lowercase, digit, and special character' });
-    }
+    // AUT-009: validasi via kebijakan terpusat (min 12 + kompleksitas).
+    validateAdminPasswordPolicy(dto.password);
 
     const hashedPassword = await bcryptHash(dto.password, BCRYPT_ROUNDS_ADMIN);
     const { nanoid } = await import('nanoid');
@@ -130,6 +128,8 @@ export class AdminManagementService {
         role: dto.role,
         isActive: true,
         createdBy: creatorId,
+        // AUT-011: admin baru WAJIB mengganti password bawaan saat login pertama.
+        mustChangePassword: true,
       },
       select: {
         id: true,
@@ -288,6 +288,88 @@ export class AdminManagementService {
     });
 
     return { message: '2FA reset successfully' };
+  }
+
+  /**
+   * AUT-002: reset password admin oleh SUPER_ADMIN. Tidak ada alur
+   * lupa-password mandiri via email/OTP untuk admin (by design: akun
+   * privilese tinggi hanya dipulihkan lewat SUPER_ADMIN yang teraudit).
+   *
+   * - Tidak boleh me-reset password milik sendiri (pola yang sama dengan
+   *   reset 2FA — `CANNOT_RESET_OWN_2FA`).
+   * - Password sementara WAJIB memenuhi kebijakan admin (min 12 +
+   *   kompleksitas); bila tidak diberikan, dibuat acak yang memenuhi syarat.
+   * - Flag `mustChangePassword=true` (AUT-011): target WAJIB mengganti
+   *   password saat login berikutnya sebelum mendapat sesi.
+   * - Semua sesi target dicabut (fail-closed).
+   */
+  async resetAdminPassword(
+    targetId: string,
+    updaterId: string,
+    ipAddress: string,
+    temporaryPassword?: string,
+  ): Promise<{ message: string; temporaryPassword: string }> {
+    const admin = await this.prisma.adminUser.findFirst({ where: { id: targetId, deletedAt: null } });
+    if (!admin) {
+      throw new NotFoundException({ code: ErrorCodes.ADMIN_NOT_FOUND, message: 'Admin not found' });
+    }
+
+    if (targetId === updaterId) {
+      throw new ForbiddenException({ code: 'CANNOT_RESET_OWN_PASSWORD', message: 'Cannot reset your own password — use change-password instead' });
+    }
+
+    const tempPassword = temporaryPassword?.trim() || this.generateTemporaryPassword();
+    validateAdminPasswordPolicy(tempPassword);
+
+    const hashedPassword = await bcryptHash(tempPassword, BCRYPT_ROUNDS_ADMIN);
+    await this.prisma.adminUser.update({
+      where: { id: targetId },
+      data: {
+        password: hashedPassword,
+        mustChangePassword: true,
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+      },
+    });
+    // Cabut semua sesi target — password lama (bila bocor) tidak bisa dipakai lagi.
+    await this.redis.setex(
+      `admin_revoked:${targetId}`,
+      ADMIN_REVOKED_MARKER_TTL_SECONDS,
+      String(Math.floor(Date.now() / 1000)),
+      { throwOnError: true },
+    );
+
+    this.auditLog.logAdminAction({
+      adminId: updaterId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'AdminUser',
+      targetId: admin.id,
+      description: `Reset password for admin "${admin.fullName}" (${admin.adminId}) — must change on next login`,
+      ipAddress,
+    });
+
+    return { message: 'Password reset successfully. The admin must change it on next login.', temporaryPassword: tempPassword };
+  }
+
+  /**
+   * Bangkitkan password sementara yang memenuhi kebijakan admin:
+   * 16 karakter dari 4 kelas (besar/kecil/angka/simbol), CSPRNG.
+   */
+  private generateTemporaryPassword(): string {
+    const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+    const lower = 'abcdefghijkmnopqrstuvwxyz';
+    const digits = '23456789';
+    const symbols = '!@#$%^&*()-_=+';
+    const all = upper + lower + digits + symbols;
+    const pick = (chars: string): string => chars[cryptoRandomInt(chars.length)];
+    // Jamin tiap kelas muncul minimal sekali, lalu acak urutan.
+    const chars = [pick(upper), pick(lower), pick(digits), pick(symbols)];
+    for (let i = 0; i < 12; i++) chars.push(pick(all));
+    for (let i = chars.length - 1; i > 0; i--) {
+      const j = cryptoRandomInt(i + 1);
+      [chars[i], chars[j]] = [chars[j], chars[i]];
+    }
+    return chars.join('');
   }
 
   async unlockAdmin(targetId: string, updaterId: string, ipAddress: string): Promise<{ message: string }> {

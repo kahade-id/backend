@@ -49,6 +49,19 @@ export interface DanaDirectPayResult {
   qrString: string | null;
   webRedirectUrl: string | null;
   expiryTime: Date;
+  /**
+   * BFI-084: info refund ADITIF — hanya diisi bila ada refund
+   * (PaymentTransaction.refundedAmount > 0). FE membaca defensif (null →
+   * tidak tampil). Tanpa query tambahan: semua field sudah di baris yang sama.
+   */
+  refund?: {
+    /** "REFUNDED" (penuh) | "PARTIAL" (parsial). */
+    status: 'REFUNDED' | 'PARTIAL';
+    /** Rupiah. */
+    amount: number;
+    refundedAt: string | null;
+    refundReference: string | null;
+  } | null;
 }
 
 export interface DanaPaymentMethodInfo {
@@ -148,6 +161,9 @@ export class DanaDirectPaymentService {
       expiredAt: Date | null;
       danaPayKind: string | null;
       providerInstructions: Prisma.JsonValue | null;
+      refundedAmount: bigint;
+      refundRequestedAt: Date | null;
+      refundReference: string | null;
     },
     orderId: string,
   ): DanaDirectPayResult {
@@ -171,6 +187,19 @@ export class DanaDirectPaymentService {
       webRedirectUrl:
         typeof instructions.webRedirectUrl === 'string' ? instructions.webRedirectUrl : null,
       expiryTime: payment.expiredAt ?? new Date(),
+      // BFI-084: sertakan info refund bila ada (aditif; FE defensif).
+      refund:
+        payment.refundedAmount > BigInt(0)
+          ? {
+              status:
+                payment.refundedAmount >= payment.grossAmount
+                  ? ('REFUNDED' as const)
+                  : ('PARTIAL' as const),
+              amount: toIdr(payment.refundedAmount),
+              refundedAt: payment.refundRequestedAt?.toISOString() ?? null,
+              refundReference: payment.refundReference,
+            }
+          : null,
     };
   }
 

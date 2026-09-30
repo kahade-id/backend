@@ -409,19 +409,21 @@ describe('BankAccountsService', () => {
       ).rejects.toMatchObject({ response: { code: 'BANK_ACCOUNT_DUPLICATE' } });
     });
 
-    it('rejects a provider account-number mismatch before persisting verification', async () => {
+    it('rejects when DANA did not verify the inquiry before persisting verification', async () => {
+      // BFI-080: inquiry.accountNumber hanya gema request (bukan hasil DANA),
+      // jadi sinyal verifikasi yang benar adalah inquiry.verified.
       arrangePreChecks();
       arrangeTx({ existing: null });
       mockDanaDisbursement.bankAccountInquiry.mockResolvedValueOnce({
         accountName: 'BUDI SANTOSO',
-        accountNumber: '9999999999',
+        accountNumber: '1234567890',
         bankCode: BankCode.BCA,
-        verified: true,
+        verified: false,
       });
 
       await expect(
         service.addBankAccount(HASH_OWNER, BankCode.BCA, 'BCA', '1234567890', 'BUDI SANTOSO'),
-      ).rejects.toMatchObject({ response: { code: 'BANK_ACCOUNT_NUMBER_MISMATCH' } });
+      ).rejects.toMatchObject({ response: { code: 'BANK_ACCOUNT_VERIFICATION_FAILED' } });
     });
 
     it('inserts normally when the hash is unused', async () => {

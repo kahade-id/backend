@@ -527,6 +527,9 @@ export class DisputesService {
           title: 'Bukti baru dalam sengketa',
           body: `Pihak lawan menambahkan bukti baru pada sengketa ${dispute.disputeId}. Silakan periksa.`,
           isRead: false,
+          // NCC-003: actionUrl + ref agar tap inbox membuka detail sengketa.
+          actionUrl: `/dispute/${encodeURIComponent(dispute.id)}`,
+          refType: 'DISPUTE', refId: dispute.id,
         },
       })
       .catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
@@ -734,6 +737,9 @@ export class DisputesService {
             title: 'Klaim balasan dalam sengketa',
             body: `Pihak lawan mengajukan klaim pada sengketa ${isClaimantBuyer.disputeId}. Silakan periksa.`,
             isRead: false,
+            // NCC-003: actionUrl + ref agar tap inbox membuka detail sengketa.
+            actionUrl: `/dispute/${encodeURIComponent(isClaimantBuyer.id)}`,
+            refType: 'DISPUTE', refId: isClaimantBuyer.id,
           },
         })
         .catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
@@ -861,17 +867,23 @@ export class DisputesService {
      * errors and no way to reach their own dispute. Demoted to the codebase's `silent-catch`
      * idiom (46 other call sites, e.g. `rating-reply.service.ts:58`): the notification is
      * best-effort, the dispute is not.
+     *
+     * NCC-002 [P0]: baris inbox DIBUAT dengan actionUrl + refType/refId (pola
+     * queue: row dulu, baru emit) — lawan sengketa yang push-nya terlewat
+     * tetap punya jejak in-app yang bisa di-tap ke detail sengketa.
      */
+    const disputeActionUrl = `/dispute/${encodeURIComponent(createdDispute.id)}`;
     this.prisma.notification
       .create({
         data: {
           notifId: generateNotifId(), userId: counterpartId,
           type: NotificationType.DISPUTE_SUBMITTED, category: getCategoryForType(NotificationType.DISPUTE_SUBMITTED),
           title: 'Dispute Filed', body: `A dispute has been filed for order ${order.orderId}. Please review the dispute details.`, isRead: false,
+          actionUrl: disputeActionUrl, refType: 'DISPUTE', refId: createdDispute.id,
         },
       })
       .catch((err) => this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`));
-    this.runRealtimeBestEffort(() => this.prisma.emitNotificationCreated({ userId: counterpartId, title: 'Dispute Filed', body: `Dispute filed for order ${order.orderId}`, data: { type: 'DISPUTE_SUBMITTED', disputeId: createdDispute.id } }), `SUBMIT_DISPUTE_NOTIFICATION orderId=${order.orderId}`);
+    this.runRealtimeBestEffort(() => this.prisma.emitNotificationCreated({ userId: counterpartId, title: 'Dispute Filed', body: `Dispute filed for order ${order.orderId}`, data: { type: 'DISPUTE_SUBMITTED', disputeId: createdDispute.id, actionUrl: disputeActionUrl } }), `SUBMIT_DISPUTE_NOTIFICATION orderId=${order.orderId}`);
 
     this.logger.log(`Dispute created: disputeId=${createdDispute.disputeId}, orderId=${orderId}, initiator=${userId}`);
 
@@ -1058,6 +1070,16 @@ export class DisputesService {
    * DP-021: notifikasi ke admin yang ditugaskan via adminAuditLog (mekanisme
    * notifikasi admin di codebase ini — AdminUser tidak punya userId yang terhubung
    * ke tabel notifikasi user). Best-effort: kegagalan tidak menggagalkan aksi utama.
+   *
+   * NCC-012 (TIDAK BISA penuh — dicatat, bukan dibangun): membuat notification
+   * row untuk admin TIDAK MUNGKIN dengan infrastruktur yang ada —
+   * `Notification.userId` ber-FK ke tabel `User`, sedangkan `AdminUser`
+   * (schema.prisma:3244) tidak punya kolom/relasi ke `User`; panel admin pun
+   * tidak punya notification center/inbox (satu-satunya "notification" di
+   * panel adalah checkbox push di system/page.tsx). Membangun pemetaan
+   * admin↔user + inbox admin + push ke admin = notification center baru —
+   * eksplisit di luar cakupan fix. Mitigasi yang ada: baris adminAuditLog
+   * (di bawah) + daftar sengketa yang ditugaskan di panel admin.
    */
   private notifyAssignedAdmin(
     assignedAdminId: string | null | undefined,
@@ -1150,6 +1172,10 @@ export class DisputesService {
             title: escalateTitle,
             body: escalateBody,
             isRead: false,
+            // NCC-003: actionUrl + ref agar tap inbox membuka detail sengketa
+            // (nilai selaras dengan disputeId pada payload emit di bawah).
+            actionUrl: `/dispute/${encodeURIComponent(dispute.disputeId)}`,
+            refType: 'DISPUTE', refId: dispute.disputeId,
           },
         })
         .then(() => {

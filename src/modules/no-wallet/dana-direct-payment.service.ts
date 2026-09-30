@@ -47,6 +47,12 @@ export interface DanaDirectPayResult {
   qrString: string | null;
   webRedirectUrl: string | null;
   expiryTime: Date;
+  /**
+   * MFE-006: progres refund DANA (async) — diekspos agar buyer melihat
+   * "Dana dikembalikan RpX" + referensi refund. Null/0 bila belum ada refund.
+   */
+  refundedAmount: number;
+  refundReference: string | null;
 }
 
 export interface DanaPaymentMethodInfo {
@@ -120,7 +126,16 @@ export class DanaDirectPaymentService {
     private readonly walletMode: WalletModeService,
   ) {}
 
-  /** Fee provider per metode (basis points dari gross escrow). Default QRIS 0.7%. */
+  /**
+   * Fee provider per metode (basis points dari gross escrow). Default QRIS 0.7%.
+   *
+   * MFE-019 (ASUMSI TERDOKUMENTASI, BUKAN FAKTA): fee VA/BALANCE = 0 bps
+   * adalah asumsi — DANA Enterprise mengenakan fee QRIS 0.7% yang terverifikasi
+   * di sandbox, tetapi struktur fee VA/BALANCE Gapura belum terkonfirmasi ke
+   * DANA. TODO: verifikasi tarif VA & BALANCE resmi DANA (dashboard/merchant
+   * services); bila > 0, sesuaikan bps di sini + catat di paymentFee/
+   * grossAmount agar nominal yang ditagih tetap = nominal yang ditampilkan.
+   */
   private feeFor(payKind: DanaDirectPayKind, escrowAmountIdr: number): number {
     const bps =
       payKind === DanaDirectPayKind.QRIS
@@ -143,6 +158,8 @@ export class DanaDirectPaymentService {
       amount: bigint;
       paymentFee: bigint;
       grossAmount: bigint;
+      refundedAmount: bigint;
+      refundReference: string | null;
       expiredAt: Date | null;
       danaPayKind: string | null;
       providerInstructions: Prisma.JsonValue | null;
@@ -169,6 +186,8 @@ export class DanaDirectPaymentService {
       webRedirectUrl:
         typeof instructions.webRedirectUrl === 'string' ? instructions.webRedirectUrl : null,
       expiryTime: payment.expiredAt ?? new Date(),
+      refundedAmount: toIdr(payment.refundedAmount),
+      refundReference: payment.refundReference,
     };
   }
 
@@ -281,10 +300,20 @@ export class DanaDirectPaymentService {
         amountIdr: grossAmount,
         bankCode: dto.bankCode,
         orderTitle: `Kahade escrow ${orderId}`,
+        // MFE-022: tiga "jam" kedaluwarsa yang sedikit berbeda — (1) expiredAt
+        // DB awal dihitung di sini, (2) DANA menghitung validUpTo sendiri dari
+        // expiryMinutes (pembulatan menit) lalu mengembalikan expiresAt, (3)
+        // expiredAt DB final ditimpa dari respons DANA di bawah. FE membaca
+        // SATU-SATUNYA yang konsisten: `expiryTime` hasil serialize() (MFE-008).
         expiryMinutes: Math.round((expiredAt.getTime() - Date.now()) / 60_000),
       });
+      // MFE-002: DANA mengembalikan string QR EMVCo di
+      // `additionalInfo.paymentCode` untuk QRIS — simpan ke `qrString` (bukan
+      // hanya `paymentCode`), karena serialize()/FE membaca key `qrString`
+      // untuk merender QR. Tanpa ini QRIS dirender sebagai "nomor VA" sampah.
       const instructions: Prisma.InputJsonValue = {
         paymentCode: created.paymentCode || null,
+        qrString: payKind === DanaDirectPayKind.QRIS ? created.paymentCode || null : null,
         webRedirectUrl: created.webRedirectUrl ?? null,
         danaReferenceNo: created.referenceNo,
         payKind,

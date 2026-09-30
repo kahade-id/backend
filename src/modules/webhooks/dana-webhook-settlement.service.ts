@@ -9,7 +9,7 @@ import { PaymentProvider, PaymentPurpose, PaymentStatus, Prisma } from '@prisma/
 import { PrismaService } from '../../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { OrderQrisPaymentService } from '../payment/order-qris-payment.service';
-import { DanaPaymentService } from '../payment/dana/dana-payment.service';
+import { DanaPaymentService, mapDanaTxStatus } from '../payment/dana/dana-payment.service';
 import { DanaDirectPaymentService } from '../no-wallet/dana-direct-payment.service';
 import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
 import { WalletModeService } from '../wallet-mode/wallet-mode.service';
@@ -259,9 +259,25 @@ export class DanaWebhookSettlementService {
 
     // Hanya status sukses DANA yang boleh lanjut ke settlement finansial.
     if (notify.latestTransactionStatus !== DANA_TX_STATUS_SUCCESS) {
-      this.logger.log(
-        `DANA webhook: status ${notify.latestTransactionStatus} bukan sukses — tanpa kredit`,
-      );
+      // MFE-009: notify kedaluwarsa DANA ('05'/EXPIRED) HARUS dipersist —
+      // payment yang mati di DANA tidak boleh macet PENDING selamanya di DB
+      // (dulu silent return; FE mem-poll 15 menit penuh untuk charge yang
+      // sudah mati). Transisi fail-closed: hanya PENDING → EXPIRED; baris
+      // SUCCESS/REFUNDED/final lain TIDAK diturunkan statusnya.
+      const mapped = mapDanaTxStatus(notify.latestTransactionStatus);
+      if (mapped === 'EXPIRED' && pt.status === PaymentStatus.PENDING) {
+        await this.prisma.paymentTransaction.update({
+          where: { id: pt.id },
+          data: { status: PaymentStatus.EXPIRED, failedAt: new Date() },
+        });
+        this.logger.log(
+          `DANA webhook: paymentTransaction ${pt.id} → EXPIRED (notify ${notify.latestTransactionStatus})`,
+        );
+      } else {
+        this.logger.log(
+          `DANA webhook: status ${notify.latestTransactionStatus} bukan sukses — tanpa kredit`,
+        );
+      }
       return;
     }
 
@@ -331,6 +347,18 @@ export class DanaWebhookSettlementService {
         await this.walletService.handleTopupSuccess(pt.midtransOrderId, grossAmount);
       }
     } else if (pt.purpose === PaymentPurpose.ORDER_ESCROW) {
+      // MFE-021: baris escrow DANA TANPA danaPayKind = baris ambigu —
+      // JANGAN jatuh ke jalur wallet/QRIS lama (mode BI-safe: wallet tidak
+      // boleh dikredit dari jalur ini). Fail-closed: log error + skip;
+      // settlement manual via rekonsiliasi admin. Baris non-DANA tetap memakai
+      // jalur QRIS lama seperti sebelumnya.
+      if (pt.provider === PaymentProvider.DANA && !pt.danaPayKind) {
+        this.logger.error(
+          `DANA webhook: escrow ${pt.id} (partnerRef=${pt.danaPartnerReferenceNo}) tanpa danaPayKind — ` +
+            'skip settlement ke jalur wallet; butuh review manual',
+        );
+        return;
+      }
       await this.orderQrisPaymentService.handleSettlement(pt.midtransOrderId, grossAmount);
     } else if (
       pt.provider === PaymentProvider.DANA &&

@@ -98,6 +98,8 @@ export class DanaPaymentService {
       channelId: this.config.get<string>('dana.channelId') ?? '95221',
       externalStoreId: this.config.get<string>('dana.externalStoreId') ?? '',
       webhookUrl: this.config.get<string>('dana.webhookUrl') ?? '',
+      /** MFE-010: halaman finish user untuk PAY_RETURN deeplink BALANCE. */
+      payReturnUrl: this.config.get<string>('dana.payReturnUrl') ?? '',
       debug: this.config.get<boolean>('dana.debug') ?? false,
       orderExpiryMinutes: this.config.get<number>('dana.orderExpiryMinutes') ?? 30,
     };
@@ -209,12 +211,18 @@ export class DanaPaymentService {
       validUpTo,
       urlParams: [
         { url: c.webhookUrl, type: 'NOTIFICATION', isDeeplink: 'Y' },
-        { url: c.webhookUrl, type: 'PAY_RETURN', isDeeplink: 'Y' },
+        // MFE-010: PAY_RETURN untuk BALANCE (deeplink aplikasi DANA) menunjuk
+        // ke halaman finish user, BUKAN ke endpoint webhook JSON — buyer
+        // dikembalikan ke aplikasi, bukan ke respons API mentah.
+        { url: params.kind === 'BALANCE' ? c.payReturnUrl : c.webhookUrl, type: 'PAY_RETURN', isDeeplink: 'Y' },
       ],
       payOptionDetails: [
         {
           payMethod,
-          payOption,
+          // MFE-020: JANGAN kirim payOption: '' untuk BALANCE — field kosong
+          // berisiko 4005401 Invalid Field Format dari DANA (fixture resmi
+          // selalu mengisi payOption). Key di-omit bila kosong.
+          ...(payOption ? { payOption } : {}),
           transAmount: { value: amount, currency: 'IDR' },
         },
       ],

@@ -5,7 +5,7 @@ import { Request } from 'express';
 import { ApiTags, ApiBearerAuth, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { AdminOrdersService } from './admin-orders.service';
 import { PaginatedResponse } from '../../../common/dto/pagination.dto';
-import { AdminOrderQueryDto, ForceActionDto } from './dto/admin-order-query.dto';
+import { AdminOrderQueryDto, ForceActionDto, ForceActionWithReauthDto } from './dto/admin-order-query.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
 import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
@@ -46,7 +46,8 @@ export class AdminOrdersController {
     summary: 'Force cancel order',
     description:
       'Admin force-cancels an order with optional escrow refund. ' +
-      'ADM-404: DISPUTE_ADMIN hanya untuk order dengan dispute aktif; di luar itu butuh SUPER_ADMIN. Reason wajib (min 10 karakter).',
+      'ADM-404: DISPUTE_ADMIN hanya untuk order dengan dispute aktif; di luar itu butuh SUPER_ADMIN. Reason wajib (min 10 karakter). ' +
+      'AUT-013: aksi finansial final — password admin wajib di body (re-auth).',
   })
   @ApiResponse({ status: 200, description: 'Order force-cancelled.' })
   @ApiResponse({ status: 400, description: 'Invalid order status for cancellation.' })
@@ -54,7 +55,7 @@ export class AdminOrdersController {
   @ApiResponse({ status: 404, description: 'Order not found.' })
   forceCancel(
     @Param('orderId', ParseIdPipe) orderId: string,
-    @Body() dto: ForceActionDto,
+    @Body() dto: ForceActionWithReauthDto,
     @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<{ orderId: string; status: string }> {
@@ -89,13 +90,13 @@ export class AdminOrdersController {
   @Idempotency()
   @UseGuards(UserThrottleGuard)
   @AdminRoles('SUPER_ADMIN')
-  @ApiOperation({ summary: 'Force complete order', description: 'Admin force-completes an order, releasing escrow to seller.' })
+  @ApiOperation({ summary: 'Force complete order', description: 'Admin force-completes an order, releasing escrow to seller. AUT-013: password admin wajib di body (re-auth).' })
   @ApiResponse({ status: 200, description: 'Order force-completed.' })
   @ApiResponse({ status: 400, description: 'Invalid order status for completion.' })
   @ApiResponse({ status: 404, description: 'Order not found.' })
   forceComplete(
     @Param('orderId', ParseIdPipe) orderId: string,
-    @Body() dto: ForceActionDto,
+    @Body() dto: ForceActionWithReauthDto,
     @CurrentAdmin('sub') adminId: string,
     @Req() req: Request,
   ): Promise<{ orderId: string; status: string }> {

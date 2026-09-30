@@ -10,7 +10,7 @@ import {
   Optional,
 } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { Prisma, AuditAction, WalletTransactionType, WalletTransactionStatus } from '@prisma/client';
+import { Prisma, AuditAction, WalletTransactionType, WalletTransactionStatus, OrderStatus, PaymentProvider, PaymentPurpose, PaymentStatus, EscrowDisbursementStatus, EscrowDisbursementScope } from '@prisma/client';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { FinanceTransactionQueryDto } from './dto/finance-query.dto';
 import { WithdrawalApproveDto, WithdrawalRejectDto } from './dto/withdrawal-action.dto';
@@ -1340,27 +1340,68 @@ export class AdminFinanceService {
   }
 
   /**
-   * BAI-047 (P1): di era tanpa-wallet, dana escrow dipegang DANA (payment
-   * direct), BUKAN kolom wallet.escrowBalance — sehingga SUM wallet selalu
-   * Rp0 sementara order aktif > 0 (kartu "Escrow aktif: Rp0" menyesatkan).
+   * BAI-047 (P1) + MFE-011: ringkasan escrow mencakup SEMUA "pot" dana.
+   *
+   * BAI-047: di era tanpa-wallet, dana escrow dipegang DANA (payment direct),
+   * BUKAN kolom wallet.escrowBalance — sehingga SUM wallet selalu Rp0
+   * sementara order aktif > 0 (kartu "Escrow aktif: Rp0" menyesatkan).
    * Bila wallet nonaktif: total = SUM(buyerPayAmount) order aktif
    * (PROCESSING/IN_DELIVERY/DISPUTED) + flag `source: 'ORDER_BASED'` agar UI
    * melabelinya dengan jelas. Bila wallet aktif: perilaku lama +
    * `source: 'WALLET_BASED'`.
+   *
+   * MFE-011: agregat DANA-direct (PaymentTransaction SUCCESS, purpose
+   * ORDER_ESCROW, order masih aktif) selalu dihitung agar dashboard tidak
+   * menampilkan escrow aktif Rp0 walau dana nyata tertahan di DANA.
+   * Field dana* bersifat aditif (read-only; tanpa mutasi).
    */
   async getEscrowSummary(): Promise<{
     totalEscrowBalance: number;
     walletsWithEscrow: number;
     activeEscrowOrders: number;
     source: 'WALLET_BASED' | 'ORDER_BASED';
+    /** MFE-011: agregat escrow DANA-direct (mode tanpa-wallet). */
+    danaEscrowBalance: number;
+    danaEscrowPayments: number;
+    danaDisbursementsPending: number;
   }> {
+    const activeOrderStatuses: OrderStatus[] = [
+      OrderStatus.PROCESSING,
+      OrderStatus.IN_DELIVERY,
+      OrderStatus.DISPUTED,
+    ];
+
+    // MFE-011: agregat DANA-direct (read-only) — dihitung di kedua mode agar
+    // admin selalu punya visibilitas pot escrow DANA.
+    const [danaAgg, danaDisburs] = await Promise.all([
+      this.prisma.paymentTransaction.aggregate({
+        where: {
+          provider: PaymentProvider.DANA,
+          purpose: PaymentPurpose.ORDER_ESCROW,
+          status: PaymentStatus.SUCCESS,
+          order: { status: { in: activeOrderStatuses }, deletedAt: null },
+        },
+        _sum: { grossAmount: true },
+        _count: true,
+      }),
+      this.prisma.escrowDisbursement.count({
+        where: { status: { not: 'SUCCESS' } },
+      }),
+    ]);
+    const danaFields = {
+      danaEscrowBalance: toIdr(danaAgg._sum.grossAmount ?? BigInt(0)),
+      danaEscrowPayments: danaAgg._count,
+      danaDisbursementsPending: danaDisburs,
+    };
+
     const activeEscrowOrders = await this.prisma.order.count({
-      where: { status: { in: ['PROCESSING', 'IN_DELIVERY', 'DISPUTED'] } },
+      where: { status: { in: activeOrderStatuses } },
     });
 
+    // BAI-047: mode tanpa-wallet → total dari order aktif (bukan kolom wallet).
     if (this.walletMode && !this.walletMode.isWalletEnabled()) {
       const orderAgg = await this.prisma.order.aggregate({
-        where: { status: { in: ['PROCESSING', 'IN_DELIVERY', 'DISPUTED'] } },
+        where: { status: { in: activeOrderStatuses } },
         _sum: { buyerPayAmount: true },
       });
       return {
@@ -1370,6 +1411,7 @@ export class AdminFinanceService {
         walletsWithEscrow: 0,
         activeEscrowOrders,
         source: 'ORDER_BASED',
+        ...danaFields,
       };
     }
 
@@ -1384,7 +1426,89 @@ export class AdminFinanceService {
       walletsWithEscrow: escrowAgg._count,
       activeEscrowOrders,
       source: 'WALLET_BASED',
+      ...danaFields,
     };
+  }
+
+  /**
+   * MFE-015: antrean disbursement escrow untuk admin (visibilitas operasional
+   * atas dana DANA-direct yang keluar ke rekening bank seller).
+   *
+   * Filter yang penting: status HELD_NO_BANK (seller belum punya rekening
+   * terverifikasi — fail-closed, butuh tindak lanjut) dan NEEDS_REVIEW
+   * (status DANA tak dikenal — butuh review manual sebelum retry/FAILED).
+   * Read-only: tidak ada aksi mutasi di sini (retry manual ditangani modul
+   * disbursement / cron retryDue).
+   */
+  async listDisbursements(query: {
+    page?: number;
+    limit?: number;
+    status?: EscrowDisbursementStatus;
+    scope?: string;
+    q?: string;
+    sortBy?: 'createdAt' | 'updatedAt' | 'amountSen';
+    sortOrder?: 'asc' | 'desc';
+  }): Promise<object> {
+    const page = Math.max(1, query.page ?? 1);
+    const safeLimit = Math.min(Math.max(query.limit ?? 20, 1), 100);
+    const where: Prisma.EscrowDisbursementWhereInput = {};
+    if (query.status) where.status = query.status;
+    const scopes = Object.values(EscrowDisbursementScope) as string[];
+    if (query.scope && scopes.includes(query.scope)) {
+      where.scope = query.scope as EscrowDisbursementScope;
+    }
+    const q = query.q?.trim();
+    if (q) {
+      where.OR = [
+        { danaPartnerReferenceNo: { contains: q, mode: 'insensitive' } },
+        { sellerId: { contains: q, mode: 'insensitive' } },
+        { orderId: { contains: q, mode: 'insensitive' } },
+      ];
+    }
+    const orderBy: Prisma.EscrowDisbursementOrderByWithRelationInput =
+      query.sortBy === 'amountSen'
+        ? { amountSen: query.sortOrder ?? 'desc' }
+        : query.sortBy === 'updatedAt'
+          ? { updatedAt: query.sortOrder ?? 'desc' }
+          : { createdAt: query.sortOrder ?? 'desc' };
+
+    const [rows, total] = await Promise.all([
+      this.prisma.escrowDisbursement.findMany({
+        where,
+        orderBy,
+        skip: (page - 1) * safeLimit,
+        take: safeLimit,
+        include: {
+          seller: { select: { userId: true, username: true, fullName: true, email: true } },
+          bankAccount: { select: { id: true, bankCode: true, accountName: true, accountNumber: true } },
+        },
+      }),
+      this.prisma.escrowDisbursement.count({ where }),
+    ]);
+
+    return createPaginatedResponse(
+      rows.map(r => ({
+        id: r.id,
+        scope: r.scope,
+        scopeRefId: r.scopeRefId,
+        orderId: r.orderId,
+        amount: toIdr(r.amountSen),
+        status: r.status,
+        heldReason: r.heldReason,
+        lastError: r.lastError,
+        danaPartnerReferenceNo: r.danaPartnerReferenceNo,
+        danaReferenceNo: r.danaReferenceNo,
+        attemptCount: r.attemptCount,
+        releasedAt: r.releasedAt,
+        createdAt: r.createdAt,
+        updatedAt: r.updatedAt,
+        seller: r.seller,
+        bankAccount: r.bankAccount,
+      })),
+      total,
+      page,
+      safeLimit,
+    );
   }
 
   async getRevenue(): Promise<object> {

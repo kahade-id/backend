@@ -16,6 +16,8 @@ const SAFE_PUSH_DATA_KEYS = new Set([
   'orderId', 'transactionId', 'txId', 'roomId', 'chatRoomId', 'orderLinkToken', 'linkToken', 'token',
   'username', 'userUsername', 'profileUsername', 'disputeId', 'rewardId', 'badgeId', 'templateId',
   'ticketId', 'promoCode', 'code', 'scheduleId', 'entityId', 'entityType', 'broadcastId',
+  'milestoneId', // NCC-004: data push milestone (notifyMilestone)
+  'questionId', // NCC-014: data push pengingat pertanyaan (question-reminder)
 ]);
 
 /**
@@ -105,7 +107,9 @@ export class PushService implements OnModuleInit {
       CHAT_NEW: NotificationType.CHAT_NEW_MESSAGE,
       DISPUTE_RESOLUTION: NotificationType.DISPUTE_DECISION,
       DISPUTE_RESOLVED: NotificationType.DISPUTE_DECISION,
-      ORDER_DELIVERED: NotificationType.ORDER_SHIPPED,
+      // NCC-010: alias ORDER_DELIVERED → ORDER_SHIPPED DIHAPUS — ORDER_DELIVERED
+      // kini anggota enum NotificationType yang sah; alias ini membuat lookup
+      // baris notifikasi enrichPushData meleset dari baris bertipe ORDER_DELIVERED.
       SECURITY_BACKUP_CODE: NotificationType.SECURITY_BACKUP_CODE_USED,
       SECURITY_ALERT: NotificationType.SECURITY_NEW_LOGIN,
       WALLET_TOPUP: NotificationType.WALLET_TOPUP_SUCCESS,
@@ -119,6 +123,11 @@ export class PushService implements OnModuleInit {
     if (data?.actionUrl) return data.actionUrl;
     if (data?.orderId) return `/order/${encodeURIComponent(data.orderId)}`;
     if (data?.roomId ?? data?.chatRoomId) return `/chat/${encodeURIComponent(data.roomId ?? data.chatRoomId ?? '')}`;
+    // NCC-003: cabang disputeId (selaras notification.processor) — tap push
+    // sengketa (DISPUTE_DECISION, DISPUTE_SUBMITTED, …) membuka detail sengketa.
+    if (data?.disputeId) return `/dispute/${encodeURIComponent(data.disputeId)}`;
+    // NCC-004: cabang milestoneId — tap push milestone membuka detail milestone.
+    if (data?.milestoneId) return `/milestones/${encodeURIComponent(data.milestoneId)}`;
     if (data?.transactionId ?? data?.txId) return `/wallet/transaction?id=${encodeURIComponent(data.transactionId ?? data.txId ?? '')}`;
     if (data?.notificationId) return `/notifications?notificationId=${encodeURIComponent(data.notificationId)}`;
     return undefined;
@@ -146,7 +155,11 @@ export class PushService implements OnModuleInit {
     if (notificationType.startsWith('SECURITY_')) return 'securityPush';
     if (notificationType.startsWith('CHAT_')) return 'chatPush';
     if (notificationType.startsWith('DISPUTE_')) return 'disputePush';
-    if (notificationType.startsWith('RATING_')) return 'rankingPush';
+    // NCC-013: RATING_* dan MILESTONE_* digate toggle `orderPush`, selaras
+    // toggle lokal FE ("transaction"). Sebelumnya RATING_* digate `rankingPush`
+    // dan MILESTONE_* tak terpetakan (preferensi server diabaikan).
+    if (notificationType.startsWith('RATING_')) return 'orderPush';
+    if (notificationType.startsWith('MILESTONE_')) return 'orderPush';
     if (notificationType === 'RANK_UPGRADED') return 'rankingPush';
     if (notificationType.startsWith('SUBSCRIPTION_')) return 'rankingPush';
     if (notificationType === 'REFERRAL_REWARD_RECEIVED') return 'rankingPush';

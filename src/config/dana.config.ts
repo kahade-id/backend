@@ -75,6 +75,13 @@ export const danaConfig = registerAs('dana', () => {
     webhookUrl:
       process.env.DANA_WEBHOOK_URL ||
       'https://api.kahade.id/v1/webhooks/dana/payment',
+    /**
+     * MFE-010: halaman finish user untuk PAY_RETURN deeplink BALANCE
+     * (buyer dikembalikan ke aplikasi, bukan ke endpoint webhook JSON).
+     * Harus sama dengan "Finish Redirect URL" di DANA dashboard.
+     */
+    payReturnUrl:
+      process.env.DANA_PAY_RETURN_URL || 'https://kahade.id/payment/finish',
     /** X-DEBUG header — default true di sandbox (mengikuti SDK resmi). */
     debug: process.env.DANA_DEBUG === 'true' || !isProduction,
     /** Masa berlaku order QRIS/VA dalam menit (sandbox: maks 30). */

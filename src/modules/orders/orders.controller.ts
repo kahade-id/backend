@@ -236,14 +236,21 @@ export class OrdersController {
    */
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 900000, limit: 5 } })
+  // MFE-018: endpoint LEGACY — pasangan kanonis adalah POST /payments +
+  // GET /dana-payment-status. DITANDAI DEPRECATED (OpenAPI + komentar):
+  // JANGAN dihapus (klien lama masih bisa memanggil), tetapi semua kode baru
+  // wajib memakai pasangan kanonis.
   @Post(':orderId/pay-dana')
   @Idempotency()
   @HttpCode(200)
   @ApiOperation({
-    summary: 'Bayar escrow langsung via DANA (mode tanpa wallet)',
+    summary: '[DEPRECATED] Bayar escrow langsung via DANA (mode tanpa wallet)',
     description:
+      'DEPRECATED — pakai POST /v1/orders/{orderId}/payments (kontrak kanonis). ' +
+      'Endpoint ini dipertahankan untuk kompatibilitas klien lama. ' +
       'Membuat order DANA (QRIS/VA/Balance sesuai payKind). Buyer bayar ke DANA; ' +
       'webhook finish-notify mendanai escrow tanpa lewat wallet internal.',
+    deprecated: true,
   })
   async initiateDanaDirectPayment(
     @CurrentUser('sub') userId: string,
@@ -255,9 +262,18 @@ export class OrdersController {
 
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 900000, limit: 5 } })
+  // MFE-018: endpoint LEGACY — pasangan kanonisnya POST /payments/cancel
+  // tidak ada; pembatalan kanonis via POST /v1/orders/{orderId}/payments
+  // ulang dengan metode lain atau biarkan kedaluwarsa. DITANDAI DEPRECATED
+  // (JANGAN dihapus — klien lama masih bisa memanggil).
   @Post(':orderId/pay-dana/cancel')
   @HttpCode(200)
-  @ApiOperation({ summary: 'Batalkan charge DANA-direct yang masih PENDING' })
+  @ApiOperation({
+    summary: '[DEPRECATED] Batalkan charge DANA-direct yang masih PENDING',
+    description:
+      'DEPRECATED — endpoint ini dipertahankan untuk kompatibilitas klien lama.',
+    deprecated: true,
+  })
   async cancelDanaDirectPayment(
     @CurrentUser('sub') userId: string,
     @Param('orderId', ParseIdPipe) orderId: string,
@@ -322,12 +338,22 @@ export class OrdersController {
     return this.danaDirectPaymentService.initiate(orderId, userId, dto);
   }
 
+  /**
+   * MFE-004: endpoint status KANONIS untuk DANA-direct — didelegasikan ke
+   * `DanaDirectPaymentService.getStatus` (kontrak `DanaDirectPayResult`:
+   * payKind/paymentCode/qrString/webRedirectUrl/expiryTime). Fallback ke
+   * service QRIS lama HANYA bila tidak ada baris DANA-direct (null) — untuk
+   * intent QRIS lawas pra-migrasi. Tanpa fallback ini, FE tidak bisa
+   * memulihkan QR/kode VA DANA setelah app restart.
+   */
   @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Get(':orderId/payment-status')
   async getOrderPaymentStatus(
     @CurrentUser('sub') userId: string,
     @Param('orderId', ParseIdPipe) orderId: string,
-  ): Promise<{ payment: OrderQrisPaymentResult | null }> {
+  ): Promise<{ payment: DanaDirectPayResult | OrderQrisPaymentResult | null }> {
+    const dana = await this.danaDirectPaymentService.getStatus(orderId, userId);
+    if (dana) return { payment: dana };
     return { payment: await this.orderQrisPaymentService.getStatus(orderId, userId) };
   }
 

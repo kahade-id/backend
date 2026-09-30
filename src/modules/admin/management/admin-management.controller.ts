@@ -10,6 +10,7 @@ import { SuspendAdminDto } from './dto/suspend-admin.dto';
 import { ChangeAdminRoleDto } from './dto/change-admin-role.dto';
 import { CreateEmergencyGrantDto } from './dto/emergency-grant.dto';
 import { CreateHandoffDto, HandoffQueryDto } from './dto/create-handoff.dto';
+import { ResetAdminPasswordDto } from './dto/reset-admin-password.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
 import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
@@ -344,6 +345,35 @@ export class AdminManagementController {
     @Req() req: Request,
   ): Promise<{ message: string }> {
     return this.service.resetAdmin2fa(id, adminId, req.ip ?? '');
+  }
+
+  /**
+   * AUT-002: reset password admin oleh SUPER_ADMIN (controller ini
+   * class-level SUPER_ADMIN-only). Tidak ada alur lupa-password mandiri
+   * untuk admin — pemulihan hanya lewat endpoint ini, teraudit.
+   */
+  @Post(':id/reset-password')
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Reset admin password (SUPER_ADMIN)',
+    description:
+      'Mereset password admin target ke password sementara (dibangkitkan bila ' +
+      'tidak diberikan). Target WAJIB mengganti password saat login berikutnya ' +
+      '(flag mustChangePassword) dan semua sesinya dicabut. Tidak bisa dipakai ' +
+      'untuk me-reset password sendiri — gunakan /v1/admin/auth/change-password.',
+  })
+  @ApiResponse({ status: 200, description: 'Password reset; temporary password returned (tampilkan sekali ke SUPER_ADMIN).' })
+  @ApiResponse({ status: 403, description: 'Cannot reset own password.' })
+  @ApiResponse({ status: 404, description: 'Admin not found.' })
+  resetAdminPassword(
+    @Param('id', ParseIdPipe) id: string,
+    @Body() dto: ResetAdminPasswordDto,
+    @CurrentAdmin('sub') adminId: string,
+    @Req() req: Request,
+  ): Promise<{ message: string; temporaryPassword: string }> {
+    return this.service.resetAdminPassword(id, adminId, req.ip ?? '', dto.temporaryPassword);
   }
 
   @Post(':id/unlock')

@@ -265,6 +265,29 @@ export class DanaWebhookDisbursementService {
     }
 
     if (s === '00') {
+      // MFE-016: verifikasi nominal SEBELUM menandai SUCCESS (postur
+      // fail-closed konsisten dengan finish-notify payment). Nominal
+      // tersimpan dalam SEN; DANA melaporkan rupiah — bandingkan dalam
+      // rupiah. Mismatch → NEEDS_REVIEW (bukan SUCCESS, bukan auto-FAILED):
+      // notify nominal janggal tidak boleh menjadi keputusan finansial.
+      const expectedIdr = Math.round(Number(disb.amountSen) / 100);
+      if (notify.amountIdr === null || notify.amountIdr !== expectedIdr) {
+        await this.prisma.escrowDisbursement.update({
+          where: { id: disb.id },
+          data: {
+            status: 'NEEDS_REVIEW',
+            lastError:
+              `DANA disburs notify: nominal mismatch (dana=${notify.amountIdr}, expected=${expectedIdr}) — butuh review manual`.slice(
+                0,
+                500,
+              ),
+          },
+        });
+        this.logger.error(
+          `DANA disburs notify: nominal mismatch untuk disbursement ${disb.id} (dana=${notify.amountIdr}, expected=${expectedIdr}) → NEEDS_REVIEW`,
+        );
+        return;
+      }
       await this.prisma.escrowDisbursement.update({
         where: { id: disb.id },
         data: {

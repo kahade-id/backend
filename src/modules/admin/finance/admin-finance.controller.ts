@@ -19,6 +19,7 @@ import { FinanceTransactionQueryDto } from './dto/finance-query.dto';
 import { FindingsQueryDto, AcknowledgeFindingDto, BatchDiscrepanciesQueryDto } from './dto/finance-findings.dto';
 import { RequestCorrectionDto, DecideCorrectionDto, CorrectionsQueryDto } from './dto/ledger-correction.dto';
 import { WithdrawalApproveDto, WithdrawalRejectDto } from './dto/withdrawal-action.dto';
+import { DisbursementListQueryDto } from './dto/disbursement-query.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
 import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { WalletKillSwitchGuard } from '../../../modules/wallet-mode/wallet-kill-switch.guard';
@@ -135,9 +136,18 @@ export class AdminFinanceController {
   }
 
   @Get('escrow-summary')
-  @ApiOperation({ summary: 'Active escrow totals', description: 'BAI-047: di era tanpa-wallet (WALLET_ENABLED=false) total dihitung dari order aktif (source=ORDER_BASED, dana dipegang DANA); bila wallet aktif dari wallet.escrowBalance (source=WALLET_BASED). UI wajib melabeli sumbernya.' })
+  @ApiOperation({ summary: 'Active escrow totals', description: 'BAI-047 + MFE-011: di era tanpa-wallet (WALLET_ENABLED=false) total dihitung dari order aktif (source=ORDER_BASED, dana dipegang DANA); bila wallet aktif dari wallet.escrowBalance (source=WALLET_BASED). UI wajib melabeli sumbernya. Agregat DANA-direct (PaymentTransaction SUCCESS, purpose ORDER_ESCROW) + pending disbursement count selalu disertakan agar dashboard tidak menampilkan Rp0 saat dana nyata tertahan.' })
   @ApiResponse({ status: 200, description: 'Escrow summary returned.' })
-  getEscrowSummary(): Promise<{ totalEscrowBalance: number; walletsWithEscrow: number; activeEscrowOrders: number; source: 'WALLET_BASED' | 'ORDER_BASED' }> {
+  getEscrowSummary(): Promise<{
+    totalEscrowBalance: number;
+    walletsWithEscrow: number;
+    activeEscrowOrders: number;
+    source: 'WALLET_BASED' | 'ORDER_BASED';
+    /** MFE-011: agregat escrow DANA-direct (mode tanpa-wallet). */
+    danaEscrowBalance: number;
+    danaEscrowPayments: number;
+    danaDisbursementsPending: number;
+  }> {
     return this.service.getEscrowSummary();
   }
 
@@ -146,6 +156,25 @@ export class AdminFinanceController {
   @ApiResponse({ status: 200, description: 'Revenue data returned.' })
   getRevenue(): Promise<object> {
     return this.service.getRevenue();
+  }
+
+  /**
+   * MFE-015: antrean disbursement escrow untuk admin — visibilitas atas dana
+   * DANA-direct yang keluar ke rekening bank seller (incl. HELD_NO_BANK &
+   * NEEDS_REVIEW yang butuh tindak lanjut manual). Read-only.
+   */
+  @Get('disbursements')
+  @ApiOperation({
+    summary: 'List escrow disbursements (DANA payouts)',
+    description:
+      'Paginated escrow disbursement queue with status/scope/q filters. ' +
+      'Highlight filters: HELD_NO_BANK (seller has no verified bank account — fail-closed) ' +
+      'and NEEDS_REVIEW (unknown DANA status — manual review required). Read-only.',
+  })
+  @ApiResponse({ status: 200, description: 'Disbursement list returned.' })
+  @ApiResponse({ status: 400, description: 'Invalid query (ErrorCode 1101).' })
+  listDisbursements(@Query() query: DisbursementListQueryDto): Promise<object> {
+    return this.service.listDisbursements(query);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 5 } })

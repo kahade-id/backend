@@ -74,7 +74,12 @@ import {
   timingSafeEqual as _timingSafeEqual,
 } from 'crypto';
 import { OAuth2Client } from 'google-auth-library';
-const TWO_FA_ATTEMPT_KEY = (userId: string): string => `2fa_attempts:${userId}`;
+// AUT-008: 5 percobaan TOTP per TEMPTOKEN (bukan per user) — disamakan dengan
+// model admin (`ADMIN_2FA_ATTEMPT_KEY`). Key terikat sub+jti; JTI di-blacklist
+// saat limit habis agar flush Redis tidak membuka kembali brute force pada
+// token yang sama. Throttle IP di controller tetap sebagai lapis tambahan.
+const TWO_FA_ATTEMPT_KEY = (sub: string, jti?: string): string =>
+  `2fa_attempts:${sub}:${jti ?? 'no-jti'}`;
 
 let _dummyHash: string | undefined;
 // Module-load prewarm so the dummy-compare (timing-attack mitigation) is ready
@@ -576,34 +581,20 @@ export class AuthService {
     const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({
       where: { userId: existingUser.id },
     });
+    // AUT-005 (fail-closed): bypass "trusted device" DIHAPUS. Bila 2FA aktif,
+    // TOTP SELALU diminta — termasuk login via OTP WhatsApp dari perangkat
+    // yang sebelumnya ditandai tepercaya. Jalur OTP adalah jalur yang paling
+    // rentan (SIM-swap / social engineering ke nomor HP); menggugurkan faktor
+    // kedua tepat di sana adalah asimetri kebijakan yang tidak dapat
+    // dipertahankan. Perangkat tepercaya tetap dicatat (UserDevice.isTrusted)
+    // untuk visibilitas, tetapi tidak lagi melewati 2FA.
     if (twoFactorAuth?.isEnabled) {
-      let skipTwoFa = false;
-      if (deviceId) {
-        const trustedDevice = await this.prisma.userDevice.findFirst({
-          where: { userId: existingUser.id, deviceId, isTrusted: true },
-        });
-        if (trustedDevice?.trustedAt) {
-          const trustExpiryMs =
-            (this.configService.get<number>('app.trustedDeviceDays') ?? 30) * 24 * 60 * 60 * 1000;
-          const isExpired = Date.now() - trustedDevice.trustedAt.getTime() >= trustExpiryMs;
-          if (isExpired) {
-            await this.prisma.userDevice.update({
-              where: { id: trustedDevice.id },
-              data: { isTrusted: false, trustedAt: null },
-            });
-          } else {
-            skipTwoFa = true;
-          }
-        }
-      }
-      if (!skipTwoFa) {
-        const tempToken = this.tokenService.signTempToken({
-          sub: existingUser.id,
-          scope: '2fa_verify',
-          deviceId,
-        });
-        return { status: 'existing_user', requires2FA: true, tempToken };
-      }
+      const tempToken = this.tokenService.signTempToken({
+        sub: existingUser.id,
+        scope: '2fa_verify',
+        deviceId,
+      });
+      return { status: 'existing_user', requires2FA: true, tempToken };
     }
 
     const lockoutCycleKey = `lockout_cycles:${existingUser.id}`;
@@ -622,7 +613,7 @@ export class AuthService {
       },
     });
 
-    const refreshToken = this.tokenService.signRefreshToken({ sub: existingUser.id });
+    const refreshToken = this.tokenService.signRefreshToken({ sub: existingUser.id, deviceId }); // AUT-006
     const sessionId = await this.saveSession(
       existingUser.id,
       refreshToken,
@@ -1089,33 +1080,15 @@ export class AuthService {
     const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({
       where: { userId: user.id },
     });
+    // AUT-005 (fail-closed): bypass "trusted device" DIHAPUS — bila 2FA aktif,
+    // TOTP selalu diminta, termasuk di jalur penyelesaian migrasi ini.
     if (twoFactorAuth?.isEnabled) {
-      let skipTwoFa = false;
-      if (opts.deviceId) {
-        const trustedDevice = await this.prisma.userDevice.findFirst({
-          where: { userId: user.id, deviceId: opts.deviceId, isTrusted: true },
-        });
-        if (trustedDevice?.trustedAt) {
-          const trustExpiryMs =
-            (this.configService.get<number>('app.trustedDeviceDays') ?? 30) * 24 * 60 * 60 * 1000;
-          if (Date.now() - trustedDevice.trustedAt.getTime() >= trustExpiryMs) {
-            await this.prisma.userDevice.update({
-              where: { id: trustedDevice.id },
-              data: { isTrusted: false, trustedAt: null },
-            });
-          } else {
-            skipTwoFa = true;
-          }
-        }
-      }
-      if (!skipTwoFa) {
-        const tempToken = this.tokenService.signTempToken({
-          sub: user.id,
-          scope: '2fa_verify',
-          deviceId: opts.deviceId,
-        });
-        return { requires2FA: true, tempToken };
-      }
+      const tempToken = this.tokenService.signTempToken({
+        sub: user.id,
+        scope: '2fa_verify',
+        deviceId: opts.deviceId,
+      });
+      return { requires2FA: true, tempToken };
     }
 
     return this.issueLoginSession(user, ipAddress, {
@@ -1372,7 +1345,7 @@ export class AuthService {
       throw err;
     }
 
-    const refreshToken = this.tokenService.signRefreshToken({ sub: user.id });
+    const refreshToken = this.tokenService.signRefreshToken({ sub: user.id, deviceId: dto.deviceId }); // AUT-006
 
     // Penautan akun sosial pasca-registrasi (identitas baru dari social login).
     // Nomor HP sudah terverifikasi di titik ini — penautan aman dilakukan.
@@ -2215,22 +2188,15 @@ export class AuthService {
     const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({
       where: { userId: user.id },
     });
+    // AUT-005 (fail-closed): bypass "trusted device" DIHAPUS — bila 2FA aktif,
+    // TOTP selalu diminta, termasuk di jalur penyelesaian migrasi nomor HP ini.
     if (twoFactorAuth?.isEnabled) {
-      let skipTwoFa = false;
-      if (dto.deviceId) {
-        const trusted = await this.prisma.userDevice.findFirst({
-          where: { userId: user.id, deviceId: dto.deviceId, isTrusted: true },
-        });
-        skipTwoFa = !!trusted;
-      }
-      if (!skipTwoFa) {
-        const tempToken = this.tokenService.signTempToken({
-          sub: user.id,
-          scope: '2fa_verify',
-          deviceId: dto.deviceId,
-        });
-        return { requires2FA: true, tempToken };
-      }
+      const tempToken = this.tokenService.signTempToken({
+        sub: user.id,
+        scope: '2fa_verify',
+        deviceId: dto.deviceId,
+      });
+      return { requires2FA: true, tempToken };
     }
 
     return this.issueLoginSession(updatedUser, ipAddress, {
@@ -2433,36 +2399,16 @@ export class AuthService {
     const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({
       where: { userId: user.id },
     });
+    // AUT-005 (fail-closed): bypass "trusted device" DIHAPUS — lihat komentar
+    // yang sama di jalur login OTP di atas. Bila 2FA aktif, TOTP selalu
+    // diminta walau perangkat terdaftar tepercaya.
     if (twoFactorAuth?.isEnabled) {
-      let skipTwoFa = false;
-      if (dto.deviceId) {
-        const trustedDevice = await this.prisma.userDevice.findFirst({
-          where: { userId: user.id, deviceId: dto.deviceId, isTrusted: true },
-        });
-        if (trustedDevice?.trustedAt) {
-          const trustExpiryMs =
-            (this.configService.get<number>('app.trustedDeviceDays') ?? 30) * 24 * 60 * 60 * 1000;
-          const isExpired = Date.now() - trustedDevice.trustedAt.getTime() >= trustExpiryMs;
-          if (isExpired) {
-            await this.prisma.userDevice.update({
-              where: { id: trustedDevice.id },
-              data: { isTrusted: false, trustedAt: null },
-            });
-            this.logger.log(`Trusted device ${dto.deviceId} expired for user ${user.id}`);
-          } else {
-            skipTwoFa = true;
-            this.logger.log(`Skipping 2FA for trusted device ${dto.deviceId} (user ${user.id})`);
-          }
-        }
-      }
-      if (!skipTwoFa) {
-        const tempToken = this.tokenService.signTempToken({
-          sub: user.id,
-          scope: '2fa_verify',
-          deviceId: dto.deviceId,
-        });
-        return { requires2FA: true, tempToken };
-      }
+      const tempToken = this.tokenService.signTempToken({
+        sub: user.id,
+        scope: '2fa_verify',
+        deviceId: dto.deviceId,
+      });
+      return { requires2FA: true, tempToken };
     }
 
     return this.issueLoginSession(user, ipAddress, {
@@ -2520,7 +2466,7 @@ export class AuthService {
       data: updateData,
     });
 
-    const refreshToken = this.tokenService.signRefreshToken({ sub: user.id });
+    const refreshToken = this.tokenService.signRefreshToken({ sub: user.id, deviceId: opts.deviceId }); // AUT-006
     const sessionId = await this.saveSession(
       user.id,
       refreshToken,
@@ -2636,9 +2582,34 @@ export class AuthService {
 
     const userId = payload.sub;
 
-    const attemptKey = TWO_FA_ATTEMPT_KEY(userId);
-    const attempts = await this.redis.incrWithTtl(attemptKey, 5 * 60);
+    // AUT-008: tolak temp token yang JTI-nya sudah dikonsumsi (sukses) atau
+    // di-blacklist karena kehabisan percobaan — menutup reuse dalam jendela
+    // 5 menit walau counter percobaan hilang (flush/evict Redis).
+    if (payload.jti) {
+      const consumed = await this.redis.get(TEMP_TOKEN_USED(payload.jti), { throwOnError: true });
+      if (consumed) {
+        throw new UnauthorizedException({
+          code: ErrorCodes.TEMP_TOKEN_EXPIRED,
+          message: '2FA session already used. Please log in again.',
+        });
+      }
+    }
+
+    // AUT-008: 5 tebakan TOTP per tempToken (key sub:jti, TTL 15 menit) —
+    // model yang sama dengan admin. Penyerang dengan banyak IP tidak lagi
+    // mendapat 5 tebakan/IP/menit atas token yang sama.
+    const attemptKey = TWO_FA_ATTEMPT_KEY(userId, payload.jti);
+    const attempts = await this.redis.incrWithTtl(attemptKey, 15 * 60);
     if (attempts > TWO_FA_MAX_ATTEMPTS) {
+      // Blacklist JTI segera: tanpa ini, flush Redis menghapus counter dan
+      // penyerang bisa melanjutkan brute force atas token yang SAMA sampai
+      // kedaluwarsa native JWT-nya. Klaim atomik di bawah (setelah TOTP
+      // valid) + pre-check di atas akan menangkapnya di tiap percobaan
+      // berikutnya apa pun kondisi counter.
+      if (payload.jti) {
+        const ttl = Math.max(60, Math.floor(this.getTempTokenTtlFromPayload(payload) ?? 300));
+        await this.redis.setNx(TEMP_TOKEN_USED(payload.jti), '1', ttl, { throwOnError: false });
+      }
       throw new ForbiddenException({
         code: ErrorCodes.TOO_MANY_REQUESTS,
         message: 'Too many 2FA attempts. Please log in again.',
@@ -2777,7 +2748,7 @@ export class AuthService {
       },
     });
 
-    const refreshToken = this.tokenService.signRefreshToken({ sub: user.id });
+    const refreshToken = this.tokenService.signRefreshToken({ sub: user.id, deviceId }); // AUT-006
     const sessionId = await this.saveSession(
       user.id,
       refreshToken,
@@ -2851,7 +2822,7 @@ export class AuthService {
     return _timingSafeEqual(a, b);
   }
 
-  async refreshToken(refreshToken: string): Promise<{ accessToken: string; refreshToken: string }> {
+  async refreshToken(refreshToken: string, requestDeviceId?: string): Promise<{ accessToken: string; refreshToken: string }> {
     let payload: RefreshTokenPayload;
     try {
       payload = this.tokenService.verifyRefreshToken(refreshToken);
@@ -2899,6 +2870,37 @@ export class AuthService {
       });
     }
 
+    // AUT-006: ikat refresh token ke perangkat. Baris sesi adalah otoritas
+    // binding — hanya ditegakkan bila sesi dibuat dengan deviceId.
+    if (session.deviceId) {
+      // (a) Klaim JWT tidak boleh bertentangan dengan baris sesi. Menutup
+      // token yang "ditempel" ke sesi lain / sesi yang deviceId-nya berubah.
+      if (payload.deviceId && payload.deviceId !== session.deviceId) {
+        this.logger.warn(
+          `[SECURITY] Refresh token device claim mismatch untuk sesi ${session.id} ` +
+            `(klaim=${payload.deviceId}, sesi=${session.deviceId}) — request ditolak.`,
+        );
+        throw new UnauthorizedException({
+          code: ErrorCodes.UNAUTHORIZED,
+          message: 'Invalid refresh token',
+        });
+      }
+      // (b) Bila klien menyatakan deviceId (mobile + web mengirimnya di body
+      // refresh), harus cocok dengan sesi — menutup pemakaian token curian
+      // dari perangkat lain. Klien lama yang tidak mengirim deviceId +
+      // token lama tanpa klaim = jalur transisi: diizinkan sekali, lalu
+      // dirotasi menjadi token ber-klaim (lihat bawah).
+      if (requestDeviceId && requestDeviceId !== session.deviceId) {
+        this.logger.warn(
+          `[SECURITY] Refresh ditolak: deviceId peminta tidak cocok dengan sesi ${session.id} — request ditolak.`,
+        );
+        throw new UnauthorizedException({
+          code: ErrorCodes.UNAUTHORIZED,
+          message: 'Invalid refresh token',
+        });
+      }
+    }
+
     const incomingTokenHash = sha256(refreshToken);
     const isTokenValid = await this.verifyStoredRefreshToken(incomingTokenHash, session);
     if (!isTokenValid) {
@@ -2939,7 +2941,11 @@ export class AuthService {
 
     const oldJti = payload.jti;
 
-    const newRefreshToken = this.tokenService.signRefreshToken({ sub: user.id });
+    // AUT-006: rotation meneruskan binding perangkat — klaim diambil dari
+    // baris sesi (otoritas); fallback ke klaim token lama bila sesi tak
+    // ber-deviceId (transisi token lama).
+    const boundDeviceId = session.deviceId ?? payload.deviceId ?? undefined;
+    const newRefreshToken = this.tokenService.signRefreshToken({ sub: user.id, deviceId: boundDeviceId });
     const newPayload: DecodedTokenPayload | null = this.tokenService.decodeToken(newRefreshToken);
     const newJti = newPayload?.jti;
 
@@ -4796,7 +4802,7 @@ export class AuthService {
       data: { lastLoginAt: new Date(), lastLoginIp: ipAddress, failedLoginAttempts: 0, lockedUntil: null },
     });
 
-    const refreshToken = this.tokenService.signRefreshToken({ sub: user.id });
+    const refreshToken = this.tokenService.signRefreshToken({ sub: user.id, deviceId }); // AUT-006
     const sessionId = await this.saveSession(user.id, refreshToken, deviceId, deviceInfo, ipAddress);
     if (deviceId) {
       await this.trackDevice(user.id, deviceId, deviceInfo, ipAddress).catch(() => undefined);

@@ -174,10 +174,11 @@ export const PLUS_FEE_WAIVER_QUOTA_IDR = 990_000;
 // menyusul dari tim produk — nilai ini hanya placeholder.
 export const INSURANCE_DEFAULT_CAP_IDR = 10_000_000;
 
-export const UPLOAD_MAX_AVATAR_MB = 2;
-export const UPLOAD_MAX_CHAT_MB = 10;
-export const UPLOAD_MAX_KYC_MB = 5;
-export const UPLOAD_MAX_EVIDENCE_MB = 10;
+// DBL-005 (audit integrasi 2026-10-01): konstanta UPLOAD_MAX_*_MB mati
+// DIHAPUS — grep menunjukkan nol pemakaian di luar definisi dan nilainya
+// bertentangan dengan penegakan aktual (mis. chat 10 vs 50 MB aktual).
+// Batas upload yang benar-benar ditegakkan ada di
+// src/modules/upload/upload.service.ts (MAX_FILE_SIZE).
 
 export const DEFAULT_PAGE = 1;
 export const DEFAULT_LIMIT = 20;

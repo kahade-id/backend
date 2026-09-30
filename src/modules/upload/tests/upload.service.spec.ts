@@ -45,8 +45,28 @@ const mockConfig = {
 describe('UploadService — confirmUpload', () => {
   let service: UploadService;
   let s3Send: jest.Mock;
+  // Header JPEG valid — mock readFileRange harus mengembalikan bytes nyata
+  // seperti file di disk; Buffer.alloc(16) (nol) selalu gagal deteksi
+  // magic-bytes (B-36) dengan MIME_TYPE_MISMATCH.
+  const JPEG_HEADER = Buffer.from([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
+  ]);
+  let mockLocalStorage: {
+    deleteFile: jest.Mock;
+    fileExists: jest.Mock;
+    getFileSize: jest.Mock;
+    getContentType: jest.Mock;
+    readFileRange: jest.Mock;
+  };
 
   beforeEach(async () => {
+    mockLocalStorage = {
+      deleteFile: jest.fn().mockResolvedValue(true),
+      fileExists: jest.fn().mockResolvedValue(true),
+      getFileSize: jest.fn().mockResolvedValue(1024),
+      getContentType: jest.fn().mockResolvedValue('image/jpeg'),
+      readFileRange: jest.fn().mockResolvedValue(JPEG_HEADER),
+    };
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         UploadService,
@@ -54,13 +74,7 @@ describe('UploadService — confirmUpload', () => {
         { provide: ConfigService, useValue: mockConfig },
         // Pre-existing: UploadService butuh LocalStorageService (self-hosted
         // storage) — modul uji belum di-update saat migrasi dari R2.
-        { provide: LocalStorageService, useValue: {
-          deleteFile: jest.fn().mockResolvedValue(true),
-          fileExists: jest.fn().mockResolvedValue(true),
-          getFileSize: jest.fn().mockResolvedValue(1024),
-          getContentType: jest.fn().mockResolvedValue('image/jpeg'),
-          readFileRange: jest.fn().mockResolvedValue(Buffer.alloc(16)),
-        } },
+        { provide: LocalStorageService, useValue: mockLocalStorage },
         // Batch 19 TIM A (item 1): UploadService kini menginject
         // VideoProcessingService — mock DI untuk wiring test lama.
         { provide: VideoProcessingService, useValue: {
@@ -128,11 +142,12 @@ describe('UploadService — confirmUpload', () => {
     });
   });
 
-  it('should roll back Redis key and throw NOT_FOUND if R2 HeadObject fails', async () => {
+  it('should roll back Redis key and throw NOT_FOUND if file is missing from storage', async () => {
     mockRedis.setNx.mockResolvedValueOnce(true);
     mockRedis.del.mockResolvedValueOnce(1);
-    s3Send = jest.fn().mockRejectedValueOnce(new Error('NoSuchKey'));
-    (service as unknown as { _s3Client: { send: jest.Mock } | null })._s3Client = { send: s3Send };
+    // R2 HeadObject sudah tidak dipakai — confirmUpload membaca via
+    // LocalStorageService; file hilang disimulasikan lewat fileExists=false.
+    mockLocalStorage.fileExists.mockResolvedValueOnce(false);
 
     await expect(
       service.confirmUpload(userId, ktpFileKey),
@@ -144,8 +159,11 @@ describe('UploadService — confirmUpload', () => {
   it('should roll back Redis key and throw BAD_REQUEST if ContentType is not allowed', async () => {
     mockRedis.setNx.mockResolvedValueOnce(true);
     mockRedis.del.mockResolvedValueOnce(1);
-    s3Send = jest.fn().mockResolvedValueOnce({ ContentLength: 1024, ContentType: 'application/x-msdownload' });
-    (service as unknown as { _s3Client: { send: jest.Mock } | null })._s3Client = { send: s3Send };
+    // Tipe konten kini dideteksi dari bytes (bukan S3 HeadObject): simulasikan
+    // file biner yang bukan gambar/PDF (header MZ ala executable).
+    mockLocalStorage.readFileRange.mockResolvedValueOnce(
+      Buffer.from([0x4d, 0x5a, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00]),
+    );
 
     await expect(
       service.confirmUpload(userId, ktpFileKey),
@@ -189,8 +207,8 @@ describe('UploadService — confirmUpload', () => {
     mockRedis.setNx.mockResolvedValueOnce(true);
     mockRedis.del.mockResolvedValueOnce(1);
     const oversize = 6 * 1024 * 1024;
-    s3Send = jest.fn().mockResolvedValueOnce({ ContentLength: oversize, ContentType: 'image/jpeg' });
-    (service as unknown as { _s3Client: { send: jest.Mock } | null })._s3Client = { send: s3Send };
+    // Ukuran dibaca dari local storage (bukan S3 HeadObject).
+    mockLocalStorage.getFileSize.mockResolvedValueOnce(oversize);
 
     await expect(
       service.confirmUpload(userId, ktpFileKey),
@@ -235,8 +253,8 @@ describe('UploadService — confirmUpload', () => {
   it('fails closed when confirmed attachment storage metadata is incomplete', async () => {
     const chatKey = `uploads/chat-attachments/${userId}/chat.jpg`;
     mockRedis.get.mockResolvedValueOnce('1');
-    s3Send = jest.fn().mockResolvedValueOnce({ ContentType: 'image/jpeg' });
-    (service as unknown as { _s3Client: { send: jest.Mock } | null })._s3Client = { send: s3Send };
+    // Metadata tak lengkap = ukuran tak diketahui → fail closed FILE_TOO_LARGE.
+    mockLocalStorage.getFileSize.mockResolvedValueOnce(null);
     await expect(service.verifyUserFileKeys(userId, [chatKey], 'CHAT_ATTACHMENT' as any)).rejects.toMatchObject({ response: { code: 'FILE_TOO_LARGE' } });
     expect(mockRedis.consumeOnce).not.toHaveBeenCalled();
   });

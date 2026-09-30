@@ -217,7 +217,7 @@ export class EscrowDisbursementService {
   }
 
   private async settle(
-    row: { id: string; idempotencyKey: string; sellerId: string; amountSen: bigint; danaPartnerReferenceNo: string | null },
+    row: { id: string; idempotencyKey: string; sellerId: string; amountSen: bigint; danaPartnerReferenceNo: string | null; orderId: string | null },
   ): Promise<ReleaseResult> {
     // 1) Rekening bank seller wajib ada (primary, tidak dihapus)
     const bank = await this.prisma.bankAccount.findFirst({
@@ -237,6 +237,15 @@ export class EscrowDisbursementService {
         userId: row.sellerId,
         title: 'Daftarkan rekening bank',
         body: 'Dana escrow menunggu dicairkan — daftarkan rekening bank Anda agar dana masuk otomatis.',
+        // NCC-008: deep link ke layar rekening bank (FE ROUTES.bankAccounts =
+        // "/bank-accounts") + pushData agar tap push tidak jatuh ke fallback
+        // /notifications.
+        actionUrl: '/bank-accounts',
+        pushData: {
+          type: 'ESCROW_HELD_NO_BANK',
+          // orderId nullable di model — hanya sertakan bila ada.
+          ...(row.orderId ? { orderId: row.orderId } : {}),
+        },
       });
       this.logger.warn(`Disbursement HELD_NO_BANK: seller=${row.sellerId} key=${row.idempotencyKey}`);
       return { outcome: 'HELD_NO_BANK', disbursementId: held.id };

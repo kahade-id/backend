@@ -250,6 +250,10 @@ export class MilestonesService {
     refId: string,
   ) {
     try {
+      // NCC-004: actionUrl `/milestones/<id>` agar tap notifikasi (push
+      // maupun inbox) membuka detail milestone; milestoneId ikut di payload
+      // push (SAFE_PUSH_DATA_KEYS) sebagai fallback derive.
+      const actionUrl = `/milestones/${encodeURIComponent(refId)}`;
       await this.prisma.notification.create({
         data: {
           notifId: generateNotifId(),
@@ -261,9 +265,10 @@ export class MilestonesService {
           isRead: false,
           refType: 'MILESTONE',
           refId,
+          actionUrl,
         },
       });
-      this.prisma.emitNotificationCreated({ userId, title, body, data: { type, milestoneId: refId } });
+      this.prisma.emitNotificationCreated({ userId, title, body, data: { type, milestoneId: refId, actionUrl } });
     } catch (err: unknown) {
       this.logger.warn(`silent-catch: milestone notification failed: ${err instanceof Error ? err.message : String(err)}`);
     }

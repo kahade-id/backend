@@ -50,10 +50,61 @@ import { AllowResponseFields } from '../../common/decorators/allow-response-fiel
 @ApiTags('auth-passkey')
 @Controller('auth/passkey')
 export class PasskeyController {
-  constructor(private readonly passkeyService: PasskeyService) {}
+  constructor(
+    private readonly passkeyService: PasskeyService,
+    private readonly configService: ConfigService,
+  ) {}
 
   private clientIp(req: Request): string {
     return req.ip || req.socket?.remoteAddress || 'unknown';
+  }
+
+  /**
+   * BFI-034: cookie sesi passkey disamakan dengan endpoint penerbit token lain
+   * di auth.controller (login/verify-otp/social): refreshToken lolos
+   * interceptor + cookie httpOnly untuk web. Logika disalin dari
+   * AuthController (helper private di sana, tidak bisa dipakai lintas class).
+   */
+  private getRefreshCookiePath(): string {
+    const prefix = this.configService.get<string>('app.apiPrefix') || 'v1';
+    return `/${prefix}/auth/refresh`;
+  }
+
+  private useSecureAuthCookies(): boolean {
+    const nodeEnv =
+      this.configService.get<string>('app.nodeEnv') ?? process.env.NODE_ENV ?? 'production';
+    const appUrl = this.configService.get<string>('app.appUrl') ?? '';
+    let isLocalHttpDevelopment = false;
+    try {
+      const parsedUrl = new URL(appUrl);
+      isLocalHttpDevelopment =
+        ['development', 'test'].includes(nodeEnv) &&
+        parsedUrl.protocol === 'http:' &&
+        ['localhost', '127.0.0.1'].includes(parsedUrl.hostname.toLowerCase());
+    } catch {
+      // Invalid app URLs are rejected by startup validation; keep cookies secure here.
+    }
+    return !isLocalHttpDevelopment;
+  }
+
+  private setAccessTokenCookie(res: Response, accessToken: string): void {
+    res.cookie('kahade_access_token', accessToken, {
+      httpOnly: true,
+      secure: this.useSecureAuthCookies(),
+      sameSite: 'strict',
+      path: '/',
+      maxAge: 15 * 60 * 1000,
+    });
+  }
+
+  private setRefreshTokenCookie(res: Response, refreshToken: string): void {
+    res.cookie('kahade_refresh_token', refreshToken, {
+      httpOnly: true,
+      secure: this.useSecureAuthCookies(),
+      sameSite: 'strict',
+      path: this.getRefreshCookiePath(),
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
   }
 
   // ── Registrasi ────────────────────────────────────────────────────

@@ -784,7 +784,9 @@ export class AdminDisputesService {
       ipAddress,
     });
 
-    // BAI-098: notifikasi putusan yang kegagalannya tercatat + status kirim.
+    // BAI-098 + NCC-003: notifikasi putusan yang kegagalannya tercatat + status
+    // kirim (lihat notifyDecisionOutcomeTracked — sudah mencakup actionUrl/ref
+    // NCC-003 agar tap inbox membuka detail sengketa).
     const notificationDelivered = await this.notifyDecisionOutcomeTracked(result, adminId, ipAddress);
 
     // AW-018: openDisputes di summary dashboard berubah.
@@ -1040,6 +1042,10 @@ export class AdminDisputesService {
             title: result.disputeNotifTitle,
             body: result.disputeNotifBody,
             isRead: false,
+            // NCC-003: actionUrl + ref agar tap inbox membuka detail sengketa.
+            actionUrl: `/dispute/${encodeURIComponent(result.resolvedDisputeId)}`,
+            refType: 'DISPUTE',
+            refId: result.resolvedDisputeId,
           },
         });
         this.prisma.emitNotificationCreated({ userId: uid, title: result.disputeNotifTitle, body: result.disputeNotifBody, data: { type: 'DISPUTE_RESOLVED', disputeId: result.resolvedDisputeId } });
@@ -1395,6 +1401,9 @@ export class AdminDisputesService {
             title: mediationTitle,
             body: mediationPreview || `Mediator mengirim pesan baru pada sengketa ${dispute.disputeId}.`,
             isRead: false,
+            // NCC-003: actionUrl + ref agar tap inbox membuka detail sengketa.
+            actionUrl: `/dispute/${encodeURIComponent(dispute.disputeId)}`,
+            refType: 'DISPUTE', refId: dispute.disputeId,
           },
         });
         this.prisma.emitNotificationCreated({

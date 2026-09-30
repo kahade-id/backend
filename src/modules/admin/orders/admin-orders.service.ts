@@ -1,7 +1,8 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger, Optional } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, UnauthorizedException, Logger, Optional } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { OrderStatus, AuditAction, Prisma, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType, DisputeStatus } from '@prisma/client';
+import { bcryptCompare } from '../../../common/utils/crypto.util';
+import { OrderStatus, AuditAction, Prisma, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType, DisputeStatus, PaymentProvider } from '@prisma/client';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditLogService } from '../../../common/services/audit-log.service';
@@ -16,7 +17,7 @@ import { UnshippedOrderCancelService } from '../../orders/unshipped-order-cancel
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
-import { AdminOrderQueryDto, ForceActionDto } from './dto/admin-order-query.dto';
+import { AdminOrderQueryDto, ForceActionDto, ForceActionWithReauthDto } from './dto/admin-order-query.dto';
 import { toIdr } from '../../../common/utils/currency.util';
 import { decryptPiiSafe } from '../../../common/utils/pii.util';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
@@ -147,6 +148,33 @@ export class AdminOrdersService {
         dispute: true,
         ratings: true,
         extensionRequests: { orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] },
+        // MFE-012/MFE-013: expose jejak finansial DANA-direct di order detail
+        // admin — lifecycle charge (payKind, partnerReferenceNo, fee, gross,
+        // refund). Catatan: EscrowDisbursement TIDAK punya @relation balik ke
+        // Order di skema (hanya kolom orderId), jadi antrean disbursement
+        // di-query terpisah setelah order ditemukan, bukan via include.
+        paymentTransactions: {
+          where: { provider: PaymentProvider.DANA },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          select: {
+            id: true,
+            midtransOrderId: true,
+            purpose: true,
+            method: true,
+            status: true,
+            amount: true,
+            paymentFee: true,
+            grossAmount: true,
+            refundedAmount: true,
+            refundReference: true,
+            danaPayKind: true,
+            danaPartnerReferenceNo: true,
+            danaReferenceNo: true,
+            paidAt: true,
+            failedAt: true,
+            createdAt: true,
+          },
+        },
       },
     });
 
@@ -154,7 +182,59 @@ export class AdminOrdersService {
       throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
     }
 
+    // Antrean disbursement escrow untuk order ini (query terpisah — bukan
+    // relation Prisma). Diurut terbaru dulu; select dibatasi ke field yang
+    // relevan untuk panel admin.
+    const orderDisbursements = await this.prisma.escrowDisbursement.findMany({
+      where: { orderId: order.id },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      select: {
+        id: true,
+        scope: true,
+        status: true,
+        amountSen: true,
+        heldReason: true,
+        lastError: true,
+        danaReferenceNo: true,
+        releasedAt: true,
+        createdAt: true,
+      },
+    });
+
     const result = serializeOrder(order as unknown as Record<string, unknown>);
+
+    // MFE-012/MFE-013: mapping ter-serialisasi untuk admin FE —
+    // danaPayments berisi snapshot DANA-direct per order (BigInt→IDR).
+    // Raw paymentTransactions/escrowDisbursements di-keep (backward compat
+    // dengan konsumen lama); danaPayments adalah view yang diformat.
+    result.danaPayments = (order.paymentTransactions as Array<Record<string, unknown>>).map(pt => ({
+      id: pt.id as string,
+      partnerReferenceNo: pt.midtransOrderId as string,
+      payKind: (pt.danaPayKind as string | null) ?? 'UNKNOWN',
+      purpose: pt.purpose as string,
+      status: pt.status as string,
+      amount: toIdr(pt.amount as bigint),
+      providerFee: toIdr(pt.paymentFee as bigint),
+      grossAmount: toIdr(pt.grossAmount as bigint),
+      refundedAmount: toIdr(pt.refundedAmount as bigint),
+      refundReference: (pt.refundReference as string | null) ?? null,
+      danaPartnerReferenceNo: (pt.danaPartnerReferenceNo as string | null) ?? null,
+      danaReferenceNo: (pt.danaReferenceNo as string | null) ?? null,
+      paidAt: pt.paidAt ? (pt.paidAt as Date).toISOString() : null,
+      failedAt: pt.failedAt ? (pt.failedAt as Date).toISOString() : null,
+      createdAt: (pt.createdAt as Date).toISOString(),
+    }));
+    result.escrowDisbursementsList = (orderDisbursements as Array<Record<string, unknown>>).map(d => ({
+      id: d.id as string,
+      scope: d.scope as string,
+      status: d.status as string,
+      amount: toIdr(d.amountSen as bigint),
+      heldReason: (d.heldReason as string | null) ?? null,
+      lastError: (d.lastError as string | null) ?? null,
+      danaReferenceNo: (d.danaReferenceNo as string | null) ?? null,
+      releasedAt: d.releasedAt ? (d.releasedAt as Date).toISOString() : null,
+      createdAt: (d.createdAt as Date).toISOString(),
+    }));
 
     // Lokasi presisi buyer (fraud checking) — dekripsi fail-closed, ciphertext
     // mentah TIDAK pernah dikirim ke client.
@@ -186,7 +266,52 @@ export class AdminOrdersService {
   // ADM-404: DISPUTE_ADMIN hanya boleh force-cancel order yang memiliki dispute AKTIF.
   // SUPER_ADMIN tidak dibatasi. Reason wajib (ForceActionDto, min 10 karakter) dan
   // aksi diaudit sebagai ORDER_FORCE_CANCEL.
-  async forceCancel(orderId: string, adminId: string, adminRole: string, dto: ForceActionDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: OrderStatus }> {
+  /**
+   * AUT-013: re-auth password untuk aksi finansial final (force-cancel /
+   * force-complete). JWT yang dicuri saja tidak cukup — penyerang harus tahu
+   * password admin juga. Kegagalan diaudit (pola yang sama dengan
+   * admin-business-verification.service.ts).
+   */
+  private async verifyAdminPasswordForForceAction(
+    adminId: string,
+    password: string | undefined,
+    action: string,
+    orderId: string,
+    ipAddress: string,
+  ): Promise<void> {
+    if (!password) {
+      throw new UnauthorizedException({
+        code: ErrorCodes.UNAUTHORIZED,
+        message: 'Re-authentication required for this action. Provide your password.',
+      });
+    }
+    const admin = await this.prisma.adminUser.findUnique({ where: { id: adminId } });
+    if (!admin || !admin.isActive || admin.deletedAt) {
+      throw new UnauthorizedException({ code: ErrorCodes.UNAUTHORIZED, message: 'Admin not found' });
+    }
+    const isPasswordValid = await bcryptCompare(password, admin.password);
+    if (!isPasswordValid) {
+      // Kegagalan diaudit (pola yang sama dengan forceCancel/forceComplete:
+      // fire-and-forget agar kegagalan audit tidak menggagalkan penolakan).
+      this.auditLog.logAdminAction({
+        adminId,
+        action: AuditAction.ADMIN_ACTION,
+        targetType: 'Order',
+        targetId: orderId,
+        description: `Failed re-authentication attempt for force ${action} on order ${orderId}`,
+        ipAddress,
+      });
+      throw new UnauthorizedException({
+        code: ErrorCodes.INVALID_CREDENTIALS,
+        message: 'Invalid password for re-authentication',
+      });
+    }
+  }
+
+  async forceCancel(orderId: string, adminId: string, adminRole: string, dto: ForceActionWithReauthDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: OrderStatus }> {
+    // AUT-013: re-auth password SEBELUM menyentuh order.
+    await this.verifyAdminPasswordForForceAction(adminId, dto.password, 'cancel', orderId, ipAddress);
+
     const order = await this.prisma.order.findFirst({
       where: { OR: [{ id: orderId }, { orderId }], deletedAt: null },
     });
@@ -274,7 +399,10 @@ export class AdminOrdersService {
     };
   }
 
-  async forceComplete(orderId: string, adminId: string, dto: ForceActionDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: OrderStatus }> {
+  async forceComplete(orderId: string, adminId: string, dto: ForceActionWithReauthDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: OrderStatus }> {
+    // AUT-013: re-auth password SEBELUM menyentuh order.
+    await this.verifyAdminPasswordForForceAction(adminId, dto.password, 'complete', orderId, ipAddress);
+
     const order = await this.prisma.order.findFirst({
       where: { OR: [{ id: orderId }, { orderId }], deletedAt: null },
       include: {

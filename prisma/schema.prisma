@@ -502,6 +502,9 @@ enum ChatMessageType {
   LOCATION
   PRODUCT_CARD
   ORDER_CARD
+  // NCC-009: DTO send-message mengizinkan VIDEO — enum DB harus selaras
+  // (sebelumnya pesan VIDEO lolos validasi lalu 500 saat write DB).
+  VIDEO
 }
 
 // ORDER  : percakapan yang melekat pada satu order (1 room per order).
@@ -3295,6 +3298,11 @@ model AdminUser {
 
   failedLoginAttempts Int       @default(0)
   lockedUntil         DateTime?
+
+  // AUT-011: true = admin WAJIB mengganti password saat login berikutnya
+  // (dibuat baru / di-reset SUPER_ADMIN). Login menerbitkan tempToken scope
+  // admin_password_change, bukan sesi.
+  mustChangePassword Boolean @default(false)
 
   createdBy String?
   createdAt DateTime  @default(now())

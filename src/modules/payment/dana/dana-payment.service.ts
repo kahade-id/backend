@@ -222,8 +222,10 @@ export class DanaPaymentService {
         order: {
           orderTitle: params.orderTitle ?? 'Kahade Payment',
           scenario: 'API',
-          // DANA menandai buyer sebagai Required — object kosong {} bila tidak ada.
-          buyer: params.buyerExternalUserId ? { externalUserId: params.buyerExternalUserId } : {},
+          // E2E 2026-09-30: fixture UAT DANA TIDAK menyertakan buyer sama sekali.
+          // Object kosong {} menyebabkan "Invalid Field Format" — hanya kirim
+          // bila ada buyerExternalUserId.
+          ...(params.buyerExternalUserId ? { buyer: { externalUserId: params.buyerExternalUserId } } : {}),
         },
         // Wajib menurut fixture resmi DANA — create order kena 4005401
         // Invalid Field Format tanpa field-field ini (terbukti di E2E sandbox 2026-09-29).

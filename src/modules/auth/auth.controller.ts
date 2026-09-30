@@ -64,6 +64,7 @@ import {
   type TriggerPayload,
   type OtpTriggerStatus,
 } from './otp-trigger.service';
+import { type OtpTriggerPurpose } from './dto/otp-trigger.dto';
 
 /** Type guard G014: hasil social-login berupa permintaan konfirmasi taut. */
 function isSocialLoginPendingLink(
@@ -267,9 +268,11 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   async otpTriggerStatus(
     @Param('refCode') refCode: string,
-  ): Promise<{ status: OtpTriggerStatus }> {
-    const { status } = await this.otpTriggerService.getTriggerStatus(refCode);
-    return { status };
+  ): Promise<{ status: OtpTriggerStatus; purpose?: OtpTriggerPurpose }> {
+    // BFI-040: kembalikan purpose juga (service sudah menyediakannya) —
+    // FE memakainya untuk menentukan langkah berikutnya.
+    const { status, purpose } = await this.otpTriggerService.getTriggerStatus(refCode);
+    return { status, purpose };
   }
 
   /**
@@ -1000,7 +1003,7 @@ export class AuthController {
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @Get('2fa/status')
   @HttpCode(HttpStatus.OK)
-  async get2faStatus(@CurrentUser('sub') userId: string): Promise<{ enabled: boolean }> {
+  async get2faStatus(@CurrentUser('sub') userId: string): Promise<{ enabled: boolean; backupCodesRemaining?: number }> {
     return this.authService.get2faStatus(userId);
   }
 

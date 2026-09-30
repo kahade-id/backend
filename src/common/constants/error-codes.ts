@@ -116,6 +116,16 @@ export const REAUTH_INVALID_PASSWORD = 'REAUTH_INVALID_PASSWORD';
 export const REAUTH_TOO_MANY_ATTEMPTS = 'REAUTH_TOO_MANY_ATTEMPTS';
 export const KYC_REQUIRED = 'KYC_REQUIRED';
 export const KYC_REQUIRED_FOR_WITHDRAW = 'KYC_REQUIRED_FOR_WITHDRAW';
+// BFI-065: PIN dompet belum pernah diatur — kode khusus agar klien tidak
+// menebak dari NOT_FOUND generik + wording pesan Inggris (dulu di
+// wallet.service.ts verifyWalletPin). Dipetakan FE via error-codes.ts.
+export const WALLET_PIN_NOT_SET = 'WALLET_PIN_NOT_SET';
+
+// DANA Direct (no-wallet)
+// BFI-066: bankCode wajib untuk pembayaran Virtual Account DANA. Pesan
+// backend berbahasa Indonesia dan aman ditampilkan langsung ke user
+// (didaftarkan di FE error-codes.ts → DISPLAYABLE_BACKEND_MESSAGES).
+export const DANA_VA_BANK_REQUIRED = 'DANA_VA_BANK_REQUIRED';
 
 // Disputes
 export const DISPUTE_NOT_FOUND = 'DISPUTE_NOT_FOUND';

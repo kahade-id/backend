@@ -21,6 +21,11 @@ export enum UploadPurpose {
   DISPUTE_EVIDENCE = 'DISPUTE_EVIDENCE',
   REPORT_EVIDENCE = 'REPORT_EVIDENCE',
   DELIVERY_PROOF = 'DELIVERY_PROOF',
+  // BFI-097 (audit integrasi 2026-09-30): bukti penyelesaian milestone
+  // (FE: app/milestones/[id].tsx → uploadDirectImage). Private, sama seperti
+  // bukti sengketa/laporan — hanya pemilik + pihak terkait yang boleh baca
+  // via signed URL.
+  MILESTONE_EVIDENCE = 'MILESTONE_EVIDENCE',
 }
 
 export class PresignedUrlDto {

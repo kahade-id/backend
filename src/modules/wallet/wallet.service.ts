@@ -1300,8 +1300,12 @@ export class WalletService implements OnModuleInit {
     }
 
     if (!hasPin) {
+      // BFI-065: kode khusus — JANGAN pakai NOT_FOUND generik. FE
+      // (isPinNotSetError) menampilkan ajakan "Buat PIN" dari kode ini;
+      // deteksi lama via wording pesan Inggris dipertahankan sebagai fallback
+      // untuk kompatibilitas backend lama.
       throw new BadRequestException({
-        code: ErrorCodes.NOT_FOUND,
+        code: ErrorCodes.WALLET_PIN_NOT_SET,
         message: 'Wallet PIN has not been set. Please set a PIN before proceeding.',
       });
     }

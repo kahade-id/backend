@@ -1,8 +1,10 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
+  NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -319,18 +321,23 @@ export class OrderQrisPaymentService {
     }
   }
 
+  /**
+   * BFI-058: sesi tak valid memakai status HTTP yang tepat — order tidak ada
+   * → 404 (bukan 400), bukan peserta → 403 (bukan 400). Body error tetap
+   * membawa `code` agar klien bisa memetakan.
+   */
   async getStatus(orderId: string, buyerId: string): Promise<OrderQrisPaymentResult | null> {
     const order = await this.prisma.order.findUnique({
       where: { orderId },
       select: { id: true, buyerId: true },
     });
     if (!order)
-      throw new BadRequestException({
+      throw new NotFoundException({
         code: ErrorCodes.ORDER_NOT_FOUND,
         message: 'Order not found',
       });
     if (order.buyerId !== buyerId)
-      throw new BadRequestException({
+      throw new ForbiddenException({
         code: ErrorCodes.NOT_ORDER_PARTICIPANT,
         message: 'Not authorized to view this payment',
       });

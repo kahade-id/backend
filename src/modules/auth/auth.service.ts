@@ -3244,9 +3244,21 @@ export class AuthService {
   }
 
   // ─────────────────────────────────────────────────────────────────
-  async get2faStatus(userId: string): Promise<{ enabled: boolean }> {
+  async get2faStatus(
+    userId: string,
+  ): Promise<{ enabled: boolean; backupCodesRemaining?: number }> {
     const twoFa = await this.prisma.twoFactorAuth.findUnique({ where: { userId } });
-    return { enabled: twoFa?.isEnabled ?? false };
+    if (!twoFa?.isEnabled) return { enabled: false };
+    // BFI-044: FE (two-factor.tsx) butuh jumlah kode cadangan TERSISA untuk
+    // memperingatkan pengguna bila tinggal sedikit. Tidak membocorkan nilai
+    // kode — hanya hitungan (backupCodes.length − usedBackupCodes.length).
+    return {
+      enabled: true,
+      backupCodesRemaining: Math.max(
+        0,
+        twoFa.backupCodes.length - twoFa.usedBackupCodes.length,
+      ),
+    };
   }
 
   // SETUP 2FA

@@ -35,6 +35,7 @@ import {
   CHAT_SEARCH_MIN_QUERY_LENGTH,
   CHAT_VOICE_MAX_DURATION_SECONDS,
   CHAT_VOICE_MIN_DURATION_SECONDS,
+  TYPING_HOLD_MS,
 } from '../../common/constants/app.constants';
 import { createPaginatedResponse } from '../../common/dto/pagination.dto';
 import { escapeLikePattern } from '../../common/utils/search.util';
@@ -1997,7 +1998,10 @@ export class ChatService implements OnModuleInit {
       // pembaca sendiri). Status baca internal (lastReadAt, badge notifikasi)
       // tetap diperbarui.
       const hideReceipts = await this.isHideReadReceiptsEnabled(userId);
-      const payload = { roomId, userId, readAt: now, markedCount };
+      // BFI-114: tandai event sinkronisasi multi-device milik sendiri agar
+      // klien memprosesnya walau payload.userId == viewerId (filter gema
+      // biasa tetap mengabaikan event tanpa flag ini).
+      const payload = { roomId, userId, readAt: now, markedCount, isOwnDeviceSync: true };
       if (hideReceipts) {
         this.realtime.emitToUser(userId, 'chat.read', payload);
       } else {
@@ -2819,7 +2823,21 @@ export class ChatService implements OnModuleInit {
   async sendTypingIndicator(userId: string, roomId: string, isTyping: boolean): Promise<{ sent: boolean }> {
     const room = await this.validateRoomAccess(userId, roomId);
     await this.assertNotBlocked(userId, this.resolveCounterpart(room, userId));
-    this.emitChatEvent(room, 'chat.typing', { roomId, userId, isTyping, at: new Date().toISOString() });
+    // BFI-115: samakan dengan payload gateway (broadcastTyping) — field
+    // top-level { roomId, userId, username, isTyping, expiresAt }.
+    // `username` = nama tampilan (fullName || username), sama prioritasnya
+    // dengan lookupDisplayName di gateway.
+    const author = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { fullName: true, username: true },
+    }).catch(() => null);
+    this.emitChatEvent(room, 'chat.typing', {
+      roomId,
+      userId,
+      username: author?.fullName || author?.username || null,
+      isTyping,
+      expiresAt: new Date(Date.now() + (isTyping ? TYPING_HOLD_MS : 0)).toISOString(),
+    });
     return { sent: true };
   }
 
@@ -2869,7 +2887,8 @@ export class ChatService implements OnModuleInit {
     if (markedCount > 0) {
       // Batch 43 BE-CHAT: hormati hideReadReceipts (lihat markAsRead).
       const hideReceipts = await this.isHideReadReceiptsEnabled(userId);
-      const payload = { roomId, userId, messageId, readAt: now, markedCount };
+      // BFI-114: flag sinkronisasi multi-device (lihat markAsRead).
+      const payload = { roomId, userId, messageId, readAt: now, markedCount, isOwnDeviceSync: true };
       if (hideReceipts) {
         this.realtime.emitToUser(userId, 'chat.read', payload);
       } else {

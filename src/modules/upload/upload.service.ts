@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, NotFoundException, Logger, ConflictException, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, Logger, ConflictException, InternalServerErrorException, PayloadTooLargeException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHash, createHmac, timingSafeEqual } from 'crypto';
 import { Readable } from 'stream';
@@ -49,6 +49,8 @@ export const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
   [UploadPurpose.DISPUTE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm'],
   [UploadPurpose.REPORT_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf'],
   [UploadPurpose.DELIVERY_PROOF]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf'],
+  // BFI-097: bukti milestone — foto/scan + PDF, privat.
+  [UploadPurpose.MILESTONE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf'],
 };
 
 const MIN_FILE_SIZE = 1024;
@@ -92,6 +94,8 @@ export const MAX_FILE_SIZE: Record<UploadPurpose, number> = {
   [UploadPurpose.DISPUTE_EVIDENCE]: 50 * 1024 * 1024,
   [UploadPurpose.REPORT_EVIDENCE]: 10 * 1024 * 1024,
   [UploadPurpose.DELIVERY_PROOF]: 10 * 1024 * 1024,
+  // BFI-097: bukti milestone — 10 MiB (sama seperti bukti laporan/pengiriman).
+  [UploadPurpose.MILESTONE_EVIDENCE]: 10 * 1024 * 1024,
 };
 
 const CONFIRMED_KEY_TTL_SECONDS = 86_400;
@@ -176,7 +180,12 @@ function sanitizeStoredFileName(rawFileName: string): string {
   return s;
 }
 
-const FILE_KEY_PATTERN = /^uploads\/[a-z-]+\/[a-zA-Z0-9_-]+\/[\w.-]+$/;
+const FILE_KEY_PATTERN = /^(?:uploads\/[a-z-]+\/[a-zA-Z0-9_-]+\/[\w.-]+|(?:avatars|headers)\/[a-zA-Z0-9_-]+\/[\w.-]+)$/;
+// BFI-103: alternatif kedua = key avatar/header LEGACY tanpa prefix
+// `uploads/` (avatars/<uid>/…, headers/<uid>/…) — kompatibilitas mundur:
+// file lama di disk & URL lama tidak berubah, validator tetap menerima
+// bentuk key yang tersimpan sebelum kanonisasi. Batasan traversal
+// (`..`, `//`, `\`, `%`) tetap dicek terpisah di isSafeFileKey.
 
 // B-39 (audit-fix): single guard that EVERY code path turning a client-supplied
 // file key into an S3 operation must run. Previously only `confirmUpload()`
@@ -210,6 +219,8 @@ const PURPOSE_VISIBILITY: Record<UploadPurpose, 'private' | 'public'> = {
   [UploadPurpose.DISPUTE_EVIDENCE]: 'private',
   [UploadPurpose.REPORT_EVIDENCE]: 'private',
   [UploadPurpose.DELIVERY_PROOF]: 'private',
+  // BFI-097: bukti milestone — privat (signed URL kedaluwarsa).
+  [UploadPurpose.MILESTONE_EVIDENCE]: 'private',
 };
 
 const PURPOSE_FOLDER_MAP_INTERNAL: Record<UploadPurpose, string> = {
@@ -225,6 +236,8 @@ const PURPOSE_FOLDER_MAP_INTERNAL: Record<UploadPurpose, string> = {
   [UploadPurpose.DISPUTE_EVIDENCE]: 'dispute-evidence',
   [UploadPurpose.REPORT_EVIDENCE]: 'report-evidence',
   [UploadPurpose.DELIVERY_PROOF]: 'delivery-proof',
+  // BFI-097: folder privat baru untuk bukti milestone.
+  [UploadPurpose.MILESTONE_EVIDENCE]: 'milestone-evidence',
 };
 
 // Reverse of PURPOSE_FOLDER_MAP_INTERNAL, derived rather than hand-written so a new
@@ -286,6 +299,28 @@ export interface DirectUploadResult {
   height?: number;
 }
 
+/**
+ * BFI-060/BFI-099 (audit integrasi 2026-09-30): exception file-kebesaran yang
+ * SELALU 413 `PayloadTooLargeException` dengan kode terstruktur — dipakai
+ * `uploadDirect` MAUPUN `chunked init` agar kode konsisten di semua jalur:
+ * - SHOWCASE_VIDEO → `VIDEO_TOO_LARGE` + pesan Indonesia
+ * - purpose lain   → `FILE_TOO_LARGE`
+ * HttpExceptionFilter meneruskan `code` dari body, jadi FE tetap bisa
+ * memetakan copy per kode (lihat VIDEO_UPLOAD_ERROR_COPY).
+ */
+export function fileTooLargeException(purpose: UploadPurpose | undefined, maxSize: number): PayloadTooLargeException {
+  if (purpose === UploadPurpose.SHOWCASE_VIDEO) {
+    return new PayloadTooLargeException({
+      code: ErrorCodes.VIDEO_TOO_LARGE,
+      message: `Ukuran video melebihi batas maksimal ${Math.round(maxSize / 1024 / 1024)} MB. Maksimal 100 MB / 180 detik.`,
+    });
+  }
+  return new PayloadTooLargeException({
+    code: ErrorCodes.FILE_TOO_LARGE,
+    message: `File exceeds maximum allowed size of ${Math.round(maxSize / 1024 / 1024)} MB`,
+  });
+}
+
 @Injectable()
 export class UploadService {
   private readonly logger = new Logger(UploadService.name);
@@ -296,22 +331,6 @@ export class UploadService {
     private localStorage: LocalStorageService,
     private videoProcessing: VideoProcessingService,
   ) {}
-
-  // ── Batas video etalase resmi (keputusan user 2026-09-28): 100MB / 180 detik.
-  // Khusus SHOWCASE_VIDEO, pelanggaran batas ukuran memakai kode
-  // VIDEO_TOO_LARGE + pesan Indonesia; purpose lain tidak berubah.
-  private throwFileTooLarge(purpose: UploadPurpose | undefined, maxSize: number): never {
-    if (purpose === UploadPurpose.SHOWCASE_VIDEO) {
-      throw new BadRequestException({
-        code: ErrorCodes.VIDEO_TOO_LARGE,
-        message: `Ukuran video melebihi batas maksimal ${Math.round(maxSize / 1024 / 1024)} MB. Maksimal 100 MB / 180 detik.`,
-      });
-    }
-    throw new BadRequestException({
-      code: ErrorCodes.FILE_TOO_LARGE,
-      message: `File exceeds maximum allowed size of ${Math.round(maxSize / 1024 / 1024)} MB`,
-    });
-  }
 
   // ── Batch 1A (ST-002/03-#1): signed URL HMAC untuk file privat ──
   // Menggantikan semantik presigned-URL R2: URL kedaluwarsa yang hanya bisa
@@ -507,7 +526,7 @@ export class UploadService {
       const maxSize = MAX_FILE_SIZE[detectedPurpose];
       if (contentLength !== undefined && contentLength > maxSize) {
         await this.redis.del(redisKey);
-        this.throwFileTooLarge(detectedPurpose, maxSize);
+        throw fileTooLargeException(detectedPurpose, maxSize);
       }
 
       try {
@@ -636,7 +655,8 @@ export class UploadService {
       }
 
       if (contentLength !== undefined && contentLength > maxSize) {
-        throw new BadRequestException({
+        // BFI-060: file kebesaran → 413 (bukan 400), kode tetap FILE_TOO_LARGE.
+        throw new PayloadTooLargeException({
           code: ErrorCodes.FILE_TOO_LARGE,
           message: `Evidence file exceeds maximum allowed size of ${Math.round(maxSize / 1024 / 1024)} MB`,
         });
@@ -754,7 +774,7 @@ export class UploadService {
       }
       // Batas video etalase resmi (keputusan user 2026-09-28): 100MB / 180 detik.
       if (contentLength > maxSize) {
-        this.throwFileTooLarge(purpose, maxSize);
+        throw fileTooLargeException(purpose, maxSize);
       }
       // Content type dideteksi dari bytes saat confirm — local storage tidak
       // menyimpan ContentType terpisah, jadi skip check ContentType di sini.
@@ -952,7 +972,7 @@ export class UploadService {
 
     const maxSize = MAX_FILE_SIZE[purpose];
     if (fileBuffer.length > maxSize) {
-      this.throwFileTooLarge(purpose, maxSize);
+      throw fileTooLargeException(purpose, maxSize);
     }
 
     const header = fileBuffer.subarray(0, MIME_HEADER_BYTES);

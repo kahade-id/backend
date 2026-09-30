@@ -211,19 +211,26 @@ export class BankAccountsService {
           beneficiaryAccountNumber: normalizedAccountNumber,
           beneficiaryBankCode: snapBankCode,
         });
-        const returnedAccountNumber = String(inquiry.accountNumber ?? '')
-          .trim()
-          .replace(/\s+/g, '');
-        if (!returnedAccountNumber || returnedAccountNumber !== normalizedAccountNumber) {
+        // BFI-080: DanaBankAccountInquiryResult.accountNumber HANYA gema
+        // beneficiaryAccountNumber dari request (bankAccountInquiry mengisi
+        // dari params, bukan dari respons DANA) — membandingkannya dengan
+        // nomor yang diminta tidak memverifikasi apa pun (selalu sama).
+        // Sinyal verifikasi yang benar dari hasil inquiry adalah
+        // inquiry.verified (responseCode DANA 200 + nama pemilik rekening
+        // diterima). Fail-closed: tolak verifikasi bila DANA tidak
+        // memverifikasi inquiry ini.
+        if (!inquiry.verified) {
           this.logger.error(
-            `Bank inquiry account number mismatch for bank=${bankCode}; refusing verification`,
+            `Bank inquiry not verified by DANA for bank=${bankCode}; refusing verification`,
           );
           throw new BadRequestException({
-            code: 'BANK_ACCOUNT_NUMBER_MISMATCH',
-            message: 'Bank account verification response does not match the requested account.',
+            code: 'BANK_ACCOUNT_VERIFICATION_FAILED',
+            message: 'Bank could not verify this account. Please check the account number and try again.',
           });
         }
         if (!inquiry.accountName) {
+          // Disubsume !inquiry.verified di atas (verified mensyaratkan
+          // accountName) — dipertahankan sebagai type guard + defense-in-depth.
           this.logger.error(
             `Bank inquiry returned no account name for bank=${bankCode}; refusing verification`,
           );

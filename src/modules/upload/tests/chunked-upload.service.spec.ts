@@ -50,7 +50,9 @@ describe('ChunkedUploadService — NP-006', () => {
       chunkSize,
     });
 
-  it('init: menolak totalSize melebihi batas purpose (FILE_TOO_LARGE)', async () => {
+  // BFI-099: SHOWCASE_VIDEO kini memakai VIDEO_TOO_LARGE (selaras jalur direct),
+  // bukan FILE_TOO_LARGE — agar FE bisa memetakan copy per kode.
+  it('init: menolak totalSize melebihi batas purpose (VIDEO_TOO_LARGE untuk SHOWCASE_VIDEO)', async () => {
     await expect(
       service.initiate('user-1', {
         purpose: UploadPurpose.SHOWCASE_VIDEO,
@@ -58,7 +60,7 @@ describe('ChunkedUploadService — NP-006', () => {
         mimeType: 'video/mp4',
         totalSize: 101 * 1024 * 1024,
       }),
-    ).rejects.toMatchObject({ response: expect.objectContaining({ code: 'FILE_TOO_LARGE' }) });
+    ).rejects.toMatchObject({ response: expect.objectContaining({ code: 'VIDEO_TOO_LARGE' }) });
   });
 
   it('init: menolak MIME di luar allowlist purpose (MIME_TYPE_MISMATCH)', async () => {

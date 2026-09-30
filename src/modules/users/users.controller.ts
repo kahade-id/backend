@@ -150,7 +150,7 @@ export class UsersController {
   async uploadAvatarDirect(
     @CurrentUser('sub') userId: string,
     @UploadedFile() file: MulterFile,
-  ): Promise<{ avatarUrl: string }> {
+  ): Promise<{ avatarUrl: string; avatarKey: string }> {
     if (!file) {
       throw new BadRequestException({ code: 'FILE_REQUIRED', message: 'File is required' });
     }

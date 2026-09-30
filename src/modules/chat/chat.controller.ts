@@ -631,7 +631,7 @@ export class ChatController {
     @CurrentUser('sub') userId: string,
     @Param('roomId', ParseIdPipe) roomId: string,
     @UploadedFile() file: MulterFile,
-  ): Promise<{ url: string; fileUrl: string; fileKey: string }> {
+  ): Promise<{ url: string; fileUrl: string; fileKey: string; fileName: string; mimeType: string }> {
     if (!file) {
       throw new BadRequestException({ code: 'VALIDATION_ERROR', message: 'File is required' });
     }
@@ -651,7 +651,15 @@ export class ChatController {
     // (Sebelumnya: fileUrl berupa URL publik permanen, sehingga controller ini
     // memanggil ulang generateDownloadUrl().)
     const readableUrl = result.fileUrl;
-    return { url: readableUrl, fileUrl: readableUrl, fileKey: result.fileKey };
+    // BFI-096 (audit integrasi 2026-09-30): FE mewajibkan `fileName`
+    // (parseChatUploadResponse → ChatAttachmentDto). Aditif — field lama
+    // tidak berubah. Nama diambil dari originalname; fallback ke segmen
+    // terakhir fileKey (sudah disanitasi server-side saat upload).
+    const fileName =
+      (typeof file.originalname === 'string' && file.originalname.trim()) ||
+      result.fileKey.split('/').pop() ||
+      'file';
+    return { url: readableUrl, fileUrl: readableUrl, fileKey: result.fileKey, fileName, mimeType: file.mimetype };
   }
 
   @Get('rooms/:roomId/attachments')

@@ -119,3 +119,15 @@ export class RevisionDto {
   @MaxLength(1000)
   note?: string;
 }
+
+/**
+ * BFI-006 (audit integrasi): FE mengirim `{ note? }` saat submit —
+ * sebelumnya body diabaikan total (tanpa @Body()). Aditif: note opsional,
+ * dicatat di payload event SUBMITTED.
+ */
+export class SubmitMilestoneDto {
+  @IsOptional()
+  @IsString()
+  @MaxLength(2000, { message: 'Catatan maksimal 2000 karakter.' })
+  note?: string;
+}

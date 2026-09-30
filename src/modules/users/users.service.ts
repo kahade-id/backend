@@ -331,7 +331,11 @@ export class UsersService {
           where: { isHidden: false, giver: { isActive: true, isBanned: false, deletedAt: null, profileVisible: true } },
           orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], // tiebreak { id } — halaman stabil
           take: PROFILE_RECENT_RATINGS_LIMIT,
-          select: { stars: true, comment: true, createdAt: true, giver: { select: { username: true, avatarUrl: true } } },
+          select: { stars: true, comment: true, createdAt: true, giver: { select: { username: true, avatarUrl: true } },
+            // BFI-128 (audit integrasi 2026-09-30): sertakan balasan rating
+            // (aditif). Balasan yang disembunyikan tidak bocor ke publik.
+            reply: { where: { isHidden: false }, select: { content: true, createdAt: true, replier: { select: { username: true, avatarUrl: true } } } },
+          },
         },
         links: {
           orderBy: [{ displayOrder: 'asc' }, { id: 'asc' }],
@@ -809,7 +813,7 @@ export class UsersService {
    * Upload avatar langsung ke self-hosted disk (2026-09-26, SS-007/ST-007).
    * R2 tidak dipakai lagi — tidak ada dependensi kredensial R2.
    */
-  async uploadAvatarDirect(userId: string, fileName: string, contentType: string, fileBuffer: Buffer): Promise<{ avatarUrl: string }> {
+  async uploadAvatarDirect(userId: string, fileName: string, contentType: string, fileBuffer: Buffer): Promise<{ avatarUrl: string; avatarKey: string }> {
     const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true, avatarUrl: true } });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
 
@@ -838,7 +842,10 @@ export class UsersService {
     }
 
     const ext = contentType === 'image/png' ? 'png' : contentType === 'image/webp' ? 'webp' : 'jpg';
-    const avatarKey = `avatars/${userId}/${nanoid(16)}.${ext}`;
+    // BFI-103: key kanonis BARU memakai prefix `uploads/` (selaras folder
+    // purpose lain). resolvePath/getPublicUrl men-strip prefix ini, jadi file
+    // di disk & URL publik IDENTIK dengan key lama — URL lama tidak rusak.
+    const avatarKey = `uploads/avatars/${userId}/${nanoid(16)}.${ext}`;
 
     try {
       await this.localStorage.saveFile(avatarKey, fileBuffer);
@@ -857,7 +864,10 @@ export class UsersService {
 
     await this.prisma.user.update({ where: { id: userId }, data: { avatarUrl } });
     this.invalidateUserOgCaches(user.username);
-    return { avatarUrl };
+    // BFI-105: sertakan avatarKey (aditif) — FE memakainya untuk
+    // confirmAvatar + cleanup orphan (G-04); pickString FE sudah membaca
+    // ["avatarKey", "avatar_key"].
+    return { avatarUrl, avatarKey };
   }
 
   async confirmAvatar(userId: string, avatarKey: string): Promise<{ avatarUrl: string }> {
@@ -865,7 +875,12 @@ export class UsersService {
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
 
     const normalizedKey = avatarKey.replace(/\.\.\//g, '').replace(/\/+/g, '/');
-    if (!normalizedKey.startsWith(`avatars/${userId}/`) || normalizedKey !== avatarKey) {
+    // BFI-103: terima key kanonis BARU (`uploads/avatars/<uid>/…`) DAN key
+    // LEGACY (`avatars/<uid>/…`) — kompatibilitas mundur confirm lama.
+    const avatarKeyOk =
+      normalizedKey.startsWith(`uploads/avatars/${userId}/`) ||
+      normalizedKey.startsWith(`avatars/${userId}/`);
+    if (!avatarKeyOk || normalizedKey !== avatarKey) {
       throw new BadRequestException({
         code: ErrorCodes.VALIDATION_ERROR,
         message: 'Invalid avatar key',
@@ -1566,6 +1581,8 @@ export class UsersService {
           comment: true,
           createdAt: true,
           giver: { select: { username: true, avatarUrl: true } },
+          // BFI-128: sertakan balasan rating (aditif; yang disembunyikan tidak bocor).
+          reply: { where: { isHidden: false }, select: { content: true, createdAt: true, replier: { select: { username: true, avatarUrl: true } } } },
         },
       }),
       this.prisma.rating.count({ where }),
@@ -2175,7 +2192,11 @@ export class UsersService {
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
 
     const baseName = path.basename(headerKey);
-    const expectedPrefix = `headers/${userId}/`;
+    // BFI-103: terima key kanonis BARU (`uploads/headers/<uid>/…`) DAN key
+    // LEGACY (`headers/<uid>/…`) — kepemilikan tetap dicek via segmen userId.
+    const expectedPrefix = headerKey.startsWith(`uploads/headers/${userId}/`)
+      ? `uploads/headers/${userId}/`
+      : `headers/${userId}/`;
     const normalizedKey = `${expectedPrefix}${baseName}`;
     if (normalizedKey !== headerKey || !baseName || baseName.includes('..')) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid header key' });
@@ -2231,7 +2252,8 @@ export class UsersService {
     }
 
     const ext = contentType === 'image/png' ? 'png' : contentType === 'image/webp' ? 'webp' : 'jpg';
-    const headerKey = `headers/${userId}/${nanoid(16)}.${ext}`;
+    // BFI-103: key kanonis BARU memakai prefix `uploads/` (lihat avatar di atas).
+    const headerKey = `uploads/headers/${userId}/${nanoid(16)}.${ext}`;
 
     // Self-hosted (2026-09-26, SS-007/ST-007): R2 diganti LocalStorageService.
     try {

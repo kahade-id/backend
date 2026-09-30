@@ -94,7 +94,7 @@ export class CreateProductDto {
   attributesSchema?: Record<string, string[]>;
 
   @IsOptional()
-  @IsArray({ message: 'Dimensi tidak valid.' })
+  @IsObject({ message: 'Dimensi harus berupa objek.' })
   @ValidateNested()
   @Type(() => ProductDimensionsDto)
   dimensions?: ProductDimensionsDto;

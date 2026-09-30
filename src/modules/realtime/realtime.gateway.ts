@@ -41,7 +41,7 @@ interface TypingState {
   timer: ReturnType<typeof setTimeout>;
   lastBroadcastAt: number;
   orderId: string | null;
-  fullName: string | null;
+  username: string | null;
 }
 
 const WS_MSG_RATE_LIMIT = 30;
@@ -126,10 +126,49 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     if (!this.notificationListenerRegistered) {
       this.notificationListenerRegistered = true;
       this.prisma.onNotificationCreated(async (data) => {
+        // BFI-120: sertakan identitas notifikasi di payload `notification.new`
+        // agar klien bisa mark-as-read presisi & deep-link tanpa round-trip
+        // refetch. Signature `emitNotificationCreated` (60+ call site) TIDAK
+        // membawa notifId → resolve best-effort di sini:
+        // 1) `data.data.notificationId` bila pembuat menyertakannya
+        //    (mis. chat.service menyertakan notifId baris notification);
+        // 2) baris notification terbaru milik user dgn title+body sama.
+        // Kegagalan lookup TIDAK menggagalkan emit (notifId: null).
+        let notifId: string | null =
+          typeof data.data?.notificationId === 'string' && data.data.notificationId
+            ? data.data.notificationId
+            : null;
+        let notifType: string | null =
+          typeof data.data?.notificationType === 'string' && data.data.notificationType
+            ? data.data.notificationType
+            : typeof data.data?.type === 'string' && data.data.type
+              ? data.data.type
+              : null;
+        if (notifId === null) {
+          try {
+            const row = await this.prisma.notification.findFirst({
+              where: { userId: data.userId, title: data.title, body: data.body },
+              orderBy: { createdAt: 'desc' },
+              select: { notifId: true, type: true },
+            });
+            if (row) {
+              notifId = row.notifId;
+              if (notifType === null) notifType = row.type;
+            }
+          } catch (err) {
+            this.logger.warn(
+              `Failed to resolve notifId for notification.new (user ${data.userId}): ${(err as Error).message}`,
+            );
+          }
+        }
         this.realtimeService.emitToUser(data.userId, 'notification.new', {
           title: data.title,
           body: data.body,
           ...(data.data ?? {}),
+          // Diletakkan SETELAH spread agar menang atas kunci `data` yang
+          // bentrok (alias `type` di data.data bukan identitas kanonis).
+          notifId,
+          type: notifType,
         });
 
         try {
@@ -572,13 +611,13 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     }, TYPING_HOLD_MS);
 
     if (shouldBroadcast) {
-      const fullName = existing?.fullName ?? (await this.lookupDisplayName(client.userId));
-      await this.broadcastTyping(client, roomId, room.orderId ?? null, true, fullName);
+      const username = existing?.username ?? (await this.lookupDisplayName(client.userId));
+      await this.broadcastTyping(client, roomId, room.orderId ?? null, true, username);
       this.typingState.set(stateKey, {
         timer,
         lastBroadcastAt: Date.now(),
         orderId: room.orderId ?? null,
-        fullName,
+        username,
       });
       return;
     }
@@ -587,7 +626,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
       timer,
       lastBroadcastAt: existing?.lastBroadcastAt ?? 0,
       orderId: room.orderId ?? null,
-      fullName: existing?.fullName ?? null,
+      username: existing?.username ?? null,
     });
   }
 
@@ -596,7 +635,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     if (!state) return; // tidak pernah di-broadcast → tidak ada status untuk dibatalkan
     clearTimeout(state.timer);
     this.typingState.delete(stateKey);
-    await this.broadcastTyping(client, roomId, state.orderId, false, state.fullName);
+    await this.broadcastTyping(client, roomId, state.orderId, false, state.username);
   }
 
   private async broadcastTyping(
@@ -604,12 +643,15 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     roomId: string,
     orderId: string | null,
     isTyping: boolean,
-    fullName: string | null,
+    username: string | null,
   ): Promise<void> {
+    // BFI-115: bentuk kanonis — { roomId, userId, username, isTyping,
+    // expiresAt } top-level, SAMA dengan jalur REST (sendTypingIndicator).
+    // Field `username` berisi nama tampilan (fullName || username).
     const payload = {
       roomId,
       userId: client.userId,
-      fullName,
+      username,
       isTyping,
       // Klien bisa mematikan indikator sendiri tanpa menunggu event stop,
       // yang penting bila paket `typing.stop` hilang karena koneksi putus.
@@ -626,7 +668,10 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     }
   }
 
-  /** Nama tampilan di-cache per sesi mengetik agar tidak ada query per ketikan. */
+  /**
+   * Nama tampilan di-cache per sesi mengetik agar tidak ada query per ketikan.
+   * Dipetakan ke field payload `username` (kontrak BFI-115).
+   */
   private async lookupDisplayName(userId: string): Promise<string | null> {
     try {
       const user = await this.prisma.user.findUnique({

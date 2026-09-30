@@ -67,6 +67,8 @@ describe('AdminAuthService SEC-501 — MFA enforcement tanpa bootstrap bypass', 
       config as never,
       auditLogService as never,
       tokenService as never,
+      // AUT-003: CaptchaService kini argumen konstruktor ke-6.
+      { shouldRequireLoginCaptcha: jest.fn(), recordLoginFailure: jest.fn(), clearLoginFailures: jest.fn() } as never,
     );
   });
 

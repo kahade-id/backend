@@ -48,9 +48,10 @@ export class AdminAuthService {
     // (pola yang sama dengan mobile) agar tempToken yang bocor tidak bisa
     // dipakai dari perangkat lain.
     deviceId?: string,
-    // AUT-003: slider captcha (protokol yang sama dengan mobile).
+    // AUT-003: slider captcha (protokol yang sama dengan mobile): jawaban
+    // adalah posisi X slider 0-100 (sama seperti CaptchaService.verifyChallenge).
     captchaId?: string,
-    captchaAnswer?: string,
+    captchaAnswer?: number,
   ): Promise<
     | { requiresMfa: true; tempToken: string }
     | { requiresMfaSetup: true; tempToken: string }
@@ -798,7 +799,7 @@ export class AdminAuthService {
       targetType: 'AdminUser',
       targetId: admin.id,
       description: `Admin "${admin.fullName}" (${admin.adminId}) changed their own password`,
-      ipAddress,
+      ipAddress: ipAddress ?? 'unknown',
     });
 
     return { message: 'Password changed successfully. Please log in again.' };
@@ -865,7 +866,7 @@ export class AdminAuthService {
       targetType: 'AdminUser',
       targetId: admin.id,
       description: `Admin "${admin.fullName}" (${admin.adminId}) completed first password change`,
-      ipAddress,
+      ipAddress: ipAddress ?? 'unknown',
     });
 
     return { message: 'Password changed successfully. Please log in with your new password.' };

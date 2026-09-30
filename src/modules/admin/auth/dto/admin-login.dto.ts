@@ -1,4 +1,4 @@
-import { IsEmail, IsString, IsOptional, MinLength, MaxLength, Matches } from 'class-validator';
+import { IsEmail, IsString, IsNumber, IsOptional, Min, Max, MinLength, MaxLength, Matches } from 'class-validator';
 import { Transform } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -36,8 +36,10 @@ export class AdminLoginDto {
   @MaxLength(128)
   captchaId?: string;
 
-  @ApiPropertyOptional({ description: 'Captcha slider answer (required when CAPTCHA_REQUIRED)' })
+  @ApiPropertyOptional({ description: 'Captcha slider answer X (0-100; required when CAPTCHA_REQUIRED)' })
   @IsOptional()
-  @IsString()
-  captchaAnswer?: string;
+  @IsNumber()
+  @Min(0)
+  @Max(100)
+  captchaAnswer?: number;
 }

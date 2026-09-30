@@ -241,7 +241,11 @@ export class EscrowDisbursementService {
         // "/bank-accounts") + pushData agar tap push tidak jatuh ke fallback
         // /notifications.
         actionUrl: '/bank-accounts',
-        pushData: { type: 'ESCROW_HELD_NO_BANK', orderId: row.orderId },
+        pushData: {
+          type: 'ESCROW_HELD_NO_BANK',
+          // orderId nullable di model — hanya sertakan bila ada.
+          ...(row.orderId ? { orderId: row.orderId } : {}),
+        },
       });
       this.logger.warn(`Disbursement HELD_NO_BANK: seller=${row.sellerId} key=${row.idempotencyKey}`);
       return { outcome: 'HELD_NO_BANK', disbursementId: held.id };

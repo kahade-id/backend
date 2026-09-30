@@ -99,6 +99,21 @@ export interface DanaFinishNotify {
   externalStoreId?: string;
 }
 
+/**
+ * Payload Transfer to Bank Notify (webhook disbursement) yang sudah diparsing.
+ * Dok: DANA API "Transfer to Bank Notify" — DANA mengirim update status
+ * transfer bank ke endpoint merchant setelah pemrosesan bank selesai.
+ * latestTransactionStatus: 00=sukses, 01/02/03=pending, 04-07=gagal.
+ */
+export interface DanaDisbursementNotify {
+  originalPartnerReferenceNo: string;
+  originalReferenceNo: string;
+  /** "00"=sukses, "01"/"02"/"03"=pending, "04"-"07"=gagal. */
+  latestTransactionStatus: string;
+  transactionStatusDesc: string;
+  amountIdr: number | null;
+}
+
 /** Disbursement → rekening bank. */
 export interface DanaTransferToBankParams {
   partnerReferenceNo: string;

@@ -19,6 +19,7 @@ import {
   EvidenceDto,
   ExtendDeadlineDto,
   RevisionDto,
+  SubmitMilestoneDto,
   UpdateMilestoneDto,
 } from './dto/milestone.dto';
 
@@ -82,8 +83,12 @@ export class MilestonesController {
 
   @Post('milestones/:id/submit')
   @HttpCode(200)
-  submit(@Param('id') id: string, @CurrentUser('sub') userId: string) {
-    return this.milestones.submitMilestone(id, userId);
+  submit(
+    @Param('id') id: string,
+    @CurrentUser('sub') userId: string,
+    @Body() dto: SubmitMilestoneDto,
+  ) {
+    return this.milestones.submitMilestone(id, userId, dto?.note);
   }
 
   @Post('milestones/:id/evidence')

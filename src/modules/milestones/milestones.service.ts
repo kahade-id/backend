@@ -739,7 +739,7 @@ export class MilestonesService {
    * Seller menyerahkan hasil tahap (G180). Evidence tercatat sebagai bukti
    * (G181). Status → SUBMITTED, reviewDeadline = +3 hari.
    */
-  async submitMilestone(milestoneId: string, sellerId: string) {
+  async submitMilestone(milestoneId: string, sellerId: string, note?: string) {
     const milestone = await this.getMilestoneForParty(milestoneId, sellerId);
     if (sellerId !== milestone.order.sellerId) {
       throw new ForbiddenException({ code: 'FORBIDDEN', message: 'Hanya penjual yang dapat menyerahkan tahap.' });
@@ -766,6 +766,8 @@ export class MilestonesService {
       }
       await this.recordEvent(tx, milestoneId, MilestoneActorType.SELLER, MilestoneEventType.SUBMITTED, sellerId, {
         reviewDeadline: reviewDeadline.toISOString(),
+        // BFI-006: catatan hasil submit (opsional, aditif).
+        ...(note?.trim() ? { note: note.trim() } : {}),
       } as Prisma.InputJsonValue);
     });
     await this.notifyUser(

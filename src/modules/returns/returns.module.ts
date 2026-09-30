@@ -17,6 +17,7 @@ import { AuditLogModule } from '../../common/services/audit-log.module';
 // (di-export), bukan didaftarkan ulang.
 import { WalletModule } from '../wallet/wallet.module';
 import { NoWalletModule } from '../no-wallet/no-wallet.module';
+import { WalletModeModule } from '../wallet-mode/wallet-mode.module';
 import { ReturnsController } from './returns.controller';
 import { AdminReturnsController } from './admin-returns.controller';
 import { ReturnsService } from './returns.service';
@@ -25,7 +26,7 @@ import { ReturnsRefundService } from './returns-refund.service';
 import { ReturnsSlaService } from './returns-sla.service';
 
 @Module({
-  imports: [PrismaModule, RedisModule, UploadModule, AuditLogModule, WalletModule, NoWalletModule],
+  imports: [PrismaModule, RedisModule, UploadModule, AuditLogModule, WalletModule, NoWalletModule, WalletModeModule],
   controllers: [ReturnsController, AdminReturnsController],
   providers: [
     ReturnsService,

@@ -9,6 +9,7 @@ import { Injectable, Logger, NotFoundException, BadRequestException, Optional, S
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
 import { DanaDisbursementService } from '../payment/dana/dana-disbursement.service';
+import { BANK_CODE_TO_SNAP } from '../no-wallet/escrow-disbursement.service';
 import { PasskeyService } from '../auth/passkey.service';
 import { encryptAES, hmacSHA256, decryptAES } from '../../common/utils/crypto.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
@@ -193,11 +194,22 @@ export class BankAccountsService {
       (this.configService.get<boolean>('app.skipBankVerification') ?? false);
 
     if (!skipVerification) {
+      // E2E 2026-09-30: DANA bank-account-inquiry butuh kode bank SNAP numerik
+      // (mis. '014' untuk BCA), BUKAN enum Kahade ('BCA'). Tanpa mapping,
+      // DANA menolak dengan "Invalid Field Format additionalInfo.beneficiaryBankCode"
+      // dan SEMUA verifikasi rekening gagal. Fail-closed: kode tak terpetakan
+      // -> lewati verifikasi (rekening ditambah sebagai unverified).
+      const snapBankCode = BANK_CODE_TO_SNAP[bankCode];
+      if (!snapBankCode) {
+        this.logger.warn(
+          `Bank code ${bankCode} tidak terpetakan ke SNAP — verifikasi dilewati (unverified)`,
+        );
+      } else {
       try {
         const inquiry = await this.danaDisbursementService.bankAccountInquiry({
           partnerReferenceNo: `BANKINQ-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
           beneficiaryAccountNumber: normalizedAccountNumber,
-          beneficiaryBankCode: bankCode,
+          beneficiaryBankCode: snapBankCode,
         });
         const returnedAccountNumber = String(inquiry.accountNumber ?? '')
           .trim()
@@ -244,6 +256,7 @@ export class BankAccountsService {
         );
         isVerified = false;
       }
+      } // end else (snapBankCode tersedia)
     }
 
     const encryptedAccountNumber = await encryptAES(normalizedAccountNumber);

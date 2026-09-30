@@ -28,8 +28,14 @@ export class ReturnsNotifyService {
 
   constructor(private prisma: PrismaService) {}
 
-  /** Kirim ke satu user: persist baris + emit realtime/push (best-effort). */
-  async notifyStage(params: ReturnNotifyParams): Promise<void> {
+  /**
+   * Kirim ke satu user: persist baris + emit realtime/push (best-effort).
+   *
+   * BAI-098: mengembalikan `{ delivered }` — `false` bila persist baris
+   * notifikasi gagal. Kegagalan dicatat di sini (logger.error) dan pemanggil
+   * (aksi admin) wajib mencatatnya ke timeline agar terlihat di panel admin.
+   */
+  async notifyStage(params: ReturnNotifyParams): Promise<{ delivered: boolean }> {
     const type: NotificationType =
       RETURN_STAGE_NOTIFICATION_TYPE[params.stage] ?? NotificationType.SYSTEM_ANNOUNCEMENT;
     const data = {
@@ -51,7 +57,8 @@ export class ReturnsNotifyService {
         },
       });
     } catch (err) {
-      this.logger.warn(`notifyStage: gagal persist notifikasi ${params.stage}: ${(err as Error).message}`);
+      this.logger.error(`notifyStage: GAGAL persist notifikasi ${params.stage} ke user ${params.userId}: ${(err as Error).message}`);
+      return { delivered: false };
     }
     try {
       this.prisma.emitNotificationCreated({
@@ -63,9 +70,10 @@ export class ReturnsNotifyService {
     } catch (err) {
       this.logger.warn(`notifyStage: gagal emit ${params.stage}: ${(err as Error).message}`);
     }
+    return { delivered: true };
   }
 
-  /** Kirim ke buyer & seller sekaligus. */
+  /** Kirim ke buyer & seller sekaligus. `delivered` = true hanya bila keduanya persist. */
   async notifyBoth(
     buyerId: string,
     sellerId: string,
@@ -76,8 +84,9 @@ export class ReturnsNotifyService {
     sellerBody: string,
     returnDbId: string,
     returnPublicId: string,
-  ): Promise<void> {
-    await this.notifyStage({ userId: buyerId, stage, title: buyerTitle, body: buyerBody, returnDbId, returnPublicId });
-    await this.notifyStage({ userId: sellerId, stage, title: sellerTitle, body: sellerBody, returnDbId, returnPublicId });
+  ): Promise<{ delivered: boolean }> {
+    const b = await this.notifyStage({ userId: buyerId, stage, title: buyerTitle, body: buyerBody, returnDbId, returnPublicId });
+    const s = await this.notifyStage({ userId: sellerId, stage, title: sellerTitle, body: sellerBody, returnDbId, returnPublicId });
+    return { delivered: b.delivered && s.delivered };
   }
 }

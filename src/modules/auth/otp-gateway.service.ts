@@ -31,6 +31,10 @@ const DEFAULT_OTP_TEMPLATE = (code: string, method: OtpDeliveryMethod): string =
   `Berlaku 5 menit. Jangan bagikan kode ini kepada siapa pun, termasuk staff Kahade. ` +
   `(Kanal: ${method})`;
 
+/** BAI-102: fallback bila FONNTE_API_URL / FONNTE_COUNTRY_CODE belum diset. */
+const DEFAULT_FONNTE_ENDPOINT = 'https://api.fonnte.com/send';
+const DEFAULT_FONNTE_COUNTRY_CODE = '62';
+
 class MockOtpProvider implements OtpProviderAdapter {
   constructor(private readonly logger: Logger) {}
 
@@ -62,8 +66,6 @@ class MockOtpProvider implements OtpProviderAdapter {
 }
 
 class FonnteOtpProvider implements OtpProviderAdapter {
-  private readonly endpoint: string;
-
   constructor(
     private readonly logger: Logger,
     /**
@@ -72,11 +74,15 @@ class FonnteOtpProvider implements OtpProviderAdapter {
      * Mengembalikan undefined bila token belum dikonfigurasi.
      */
     private readonly tokenProvider: () => string | undefined,
-    endpoint?: string,
-    private readonly countryCode: string = '62',
-  ) {
-    this.endpoint = endpoint || 'https://api.fonnte.com/send';
-  }
+    /**
+     * BAI-102: endpoint & country code JUGA dibaca per-request via provider
+     * function (bukan di-capture di konstruktor) agar perubahan via admin
+     * panel berlaku tanpa restart — sama seperti token. Fallback ke default
+     * bila provider tidak diberikan / mengembalikan undefined.
+     */
+    private readonly endpointProvider?: () => string | undefined,
+    private readonly countryCodeProvider?: () => string | undefined,
+  ) {}
 
   // Fonnte's /send endpoint is WhatsApp-only — there is no SMS routing
   // parameter (see https://docs.fonnte.com/api-send-message/). The auth flow
@@ -119,15 +125,19 @@ class FonnteOtpProvider implements OtpProviderAdapter {
       this.logger.error('Fonnte token belum dikonfigurasi — pengiriman WhatsApp dibatalkan (fail-closed). Set FONNTE_API_TOKEN via admin panel (Pengaturan Operasional) atau .env.');
       return { success: false, error: 'OTP_PROVIDER_NOT_CONFIGURED' };
     }
+    // BAI-102: endpoint & country code dibaca per pengiriman (dinamis via
+    // admin panel, tanpa restart). Nilai panel yang kosong → fallback default.
+    const endpoint = this.endpointProvider?.() || DEFAULT_FONNTE_ENDPOINT;
+    const countryCode = this.countryCodeProvider?.() || DEFAULT_FONNTE_COUNTRY_CODE;
     const body = new URLSearchParams({
       target,
       message,
-      countryCode: this.countryCode,
+      countryCode,
     }).toString();
 
     let res: Response;
     try {
-      res = await fetch(this.endpoint, {
+      res = await fetch(endpoint, {
         method: 'POST',
         // SEC-201: jangan ikuti redirect — endpoint Fonnte yang tervalidasi
         // tidak boleh dialihkan (anti-SSRF via open redirect).
@@ -367,9 +377,12 @@ export class OtpGatewayService {
     switch (name) {
       case 'fonnte': {
         // OPS: token dibaca dinamis via OpsSettingsService (DB panel > .env).
-        // Boot TIDAK lagi throw bila token kosong — token bisa diprovisioning
-        // belakangan via admin panel. Pengiriman tanpa token gagal eksplisit
-        // (OTP_PROVIDER_NOT_CONFIGURED), bukan mock diam-diam.
+        // BAI-101: boot TIDAK throw bila token kosong — token bisa
+        // diprovisioning belakangan via admin panel. Produksi: pengiriman
+        // tanpa token gagal eksplisit (OTP_PROVIDER_NOT_CONFIGURED,
+        // fail-closed). Non-produksi: fallback ke mock agar alur auth tetap
+        // bisa diuji tanpa kredensial nyata (log error menegaskan OTP nyata
+        // TIDAK terkirim) — cabang ini TERCAPAI, bukan dead code (BAI-103).
         const hasToken = () => !!this.opsSettings.getSecret('FONNTE_API_TOKEN');
         if (!hasToken() && this.isProductionRuntime()) {
           this.logger.error(
@@ -383,11 +396,14 @@ export class OtpGatewayService {
           );
           return new MockOtpProvider(this.logger);
         }
+        // BAI-102: endpoint & country code dibaca per-request (dinamis),
+        // bukan di-capture di konstruktor — perubahan via panel berlaku
+        // tanpa restart. OpsSettingsService.get() sudah fallback ke .env.
         return new FonnteOtpProvider(
           this.logger,
           () => this.opsSettings.getSecret('FONNTE_API_TOKEN'),
-          this.opsSettings.get('FONNTE_API_URL') || this.config.get<string>('FONNTE_API_URL') || undefined,
-          this.opsSettings.get('FONNTE_COUNTRY_CODE') || this.config.get<string>('FONNTE_COUNTRY_CODE') || '62',
+          () => this.opsSettings.get('FONNTE_API_URL') || undefined,
+          () => this.opsSettings.get('FONNTE_COUNTRY_CODE') || undefined,
         );
       }
       case 'twilio': {

@@ -1,5 +1,5 @@
 import { AdminRoute } from '../../../common/decorators/public.decorator';
-import { Controller, Get, Post, Delete, Param, Body, Query, UseGuards, Req, Res, HttpStatus } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Delete, Param, Body, Query, UseGuards, Req, Res, HttpStatus } from '@nestjs/common';
 import { Response } from 'express';
 import { ParseIdPipe } from '../../../common/pipes/parse-id.pipe';
 import { ApiTags, ApiBearerAuth, ApiOperation, ApiResponse } from '@nestjs/swagger';
@@ -19,6 +19,8 @@ import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator
 import { WalletAdjustDto } from './dto/wallet-adjust.dto';
 import { DeletionLegalHoldDto } from './dto/deletion-legal-hold.dto';
 import { GrayRevokeDto } from './dto/gray-revoke.dto';
+import { UpdateUserDto } from './dto/update-user.dto';
+import { SuspendUserDto } from './dto/suspend-user.dto';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
 import { Idempotency } from '../../../common/decorators/idempotency.decorator';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
@@ -187,6 +189,76 @@ export class AdminUsersController {
   @ApiResponse({ status: 404, description: 'User not found.' })
   unbanUser(@Param('userId', ParseIdPipe) userId: string, @CurrentAdmin() admin: AdminJwtPayload, @Req() req: Request): Promise<object> {
     return this.service.unbanUser(userId, admin.sub, req.ip || 'unknown');
+  }
+
+  // BAI-071 — update terbatas profil user (whitelist field di UpdateUserDto).
+  // SENSITIF: SUPER_ADMIN saja + audit wajib. Pipe global menolak field di
+  // luar whitelist (422) sehingga permukaan mutasi tetap minimal.
+  @Patch(':userId')
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN')
+  @ApiOperation({
+    summary: 'Update terbatas data user',
+    description:
+      'Mengubah field whitelisted user (saat ini: accountType). ' +
+      'Hanya SUPER_ADMIN; setiap perubahan tercatat di audit log (before/after).',
+  })
+  @ApiResponse({ status: 200, description: 'User updated.' })
+  @ApiResponse({ status: 403, description: 'Insufficient admin role.' })
+  @ApiResponse({ status: 404, description: 'User not found.' })
+  @ApiResponse({ status: 422, description: 'Field di luar whitelist atau tidak ada perubahan.' })
+  updateUser(
+    @Param('userId', ParseIdPipe) userId: string,
+    @Body() dto: UpdateUserDto,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.updateUser(userId, dto, admin.sub, req.ip || 'unknown');
+  }
+
+  // BAI-074 — suspend ringan berbatas waktu (SUPER_ADMIN saja + audit wajib).
+  // Efek: sesi aktif dicabut (kick langsung) + login diblokir sampai
+  // kedaluwarsa; state di Redis dengan TTL sehingga auto-unsuspend.
+  @Post(':userId/suspend')
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN')
+  @ApiOperation({
+    summary: 'Suspend sementara user',
+    description:
+      'Penangguhan ringan berbatas waktu: sesi aktif dicabut dan login ' +
+      'diblokir sampai durasi habis (auto-unsuspend via TTL Redis). ' +
+      'Hanya SUPER_ADMIN; tercatat di audit log.',
+  })
+  @ApiResponse({ status: 200, description: 'User suspended.' })
+  @ApiResponse({ status: 403, description: 'Insufficient admin role.' })
+  @ApiResponse({ status: 404, description: 'User not found.' })
+  @ApiResponse({ status: 409, description: 'User sudah di-suspend atau di-ban.' })
+  suspendUser(
+    @Param('userId', ParseIdPipe) userId: string,
+    @Body() dto: SuspendUserDto,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.suspendUser(userId, dto, admin.sub, req.ip || 'unknown');
+  }
+
+  @Post(':userId/unsuspend')
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN')
+  @ApiOperation({
+    summary: 'Lepas suspend user',
+    description:
+      'Menghapus penangguhan sebelum waktunya. Sesi yang dicabut saat ' +
+      'suspend TIDAK dipulihkan — user harus login ulang.',
+  })
+  @ApiResponse({ status: 200, description: 'Suspension lifted.' })
+  @ApiResponse({ status: 404, description: 'User not found / tidak sedang di-suspend.' })
+  unsuspendUser(
+    @Param('userId', ParseIdPipe) userId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.unsuspendUser(userId, admin.sub, req.ip || 'unknown');
   }
 
   // Tier verified 3 tingkat (koreksi model 2026-09-26):

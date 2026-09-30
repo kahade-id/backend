@@ -9,6 +9,7 @@ import {
   BadRequestException,
   UnprocessableEntityException,
   UnauthorizedException,
+  Optional,
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { bcryptCompare } from '../../../common/utils/crypto.util';
@@ -39,6 +40,7 @@ import {
   WalletTransactionType,
 } from '@prisma/client';
 import { toSen } from '../../../common/utils/currency.util';
+import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
@@ -136,6 +138,9 @@ export class LedgerCorrectionService {
     private readonly prisma: PrismaService,
     private readonly walletTxSerial: WalletTxSerialService,
     private readonly redis: RedisService,
+    // BAI-054: opsional agar konstruksi manual di test lama tetap jalan;
+    // di-inject via WalletModeModule di runtime.
+    @Optional() private readonly walletMode?: WalletModeService,
   ) {}
 
   /**
@@ -423,6 +428,20 @@ export class LedgerCorrectionService {
     }
 
     // APPROVE → eksekusi mutasi atomik.
+    // BAI-054 (P2): di era tanpa-wallet (WALLET_ENABLED=false), saldo wallet
+    // BUKAN sumber kebenaran uang (aliran uang via DANA langsung) — koreksi
+    // ledger yang memutasi wallet.availableBalance akan memberi kesan masalah
+    // keuangan terselesaikan padahal uang aktual (di DANA) tidak tersentuh.
+    // Fail-closed: tolak APPROVE dengan 409 eksplisit.
+    if (dto.decision === 'APPROVE' && this.walletMode && !this.walletMode.isWalletEnabled()) {
+      throw new ConflictException({
+        code: ErrorCodes.LEDGER_CORRECTION_WALLET_DISABLED,
+        message:
+          'Koreksi ledger dinonaktifkan (409): wallet internal nonaktif (mode BI-safe). ' +
+          'Saldo wallet bukan sumber kebenaran uang — aliran dana aktual via DANA. ' +
+          'Koreksi finansial dilakukan via review disbursement DANA (GET /v1/admin/finance/disbursements).',
+      });
+    }
     LedgerCorrectionService.assertAmountWithinLimit(req.amountIdr);
     const amountSen = BigInt(req.amountSen);
     const isCredit = req.type === 'CREDIT';

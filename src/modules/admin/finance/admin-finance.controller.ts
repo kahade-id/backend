@@ -21,6 +21,7 @@ import { RequestCorrectionDto, DecideCorrectionDto, CorrectionsQueryDto } from '
 import { WithdrawalApproveDto, WithdrawalRejectDto } from './dto/withdrawal-action.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
 import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
+import { WalletKillSwitchGuard } from '../../../modules/wallet-mode/wallet-kill-switch.guard';
 import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
@@ -90,14 +91,17 @@ export class AdminFinanceController {
     return this.service.listPendingWithdrawals(query.page, query.limit, adminId, req.ip || 'unknown');
   }
 
-  // B-02 (audit-fix): Withdrawal approve/reject MUST be idempotent — a
-  // network-retry / double-tap on "Approve" must not produce two Iris payouts.
+  // BAI-041 (P0): jalur payout legacy DI-SUNSET. Service melempar 410 GONE
+  // (IRIS_PAYOUT_SUNSET); WalletKillSwitchGuard sebagai pertahanan lapis kedua
+  // agar endpoint ini tidak bisa dipakai saat wallet nonaktif (era DANA).
+  // Pencairan dana kini via EscrowDisbursement — lihat
+  // GET /v1/admin/finance/disbursements.
   @Post('withdrawals/:txId/approve')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(WalletKillSwitchGuard, UserThrottleGuard)
   @Idempotency()
   @Throttle({ default: { ttl: 60000, limit: 10 } })
-  @ApiOperation({ summary: 'Approve pending withdrawal (dual control)', description: 'ADM-205: records this admin\'s approval. The Iris payout is executed ONLY after the required quorum of DIFFERENT admins approve (default: 2 for all amounts — fail-closed; configurable via SystemConfig withdrawal.dual_approval_threshold_idr). First approval returns AWAITING_SECOND_APPROVAL without touching the payout. Requires Idempotency-Key.' })
-  @ApiResponse({ status: 200, description: 'Withdrawal approved.' })
+  @ApiOperation({ summary: 'Approve pending withdrawal (legacy — DINONAKTIFKAN)', description: 'BAI-041: jalur payout Midtrans Iris sudah di-sunset (410 GONE). Endpoint ini TIDAK LAGI mengeksekusi payout. Pencairan dana era DANA tercatat di EscrowDisbursement — lihat GET /v1/admin/finance/disbursements. Requires Idempotency-Key.' })
+  @ApiResponse({ status: 410, description: 'Jalur payout legacy dinonaktifkan (IRIS_PAYOUT_SUNSET).' })
   @ApiResponse({ status: 404, description: 'Transaction not found.' })
   approveWithdrawal(@Param('txId', ParseIdPipe) txId: string, @Body() dto: WithdrawalApproveDto, @CurrentAdmin('sub') adminId: string, @Req() req: Request): Promise<object> {
     return this.service.approveWithdrawal(txId, dto, adminId, req.ip || 'unknown');
@@ -114,14 +118,16 @@ export class AdminFinanceController {
     return this.service.rejectWithdrawal(txId, dto, adminId, req.ip || 'unknown');
   }
 
-  // ADM-213: recheck manual — query status provider, BUKAN retry payout.
-  // network-retry / double-tap must not re-query-spam the provider nor mutate twice.
+  // BAI-042 (P0): recheck legacy DINONAKTIFKAN (501) — implementasi lama
+  // men-query Midtrans Iris (provider yang SALAH untuk payout DANA).
+  // Untuk disbursement DANA gunakan
+  // POST /v1/admin/finance/disbursements/:id/recheck.
   @Post('withdrawals/:txId/recheck')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(WalletKillSwitchGuard, UserThrottleGuard)
   @Idempotency()
   @Throttle({ default: { ttl: 60000, limit: 10 } })
-  @ApiOperation({ summary: 'Recheck PROCESSING withdrawal against payout provider', description: 'ADM-213: queries Midtrans Iris payout status for ONE stuck PROCESSING withdrawal and applies the same safe transitions as the automated reconciler (completed/processed -> SUCCESS, failed/rejected -> FAILED + refund; otherwise stays PROCESSING, no money mutation). NEVER submits a new payout. Requires Idempotency-Key.' })
-  @ApiResponse({ status: 200, description: 'Recheck result (providerStatus + outcome).' })
+  @ApiOperation({ summary: 'Recheck withdrawal legacy (DINONAKTIFKAN)', description: 'BAI-042: 501 LEGACY_WITHDRAWAL_RECHECK_DISABLED — jalur ini men-query Midtrans Iris, bukan DANA. Untuk payout DANA gunakan POST /v1/admin/finance/disbursements/:id/recheck (query status DANA yang aman, tanpa transfer baru). Requires Idempotency-Key.' })
+  @ApiResponse({ status: 501, description: 'Recheck legacy dinonaktifkan.' })
   @ApiResponse({ status: 404, description: 'Transaction not found.' })
   @ApiResponse({ status: 409, description: 'Withdrawal is not PROCESSING.' })
   recheckWithdrawal(@Param('txId', ParseIdPipe) txId: string, @CurrentAdmin('sub') adminId: string, @Req() req: Request): Promise<object> {
@@ -129,9 +135,9 @@ export class AdminFinanceController {
   }
 
   @Get('escrow-summary')
-  @ApiOperation({ summary: 'Active escrow totals', description: 'Returns aggregated escrow balance totals across all wallets.' })
+  @ApiOperation({ summary: 'Active escrow totals', description: 'BAI-047: di era tanpa-wallet (WALLET_ENABLED=false) total dihitung dari order aktif (source=ORDER_BASED, dana dipegang DANA); bila wallet aktif dari wallet.escrowBalance (source=WALLET_BASED). UI wajib melabeli sumbernya.' })
   @ApiResponse({ status: 200, description: 'Escrow summary returned.' })
-  getEscrowSummary(): Promise<{ totalEscrowBalance: number; walletsWithEscrow: number; activeEscrowOrders: number }> {
+  getEscrowSummary(): Promise<{ totalEscrowBalance: number; walletsWithEscrow: number; activeEscrowOrders: number; source: 'WALLET_BASED' | 'ORDER_BASED' }> {
     return this.service.getEscrowSummary();
   }
 

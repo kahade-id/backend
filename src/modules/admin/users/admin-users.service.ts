@@ -8,7 +8,7 @@ import { Prisma, AuditAction, OrderStatus, WalletTransactionType, WalletTransact
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
-import { SESSION_REVOKED_KEY } from '../../../common/constants/redis-keys';
+import { SESSION_REVOKED_KEY, USER_SUSPENDED_KEY } from '../../../common/constants/redis-keys';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { WalletAdjustDto, WalletAdjustType } from './dto/wallet-adjust.dto';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
@@ -27,10 +27,12 @@ import { DashboardService } from '../dashboard/dashboard.service';
 import { UploadService } from '../../upload/upload.service';
 import { LocalStorageService } from '../../upload/local-storage.service';
 import { encryptAES } from '../../../common/utils/crypto.util';
-import { applyUserMask, PII_UNMASKED_ROLES } from '../../../common/maskPiiByRole';
+import { applyUserMask, PII_UNMASKED_ROLES, maskIp } from '../../../common/maskPiiByRole';
 import { walletTxDirection } from '../../../common/utils/wallet-direction.util';
 import { UserExportQueryDto } from './dto/user-export-query.dto';
 import { ModerationEventsQueryDto, ModerationEventType } from './dto/moderation-events-query.dto';
+import { UpdateUserDto } from './dto/update-user.dto';
+import { SuspendUserDto } from './dto/suspend-user.dto';
 
 @Injectable()
 export class AdminUsersService {
@@ -137,6 +139,10 @@ export class AdminUsersService {
     if (status === 'active') where.isBanned = false;
     if (status === 'kyc_approved') where.kycStatus = 'APPROVED';
     if (status === 'kyc_pending') where.kycStatus = 'PENDING';
+    // BAI-070: segmen KYC lain yang sebelumnya tak terjangkau filter.
+    if (status === 'kyc_rejected') where.kycStatus = 'REJECTED';
+    if (status === 'kyc_revoked') where.kycStatus = 'REVOKED';
+    if (status === 'kyc_unverified') where.kycStatus = 'UNVERIFIED';
     // Section 6: antrean moderasi — user yang terflag agregasi laporan
     // (>= 3 reporter berbeda dalam 24 jam). Flag ini sinyal saja, bukan sanksi.
     if (status === 'flagged') where.flaggedForReview = true;
@@ -208,10 +214,18 @@ export class AdminUsersService {
       email: userData.email,
       phoneNumber: decryptedPhone,
     });
+    // BAI-076: lastLoginIp (data lokasi-ish sensitif) di-mask untuk role
+    // non-SUPER_ADMIN — konsisten dengan email/nomor HP.
+    const isUnmasked = !!adminRole && PII_UNMASKED_ROLES.includes(adminRole);
+    // BAI-074: status suspend ringan (state Redis, auto-unsuspend via TTL) —
+    // dipakai UI untuk menampilkan tombol Tangguhkan/Batalkan yang benar.
+    const suspended = await this.isUserSuspended(user.id);
     return {
       ...userData,
       email: maskedPii.email,
       phoneNumber: maskedPii.phoneNumber,
+      lastLoginIp: isUnmasked ? userData.lastLoginIp : maskIp(userData.lastLoginIp),
+      suspended,
       followersCount: _count.followers,
       followingCount: _count.following,
       blockedUsersCount: _count.blockedUsers,
@@ -282,6 +296,63 @@ export class AdminUsersService {
     return updated;
   }
 
+  /**
+   * BAI-071 — update terbatas profil user (SUPER_ADMIN, whitelist field).
+   *
+   * SENSITIF: hanya field yang dideklarasikan di `UpdateUserDto` yang
+   * diproses (pipe global menolak field lain — forbidNonWhitelisted).
+   * Setiap perubahan dicatat di audit log dengan before/after.
+   * Perubahan accountType → invalidate badge agar badge biru/abu sinkron.
+   */
+  async updateUser(
+    userId: string,
+    dto: UpdateUserDto,
+    adminId: string,
+    ipAddress: string = 'internal',
+  ): Promise<object> {
+    const user = await this.prisma.user.findFirst({
+      where: { OR: [{ id: userId }, { userId }], deletedAt: null },
+      select: { id: true, userId: true, accountType: true },
+    });
+    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+
+    const changes: Record<string, { before: unknown; after: unknown }> = {};
+    const data: Prisma.UserUpdateInput = {};
+    if (dto.accountType !== undefined && dto.accountType !== user.accountType) {
+      data.accountType = dto.accountType;
+      changes.accountType = { before: user.accountType, after: dto.accountType };
+    }
+    if (Object.keys(changes).length === 0) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'No changes to apply',
+      });
+    }
+
+    const updated = await this.prisma.user.update({
+      where: { id: user.id },
+      data,
+      select: { userId: true, accountType: true },
+    });
+
+    // Badge publik bisa berubah mengikuti accountType (mis. BUSINESS_VERIFIED
+    // mensyaratkan accountType=BUSINESS) — sinkronkan segera.
+    await this.verificationBadge.invalidate(user.id);
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.USER_UPDATED,
+      targetType: 'User',
+      targetId: user.id,
+      description: `Admin updated user ${user.id}: ${Object.keys(changes).join(', ')}`,
+      before: Object.fromEntries(Object.entries(changes).map(([k, v]) => [k, v.before])),
+      after: Object.fromEntries(Object.entries(changes).map(([k, v]) => [k, v.after])),
+      ipAddress,
+    });
+
+    return updated;
+  }
+
   async unbanUser(userId: string, adminId: string, ipAddress: string = 'internal'): Promise<object> {
     const user = await this.prisma.user.findFirst({
       where: { OR: [{ id: userId }, { userId }], deletedAt: null },
@@ -315,6 +386,139 @@ export class AdminUsersService {
     await this.dashboard.invalidateSummaryCache();
 
     return result;
+  }
+
+  /**
+   * BAI-074 — suspend ringan berbatas waktu (SUPER_ADMIN + audit wajib).
+   *
+   * Beda dari ban: suspend bersifat sementara dan ringan.
+   * - State disimpan di Redis dengan TTL = durasi suspend → auto-unsuspend
+   *   tanpa cron dan tanpa kolom DB baru (additive-only).
+   * - Sesi aktif dicabut saat suspend (kick langsung), pola sama seperti ban:
+   *   `userSession` di-revoke + `SESSION_REVOKED_KEY` agar access token lama
+   *   langsung mati. Sesi yang dicabut TIDAK dipulihkan saat unsuspend —
+   *   user harus login ulang.
+   * - Login diblokir selama suspend via `USER_SUSPENDED_KEY` yang dicek di
+   *   jalur login AuthService (`assertNotSuspended`).
+   */
+  async suspendUser(
+    userId: string,
+    dto: SuspendUserDto,
+    adminId: string,
+    ipAddress: string = 'internal',
+  ): Promise<object> {
+    const user = await this.prisma.user.findFirst({
+      where: { OR: [{ id: userId }, { userId }], deletedAt: null },
+      select: { id: true, userId: true, isBanned: true },
+    });
+    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    if (user.isBanned) {
+      throw new ConflictException({
+        code: ErrorCodes.USER_ALREADY_BANNED,
+        message: 'User is banned; unban first before suspending',
+      });
+    }
+
+    const suspendKey = USER_SUSPENDED_KEY(user.id);
+    const alreadySuspended = await this.redis.exists(suspendKey);
+    if (alreadySuspended) {
+      throw new ConflictException({
+        code: ErrorCodes.USER_ALREADY_SUSPENDED,
+        message: 'User is already suspended',
+      });
+    }
+
+    const reason = dto.reason.trim();
+    const ttlSeconds = dto.durationHours * 3600;
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + ttlSeconds * 1000);
+
+    // Kick: cabut semua sesi aktif (pola sama seperti banUser).
+    const activeSessions = await this.prisma.userSession.findMany({
+      where: { userId: user.id, isRevoked: false },
+      select: { id: true },
+    });
+    if (activeSessions.length > 0) {
+      await this.prisma.userSession.updateMany({
+        where: { userId: user.id, isRevoked: false },
+        data: { isRevoked: true, revokedAt: now, revokedReason: 'user_suspended' },
+      });
+      await Promise.all(
+        activeSessions.map((s) =>
+          this.redis.setex(SESSION_REVOKED_KEY(s.id), this.accessTokenTtlSeconds, 'revoked'),
+        ),
+      );
+    }
+
+    await this.redis.setex(
+      suspendKey,
+      ttlSeconds,
+      JSON.stringify({ reason, adminId, suspendedAt: now.toISOString(), expiresAt: expiresAt.toISOString() }),
+    );
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.USER_SUSPENDED,
+      targetType: 'User',
+      targetId: user.id,
+      description: `Admin suspended user ${user.id} for ${dto.durationHours}h. Reason: ${reason}`,
+      before: { suspended: false },
+      after: { suspended: true, reason, durationHours: dto.durationHours, expiresAt: expiresAt.toISOString() },
+      ipAddress,
+    });
+
+    return {
+      userId: user.userId,
+      suspended: true,
+      reason,
+      durationHours: dto.durationHours,
+      suspendedAt: now.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+      sessionsRevoked: activeSessions.length,
+    };
+  }
+
+  /** BAI-074 — lepas suspend sebelum waktunya. Sesi yang dicabut saat
+   * suspend TIDAK dipulihkan — user harus login ulang. */
+  async unsuspendUser(
+    userId: string,
+    adminId: string,
+    ipAddress: string = 'internal',
+  ): Promise<object> {
+    const user = await this.prisma.user.findFirst({
+      where: { OR: [{ id: userId }, { userId }], deletedAt: null },
+      select: { id: true, userId: true },
+    });
+    if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+
+    const suspendKey = USER_SUSPENDED_KEY(user.id);
+    const suspended = await this.redis.exists(suspendKey);
+    if (!suspended) {
+      throw new NotFoundException({
+        code: ErrorCodes.USER_NOT_SUSPENDED,
+        message: 'User is not currently suspended',
+      });
+    }
+
+    await this.redis.del(suspendKey);
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.USER_ACTIVATED,
+      targetType: 'User',
+      targetId: user.id,
+      description: `Admin lifted suspension for user ${user.id} before expiry`,
+      before: { suspended: true },
+      after: { suspended: false },
+      ipAddress,
+    });
+
+    return { userId: user.userId, suspended: false };
+  }
+
+  /** BAI-074 — dipakai jalur login untuk memblokir akun yang di-suspend. */
+  async isUserSuspended(userId: string): Promise<boolean> {
+    return (await this.redis.exists(USER_SUSPENDED_KEY(userId))) > 0;
   }
 
   /**
@@ -978,6 +1182,13 @@ export class AdminUsersService {
     const actorFilter = query.actor;
     const from = query.from ? new Date(query.from) : undefined;
     const to = query.to ? new Date(query.to) : undefined;
+    // BAI-061/BAI-073: paginasi nyata — page/limit dari DTO dipatuhi, bukan
+    // selalu 200 pertama. limit di-cap 100 oleh PaginationDto.
+    const page = query.page ?? 1;
+    const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
+    const limit = query.limit ?? 20;
+    const safeLimit = Number.isFinite(limit) ? Math.min(100, Math.max(1, Math.floor(limit))) : 20;
+    const skip = (safePage - 1) * safeLimit;
 
     const inRange = (d: Date): boolean =>
       (!from || d >= from) && (!to || d <= to);
@@ -1129,12 +1340,13 @@ export class AdminUsersService {
     events.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
     // ADM-005: filter sumber event (system/admin) — diterapkan setelah merge.
     const kindFiltered = kindFilter ? events.filter((e) => kindOk(e.source)) : events;
-    const limited = kindFiltered.slice(0, AdminUsersService.MODERATION_TIMELINE_LIMIT);
-    return {
-      data: limited,
-      total: kindFiltered.length,
-      hasMore: kindFiltered.length > limited.length,
-    };
+    // BAI-061/BAI-073: paginasi nyata atas timeline gabungan. Sumber
+    // di-fetch bounded (audit ≤200 terbaru, KYC ≤50, laporan ≤50) sehingga
+    // total mencerminkan seluruh event dalam batas tersebut; halaman >1
+    // mengembalikan data yang berbeda dari halaman 1.
+    const total = kindFiltered.length;
+    const pageData = kindFiltered.slice(skip, skip + safeLimit);
+    return createPaginatedResponse(pageData, total, safePage, safeLimit);
   }
 
   // ══════════════════════════════════════════════════════════════

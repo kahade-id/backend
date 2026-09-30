@@ -1,8 +1,11 @@
 import { IsOptional, IsString, IsIn, IsInt, Min, Max, IsBoolean } from 'class-validator';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { PaginationDto } from '../../../../common/dto/pagination.dto';
 import { QA_MODERATION_REASONS, QA_REPORT_TARGETS } from '../qa-moderation.types';
+// BAI-034 (audit integrasi 2026-09-30): Transform boolean ketat — JANGAN
+// pakai `@Type(() => Boolean)` (Boolean("false") === true).
+import { strictBooleanTransform } from '../../showcase-reports/dto/moderation-queue-query.dto';
 
 export class QaModerationQueueQueryDto extends PaginationDto {
   @ApiPropertyOptional({
@@ -35,7 +38,8 @@ export class QaModerationQueueQueryDto extends PaginationDto {
 
   @ApiPropertyOptional({ description: 'true = hanya item yang punya laporan PENDING.' })
   @IsOptional()
-  @Type(() => Boolean)
+  // BAI-034 — Transform ketat: "?reportedOnly=false" tidak boleh jadi true.
+  @Transform(strictBooleanTransform)
   @IsBoolean()
   reportedOnly?: boolean;
 
@@ -43,7 +47,8 @@ export class QaModerationQueueQueryDto extends PaginationDto {
     description: 'true = hanya item yang tersembunyi (owner maupun moderator).',
   })
   @IsOptional()
-  @Type(() => Boolean)
+  // BAI-034 — Transform ketat: "?hiddenOnly=false" tidak boleh jadi true.
+  @Transform(strictBooleanTransform)
   @IsBoolean()
   hiddenOnly?: boolean;
 
@@ -51,7 +56,8 @@ export class QaModerationQueueQueryDto extends PaginationDto {
     description: 'true = hanya kandidat spam lintas profil (heuristik G440).',
   })
   @IsOptional()
-  @Type(() => Boolean)
+  // BAI-034 — Transform ketat: "?spamOnly=false" tidak boleh jadi true.
+  @Transform(strictBooleanTransform)
   @IsBoolean()
   spamOnly?: boolean;
 

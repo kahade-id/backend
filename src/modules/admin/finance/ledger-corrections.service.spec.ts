@@ -195,6 +195,47 @@ describe('LedgerCorrectionService — idempotency & dual approval', () => {
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
+  it('BAI-054: APPROVE ditolak 409 LEDGER_CORRECTION_WALLET_DISABLED bila wallet nonaktif', async () => {
+    prisma.adminAuditLog.findFirst
+      .mockResolvedValueOnce(requestRow()) // request row
+      .mockResolvedValueOnce(null); // no decision yet
+    const walletMode = { isWalletEnabled: () => false };
+    const svc = new LedgerCorrectionService(
+      prisma as never,
+      { getNext: jest.fn().mockResolvedValue(42) } as never,
+      redis as never,
+      walletMode as never,
+    );
+    const err = await svc
+      .decideCorrection('req-1', 'admin-other', { decision: 'APPROVE', reauthPassword: 'password123' }, '127.0.0.1')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConflictException);
+    expect((err as { response?: { code?: string } }).response?.code).toBe('LEDGER_CORRECTION_WALLET_DISABLED');
+    // Fail-closed: tidak ada decision yang dicatat.
+    expect(prisma.adminAuditLog.create).not.toHaveBeenCalled();
+  });
+
+  it('BAI-054: APPROVE tetap jalan bila wallet aktif (guard tidak memblokir)', async () => {
+    prisma.adminAuditLog.findFirst
+      .mockResolvedValueOnce(requestRow()) // request row
+      .mockResolvedValueOnce(null); // no decision yet
+    const walletMode = { isWalletEnabled: () => true };
+    const svc = new LedgerCorrectionService(
+      prisma as never,
+      { getNext: jest.fn().mockResolvedValue(42) } as never,
+      redis as never,
+      walletMode as never,
+    );
+    // Tidak boleh melempar LEDGER_CORRECTION_WALLET_DISABLED — boleh gagal
+    // di langkah berikutnya (mock), tapi bukan di guard wallet.
+    const err = await svc
+      .decideCorrection('req-1', 'admin-other', { decision: 'APPROVE', reauthPassword: 'password123' }, '127.0.0.1')
+      .catch((e: unknown) => e);
+    if (err instanceof ConflictException) {
+      expect((err as unknown as { response?: { code?: string } }).response?.code).not.toBe('LEDGER_CORRECTION_WALLET_DISABLED');
+    }
+  });
+
   it('REJECT oleh admin berbeda mencatat decision tanpa mutasi wallet', async () => {
     prisma.adminAuditLog.findFirst
       .mockResolvedValueOnce(requestRow())

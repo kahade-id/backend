@@ -22,6 +22,10 @@ export class BannersService {
         linkUrl: dto.linkUrl ?? null,
         position: dto.position ?? 'home_top',
         sortOrder: dto.sortOrder ?? 0,
+        // BAI-029 (audit integrasi 2026-09-30) — hormati checkbox "Aktif" admin.
+        // DTO sudah menerima isActive, tapi service mengabaikannya sehingga
+        // banner selalu langsung live (default model true).
+        isActive: dto.isActive ?? true,
         startsAt: dto.startsAt ? new Date(dto.startsAt) : null,
         endsAt: dto.endsAt ? new Date(dto.endsAt) : null,
         createdBy: adminId,
@@ -29,10 +33,18 @@ export class BannersService {
     });
   }
 
-  async listAdminBanners(page = 1, limit = 20): Promise<PaginatedResponse<Record<string, unknown>>> {
+  async listAdminBanners(
+    page = 1,
+    limit = 20,
+    filters: { isActive?: boolean; q?: string } = {},
+  ): Promise<PaginatedResponse<Record<string, unknown>>> {
+    // BAI-013: filter isActive & q yang dikirim admin — sebelumnya diabaikan.
+    const where: Record<string, unknown> = {};
+    if (filters.isActive !== undefined) where.isActive = filters.isActive;
+    if (filters.q) where.title = { contains: filters.q, mode: 'insensitive' };
     const [rows, total] = await Promise.all([
-      this.prisma.banner.findMany({ orderBy: [{ sortOrder: 'asc' }, { createdAt: 'desc' }], skip: (page - 1) * limit, take: limit }),
-      this.prisma.banner.count(),
+      this.prisma.banner.findMany({ where, orderBy: [{ sortOrder: 'asc' }, { createdAt: 'desc' }], skip: (page - 1) * limit, take: limit }),
+      this.prisma.banner.count({ where }),
     ]);
     return createPaginatedResponse(rows, total, page, limit);
   }

@@ -241,7 +241,12 @@ export class AdminQaModerationController {
 
   @Post('reports/:reportId/resolve')
   @UseGuards(UserThrottleGuard)
-  @ApiOperation({ summary: 'Resolve laporan (DISMISSED / ACTION_TAKEN)' })
+  @ApiOperation({
+    summary: 'Resolve laporan (DISMISSED / ACTION_TAKEN)',
+    description:
+      'BAI-027 — catatan `note` opsional disimpan ke audit trail ' +
+      '(event REPORT_RESOLVED + admin_audit_logs), bukan dibuang.',
+  })
   resolveReport(
     @CurrentAdmin('sub') adminId: string,
     @Param('reportId', ParseIdPipe) reportId: string,

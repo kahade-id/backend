@@ -1,10 +1,22 @@
-import { IsIn, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
+import { Type, Transform } from 'class-transformer';
 
 /**
  * G411 — antrean prioritas moderasi: filter risiko + badge overdue.
+ *
+ * BAI-034 (audit integrasi 2026-09-30): JANGAN pakai `@Type(() => Boolean)`
+ * untuk flag query — class-transformer mengubah string "false" menjadi
+ * `true` (Boolean("false") === true), sehingga `?overdueOnly=false` memfilter
+ * SEOLAH true. Pakai Transform ketat di bawah: hanya string "true"/"false"
+ * (atau boolean asli) yang diterima; nilai lain diteruskan apa adanya agar
+ * @IsBoolean menolaknya dengan 400 yang jelas.
  */
+export function strictBooleanTransform({ value }: { value: unknown }): unknown {
+  if (value === 'true' || value === true) return true;
+  if (value === 'false' || value === false) return false;
+  return value;
+}
 export class ModerationQueueQueryDto {
   @ApiPropertyOptional({ description: 'Halaman', default: 1 })
   @Type(() => Number)
@@ -29,8 +41,10 @@ export class ModerationQueueQueryDto {
   riskTier?: string;
 
   @ApiPropertyOptional({ description: 'Hanya yang melewati SLA', default: false })
-  @Type(() => Boolean)
+  // BAI-034 — lihat strictBooleanTransform di atas.
+  @Transform(strictBooleanTransform)
   @IsOptional()
+  @IsBoolean()
   overdueOnly?: boolean;
 
   @ApiPropertyOptional({ description: 'Urutkan: risk | oldest | newest', default: 'risk' })

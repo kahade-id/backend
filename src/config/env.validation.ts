@@ -93,12 +93,42 @@ function optionalEnum<T extends string>(
 }
 
 /**
+ * BAI-101 — Peringatan lunak untuk variabel yang BOLEH kosong saat boot karena
+ * bisa diprovisioning belakangan via admin panel (Pengaturan Operasional).
+ * Mengembalikan daftar pesan warning (tanpa throw).
+ *
+ * ATURAN KERAS: hanya variabel yang terdaftar di MANAGEABLE_SETTINGS
+ * (ops-settings.registry.ts) yang boleh masuk sini. Boot secret & kredensial
+ * yang tidak manageable via panel TETAP hard error di validateEnv.
+ */
+export function collectEnvWarnings(env: Env): string[] {
+  const warnings: string[] = []
+  const otpProvider = (env['OTP_PROVIDER'] || 'mock').toLowerCase()
+  if (otpProvider === 'fonnte' && !env['FONNTE_API_TOKEN']) {
+    warnings.push(
+      'FONNTE_API_TOKEN is not set in process.env while OTP_PROVIDER=fonnte — ' +
+        'boot tetap lanjut; token bisa diprovisioning belakangan via admin panel ' +
+        '(Pengaturan Operasional). Sampai token diset, pengiriman WhatsApp GAGAL ' +
+        'eksplisit (fail-closed, OTP_PROVIDER_NOT_CONFIGURED).',
+    )
+  }
+  return warnings
+}
+
+/**
  * Validate function passed to ConfigModule.forRoot({ validate }).
  * Receives the raw process.env and returns a typed config object.
  * Throws if any critical variable is missing or invalid.
+ *
+ * BAI-101: checks for values that CAN be provisioned later via the admin
+ * panel (Pengaturan Operasional) only produce warnings — they never block
+ * boot. Everything else still throws (fail-closed boot is preserved).
  */
 export function validateEnv(env: Env): Env {
   const errors: ValidationError[] = []
+  // BAI-101: peringatan lunak untuk nilai yang bisa diprovisioning belakangan
+  // via admin panel — tidak menggagalkan boot, hanya dicatat ke console.
+  const warnings = collectEnvWarnings(env)
   // ── NODE ENVIRONMENT ─────────────────────────────────────────────────────────
   // Validate the raw environment before using it for any production/staging gate.
   // Otherwise an unknown value (for example NODE_ENV=prod) bypasses every
@@ -241,12 +271,15 @@ export function validateEnv(env: Env): Env {
       message: 'OTP_PROVIDER must be set to a real provider (e.g. "fonnte" or "twilio") in production. Refusing to start with the mock gateway in production — users would never receive OTPs.',
     })
   }
-  if (otpProvider === 'fonnte' && !env['FONNTE_API_TOKEN']) {
-    errors.push({
-      key: 'FONNTE_API_TOKEN',
-      message: 'FONNTE_API_TOKEN is required when OTP_PROVIDER=fonnte.',
-    })
-  }
+  // ── FONNTE TOKEN — VALIDASI LUNAK (BAI-101) ──────────────────────────────────
+  // FONNTE_API_TOKEN bisa diprovisioning belakangan via admin panel
+  // (Pengaturan Operasional), jadi ketiadaannya di .env TIDAK menggagalkan
+  // boot — hanya warning via collectEnvWarnings() di bawah. Sampai token
+  // diset, pengiriman WhatsApp GAGAL eksplisit (fail-closed,
+  // OTP_PROVIDER_NOT_CONFIGURED), bukan pengiriman diam-diam.
+  // CATATAN: pengecualian ini disengaja dan TERBATAS pada token yang memang
+  // manageable via panel. Kredensial Twilio tetap HARD ERROR karena tidak
+  // bisa diprovisioning via panel.
   if (otpProvider === 'twilio') {
     if (!env['TWILIO_ACCOUNT_SID']) {
       errors.push({ key: 'TWILIO_ACCOUNT_SID', message: 'TWILIO_ACCOUNT_SID is required when OTP_PROVIDER=twilio.' })
@@ -367,6 +400,13 @@ export function validateEnv(env: Env): Env {
     throw new Error(
       `Environment validation failed — fix the following variables before starting:\n${lines.join('\n')}`,
     )
+  }
+
+  // BAI-101: warning lunak dicatat ke console (validate() berjalan sebelum
+  // logger Nest tersedia, jadi console.warn adalah jalurnya).
+  for (const warning of warnings) {
+    // eslint-disable-next-line no-console
+    console.warn(`[env] WARNING: ${warning}`)
   }
 
   return env

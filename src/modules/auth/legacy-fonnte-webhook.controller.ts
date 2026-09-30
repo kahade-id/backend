@@ -31,15 +31,14 @@ export class LegacyFonnteWebhookController {
     @Body() body: Record<string, unknown>,
     @Req() req: Request,
   ): Promise<{ ok: true }> {
-    const q = req.query as Record<string, unknown> | undefined;
-    // SEC-003: urutan preferensi header > body > query. Query param didukung
-    // untuk kompatibilitas (dashboard Fonnte menempelkan secret di URL), tapi
-    // TIDAK disarankan karena full URL tercatat di nginx access log.
+    // BAI-116: secret HANYA via header x-fonnte-secret atau field body
+    // webhookSecret. Query param DITOLAK (fail-closed) — full URL tercatat di
+    // nginx access log (SEC-003), sehingga secret di query = bocor ke log.
+    // Dashboard Fonnte yang masih menempel secret di URL akan 401: pindahkan
+    // secret ke header/body.
     const secret =
       (req.headers['x-fonnte-secret'] as string | undefined) ??
-      (typeof body.webhookSecret === 'string' ? body.webhookSecret : undefined) ??
-      (typeof q?.webhookSecret === 'string' ? (q.webhookSecret as string) : undefined) ??
-      (typeof q?.secret === 'string' ? (q.secret as string) : undefined);
+      (typeof body.webhookSecret === 'string' ? body.webhookSecret : undefined);
     if (!this.otpTriggerService.verifyWebhookSecret(secret)) {
       throw new UnauthorizedException({
         code: ErrorCodes.UNAUTHORIZED,

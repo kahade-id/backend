@@ -17,6 +17,8 @@ import { AuditLogService } from '../../../common/services/audit-log.service';
 import { ReturnsService, RETURN_DUPLICATE } from '../returns.service';
 import { ReturnsNotifyService } from '../returns-notify.service';
 import { ReturnsRefundService } from '../returns-refund.service';
+import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
+import { DanaDirectRefundService } from '../../no-wallet/dana-direct-refund.service';
 import {
   assertLegalReturnTransition,
   isLegalReturnTransition,
@@ -87,6 +89,8 @@ describe('ReturnsService (GAP-D retur)', () => {
   let auditLog: { logUserAction: MockFn; logAdminAction: MockFn };
   let notify: { notifyStage: MockFn; notifyBoth: MockFn };
   let refundService: ReturnsRefundService;
+  let walletMode: { isWalletEnabled: MockFn };
+  let danaDirectRefundService: { refundAmount: MockFn };
   let service: ReturnsService;
 
   beforeEach(() => {
@@ -98,6 +102,9 @@ describe('ReturnsService (GAP-D retur)', () => {
       returnTimeline: makeDelegate(),
       returnShipmentEvent: makeDelegate(),
       returnRefundApproval: makeDelegate(),
+      adminUser: makeDelegate(),
+      danaRefundAttempt: makeDelegate(),
+      paymentTransaction: makeDelegate(),
     };
     orderDelegate = makeDelegate();
     walletDelegate = makeDelegate();
@@ -126,6 +133,10 @@ describe('ReturnsService (GAP-D retur)', () => {
       prisma as unknown as PrismaService,
       serial as unknown as WalletTxSerialService,
     );
+    // HEAD (7d3075c) menambah walletMode + danaDirectRefundService ke konstruktor.
+    // Default wallet ENABLED agar test jalur ledger wallet lama tetap valid.
+    walletMode = { isWalletEnabled: jest.fn().mockReturnValue(true) };
+    danaDirectRefundService = { refundAmount: jest.fn() };
     service = new ReturnsService(
       prisma as unknown as PrismaService,
       serial as unknown as WalletTxSerialService,
@@ -133,6 +144,8 @@ describe('ReturnsService (GAP-D retur)', () => {
       auditLog as unknown as AuditLogService,
       notify as unknown as ReturnsNotifyService,
       refundService,
+      walletMode as unknown as WalletModeService,
+      danaDirectRefundService as unknown as DanaDirectRefundService,
     );
     jest.clearAllMocks();
     // jest.clearAllMocks menghapus implementasi mockResolvedValue di atas —
@@ -142,6 +155,8 @@ describe('ReturnsService (GAP-D retur)', () => {
     notify.notifyBoth.mockResolvedValue(undefined);
     uploadService.cleanupFileKeys.mockResolvedValue({ deleted: 1, errors: [] });
     delegates.returnTimeline.create.mockResolvedValue({});
+    // BAI-083: guard aksi-uang di adminAct membaca role admin — default SUPER_ADMIN.
+    delegates.adminUser.findUnique.mockResolvedValue({ role: 'SUPER_ADMIN' });
   });
 
   // ---------------------------------------------------------- state machine

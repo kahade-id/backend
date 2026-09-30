@@ -38,14 +38,18 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
       'Secret verifikasi webhook Fonnte. Kirim via header x-fonnte-secret ' +
       '(disarankan) atau field body webhookSecret — JANGAN via query param ' +
       '?webhookSecret= karena URL tercatat di nginx access log (SEC-003). ' +
-      'Wajib diset untuk hardening produksi; kosong = fail-open (tidak aman).',
+      'Bila kosong, SEMUA webhook DITOLAK (fail-closed); set sebelum go-live.',
     isSecret: true,
     testable: false,
   },
   {
     key: 'FONNTE_API_URL',
     label: 'Fonnte API URL',
-    description: 'Endpoint API Fonnte. Kosongkan untuk memakai default https://api.fonnte.com/send.',
+    description:
+      'Endpoint API Fonnte (default https://api.fonnte.com/send). Hapus override ' +
+      'via tombol "Kembalikan ke default" untuk memakai default. URL divalidasi ' +
+      'anti-SSRF (wajib HTTPS, tanpa kredensial, bukan IP privat) dan ' +
+      'dinormalisasi — nilai tersimpan bisa berbeda dari yang diketik.',
     isSecret: false,
     testable: false,
   },
@@ -71,7 +75,8 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
     label: 'Pesan Maintenance',
     description:
       'Pesan yang ditampilkan ke user saat mode maintenance aktif ' +
-      '(maks 500 karakter). Kosong = pesan default Bahasa Indonesia.',
+      '(maks 500 karakter). Hapus override via tombol "Kembalikan ke default" ' +
+      '(atau kosongkan pesan di kartu maintenance) untuk memakai pesan default.',
     isSecret: false,
     testable: false,
   },

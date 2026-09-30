@@ -90,6 +90,27 @@ export type PiiBearingUser = {
 };
 
 /**
+ * Samarkan alamat IP: IPv4 `36.81.123.45` → `36.••.••.••`; IPv6 hanya
+ * hextet pertama yang dipertahankan. Nilai null/undefined diteruskan.
+ * Dipakai BAI-076 untuk lastLoginIp di detail user (non-SUPER_ADMIN).
+ */
+export function maskIp(ip: string | null | undefined): string | null {
+  if (!ip) return null;
+  const trimmed = ip.trim();
+  if (!trimmed) return null;
+  if (trimmed.includes(':')) {
+    // IPv6 — pertahankan hextet pertama saja.
+    const first = trimmed.split(':')[0];
+    return `${first}${first ? ':' : ''}${MASK_CHAR.repeat(4)}`;
+  }
+  const parts = trimmed.split('.');
+  if (parts.length === 4 && parts.every((p) => /^\d{1,3}$/.test(p))) {
+    return `${parts[0]}.${MASK_CHAR.repeat(2)}.${MASK_CHAR.repeat(2)}.${MASK_CHAR.repeat(2)}`;
+  }
+  return `${MASK_CHAR.repeat(4)}`;
+}
+
+/**
  * Terapkan masking PII sesuai role admin.
  * Kembalikan salinan `user` dengan email/phoneNumber disamarkan kecuali
  * `adminRole` ada di {@link PII_UNMASKED_ROLES}.

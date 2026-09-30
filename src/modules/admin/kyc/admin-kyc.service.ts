@@ -93,7 +93,9 @@ export class AdminKycService {
     const skip = (safePage - 1) * safeLimit;
 
     const status = query.status;
-    const validStatuses = ['PENDING', 'APPROVED', 'REJECTED', 'REVOKED'];
+    // BAI-065: UNVERIFIED adalah status awal setiap pengajuan baru —
+    // antrean tanpa filter sudah memuatnya, jadi filter harus menerimanya.
+    const validStatuses = ['UNVERIFIED', 'PENDING', 'APPROVED', 'REJECTED', 'REVOKED'];
     if (status && !validStatuses.includes(status)) {
       throw new BadRequestException({
         code: ErrorCodes.INVALID_STATUS,
@@ -164,6 +166,8 @@ export class AdminKycService {
         kycId: true,
         userId: true,
         status: true,
+        // BAI-072: jenis dokumen (KTP|PASSPORT) perlu terlihat di detail.
+        documentType: true,
         rejectionReason: true,
         attemptNumber: true,
         createdAt: true,
@@ -648,6 +652,8 @@ export class AdminKycService {
         kycId: true,
         userId: true,
         status: true,
+        // BAI-072: jenis dokumen (KTP|PASSPORT) perlu terlihat di detail.
+        documentType: true,
         rejectionReason: true,
         adminNotes: true,
         attemptNumber: true,

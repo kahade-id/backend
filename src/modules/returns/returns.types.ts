@@ -60,9 +60,21 @@ export const TERMINAL_RETURN_STATUSES: ReadonlySet<ReturnStatus> = new Set([
   'EXPIRED',
 ]);
 
+/**
+ * BAI-049: ringkasan hasil refund DANA untuk satu retur (dari
+ * DanaRefundAttempt via idempotencyKey `RETURN:<returnDbId>`).
+ * Diekspos ke admin saja — buyer/seller tidak butuh detail referensi provider.
+ */
+export type RefundDanaInfo = {
+  status: string;
+  danaReferenceNo: string | null;
+  partnerRefundNo: string;
+  amountSen: string;
+  updatedAt: Date;
+} | null;
+
 /** Bentuk baris return_requests yang dipakai modul ini. */
-export interface ReturnRequestRow {
-  id: string;
+export interface ReturnRequestRow {  id: string;
   returnId: string;
   orderId: string;
   itemRef: string | null;

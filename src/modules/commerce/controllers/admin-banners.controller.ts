@@ -2,8 +2,7 @@ import { Controller, Get, Post, Patch, Delete, Body, Param, Query, UseGuards } f
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { BannersService } from '../services/banners.service';
-import { CreateBannerDto, UpdateBannerDto } from '../dto/commerce.dto';
-import { PaginationDto } from '../../../common/dto/pagination.dto';
+import { CreateBannerDto, UpdateBannerDto, AdminBannerListQueryDto } from '../dto/commerce.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
 import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
@@ -23,8 +22,11 @@ export class AdminBannersController {
   @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Get()
   @ApiOperation({ summary: 'Daftar semua banner (admin)' })
-  list(@Query() pagination: PaginationDto) {
-    return this.service.listAdminBanners(pagination.page ?? 1, pagination.limit ?? 20);
+  list(@Query() query: AdminBannerListQueryDto) {
+    return this.service.listAdminBanners(query.page ?? 1, query.limit ?? 20, {
+      isActive: query.isActive,
+      q: query.q,
+    });
   }
 
   @Throttle({ default: { ttl: 60000, limit: 60 } })

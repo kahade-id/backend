@@ -2,7 +2,7 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { OrderStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
-import { parseDateBoundaryWIB, startOfDayWIB } from '../../../common/utils/date.util';
+import { parseDateBoundaryWIB, startOfDayWIB, toWIB } from '../../../common/utils/date.util';
 import { toIdr } from '../../../common/utils/currency.util';
 import { ChartQueryDto } from './dto/chart-query.dto';
 
@@ -16,15 +16,32 @@ export class DashboardService {
     private redis: RedisService,
   ) {}
 
+  /**
+   * BAI-122: definisi "escrow aktif" = SEMUA status order yang belum final:
+   * WAITING_CONFIRMATION (status default setiap order baru — sebelumnya
+   * tertinggal), WAITING_PAYMENT, PROCESSING, IN_DELIVERY. Status final
+   * (COMPLETED, CANCELLED, DISPUTED) bukan bagian dari metrik ini.
+   */
+  static readonly ACTIVE_ORDER_STATUSES: OrderStatus[] = [
+    OrderStatus.WAITING_CONFIRMATION,
+    OrderStatus.WAITING_PAYMENT,
+    OrderStatus.PROCESSING,
+    OrderStatus.IN_DELIVERY,
+  ];
+
   // hitting the DB with 9 parallel count/aggregate queries on every dashboard load.
-  async getSummary(): Promise<object> {
-    const cached = await this.redis.get(DASHBOARD_SUMMARY_CACHE_KEY);
-    if (cached) {
-      try {
-        return JSON.parse(cached);
-      } catch {
-        // A corrupt cache entry must not turn the dashboard into a permanent 500.
-        await this.redis.del(DASHBOARD_SUMMARY_CACHE_KEY);
+  // BAI-125: `refresh=true` melewati cache (tombol "Muat ulang" di panel admin)
+  // dan menghitung ulang dari DB, lalu menulis ulang cache.
+  async getSummary(refresh = false): Promise<object> {
+    if (!refresh) {
+      const cached = await this.redis.get(DASHBOARD_SUMMARY_CACHE_KEY);
+      if (cached) {
+        try {
+          return JSON.parse(cached);
+        } catch {
+          // A corrupt cache entry must not turn the dashboard into a permanent 500.
+          await this.redis.del(DASHBOARD_SUMMARY_CACHE_KEY);
+        }
       }
     }
 
@@ -39,19 +56,15 @@ export class DashboardService {
       this.prisma.user.count({ where: { deletedAt: null } }),
       this.prisma.user.count({ where: { deletedAt: null, createdAt: { gte: today } } }),
       this.prisma.user.count({ where: { deletedAt: null, kycStatus: 'APPROVED' } }),
-      this.prisma.order.count(),
+      // BAI-132: filter deletedAt agar konsisten dengan analitik (admin-analytics).
+      this.prisma.order.count({ where: { deletedAt: null } }),
       this.prisma.order.count({
         where: {
-          status: {
-            in: [
-              OrderStatus.WAITING_PAYMENT,
-              OrderStatus.PROCESSING,
-              OrderStatus.IN_DELIVERY,
-            ],
-          },
+          deletedAt: null,
+          status: { in: DashboardService.ACTIVE_ORDER_STATUSES },
         },
       }),
-      this.prisma.order.count({ where: { status: OrderStatus.COMPLETED } }),
+      this.prisma.order.count({ where: { deletedAt: null, status: OrderStatus.COMPLETED } }),
       this.prisma.dispute.count({ where: { status: { in: ['OPEN', 'UNDER_REVIEW'] } } }),
       this.prisma.kycRequest.count({ where: { status: 'PENDING' } }),
       this.prisma.wallet.aggregate({ _sum: { totalBalance: true } }),
@@ -146,17 +159,25 @@ export class DashboardService {
       `,
     ]);
 
-    const allDates = new Set([
-      ...ordersByDay.map(o => o.day),
-      ...revenueByDay.map(r => r.day),
-    ]);
     const orderMap = new Map(ordersByDay.map(o => [o.day, Number(o.count)]));
     const revenueMap = new Map(revenueByDay.map(r => [r.day, r.revenue]));
-    const sortedDates = [...allDates].sort();
+
+    // BAI-130: zero-fill — semua hari kalender WIB dalam rentang muncul di
+    // sumbu waktu (hari tanpa order/revenue = 0), agar tren tidak terlihat
+    // kontinu padahal ada gap.
+    const rangeEnd = endDate ?? new Date();
+    const fillDates: string[] = [];
+    let cursor = startOfDayWIB(startDate);
+    const lastDay = startOfDayWIB(rangeEnd);
+    // WIB tidak punya DST — langkah 24 jam aman.
+    while (cursor <= lastDay) {
+      fillDates.push(toWIB(cursor).format('YYYY-MM-DD'));
+      cursor = new Date(cursor.getTime() + 24 * 60 * 60 * 1000);
+    }
 
     return {
       period,
-      data: sortedDates.map(date => ({
+      data: fillDates.map(date => ({
         date,
         orders: orderMap.get(date) ?? 0,
         revenue: toIdr(revenueMap.get(date) ?? BigInt(0)),
@@ -222,8 +243,12 @@ export class DashboardService {
   }
 
   async getOrderStats(): Promise<object> {
+    // BAI-132: order yang di-soft-delete dikecualikan — konsisten dengan
+    // analitik (admin-analytics.service), agar "Total order" identik di
+    // Dashboard dan Analitik.
     const grouped = await this.prisma.order.groupBy({
       by: ['status'],
+      where: { deletedAt: null },
       _count: { id: true },
     });
 

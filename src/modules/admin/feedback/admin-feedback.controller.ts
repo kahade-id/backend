@@ -30,6 +30,7 @@ import {
   AdminFeedbackSlaRuleDto,
   AdminFeedbackStatusDto,
   AdminFeedbackTagsDto,
+  UpdateAdminFeedbackSlaRuleDto,
 } from './dto/admin-feedback.dto';
 
 @ApiTags('admin-feedback')
@@ -69,6 +70,17 @@ export class AdminFeedbackController {
     @CurrentAdmin() admin: AdminJwtPayload,
   ): Promise<object> {
     return this.service.createSlaRule(admin.sub, dto);
+  }
+
+  @Patch('sla-rules/:ruleId')
+  @AdminRoles(AdminRole.SUPER_ADMIN)
+  @ApiOperation({ summary: 'Ubah aturan SLA (SUPER_ADMIN)' })
+  updateSlaRule(
+    @Param('ruleId', ParseIdPipe) ruleId: string,
+    @Body() dto: UpdateAdminFeedbackSlaRuleDto,
+    @CurrentAdmin() admin: AdminJwtPayload,
+  ): Promise<object> {
+    return this.service.updateSlaRule(admin.sub, ruleId, dto);
   }
 
   @Delete('sla-rules/:ruleId')

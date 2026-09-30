@@ -59,12 +59,16 @@ describe('AdminAnalyticsService', () => {
     expect(sql).toContain('"disputedAt"');
     expect(sql).toContain('"cancelledAt"');
     expect(sql).toContain('UNION ALL');
-    const day5 = result.find(r => (r.period as Date).toISOString().startsWith('2026-01-05'));
+    const day5 = result.find(r => String(r.period).startsWith('2026-01-05'));
     expect(day5).toMatchObject({ totalOrders: 4, completed: 2, disputed: 1, cancelled: 0 });
     expect(day5?.gmv).toBe(100000); // toIdr: sen → rupiah
     expect(day5?.revenue).toBe(2500);
-    const day6 = result.find(r => (r.period as Date).toISOString().startsWith('2026-01-06'));
+    const day6 = result.find(r => String(r.period).startsWith('2026-01-06'));
     expect(day6).toMatchObject({ totalOrders: 0, completed: 0, disputed: 0, cancelled: 1 });
+    // BAI-129: bucket diserialisasi sebagai tanggal WIB "YYYY-MM-DD" —
+    // bukan timestamp (sebelumnya dirender admin sebagai "07.00 WIB").
+    expect(day5?.period).toBe('2026-01-05');
+    expect(day6?.period).toBe('2026-01-06');
   });
 
   it('filters deleted rows in order stats and user growth raw queries', async () => {
@@ -79,5 +83,13 @@ describe('AdminAnalyticsService', () => {
     mockPrisma.user.findMany.mockResolvedValue([]);
     await service.getTopUsers(9999, 'volume');
     expect(mockPrisma.user.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 100, where: { deletedAt: null }, orderBy: { totalTransactionValue: 'desc' } }));
+  });
+
+  it('BAI-129: user-growth days are WIB date-only strings (no misleading time)', async () => {
+    mockPrisma.$queryRaw.mockResolvedValue([
+      { day: new Date('2026-01-05T00:00:00Z'), new_users: 3n, cumulative: 42n },
+    ]);
+    const result = await service.getUserGrowth() as Array<Record<string, unknown>>;
+    expect(result[0]).toMatchObject({ day: '2026-01-05', newUsers: 3, cumulative: 42 });
   });
 });

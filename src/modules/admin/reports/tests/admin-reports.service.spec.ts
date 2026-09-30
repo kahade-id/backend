@@ -38,4 +38,38 @@ describe('AdminReportsService state transitions', () => {
       .rejects.toBeInstanceOf(BadRequestException);
     expect(auditLog.logAdminAction).not.toHaveBeenCalled();
   });
+
+  it('BAI-127: dismiss stores the admin notes in `resolution` + audit log (no longer silently dropped)', async () => {
+    prisma.userReport.findUnique.mockResolvedValue({ id: 'creport123456789012345678', status: 'PENDING' });
+
+    await expect(
+      service.dismissReport('creport123456789012345678', 'admin-1', '127.0.0.1', 'Laporan tidak terbukti'),
+    ).resolves.toMatchObject({ reportId: 'creport123456789012345678' });
+
+    expect(prisma.userReport.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'DISMISSED',
+          resolution: 'Laporan tidak terbukti',
+        }),
+      }),
+    );
+    expect(auditLog.logAdminAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        description: expect.stringContaining('Laporan tidak terbukti'),
+      }),
+    );
+  });
+
+  it('BAI-127: dismiss without notes stores resolution=null', async () => {
+    prisma.userReport.findUnique.mockResolvedValue({ id: 'creport123456789012345678', status: 'PENDING' });
+
+    await service.dismissReport('creport123456789012345678', 'admin-1', '127.0.0.1');
+
+    expect(prisma.userReport.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ resolution: null }),
+      }),
+    );
+  });
 });

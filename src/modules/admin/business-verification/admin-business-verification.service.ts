@@ -5,7 +5,7 @@ import {
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { AuditAction, BusinessVerificationStatus, NotificationType, Prisma } from '@prisma/client';
+import { AuditAction, BusinessVerificationStatus, NotificationType, Prisma, UserAccountType } from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { UploadService } from '../../upload/upload.service';
@@ -329,7 +329,7 @@ export class AdminBusinessVerificationService {
     }
 
     const now = new Date();
-    const updated = await this.prisma.$transaction(
+    const txResult = await this.prisma.$transaction(
       async (tx: Prisma.TransactionClient) => {
         // Guard atomik: kalau admin lain sudah memproses, count === 0.
         const guard = await tx.businessVerification.updateMany({
@@ -348,10 +348,28 @@ export class AdminBusinessVerificationService {
             message: 'Business verification was already processed by another admin',
           });
         }
-        return tx.businessVerification.findUniqueOrThrow({ where: { id: request.id } });
+        // BAI-064: badge BUSINESS_VERIFIED mensyaratkan
+        // user.accountType === BUSINESS — sinkronkan saat approve agar badge
+        // biru publik muncul walau user mendaftar sebagai PERSONAL.
+        const owner = await tx.user.findUnique({
+          where: { id: request.userId },
+          select: { accountType: true },
+        });
+        let accountTypeChanged = false;
+        if (owner && owner.accountType !== UserAccountType.BUSINESS) {
+          await tx.user.update({
+            where: { id: request.userId },
+            data: { accountType: UserAccountType.BUSINESS },
+          });
+          accountTypeChanged = true;
+        }
+        const result = await tx.businessVerification.findUniqueOrThrow({ where: { id: request.id } });
+        return { result, accountTypeChanged };
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
+    const updated = txResult.result;
+    const accountTypeChanged = txResult.accountTypeChanged;
 
     // Post-commit: badge "Business Verified" harus langsung muncul.
     await this.verificationBadgeService.invalidate(request.userId);
@@ -364,7 +382,12 @@ export class AdminBusinessVerificationService {
       description:
         `Business verification ${verificationId} approved for user ${request.userId}` +
         (batchId ? ` [batchId=${batchId}]` : '') +
-        (normalizedNotes ? ': ' + normalizedNotes : ''),
+        (normalizedNotes ? ': ' + normalizedNotes : '') +
+        // BAI-064: catat sinkronisasi accountType agar perubahan badge
+        // biru publik bisa ditelusuri dari audit trail.
+        (accountTypeChanged ? ' [accountType: PERSONAL -> BUSINESS]' : ''),
+      before: accountTypeChanged ? { accountType: 'PERSONAL' } : undefined,
+      after: accountTypeChanged ? { accountType: 'BUSINESS' } : undefined,
       ipAddress,
     });
 

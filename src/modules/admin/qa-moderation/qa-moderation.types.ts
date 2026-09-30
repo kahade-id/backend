@@ -38,6 +38,9 @@ export const QA_EVENT_ACTIONS = [
   'APPEAL_SUBMITTED',
   'APPEAL_APPROVED',
   'APPEAL_REJECTED',
+  // BAI-027 (audit integrasi 2026-09-30): resolusi laporan QA tercatat sebagai
+  // event audit beserta catatan internal resolusi.
+  'REPORT_RESOLVED',
 ] as const;
 export type QaEventAction = (typeof QA_EVENT_ACTIONS)[number];
 

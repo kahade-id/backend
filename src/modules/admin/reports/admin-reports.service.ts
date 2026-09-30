@@ -151,7 +151,7 @@ export class AdminReportsService {
     return { message: 'Report resolved successfully', reportId };
   }
 
-  async dismissReport(reportId: string, adminId: string, ipAddress: string): Promise<{ message: string; reportId: string }> {
+  async dismissReport(reportId: string, adminId: string, ipAddress: string, notes?: string): Promise<{ message: string; reportId: string }> {
     const report = await this.prisma.userReport.findUnique({
       where: { id: reportId },
     });
@@ -176,6 +176,9 @@ export class AdminReportsService {
         status: ReportStatus.DISMISSED,
         reviewedBy: adminId,
         reviewedAt: new Date(),
+        // BAI-127: simpan catatan alasan dismiss (kolom `resolution` dipakai
+        // sebagai catatan penanganan untuk semua status final).
+        resolution: notes ?? null,
       },
     });
     if (updated.count !== 1) {
@@ -187,7 +190,7 @@ export class AdminReportsService {
       action: AuditAction.ADMIN_ACTION,
       targetType: 'UserReport',
       targetId: reportId,
-      description: `Dismissed report ${reportId}`,
+      description: `Dismissed report ${reportId}${notes ? `: ${notes}` : ''}`,
       ipAddress,
     });
 

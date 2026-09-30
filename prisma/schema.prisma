@@ -628,6 +628,14 @@ enum AuditAction {
   WITHDRAWAL_REJECTED
   // ADM-213 recheck manual withdrawal PROCESSING (append-only; migrasi 20260927180000_recheck_reactivate_audit)
   WITHDRAWAL_RECHECKED
+  // BAI-043/044/045 (2026-10-01, append-only; migrasi
+  // 20261013000000_disbursement_admin_audit): aksi admin atas lifecycle
+  // EscrowDisbursement DANA — recheck status ke provider, review manual
+  // NEEDS_REVIEW, dan requeue HELD_NO_BANK.
+  DISBURSEMENT_VIEWED
+  DISBURSEMENT_RECHECKED
+  DISBURSEMENT_REVIEWED
+  DISBURSEMENT_REQUEUED
   // ADM-406/ADM-430 (2026-09-27, append-only): kode spesifik menggantikan
   // ADMIN_ACTION generik di admin-finance.service & admin-users.service agar
   // filter action= di /admin/activity-log bisa menjawab "siapa menyetujui apa".
@@ -2444,12 +2452,21 @@ model Dispute {
   isSlaBreached Boolean   @default(false)
 
   // SLA tahap kedua: setelah ESCALATED, admin punya 3x24 jam untuk putusan.
+  // BAI-097: sumber kebenaran tunggal angkanya = DISPUTE_ESCALATION_SLA_HOURS
+  // di src/common/constants/app.constants.ts (72). Kolom ini ditulis oleh
+  // SEMUA jalur eskalasi (manual user, quick-escalate admin, auto-escalate
+  // scheduler) — admin UI membaca kolom ini, bukan menghitung sendiri.
   escalatedAt                DateTime?
   escalationSlaDeadlineAt    DateTime?
   escalationSlaWarningSentAt DateTime?
   isEscalationSlaBreached    Boolean   @default(false)
 
   // Kategori sengketa (diisi saat buka sengketa)
+  // BAI-088: kapan mediator yang di-assign PERTAMA KALI memasuki room order
+  // (getDisputeOrderChat) — dipakai untuk mengirim DISPUTE_ADMIN_JOINED tepat
+  // sekali per sengketa. NULL = mediator belum pernah masuk room.
+  mediatorJoinedNotifiedAt DateTime?
+
   category DisputeCategory?
 
   // GAP-C (G190): sengketa yang dibatasi ke milestone tertentu.
@@ -2467,6 +2484,9 @@ model Dispute {
   calls           DisputeCall[]
   messages        DisputeMessage[]
   mutualProposals MutualResolutionProposal[]
+  // BAI-095: catatan internal kolaboratif antar admin (pengganti localStorage
+  // per-perangkat di panel admin).
+  internalNotes   DisputeInternalNote[]
 
   @@index([status])
   @@index([status, createdAt])
@@ -2475,6 +2495,22 @@ model Dispute {
   @@index([initiatorUserId])
   @@index([milestoneId])
   @@map("disputes")
+}
+
+// BAI-095: catatan internal sengketa — kolaboratif antar admin (pengganti
+// draf localStorage per-perangkat di panel admin). Hanya SUPER_ADMIN /
+// DISPUTE_ADMIN yang bisa baca/tulis (dijaga di service, bukan DB).
+model DisputeInternalNote {
+  id        String    @id @default(cuid())
+  disputeId String
+  dispute   Dispute   @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+  adminId   String
+  admin     AdminUser @relation("DisputeInternalNoteAdmin", fields: [adminId], references: [id], onDelete: Cascade)
+  note      String    @db.Text
+  createdAt DateTime  @default(now())
+
+  @@index([disputeId, createdAt])
+  @@map("dispute_internal_notes")
 }
 
 model MutualResolutionProposal {
@@ -2532,7 +2568,12 @@ model DisputeEvidence {
 
   description String   @db.Text
   fileUrls    String[] // Array URL bukti (parallel array dengan fileTypes — harus sama panjang)
-  fileTypes   String[] // Valid values per elemen: "image" | "document" | "screenshot"
+  // BAI-099: nilai aktual per elemen adalah MIME type (bukan kategori
+  // "image"|"document"|"screenshot"). Daftar valid = ALLOWED_EVIDENCE_MIME_TYPES
+  // di src/modules/disputes/dto/submit-evidence.dto.ts:
+  // "image/jpeg" | "image/png" | "image/webp" | "application/pdf" |
+  // "video/mp4" | "video/quicktime" | "video/webm" (divalidasi @IsIn per elemen).
+  fileTypes   String[]
   // Validated in application layer; enforced via DB constraint below
   // ALTER TABLE dispute_evidences ADD CONSTRAINT evidence_files_length
   //   CHECK (array_length(file_urls, 1) = array_length(file_types, 1));
@@ -3273,6 +3314,8 @@ model AdminUser {
 
   disputeEvidences      DisputeEvidence[]      @relation("DisputeEvidenceAdmin")
   disputeMessages       DisputeMessage[]       @relation("DisputeMessageAdmin")
+  // BAI-095: catatan internal sengketa yang ditulis admin ini.
+  disputeInternalNotes  DisputeInternalNote[]  @relation("DisputeInternalNoteAdmin")
   // GAP-E admin ops (G376–G400)
   emergencyAccessGrants EmergencyAccessGrant[]
   userExportAudits      UserExportAudit[]

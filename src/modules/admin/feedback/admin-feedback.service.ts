@@ -27,6 +27,7 @@ import {
   AdminFeedbackSlaRuleDto,
   AdminFeedbackStatusDto,
   AdminFeedbackTagsDto,
+  UpdateAdminFeedbackSlaRuleDto,
 } from './dto/admin-feedback.dto';
 
 // G153/G171: matriks transisi status yang diizinkan.
@@ -664,6 +665,56 @@ export class AdminFeedbackService {
     this.logger.log(`SLA rule kategori="${rule.category}" hours=${rule.hours} oleh admin ${adminId}`);
     await this.recomputeOpenSla(rule.category, rule.hours);
     return { success: true, data: rule };
+  }
+
+  async updateSlaRule(
+    adminId: string,
+    ruleId: string,
+    dto: UpdateAdminFeedbackSlaRuleDto,
+  ): Promise<object> {
+    const rule = await this.prisma.feedbackSlaRule.findUnique({ where: { id: ruleId } });
+    if (!rule) {
+      throw new NotFoundException({
+        code: ErrorCodes.FEEDBACK_SLA_RULE_NOT_FOUND,
+        message: 'Aturan SLA tidak ditemukan',
+      });
+    }
+    // Hanya field yang dikirim yang diubah; validasi konsisten dengan create (DTO).
+    const data: Prisma.FeedbackSlaRuleUpdateInput = {};
+    if (dto.category !== undefined) data.category = dto.category;
+    if (dto.hours !== undefined) data.hours = dto.hours;
+    if (dto.isCritical !== undefined) data.isCritical = dto.isCritical;
+    if (Object.keys(data).length === 0) {
+      throw new BadRequestException({
+        code: ErrorCodes.FEEDBACK_SLA_RULE_NO_CHANGES,
+        message: 'Tidak ada field yang diubah',
+      });
+    }
+    try {
+      const updated = await this.prisma.feedbackSlaRule.update({
+        where: { id: ruleId },
+        data,
+      });
+      this.logger.log(
+        `SLA rule ${ruleId} kategori="${updated.category}" hours=${updated.hours} diubah oleh admin ${adminId}`,
+      );
+      // Hitung ulang slaDueAt feedback terbuka bila kategori/jam berubah.
+      if (dto.hours !== undefined || dto.category !== undefined) {
+        if (dto.category !== undefined && dto.category !== rule.category) {
+          await this.recomputeOpenSla(rule.category, rule.hours);
+        }
+        await this.recomputeOpenSla(updated.category, updated.hours);
+      }
+      return { success: true, data: updated };
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        throw new BadRequestException({
+          code: ErrorCodes.FEEDBACK_SLA_RULE_CATEGORY_CONFLICT,
+          message: 'Kategori sudah dipakai aturan SLA lain',
+        });
+      }
+      throw err;
+    }
   }
 
   async deleteSlaRule(adminId: string, ruleId: string): Promise<object> {

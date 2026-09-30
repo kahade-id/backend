@@ -52,4 +52,59 @@ describe('DashboardService control-plane contracts', () => {
     redis.del.mockRejectedValueOnce(new Error('redis down'));
     await expect(service.invalidateSummaryCache()).resolves.toBeUndefined();
   });
+
+  it('BAI-125: refresh=true bypasses the 5-minute cache and recomputes from DB', async () => {
+    redis.get.mockResolvedValue(JSON.stringify({ users: { total: 999 } }));
+
+    const result = await service.getSummary(true);
+
+    expect(redis.get).not.toHaveBeenCalled();
+    expect(prisma.user.count).toHaveBeenCalled();
+    expect(redis.setex).toHaveBeenCalledWith('dashboard:summary_v2', 300, expect.any(String));
+    expect(result).toMatchObject({ users: { total: 0 }, orders: { total: 0 } });
+  });
+
+  it('BAI-125: default getSummary() still serves the cached snapshot', async () => {
+    redis.get.mockResolvedValue(JSON.stringify({ users: { total: 7 } }));
+
+    const result = await service.getSummary();
+
+    expect(prisma.user.count).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ users: { total: 7 } });
+  });
+
+  it('BAI-122: active orders include WAITING_CONFIRMATION (the default new-order status)', async () => {
+    redis.get.mockResolvedValue(null);
+    await service.getSummary();
+
+    const activeCall = prisma.order.count.mock.calls.find((args: unknown[]) =>
+      (args[0] as { where?: { status?: { in?: string[] } } })?.where?.status?.in,
+    );
+    expect(activeCall).toBeDefined();
+    const statuses = (activeCall![0] as { where: { status: { in: string[] } } }).where.status.in;
+    expect(statuses).toEqual(
+      expect.arrayContaining(['WAITING_CONFIRMATION', 'WAITING_PAYMENT', 'PROCESSING', 'IN_DELIVERY']),
+    );
+    // Semua count order mengecualikan soft-delete (BAI-132).
+    for (const args of prisma.order.count.mock.calls) {
+      expect((args[0] as { where?: object }).where).toEqual(expect.objectContaining({ deletedAt: null }));
+    }
+  });
+
+  it('BAI-130/BAI-131: getCharts zero-fills empty days and reports period=custom for custom ranges', async () => {
+    prisma.$queryRaw
+      .mockResolvedValueOnce([{ day: '2026-09-28', count: 5n }]) // ordersByDay
+      .mockResolvedValueOnce([]); // revenueByDay
+
+    const result = (await service.getCharts({
+      startDate: '2026-09-28',
+      endDate: '2026-09-30',
+    })) as { period: string; data: Array<{ date: string; orders: number; revenue: number }> };
+
+    expect(result.period).toBe('custom');
+    expect(result.data.map((d) => d.date)).toEqual(['2026-09-28', '2026-09-29', '2026-09-30']);
+    expect(result.data[0].orders).toBe(5);
+    expect(result.data[1]).toMatchObject({ date: '2026-09-29', orders: 0, revenue: 0 });
+    expect(result.data[2]).toMatchObject({ date: '2026-09-30', orders: 0, revenue: 0 });
+  });
 });

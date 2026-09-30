@@ -81,7 +81,14 @@ export interface FinanceTransactionAggregate {
 }
 
 /**
- * ADM-205 — dual control untuk approve withdrawal (maker-checker).
+ * ADM-205 — dual control untuk approve withdrawal (maker-checker) [LEGACY].
+ *
+ * BAI-041 (P0, 2026-10-01): jalur approve withdrawal legacy DI-SUNSET —
+ * approveWithdrawal() kini melempar 410 GONE (IRIS_PAYOUT_SUNSET) dan TIDAK
+ * LAGI mengeksekusi payout ke provider mana pun. DANA Enterprise adalah
+ * satu-satunya provider; pencairan dana tercatat di EscrowDisbursement
+ * (GET /v1/admin/finance/disbursements). Komentar di bawah ini adalah
+ * dokumentasi historis alur lama dan tidak lagi berlaku.
  *
  * Sebelum perbaikan ini, SATU admin FINANCE_ADMIN bisa menyetujui penarikan
  * berapa pun nominalnya dan langsung memicu payout Iris nyata. Sekarang dua
@@ -851,6 +858,41 @@ export class AdminFinanceService {
         GROUP BY 1 ORDER BY 1`,
     ]);
 
+    // BAI-055 (P2): di era DANA-direct, pergerakan uang riil (disbursement ke
+    // seller, refund DANA ke buyer, payment masuk) TIDAK tercatat di
+    // wallet_transactions — export "rekonsiliasi" wajib mencakupnya.
+    // Semua agregat, tanpa PII.
+    type DanaDailyRow = { day: Date; scope: string; status: string; total: bigint; cnt: bigint };
+    const [disbursementDaily, refundDaily] = await Promise.all([
+      this.prisma.$queryRaw<DanaDailyRow[]>`
+        SELECT date_trunc('day', "createdAt")::date AS day,
+               scope::text AS scope,
+               status::text AS status,
+               COALESCE(SUM("amountSen"), 0)::bigint AS total,
+               COUNT(*)::bigint AS cnt
+        FROM escrow_disbursements
+        WHERE "createdAt" >= ${from} AND "createdAt" <= ${to}
+        GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`,
+      this.prisma.$queryRaw<DanaDailyRow[]>`
+        SELECT date_trunc('day', "createdAt")::date AS day,
+               'DANA_REFUND' AS scope,
+               status AS status,
+               COALESCE(SUM("amountSen"), 0)::bigint AS total,
+               COUNT(*)::bigint AS cnt
+        FROM dana_refund_attempts
+        WHERE "createdAt" >= ${from} AND "createdAt" <= ${to}
+        GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`,
+    ]);
+    type PaymentDailyRow = { day: Date; status: string; total: bigint; cnt: bigint };
+    const paymentDaily = await this.prisma.$queryRaw<PaymentDailyRow[]>`
+      SELECT date_trunc('day', "createdAt")::date AS day,
+             status::text AS status,
+             COALESCE(SUM("amount"), 0)::bigint AS total,
+             COUNT(*)::bigint AS cnt
+      FROM payment_transactions
+      WHERE "createdAt" >= ${from} AND "createdAt" <= ${to}
+      GROUP BY 1, 2 ORDER BY 1, 2`;
+
     const dayKey = (d: Date | string): string =>
       d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10);
     const toMap = (rows: DailyRow[]): Map<string, DailyRow> =>
@@ -859,7 +901,6 @@ export class AdminFinanceService {
     const withdrawMap = toMap(withdrawDaily);
     const feeMap = toMap(feeDaily);
     const allDays = [...new Set([...topupMap.keys(), ...withdrawMap.keys(), ...feeMap.keys()])].sort();
-
     const csvCell = (v: unknown): string => {
       const s = v === null || v === undefined ? '' : String(v);
       return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
@@ -896,6 +937,31 @@ export class AdminFinanceService {
           f ? toIdr(f.total) : 0,
           f ? Number(f.cnt) : 0,
         ].map(csvCell).join(','),
+      );
+    }
+    // BAI-055: pergerakan dana DANA aktual (bukan wallet legacy).
+    lines.push('');
+    lines.push('[disbursement_daily]');
+    lines.push('date,scope,status,count,total_idr');
+    for (const r of disbursementDaily) {
+      lines.push(
+        [dayKey(r.day), r.scope, r.status, Number(r.cnt), toIdr(r.total)].map(csvCell).join(','),
+      );
+    }
+    lines.push('');
+    lines.push('[dana_refund_daily]');
+    lines.push('date,scope,status,count,total_idr');
+    for (const r of refundDaily) {
+      lines.push(
+        [dayKey(r.day), r.scope, r.status, Number(r.cnt), toIdr(r.total)].map(csvCell).join(','),
+      );
+    }
+    lines.push('');
+    lines.push('[payment_daily]');
+    lines.push('date,status,count,total_idr');
+    for (const r of paymentDaily) {
+      lines.push(
+        [dayKey(r.day), r.status, Number(r.cnt), toIdr(r.total)].map(csvCell).join(','),
       );
     }
     // ADM-429: watermark pengekspor di baris awal CSV untuk keterlacakan kebocoran.
@@ -1030,8 +1096,9 @@ export class AdminFinanceService {
     // eksekusi diam-diam ke provider yang salah), plus WalletKillSwitchGuard
     // di controller sebagai pertahanan lapis kedua. Pencairan dana kini
     // tercatat di EscrowDisbursement — lihat GET /v1/admin/finance/disbursements.
-    // Seluruh badan fungsi di bawah ini dipertahankan sebagai dokumentasi
-    // arkeologis alur lama dan TIDAK PERNAH tercapai.
+    // Badan fungsi lama DIHAPUS (2026-10-01): kode setelah throw unconditional
+    // tidak terjangkau dan merusak type-check (narrowing TS tidak berlaku di
+    // kode unreachable). Arkeologi alur lama tersimpan di riwayat git.
     throw new GoneException({
       code: ErrorCodes.IRIS_PAYOUT_SUNSET,
       message:
@@ -1039,207 +1106,6 @@ export class AdminFinanceService {
         'Pencairan dana kini berjalan via disbursement DANA — lihat antrean "Disbursement DANA" ' +
         '(GET /v1/admin/finance/disbursements).',
     });
-    const adminNote = this.sanitizeAdminNote(dto.adminNote);
-    // B-22 (audit-fix): lookup by public txId only -- the OR-by-internal-id
-    // was permissive and meant attacker control over the URL parameter could
-    // disambiguate via either column. Public txId is the documented contract.
-    const tx = await this.prisma.walletTransaction.findFirst({
-      where: { txId },
-      include: { wallet: true, bankAccount: true },
-    });
-
-    if (!tx) {
-      throw new NotFoundException({
-        code: ErrorCodes.NOT_FOUND,
-        message: 'Transaction not found',
-      });
-    }
-
-    if (tx.type !== 'WITHDRAW' || tx.withdrawStatus !== 'PENDING_PROCESS') {
-      throw new BadRequestException({
-        code: ErrorCodes.INVALID_STATUS,
-        message: 'Transaction is not a pending withdrawal',
-      });
-    }
-
-    // B-03 (audit-fix): a withdrawal MUST have an attached bankAccount before
-    // approval. Without this guard the function silently skipped the Iris
-    // payout but still updated the description / audit-log to "approved",
-    // leaving the user with no money sent and the operator believing payout
-    // succeeded. Bank account can become null if the user soft-deleted it
-    // between submission and admin review, or if a Prisma cascade nullified it.
-    if (!tx.bankAccount) {
-      throw new BadRequestException({
-        code: ErrorCodes.INVALID_STATUS,
-        message:
-          'Withdrawal has no attached bank account -- cannot approve. Ask user to re-submit with a valid bank account.',
-      });
-    }
-
-    // ADM-205 (dual control): catat persetujuan admin ini SEBELUM payout.
-    // Payout hanya dieksekusi bila kuorum admin BERBEDA tercapai.
-    const amountIdr = toIdr(tx.amount);
-    const dualThresholdIdr = await this.getWithdrawalDualApprovalThresholdIdr();
-    const requiredApprovals = AdminFinanceService.requiredWithdrawalApprovals(amountIdr, dualThresholdIdr);
-    const priorApproverIds = await this.getWithdrawalApproverIds(tx.id);
-    if (priorApproverIds.includes(adminId)) {
-      throw new ConflictException({
-        code: ErrorCodes.WITHDRAWAL_ALREADY_APPROVED,
-        message:
-          'Anda sudah menyetujui penarikan ini — menunggu persetujuan admin lain sebelum payout dieksekusi',
-      });
-    }
-    await this.prisma.adminAuditLog.create({
-      data: {
-        adminId,
-        action: AuditAction.WITHDRAWAL_APPROVED,
-        targetType: WITHDRAWAL_APPROVAL_TARGET_TYPE,
-        targetId: tx.id,
-        description:
-          `Withdrawal approval ${priorApproverIds.length + 1}/${requiredApprovals} untuk ${tx.txId ?? tx.id} ` +
-          `(Rp${amountIdr.toLocaleString('id-ID')}) oleh admin ${adminId}`,
-        after: {
-          txId: tx.txId,
-          amountIdr,
-          thresholdIdr: dualThresholdIdr,
-          requiredApprovals,
-          approvedAt: new Date().toISOString(),
-        } as unknown as Prisma.InputJsonValue,
-        ipAddress,
-      },
-    });
-    const approverIds = await this.getWithdrawalApproverIds(tx.id);
-    if (approverIds.length < requiredApprovals) {
-      // Kuorum belum tercapai: JANGAN sentuh status / payout. Transaksi tetap
-      // PENDING_PROCESS agar muncul di antrean untuk admin kedua.
-      await this.dashboard.invalidateSummaryCache();
-      return {
-        status: 'AWAITING_SECOND_APPROVAL',
-        txId: tx.txId,
-        amountIdr,
-        approvals: approverIds.length,
-        requiredApprovals,
-        executed: false,
-        message:
-          `Persetujuan ke-${approverIds.length} tercatat. ` +
-          `Butuh ${requiredApprovals - approverIds.length} persetujuan admin berbeda lagi sebelum payout dieksekusi.`,
-      };
-    }
-
-    const txUpdate = await this.prisma.walletTransaction.updateMany({
-      where: {
-        id: tx.id,
-        withdrawStatus: 'PENDING_PROCESS',
-      },
-      data: {
-        withdrawStatus: 'PROCESSING',
-        description: `Processing by admin ${adminId} at ${new Date().toISOString()}`,
-      },
-    });
-
-    if (txUpdate.count === 0) {
-      // ADM-205: dengan dual control, dua admin bisa mencapai kuorum hampir
-      // bersamaan — yang kalah optimistic-lock claim tidak boleh menerima
-      // error mentah bila payout sudah dieksekusi persetujuan lain.
-      const current = await this.prisma.walletTransaction.findUnique({
-        where: { id: tx.id },
-        select: { withdrawStatus: true, txId: true },
-      });
-      if (current && current.withdrawStatus !== 'PENDING_PROCESS') {
-        return {
-          status: 'ALREADY_EXECUTED',
-          txId: current.txId,
-          executed: true,
-          message:
-            'Payout sudah dieksekusi oleh persetujuan admin lain — tidak ada payout ganda',
-        };
-      }
-      throw new ConflictException({
-        code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT,
-        message: 'Withdrawal was already processed by another admin, please refresh',
-      });
-    }
-
-    try {
-      const plainAccountNumber = await decryptAES(tx.bankAccount.accountNumber);
-      this.auditLog.logAdminAction({
-        adminId,
-        action: AuditAction.BANK_ACCOUNT_NUMBER_ACCESSED,
-        targetType: 'BankAccount',
-        targetId: tx.bankAccount.id ?? 'unknown',
-        description: `Bank account number decrypted for payout processing (tx: ${tx.txId})`,
-        ipAddress,
-      });
-      let beneficiaryName = tx.bankAccount.accountName;
-      try {
-        beneficiaryName = await decryptAES(tx.bankAccount.accountName);
-      } catch {
-        /* pre-migration data */
-      }
-      await this.midtransService.createIrisPayout({
-        referenceNo: tx.txId,
-        beneficiaryName,
-        beneficiaryAccount: plainAccountNumber,
-        beneficiaryBank: tx.bankAccount.bankCode,
-        amount: toIdr(tx.amount),
-      });
-
-      await this.prisma.walletTransaction.update({
-        where: { id: tx.id },
-        data: {
-          description: adminNote
-            ? `Approved by admin ${adminId}: ${adminNote} — awaiting Iris confirmation`
-            : `Approved by admin ${adminId} — awaiting Iris confirmation`,
-        },
-      });
-    } catch (payoutError) {
-      this.logger.error(
-        `Payout failed for txId=${tx.txId ?? tx.id}: ${payoutError instanceof Error ? payoutError.message : String(payoutError)}`,
-      );
-      await this.prisma.walletTransaction.updateMany({
-        where: { id: tx.id, withdrawStatus: 'PROCESSING' },
-        data: {
-          description: adminNote
-            ? `Approved by admin ${adminId}: ${adminNote} — payout submission outcome pending reconciliation`
-            : `Approved by admin ${adminId} — payout submission outcome pending reconciliation`,
-        },
-      });
-      this.auditLog.logAdminAction({
-        adminId,
-        action: AuditAction.WITHDRAWAL_PAYOUT_UNCONFIRMED,
-        targetType: 'WalletTransaction',
-        targetId: tx.id,
-        description: `Withdrawal payout submission could not be confirmed for ${tx.txId ?? tx.id}; retained in PROCESSING for Iris reconciliation`,
-        ipAddress,
-      });
-      throw new ServiceUnavailableException({
-        code: ErrorCodes.PAYOUT_FAILED,
-        message:
-          'Payout submission could not be confirmed. The withdrawal remains in processing while provider status is reconciled.',
-      });
-    }
-
-    const updated = await this.prisma.walletTransaction.findUniqueOrThrow({ where: { id: tx.id } });
-
-    // ADM-205: payout dieksekusi setelah kuorum dual approval tercapai.
-    this.auditLog.logAdminAction({
-      adminId,
-      action: AuditAction.WITHDRAWAL_APPROVED,
-      targetType: 'WalletTransaction',
-      targetId: tx.id,
-      description: `Approved withdrawal payout ${tx.txId ?? tx.id} — kuorum dual approval tercapai, payout dieksekusi`,
-      ipAddress,
-    });
-
-    // AW-018: totalWalletBalance/totalEscrowBalance di summary bisa berubah.
-    await this.dashboard.invalidateSummaryCache();
-
-    return {
-      ...updated,
-      amount: toIdr(updated.amount),
-      balanceBefore: toIdr(updated.balanceBefore),
-      balanceAfter: toIdr(updated.balanceAfter),
-    };
   }
 
   async rejectWithdrawal(
@@ -1395,83 +1261,15 @@ export class AdminFinanceService {
     // yang salah. Untuk disbursement DANA gunakan
     // POST /v1/admin/finance/disbursements/:id/recheck (query status DANA yang
     // aman — tanpa pengiriman transfer baru).
-    // Badan fungsi lama dipertahankan di bawah sebagai dokumentasi dan TIDAK
-    // PERNAH tercapai.
+    // Badan fungsi lama DIHAPUS (2026-10-01): kode setelah throw unconditional
+    // tidak terjangkau dan merusak type-check (narrowing TS tidak berlaku di
+    // kode unreachable). Arkeologi alur lama tersimpan di riwayat git.
     throw new NotImplementedException({
       code: ErrorCodes.LEGACY_WITHDRAWAL_RECHECK_DISABLED,
       message:
         'Recheck withdrawal legacy dinonaktifkan (501): jalur ini men-query Midtrans Iris, ' +
         'bukan DANA. Untuk payout DANA gunakan POST /v1/admin/finance/disbursements/:id/recheck.',
     });
-    const tx = await this.prisma.walletTransaction.findFirst({
-      where: { txId, type: 'WITHDRAW' },
-      select: {
-        id: true,
-        txId: true,
-        amount: true,
-        walletId: true,
-        withdrawStatus: true,
-        description: true,
-        createdAt: true,
-      },
-    });
-    if (!tx) {
-      throw new NotFoundException({
-        code: ErrorCodes.NOT_FOUND,
-        message: 'Withdrawal not found',
-      });
-    }
-    if (tx.withdrawStatus !== 'PROCESSING') {
-      throw new ConflictException({
-        code: ErrorCodes.WITHDRAWAL_NOT_PROCESSING,
-        message: `Hanya withdrawal berstatus PROCESSING yang dapat dicek ulang (saat ini: ${tx.withdrawStatus})`,
-      });
-    }
-
-    // Hanya query status — tidak ada pengiriman payout baru di jalur ini.
-    const iris = await this.midtransService.getIrisPayoutStatus(tx.txId);
-    const providerStatus = iris.status;
-    let outcome: 'CONFIRMED' | 'FAILED_REFUNDED' | 'STILL_PROCESSING' | 'UNKNOWN';
-    let changed = false;
-
-    if (['completed', 'processed'].includes(providerStatus)) {
-      const claimed = await this.prisma.walletTransaction.updateMany({
-        where: { id: tx.id, withdrawStatus: 'PROCESSING' },
-        data: {
-          withdrawStatus: 'SUCCESS',
-          status: 'SUCCESS',
-          description: `Payout confirmed via manual recheck by admin ${adminId}`,
-        },
-      });
-      changed = claimed.count > 0;
-      outcome = 'CONFIRMED';
-    } else if (['failed', 'rejected'].includes(providerStatus)) {
-      changed = await this.refundProcessingWithdrawal(tx.id, tx.txId, tx.walletId, tx.amount, tx.createdAt);
-      outcome = 'FAILED_REFUNDED';
-    } else {
-      outcome = providerStatus === 'not_found' ? 'UNKNOWN' : 'STILL_PROCESSING';
-    }
-
-    this.auditLog.logAdminAction({
-      adminId,
-      action: AuditAction.WITHDRAWAL_RECHECKED,
-      targetType: 'WalletTransaction',
-      targetId: tx.id,
-      description:
-        `Manual recheck withdrawal ${tx.txId}: provider=${providerStatus} outcome=${outcome}` +
-        (changed ? '' : ' (no state change)'),
-      ipAddress,
-    });
-
-    // AW-018: status withdrawal memengaruhi summary dashboard.
-    await this.dashboard.invalidateSummaryCache();
-
-    return {
-      txId: tx.txId,
-      providerStatus,
-      outcome,
-      changed,
-    };
   }
 
   /**

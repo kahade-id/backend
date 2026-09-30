@@ -106,13 +106,26 @@ export class AdminDisbursementService {
         take: limit,
         include: {
           seller: { select: { id: true, fullName: true, username: true } },
-          order: { select: { orderId: true } },
         },
       }),
       this.prisma.escrowDisbursement.count({ where }),
     ]);
 
-    const data: DisbursementListItem[] = rows.map((r) => this.toListItem(r));
+    // EscrowDisbursement.orderId hanya scalar (tanpa relasi Prisma) —
+    // ambil orderId publik (ORD-...) via batch query terpisah.
+    const orderDbIds = [...new Set(rows.map((r) => r.orderId).filter((id): id is string => !!id))];
+    const orderPublicById = new Map<string, string>();
+    if (orderDbIds.length > 0) {
+      const orders = await this.prisma.order.findMany({
+        where: { id: { in: orderDbIds } },
+        select: { id: true, orderId: true },
+      });
+      for (const o of orders) orderPublicById.set(o.id, o.orderId);
+    }
+
+    const data: DisbursementListItem[] = rows.map((r) =>
+      this.toListItem(r, r.orderId ? (orderPublicById.get(r.orderId) ?? null) : null),
+    );
     return createPaginatedResponse(data, total, page, limit);
   }
 
@@ -121,12 +134,21 @@ export class AdminDisbursementService {
       where: { id },
       include: {
         seller: { select: { id: true, fullName: true, username: true } },
-        order: { select: { orderId: true } },
         bankAccount: { select: { id: true, bankCode: true, accountName: true, accountNumber: true } },
       },
     });
     if (!row) {
       throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Disbursement tidak ditemukan' });
+    }
+
+    // orderId publik (ORD-...) — relasi Prisma tidak ada, query terpisah.
+    let orderPublicId: string | null = null;
+    if (row.orderId) {
+      const ord = await this.prisma.order.findUnique({
+        where: { id: row.orderId },
+        select: { orderId: true },
+      });
+      orderPublicId = ord?.orderId ?? null;
     }
 
     this.auditLog.logAdminAction({
@@ -139,7 +161,7 @@ export class AdminDisbursementService {
     });
 
     return {
-      ...this.toListItem(row),
+      ...this.toListItem(row, orderPublicId),
       scopeRefId: row.scopeRefId,
       bankAccount: row.bankAccount
         ? {
@@ -223,7 +245,7 @@ export class AdminDisbursementService {
       targetId: row.id,
       description:
         `Manual recheck disbursement ${row.idempotencyKey}: provider=${providerStatus ?? 'query-failed'} outcome=${outcome}`,
-      after: { idempotencyKey: row.idempotencyKey, providerStatus, outcome } as unknown as Prisma.InputJsonValue,
+      after: { idempotencyKey: row.idempotencyKey, providerStatus, outcome },
       ipAddress,
     });
 
@@ -311,7 +333,7 @@ export class AdminDisbursementService {
         from: 'NEEDS_REVIEW',
         to: nextStatus,
         reason,
-      } as unknown as Prisma.InputJsonValue,
+      },
       ipAddress,
     });
 
@@ -364,7 +386,7 @@ export class AdminDisbursementService {
         idempotencyKey: row.idempotencyKey,
         from: 'HELD_NO_BANK',
         to: 'PENDING',
-      } as unknown as Prisma.InputJsonValue,
+      },
       ipAddress,
     });
 
@@ -386,15 +408,15 @@ export class AdminDisbursementService {
       createdAt: Date;
       updatedAt: Date;
       seller?: { id: string; fullName: string; username: string | null } | null;
-      order?: { orderId: string } | null;
     },
+    orderPublicId: string | null,
   ): DisbursementListItem {
     return {
       id: r.id,
       idempotencyKey: r.idempotencyKey,
       scope: r.scope,
       orderId: r.orderId,
-      orderPublicId: r.order?.orderId ?? null,
+      orderPublicId,
       sellerId: r.sellerId,
       sellerName: r.seller?.fullName ?? r.seller?.username ?? null,
       amountSen: r.amountSen.toString(),

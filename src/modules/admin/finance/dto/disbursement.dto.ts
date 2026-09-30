@@ -1,7 +1,7 @@
 import { IsOptional, IsEnum, IsString, MaxLength, MinLength, IsIn } from 'class-validator';
 import { EscrowDisbursementScope, EscrowDisbursementStatus } from '@prisma/client';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { PaginationDto } from '../../../common/dto/pagination.dto';
+import { PaginationDto } from '../../../../common/dto/pagination.dto';
 
 /**
  * BAI-043 (P0): filter antrean admin lifecycle EscrowDisbursement DANA.

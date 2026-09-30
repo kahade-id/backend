@@ -55,6 +55,12 @@ export const DISPUTE_SLA_HOURS = 72;
  * SLA tahap kedua: setelah sengketa di-ESCALATED (otomatis karena SLA breach
  * atau manual oleh admin), admin punya 3x24 jam untuk memberi putusan.
  * Warning dikirim ke kedua pihak 24 jam sebelum deadline.
+ *
+ * BAI-097: SUMBER KEBENARAN TUNGGAL angka ini. Jangan definisikan konstanta
+ * lokal lain (insiden: dispute-quick-escalation.service.ts sempat memakai 24
+ * jam lokal sehingga deadline eskalasi berbeda per jalur). Semua penulis
+ * `escalationSlaDeadlineAt` WAJIB memakai konstanta ini; admin UI membaca
+ * kolom `escalationSlaDeadlineAt` per sengketa (bukan menghitung sendiri).
  */
 export const DISPUTE_ESCALATION_SLA_HOURS = 72;
 export const DISPUTE_ESCALATION_SLA_WARNING_HOURS = 24;

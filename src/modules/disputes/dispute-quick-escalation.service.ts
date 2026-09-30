@@ -4,9 +4,14 @@ import { DisputeStatus, NotificationType } from '@prisma/client';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { generateNotifId } from '../../common/utils/id-generator.util';
 import { getCategoryForType } from '../notifications/notification-category.map';
+// BAI-097: JANGAN definisikan konstanta lokal di sini — sumber kebenaran
+// tunggal SLA eskalasi adalah DISPUTE_ESCALATION_SLA_HOURS di
+// app.constants.ts (72 jam = 3x24 jam pasca-ESCALATED; dipakai
+// disputes.service.ts & auto-escalate scheduler). Nilai lokal 24 jam yang
+// dulu ada di file ini kontradiktif dan menyebabkan deadline eskalasi
+// berbeda tergantung jalur eskalasinya.
 
-/** SLA eskalasi (jam) — disamakan dengan eskalasi manual user. */
-const DISPUTE_ESCALATION_SLA_HOURS = 24;
+import { DISPUTE_ESCALATION_SLA_HOURS } from '../../common/constants/app.constants';
 
 /**
  * BE-COMMERCE (2026-10-01) — item 16: eskalasi dispute 1 ketuk (admin).
@@ -14,6 +19,10 @@ const DISPUTE_ESCALATION_SLA_HOURS = 24;
  * panjang. Idempoten & fail-closed: dispute yang sudah RESOLVED/ESCALATED
  * ditolak; update memakai predikat status (pola SEC-DSP-02) agar tidak
  * menghidupkan kembali dispute yang sudah diputus.
+ *
+ * BAI-097: escalationSlaDeadlineAt dihitung dari DISPUTE_ESCALATION_SLA_HOURS
+ * (app.constants.ts) — sama dengan jalur eskalasi manual user & scheduler,
+ * sehingga kolom escalationSlaDeadlineAt selalu konsisten apa pun jalurnya.
  */
 @Injectable()
 export class DisputeQuickEscalationService {

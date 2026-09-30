@@ -19,6 +19,8 @@ import * as ErrorCodes from '../../../common/constants/error-codes';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { escapeHtml } from '../../../common/utils/sanitize.util';
 import { UploadService } from '../../upload/upload.service';
+import { UploadPurpose } from '../../upload/dto/presigned-url.dto';
+import { SubmitDisputeEvidenceAdminDto } from './dto/submit-dispute-evidence-admin.dto';
 import { RealtimeService } from '../../realtime/realtime.service';
 import { escapeLikePattern } from '../../../common/utils/search.util';
 import { ChatService } from '../../chat/chat.service';
@@ -782,39 +784,13 @@ export class AdminDisputesService {
       ipAddress,
     });
 
-    for (const uid of result.notifyUserIds) {
-      this.prisma.notification.create({
-        data: {
-          notifId: generateNotifId(),
-          userId: uid,
-          type: NotificationType.DISPUTE_DECISION,
-          category: getCategoryForType(NotificationType.DISPUTE_DECISION),
-          title: result.disputeNotifTitle,
-          body: result.disputeNotifBody,
-          isRead: false,
-        },
-      }).catch((err: unknown) => this.logger.warn(`silent-catch: dispute decision notification failed: ${err instanceof Error ? err.message : String(err)}`));
-      this.prisma.emitNotificationCreated({ userId: uid, title: result.disputeNotifTitle, body: result.disputeNotifBody, data: { type: 'DISPUTE_RESOLVED', disputeId: result.resolvedDisputeId } });
-    }
-
-    for (const voucher of result.apologyVouchers) {
-      this.prisma.notification.create({
-        data: {
-          notifId: generateNotifId(),
-          userId: voucher.userId,
-          type: NotificationType.VOUCHER_ISSUED,
-          category: getCategoryForType(NotificationType.VOUCHER_ISSUED),
-          title: 'Voucher Apology dari Kahade',
-          body: `Voucher ${voucher.code} telah ditambahkan sebagai permintaan maaf setelah sengketa selesai.`,
-          metadata: { voucherCode: voucher.code, disputeId: result.resolvedDisputeId },
-        },
-      }).catch((err: unknown) => this.logger.warn(`silent-catch: dispute apology voucher notification failed: ${err instanceof Error ? err.message : String(err)}`));
-    }
+    // BAI-098: notifikasi putusan yang kegagalannya tercatat + status kirim.
+    const notificationDelivered = await this.notifyDecisionOutcomeTracked(result, adminId, ipAddress);
 
     // AW-018: openDisputes di summary dashboard berubah.
     await this.dashboard.invalidateSummaryCache();
 
-    return result.decision;
+    return { ...result.decision, notificationDelivered };
   }
 
   /**
@@ -993,34 +969,8 @@ export class AdminDisputesService {
       ipAddress,
     });
 
-    for (const uid of result.notifyUserIds) {
-      this.prisma.notification.create({
-        data: {
-          notifId: generateNotifId(),
-          userId: uid,
-          type: NotificationType.DISPUTE_DECISION,
-          category: getCategoryForType(NotificationType.DISPUTE_DECISION),
-          title: result.disputeNotifTitle,
-          body: result.disputeNotifBody,
-          isRead: false,
-        },
-      }).catch((err: unknown) => this.logger.warn(`silent-catch: dispute decision notification failed: ${err instanceof Error ? err.message : String(err)}`));
-      this.prisma.emitNotificationCreated({ userId: uid, title: result.disputeNotifTitle, body: result.disputeNotifBody, data: { type: 'DISPUTE_RESOLVED', disputeId: result.resolvedDisputeId } });
-    }
-
-    for (const voucher of result.apologyVouchers) {
-      this.prisma.notification.create({
-        data: {
-          notifId: generateNotifId(),
-          userId: voucher.userId,
-          type: NotificationType.VOUCHER_ISSUED,
-          category: getCategoryForType(NotificationType.VOUCHER_ISSUED),
-          title: 'Voucher Apology dari Kahade',
-          body: `Voucher ${voucher.code} telah ditambahkan sebagai permintaan maaf setelah sengketa selesai.`,
-          metadata: { voucherCode: voucher.code, disputeId: result.resolvedDisputeId },
-        },
-      }).catch((err: unknown) => this.logger.warn(`silent-catch: dispute apology voucher notification failed: ${err instanceof Error ? err.message : String(err)}`));
-    }
+    // BAI-098: notifikasi putusan yang kegagalannya tercatat + status kirim.
+    const notificationDelivered = await this.notifyDecisionOutcomeTracked(result, adminId, ipAddress);
 
     await this.dashboard.invalidateSummaryCache();
 
@@ -1050,7 +1000,77 @@ export class AdminDisputesService {
       return null;
     });
 
-    return { decision: result.decision, settlement };
+    return { decision: result.decision, settlement, notificationDelivered };
+  }
+
+  /**
+   * BAI-098 — notifikasi hasil putusan sengketa yang KEGAGALANNYA TERCATAT.
+   *
+   * Mengirim DISPUTE_DECISION ke kedua pihak + VOUCHER_ISSUED untuk apology
+   * voucher, di-await berurutan (bukan fire-and-forget). Kegagalan persist
+   * dicatat via logger.error + audit log (NOTIFICATION_FAILED) dan dilaporkan
+   * lewat return value agar panel admin bisa menampilkan status kirim.
+   * Mengembalikan true bila SEMUA notifikasi berhasil dipersist.
+   */
+  private async notifyDecisionOutcomeTracked(
+    result: {
+      notifyUserIds: string[];
+      disputeNotifTitle: string;
+      disputeNotifBody: string;
+      resolvedDisputeId: string;
+      auditTargetId: string;
+      apologyVouchers: { userId: string; code: string }[];
+    },
+    adminId: string,
+    ipAddress: string,
+  ): Promise<boolean> {
+    let delivered = true;
+    const fail = (where: string, err: unknown): void => {
+      delivered = false;
+      this.logger.error(`notif putusan sengketa ${result.resolvedDisputeId} GAGAL (${where}): ${err instanceof Error ? err.message : String(err)}`);
+    };
+    for (const uid of result.notifyUserIds) {
+      try {
+        await this.prisma.notification.create({
+          data: {
+            notifId: generateNotifId(),
+            userId: uid,
+            type: NotificationType.DISPUTE_DECISION,
+            category: getCategoryForType(NotificationType.DISPUTE_DECISION),
+            title: result.disputeNotifTitle,
+            body: result.disputeNotifBody,
+            isRead: false,
+          },
+        });
+        this.prisma.emitNotificationCreated({ userId: uid, title: result.disputeNotifTitle, body: result.disputeNotifBody, data: { type: 'DISPUTE_RESOLVED', disputeId: result.resolvedDisputeId } });
+      } catch (err: unknown) { fail('DISPUTE_DECISION', err); }
+    }
+    for (const voucher of result.apologyVouchers) {
+      try {
+        await this.prisma.notification.create({
+          data: {
+            notifId: generateNotifId(),
+            userId: voucher.userId,
+            type: NotificationType.VOUCHER_ISSUED,
+            category: getCategoryForType(NotificationType.VOUCHER_ISSUED),
+            title: 'Voucher Apology dari Kahade',
+            body: `Voucher ${voucher.code} telah ditambahkan sebagai permintaan maaf setelah sengketa selesai.`,
+            metadata: { voucherCode: voucher.code, disputeId: result.resolvedDisputeId },
+          },
+        });
+      } catch (err: unknown) { fail('VOUCHER_ISSUED', err); }
+    }
+    if (!delivered) {
+      this.auditLog.logAdminAction({
+        adminId,
+        action: AuditAction.ADMIN_ACTION,
+        targetType: 'Dispute',
+        targetId: result.auditTargetId,
+        description: `NOTIFICATION_FAILED: sebagian/seluruh notifikasi putusan sengketa ${result.resolvedDisputeId} tidak terkirim`,
+        ipAddress,
+      });
+    }
+    return delivered;
   }
 
   async assignAdmin(disputeId: string, requestingAdminId: string, targetAdminId?: string, _ipAddress: string = 'internal'): Promise<object> {
@@ -1110,7 +1130,9 @@ export class AdminDisputesService {
 
     this.auditLog.logAdminAction({
       adminId: requestingAdminId,
-      action: AuditAction.ADMIN_ACTION,
+      // BAI-090: pakai taksonomi DISPUTE_ASSIGNED (bukan ADMIN_ACTION generik)
+      // agar filter audit action=DISPUTE_ASSIGNED menemukan jejak assign.
+      action: AuditAction.DISPUTE_ASSIGNED,
       targetType: 'Dispute',
       targetId: dispute.disputeId,
       description: isReassign
@@ -1180,13 +1202,61 @@ export class AdminDisputesService {
   ): Promise<object> {
     const dispute = await this.prisma.dispute.findFirst({
       where: { OR: [{ id: disputeId }, { disputeId }] },
-      include: { order: { select: { id: true, orderId: true } } },
+      include: { order: { select: { id: true, orderId: true, buyerId: true, sellerId: true } } },
     });
     if (!dispute) throw new NotFoundException({ code: ErrorCodes.DISPUTE_NOT_FOUND, message: 'Dispute not found' });
 
-    const admin = await this.prisma.adminUser.findUnique({ where: { id: adminId }, select: { role: true } });
+    const admin = await this.prisma.adminUser.findUnique({ where: { id: adminId }, select: { role: true, fullName: true } });
     if (admin?.role !== 'SUPER_ADMIN' && dispute.assignedAdminId !== adminId) {
       throw new ForbiddenException({ code: ErrorCodes.NOT_ASSIGNED_ADMIN, message: 'Only the assigned admin or a SUPER_ADMIN can view dispute messages' });
+    }
+
+    // BAI-088: mediator yang di-assign PERTAMA KALI memasuki room order →
+    // beri tahu buyer & seller (DISPUTE_ADMIN_JOINED). Sekali per sengketa
+    // (flag mediatorJoinedNotifiedAt + predikat updateMany agar idempoten di
+    // bawah konkurensi). SUPER_ADMIN yang sekadar mengintip tidak memicu —
+    // hanya mediator yang memegang kasus. Best-effort tercatat (BAI-098):
+    // kegagalan tidak menggagalkan baca chat.
+    if (dispute.assignedAdminId === adminId && !dispute.mediatorJoinedNotifiedAt) {
+      const marked = await this.prisma.dispute.updateMany({
+        where: { id: dispute.id, mediatorJoinedNotifiedAt: null },
+        data: { mediatorJoinedNotifiedAt: new Date() },
+      });
+      if (marked.count > 0) {
+        const joinedTitle = 'Mediator bergabung';
+        const joinedBody = `Mediator ${admin?.fullName?.trim() || 'Kahade'} telah bergabung untuk menangani sengketa ${dispute.disputeId}.`;
+        for (const partyId of [dispute.order.buyerId, dispute.order.sellerId]) {
+          try {
+            await this.prisma.notification.create({
+              data: {
+                notifId: generateNotifId(),
+                userId: partyId,
+                type: NotificationType.DISPUTE_ADMIN_JOINED,
+                category: getCategoryForType(NotificationType.DISPUTE_ADMIN_JOINED),
+                title: joinedTitle,
+                body: joinedBody,
+                isRead: false,
+              },
+            });
+            this.prisma.emitNotificationCreated({
+              userId: partyId,
+              title: joinedTitle,
+              body: joinedBody,
+              data: { type: 'DISPUTE_ADMIN_JOINED', disputeId: dispute.disputeId },
+            });
+          } catch (err: unknown) {
+            this.logger.error(`DISPUTE_ADMIN_JOINED gagal untuk sengketa ${dispute.disputeId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+        this.auditLog.logAdminAction({
+          adminId,
+          action: AuditAction.ADMIN_ACTION,
+          targetType: 'Dispute',
+          targetId: dispute.disputeId,
+          description: `Mediator joined order chat for dispute ${dispute.disputeId} (DISPUTE_ADMIN_JOINED sent)`,
+          ipAddress,
+        });
+      }
     }
 
     const room = await this.prisma.chatRoom.findUnique({
@@ -1249,7 +1319,10 @@ export class AdminDisputesService {
 
     this.auditLog.logAdminAction({
       adminId,
-      action: AuditAction.ADMIN_ACTION,
+      // BAI-090: mulai-review adalah bagian dari alur assignment — catat
+      // sebagai DISPUTE_ASSIGNED agar jejak "siapa memegang sengketa kapan"
+      // bisa difilter (sebelumnya tenggelam di ADMIN_ACTION generik).
+      action: AuditAction.DISPUTE_ASSIGNED,
       targetType: 'Dispute',
       targetId: dispute.disputeId,
       description: `Admin marked dispute ${dispute.disputeId} as UNDER_REVIEW (was ${dispute.status})`,
@@ -1306,11 +1379,14 @@ export class AdminDisputesService {
     // DP-022: pesan mediasi admin tidak boleh hanya realtime — pihak yang offline
     // butuh notification row + push (pola dispute-message.service.ts DSP-OFFLINE-01).
     // Pakai safeContent (sudah escapeHtml) agar tidak ada HTML mentah di notifikasi.
+    // BAI-098: kirim di-await berurutan; kegagalan tercatat (audit + logger) dan
+    // dilaporkan via notificationDelivered — bukan silent-catch.
     const mediationTitle = 'Pesan baru dari mediator';
     const mediationPreview = safeContent.length > 120 ? safeContent.slice(0, 120) + '…' : safeContent;
+    let notificationDelivered = true;
     for (const userId of recipientIds) {
-      this.prisma.notification
-        .create({
+      try {
+        await this.prisma.notification.create({
           data: {
             notifId: generateNotifId(),
             userId,
@@ -1320,16 +1396,28 @@ export class AdminDisputesService {
             body: mediationPreview || `Mediator mengirim pesan baru pada sengketa ${dispute.disputeId}.`,
             isRead: false,
           },
-        })
-        .then(() => {
-          this.prisma.emitNotificationCreated({
-            userId,
-            title: mediationTitle,
-            body: mediationPreview || `Mediator mengirim pesan baru pada sengketa ${dispute.disputeId}.`,
-            data: { type: 'DISPUTE_MESSAGE_RECEIVED', disputeId: dispute.disputeId },
-          });
-        })
-        .catch((err: unknown) => this.logger.warn(`silent-catch: admin mediation notification failed: ${err instanceof Error ? err.message : String(err)}`));
+        });
+        this.prisma.emitNotificationCreated({
+          userId,
+          title: mediationTitle,
+          body: mediationPreview || `Mediator mengirim pesan baru pada sengketa ${dispute.disputeId}.`,
+          data: { type: 'DISPUTE_MESSAGE_RECEIVED', disputeId: dispute.disputeId },
+        });
+      } catch (err: unknown) {
+        notificationDelivered = false;
+        this.logger.error(`notif pesan mediasi sengketa ${dispute.disputeId} GAGAL ke user ${userId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (!notificationDelivered) {
+      this.auditLog.logAdminAction({
+        adminId,
+        action: AuditAction.ADMIN_ACTION,
+        targetType: 'Dispute',
+        targetId: dispute.disputeId,
+        description: `NOTIFICATION_FAILED: admin mediation message notification not delivered for dispute ${dispute.disputeId}`,
+        after: { messageId: message.id },
+        ipAddress,
+      });
     }
     this.auditLog.logAdminAction({
       adminId,
@@ -1337,9 +1425,244 @@ export class AdminDisputesService {
       targetType: 'Dispute',
       targetId: dispute.disputeId,
       description: `Admin sent mediation message in dispute ${dispute.disputeId}`,
-      after: { messageId: message.id },
+      after: { messageId: message.id, notificationDelivered },
       ipAddress,
     });
-    return message;
+    return { ...message, notificationDelivered };
+  }
+
+  /**
+   * BAI-094 — admin melampirkan bukti "titipan" ke sengketa.
+   *
+   * Kontras dengan jalur user (UploadPurpose.USER → upload service): bukti
+   * admin melewati UploadService.uploadDirect dengan tujuan DISPUTE_EVIDENCE
+   * (prefix `uploads/dispute-evidence/<adminId>/`, pola sama dengan jalur
+   * user — lihat verifikasi prefix di upload.service.ts).
+   */
+  async uploadEvidenceFileAsAdmin(
+    disputeId: string,
+    adminId: string,
+    file: { originalname: string; mimetype: string; size: number; buffer: Buffer } | undefined,
+    ipAddress: string = 'internal',
+  ): Promise<object> {
+    const dispute = await this.mustFindDisputeForAdmin(disputeId, adminId, 'upload evidence');
+    if (!file || !file.buffer || file.size === 0) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'File bukti wajib dilampirkan.' });
+    }
+    const result = await this.uploadService.uploadDirect(
+      adminId,
+      UploadPurpose.DISPUTE_EVIDENCE,
+      file.originalname,
+      file.mimetype,
+      file.buffer,
+    );
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.DISPUTE_EVIDENCE_SUBMITTED,
+      targetType: 'Dispute',
+      targetId: dispute.disputeId,
+      description: `Admin uploaded dispute evidence file (pending submit) for dispute ${dispute.disputeId}`,
+      after: { fileKey: result.fileKey },
+      ipAddress,
+    });
+    return result;
+  }
+
+  /**
+   * BAI-094 — admin meng-submit bukti "titipan" (file SUDAH di-upload via
+   * uploadEvidenceFileAsAdmin, belum di-confirm) ke sengketa.
+   *
+   * Menyatakan bukti atas nama ADMIN (submittedByRole='ADMIN',
+   * submittedByAdminId), fail-closed:
+   * - hanya mediator yang di-assign / SUPER_ADMIN (NOT_ASSIGNED_ADMIN);
+   * - hanya status terbuka untuk bukti (OPEN, ASSIGNED, UNDER_REVIEW —
+   *   ditambah ESCALATED karena mediator paling butuh melampirkan titipan
+   *   saat eskalasi berjalan);
+   * - fileKeys wajib lolos verifikasi prefix/konfirmasi (anti-referensi
+   *   file milik user lain);
+   * - batas 10MB/file dan 50MB per submit (pola sama dengan jalur user).
+   */
+  async submitEvidenceAsAdmin(
+    disputeId: string,
+    adminId: string,
+    dto: SubmitDisputeEvidenceAdminDto,
+    ipAddress: string = 'internal',
+  ): Promise<object> {
+    const dispute = await this.mustFindDisputeForAdmin(disputeId, adminId, 'submit evidence');
+    const openForEvidence: DisputeStatus[] = [DisputeStatus.OPEN, DisputeStatus.ASSIGNED, DisputeStatus.UNDER_REVIEW, DisputeStatus.ESCALATED];
+    if (!openForEvidence.includes(dispute.status)) {
+      throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: `Bukti tidak bisa ditambahkan pada sengketa berstatus ${dispute.status}.` });
+    }
+    if (!dto.fileUrls || dto.fileUrls.length === 0) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Minimal satu file bukti wajib dilampirkan.' });
+    }
+    if (dto.fileUrls.length !== dto.fileTypes.length) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'fileUrls dan fileTypes harus berpasangan.' });
+    }
+
+    // Verifikasi kunci (prefix admin-scoped + confirmed, anti-spoof).
+    const fileResults = await this.uploadService.verifyEvidenceFileKeysBatch(adminId, dto.fileUrls, dto.fileTypes);
+    const failed = fileResults.filter((r) => r.status !== 'ok');
+    if (failed.length > 0) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: `Bukti tidak valid: ${failed.map((f) => f.error ?? 'unknown').join('; ')}`,
+      });
+    }
+    const validKeys = dto.fileUrls;
+    const validTypes = fileResults.map((r) => r.fileType);
+    // Verifikasi ukuran (pola sama dengan jalur user; verify batch tidak
+    // mengembalikan size, jadi baca via getFileSize).
+    const MAX_PER_FILE = 10 * 1024 * 1024;
+    const MAX_TOTAL = 50 * 1024 * 1024;
+    const fileSizes = await Promise.all(
+      validKeys.map(async (key) => {
+        try {
+          return await this.uploadService.getFileSize(key);
+        } catch {
+          return -1;
+        }
+      }),
+    );
+    if (fileSizes.some((s) => s < 0)) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Ukuran salah satu file tidak bisa diverifikasi. Coba lagi.' });
+    }
+    const oversizedIdx = fileSizes.findIndex((s) => s > MAX_PER_FILE);
+    if (oversizedIdx >= 0) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `File ${validKeys[oversizedIdx]} melebihi batas 10MB.` });
+    }
+    const totalSize = fileSizes.reduce((sum, s) => sum + s, 0);
+    if (totalSize > MAX_TOTAL) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Total ukuran bukti melebihi batas 50MB per submit.' });
+    }
+
+    // Model DisputeEvidence hanya menyimpan description (tanpa title/tags) —
+    // judul dilipat ke baris pertama deskripsi, pola sama dengan jalur user.
+    const description = `[${dto.title}] ${dto.description}\n\n— Evidence (titipan) admin untuk sengketa ${dispute.disputeId}`;
+    const evidence = await this.prisma.disputeEvidence.create({
+      data: {
+        disputeId: dispute.id,
+        description,
+        fileUrls: validKeys,
+        fileTypes: validTypes,
+        submittedByRole: 'ADMIN',
+        submittedByAdminId: adminId,
+      },
+    });
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.DISPUTE_EVIDENCE_SUBMITTED,
+      targetType: 'Dispute',
+      targetId: dispute.disputeId,
+      description: `Admin submitted evidence (titipan) for dispute ${dispute.disputeId}: ${dto.title}`,
+      after: { evidenceDbId: evidence.id, fileCount: validKeys.length },
+      ipAddress,
+    });
+
+    // Beri tahu kedua pihak (transparansi) — kegagalan tercatat (BAI-098).
+    let notificationDelivered = true;
+    const evTitle = 'Bukti baru pada sengketa';
+    const evBody = `Mediator menambahkan bukti "${dto.title}" pada sengketa ${dispute.disputeId}.`;
+    for (const partyId of [dispute.order.buyerId, dispute.order.sellerId]) {
+      try {
+        await this.prisma.notification.create({
+          data: {
+            notifId: generateNotifId(),
+            userId: partyId,
+            type: NotificationType.DISPUTE_EVIDENCE_SUBMITTED,
+            category: getCategoryForType(NotificationType.DISPUTE_EVIDENCE_SUBMITTED),
+            title: evTitle,
+            body: evBody,
+            isRead: false,
+          },
+        });
+        this.prisma.emitNotificationCreated({
+          userId: partyId,
+          title: evTitle,
+          body: evBody,
+          data: { type: 'DISPUTE_EVIDENCE_SUBMITTED', disputeId: dispute.disputeId },
+        });
+      } catch (err: unknown) {
+        notificationDelivered = false;
+        this.logger.error(`notif bukti admin sengketa ${dispute.disputeId} GAGAL: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    return {
+      evidence,
+      fileResults,
+      summary: { filesAttached: validKeys.length, totalSizeBytes: totalSize },
+      notificationDelivered,
+    };
+  }
+
+  /**
+   * BAI-095 — baca catatan internal sengketa (kolaboratif antar admin).
+   * Hanya mediator yang di-assign / SUPER_ADMIN (NOT_ASSIGNED_ADMIN).
+   */
+  async listInternalNotes(disputeId: string, adminId: string): Promise<object> {
+    const dispute = await this.mustFindDisputeForAdmin(disputeId, adminId, 'read internal notes');
+    const notes = await this.prisma.disputeInternalNote.findMany({
+      where: { disputeId: dispute.id },
+      orderBy: { createdAt: 'asc' },
+      include: { admin: { select: { adminId: true, fullName: true } } },
+    });
+    return { disputeId: dispute.disputeId, notes };
+  }
+
+  /**
+   * BAI-095 — tambah catatan internal sengketa (maks 2000 karakter).
+   * Hanya mediator yang di-assign / SUPER_ADMIN (NOT_ASSIGNED_ADMIN).
+   */
+  async addInternalNote(
+    disputeId: string,
+    adminId: string,
+    note: string,
+    ipAddress: string = 'internal',
+  ): Promise<object> {
+    const dispute = await this.mustFindDisputeForAdmin(disputeId, adminId, 'add internal note');
+    const trimmed = (note ?? '').trim();
+    if (!trimmed || trimmed.length > 2000) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Catatan harus 1–2000 karakter.' });
+    }
+    const created = await this.prisma.disputeInternalNote.create({
+      data: { disputeId: dispute.id, adminId, note: trimmed },
+      include: { admin: { select: { adminId: true, fullName: true } } },
+    });
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'Dispute',
+      targetId: dispute.disputeId,
+      description: `Admin added internal note to dispute ${dispute.disputeId}`,
+      after: { noteId: created.id },
+      ipAddress,
+    });
+    return created;
+  }
+
+  /**
+   * Guard bersama untuk operasi admin atas sengketa (BAI-088/094/095):
+   * sengketa harus ada dan admin harus mediator yang di-assign atau
+   * SUPER_ADMIN — fail-closed dengan NOT_ASSIGNED_ADMIN.
+   */
+  private async mustFindDisputeForAdmin(
+    disputeId: string,
+    adminId: string,
+    actionLabel: string,
+  ): Promise<{ id: string; disputeId: string; status: DisputeStatus; assignedAdminId: string | null; order: { buyerId: string; sellerId: string } }> {
+    const dispute = await this.prisma.dispute.findFirst({
+      where: { OR: [{ id: disputeId }, { disputeId }] },
+      include: { order: { select: { buyerId: true, sellerId: true } } },
+    });
+    if (!dispute) {
+      throw new NotFoundException({ code: ErrorCodes.DISPUTE_NOT_FOUND, message: 'Dispute not found' });
+    }
+    const admin = await this.prisma.adminUser.findUnique({ where: { id: adminId }, select: { role: true } });
+    if (admin?.role !== 'SUPER_ADMIN' && dispute.assignedAdminId !== adminId) {
+      throw new ForbiddenException({ code: ErrorCodes.NOT_ASSIGNED_ADMIN, message: `Only the assigned mediator or a SUPER_ADMIN can ${actionLabel}` });
+    }
+    return dispute as { id: string; disputeId: string; status: DisputeStatus; assignedAdminId: string | null; order: { buyerId: string; sellerId: string } };
   }
 }

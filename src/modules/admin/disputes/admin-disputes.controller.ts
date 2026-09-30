@@ -1,10 +1,14 @@
 import { AdminRoute } from '../../../common/decorators/public.decorator';
 import { Idempotency } from '../../../common/decorators/idempotency.decorator';
-import { Controller, Get, Post, Param, Body, Query, UseGuards, Req, DefaultValuePipe, ParseBoolPipe } from '@nestjs/common';
+import { Controller, Get, Post, Param, Body, Query, UseGuards, Req, DefaultValuePipe, ParseBoolPipe, UseInterceptors, UploadedFile } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { ParseIdPipe } from '../../../common/pipes/parse-id.pipe';
 import { ParseQueryStringPipe } from '../../../common/pipes/parse-query-string.pipe';
 import { ClampLimitPipe } from '../../../common/pipes/clamp-limit.pipe';
-import { ApiTags, ApiBearerAuth, ApiOperation, ApiResponse } from '@nestjs/swagger';
+import { ApiTags, ApiBearerAuth, ApiOperation, ApiResponse, ApiConsumes } from '@nestjs/swagger';
+import { SubmitEvidenceDto } from '../../disputes/dto/submit-evidence.dto';
+import { SubmitDisputeEvidenceAdminDto } from './dto/submit-dispute-evidence-admin.dto';
+import { UPLOAD_DIRECT_MULTER_MAX_BYTES } from '../../../common/constants/app.constants';
 import { Request } from 'express';
 import { AdminJwtPayload } from '../../../common/types/jwt-payload.types';
 import { AdminDisputesService } from './admin-disputes.service';
@@ -94,6 +98,70 @@ export class AdminDisputesController {
     @Req() req: Request,
   ): Promise<object> {
     return this.service.sendDisputeMessage(disputeId, admin.sub, dto.content, req.ip || 'unknown');
+  }
+
+  // BAI-094: admin melampirkan bukti "titipan" ke sengketa. Dua tahap:
+  // 1) POST :disputeId/evidence/upload (multipart) → fileKey (belum di-confirm)
+  // 2) POST :disputeId/evidence (JSON SubmitEvidenceDto) → verifikasi +
+  //    simpan sebagai bukti ADMIN. Hanya mediator yang di-assign / SUPER_ADMIN.
+  @Post(':disputeId/evidence/upload')
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN')
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: UPLOAD_DIRECT_MULTER_MAX_BYTES } }))
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({ summary: 'Admin upload dispute evidence file', description: 'Uploads a file as admin for later evidence submit. Uses UploadService.uploadDirect with DISPUTE_EVIDENCE purpose (admin-scoped prefix).' })
+  @ApiResponse({ status: 201, description: 'File uploaded, returns fileKey.' })
+  @ApiResponse({ status: 403, description: 'Not the assigned admin.' })
+  uploadEvidenceFile(
+    @Param('disputeId', ParseIdPipe) disputeId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.uploadEvidenceFileAsAdmin(disputeId, admin.sub, file, req.ip || 'unknown');
+  }
+
+  @Post(':disputeId/evidence')
+  @Idempotency()
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN')
+  @ApiOperation({ summary: 'Admin submit dispute evidence', description: 'Submits admin-uploaded files as dispute evidence (submittedByRole=ADMIN). Only the assigned mediator or SUPER_ADMIN.' })
+  @ApiResponse({ status: 201, description: 'Evidence submitted.' })
+  @ApiResponse({ status: 403, description: 'Not the assigned admin.' })
+  submitEvidence(
+    @Param('disputeId', ParseIdPipe) disputeId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Body() dto: SubmitDisputeEvidenceAdminDto,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.submitEvidenceAsAdmin(disputeId, admin.sub, dto, req.ip || 'unknown');
+  }
+
+  // BAI-095: catatan internal sengketa (kolaboratif antar admin) —
+  // pengganti draf localStorage per-perangkat di panel admin.
+  @Get(':disputeId/notes')
+  @AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN')
+  @ApiOperation({ summary: 'List internal dispute notes', description: 'Returns internal notes for a dispute. Only the assigned mediator or SUPER_ADMIN.' })
+  listInternalNotes(
+    @Param('disputeId', ParseIdPipe) disputeId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+  ): Promise<object> {
+    return this.service.listInternalNotes(disputeId, admin.sub);
+  }
+
+  @Post(':disputeId/notes')
+  @Idempotency()
+  @UseGuards(UserThrottleGuard)
+  @AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN')
+  @ApiOperation({ summary: 'Add internal dispute note', description: 'Adds an internal note to a dispute. Only the assigned mediator or SUPER_ADMIN.' })
+  @ApiResponse({ status: 201, description: 'Note added.' })
+  addInternalNote(
+    @Param('disputeId', ParseIdPipe) disputeId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Body() body: { note: string },
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.addInternalNote(disputeId, admin.sub, body.note, req.ip || 'unknown');
   }
 
   // B-31 (audit-fix): assign is idempotent so double-click cannot race two

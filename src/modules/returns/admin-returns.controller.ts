@@ -37,10 +37,13 @@ export class AdminReturnsController {
 
   @Post(':id/action')
   @Idempotency()
-  // ADM-104: aksi uang (APPROVE → refund, FORCE_RESOLVE_* → tutup paksa)
-  // hanya boleh dilakukan SUPER_ADMIN / DISPUTE_ADMIN — CUSTOMER_SUPPORT
-  // sengaja dikecualikan walau guard level-class mengizinkannya.
-  @AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN')
+  // ADM-104: aksi uang (APPROVE → refund, FORCE_RESOLVE_* → tutup paksa,
+  // EXTEND_DEADLINE) hanya boleh dilakukan SUPER_ADMIN / DISPUTE_ADMIN —
+  // CUSTOMER_SUPPORT sengaja dikecualikan walau guard level-class mengizinkannya.
+  // BAI-083: REJECT & ESCALATE memang boleh untuk CUSTOMER_SUPPORT (operasional
+  // harian), sehingga guard method-level mencakup CS; pembatasan aksi uang
+  // ditegakkan di ReturnsService.adminAct (fail-closed bila role berubah).
+  @AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN', 'CUSTOMER_SUPPORT')
   @ApiOperation({ summary: 'Aksi admin: approve / reject / escalate / force-resolve' })
   async act(
     @Param('id') id: string,
@@ -59,5 +62,21 @@ export class AdminReturnsController {
     @Body() body: { message: string },
   ) {
     return this.returnsService.addNote(id, admin.sub, { message: body.message }, 'ADMIN');
+  }
+
+  @Post(':id/convert-to-dispute')
+  @Idempotency()
+  // BAI-086: tombol "Buat sengketa dari retur" — konversi manual retur
+  // ESCALATED yang eskalasinya tidak menemukan sengketa aktif
+  // (needsManualConversion). Fail-closed di service: hanya dari ESCALATED,
+  // idempoten bila sengketa sudah ada. Aksi non-uang → boleh DISPUTE_ADMIN
+  // (dan CS tidak — konversi membuat case sengketa baru).
+  @AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN')
+  @ApiOperation({ summary: 'Buat sengketa baru dari retur ESCALATED (konversi manual)' })
+  async convertToDispute(
+    @Param('id') id: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+  ) {
+    return this.returnsService.convertReturnToDispute(id, admin.sub);
   }
 }

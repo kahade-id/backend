@@ -24,6 +24,8 @@ import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
 import { UploadService } from '../upload/upload.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
+import { generateDisputeId } from '../../common/utils/id-generator.util';
+import { DISPUTE_SLA_HOURS } from '../../common/constants/app.constants';
 import { getReturnsDb } from './returns.db';
 import { assertLegalReturnTransition, ACTIVE_RETURN_STATUSES } from './returns-state';
 import {
@@ -48,6 +50,7 @@ import type {
   ReturnActorType,
   ReturnPolicyRow,
   ReturnRequestRow,
+  RefundDanaInfo,
   ReturnResolutionType,
   ReturnStatus,
 } from './returns.types';
@@ -383,6 +386,10 @@ export class ReturnsService {
         executedAt: approval.executedAt, failureReason: approval.failureReason,
         walletTxIds: approval.walletTxIds,
       } : null,
+      // BAI-049 (P1): status eksekusi refund DANA (null bila belum dieksekusi
+      // via DANA Refund API). Hanya untuk admin — user tidak butuh detail
+      // referensi provider.
+      refundDana: opts.isAdmin ? await this.refundDanaFor(ret.id) : null,
     };
   }
 
@@ -672,7 +679,7 @@ export class ReturnsService {
   }
 
   /** G217 — eskalasi ke sengketa TANPA case ganda: link dispute existing. */
-  async escalateToDispute(returnDbId: string, userId: string, role: ReturnActorType, reason?: string): Promise<ReturnRequestRow & { needsManualConversion: boolean }> {
+  async escalateToDispute(returnDbId: string, userId: string, role: ReturnActorType, reason?: string): Promise<ReturnRequestRow & { needsManualConversion: boolean; notificationDelivered: boolean }> {
     const ret = await this.mustFind(returnDbId);
     if (role !== 'ADMIN') this.assertParty(ret, userId, role);
     if (!['REQUESTED', 'SELLER_REVIEW', 'CLARIFICATION_NEEDED', 'REJECTED', 'APPROVED', 'RETURN_SHIPPING', 'RECEIVED'].includes(ret.status)) {
@@ -709,20 +716,22 @@ export class ReturnsService {
         description: `Retur ${ret.returnId} dieskalasi oleh ${role}${existingDispute ? ` — ditautkan ke sengketa existing ${existingDispute.id}` : ''}`,
       });
     }
-    this.notify.notifyBoth(
-      ret.buyerId, ret.sellerId, 'RETURN_ESCALATED',
+    // BAI-098: pakai notifyBothTracked — kegagalan tercatat di timeline +
+    // flag dikembalikan agar admin UI menampilkan status kirim.
+    const notificationDelivered = await this.notifyBothTracked(
+      ret, 'RETURN_ESCALATED',
       `Retur ${ret.returnId} dieskalasi`,
       `Pengajuan retur ${ret.returnId} diteruskan ke tim sengketa Kahade.${existingDispute ? '' : ' Tim support akan menghubungi Anda.'}`,
       `Retur ${ret.returnId} dieskalasi`,
       `Pengajuan retur ${ret.returnId} diteruskan ke tim sengketa Kahade.`,
-      ret.id, ret.returnId,
-    ).catch((e) => this.logger.warn(`notif escalate gagal: ${(e as Error).message}`));
+      'eskalasi retur',
+    );
     // BAI-086: bila tidak ada sengketa aktif yang bisa ditautkan, kembalikan
     // flag needsManualConversion agar pemanggil (admin UI) menampilkan
     // peringatan + tombol "buat sengketa dari retur" — retur tidak boleh
     // nyangkut di ESCALATED tanpa pemilik.
     const needsManualConversion = !existingDispute;
-    return { ...updated, needsManualConversion };
+    return { ...updated, needsManualConversion, notificationDelivered };
   }
 
   /**
@@ -731,10 +740,82 @@ export class ReturnsService {
    * Dipakai tombol "Buat sengketa dari retur" di admin saat eskalasi tidak
    * menemukan sengketa aktif (`needsManualConversion: true`). Fail-closed:
    * - hanya dari status ESCALATED (retur yang memang sudah dieskalasi);
-   * - bila ternyata sudah ada sengketa aktif untuk order ini, tautkan saja
-   *   (idempoten — tidak membuat duplikat);
-   * - sengketa baru lahir OPEN agar masuk antrean assign normal mediator.
+   * - bila ternyata sudah ada sengketa untuk order ini, tautkan saja
+   *   (idempoten — tidak membuat duplikat; `Dispute.orderId` unik);
+   * - sengketa baru lahir OPEN agar masuk antrean assign normal mediator;
+   * - TIDAK menyentuh status order / wallet — alur uang tetap milik retur;
+   *   sengketa ini memberi kasus yang bisa di-assign ke mediator.
    */
+  async convertReturnToDispute(
+    returnDbId: string,
+    adminId: string,
+  ): Promise<{ disputeId: string; created: boolean; linked: boolean; notificationDelivered: boolean }> {
+    const ret = await this.mustFind(returnDbId);
+    if (ret.status !== 'ESCALATED') {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Hanya retur berstatus ESCALATED yang dapat dikonversi menjadi sengketa.',
+      });
+    }
+
+    const existing = await this.prisma.dispute.findFirst({
+      where: { orderId: ret.orderId },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, disputeId: true },
+    });
+    if (existing) {
+      if (ret.disputeId !== existing.id) {
+        await this.db().returnRequest.update({ where: { id: ret.id }, data: { disputeId: existing.id } });
+        await this.logTimeline(ret.id, 'RETURN_LINKED_DISPUTE', {
+          actorId: adminId, actorRole: 'ADMIN',
+          metadata: { disputeId: existing.disputeId, convertedBy: 'admin', autoLinked: true },
+        });
+      }
+      return { disputeId: existing.disputeId, created: false, linked: true, notificationDelivered: true };
+    }
+
+    const serial = await this.serial.getNextForPrefix('dispute_serial');
+    const now = new Date();
+    const dispute = await this.prisma.dispute.create({
+      data: {
+        disputeId: generateDisputeId(serial),
+        orderId: ret.orderId,
+        // Retur selalu diajukan pembeli — inisiator konversi dicatat sebagai buyer.
+        initiatedBy: 'BUYER',
+        initiatorUserId: ret.buyerId,
+        buyerClaim: `Dikonversi dari retur ${ret.returnId} oleh admin. Alasan retur: ${ret.reasonCode}${ret.reasonDetail ? ` — ${ret.reasonDetail}` : ''}`.slice(0, 2000),
+        buyerClaimedAt: now,
+        status: 'OPEN',
+        slaHours: DISPUTE_SLA_HOURS,
+        slaDeadlineAt: new Date(now.getTime() + DISPUTE_SLA_HOURS * 3_600_000),
+      },
+      select: { id: true, disputeId: true },
+    });
+    await this.db().returnRequest.update({ where: { id: ret.id }, data: { disputeId: dispute.id } });
+    await this.logTimeline(ret.id, 'RETURN_CONVERTED_TO_DISPUTE', {
+      actorId: adminId, actorRole: 'ADMIN',
+      metadata: { disputeId: dispute.disputeId, convertedBy: 'admin' },
+    });
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.DISPUTE_ESCALATED,
+      targetType: 'Dispute',
+      targetId: dispute.disputeId,
+      description: `Admin membuat sengketa ${dispute.disputeId} dari retur ${ret.returnId} (konversi manual pasca-eskalasi)`,
+      ipAddress: 'system',
+    });
+    // BAI-098: kegagalan notifikasi dicatat di timeline + dikembalikan sebagai
+    // flag agar admin UI bisa menampilkan status kirim.
+    const notificationDelivered = await this.notifyBothTracked(
+      ret, 'DISPUTE_SUBMITTED',
+      `Sengketa ${dispute.disputeId} dibuat dari retur`,
+      `Retur ${ret.returnId} Anda dikonversi menjadi sengketa ${dispute.disputeId} dan akan ditangani mediator.`,
+      `Sengketa ${dispute.disputeId} dibuat dari retur`,
+      `Retur ${ret.returnId} dikonversi menjadi sengketa ${dispute.disputeId} dan akan ditangani mediator.`,
+      'konversi retur→sengketa',
+    );
+    return { disputeId: dispute.disputeId, created: true, linked: true, notificationDelivered };
+  }
   /** G219 — antrean admin + filter umur kasus. */
   async adminQueue(query: ReturnQueueQueryDto) {
     const page = query.page ?? 1;
@@ -762,35 +843,120 @@ export class ReturnsService {
       this.db().returnRequest.findMany({ where, orderBy: { createdAt: 'asc' }, skip: (page - 1) * limit, take: limit }),
       this.db().returnRequest.count({ where }),
     ]);
+    // BAI-049 (P1): status refund DANA untuk tiap retur — batch agar tidak N+1.
+    const refundMap = await this.refundDanaMap(items.map((r) => r.id));
     const now = Date.now();
     return {
-      items: items.map((r) => ({ ...this.toListItem(r), ageHours: Math.floor((now - r.createdAt.getTime()) / 3_600_000) })),
+      items: items.map((r) => ({
+        ...this.toListItem(r),
+        ageHours: Math.floor((now - r.createdAt.getTime()) / 3_600_000),
+        refundDana: refundMap.get(r.id) ?? null,
+      })),
       page, limit, total, totalPages: Math.ceil(total / limit),
     };
   }
 
+  /**
+   * BAI-049 (P1): status eksekusi refund DANA untuk retur (null bila refund
+   * belum/tidak dieksekusi via DANA Refund API). IdempotencyKey stabil
+   * `RETURN:<returnDbId>` — sama dengan yang dipakai
+   * executeRefundForReturnNoWallet.
+   */
+  private async refundDanaMap(returnDbIds: string[]): Promise<
+    Map<string, { status: string; danaReferenceNo: string | null; partnerRefundNo: string; amountSen: string; updatedAt: Date }>
+  > {
+    const map = new Map<string, { status: string; danaReferenceNo: string | null; partnerRefundNo: string; amountSen: string; updatedAt: Date }>();
+    if (returnDbIds.length === 0) return map;
+    const attempts = await this.prisma.danaRefundAttempt.findMany({
+      where: { idempotencyKey: { in: returnDbIds.map((id) => `RETURN:${id}`) } },
+      select: { idempotencyKey: true, status: true, danaReferenceNo: true, partnerRefundNo: true, amountSen: true, updatedAt: true },
+    });
+    for (const a of attempts) {
+      const returnDbId = a.idempotencyKey.slice('RETURN:'.length);
+      map.set(returnDbId, {
+        status: a.status,
+        danaReferenceNo: a.danaReferenceNo,
+        partnerRefundNo: a.partnerRefundNo,
+        amountSen: a.amountSen.toString(),
+        updatedAt: a.updatedAt,
+      });
+    }
+    return map;
+  }
+
+  /** BAI-049: versi single-item untuk detail/aksi admin. */
+  private async refundDanaFor(returnDbId: string): Promise<RefundDanaInfo> {
+    const attempt = await this.prisma.danaRefundAttempt.findUnique({
+      where: { idempotencyKey: `RETURN:${returnDbId}` },
+      select: { status: true, danaReferenceNo: true, partnerRefundNo: true, amountSen: true, updatedAt: true },
+    });
+    return attempt
+      ? {
+          status: attempt.status,
+          danaReferenceNo: attempt.danaReferenceNo,
+          partnerRefundNo: attempt.partnerRefundNo,
+          amountSen: attempt.amountSen.toString(),
+          updatedAt: attempt.updatedAt,
+        }
+      : null;
+  }
+
   /** Aksi admin: approve / reject / escalate / force-resolve. */
-  async adminAct(returnDbId: string, adminId: string, dto: AdminReturnActionDto): Promise<ReturnRequestRow> {
+  async adminAct(
+    returnDbId: string,
+    adminId: string,
+    dto: AdminReturnActionDto,
+  ): Promise<ReturnRequestRow & { refundDana: RefundDanaInfo; notificationDelivered?: boolean; needsManualConversion?: boolean }> {
     const ret = await this.mustFind(returnDbId);
+    // BAI-083: guard method-level kini mencakup CUSTOMER_SUPPORT agar
+    // REJECT/ESCALATE bisa dipakai CS — tapi aksi UANG tetap fail-closed di
+    // sini (tidak bergantung pada decorator saja bila role berubah).
+    const MONEY_ACTIONS = ['APPROVE', 'FORCE_RESOLVE_REFUND', 'FORCE_RESOLVE_EXCHANGE', 'FORCE_RESOLVE_REPAIR', 'EXTEND_DEADLINE'];
+    if (MONEY_ACTIONS.includes(dto.action)) {
+      const admin = await this.prisma.adminUser.findUnique({ where: { id: adminId }, select: { role: true } });
+      if (admin?.role !== 'SUPER_ADMIN' && admin?.role !== 'DISPUTE_ADMIN') {
+        throw new ForbiddenException({
+          code: ErrorCodes.INSUFFICIENT_ADMIN_ROLE,
+          message: 'Aksi ini (keuangan) hanya boleh dilakukan SUPER_ADMIN / DISPUTE_ADMIN.',
+        });
+      }
+    }
+    let result: ReturnRequestRow;
+    let notificationDelivered: boolean | undefined;
+    let needsManualConversion: boolean | undefined;
     switch (dto.action) {
-      case 'APPROVE':
-        return this.sellerRespondAsAdmin(ret, adminId, {
+      case 'APPROVE': {
+        const r = await this.sellerRespondAsAdmin(ret, adminId, {
           decision: 'APPROVE',
           resolutionType: dto.resolutionType ?? ret.resolutionType ?? 'REFUND',
           refundAmountSen: dto.refundAmountSen,
           note: dto.note,
         });
-      case 'REJECT':
-        return this.sellerRespondAsAdmin(ret, adminId, {
+        notificationDelivered = r.notificationDelivered;
+        result = r;
+        break;
+      }
+      case 'REJECT': {
+        const r = await this.sellerRespondAsAdmin(ret, adminId, {
           decision: 'REJECT',
           rejectReasonCode: dto.rejectReasonCode ?? 'LAINNYA',
           note: dto.note,
         });
-      case 'ESCALATE':
-        return this.escalateToDispute(returnDbId, adminId, 'ADMIN', dto.note);
+        notificationDelivered = r.notificationDelivered;
+        result = r;
+        break;
+      }
+      case 'ESCALATE': {
+        const r = await this.escalateToDispute(returnDbId, adminId, 'ADMIN', dto.note);
+        notificationDelivered = r.notificationDelivered;
+        needsManualConversion = r.needsManualConversion;
+        result = r;
+        break;
+      }
       case 'EXTEND_DEADLINE':
         // ADM-114: tombol "+24 jam" kini punya implementasi backend.
-        return this.extendSellerDeadlineAsAdmin(ret, adminId);
+        result = await this.extendSellerDeadlineAsAdmin(ret, adminId);
+        break;
       case 'FORCE_RESOLVE_REFUND':
       case 'FORCE_RESOLVE_EXCHANGE':
       case 'FORCE_RESOLVE_REPAIR': {
@@ -805,9 +971,18 @@ export class ReturnsService {
             patch: { receivedAt: new Date(), receivedNote: 'Dilewati oleh admin (force-resolve).' },
           });
         }
-        return this.resolveReturn(current.id, adminId, 'ADMIN', outcome, dto.note ?? 'Force-resolve oleh admin.');
+        result = await this.resolveReturn(current.id, adminId, 'ADMIN', outcome, dto.note ?? 'Force-resolve oleh admin.');
+        break;
       }
+      default:
+        // Fail-closed: aksi tak dikenal tidak boleh lolos diam-diam.
+        throw new BadRequestException({ code: 'INVALID_RETURN_ACTION', message: `Aksi retur tidak dikenal: ${(dto as { action?: string }).action}` });
     }
+    // BAI-049 (P1): respons aksi admin menyertakan status eksekusi refund DANA
+    // agar operator tahu apakah DANA Refund API benar-benar sukses/gagal —
+    // bukan hanya status retur RESOLVED_REFUND.
+    const refundDana = await this.refundDanaFor(result.id);
+    return { ...result, refundDana, notificationDelivered, needsManualConversion };
   }
 
   /**
@@ -1040,6 +1215,44 @@ export class ReturnsService {
     }).catch((e) => this.logger.warn(`timeline gagal: ${(e as Error).message}`));
   }
 
+  /**
+   * BAI-098 — notifikasi aksi admin yang KEGAGALANNYA TERCATAT.
+   *
+   * Mengirim ke buyer+seller, lalu:
+   * - sukses → `true`;
+   * - gagal persist (salah satu / keduanya) → `logger.error` + entri
+   *   timeline `NOTIFICATION_FAILED` (terlihat di panel admin) → `false`.
+   * Pemanggil (aksi admin) menyertakan flag ini di respons agar UI bisa
+   * menampilkan status kirim, bukan menebak.
+   */
+  private async notifyBothTracked(
+    ret: ReturnRequestRow,
+    stage: string,
+    buyerTitle: string,
+    buyerBody: string,
+    sellerTitle: string,
+    sellerBody: string,
+    context: string,
+  ): Promise<boolean> {
+    try {
+      const res = await this.notify.notifyBoth(
+        ret.buyerId, ret.sellerId, stage,
+        buyerTitle, buyerBody, sellerTitle, sellerBody,
+        ret.id, ret.returnId,
+      );
+      if (!res.delivered) throw new Error('persist baris notifikasi gagal');
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.error(`notif ${context} GAGAL untuk retur ${ret.returnId}: ${message}`);
+      await this.logTimeline(ret.id, 'NOTIFICATION_FAILED', {
+        actorRole: 'SYSTEM',
+        metadata: { stage, context, error: message },
+      });
+      return false;
+    }
+  }
+
   /** Eksekusi refund idempoten untuk satu return (G210/G211). */
   private async executeRefundForReturn(ret: ReturnRequestRow, actorId: string, actorRole: ReturnActorType): Promise<void> {
     const approval = await this.refundService.getApproval(ret.id);
@@ -1087,12 +1300,19 @@ export class ReturnsService {
       await this.logTimeline(ret.id, 'REFUND_FAILED', { actorId, actorRole, metadata: { reason } });
       if ((err as { code?: string })?.code === RETURN_REFUND_INSUFFICIENT_FUNDS) {
         // Dana seller kurang → biarkan FAILED agar admin menindaklanjuti; jangan hanguskan.
-        this.notify.notifyStage({
+        // BAI-098: kegagalan notifikasi ini pun tercatat (bukan .catch diam-diam).
+        const delivered = await this.notify.notifyStage({
           userId: ret.sellerId, stage: 'RETURN_REFUND_APPROVED',
           title: `Saldo tidak cukup untuk refund ${ret.returnId}`,
           body: `Refund ${ret.returnId} gagal dieksekusi karena saldo Anda tidak mencukupi. Harap top-up atau hubungi support.`,
           returnDbId: ret.id, returnPublicId: ret.returnId,
-        }).catch(() => undefined);
+        });
+        if (!delivered.delivered) {
+          this.logger.error(`notif saldo-kurang refund ${ret.returnId} GAGAL persist`);
+          await this.logTimeline(ret.id, 'NOTIFICATION_FAILED', {
+            actorId, actorRole, metadata: { stage: 'RETURN_REFUND_APPROVED', context: 'saldo tidak cukup' },
+          });
+        }
       }
       throw err;
     }
@@ -1166,7 +1386,7 @@ export class ReturnsService {
     ret: ReturnRequestRow, adminId: string,
     dto: { decision: 'APPROVE' | 'REJECT'; resolutionType?: ReturnResolutionType; refundAmountSen?: number; rejectReasonCode?: never; note?: string } |
          { decision: 'REJECT'; rejectReasonCode: 'MELEWATI_BATAS_WAKTU' | 'BARANG_TIDAK_RUSAK' | 'KLAIM_TIDAK_VALID' | 'BUKTI_TIDAK_CUKUP' | 'BARANG_SUDAH_DIGUNAKAN' | 'KERUSAKAN_AKIBAT_PEMBELI' | 'DILUAR_CAKUPAN_KEBIJAKAN' | 'LAINNYA'; note?: string },
-  ): Promise<ReturnRequestRow> {
+  ): Promise<ReturnRequestRow & { notificationDelivered?: boolean }> {
     // Reuse logika sellerRespond dengan actorRole ADMIN — duplikasi minimal.
     if (dto.decision === 'REJECT') {
       const r = dto as { rejectReasonCode: 'LAINNYA'; note?: string };
@@ -1177,8 +1397,16 @@ export class ReturnsService {
         actorId: adminId, actorRole: 'ADMIN', event: 'ADMIN_REJECTED',
         patch: { rejectReasonCode: r.rejectReasonCode, rejectNote: r.note?.trim() || null, rejectedAt: new Date() },
       });
-      this.notify.notifyStage({ userId: ret.buyerId, stage: 'RETURN_REJECTED', title: `Retur ${ret.returnId} ditolak admin`, body: `Tim Kahade menolak pengajuan retur Anda: ${RETURN_REJECT_REASON_LABEL[r.rejectReasonCode]}.`, returnDbId: ret.id, returnPublicId: ret.returnId }).catch(() => undefined);
-      return updated;
+      // BAI-098: kegagalan notifikasi tercatat (timeline) + flag status kirim.
+      const notificationDelivered = await this.notifyBothTracked(
+        ret, 'RETURN_REJECTED',
+        `Retur ${ret.returnId} ditolak admin`,
+        `Tim Kahade menolak pengajuan retur Anda: ${RETURN_REJECT_REASON_LABEL[r.rejectReasonCode]}.`,
+        `Retur ${ret.returnId} ditolak admin`,
+        `Tim Kahade menolak pengajuan retur ${ret.returnId}: ${RETURN_REJECT_REASON_LABEL[r.rejectReasonCode]}.`,
+        'penolakan retur oleh admin',
+      );
+      return { ...updated, notificationDelivered };
     }
     const a = dto as { resolutionType?: ReturnResolutionType; refundAmountSen?: number; note?: string };
     if (!['REQUESTED', 'SELLER_REVIEW'].includes(ret.status)) {

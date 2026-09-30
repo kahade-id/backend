@@ -27,7 +27,7 @@ const mockPrisma = {
   order: { findFirst: jest.fn(), findMany: jest.fn() },
   // Dipakai gateway untuk melabeli payload typing dengan nama pengirim.
   user: { findUnique: jest.fn() },
-  notification: { count: jest.fn() },
+  notification: { count: jest.fn(), findFirst: jest.fn() },
   onNotificationCreated: jest.fn(),
 };
 const mockRedis = {
@@ -265,6 +265,68 @@ describe('RealtimeGateway — unread notification count', () => {
       },
     });
     expect(mockRealtimeService.emitToUser).toHaveBeenCalledWith('buyer', 'notification.unread_count', { unreadCount: 3 });
+  });
+
+  it('BFI-120: notification.new membawa notifId + type kanonis dari data pembuat', async () => {
+    let handler: ((data: { userId: string; title: string; body: string; data?: Record<string, string> }) => Promise<void>) | undefined;
+    mockPrisma.onNotificationCreated.mockImplementation((callback: typeof handler) => { handler = callback; });
+    mockPrisma.notification.count.mockResolvedValue(0);
+
+    gateway.afterInit({} as never);
+    await handler?.({
+      userId: 'buyer',
+      title: 'Message from Seller',
+      body: 'Halo',
+      data: { notificationId: 'n_123', notificationType: 'CHAT_NEW_MESSAGE', type: 'CHAT_NEW', roomId: 'r1' },
+    });
+
+    // notifId + type kanonis (notificationType) diletakkan SETELAH spread
+    // data agar menang atas alias `type` di data; kunci data lain tetap ada.
+    expect(mockRealtimeService.emitToUser).toHaveBeenCalledWith('buyer', 'notification.new', expect.objectContaining({
+      notifId: 'n_123',
+      type: 'CHAT_NEW_MESSAGE',
+      title: 'Message from Seller',
+      body: 'Halo',
+      roomId: 'r1',
+    }));
+    // Jalur cepat: tidak perlu lookup DB bila pembuat sudah menyertakan id.
+    expect(mockPrisma.notification.findFirst).not.toHaveBeenCalled();
+  });
+
+  it('BFI-120: fallback lookup baris notification terbaru bila data tanpa notificationId', async () => {
+    let handler: ((data: { userId: string; title: string; body: string; data?: Record<string, string> }) => Promise<void>) | undefined;
+    mockPrisma.onNotificationCreated.mockImplementation((callback: typeof handler) => { handler = callback; });
+    mockPrisma.notification.count.mockResolvedValue(0);
+    mockPrisma.notification.findFirst.mockResolvedValue({ notifId: 'n_999', type: 'ORDER_PAID' });
+
+    gateway.afterInit({} as never);
+    await handler?.({ userId: 'buyer', title: 'Order update', body: 'Paid' });
+
+    expect(mockPrisma.notification.findFirst).toHaveBeenCalledWith({
+      where: { userId: 'buyer', title: 'Order update', body: 'Paid' },
+      orderBy: { createdAt: 'desc' },
+      select: { notifId: true, type: true },
+    });
+    expect(mockRealtimeService.emitToUser).toHaveBeenCalledWith('buyer', 'notification.new', expect.objectContaining({
+      notifId: 'n_999',
+      type: 'ORDER_PAID',
+    }));
+  });
+
+  it('BFI-120: lookup gagal → emit tetap jalan dengan notifId null (fail-open emit)', async () => {
+    let handler: ((data: { userId: string; title: string; body: string; data?: Record<string, string> }) => Promise<void>) | undefined;
+    mockPrisma.onNotificationCreated.mockImplementation((callback: typeof handler) => { handler = callback; });
+    mockPrisma.notification.count.mockResolvedValue(0);
+    mockPrisma.notification.findFirst.mockRejectedValue(new Error('db down'));
+
+    gateway.afterInit({} as never);
+    await handler?.({ userId: 'buyer', title: 'Order update', body: 'Paid' });
+
+    expect(mockRealtimeService.emitToUser).toHaveBeenCalledWith('buyer', 'notification.new', expect.objectContaining({
+      notifId: null,
+      title: 'Order update',
+      body: 'Paid',
+    }));
   });
 });
 

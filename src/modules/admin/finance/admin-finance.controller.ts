@@ -19,6 +19,7 @@ import { FinanceTransactionQueryDto } from './dto/finance-query.dto';
 import { FindingsQueryDto, AcknowledgeFindingDto, BatchDiscrepanciesQueryDto } from './dto/finance-findings.dto';
 import { RequestCorrectionDto, DecideCorrectionDto, CorrectionsQueryDto } from './dto/ledger-correction.dto';
 import { WithdrawalApproveDto, WithdrawalRejectDto } from './dto/withdrawal-action.dto';
+import { DisbursementListQueryDto } from './dto/disbursement-query.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
 import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
@@ -129,9 +130,23 @@ export class AdminFinanceController {
   }
 
   @Get('escrow-summary')
-  @ApiOperation({ summary: 'Active escrow totals', description: 'Returns aggregated escrow balance totals across all wallets.' })
+  @ApiOperation({
+    summary: 'Active escrow totals',
+    description:
+      'Returns aggregated escrow totals: wallet escrowBalance + DANA-direct escrow ' +
+      '(PaymentTransaction SUCCESS, purpose ORDER_ESCROW) + pending disbursement count. ' +
+      'MFE-011: tanpa agregat DANA, ringkasan selalu Rp0 di mode tanpa-wallet.',
+  })
   @ApiResponse({ status: 200, description: 'Escrow summary returned.' })
-  getEscrowSummary(): Promise<{ totalEscrowBalance: number; walletsWithEscrow: number; activeEscrowOrders: number }> {
+  getEscrowSummary(): Promise<{
+    totalEscrowBalance: number;
+    walletsWithEscrow: number;
+    activeEscrowOrders: number;
+    /** MFE-011: agregat escrow DANA-direct (mode tanpa-wallet). */
+    danaEscrowBalance: number;
+    danaEscrowPayments: number;
+    danaDisbursementsPending: number;
+  }> {
     return this.service.getEscrowSummary();
   }
 
@@ -140,6 +155,25 @@ export class AdminFinanceController {
   @ApiResponse({ status: 200, description: 'Revenue data returned.' })
   getRevenue(): Promise<object> {
     return this.service.getRevenue();
+  }
+
+  /**
+   * MFE-015: antrean disbursement escrow untuk admin — visibilitas atas dana
+   * DANA-direct yang keluar ke rekening bank seller (incl. HELD_NO_BANK &
+   * NEEDS_REVIEW yang butuh tindak lanjut manual). Read-only.
+   */
+  @Get('disbursements')
+  @ApiOperation({
+    summary: 'List escrow disbursements (DANA payouts)',
+    description:
+      'Paginated escrow disbursement queue with status/scope/q filters. ' +
+      'Highlight filters: HELD_NO_BANK (seller has no verified bank account — fail-closed) ' +
+      'and NEEDS_REVIEW (unknown DANA status — manual review required). Read-only.',
+  })
+  @ApiResponse({ status: 200, description: 'Disbursement list returned.' })
+  @ApiResponse({ status: 400, description: 'Invalid query (ErrorCode 1101).' })
+  listDisbursements(@Query() query: DisbursementListQueryDto): Promise<object> {
+    return this.service.listDisbursements(query);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 5 } })

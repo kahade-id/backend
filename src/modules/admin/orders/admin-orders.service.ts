@@ -1,7 +1,7 @@
 import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger, Optional } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { OrderStatus, AuditAction, Prisma, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType, DisputeStatus } from '@prisma/client';
+import { OrderStatus, AuditAction, Prisma, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType, DisputeStatus, PaymentProvider } from '@prisma/client';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditLogService } from '../../../common/services/audit-log.service';
@@ -147,6 +147,33 @@ export class AdminOrdersService {
         dispute: true,
         ratings: true,
         extensionRequests: { orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] },
+        // MFE-012/MFE-013: expose jejak finansial DANA-direct di order detail
+        // admin — lifecycle charge (payKind, partnerReferenceNo, fee, gross,
+        // refund). Catatan: EscrowDisbursement TIDAK punya @relation balik ke
+        // Order di skema (hanya kolom orderId), jadi antrean disbursement
+        // di-query terpisah setelah order ditemukan, bukan via include.
+        paymentTransactions: {
+          where: { provider: PaymentProvider.DANA },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          select: {
+            id: true,
+            midtransOrderId: true,
+            purpose: true,
+            method: true,
+            status: true,
+            amount: true,
+            paymentFee: true,
+            grossAmount: true,
+            refundedAmount: true,
+            refundReference: true,
+            danaPayKind: true,
+            danaPartnerReferenceNo: true,
+            danaReferenceNo: true,
+            paidAt: true,
+            failedAt: true,
+            createdAt: true,
+          },
+        },
       },
     });
 
@@ -154,7 +181,59 @@ export class AdminOrdersService {
       throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
     }
 
+    // Antrean disbursement escrow untuk order ini (query terpisah — bukan
+    // relation Prisma). Diurut terbaru dulu; select dibatasi ke field yang
+    // relevan untuk panel admin.
+    const orderDisbursements = await this.prisma.escrowDisbursement.findMany({
+      where: { orderId: order.id },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      select: {
+        id: true,
+        scope: true,
+        status: true,
+        amountSen: true,
+        heldReason: true,
+        lastError: true,
+        danaReferenceNo: true,
+        releasedAt: true,
+        createdAt: true,
+      },
+    });
+
     const result = serializeOrder(order as unknown as Record<string, unknown>);
+
+    // MFE-012/MFE-013: mapping ter-serialisasi untuk admin FE —
+    // danaPayments berisi snapshot DANA-direct per order (BigInt→IDR).
+    // Raw paymentTransactions/escrowDisbursements di-keep (backward compat
+    // dengan konsumen lama); danaPayments adalah view yang diformat.
+    result.danaPayments = (order.paymentTransactions as Array<Record<string, unknown>>).map(pt => ({
+      id: pt.id as string,
+      partnerReferenceNo: pt.midtransOrderId as string,
+      payKind: (pt.danaPayKind as string | null) ?? 'UNKNOWN',
+      purpose: pt.purpose as string,
+      status: pt.status as string,
+      amount: toIdr(pt.amount as bigint),
+      providerFee: toIdr(pt.paymentFee as bigint),
+      grossAmount: toIdr(pt.grossAmount as bigint),
+      refundedAmount: toIdr(pt.refundedAmount as bigint),
+      refundReference: (pt.refundReference as string | null) ?? null,
+      danaPartnerReferenceNo: (pt.danaPartnerReferenceNo as string | null) ?? null,
+      danaReferenceNo: (pt.danaReferenceNo as string | null) ?? null,
+      paidAt: pt.paidAt ? (pt.paidAt as Date).toISOString() : null,
+      failedAt: pt.failedAt ? (pt.failedAt as Date).toISOString() : null,
+      createdAt: (pt.createdAt as Date).toISOString(),
+    }));
+    result.escrowDisbursementsList = (orderDisbursements as Array<Record<string, unknown>>).map(d => ({
+      id: d.id as string,
+      scope: d.scope as string,
+      status: d.status as string,
+      amount: toIdr(d.amountSen as bigint),
+      heldReason: (d.heldReason as string | null) ?? null,
+      lastError: (d.lastError as string | null) ?? null,
+      danaReferenceNo: (d.danaReferenceNo as string | null) ?? null,
+      releasedAt: d.releasedAt ? (d.releasedAt as Date).toISOString() : null,
+      createdAt: (d.createdAt as Date).toISOString(),
+    }));
 
     // Lokasi presisi buyer (fraud checking) — dekripsi fail-closed, ciphertext
     // mentah TIDAK pernah dikirim ke client.

@@ -941,7 +941,10 @@ export class AuthController {
   }
 
   @Public()
-  @Throttle({ default: { ttl: 3600000, limit: 3 } })
+  // Audit 2026-10-01: limit dinaikkan 3→5/jam — 3 terlalu agresif untuk user
+  // sah yang sedang troubleshooting (kasus: 3× dalam 7 menit saat panik).
+  // Tetap protektif terhadap abuse; frontend menampilkan countdown jelas.
+  @Throttle({ default: { ttl: 3600000, limit: 5 } })
   @Post('forgot-password')
   @HttpCode(HttpStatus.OK)
   async forgotPassword(

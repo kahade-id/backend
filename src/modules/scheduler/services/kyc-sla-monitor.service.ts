@@ -70,8 +70,9 @@ export class KycSlaMonitorService {
   private async backfillSlaStartedAt(): Promise<void> {
     // String SQL statis — tanpa interpolasi nilai luar.
     // (business_verifications tidak punya kolom SLA; SLA-nya dihitung dari createdAt.)
+    // Kolom DB adalah "createdAt" (camelCase, tanpa @map di schema) — bukan "created_at".
     const kyc = await this.prisma.$executeRawUnsafe(
-      `UPDATE "kyc_requests" SET "sla_started_at" = "created_at" WHERE "status" = 'PENDING' AND "sla_started_at" IS NULL`,
+      `UPDATE "kyc_requests" SET "sla_started_at" = "createdAt" WHERE "status" = 'PENDING' AND "sla_started_at" IS NULL`,
     );
     if (Number(kyc) > 0) {
       this.logger.log(`Backfilled slaStartedAt for ${kyc} KYC request(s).`);

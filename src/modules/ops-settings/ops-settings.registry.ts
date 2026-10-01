@@ -38,8 +38,22 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
       'Secret verifikasi webhook Fonnte. Kirim via header x-fonnte-secret ' +
       '(disarankan) atau field body webhookSecret — JANGAN via query param ' +
       '?webhookSecret= karena URL tercatat di nginx access log (SEC-003). ' +
-      'Bila kosong, SEMUA webhook DITOLAK (fail-closed); set sebelum go-live.',
+      'CATATAN: Dashboard Fonnte tidak mendukung secret custom — gunakan ' +
+      'FONNTE_WEBHOOK_IPS (IP whitelist) sebagai gantinya. Bila secret DAN ' +
+      'IP whitelist kosong, SEMUA webhook DITOLAK (fail-closed).',
     isSecret: true,
+    testable: false,
+  },
+  {
+    key: 'FONNTE_WEBHOOK_IPS',
+    label: 'Fonnte Webhook IP Whitelist',
+    description:
+      'Daftar IP server Fonnte yang diizinkan mengirim webhook, dipisah koma ' +
+      '(mis. 103.52.212.50). Dashboard Fonnte tidak mendukung webhook secret, ' +
+      'sehingga verifikasi dilakukan via IP pengirim. Hanya IP dalam daftar ' +
+      'ini yang diterima bila secret tidak cocok. Kosongkan untuk menonaktifkan ' +
+      'verifikasi IP (tidak disarankan).',
+    isSecret: false,
     testable: false,
   },
   {

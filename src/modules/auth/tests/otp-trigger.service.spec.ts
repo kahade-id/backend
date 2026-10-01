@@ -36,8 +36,12 @@ describe('OtpTriggerService', () => {
   };
   // OPS: webhook secret kini dibaca via OpsSettingsService (DB panel > .env).
   const mockOpsSettings = {
-    get: jest.fn((key: string) => (key === 'FONNTE_WEBHOOK_SECRET' ? 'test-secret' : undefined)),
-    getSecret: jest.fn((key: string) => (key === 'FONNTE_WEBHOOK_SECRET' ? 'test-secret' : undefined)),
+    get: jest.fn((key: string): string | undefined =>
+      key === 'FONNTE_WEBHOOK_SECRET' ? 'test-secret' : undefined,
+    ),
+    getSecret: jest.fn((key: string): string | undefined =>
+      key === 'FONNTE_WEBHOOK_SECRET' ? 'test-secret' : undefined,
+    ),
     has: jest.fn((key: string) => key === 'FONNTE_WEBHOOK_SECRET'),
   };
 
@@ -120,6 +124,24 @@ describe('OtpTriggerService', () => {
       mockOpsSettings.get.mockReturnValue(undefined);
       expect(service.verifyWebhookSecret('test-secret')).toBe(false);
       expect(service.verifyWebhookSecret(undefined)).toBe(false);
+    });
+
+    it('menerima IP yang ada di whitelist FONNTE_WEBHOOK_IPS (2026-10-01)', () => {
+      mockOpsSettings.getSecret.mockReturnValue(undefined);
+      mockOpsSettings.get.mockImplementation((key: string) =>
+        key === 'FONNTE_WEBHOOK_IPS' ? '103.52.212.50, 1.2.3.4' : undefined,
+      );
+      expect(service.verifyWebhookSecret(undefined, '103.52.212.50')).toBe(true);
+      expect(service.verifyWebhookSecret('wrong-secret', '103.52.212.50')).toBe(true);
+      expect(service.verifyWebhookSecret(undefined, '9.9.9.9')).toBe(false);
+    });
+
+    it('normalisasi IPv6-mapped IPv4 (::ffff:) pada IP whitelist', () => {
+      mockOpsSettings.getSecret.mockReturnValue(undefined);
+      mockOpsSettings.get.mockImplementation((key: string) =>
+        key === 'FONNTE_WEBHOOK_IPS' ? '103.52.212.50' : undefined,
+      );
+      expect(service.verifyWebhookSecret(undefined, '::ffff:103.52.212.50')).toBe(true);
     });
   });
 

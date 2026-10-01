@@ -265,31 +265,67 @@ export class OtpTriggerService {
   // ── Webhook pesan masuk Fonnte ───────────────────────────────────
 
   /**
-   * SEC-A M1 (fail-closed): bila FONNTE_WEBHOOK_SECRET belum dikonfigurasi,
-   * webhook DITOLAK. Fail-open sebelumnya memungkinkan siapa pun mengirim
-   * webhook palsu ke /v1/auth/webhooks/fonnte dan memicu alur OTP.
-   * Produksi WAJIB set FONNTE_WEBHOOK_SECRET via admin panel (Pengaturan
-   * Operasional) atau production .env.
+   * Verifikasi webhook Fonnte via secret ATAU IP whitelist.
+   *
+   * SEC-A M1 (fail-closed): bila FONNTE_WEBHOOK_SECRET maupun FONNTE_WEBHOOK_IPS
+   * belum dikonfigurasi, webhook DITOLAK. Fail-open memungkinkan siapa pun
+   * mengirim webhook palsu dan memicu alur OTP.
+   *
+   * Dua jalur verifikasi (salah satu cukup):
+   * 1. Secret: cocok via timingSafeEqual (header x-fonnte-secret / body webhookSecret)
+   * 2. IP whitelist: clientIp ada di FONNTE_WEBHOOK_IPS (comma-separated)
+   *
+   * CATATAN (2026-10-01): Dashboard Fonnte tidak mendukung webhook secret custom,
+   * sehingga jalur IP whitelist adalah metode utama. IP Fonnte teramati:
+   * 103.52.212.50 (dapat berubah — kelola via admin panel).
+   *
+   * Produksi WAJIB set salah satu via admin panel (Pengaturan Operasional)
+   * atau production .env.
    */
-  verifyWebhookSecret(provided?: string): boolean {
-    // OPS: secret dibaca via OpsSettingsService (DB panel > .env) agar bisa
+  verifyWebhookSecret(provided?: string, clientIp?: string): boolean {
+    // OPS: dibaca via OpsSettingsService (DB panel > .env) agar bisa
     // diset dari admin panel tanpa SSH ke server.
-    const expected = this.opsSettings.getSecret('FONNTE_WEBHOOK_SECRET');
-    if (!expected) {
-      // Secret belum dikonfigurasi: TOLAK webhook (fail-closed). Jangan
-      // pernah menerima webhook tanpa verifikasi secret.
-      this.logger.error(
-        '[SECURITY] FONNTE_WEBHOOK_SECRET is not set — rejecting Fonnte webhook (fail-closed). ' +
-          'ACTION REQUIRED: set FONNTE_WEBHOOK_SECRET via admin panel (Pengaturan Operasional) or production .env. ' +
-          'Kirim secret via header x-fonnte-secret (disarankan) atau field body webhookSecret — JANGAN via query param ?webhookSecret= ' +
-          'karena URL tercatat di nginx access log (SEC-003). Webhook URL di dashboard Fonnte: https://api.kahade.id/v1/auth/webhooks/fonnte.',
+    const expectedSecret = this.opsSettings.getSecret('FONNTE_WEBHOOK_SECRET');
+
+    // Jalur 1: verifikasi secret (bila dikonfigurasi dan disediakan)
+    if (expectedSecret && provided) {
+      const a = Buffer.from(provided);
+      const b = Buffer.from(expectedSecret);
+      if (a.length === b.length && timingSafeEqual(a, b)) {
+        return true;
+      }
+    }
+
+    // Jalur 2: verifikasi IP whitelist (metode utama untuk Fonnte)
+    const allowedIpsRaw = this.opsSettings.get('FONNTE_WEBHOOK_IPS');
+    if (allowedIpsRaw && clientIp) {
+      const allowedIps = allowedIpsRaw
+        .split(',')
+        .map((ip) => ip.trim())
+        .filter((ip) => ip.length > 0);
+      // Normalisasi: hilangkan prefix IPv6-mapped IPv4 (::ffff:1.2.3.4)
+      const normalizedIp = clientIp.replace(/^::ffff:/, '');
+      if (allowedIps.includes(normalizedIp)) {
+        return true;
+      }
+      this.logger.warn(
+        `[SECURITY] Fonnte webhook dari IP tak dikenal: ${normalizedIp} — ditolak. ` +
+          `Tambahkan ke FONNTE_WEBHOOK_IPS bila ini IP resmi Fonnte.`,
       );
       return false;
     }
-    if (!provided) return false;
-    const a = Buffer.from(provided);
-    const b = Buffer.from(expected);
-    return a.length === b.length && timingSafeEqual(a, b);
+
+    // Fail-closed: tidak ada metode verifikasi yang dikonfigurasi/berhasil
+    if (!expectedSecret && !allowedIpsRaw) {
+      this.logger.error(
+        '[SECURITY] FONNTE_WEBHOOK_SECRET maupun FONNTE_WEBHOOK_IPS belum dikonfigurasi — ' +
+          'rejecting Fonnte webhook (fail-closed). ' +
+          'ACTION REQUIRED: set salah satu via admin panel (Pengaturan Operasional) or production .env. ' +
+          'Dashboard Fonnte tidak mendukung secret custom — gunakan IP whitelist. ' +
+          'Webhook URL di dashboard Fonnte: https://api.kahade.id/v1/auth/webhooks/fonnte.',
+      );
+    }
+    return false;
   }
 
   /**

@@ -39,7 +39,10 @@ export class LegacyFonnteWebhookController {
     const secret =
       (req.headers['x-fonnte-secret'] as string | undefined) ??
       (typeof body.webhookSecret === 'string' ? body.webhookSecret : undefined);
-    if (!this.otpTriggerService.verifyWebhookSecret(secret)) {
+    // 2026-10-01: Fonnte dashboard tidak mendukung webhook secret — verifikasi
+    // via IP whitelist (FONNTE_WEBHOOK_IPS) sebagai alternatif.
+    const clientIp = req.ip || (req.socket?.remoteAddress as string | undefined);
+    if (!this.otpTriggerService.verifyWebhookSecret(secret, clientIp)) {
       throw new UnauthorizedException({
         code: ErrorCodes.UNAUTHORIZED,
         message: 'Invalid webhook secret',

@@ -2036,8 +2036,8 @@ export class ChatService implements OnModuleInit {
      *
      * `ChatRoom.orderId` is the relation column and holds `Order.id` — the internal cuid
      * (`schema.prisma:1223`). Socket rooms are named after the human-readable `Order.orderId`:
-     * that is what `join-room` joins (`realtime.gateway.ts:478`), what `join_order` joins
-     * (`:421`), what the disconnect sweep enumerates (`:325`), and what the sibling emits in
+     * that is what `join-room` joins (`realtime.gateway.ts:478`), what the disconnect
+     * sweep enumerates (`:325`), and what the sibling emits in
      * this same service already use (`:412` and `:463` both pass `room.order.orderId`).
      *
      * Passing the cuid addressed `order:<cuid>` — a room no socket has ever joined — so

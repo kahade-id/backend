@@ -4,6 +4,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { OpsSettingsService } from '../ops-settings/ops-settings.service';
 import { SUBSCRIPTION_PLANS_CACHE } from '../../common/constants/redis-keys';
+import { formatIdr } from '../../common/utils/currency.util';
 
 const SUBSCRIPTION_PLANS_TTL = 300;
 
@@ -168,7 +169,7 @@ export class PublicService {
         kahadePlusFeeRate: kahadePlusFeeRate,
         standardFeeMin,
         standardFeeMax,
-        standardFeeDescription: `${kahadeFeeRate}% of order value (min Rp ${standardFeeMin.toLocaleString('id-ID')}, max Rp ${standardFeeMax.toLocaleString('id-ID')})`,
+        standardFeeDescription: `${kahadeFeeRate}% of order value (min ${formatIdr(standardFeeMin)}, max ${formatIdr(standardFeeMax)})`,
         kahadePlusFeeDescription: `${kahadePlusFeeRate}% of order value (Kahade Plus members)`,
         orderMinValue,
         orderMaxValue,

@@ -12,7 +12,7 @@ import { SESSION_REVOKED_KEY, USER_SUSPENDED_KEY } from '../../../common/constan
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { WalletAdjustDto, WalletAdjustType } from './dto/wallet-adjust.dto';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
-import { toSen, toIdr } from '../../../common/utils/currency.util';
+import { toSen, toIdr, formatIdr } from '../../../common/utils/currency.util';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { OtpService } from '../../auth/otp.service';
@@ -932,17 +932,18 @@ export class AdminUsersService implements OnModuleInit {
           'Aliran dana aktual via DANA.',
       });
     }
-    // SEC-601: re-auth password server-side (pola AUT-013) — JWT curian saja
-    // tidak cukup untuk menggerakkan saldo.
+    // SEC-601 + SYS-B-403: re-auth password server-side (pola AUT-013) — JWT
+    // curian saja tidak cukup untuk menggerakkan saldo.
     await this.adminPassword.verifyAdminPassword(adminId, dto.reauthPassword, 'wallet.adjust', userId, ipAddress);
-    // SEC-601: CREDIT di atas ambang → WAJIB dual control.
+    // SEC-601 + SYS-B-403: CREDIT maupun DEBIT di atas ambang → WAJIB dual
+    // control. Asimetri sebelumnya (hanya credit) memungkinkan satu admin
+    // menguras saldo user.
     const amountInSen = toSen(dto.amount);
-    const isCredit = dto.type === WalletAdjustType.CREDIT;
-    if (isCredit && amountInSen > DUAL_CONTROL_THRESHOLD_SEN) {
+    if (amountInSen > DUAL_CONTROL_THRESHOLD_SEN) {
       throw new ForbiddenException({
         code: ErrorCodes.DUAL_CONTROL_REQUIRED,
         message:
-          'Kredit wallet di atas Rp1.000.000 wajib dual control ' +
+          'Adjust wallet (kredit maupun debit) di atas Rp1.000.000 wajib dual control ' +
           '(usulkan via POST /v1/admin/approvals/propose dengan actionType WALLET_ADJUST)',
       });
     }
@@ -1028,8 +1029,8 @@ export class AdminUsersService implements OnModuleInit {
           category: getCategoryForType(notifType),
           title: isCredit ? 'Balance Credited by Admin' : 'Balance Debited by Admin',
           body: isCredit
-            ? `Rp ${amount.toLocaleString('id-ID')} has been added to your wallet balance. Reason: ${reason}`
-            : `Rp ${amount.toLocaleString('id-ID')} has been deducted from your wallet balance. Reason: ${reason}`,
+            ? `${formatIdr(amount)} has been added to your wallet balance. Reason: ${reason}`
+            : `${formatIdr(amount)} has been deducted from your wallet balance. Reason: ${reason}`,
           isRead: false,
         },
       });
@@ -1038,8 +1039,8 @@ export class AdminUsersService implements OnModuleInit {
 
     const notifTitle = isCredit ? 'Balance Credited by Admin' : 'Balance Debited by Admin';
     const notifBody = isCredit
-      ? `Rp ${amount.toLocaleString('id-ID')} has been added to your wallet balance. Reason: ${reason}`
-      : `Rp ${amount.toLocaleString('id-ID')} has been deducted from your wallet balance. Reason: ${reason}`;
+      ? `${formatIdr(amount)} has been added to your wallet balance. Reason: ${reason}`
+      : `${formatIdr(amount)} has been deducted from your wallet balance. Reason: ${reason}`;
     this.prisma.emitNotificationCreated({ userId: id, title: notifTitle, body: notifBody, data: { type: 'WALLET_ADJUSTED' } });
 
     const auditAction = isCredit ? AuditAction.WALLET_CREDIT : AuditAction.WALLET_DEBIT;

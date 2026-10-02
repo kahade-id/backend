@@ -1,21 +1,24 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { MidtransService } from '../../payment/midtrans.service';
 import { DanaDirectRefundService } from '../../no-wallet/dana-direct-refund.service';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditAction, Prisma } from '@prisma/client';
-import { toIdr } from '../../../common/utils/currency.util';
+import { toIdr, toSen } from '../../../common/utils/currency.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { RedisService } from '../../../redis/redis.service';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
-import { PLUS_FEE_WAIVER_QUOTA_IDR } from '../../../common/constants/app.constants';
+import { PLUS_FEE_WAIVER_QUOTA_IDR, SUBSCRIPTION_MONTHLY_PRICE, SUBSCRIPTION_YEARLY_PRICE } from '../../../common/constants/app.constants';
 import { escapeLikePattern } from '../../../common/utils/search.util';
 import { getWibMonthStart } from '../../../common/utils/date.util';
 import { resolveUserInternalId } from '../common/resolve-user-id';
+// SYS-B-402: dual control untuk pemberian nilai subscription di atas ambang.
+import { ApprovalsService } from '../approvals/approvals.service';
+import { DUAL_CONTROL_THRESHOLD_SEN } from '../approvals/dual-control.constants';
 
 @Injectable()
-export class AdminSubscriptionsService {
+export class AdminSubscriptionsService implements OnModuleInit {
   private readonly logger = new Logger(AdminSubscriptionsService.name);
 
   constructor(
@@ -25,7 +28,40 @@ export class AdminSubscriptionsService {
     private danaDirectRefundService: DanaDirectRefundService,
     private redis: RedisService,
     private verificationBadgeService: VerificationBadgeService,
+    // SYS-B-402: modul ini mengeksekusi MONEY_VALUE_GRANT yang disetujui
+    // (ApprovalsModule @Global — tanpa import modul).
+    private readonly approvals: ApprovalsService,
   ) {}
+
+  onModuleInit(): void {
+    this.approvals.registerExecutor('MONEY_VALUE_GRANT', async (ctx) => {
+      const p = ctx.payload as Record<string, unknown>;
+      // Jalur dual control: gate ambang dilewati (sudah dipenuhi saat propose
+      // + approve oleh dua admin berbeda); validasi penuh tetap jalan.
+      if (p.kind === 'SUBSCRIPTION_GRANT') {
+        return this.performGrantSubscription(
+          String(p.userId),
+          p.plan as 'MONTHLY' | 'YEARLY',
+          p.durationDays as number,
+          typeof p.reason === 'string' ? p.reason : undefined,
+          ctx.decidedBy,
+          ctx.ipAddress,
+        );
+      }
+      return this.performCreatePromoCode(
+        {
+          code: String(p.code),
+          durationDays: p.durationDays as number,
+          maxRedemptions: typeof p.maxRedemptions === 'number' ? p.maxRedemptions : null,
+          assignedUserId: typeof p.assignedUserId === 'string' ? p.assignedUserId : null,
+          expiresAt: typeof p.expiresAt === 'string' ? new Date(p.expiresAt) : null,
+          note: typeof p.note === 'string' ? p.note : null,
+        },
+        ctx.decidedBy,
+        ctx.ipAddress,
+      );
+    });
+  }
 
   async listSubscriptions(
     page: number,
@@ -341,6 +377,35 @@ export class AdminSubscriptionsService {
     adminId: string,
     ipAddress: string,
   ): Promise<object> {
+    // SYS-B-402: grant = pemberian nilai uang (langganan gratis). Nilai
+    // pro-rata harga plan; di atas ambang → wajib dual control.
+    const planPriceIdr = plan === 'MONTHLY' ? SUBSCRIPTION_MONTHLY_PRICE : SUBSCRIPTION_YEARLY_PRICE;
+    const planDays = plan === 'MONTHLY' ? 30 : 365;
+    const valueSen = toSen(Math.round((planPriceIdr * durationDays) / planDays));
+    if (valueSen > DUAL_CONTROL_THRESHOLD_SEN) {
+      throw new ForbiddenException({
+        code: ErrorCodes.DUAL_CONTROL_REQUIRED,
+        message:
+          'Nilai grant subscription di atas Rp1.000.000 wajib dual control ' +
+          '(usulkan via POST /v1/admin/approvals/propose dengan actionType MONEY_VALUE_GRANT, kind SUBSCRIPTION_GRANT)',
+      });
+    }
+    return this.performGrantSubscription(rawUserId, plan, durationDays, reason, adminId, ipAddress);
+  }
+
+  /**
+   * Inti grant subscription — dipakai grantSubscription (jalur langsung,
+   * setelah gate ambang) dan executor MONEY_VALUE_GRANT (jalur dual control;
+   * guard sudah dipenuhi saat propose + approve oleh dua admin berbeda).
+   */
+  async performGrantSubscription(
+    rawUserId: string,
+    plan: 'MONTHLY' | 'YEARLY',
+    durationDays: number,
+    reason: string | undefined,
+    adminId: string,
+    ipAddress: string,
+  ): Promise<object> {
     // ADM-202: terima ID publik (USR-…) maupun cuid internal.
     const internalUserId = await resolveUserInternalId(this.prisma, rawUserId);
     const user = await this.prisma.user.findUnique({
@@ -431,6 +496,37 @@ export class AdminSubscriptionsService {
   // ============================================================
 
   async createPromoCode(
+    input: {
+      code: string;
+      durationDays: number;
+      maxRedemptions?: number | null;
+      assignedUserId?: string | null;
+      expiresAt?: Date | null;
+      note?: string | null;
+    },
+    adminId: string,
+    ipAddress: string,
+  ): Promise<object> {
+    // SYS-B-402: kode promo = penciptaan liabilitas (durasi gratis × batas
+    // pakai). Nilai pro-rata harga bulanan; di atas ambang → dual control.
+    const redemptions = input.maxRedemptions ?? 1;
+    const valueSen = toSen(Math.round((SUBSCRIPTION_MONTHLY_PRICE / 30) * input.durationDays * redemptions));
+    if (valueSen > DUAL_CONTROL_THRESHOLD_SEN) {
+      throw new ForbiddenException({
+        code: ErrorCodes.DUAL_CONTROL_REQUIRED,
+        message:
+          'Nilai kode promo di atas Rp1.000.000 wajib dual control ' +
+          '(usulkan via POST /v1/admin/approvals/propose dengan actionType MONEY_VALUE_GRANT, kind PROMO_CODE_CREATE)',
+      });
+    }
+    return this.performCreatePromoCode(input, adminId, ipAddress);
+  }
+
+  /**
+   * Inti pembuatan kode promo — dipakai createPromoCode (jalur langsung,
+   * setelah gate ambang) dan executor MONEY_VALUE_GRANT (jalur dual control).
+   */
+  async performCreatePromoCode(
     input: {
       code: string;
       durationDays: number;

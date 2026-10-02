@@ -312,12 +312,15 @@ export class AdminFinanceController {
 
   @Post('corrections')
   @AdminRoles('FINANCE_ADMIN', 'SUPER_ADMIN')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SYS-B-404: request koreksi ledger (kaki 1) wajib step-up server-side —
+  // konsisten dengan pola SEC-501/502/601/602 (step-up + dual approval).
+  @RequireStepUp('ledgerCorrection.request')
   @Idempotency()
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @ApiOperation({
     summary: 'Request ledger correction (step 1 of 2)',
-    description: 'Creates a PENDING_APPROVAL correction request. NO balance mutation happens here. Requires Idempotency-Key header.',
+    description: 'Creates a PENDING_APPROVAL correction request. NO balance mutation happens here. Requires X-Step-Up-Token (action ledgerCorrection.request) + Idempotency-Key header.',
   })
   @ApiResponse({ status: 200, description: 'Correction request created (or replayed idempotently).' })
   requestCorrection(
@@ -347,12 +350,15 @@ export class AdminFinanceController {
 
   @Post('corrections/:id/approve')
   @AdminRoles('FINANCE_ADMIN', 'SUPER_ADMIN')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SYS-B-404: approve koreksi ledger (kaki 2, eksekusi mutasi) wajib step-up
+  // server-side milik approver — menurunkan biaya serangan sesi curian.
+  @RequireStepUp('ledgerCorrection.approve', 'id')
   @Idempotency()
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @ApiOperation({
     summary: 'Decide correction (step 2 of 2)',
-    description: 'APPROVE executes the ledger mutation (must be a DIFFERENT admin than the requester); REJECT cancels. Requires Idempotency-Key header.',
+    description: 'APPROVE executes the ledger mutation (must be a DIFFERENT admin than the requester); REJECT cancels. Requires X-Step-Up-Token (action ledgerCorrection.approve) + Idempotency-Key header.',
   })
   @ApiResponse({ status: 200, description: 'Decision recorded.' })
   @ApiResponse({ status: 403, description: 'Self-approval is forbidden.' })

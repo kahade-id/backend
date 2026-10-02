@@ -197,6 +197,22 @@ export class AdminFinanceService {
   }
 
   /**
+   * SYS-B-504 — decrypt lalu mask, pola sama seperti `maskDecrypt` di
+   * admin-disbursement.service.ts: nama pemilik rekening TIDAK PERNAH
+   * dikembalikan full ke view list/detail; gagal decrypt → '****'
+   * (fail-closed, bukan bocor).
+   */
+  private async maskDecrypt(cipher: string | null | undefined): Promise<string> {
+    if (!cipher) return '****';
+    try {
+      const plain = await decryptAES(cipher);
+      return plain.length <= 4 ? '****' : `****${plain.slice(-4)}`;
+    } catch {
+      return '****';
+    }
+  }
+
+  /**
    * AW-002 (perf-fix): bangun filter `where` transaksi dari DTO — dipakai
    * BERSAMA oleh `listTransactions` dan `getTransactionsAggregate` agar
    * agregat selalu memakai filter yang SAMA persis dengan tabel.
@@ -468,16 +484,14 @@ export class AdminFinanceService {
           `Failed to decrypt bank account number for withdrawal detail: ${(decryptErr as Error).message}`,
         );
       }
-      let decryptedName = result.bankAccount.accountName;
-      try {
-        decryptedName = await decryptAES(result.bankAccount.accountName);
-      } catch {
-        /* pre-migration data */
-      }
+      // SYS-B-504: nama pemilik rekening di-mask seperti nomornya (pola
+      // maskDecrypt admin-disbursement) — full name tidak dikembalikan ke
+      // view detail; akses nomor penuh tetap di-audit-log di atas.
+      const maskedName = await this.maskDecrypt(result.bankAccount.accountName);
       result.bankAccount = {
         ...result.bankAccount,
         accountNumber: maskedNumber,
-        accountName: decryptedName,
+        accountName: maskedName,
       };
     }
 
@@ -965,14 +979,9 @@ export class AdminFinanceService {
             maskedAccountNumber = '****';
           }
         }
-        let decryptedAccName = tx.bankAccount?.accountName ?? null;
-        if (tx.bankAccount?.accountName) {
-          try {
-            decryptedAccName = await decryptAES(tx.bankAccount.accountName);
-          } catch {
-            /* pre-migration data */
-          }
-        }
+        // SYS-B-504: nama pemilik rekening di-mask di list (pola maskDecrypt
+        // admin-disbursement) — full name tidak dikembalikan per baris.
+        const decryptedAccName = await this.maskDecrypt(tx.bankAccount?.accountName);
         // ADM-205: kuorum dual approval untuk baris ini.
         const approverSet = approversByTx.get(tx.id) ?? new Set<string>();
         const approvalInfo: WithdrawalApprovalInfo = {

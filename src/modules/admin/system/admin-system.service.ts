@@ -1,5 +1,5 @@
-import { Injectable, NotFoundException, BadRequestException, ForbiddenException, ConflictException, Logger } from '@nestjs/common';
-import { randomBytes } from 'crypto';
+import { Injectable, NotFoundException, BadRequestException, ForbiddenException, ConflictException, Logger, OnModuleInit } from '@nestjs/common';
+import { randomBytes, createHash } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
@@ -8,38 +8,25 @@ import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { UpdateConfigDto } from './dto/update-config.dto';
 import { BroadcastDto } from './dto/broadcast.dto';
 import { AuditLogQueryDto, WebhookLogQueryDto } from './dto/audit-log-query.dto';
-import { AuditAction, NotificationCategory, NotificationChannel, NotificationType, Prisma, KycStatus } from '@prisma/client';
+import { AuditAction, NotificationCategory, NotificationChannel, NotificationType, Prisma, KycStatus, AdminRole } from '@prisma/client';
 import { escapeHtml } from '../../../common/utils/sanitize.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { ADMIN_SYSTEM_CONFIGS, FEE_CONFIG_CACHE, SUBSCRIPTION_PLANS_CACHE } from '../../../common/constants/redis-keys';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
 import { escapeLikePattern } from '../../../common/utils/search.util';
+// SYS-B-405: klasifikasi finansial/security eksplisit per key (registry) +
+// dual control terpusat via tabel approvals (menggantikan jalur pending Redis
+// paralel + deteksi substring FINANCIAL_CONFIG_KEYS).
+import { classifySystemConfig } from './system-config.registry';
+import { ApprovalsService } from '../approvals/approvals.service';
 
 const SYSTEM_CONFIG_TTL = 300;
 const SYSTEM_CONFIG_LOCK_TTL = 10;
-const PENDING_CONFIG_PREFIX = 'pending_config_change:';
-const PENDING_CONFIG_TTL = 86400;
 const MAX_ADMIN_PAGE = 100_000;
 
-const FINANCIAL_CONFIG_KEYS = [
-  'fee_percentage',
-  'platform_fee',
-  'commission_rate',
-  'kahade_fee_rate',
-  'kahade_plus_fee_rate',
-  'withdrawal_fee',
-  'payment_fee',
-  'escrow_fee',
-  'fee_savings_limit',
-  // ADM-205 review fix (2026-09-27): threshold dual-approval withdrawal adalah
-  // parameter keamanan maker-checker — perubahannya wajib lewat alur
-  // pending-approval dua admin (isFinancialConfig memakai substring match).
-  'dual_approval',
-];
-
 @Injectable()
-export class AdminSystemService {
+export class AdminSystemService implements OnModuleInit {
   private readonly logger = new Logger(AdminSystemService.name);
 
   constructor(
@@ -47,7 +34,24 @@ export class AdminSystemService {
     private redis: RedisService,
     private auditLogService: AuditLogService,
     private notificationQueue: NotificationQueueService,
+    // SYS-B-405: modul ini mengeksekusi SYSTEM_CONFIG_CHANGE yang disetujui
+    // (ApprovalsModule @Global — tanpa import modul).
+    private readonly approvals: ApprovalsService,
   ) {}
+
+  onModuleInit(): void {
+    this.approvals.registerExecutor('SYSTEM_CONFIG_CHANGE', async (ctx) => {
+      if (!ctx.targetId) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'SYSTEM_CONFIG_CHANGE membutuhkan targetId (key config)',
+        });
+      }
+      const value = typeof ctx.payload.value === 'string' ? ctx.payload.value : '';
+      const description = typeof ctx.payload.description === 'string' ? ctx.payload.description : undefined;
+      return this.applySystemConfigChange(ctx.targetId, value, description, ctx.decidedBy, ctx.proposedBy, ctx.ipAddress);
+    });
+  }
 
   async listConfigs(): Promise<object[]> {
     // 1. Return from cache if available
@@ -103,11 +107,6 @@ export class AdminSystemService {
     }
   }
 
-  private isFinancialConfig(key: string): boolean {
-    const lowerKey = key.toLowerCase();
-    return FINANCIAL_CONFIG_KEYS.some(fk => lowerKey.includes(fk));
-  }
-
   private validateConfigValue(key: string, value: string, dataType: string): void {
     if (dataType === 'NUMBER') {
       const parsed = Number(value.trim());
@@ -148,7 +147,13 @@ export class AdminSystemService {
     }
   }
 
-  async updateConfig(key: string, dto: UpdateConfigDto, adminId: string, ipAddress: string): Promise<object> {
+  async updateConfig(
+    key: string,
+    dto: UpdateConfigDto,
+    adminId: string,
+    adminRole: AdminRole,
+    ipAddress: string,
+  ): Promise<object> {
     const existing = await this.prisma.systemConfig.findUnique({
       where: { key },
     });
@@ -162,29 +167,44 @@ export class AdminSystemService {
 
     this.validateConfigValue(key, dto.value, existing.dataType);
 
-    if (this.isFinancialConfig(key)) {
-      const pendingKey = `${PENDING_CONFIG_PREFIX}${key}`;
-      const pendingChange = {
-        key,
-        proposedValue: dto.value,
-        proposedDescription: dto.description,
-        currentValue: existing.value,
-        currentDescription: existing.description,
-        proposedBy: adminId,
-        proposedAt: new Date().toISOString(),
-        ipAddress,
-      };
-      const claimed = await this.redis.setNx(pendingKey, JSON.stringify(pendingChange), PENDING_CONFIG_TTL, { throwOnError: true });
-      if (!claimed) {
-        throw new ConflictException({ code: 'CONFIG_CHANGE_PENDING', message: `A pending change already exists for config '${key}'` });
+    // SYS-B-405: klasifikasi eksplisit per key (registry), bukan substring.
+    // Key finansial ATAU security-gated SELALU via dual control (tabel
+    // approvals + step-up di controller) — tidak pernah apply langsung.
+    // Key tak dikenal → fail-closed sebagai finansial (lihat registry).
+    const classification = classifySystemConfig(key);
+    if (classification.financial || classification.securityGated) {
+      // Semantik lama: satu usulan pending per key — tolak duplikat.
+      const pending = await this.approvals.findPendingByActionTarget('SYSTEM_CONFIG_CHANGE', key);
+      if (pending) {
+        throw new ConflictException({
+          code: 'CONFIG_CHANGE_PENDING',
+          message: `A pending change already exists for config '${key}' (approval ${pending.approvalId})`,
+        });
       }
+      const valueHash = createHash('sha256').update(dto.value).digest('hex').slice(0, 16);
+      const approval = await this.approvals.propose({
+        actionType: 'SYSTEM_CONFIG_CHANGE',
+        targetId: key,
+        payload: {
+          value: dto.value,
+          ...(dto.description !== undefined ? { description: dto.description } : {}),
+        },
+        // Idempoten per (key, value): nilai sama yang diusulkan ulang
+        // mengembalikan approval yang ada; nilai beda butuh usulan baru.
+        idempotencyKey: `system-config-change:${key}:${valueHash}`,
+        proposedBy: adminId,
+        proposerRole: adminRole,
+        ipAddress,
+      });
 
       this.auditLogService.logAdminAction({
         adminId,
         action: AuditAction.SYSTEM_CONFIG_CHANGED,
         targetType: 'SystemConfig',
         targetId: existing.id,
-        description: `Proposed financial config change for '${key}' (pending approval)`,
+        description:
+          `Proposed ${classification.securityGated ? 'security-gated' : 'financial'} config change for '${key}' ` +
+          `via dual control (approval ${approval.approvalId})`,
         before: { value: existing.value },
         after: { proposedValue: dto.value },
         ipAddress,
@@ -192,7 +212,11 @@ export class AdminSystemService {
 
       return {
         status: 'pending_approval',
-        message: `Financial config '${key}' change requires approval from another admin`,
+        message:
+          `Config '${key}' ${classification.securityGated ? 'bersifat security-gated' : 'bersifat finansial'} — ` +
+          `perubahan membutuhkan persetujuan admin kedua via POST /v1/admin/approvals/${approval.approvalId}/approve`,
+        approvalId: approval.approvalId,
+        expiresAt: approval.expiresAt,
         proposedValue: dto.value,
         currentValue: existing.value,
       };
@@ -232,69 +256,104 @@ export class AdminSystemService {
     return updated;
   }
 
+  /**
+   * SYS-B-405: baca usulan pending dari TABEL approvals — satu-satunya sistem
+   * dual control yang tersisa. Rute ini dipertahankan untuk kompatibilitas
+   * panel admin; sumber datanya kini approvals, bukan Redis paralel.
+   */
   async getPendingConfigChange(key: string): Promise<object | null> {
-    const pendingKey = `${PENDING_CONFIG_PREFIX}${key}`;
-    const raw = await this.redis.get(pendingKey);
-    if (!raw) return null;
-    try {
-      return JSON.parse(raw) as object;
-    } catch {
-      return null;
-    }
+    const pending = await this.approvals.findPendingByActionTarget('SYSTEM_CONFIG_CHANGE', key);
+    if (!pending) return null;
+    const full = await this.prisma.adminActionApproval.findUnique({ where: { id: pending.approvalId } });
+    const payload = (full?.payload ?? {}) as Record<string, unknown>;
+    const existing = await this.prisma.systemConfig.findUnique({ where: { key } });
+    return {
+      key,
+      proposedValue: payload.value ?? null,
+      proposedDescription: typeof payload.description === 'string' ? payload.description : null,
+      currentValue: existing?.value ?? null,
+      proposedBy: pending.proposedBy,
+      proposedAt: pending.proposedAt,
+      approvalId: pending.approvalId,
+    };
   }
 
   async listPendingConfigChanges(): Promise<object[]> {
-    const keys = await this.redis.scan(`${PENDING_CONFIG_PREFIX}*`);
-    const results: object[] = [];
-    const prefix = this.redis.getPrefix();
-    for (const rawKey of keys) {
-      const key = rawKey.startsWith(prefix) ? rawKey.slice(prefix.length) : rawKey;
-      const raw = await this.redis.get(key);
-      if (raw) {
-        try {
-          results.push(JSON.parse(raw) as object);
-        } catch {
-          this.logger.warn(`Failed to parse pending config JSON for key: ${rawKey}`);
-        }
-      }
-    }
-    return results;
+    const pendings = await this.approvals.listPending();
+    const rows = pendings.filter((p) => p.actionType === 'SYSTEM_CONFIG_CHANGE');
+    return Promise.all(
+      rows.map(async (p) => {
+        const full = await this.prisma.adminActionApproval.findUnique({ where: { id: p.approvalId } });
+        const payload = (full?.payload ?? {}) as Record<string, unknown>;
+        const existing = p.targetId
+          ? await this.prisma.systemConfig.findUnique({ where: { key: p.targetId } })
+          : null;
+        return {
+          key: p.targetId,
+          proposedValue: payload.value ?? null,
+          proposedDescription: typeof payload.description === 'string' ? payload.description : null,
+          currentValue: existing?.value ?? null,
+          proposedBy: p.proposedBy,
+          proposedAt: p.proposedAt,
+          approvalId: p.approvalId,
+        };
+      }),
+    );
   }
 
-  async approveConfigChange(key: string, approverId: string, ipAddress: string): Promise<object> {
-    const lockKey = `${PENDING_CONFIG_PREFIX}${key}:lock`;
-    const lockToken = randomBytes(16).toString('hex');
-    if (!await this.redis.setNx(lockKey, lockToken, SYSTEM_CONFIG_LOCK_TTL, { throwOnError: true })) {
-      throw new ConflictException({ code: 'CONFIG_CHANGE_IN_PROGRESS', message: 'This config change is already being processed' });
-    }
-    try {
-      const pendingKey = `${PENDING_CONFIG_PREFIX}${key}`;
-    const raw = await this.redis.get(pendingKey);
-    if (!raw) {
+  /**
+   * SYS-B-405: approve perubahan config finansial/security-gated — diteruskan
+   * ke approvals (menjamin: bukan pengusul sendiri, belum kedaluwarsa, lalu
+   * eksekusi atomik via executor SYSTEM_CONFIG_CHANGE). Step-up milik
+   * approver ditegakkan di controller (StepUpGuard, action systemConfig.update).
+   */
+  async approveConfigChange(
+    key: string,
+    approverId: string,
+    approverRole: AdminRole,
+    ipAddress: string,
+  ): Promise<object> {
+    const pending = await this.approvals.findPendingByActionTarget('SYSTEM_CONFIG_CHANGE', key);
+    if (!pending) {
       throw new NotFoundException({
         code: ErrorCodes.NOT_FOUND,
         message: `No pending config change found for key '${key}'`,
       });
     }
+    const result = await this.approvals.approve(pending.approvalId, approverId, approverRole, ipAddress);
+    return { ...result, key };
+  }
 
-    const pending = JSON.parse(raw) as {
-      key: string;
-      proposedValue: string;
-      proposedDescription?: string;
-      currentValue: string;
-      currentDescription?: string;
-      proposedBy: string;
-      proposedAt: string;
-      ipAddress: string;
-    };
-
-    if (pending.proposedBy === approverId) {
-      throw new ForbiddenException({
-        code: ErrorCodes.FORBIDDEN,
-        message: 'Cannot approve your own config change. A different admin must approve.',
+  async rejectConfigChange(
+    key: string,
+    rejecterId: string,
+    rejecterRole: AdminRole,
+    ipAddress: string,
+  ): Promise<{ message: string }> {
+    const pending = await this.approvals.findPendingByActionTarget('SYSTEM_CONFIG_CHANGE', key);
+    if (!pending) {
+      throw new NotFoundException({
+        code: ErrorCodes.NOT_FOUND,
+        message: `No pending config change found for key '${key}'`,
       });
     }
+    await this.approvals.reject(pending.approvalId, rejecterId, rejecterRole, undefined, ipAddress);
+    return { message: `Pending config change for '${key}' has been rejected` };
+  }
 
+  /**
+   * SYS-B-405: eksekusi perubahan config — HANYA dipanggil dari executor
+   * SYSTEM_CONFIG_CHANGE setelah approval dual control (bukan dari endpoint
+   * langsung). Nilai sudah divalidasi terhadap dataType saat propose.
+   */
+  private async applySystemConfigChange(
+    key: string,
+    value: string,
+    description: string | undefined,
+    decidedBy: string,
+    proposedBy: string,
+    ipAddress: string,
+  ): Promise<object> {
     const existing = await this.prisma.systemConfig.findUnique({ where: { key } });
     if (!existing) {
       throw new NotFoundException({
@@ -302,13 +361,12 @@ export class AdminSystemService {
         message: `System config with key '${key}' not found`,
       });
     }
-
     const updated = await this.prisma.systemConfig.update({
       where: { key },
       data: {
-        value: pending.proposedValue,
-        description: pending.proposedDescription !== undefined ? pending.proposedDescription : existing.description,
-        updatedBy: approverId,
+        value,
+        description: description !== undefined ? description : existing.description,
+        updatedBy: decidedBy,
       },
     });
 
@@ -319,62 +377,20 @@ export class AdminSystemService {
       this.redis.del(`${SUBSCRIPTION_PLANS_CACHE}:plans`),
       this.redis.del('public:system:configs'),
       this.redis.del('public:exchange:rates'),
-      this.redis.del(pendingKey),
     ]);
 
     this.auditLogService.logAdminAction({
-      adminId: approverId,
+      adminId: decidedBy,
       action: AuditAction.SYSTEM_CONFIG_CHANGED,
       targetType: 'SystemConfig',
       targetId: existing.id,
-      description: `Approved financial config change for '${key}' (proposed by ${pending.proposedBy})`,
-      before: { value: pending.currentValue },
-      after: { value: pending.proposedValue, approvedBy: approverId, proposedBy: pending.proposedBy },
+      description: `Approved ${classifySystemConfig(key).securityGated ? 'security-gated' : 'financial'} config change for '${key}' via dual control (proposed by ${proposedBy})`,
+      before: { value: existing.value },
+      after: { value, approvedBy: decidedBy, proposedBy },
       ipAddress,
     });
 
     return updated;
-    } finally {
-      await this.redis.releaseLock(lockKey, lockToken);
-    }
-  }
-
-  async rejectConfigChange(key: string, rejecterId: string, ipAddress: string): Promise<{ message: string }> {
-    const lockKey = `${PENDING_CONFIG_PREFIX}${key}:lock`;
-    const lockToken = randomBytes(16).toString('hex');
-    if (!await this.redis.setNx(lockKey, lockToken, SYSTEM_CONFIG_LOCK_TTL, { throwOnError: true })) {
-      throw new ConflictException({ code: 'CONFIG_CHANGE_IN_PROGRESS', message: 'This config change is already being processed' });
-    }
-    try {
-      const pendingKey = `${PENDING_CONFIG_PREFIX}${key}`;
-    const raw = await this.redis.get(pendingKey);
-    if (!raw) {
-      throw new NotFoundException({
-        code: ErrorCodes.NOT_FOUND,
-        message: `No pending config change found for key '${key}'`,
-      });
-    }
-
-    const pending = JSON.parse(raw) as { proposedBy: string; proposedValue: string };
-
-    await this.redis.del(pendingKey);
-
-    const existing = await this.prisma.systemConfig.findUnique({ where: { key } });
-
-    this.auditLogService.logAdminAction({
-      adminId: rejecterId,
-      action: AuditAction.SYSTEM_CONFIG_CHANGED,
-      targetType: 'SystemConfig',
-      targetId: existing?.id ?? key,
-      description: `Rejected financial config change for '${key}' (proposed by ${pending.proposedBy})`,
-      after: { rejectedValue: pending.proposedValue, rejectedBy: rejecterId },
-      ipAddress,
-    });
-
-    return { message: `Pending config change for '${key}' has been rejected` };
-    } finally {
-      await this.redis.releaseLock(lockKey, lockToken);
-    }
   }
 
   async listAuditLogs(query: AuditLogQueryDto): Promise<object> {

@@ -210,6 +210,20 @@ export function validateEnv(env: Env): Env {
     required(env, 'MIDTRANS_ALLOWED_CIDRS', errors)
   }
 
+  // ── DANA (pergerakan uang) ──────────────────────────────────────────────────
+  // SYS-B-406: kunci publik webhook sandbox DANA BERSIFAT PUBLIK (disalin dari
+  // SDK resmi dana-python). Fallback ke sana tanpa cek env = fail-open di
+  // produksi. DANA_ENV=production tanpa DANA_PUBLIC_KEY → boot GAGAL.
+  const danaEnv = (env['DANA_ENV'] || 'sandbox').toLowerCase()
+  if (danaEnv === 'production' && !env['DANA_PUBLIC_KEY']) {
+    errors.push({
+      key: 'DANA_PUBLIC_KEY',
+      message:
+        'DANA_PUBLIC_KEY is required when DANA_ENV=production — without it webhook signature verification ' +
+        'silently falls back to the PUBLIC sandbox key (fail-open, SYS-B-406). Set the production public key from the DANA dashboard.',
+    })
+  }
+
   // ── CLOUDFLARE R2 / STORAGE ─────────────────────────────────────────────────
   // Batch 1A (ST-010): R2 adalah legacy — storage self-hosted adalah jalur utama
   // (keputusan produk: tanpa spend Cloudflare). Var R2 opsional; hanya warning

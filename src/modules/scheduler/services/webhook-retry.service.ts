@@ -10,6 +10,10 @@ import { PaymentService } from '../../payment/payment.service';
 import { MidtransNotificationDto } from '../../payment/dto/midtrans-notification.dto';
 import { getWebhookRetryAt, MAX_WEBHOOK_ATTEMPTS } from '../../payment/webhook-retry.constants';
 import { safeErrorMessage, startLockRenewal } from '../../../common/utils/background-reliability.util';
+import {
+  DanaPaymentReconcileService,
+  isTerminalReconcileOutcome,
+} from './dana-payment-reconcile.service';
 
 const WEBHOOK_RETRY_LOCK_KEY = 'cron_lock:webhook_inbox_retry';
 const WEBHOOK_RETRY_LOCK_TTL_SECONDS = 110;
@@ -25,6 +29,7 @@ export class WebhookRetryService {
     private redis: RedisService,
     private paymentService: PaymentService,
     private configService: ConfigService,
+    private danaPaymentReconcile: DanaPaymentReconcileService,
   ) {
     const configuredBatchSize = this.configService.get<number>('app.webhookRetryBatchSize') ?? DEFAULT_BATCH_SIZE;
     this.batchSize = Math.min(Math.max(Math.trunc(configuredBatchSize), 1), 100);
@@ -49,7 +54,10 @@ export class WebhookRetryService {
       const now = new Date();
       const candidates = await this.prisma.webhookLog.findMany({
         where: {
-          source: 'MIDTRANS',
+          // SYS-B-305: webhook DANA (source='DANA') ikut di-retry — sebelumnya
+          // hanya MIDTRANS sehingga notify DANA yang gagal diproses tak pernah
+          // pulih via sistem (satu-satunya harapan adalah retry dari DANA).
+          source: { in: ['MIDTRANS', 'DANA'] },
           isProcessed: false,
           deadLetteredAt: null,
           retryCount: { lt: MAX_WEBHOOK_ATTEMPTS },
@@ -69,6 +77,13 @@ export class WebhookRetryService {
           this.logger.warn('Webhook retry stopped because the Redis lease was lost.');
           break;
         }
+        // SYS-B-305: baris DANA tidak bisa di-replay lewat handler webhook
+        // (verifikasi signature butuh raw body yang tak disimpan) — pulihkan
+        // via jalur verify-via-API yang sama dipakai webhook itu sendiri.
+        if (candidate.source === 'DANA') {
+          await this.retryDanaWebhook(candidate, stats);
+          continue;
+        }
         try {
           await this.paymentService.handleMidtransWebhook(
             candidate.payload as unknown as MidtransNotificationDto,
@@ -77,34 +92,14 @@ export class WebhookRetryService {
           stats.processed += 1;
         } catch (error) {
           stats.failed += 1;
-          const message = safeErrorMessage(error);
-          const attempt = Math.max(candidate.retryCount + 1, 1);
-          const deadLettered = attempt >= MAX_WEBHOOK_ATTEMPTS;
-          if (deadLettered) stats.deadLettered += 1;
-
-          await this.prisma.webhookLog.updateMany({
-            where: { id: candidate.id, isProcessed: false, retryCount: candidate.retryCount },
-            data: {
-              retryCount: { increment: 1 },
-              errorMessage: message,
-              lastAttemptAt: new Date(),
-              nextRetryAt: deadLettered ? null : getWebhookRetryAt(attempt),
-              deadLetteredAt: deadLettered ? new Date() : null,
-            },
-          }).catch((updateError) => {
-            this.logger.error(`Failed to schedule webhook retry id=${candidate.id}: ${updateError instanceof Error ? updateError.message : String(updateError)}`);
-          });
-
-          this.logger.warn(
-            `Webhook retry failed id=${candidate.id} attempt=${attempt}/${MAX_WEBHOOK_ATTEMPTS} deadLettered=${deadLettered}: ${message}`,
-          );
+          await this.recordAttemptFailure(candidate, safeErrorMessage(error), stats);
         }
       }
 
       const [retryableBacklog, deadLetterBacklog] = await Promise.all([
         this.prisma.webhookLog.count({
           where: {
-            source: 'MIDTRANS',
+            source: { in: ['MIDTRANS', 'DANA'] },
             isProcessed: false,
             deadLetteredAt: null,
             retryCount: { lt: MAX_WEBHOOK_ATTEMPTS },
@@ -112,7 +107,7 @@ export class WebhookRetryService {
           },
         }),
         this.prisma.webhookLog.count({
-          where: { source: 'MIDTRANS', isProcessed: false, deadLetteredAt: { not: null } },
+          where: { source: { in: ['MIDTRANS', 'DANA'] }, isProcessed: false, deadLetteredAt: { not: null } },
         }),
       ]);
 
@@ -143,5 +138,117 @@ export class WebhookRetryService {
       lease.stop();
       await this.redis.releaseLock(WEBHOOK_RETRY_LOCK_KEY, lockToken).catch((error) => this.logger.warn(`Failed to release webhook retry lock: ${safeErrorMessage(error)}`));
     }
+  }
+
+  /**
+   * SYS-B-305a: replay baris webhookLog DANA yang gagal diproses.
+   *
+   * Replay penuh lewat handler webhook tidak mungkin (verifikasi signature
+   * RSA butuh raw body; yang tersimpan hanya payload ter-parse). Sebagai
+   * gantinya dipakai jalur verify-via-API — persis seperti yang dilakukan
+   * handler webhook setelah signature valid:
+   *  - `finish_notify:*` → `DanaPaymentReconcileService`
+   *    (getPaymentDetail + settle/expire). Outcome terminal → baris ditandai
+   *    processed; bila belum terminal → backoff retry seperti MIDTRANS.
+   *  - `disburs_notify:*` → cek status final EscrowDisbursement; yang belum
+   *    final diserahkan ke cron `dana-refund-retry` → `reconcileProcessing()`
+   *    (query Transfer-to-Bank Status API). Baris hanya dihitung gagal agar
+   *    backoff/DLQ tetap berjalan.
+   */
+  private async retryDanaWebhook(
+    candidate: { id: string; event: string | null; payload: unknown; retryCount: number },
+    stats: { processed: number; failed: number; deadLettered: number },
+  ): Promise<void> {
+    const event = candidate.event ?? '';
+    const payload = (candidate.payload ?? {}) as Record<string, unknown>;
+
+    try {
+      if (event.startsWith('finish_notify:')) {
+        const partnerRefNo = String(
+          payload['originalPartnerReferenceNo'] ?? payload['originalReferenceNo'] ?? '',
+        ).trim();
+        if (!partnerRefNo) {
+          throw new Error('payload DANA finish_notify tanpa originalPartnerReferenceNo');
+        }
+        const outcome = await this.danaPaymentReconcile.reconcileByPartnerReferenceNo(partnerRefNo);
+        if (isTerminalReconcileOutcome(outcome)) {
+          await this.markProcessed(candidate.id);
+          stats.processed += 1;
+          this.logger.log(`DANA webhook retry ok id=${candidate.id} outcome=${outcome}`);
+        } else {
+          throw new Error(`reconcile belum terminal: ${outcome}`);
+        }
+        return;
+      }
+
+      if (event.startsWith('disburs_notify:')) {
+        const partnerRefNo = String(
+          payload['originalPartnerReferenceNo'] ?? payload['originalReferenceNo'] ?? '',
+        ).trim();
+        if (partnerRefNo) {
+          const disb = await this.prisma.escrowDisbursement.findUnique({
+            where: { danaPartnerReferenceNo: partnerRefNo },
+            select: { id: true, status: true },
+          });
+          // Status final → notify sudah ter-apply (idempoten); baris selesai.
+          // Selain itu → cron dana-refund-retry/reconcileProcessing yang
+          // berwenang (query status resmi DANA); di sini cukup backoff.
+          if (!disb || ['SUCCESS', 'FAILED', 'CANCELLED'].includes(disb.status)) {
+            await this.markProcessed(candidate.id);
+            stats.processed += 1;
+            this.logger.log(`DANA disburs webhook retry ok id=${candidate.id} status=${disb?.status ?? 'tak-dikenal'}`);
+            return;
+          }
+        }
+        throw new Error('disbursement belum final — menunggu reconcileProcessing');
+      }
+
+      throw new Error(`event DANA tak dikenal: ${event || '(kosong)'}`);
+    } catch (error) {
+      stats.failed += 1;
+      await this.recordAttemptFailure(candidate, safeErrorMessage(error), stats);
+    }
+  }
+
+  private async markProcessed(id: string): Promise<void> {
+    await this.prisma.webhookLog
+      .updateMany({
+        where: { id, isProcessed: false },
+        data: { isProcessed: true, lastAttemptAt: new Date(), errorMessage: null },
+      })
+      .catch(error => {
+        this.logger.error(`Failed to mark webhook processed id=${id}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+  }
+
+  private async recordAttemptFailure(
+    candidate: { id: string; retryCount: number },
+    message: string,
+    stats: { failed: number; deadLettered: number },
+  ): Promise<void> {
+    const attempt = Math.max(candidate.retryCount + 1, 1);
+    const deadLettered = attempt >= MAX_WEBHOOK_ATTEMPTS;
+    if (deadLettered) stats.deadLettered += 1;
+
+    await this.prisma.webhookLog
+      .updateMany({
+        where: { id: candidate.id, isProcessed: false, retryCount: candidate.retryCount },
+        data: {
+          retryCount: { increment: 1 },
+          errorMessage: message,
+          lastAttemptAt: new Date(),
+          nextRetryAt: deadLettered ? null : getWebhookRetryAt(attempt),
+          deadLetteredAt: deadLettered ? new Date() : null,
+        },
+      })
+      .catch(updateError => {
+        this.logger.error(
+          `Failed to schedule webhook retry id=${candidate.id}: ${updateError instanceof Error ? updateError.message : String(updateError)}`,
+        );
+      });
+
+    this.logger.warn(
+      `Webhook retry failed id=${candidate.id} attempt=${attempt}/${MAX_WEBHOOK_ATTEMPTS} deadLettered=${deadLettered}: ${message}`,
+    );
   }
 }

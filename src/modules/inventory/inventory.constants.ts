@@ -99,10 +99,3 @@ export function variantLabelOf(attributes: Record<string, string>): string {
 function capitalize(s: string): string {
   return s.length === 0 ? s : s[0].toUpperCase() + s.slice(1);
 }
-
-/** Format rupiah dari sen (BigInt-safe, tanpa float math). */
-export function formatRupiah(sen: bigint | number | string): string {
-  const n = typeof sen === 'bigint' ? sen : BigInt(String(sen));
-  const rupiah = n / 100n;
-  return `Rp${rupiah.toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.')}`;
-}

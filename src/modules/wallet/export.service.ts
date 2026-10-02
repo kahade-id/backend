@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { Writable } from 'stream';
 import { PrismaService } from '../../prisma/prisma.service';
 import * as ExcelJS from 'exceljs';
-import { toIdr } from '../../common/utils/currency.util';
+import { toIdr, formatIdr, formatSen } from '../../common/utils/currency.util';
 import { formatWIBDate, parseDateBoundaryWIB, toWIB } from '../../common/utils/date.util';
 import PDFDocument from 'pdfkit';
 
@@ -356,7 +356,7 @@ export class WalletExportService {
         const INCOME_TYPES = ['TOP_UP', 'ORDER_RELEASE', 'ORDER_REFUND', 'REFERRAL_REWARD', 'ADMIN_CREDIT', 'DISPUTE_RELEASE', 'TRANSFER_RECEIVED', 'CAMPAIGN_CASHBACK', 'TOPUP_BONUS'];
         const totalIn = transactions.filter(t => INCOME_TYPES.includes(t.type) && t.status === 'SUCCESS').reduce((s, t) => s + toIdr(t.amount), 0);
         const totalOut = transactions.filter(t => !INCOME_TYPES.includes(t.type) && t.status === 'SUCCESS').reduce((s, t) => s + toIdr(t.amount), 0);
-        doc.fontSize(10).font('Helvetica-Bold').text(`Total In: Rp ${totalIn.toLocaleString('id-ID')} | Total Out: Rp ${totalOut.toLocaleString('id-ID')} | Net: Rp ${(totalIn - totalOut).toLocaleString('id-ID')}`);
+        doc.fontSize(10).font('Helvetica-Bold').text(`Total In: ${formatIdr(totalIn)} | Total Out: ${formatIdr(totalOut)} | Net: ${formatIdr(totalIn - totalOut)}`);
         doc.moveDown(1);
 
         // Table header
@@ -382,7 +382,7 @@ export class WalletExportService {
           const y = doc.y;
           const dateStr = toWIB(tx.createdAt).format('YYYY-MM-DD');
           const typeLabel = TYPE_LABELS[tx.type] || tx.type;
-          const amountStr = `Rp ${toIdr(tx.amount).toLocaleString('id-ID')}`;
+          const amountStr = formatSen(tx.amount);
           const statusLabel = STATUS_LABELS[tx.status] || tx.status;
           const orderId = tx.order?.orderId || '-';
           const desc = (tx.description || tx.order?.title || '').slice(0, 40);

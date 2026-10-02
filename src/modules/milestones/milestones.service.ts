@@ -64,6 +64,11 @@ type Tx = Prisma.TransactionClient;
 const REVIEW_WINDOW_MS = 3 * 24 * 60 * 60 * 1000; // 3 hari review buyer (G183)
 const MAX_MILESTONES = 20;
 
+// SYS-B-307: tahap ACCEPTED tanpa pencairan > 7 hari dicairkan otomatis
+// (cron milestone-auto-release). Aktor audit untuk event auto-release.
+const MILESTONE_AUTO_RELEASE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+const MILESTONE_AUTO_RELEASE_ACTOR = 'system:auto-release';
+
 /** Rincian split dana per tahap. */
 export interface MilestoneSplit {
   amount: bigint;
@@ -1278,6 +1283,126 @@ export class MilestonesService {
       await this.runPostCommitMilestoneRelease(result.danaDisbursement);
     }
     return { id: milestoneId, releasedTxId: result.releasedTxId, alreadyReleased: false };
+  }
+
+  /**
+   * SYS-B-307 (audit sistemik ronde 3): auto-release tahap ACCEPTED yang basi.
+   *
+   * Tahap yang sudah ACCEPTED (diterima buyer) tetapi tak pernah dicairkan —
+   * mis. crash di antara accept dan release pada versi alur lama, atau
+   * ACCEPTED yang lolos tanpa release — membuat dana seller tertahan di
+   * escrow tanpa batas waktu.
+   *
+   * Dipanggil cron harian `milestone-auto-release` (scheduler): tahap
+   * ACCEPTED dengan acceptedAt > 7 hari dicairkan otomatis via jalur release
+   * yang SAMA persis dengan `releaseMilestone()` — `releaseMilestoneFunds`
+   * atomik, idempoten, dengan concurrency guard `updateMany` berpredikat
+   * status=ACCEPTED.
+   *
+   * Fail-closed:
+   *  - Hanya bila milestone MASIH ACCEPTED saat dieksekusi (predikat di
+   *    dalam tx; race dengan release manual → tepat satu yang menang, tak
+   *    ada pencairan ganda).
+   *  - Order harus valid: `assertOrderAllowsMilestoneAction` (hanya
+   *    PROCESSING/IN_DELIVERY). Order DISPUTED/CANCELLED/COMPLETED → DITAHAN
+   *    (masuk daftar `held`) + alert oleh cron — butuh keputusan manusia,
+   *    bukan auto-release.
+   *  - Mode no-wallet: baris disbursement PENDING durable dibuat DI DALAM
+   *    tx yang sama (pola SEC-104); settlement post-commit best-effort,
+   *    cron dana-refund-retry mengambil alih bila gagal.
+   */
+  async autoReleaseStaleAccepted(limit = 50): Promise<{
+    checked: number;
+    released: number;
+    skipped: number;
+    held: string[];
+  }> {
+    const cutoff = new Date(Date.now() - MILESTONE_AUTO_RELEASE_AFTER_MS);
+    const stale = await this.prisma.orderMilestone.findMany({
+      where: { status: MilestoneStatus.ACCEPTED, acceptedAt: { lt: cutoff } },
+      select: { id: true },
+      orderBy: { acceptedAt: 'asc' },
+      take: Math.max(1, limit),
+    });
+
+    let released = 0;
+    let skipped = 0;
+    const held: string[] = [];
+    for (const s of stale) {
+      try {
+        const outcome = await this.autoReleaseOne(s.id);
+        if (outcome === 'released') released++;
+        else if (outcome === 'held') {
+          skipped++;
+          held.push(s.id);
+        } else skipped++;
+      } catch (e) {
+        skipped++;
+        this.logger.warn(
+          `auto-release tahap ${s.id} gagal: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
+    if (stale.length > 0) {
+      this.logger.log(
+        `milestone auto-release: checked=${stale.length} released=${released} skipped=${skipped} held=${held.length}`,
+      );
+    }
+    return { checked: stale.length, released, skipped, held };
+  }
+
+  /**
+   * Satu tahap auto-release. Mengembalikan 'released' | 'held' | 'skipped'.
+   * 'held' = order tak valid → JANGAN cairkan otomatis (fail-closed).
+   */
+  private async autoReleaseOne(milestoneId: string): Promise<'released' | 'held' | 'skipped'> {
+    const milestone = await this.prisma.orderMilestone.findUnique({
+      where: { id: milestoneId },
+      include: { order: true },
+    });
+    // Race: sudah berubah status (mis. dicairkan manual) → lewati.
+    if (!milestone || milestone.status !== MilestoneStatus.ACCEPTED) return 'skipped';
+
+    try {
+      this.assertOrderAllowsMilestoneAction(milestone.order);
+    } catch (e) {
+      // Fail-closed: order DISPUTED/CANCELLED/dsb — dana ditahan sampai ada
+      // keputusan manusia. Cron yang memanggil akan meng-alert daftar held.
+      this.logger.error(
+        `auto-release DITAHAN tahap ${milestoneId} (order ${milestone.order.orderId} ` +
+          `status=${milestone.order.status}): ${e instanceof Error ? e.message : String(e)}`,
+      );
+      return 'held';
+    }
+
+    const result = await this.prisma.$transaction(tx =>
+      this.releaseMilestoneFunds(tx, milestoneId, MILESTONE_AUTO_RELEASE_ACTOR),
+    );
+    // M5: settlement DANA post-commit (best-effort; baris PENDING durable
+    // sudah dibuat di dalam tx bila mode tanpa-wallet).
+    if (!result.skipped && 'danaDisbursement' in result && result.danaDisbursement) {
+      await this.runPostCommitMilestoneRelease(result.danaDisbursement);
+    }
+    if (result.skipped) return 'skipped';
+
+    const noWallet = this.isNoWalletMode();
+    await this.notifyUser(
+      milestone.order.buyerId,
+      NotificationType.MILESTONE_RELEASED,
+      'Tahap Dicairkan Otomatis',
+      `Tahap ${milestone.seq} "${milestone.title}" dicairkan otomatis setelah 7 hari tanpa pencairan manual.`,
+      milestoneId,
+    );
+    await this.notifyUser(
+      milestone.order.sellerId,
+      NotificationType.MILESTONE_RELEASED,
+      'Dana Tahap Cair Otomatis',
+      noWallet
+        ? `Tahap ${milestone.seq} "${milestone.title}" dicairkan otomatis ke rekening bank terdaftar Anda.`
+        : `Tahap ${milestone.seq} "${milestone.title}" dicairkan otomatis ke wallet Anda.`,
+      milestoneId,
+    );
+    return 'released';
   }
 
   /**

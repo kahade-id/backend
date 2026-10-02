@@ -25,9 +25,12 @@ import { RequireStepUp } from '../../../common/decorators/require-step-up.decora
  * - List & detail: murni baca.
  * - `recheck`: query status ke DANA (read terhadap provider) + transisi yang
  *   SAMA dengan cron otomatis — TIDAK PERNAH mengirim transfer baru.
- * - `review` (NEEDS_REVIEW → RETRY/CANCEL/FORCE_SUCCESS): SUPER_ADMIN only,
- *   reason min 10, audit trail wajib. FORCE_SUCCESS hanya sah dengan bukti
- *   transfer nyata yang tercatat di reason.
+ * - `review` (NEEDS_REVIEW → RETRY/CANCEL): SUPER_ADMIN only, step-up wajib
+ *   (SYS-B-401), reason min 10, audit trail wajib. RETRY → PENDING → cron.
+ * - `review` dengan keputusan FORCE_SUCCESS: SELALU via dual control
+ *   (SYS-B-401, actionType DISBURSEMENT_FORCE_SUCCESS) — endpoint hanya
+ *   membuat usulan PENDING; eksekusi (SUCCESS) oleh admin kedua via
+ *   POST /v1/admin/approvals/:id/approve. Bukti transfer nyata wajib di reason.
  * - `requeue` (HELD_NO_BANK → PENDING): hanya mengubah status lokal agar cron
  *   retryDue memproses ulang via settle() yang fail-closed (inquiry bank +
  *   verifikasi nama tetap dijalankan).
@@ -90,13 +93,16 @@ export class AdminDisbursementController {
 
   @Post(':id/review')
   @AdminRoles('SUPER_ADMIN')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SYS-B-401: review manual NEEDS_REVIEW wajib step-up server-side
+  // (keputusan RETRY memicu transfer DANA nyata via cron).
+  @RequireStepUp('disbursement.review', 'id')
   @Idempotency()
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @ApiOperation({
     summary: 'Review manual baris NEEDS_REVIEW (SUPER_ADMIN)',
     description:
-      'BAI-044: putuskan baris NEEDS_REVIEW — RETRY (kembali PENDING, diproses cron secara idempoten), CANCEL (terminal), atau FORCE_SUCCESS (hanya dengan bukti transfer nyata di reason, min 10 karakter). Audit trail wajib. Requires Idempotency-Key.',
+      'BAI-044 + SYS-B-401: putuskan baris NEEDS_REVIEW — RETRY (kembali PENDING, diproses cron secara idempoten), CANCEL (terminal), atau FORCE_SUCCESS (SELALU via dual control: endpoint ini hanya membuat usulan, eksekusi oleh admin kedua via POST /v1/admin/approvals/:id/approve). Audit trail wajib. Requires X-Step-Up-Token (action disbursement.review) + Idempotency-Key.',
   })
   @ApiResponse({ status: 200, description: 'Keputusan review tercatat.' })
   @ApiResponse({ status: 404, description: 'Disbursement tidak ditemukan.' })
@@ -104,21 +110,24 @@ export class AdminDisbursementController {
   reviewDisbursement(
     @Param('id', ParseIdPipe) id: string,
     @Body() dto: DisbursementReviewDto,
-    @CurrentAdmin('sub') adminId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<object> {
-    return this.service.reviewDisbursement(id, dto, adminId, req.ip || 'unknown');
+    return this.service.reviewDisbursement(id, dto, admin.sub, admin.role, req.ip || 'unknown');
   }
 
   @Post(':id/requeue')
   @AdminRoles('SUPER_ADMIN', 'FINANCE_ADMIN')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SYS-B-401: requeue HELD_NO_BANK → PENDING wajib step-up server-side
+  // (membuka jalan ke transfer DANA nyata via cron retryDue).
+  @RequireStepUp('disbursement.requeue', 'id')
   @Idempotency()
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @ApiOperation({
     summary: 'Cairkan ulang baris HELD_NO_BANK',
     description:
-      'BAI-045: kembalikan baris HELD_NO_BANK ke PENDING setelah seller mendaftarkan rekening terverifikasi; cron retryDue memprosesnya via settle() (inquiry bank + verifikasi nama tetap dijalankan — fail-closed bila rekening belum valid). Requires Idempotency-Key.',
+      'BAI-045 + SYS-B-401: kembalikan baris HELD_NO_BANK ke PENDING setelah seller mendaftarkan rekening terverifikasi; cron retryDue memprosesnya via settle() (inquiry bank + verifikasi nama tetap dijalankan — fail-closed bila rekening belum valid). Requires X-Step-Up-Token (action disbursement.requeue) + Idempotency-Key.',
   })
   @ApiResponse({ status: 200, description: 'Disbursement dikembalikan ke PENDING.' })
   @ApiResponse({ status: 404, description: 'Disbursement tidak ditemukan.' })

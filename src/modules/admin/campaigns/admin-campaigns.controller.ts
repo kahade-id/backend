@@ -21,6 +21,8 @@ import { PauseCampaignDto, ActivateCampaignDto } from './dto/campaign-lifecycle.
 import { DeleteCampaignDto } from './dto/delete-campaign.dto';
 import { DuplicateCampaignDto } from './dto/duplicate-campaign.dto';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
+import { StepUpGuard } from '../../../common/guards/step-up.guard';
+import { RequireStepUp } from '../../../common/decorators/require-step-up.decorator';
 
 const CAMPAIGN_STATUSES = ['DRAFT', 'ACTIVE', 'PAUSED', 'ENDED'];
 
@@ -33,10 +35,12 @@ const CAMPAIGN_STATUSES = ['DRAFT', 'ACTIVE', 'PAUSED', 'ENDED'];
 export class AdminCampaignsController {
   constructor(private campaignService: CampaignService) {}
 
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
   @Post()
+  // SYS-B-402: pembuatan campaign = definisi liabilitas promo.
+  @RequireStepUp('campaign.create')
   @Throttle({ default: { ttl: 60000, limit: 10 } })
-  @ApiOperation({ summary: 'Create a campaign' })
+  @ApiOperation({ summary: 'Create a campaign', description: 'SYS-B-402: requires X-Step-Up-Token (action campaign.create).' })
   async createCampaign(
     @CurrentAdmin('sub') adminId: string,
     @Body() dto: CreateCampaignDto,
@@ -95,12 +99,14 @@ export class AdminCampaignsController {
     return this.campaignService.getCampaign(campaignId);
   }
 
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
   @Post(':campaignId/activate')
+  // SYS-B-402: aktivasi = liabilitas finansial lahir; nilai > ambang → dual control.
+  @RequireStepUp('campaign.activate', 'campaignId')
   @Idempotency()
   @HttpCode(200)
   @Throttle({ default: { ttl: 60000, limit: 5 } })
-  @ApiOperation({ summary: 'Aktifkan kampanye — reason wajib, Idempotency-Key wajib (G359-G361)' })
+  @ApiOperation({ summary: 'Aktifkan kampanye — reason wajib, Idempotency-Key wajib (G359-G361)', description: 'SYS-B-402: requires X-Step-Up-Token (action campaign.activate). Nilai campaign di atas Rp1.000.000 wajib dual control (actionType CAMPAIGN_ACTIVATE).' })
   async activateCampaign(
     @CurrentAdmin('sub') adminId: string,
     @Param('campaignId', ParseIdPipe) campaignId: string,
@@ -110,10 +116,12 @@ export class AdminCampaignsController {
     return this.campaignService.activateCampaign(campaignId, adminId, { reason: dto.reason }, req.ip || 'unknown');
   }
 
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
   @Put(':campaignId')
+  // SYS-B-402: update campaign (field promo bisa berubah saat DRAFT).
+  @RequireStepUp('campaign.update', 'campaignId')
   @Throttle({ default: { ttl: 60000, limit: 10 } })
-  @ApiOperation({ summary: 'Update kampanye — changeReason wajib, field terkunci setelah DRAFT (G351-G355)' })
+  @ApiOperation({ summary: 'Update kampanye — changeReason wajib, field terkunci setelah DRAFT (G351-G355)', description: 'SYS-B-402: requires X-Step-Up-Token (action campaign.update).' })
   async updateCampaign(
     @CurrentAdmin('sub') adminId: string,
     @Param('campaignId', ParseIdPipe) campaignId: string,
@@ -127,11 +135,13 @@ export class AdminCampaignsController {
     }, req.ip || 'unknown');
   }
 
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
   @Post(':campaignId/pause')
+  // SYS-B-402: pause menghentikan liabilitas — tetap butuh re-auth.
+  @RequireStepUp('campaign.pause', 'campaignId')
   @HttpCode(200)
   @Throttle({ default: { ttl: 60000, limit: 10 } })
-  @ApiOperation({ summary: 'Jeda kampanye — reason wajib (G359)' })
+  @ApiOperation({ summary: 'Jeda kampanye — reason wajib (G359)', description: 'SYS-B-402: requires X-Step-Up-Token (action campaign.pause).' })
   async pauseCampaign(
     @CurrentAdmin('sub') adminId: string,
     @Param('campaignId', ParseIdPipe) campaignId: string,
@@ -141,10 +151,12 @@ export class AdminCampaignsController {
     return this.campaignService.pauseCampaign(campaignId, adminId, dto.reason, req.ip || 'unknown');
   }
 
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
   @Post(':campaignId/duplicate')
+  // SYS-B-402: duplikat membuat campaign baru (draf) dari definisi promo.
+  @RequireStepUp('campaign.duplicate', 'campaignId')
   @Throttle({ default: { ttl: 60000, limit: 10 } })
-  @ApiOperation({ summary: 'Duplikat kampanye ke draf baru tanpa hasil redemption (G362)' })
+  @ApiOperation({ summary: 'Duplikat kampanye ke draf baru tanpa hasil redemption (G362)', description: 'SYS-B-402: requires X-Step-Up-Token (action campaign.duplicate).' })
   async duplicateCampaign(
     @CurrentAdmin('sub') adminId: string,
     @Param('campaignId', ParseIdPipe) campaignId: string,
@@ -154,10 +166,12 @@ export class AdminCampaignsController {
     return this.campaignService.duplicateCampaign(campaignId, adminId, { name: dto.name }, req.ip || 'unknown');
   }
 
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
   @Delete(':campaignId')
+  // SYS-B-402: hapus campaign (guard voucher terbit tetap berlaku di service).
+  @RequireStepUp('campaign.delete', 'campaignId')
   @Throttle({ default: { ttl: 60000, limit: 5 } })
-  @ApiOperation({ summary: 'Hapus kampanye — guard voucher terbit, force hanya untuk DRAFT (G356-G357)' })
+  @ApiOperation({ summary: 'Hapus kampanye — guard voucher terbit, force hanya untuk DRAFT (G356-G357)', description: 'SYS-B-402: requires X-Step-Up-Token (action campaign.delete).' })
   async deleteCampaign(
     @CurrentAdmin('sub') adminId: string,
     @Param('campaignId', ParseIdPipe) campaignId: string,

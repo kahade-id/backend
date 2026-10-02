@@ -16,7 +16,7 @@ import {
 import { generateWalletTxId, generateReferralCode } from '../../common/utils/id-generator.util';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
-import { toIdr } from '../../common/utils/currency.util';
+import { toIdr, formatSen } from '../../common/utils/currency.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { REFERRAL_LEADERBOARD_CACHE } from '../../common/constants/redis-keys';
 // M4 no-wallet: payout referral via disbursement DANA bila wallet mati.
@@ -569,7 +569,7 @@ export class ReferralService {
     });
 
     this.logger.log(
-      `Referral rewards Rp${toIdr(rewardAmount).toLocaleString('id-ID')} each credited to referrer ${relation.referrerId} and referee ${relation.refereeId} for order ${orderId}`,
+      `Referral rewards ${formatSen(rewardAmount)} each credited to referrer ${relation.referrerId} and referee ${relation.refereeId} for order ${orderId}`,
     );
     return true;
   }
@@ -629,7 +629,7 @@ export class ReferralService {
         data: { totalRewardEarned: { increment: amount } },
       });
       this.logger.log(
-        `Referral reward Rp${toIdr(amount).toLocaleString('id-ID')} diklaim untuk user ${userId} (order ${orderId}) — payout DANA dijadwalkan via scheduler`,
+        `Referral reward ${formatSen(amount)} diklaim untuk user ${userId} (order ${orderId}) — payout DANA dijadwalkan via scheduler`,
       );
       return true;
     }

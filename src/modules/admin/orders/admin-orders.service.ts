@@ -18,7 +18,7 @@ import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
 import { AdminOrderQueryDto, ForceActionDto, ForceActionWithReauthDto } from './dto/admin-order-query.dto';
-import { toIdr } from '../../../common/utils/currency.util';
+import { toIdr, formatSen } from '../../../common/utils/currency.util';
 import { decryptPiiSafe } from '../../../common/utils/pii.util';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
@@ -711,7 +711,7 @@ export class AdminOrdersService {
       try {
         const danaRes = await executeDanaCashback(this.disbursement, forceCompleteDana.params, forceCompleteDana.intent);
         if (danaRes.outcome === 'RELEASED') {
-          const cashbackIdr = toIdr(forceCompleteDana.intent.amountSen).toLocaleString('id-ID');
+          const cashbackIdr = formatSen(forceCompleteDana.intent.amountSen);
           await this.prisma.notification.create({
             data: {
               notifId: generateNotifId(),
@@ -719,7 +719,7 @@ export class AdminOrdersService {
               type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
               category: getCategoryForType(NotificationType.CAMPAIGN_CASHBACK_CREDITED),
               title: 'Cashback Terkirim',
-              body: `Cashback Rp ${cashbackIdr} dari order "${order.title}" telah dikirim ke rekening bank Anda.`,
+              body: `Cashback ${cashbackIdr} dari order "${order.title}" telah dikirim ke rekening bank Anda.`,
               isRead: false,
             },
           }).catch((err: unknown) => this.logger.warn(`silent-catch: admin force-complete DANA cashback notification failed: ${err instanceof Error ? err.message : String(err)}`));
@@ -732,7 +732,7 @@ export class AdminOrdersService {
 
     // Batch 1-money (EO-005): beritahu penerima bila cashback dikredit.
     if (forceCompleteCashbackResult?.credited && forceCompleteCashbackResult.userId) {
-      const cashbackIdr = toIdr(forceCompleteCashbackResult.amount).toLocaleString('id-ID');
+      const cashbackIdr = formatSen(forceCompleteCashbackResult.amount);
       this.prisma.notification.create({
         data: {
           notifId: generateNotifId(),
@@ -740,7 +740,7 @@ export class AdminOrdersService {
           type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
           category: getCategoryForType(NotificationType.CAMPAIGN_CASHBACK_CREDITED),
           title: 'Cashback Credited',
-          body: `Cashback Rp ${cashbackIdr} from order "${order.title}" has been credited to your wallet.`,
+          body: `Cashback ${cashbackIdr} from order "${order.title}" has been credited to your wallet.`,
           isRead: false,
         },
       }).catch((err: unknown) => this.logger.warn(`silent-catch: admin force-complete cashback notification failed: ${err instanceof Error ? err.message : String(err)}`));

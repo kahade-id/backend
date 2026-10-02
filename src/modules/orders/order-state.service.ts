@@ -11,10 +11,11 @@ import { OrderStatus, OrderCancelReason, ActorType, WalletTransactionType, Walle
 import { addDays, resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
 import { rollbackOrderVoucherUsage } from '../../common/utils/voucher-rollback.util';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
+import { formatSen } from '../../common/utils/currency.util';
 import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback, DanaCashbackIntent } from '../../common/utils/cashback-credit.util';
 import { EscrowDisbursementService } from '../no-wallet/escrow-disbursement.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
-import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
+import { DanaDirectRefundService, deriveDanaRefundNo } from '../no-wallet/dana-direct-refund.service';
 import { MilestonesService } from '../milestones/milestones.service';
 import { FeeCalculatorService } from './fee-calculator.service';
 import { NotificationQueueService } from '../queue/notification-queue.service';
@@ -271,7 +272,7 @@ export class OrderStateService {
           userId: cashbackUsage.userId,
           type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
           title: 'Cashback Credited',
-          body: `Cashback Rp ${(cashbackUsage.discountApplied / BigInt(100)).toLocaleString('id-ID')} from order "${order.title}" has been credited to your wallet.`,
+          body: `Cashback ${formatSen(cashbackUsage.discountApplied)} from order "${order.title}" has been credited to your wallet.`,
           pushData: { type: 'CAMPAIGN_CASHBACK_CREDITED', orderId },
         });
       }
@@ -1303,12 +1304,61 @@ export class OrderStateService {
         });
         }
       }
+
+      // SYS-B-205 (pola SEC-104): baris durable danaRefundAttempt PENDING —
+      // dibuat DI DALAM tx yang sama dengan cancel. Eksekusi post-commit via
+      // klaim atomik di refundAmount() (PENDING/FAILED → EXECUTING, hanya satu
+      // eksekutor menang); crash di antaranya → sweep dana-refund-retry
+      // menjemput baris PENDING yang basi.
+      //
+      // Kunci idempotency deterministik & unik per (order, aksi):
+      // `ORDER:<orderDbId>:ADMIN_CANCEL`. Nominal snapshot sisa refund saat
+      // rencana; refundAmount() menghitung ulang dari payment segar (fail-closed
+      // bila payment tidak lagi eligible).
+      //
+      // Order bertahap (milestone) TIDAK dibuatkan baris di sini — refundnya
+      // di-routing per tahap via adminCancelMilestonesNoWallet post-commit.
+      if (danaDirectMode) {
+        const milestoneCount = await tx.orderMilestone.count({ where: { orderId: order.id } });
+        if (milestoneCount === 0) {
+          const danaPayment = await tx.paymentTransaction.findFirst({
+            where: { orderId: order.id, provider: 'DANA', status: 'SUCCESS' },
+            orderBy: { settledAt: 'desc' },
+            select: { id: true, grossAmount: true, refundedAmount: true },
+          });
+          if (danaPayment) {
+            const remaining = danaPayment.grossAmount - (danaPayment.refundedAmount ?? BigInt(0));
+            if (remaining > BigInt(0)) {
+              const attemptKey = `ORDER:${order.id}:ADMIN_CANCEL`;
+              const existingAttempt = await tx.danaRefundAttempt.findUnique({
+                where: { idempotencyKey: attemptKey },
+                select: { id: true },
+              });
+              if (!existingAttempt) {
+                await tx.danaRefundAttempt.create({
+                  data: {
+                    idempotencyKey: attemptKey,
+                    paymentTransactionId: danaPayment.id,
+                    amountSen: remaining,
+                    partnerRefundNo: deriveDanaRefundNo(attemptKey),
+                    reason: `Admin cancelled order: ${reason}`.slice(0, 500),
+                    status: 'PENDING',
+                  },
+                });
+              }
+            }
+          }
+        }
+      }
     }), 'ADMIN_CANCEL_ORDER_TX');
 
     if (danaDirectMode && this.danaDirectRefundService) {
-      // M3 (no-wallet): refund ke metode bayar asal via DANA Refund API —
-      // best-effort (idempoten per ORDER:<orderDbId>; attempt FAILED dicoba
-      // ulang cron dana-refund-retry tiap jam).
+      // SYS-B-205: klaim attempt PENDING yang dibuat di dalam tx cancel di
+      // atas (idempoten per ORDER:<orderDbId>:ADMIN_CANCEL). refundAmount()
+      // mengklaim atomik PENDING/FAILED → EXECUTING lalu mengeksekusi; bila
+      // baris belum ada (mis. payment muncul setelah tx) ia membuatnya
+      // seperti jalur biasa. Attempt FAILED / PENDING-basi dicoba ulang cron
+      // dana-refund-retry tiap jam.
       const refundService = this.danaDirectRefundService;
       this.runPostCommitBestEffort(async () => {
         const cancelled = await this.prisma.order.findFirst({ where: { orderId }, select: { id: true } });
@@ -1323,7 +1373,18 @@ export class OrderStateService {
           );
           if (routed.routed) return;
         }
-        await refundService.refundOrderEscrow(cancelled.id, `Admin cancelled order: ${reason}`);
+        const danaPayment = await this.prisma.paymentTransaction.findFirst({
+          where: { orderId: cancelled.id, provider: 'DANA', status: 'SUCCESS' },
+          orderBy: { settledAt: 'desc' },
+          select: { id: true },
+        });
+        if (!danaPayment) return;
+        await refundService.refundAmount({
+          paymentDbId: danaPayment.id,
+          amountSen: null,
+          reason: `Admin cancelled order: ${reason}`,
+          idempotencyKey: `ORDER:${cancelled.id}:ADMIN_CANCEL`,
+        });
       }, 'ADMIN_CANCEL_ORDER_DANA_REFUND');
     } else {
       // Batch 1-money (WF-022): refund provider tetap best-effort di sini agar cancel admin

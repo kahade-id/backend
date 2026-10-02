@@ -39,7 +39,11 @@ import {
 } from '../users/verification-badge.service';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import { randomBytes, randomInt } from 'crypto';
-import { toSen, toIdr, percentToBpsBigInt } from '../../common/utils/currency.util';
+import { toSen, toIdr, formatIdr, formatSen, percentToBpsBigInt } from '../../common/utils/currency.util';
+import {
+  renderNotificationCopy,
+  resolveNotificationLanguage,
+} from '../notifications/notification-copy.service';
 import {
   endOfDayWIB,
   formatWIBDate,
@@ -645,7 +649,7 @@ export class WalletService implements OnModuleInit {
     if (amount < paymentMethod.minAmount || amount > paymentMethod.maxAmount) {
       throw new BadRequestException({
         code: ErrorCodes.VALIDATION_ERROR,
-        message: `Top-up amount for ${method} must be between Rp ${paymentMethod.minAmount.toLocaleString('id-ID')} and Rp ${paymentMethod.maxAmount.toLocaleString('id-ID')}`,
+        message: `Top-up amount for ${method} must be between ${formatIdr(paymentMethod.minAmount)} and ${formatIdr(paymentMethod.maxAmount)}`,
       });
     }
     if (method === PaymentMethod.KAHADE_WALLET) {
@@ -684,7 +688,7 @@ export class WalletService implements OnModuleInit {
       if (!user || user.kycStatus !== KycStatus.APPROVED) {
         throw new ForbiddenException({
           code: ErrorCodes.KYC_REQUIRED,
-          message: `Top-up above Rp ${WALLET_KYC_FREE_LIMIT.toLocaleString('id-ID')} requires KYC verification. Please verify your identity first.`,
+          message: `Top-up above ${formatIdr(WALLET_KYC_FREE_LIMIT)} requires KYC verification. Please verify your identity first.`,
         });
       }
     }
@@ -1392,7 +1396,7 @@ export class WalletService implements OnModuleInit {
     if (amount > WALLET_KYC_FREE_LIMIT && user.kycStatus !== KycStatus.APPROVED) {
       throw new ForbiddenException({
         code: ErrorCodes.KYC_REQUIRED_FOR_WITHDRAW,
-        message: `Withdrawal above Rp ${WALLET_KYC_FREE_LIMIT.toLocaleString('id-ID')} requires KYC verification. Please verify your identity first.`,
+        message: `Withdrawal above ${formatIdr(WALLET_KYC_FREE_LIMIT)} requires KYC verification. Please verify your identity first.`,
       });
     }
 
@@ -1418,7 +1422,7 @@ export class WalletService implements OnModuleInit {
     if (amountInSen > maxWithdrawPerTx) {
       throw new BadRequestException({
         code: ErrorCodes.ABOVE_MAXIMUM_WITHDRAW,
-        message: `Per-transaction withdrawal limit is Rp ${this.maxWithdrawPerTx.toLocaleString('id-ID')}`,
+        message: `Per-transaction withdrawal limit is ${formatIdr(this.maxWithdrawPerTx)}`,
       });
     }
 
@@ -1979,7 +1983,7 @@ export class WalletService implements OnModuleInit {
     if (amount > WALLET_KYC_FREE_LIMIT && sender.kycStatus !== KycStatus.APPROVED) {
       throw new ForbiddenException({
         code: ErrorCodes.SENDER_KYC_REQUIRED,
-        message: `KYC verification is required for transfers above Rp ${WALLET_KYC_FREE_LIMIT.toLocaleString('id-ID')}`,
+        message: `KYC verification is required for transfers above ${formatIdr(WALLET_KYC_FREE_LIMIT)}`,
       });
     }
     const senderWallet = await this.prisma.wallet.findUnique({ where: { userId: sender.id } });
@@ -2027,13 +2031,13 @@ export class WalletService implements OnModuleInit {
     if (amountInSen < minTransfer) {
       throw new BadRequestException({
         code: ErrorCodes.BELOW_MINIMUM_TRANSFER,
-        message: `Minimum transfer is Rp ${WALLET_MIN_TRANSFER.toLocaleString('id-ID')}`,
+        message: `Minimum transfer is ${formatIdr(WALLET_MIN_TRANSFER)}`,
       });
     }
     if (amountInSen > maxTransfer) {
       throw new BadRequestException({
         code: ErrorCodes.ABOVE_MAXIMUM_TRANSFER,
-        message: `Maximum per-transaction transfer is Rp ${WALLET_MAX_TRANSFER_PER_TX.toLocaleString('id-ID')}`,
+        message: `Maximum per-transaction transfer is ${formatIdr(WALLET_MAX_TRANSFER_PER_TX)}`,
       });
     }
 
@@ -2126,7 +2130,7 @@ export class WalletService implements OnModuleInit {
           );
         throw new BadRequestException({
           code: ErrorCodes.DAILY_TRANSFER_LIMIT_EXCEEDED,
-          message: `Daily transfer limit of Rp ${WALLET_DAILY_TRANSFER_LIMIT.toLocaleString('id-ID')} exceeded`,
+          message: `Daily transfer limit of ${formatIdr(WALLET_DAILY_TRANSFER_LIMIT)} exceeded`,
         });
       }
 
@@ -2312,6 +2316,17 @@ export class WalletService implements OnModuleInit {
 
       // Money movement is already committed; notification persistence is best-effort and
       // must never roll back or mask a successful transfer.
+      // SYS-C-105: copy notifikasi mengikuti bahasa preferensi masing-masing user.
+      const senderCopy = renderNotificationCopy(
+        NotificationType.WALLET_TRANSFER_SENT,
+        await resolveNotificationLanguage(this.prisma, sender.id),
+        { amount: formatIdr(amount), recipientName: sanitizeName(recipient.fullName) },
+      );
+      const recipientCopy = renderNotificationCopy(
+        NotificationType.WALLET_TRANSFER_RECEIVED,
+        await resolveNotificationLanguage(this.prisma, recipient.id),
+        { amount: formatIdr(amount), senderName: sanitizeName(sender.fullName) },
+      );
       this.prisma.notification
         .createMany({
           data: [
@@ -2320,8 +2335,8 @@ export class WalletService implements OnModuleInit {
               userId: sender.id,
               type: NotificationType.WALLET_TRANSFER_SENT,
               category: getCategoryForType(NotificationType.WALLET_TRANSFER_SENT),
-              title: 'Transfer Terkirim',
-              body: `Anda mengirim Rp ${amount.toLocaleString('id-ID')} ke ${recipient.fullName}`,
+              title: senderCopy.title,
+              body: senderCopy.body,
               metadata: { txId: sentTxId, amount, recipientName: recipient.fullName },
             },
             {
@@ -2329,8 +2344,8 @@ export class WalletService implements OnModuleInit {
               userId: recipient.id,
               type: NotificationType.WALLET_TRANSFER_RECEIVED,
               category: getCategoryForType(NotificationType.WALLET_TRANSFER_RECEIVED),
-              title: 'Transfer Diterima',
-              body: `Anda menerima Rp ${amount.toLocaleString('id-ID')} dari ${sender.fullName}`,
+              title: recipientCopy.title,
+              body: recipientCopy.body,
               metadata: { txId: receivedTxId, amount, senderName: sender.fullName },
             },
           ],
@@ -2388,11 +2403,11 @@ export class WalletService implements OnModuleInit {
         .then(() =>
           this.emailQueue.add('send', {
             to: sender.email ?? '',
-            subject: `Transfer Berhasil - Rp ${amount.toLocaleString('id-ID')}`,
+            subject: `Transfer Berhasil - ${formatIdr(amount)}`,
             templateName: 'transfer-sent',
             templateContext: {
               name: sanitizeName(sender.fullName),
-              amount: `Rp ${amount.toLocaleString('id-ID')}`,
+              amount: formatIdr(amount),
               recipientName: sanitizeName(recipient.fullName),
               txId: sentTxId,
               // AUDIT-18: pin to WIB — the pod clock is UTC, so between 17:00–23:59 WIB
@@ -2411,11 +2426,11 @@ export class WalletService implements OnModuleInit {
         .then(() =>
           this.emailQueue.add('send', {
             to: recipient.email ?? '',
-            subject: `Transfer Diterima - Rp ${amount.toLocaleString('id-ID')}`,
+            subject: `Transfer Diterima - ${formatIdr(amount)}`,
             templateName: 'transfer-received',
             templateContext: {
               name: sanitizeName(recipient.fullName),
-              amount: `Rp ${amount.toLocaleString('id-ID')}`,
+              amount: formatIdr(amount),
               senderName: sanitizeName(sender.fullName),
               txId: receivedTxId,
               date: new Date().toLocaleDateString('id-ID', { timeZone: 'Asia/Jakarta' }), // AUDIT-18
@@ -2833,8 +2848,14 @@ export class WalletService implements OnModuleInit {
 
     if (!topupSettled) return;
 
-    const topupNotifTitle = 'Top-up Successful';
-    const topupNotifBody = `Top-up of Rp ${toIdr(paymentTx.amount).toLocaleString('id-ID')} has been credited to your wallet.`;
+    // SYS-C-105: copy mengikuti bahasa preferensi user.
+    const topupCopy = renderNotificationCopy(
+      NotificationType.WALLET_TOPUP_SUCCESS,
+      await resolveNotificationLanguage(this.prisma, paymentTx.userId),
+      { amount: formatSen(paymentTx.amount) },
+    );
+    const topupNotifTitle = topupCopy.title;
+    const topupNotifBody = topupCopy.body;
     // Await create SEBELUM emit: push memakai enrichPushData yang mencari
     // baris notifikasi — emit duluan bisa menghasilkan push yatim tanpa
     // notificationId/actionUrl bila insert belum commit.
@@ -2870,7 +2891,7 @@ export class WalletService implements OnModuleInit {
 
     if (topupBonusSen > BigInt(0)) {
       const bonusTitle = 'Top-up Bonus Credited';
-      const bonusBody = `Bonus top-up Rp ${toIdr(topupBonusSen).toLocaleString('id-ID')} has been credited to your wallet.`;
+      const bonusBody = `Bonus top-up ${formatSen(topupBonusSen)} has been credited to your wallet.`;
       await this.prisma.notification
         .create({
           data: {
@@ -3063,6 +3084,12 @@ export class WalletService implements OnModuleInit {
 
       if (!topupFailureClaimed) return;
 
+      // SYS-C-105: copy mengikuti bahasa preferensi user.
+      const topupFailCopy = renderNotificationCopy(
+        NotificationType.WALLET_TOPUP_FAILED,
+        await resolveNotificationLanguage(this.prisma, paymentTx.userId),
+        { amount: formatSen(paymentTx.amount) },
+      );
       this.prisma.notification
         .create({
           data: {
@@ -3070,8 +3097,8 @@ export class WalletService implements OnModuleInit {
             userId: paymentTx.userId,
             type: NotificationType.WALLET_TOPUP_FAILED,
             category: getCategoryForType(NotificationType.WALLET_TOPUP_FAILED),
-            title: 'Top-up Failed',
-            body: `Top-up of Rp ${toIdr(paymentTx.amount).toLocaleString('id-ID')} failed to process. Please try again.`,
+            title: topupFailCopy.title,
+            body: topupFailCopy.body,
             isRead: false,
           },
         })
@@ -3083,8 +3110,8 @@ export class WalletService implements OnModuleInit {
 
       this.prisma.emitNotificationCreated({
         userId: paymentTx.userId,
-        title: 'Top-up Failed',
-        body: 'Top-up payment failed to process',
+        title: topupFailCopy.title,
+        body: topupFailCopy.body,
         data: { type: 'WALLET_TOPUP_FAILED' },
       });
     } else if (paymentTx.status === PaymentStatus.SUCCESS) {
@@ -3868,7 +3895,7 @@ export class WalletService implements OnModuleInit {
     if (amount < paymentMethod.minAmount || amount > paymentMethod.maxAmount) {
       throw new BadRequestException({
         code: ErrorCodes.VALIDATION_ERROR,
-        message: `Top-up amount for ${method} must be between Rp ${paymentMethod.minAmount.toLocaleString('id-ID')} and Rp ${paymentMethod.maxAmount.toLocaleString('id-ID')}`,
+        message: `Top-up amount for ${method} must be between ${formatIdr(paymentMethod.minAmount)} and ${formatIdr(paymentMethod.maxAmount)}`,
       });
     }
     const fee = this.calculatePaymentFee(amount, method as PaymentMethod);

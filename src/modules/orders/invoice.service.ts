@@ -2,7 +2,7 @@ import { Injectable, NotFoundException, ForbiddenException, Logger } from '@nest
 import { PrismaService } from '../../prisma/prisma.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { INVOICE_COMPANY_NAME, INVOICE_COMPANY_ADDRESS } from '../../common/constants/app.constants';
-import { toIdr } from '../../common/utils/currency.util';
+import { toIdr, formatIdr } from '../../common/utils/currency.util';
 import PDFDocument from 'pdfkit';
 
 @Injectable()
@@ -99,12 +99,12 @@ export class InvoiceService {
       doc.text(`Seller: ${data.seller.fullName} (${data.seller.username})`);
       doc.moveDown();
       doc.text(`Item: ${data.items.title}`);
-      doc.text(`Value: Rp ${data.items.orderValue}`);
+      doc.text(`Value: ${formatIdr(data.items.orderValue)}`);
       doc.moveDown();
       // WF-005: feeRate SUDAH dalam persen (150 bps → 1.5); jangan dikali 100 lagi.
-      doc.text(`Fee: Rp ${data.fees.feeAmount} (${Number(data.fees.feeRate).toFixed(1)}%)`);
-      doc.text(`Buyer Pay: Rp ${data.totals.buyerPayAmount}`);
-      doc.text(`Seller Receive: Rp ${data.totals.sellerReceiveAmount}`);
+      doc.text(`Fee: ${formatIdr(data.fees.feeAmount)} (${Number(data.fees.feeRate).toFixed(1)}%)`);
+      doc.text(`Buyer Pay: ${formatIdr(data.totals.buyerPayAmount)}`);
+      doc.text(`Seller Receive: ${formatIdr(data.totals.sellerReceiveAmount)}`);
       doc.moveDown();
       doc.fontSize(10).text(`${data.company.name} - ${data.company.address}`, { align: 'center' });
       doc.end();

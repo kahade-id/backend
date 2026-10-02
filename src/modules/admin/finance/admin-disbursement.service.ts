@@ -94,6 +94,17 @@ export class AdminDisbursementService implements OnModuleInit {
       }
       return this.executeReopen(ctx.targetId, ctx.decidedBy, ctx.proposedBy, ctx.ipAddress);
     });
+    // SYS-B-401: FORCE_SUCCESS review NEEDS_REVIEW selalu via dual control.
+    this.approvals.registerExecutor('DISBURSEMENT_FORCE_SUCCESS', async (ctx) => {
+      if (!ctx.targetId) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'DISBURSEMENT_FORCE_SUCCESS membutuhkan targetId (disbursementId)',
+        });
+      }
+      const reason = typeof ctx.payload.reason === 'string' ? ctx.payload.reason : '';
+      return this.executeForceSuccess(ctx.targetId, reason, ctx.decidedBy, ctx.proposedBy, ctx.ipAddress);
+    });
   }
 
   async listDisbursements(query: DisbursementQueryDto): Promise<object> {
@@ -287,13 +298,19 @@ export class AdminDisbursementService implements OnModuleInit {
   }
 
   /**
-   * BAI-044 (P1): review manual baris NEEDS_REVIEW. SUPER_ADMIN only
-   * (ditegakkan di controller via @AdminRoles). Audit trail wajib.
+   * BAI-044 (P1) + SYS-B-401: review manual baris NEEDS_REVIEW. SUPER_ADMIN only
+   * (ditegakkan di controller via @AdminRoles) + step-up (controller via
+   * StepUpGuard). Audit trail wajib.
+   *
+   * Keputusan FORCE_SUCCESS (paling berbahaya: menandai sukses tanpa
+   * konfirmasi provider) SELALU via dual control — endpoint ini hanya membuat
+   * usulan PENDING; eksekusi oleh admin kedua via approvals.
    */
   async reviewDisbursement(
     id: string,
     dto: DisbursementReviewDto,
     adminId: string,
+    adminRole: AdminRole,
     ipAddress: string,
   ): Promise<object> {
     const row = await this.prisma.escrowDisbursement.findUnique({ where: { id } });
@@ -314,6 +331,11 @@ export class AdminDisbursementService implements OnModuleInit {
       });
     }
 
+    // SYS-B-401: FORCE_SUCCESS tidak dieksekusi langsung — selalu propose.
+    if (dto.decision === 'FORCE_SUCCESS') {
+      return this.requestForceSuccess(row, reason, adminId, adminRole, ipAddress);
+    }
+
     let nextStatus: EscrowDisbursementStatus;
     let note: string;
     switch (dto.decision) {
@@ -326,13 +348,6 @@ export class AdminDisbursementService implements OnModuleInit {
       case 'CANCEL':
         nextStatus = EscrowDisbursementStatus.CANCELLED;
         note = 'NEEDS_REVIEW dibatalkan manual → CANCELLED (terminal)';
-        break;
-      case 'FORCE_SUCCESS':
-        // PALING BERBAHAYA: menandai sukses tanpa konfirmasi provider.
-        // Hanya sah bila admin sudah memverifikasi transfer di DANA dashboard
-        // dan mencatat buktinya di reason. Fail-closed bila ragu.
-        nextStatus = EscrowDisbursementStatus.SUCCESS;
-        note = `NEEDS_REVIEW di-FORCE_SUCCESS manual — bukti: ${reason}`.slice(0, 500);
         break;
       default:
         throw new BadRequestException({
@@ -376,6 +391,97 @@ export class AdminDisbursementService implements OnModuleInit {
       status: updated.status,
       decision: dto.decision,
     };
+  }
+
+  /**
+   * SYS-B-401: FORCE_SUCCESS SELALU via dual control (DISBURSEMENT_FORCE_SUCCESS).
+   * Endpoint hanya MEMBUAT usulan PENDING (tidak mengeksekusi). Eksekusi oleh
+   * admin kedua via POST /v1/admin/approvals/:id/approve → executeForceSuccess.
+   */
+  async requestForceSuccess(
+    row: { id: string; idempotencyKey: string; amountSen: bigint },
+    reason: string,
+    adminId: string,
+    adminRole: AdminRole,
+    ipAddress: string,
+  ): Promise<object> {
+    const approval = await this.approvals.propose({
+      actionType: 'DISBURSEMENT_FORCE_SUCCESS',
+      targetId: row.id,
+      payload: { decision: 'FORCE_SUCCESS', reason },
+      amountSen: Number(row.amountSen),
+      // Idempoten per disbursement: request ulang mengembalikan approval yang ada.
+      idempotencyKey: `disbursement-force-success:${row.id}`,
+      proposedBy: adminId,
+      proposerRole: adminRole,
+      ipAddress,
+    });
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.DISBURSEMENT_REVIEWED,
+      targetType: 'EscrowDisbursement',
+      targetId: row.id,
+      description:
+        `Review manual NEEDS_REVIEW ${row.idempotencyKey}: FORCE_SUCCESS diusulkan via dual control oleh admin ${adminId}. Alasan: ${reason}`,
+      after: { decision: 'FORCE_SUCCESS', via: 'dual-control', approvalId: approval.approvalId },
+      ipAddress,
+    });
+    return {
+      approvalId: approval.approvalId,
+      status: approval.status,
+      expiresAt: approval.expiresAt,
+      message:
+        'Usulan FORCE_SUCCESS disbursement dibuat — butuh persetujuan admin kedua ' +
+        '(POST /v1/admin/approvals/:id/approve). Eksekusi: NEEDS_REVIEW → SUCCESS.',
+    };
+  }
+
+  /**
+   * SYS-B-401: eksekusi FORCE_SUCCESS — HANYA dipanggil dari executor
+   * DISBURSEMENT_FORCE_SUCCESS setelah approval dual control (bukan dari
+   * endpoint langsung). Transisi NEEDS_REVIEW → SUCCESS atomik via conditional
+   * updateMany (predicate status) agar dua approval konkuren tidak
+   * double-execute.
+   */
+  async executeForceSuccess(
+    id: string,
+    reason: string,
+    decidedBy: string,
+    proposedBy: string,
+    ipAddress: string,
+  ): Promise<object> {
+    const note = `NEEDS_REVIEW di-FORCE_SUCCESS via dual control — bukti: ${reason}`.slice(0, 500);
+    const claimed = await this.prisma.escrowDisbursement.updateMany({
+      where: { id, status: EscrowDisbursementStatus.NEEDS_REVIEW },
+      data: {
+        status: EscrowDisbursementStatus.SUCCESS,
+        lastError: note,
+        releasedAt: new Date(),
+      },
+    });
+    if (claimed.count === 0) {
+      const row = await this.prisma.escrowDisbursement.findUnique({ where: { id } });
+      if (!row) {
+        throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Disbursement tidak ditemukan' });
+      }
+      throw new ConflictException({
+        code: ErrorCodes.DISBURSEMENT_NOT_REVIEWABLE,
+        message: `Disbursement tidak lagi NEEDS_REVIEW (saat ini: ${row.status}) — FORCE_SUCCESS dibatalkan`,
+      });
+    }
+    this.auditLog.logAdminAction({
+      adminId: decidedBy,
+      action: AuditAction.DISBURSEMENT_REVIEWED,
+      targetType: 'EscrowDisbursement',
+      targetId: id,
+      description:
+        `Dual control DISBURSEMENT_FORCE_SUCCESS: diusulkan ${proposedBy}, disetujui+dieksekusi ${decidedBy} — ` +
+        `disbursement NEEDS_REVIEW → SUCCESS. Bukti: ${reason}`,
+      after: { from: 'NEEDS_REVIEW', to: 'SUCCESS' },
+      ipAddress,
+    });
+    this.logger.log(`Disbursement ${id} FORCE_SUCCESS via dual control: diusulkan ${proposedBy}, dieksekusi ${decidedBy}`);
+    return { id, status: 'SUCCESS' };
   }
 
   /**

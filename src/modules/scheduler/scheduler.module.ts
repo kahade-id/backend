@@ -43,6 +43,13 @@ import {
   NotificationDigestService,
   DanaRefundRetryService,
   DisputeSettlementSweepService,
+  NoWalletConservationService,
+  DanaDbReconciliationService,
+  StaleRefundClaimSweepService,
+  AdminApprovalSweepService,
+  DanaPaymentReconcileService,
+  DisbursementAttentionSweepService,
+  MilestoneAutoReleaseService,
 } from './services';
 import { AdminFinanceModule } from '../admin/finance/admin-finance.module';
 import { WithdrawalsModule } from '../withdrawals/withdrawals.module';
@@ -74,13 +81,17 @@ import { UploadModule } from '../upload/upload.module';
 import { ShowcaseHardDeleteService } from './services/showcase-hard-delete.service';
 import { KycSlaMonitorService } from './services/kyc-sla-monitor.service';
 import { AdminFeedbackModule } from '../admin/feedback/admin-feedback.module';
+// SYS-B-307: MilestoneAutoReleaseService butuh MilestonesService. Tidak ada
+// siklus: MilestonesModule hanya import WalletModule/WalletModeModule/
+// NoWalletModule (tidak import SchedulerModule).
+import { MilestonesModule } from '../milestones/milestones.module';
 // SEC-001: DataCleanupService butuh AccountDeletionService untuk re-check
 // eligibilitas di dalam transaksi purge. forwardRef mengikuti pola
 // AuthModule (hindari siklus UsersModule <-> SchedulerModule).
 import { UsersModule } from '../users/users.module';
 
 @Module({
-  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, AdminShowcaseReportsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, NoWalletModule, WalletModeModule, AuditLogModule, UploadModule, AdminFeedbackModule, InventoryModule, forwardRef(() => UsersModule)],
+  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, AdminShowcaseReportsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, NoWalletModule, WalletModeModule, AuditLogModule, UploadModule, AdminFeedbackModule, InventoryModule, MilestonesModule, forwardRef(() => UsersModule)],
   providers: [
     WalletDailyResetService,
     DataCleanupService,
@@ -116,6 +127,13 @@ import { UsersModule } from '../users/users.module';
     RefundReconciliationService,
     DanaRefundRetryService,
     DisputeSettlementSweepService,
+    NoWalletConservationService, // SYS-B-101: invariant konservasi no-wallet
+    DanaDbReconciliationService, // SYS-B-304: rekonsiliasi DANA→DB (refund conservation)
+    StaleRefundClaimSweepService, // SYS-B-301: pemulih danaRefundAttempt.EXECUTING basi
+    AdminApprovalSweepService, // SYS-B-303 + SYS-B-306: approval APPROVED basi + expiry 24 jam
+    DanaPaymentReconcileService, // SYS-B-305b: reconcile payment DANA PENDING via getPaymentDetail
+    DisbursementAttentionSweepService, // SYS-B-306: alert HELD_NO_BANK/NEEDS_REVIEW
+    MilestoneAutoReleaseService, // SYS-B-307: auto-release tahap ACCEPTED >7 hari
     FeedbackGuestContactRedactionService,
     MilestoneReminderService, // GAP-C (G182)
     ModerationSlaService, // GAP-F (G419/G423): terdaftar sebagai provider agar cron SLA moderasi berjalan

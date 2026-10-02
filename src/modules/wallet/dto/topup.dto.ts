@@ -4,6 +4,7 @@ import { PaymentMethod } from '@prisma/client';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { LocationDto } from '../../auth/dto/location.dto';
 import { WALLET_DAILY_TOPUP_LIMIT } from '../../../common/constants/app.constants';
+import { formatIdr } from '../../../common/utils/currency.util';
 
 const TOPUP_PAYMENT_METHODS = Object.values(PaymentMethod).filter(
   (m) => m !== PaymentMethod.KAHADE_WALLET,
@@ -21,8 +22,8 @@ export class TopupDto {
   })
   @IsNumber()
   @IsInt({ message: 'amount must be a whole number (no decimals)' })
-  @Min(10000, { message: 'Minimum top-up is Rp 10,000' })
-  @Max(WALLET_DAILY_TOPUP_LIMIT, { message: `Maximum single top-up is Rp ${WALLET_DAILY_TOPUP_LIMIT.toLocaleString('id-ID')}` })
+  @Min(10000, { message: `Minimum top-up is ${formatIdr(10000)}` })
+  @Max(WALLET_DAILY_TOPUP_LIMIT, { message: `Maximum single top-up is ${formatIdr(WALLET_DAILY_TOPUP_LIMIT)}` })
   amount!: number;
 
   @ApiProperty({

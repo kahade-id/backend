@@ -24,7 +24,7 @@ import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback, Cashba
 import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
 import { EscrowDisbursementService } from '../../no-wallet/escrow-disbursement.service';
 import { alertMoneyCronSkippedRedisDown, ensureRedisAvailable } from '../../../common/utils/redis-health.util';
-import { toIdr } from '../../../common/utils/currency.util';
+import { toIdr, formatSen } from '../../../common/utils/currency.util';
 import { AUTO_COMPLETE_GRACE_PERIOD_HOURS } from '../../../common/constants/app.constants';
 
 /*
@@ -642,7 +642,7 @@ export class AutoCompleteDeliveredOrdersService {
               try {
                 const danaRes = await executeDanaCashback(this.disbursement, params, intent);
                 if (danaRes.outcome === 'RELEASED') {
-                  const cashbackIdr = toIdr(intent.amountSen).toLocaleString('id-ID');
+                  const cashbackIdr = formatSen(intent.amountSen);
                   await this.prisma.notification
                     .create({
                       data: {
@@ -651,7 +651,7 @@ export class AutoCompleteDeliveredOrdersService {
                         type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
                         category: getCategoryForType(NotificationType.CAMPAIGN_CASHBACK_CREDITED),
                         title: 'Cashback Terkirim',
-                        body: `Cashback Rp ${cashbackIdr} dari order "${order.title}" telah dikirim ke rekening bank Anda.`,
+                        body: `Cashback ${cashbackIdr} dari order "${order.title}" telah dikirim ke rekening bank Anda.`,
                         isRead: false,
                       },
                     })
@@ -671,7 +671,7 @@ export class AutoCompleteDeliveredOrdersService {
 
             // Batch 1-money (EO-005): notifikasi cashback bila dikredit oleh helper.
             if (outcome.cashback?.credited && outcome.cashback.userId) {
-              const cashbackIdr = toIdr(outcome.cashback.amount).toLocaleString('id-ID');
+              const cashbackIdr = formatSen(outcome.cashback.amount);
               this.prisma.notification
                 .create({
                   data: {
@@ -680,7 +680,7 @@ export class AutoCompleteDeliveredOrdersService {
                     type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
                     category: getCategoryForType(NotificationType.CAMPAIGN_CASHBACK_CREDITED),
                     title: 'Cashback Credited',
-                    body: `Cashback Rp ${cashbackIdr} from order "${order.title}" has been credited to your wallet.`,
+                    body: `Cashback ${cashbackIdr} from order "${order.title}" has been credited to your wallet.`,
                     isRead: false,
                   },
                 })
@@ -691,7 +691,7 @@ export class AutoCompleteDeliveredOrdersService {
                 );
             }
 
-            const postAmountIdr = toIdr(order.sellerReceiveAmount).toLocaleString('id-ID');
+            const postAmountIdr = formatSen(order.sellerReceiveAmount);
             this.prisma.notification
               .create({
                 data: {
@@ -717,7 +717,7 @@ export class AutoCompleteDeliveredOrdersService {
                   type: NotificationType.ORDER_PAYMENT_RECEIVED,
                   category: getCategoryForType(NotificationType.ORDER_PAYMENT_RECEIVED),
                   title: 'Funds Received',
-                  body: `Order "${order.title}" completed. Rp ${postAmountIdr} has been credited to your wallet.`,
+                  body: `Order "${order.title}" completed. ${postAmountIdr} has been credited to your wallet.`,
                   isRead: false,
                 },
               })
@@ -741,7 +741,7 @@ export class AutoCompleteDeliveredOrdersService {
                 this.prisma.emitNotificationCreated({
                   userId: order.sellerId,
                   title: 'Funds Received',
-                  body: `Order "${order.title}" completed. Rp ${postAmountIdr} has been credited to your wallet.`,
+                  body: `Order "${order.title}" completed. ${postAmountIdr} has been credited to your wallet.`,
                   data: { type: 'WALLET_FUNDS_RELEASED', orderId: order.orderId },
                 }),
               `AUTO_COMPLETE_SELLER_NOTIFICATION orderId=${order.orderId}`,

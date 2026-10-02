@@ -6,6 +6,7 @@ import { DanaDisbursementService } from '../payment/dana/dana-disbursement.servi
 import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { NotificationQueueService } from '../queue/notification-queue.service';
 import { decryptAES } from '../../common/utils/crypto.util';
+import { sanitizeProviderError } from '../../common/utils/sanitize-provider-error';
 
 export type ReleaseResult =
   | { outcome: 'RELEASED'; disbursementId: string; danaReferenceNo: string | null }
@@ -328,7 +329,14 @@ export class EscrowDisbursementService {
         data: { danaPartnerReferenceNo: partnerRef, bankAccountId: bank.id },
       });
     } catch (e) {
-      return this.fail(row, `BANK_INQUIRY_ERROR: ${(e as Error).message}`);
+      // SYS-B-503: pesan mentah provider (bisa meng-echo nomor rekening)
+      // tidak disimpan ke lastError — hanya kode generik; detail teredaksi
+      // hanya ke log internal.
+      const sanitized = sanitizeProviderError(e);
+      this.logger.warn(
+        `Disbursement bank inquiry gagal: key=${row.idempotencyKey} [${sanitized.code}]: ${sanitized.detailForLog}`,
+      );
+      return this.fail(row, `BANK_INQUIRY_ERROR: ${sanitized.code}`);
     }
 
     // 4) Transfer ke bank (idempoten via partnerReferenceNo stabil)
@@ -385,7 +393,14 @@ export class EscrowDisbursementService {
       });
       return { outcome: 'PENDING', disbursementId: row.id };
     } catch (e) {
-      return this.fail(row, `TRANSFER_ERROR: ${(e as Error).message}`);
+      // SYS-B-503: pesan mentah provider (bisa meng-echo nomor rekening)
+      // tidak disimpan ke lastError — hanya kode generik; detail teredaksi
+      // hanya ke log internal.
+      const sanitized = sanitizeProviderError(e);
+      this.logger.warn(
+        `Disbursement transfer gagal: key=${row.idempotencyKey} [${sanitized.code}]: ${sanitized.detailForLog}`,
+      );
+      return this.fail(row, `TRANSFER_ERROR: ${sanitized.code}`);
     }
   }
 

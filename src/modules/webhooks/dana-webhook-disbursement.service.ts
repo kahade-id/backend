@@ -2,6 +2,7 @@ import {
   ForbiddenException,
   Injectable,
   Logger,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Prisma } from '@prisma/client';
@@ -20,18 +21,6 @@ export const DANA_DISBURSE_NOTIFY_ACK: DanaWebhookOutcome = {
   responseCode: '2004300',
   responseMessage: 'Successful',
 };
-
-/** Status DANA yang dikenal pada Transfer to Bank Notify. */
-const KNOWN_DISBURS_STATUSES = new Set([
-  '00', // sukses
-  '01',
-  '02',
-  '03', // pending
-  '04',
-  '05',
-  '06',
-  '07', // gagal
-]);
 
 /**
  * Webhook DANA Transfer to Bank Notify (disbursement).
@@ -80,6 +69,17 @@ export class DanaWebhookDisbursementService {
   private webhookPublicKey(): string {
     const fromEnv = this.config.get<string>('dana.publicKey') ?? '';
     if (fromEnv.trim()) return fromEnv;
+    // SYS-B-406: kunci publik sandbox DANA BERSIFAT PUBLIK (disalin dari SDK
+    // resmi dana-python) — HANYA boleh dipakai bila dana.env === 'sandbox'.
+    // Di luar sandbox, kunci yang hilang = config error → JANGAN verifikasi
+    // (fail-closed). Boot sudah fail-fast via env.validation.ts +
+    // dana.config.ts; ini pertahanan lapis kedua bila config dibangun manual.
+    if (this.config.get<string>('dana.env') !== 'sandbox') {
+      throw new ServiceUnavailableException({
+        code: 'DANA_WEBHOOK_KEY_UNCONFIGURED',
+        message: 'DANA_PUBLIC_KEY belum di-set untuk env non-sandbox — verifikasi webhook ditolak',
+      });
+    }
     return DANA_SANDBOX_WEBHOOK_PUBLIC_KEY;
   }
 

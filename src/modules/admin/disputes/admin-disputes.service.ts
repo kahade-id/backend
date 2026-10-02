@@ -939,6 +939,21 @@ export class AdminDisputesService implements OnModuleInit {
         },
       });
 
+      // SYS-B-205 (pola SEC-104, sama seperti mutual-resolution): baris durable
+      // "settlement intent" dibuat DI DALAM tx yang sama dengan putusan.
+      // Eksekusi finansial post-commit via claimAndSettleIntent (klaim atomik,
+      // idempoten). Crash/deploy di antara commit dan eksekusi tidak pernah
+      // kehilangan jejak: cron dispute-settlement-sweep menjemput intent
+      // PENDING/FAILED.
+      await tx.disputeSettlementIntent.create({
+        data: {
+          disputeId: dispute.id,
+          status: 'PENDING',
+          buyerAmountSen: buyerAmount,
+          sellerAmountSen: sellerAmount,
+        },
+      });
+
       // DP-014: FULL_BUYER pra-completion = transaksi batal total → CANCELLED.
       // FULL_SELLER & SPLIT → COMPLETED.
       const isFullBuyerPreCompletion = dto.decision === 'FULL_BUYER';
@@ -1025,17 +1040,22 @@ export class AdminDisputesService implements OnModuleInit {
       });
     }
 
-    // Eksekusi finansial post-commit (bukan bagian transaksi DB).
-    const settlement = await this.disputeDanaSettlement.settleDisputeNoWallet({
+    // SYS-B-205: eksekusi finansial post-commit via klaim intent (pola SEC-104,
+    // sama seperti mutual-resolution). Intent PENDING dibuat di dalam tx
+    // putusan di atas; claimAndSettleIntent mengklaimnya (PENDING/FAILED →
+    // CLAIMED — hanya satu eksekutor yang menang), menandai DONE bila sukses
+    // atau FAILED + lastError bila gagal (fail-closed; cron
+    // dispute-settlement-sweep retry sampai batas attempt).
+    const settlement = await this.disputeDanaSettlement.claimAndSettleIntent({
+      disputeId: dispute.id,
       orderDbId: dispute.orderId,
-      disputeDbId: dispute.id,
       decision: dto.decision,
       buyerAmountSen: buyerAmount,
       sellerAmountSen: sellerAmount,
       reason: `Dispute ${dispute.disputeId} resolved: ${dto.decision}`,
     }).catch((err: unknown) => {
       this.logger.error(
-        `DISPUTE_NO_WALLET_SETTLEMENT_FAILED dispute=${dispute.disputeId}: ${err instanceof Error ? err.message : String(err)} — retry via dana-refund-retry cron`,
+        `DISPUTE_NO_WALLET_SETTLEMENT_FAILED dispute=${dispute.disputeId}: ${err instanceof Error ? err.message : String(err)} — retry via dispute-settlement-sweep cron`,
       );
       return null;
     });

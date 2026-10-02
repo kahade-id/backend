@@ -1842,6 +1842,11 @@ model DanaRefundAttempt {
   status String @default("PENDING")
   reason String?
 
+  // SYS-B-203: status aktual refund sisi DANA (parsed dari respons, bukan
+  // difabrikasi) + kapan refund terkonfirmasi settle di DANA.
+  providerStatus String?
+  settledAt      DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -6636,7 +6641,7 @@ model DisputeSettlementIntent {
   id             String   @id @default(cuid())
   disputeId      String   @unique
   dispute        Dispute  @relation(fields: [disputeId], references: [id], onDelete: Cascade)
-  status         String   @default("PENDING") @db.VarChar(20) // PENDING | CLAIMED | DONE | FAILED
+  status         String   @default("PENDING") @db.VarChar(20) // PENDING | CLAIMED | DONE | FAILED | ESCALATED (SYS-B-302)
   buyerAmountSen BigInt   @default(0)
   sellerAmountSen BigInt  @default(0)
   attemptCount   Int      @default(0)

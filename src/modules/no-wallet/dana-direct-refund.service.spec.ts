@@ -1,5 +1,9 @@
-import { PaymentProvider, PaymentStatus } from '@prisma/client';
-import { DanaDirectRefundService, deriveDanaRefundNo } from './dana-direct-refund.service';
+import { PaymentProvider, PaymentPurpose, PaymentStatus } from '@prisma/client';
+import {
+  DanaDirectRefundService,
+  DanaRefundNotConfirmedError,
+  deriveDanaRefundNo,
+} from './dana-direct-refund.service';
 
 const danaSuccessPayment = {
   id: 'pt-1',
@@ -180,6 +184,70 @@ describe('DanaDirectRefundService (refundAmount kanonis)', () => {
     expect(prisma.danaRefundAttempt.update).toHaveBeenCalledWith(
       expect.objectContaining({ data: { status: 'FAILED' } }),
     );
+  });
+
+  it('SYS-B-103: topup in-flight (PENDING, danaPayKind terisi) eligible untuk refund ke sumber', async () => {
+    const topupPayment = {
+      ...danaSuccessPayment,
+      id: 'pt-top-1',
+      status: PaymentStatus.PENDING,
+      purpose: PaymentPurpose.TOPUP,
+    };
+    const store: Record<string, any> = {};
+    const prisma = buildPrisma(topupPayment, store);
+    danaPayment.refundOrder.mockResolvedValue({ partnerRefundNo: 'RFD-x', referenceNo: 'DANA-RFD-9', status: 'SUCCESS' });
+    const svc = new DanaDirectRefundService(prisma as never, danaPayment as never);
+
+    const res = await svc.refundAmount({
+      paymentDbId: 'pt-top-1',
+      reason: 'Wallet nonaktif — topup refund to source',
+      idempotencyKey: 'TOPUP:pt-top-1:NOWALLET',
+    });
+
+    expect(res).toEqual({ refunded: true, already: false, amountSen: BigInt(1510500) });
+    expect(danaPayment.refundOrder).toHaveBeenCalledTimes(1);
+    // payment PENDING penuh di-refund → REFUNDED + refundedAmount tercatat
+    expect(prisma.paymentTransaction.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: PaymentStatus.REFUNDED,
+          refundedAmount: { increment: BigInt(1510500) },
+        }),
+      }),
+    );
+    // attempt SUCCESS dengan providerStatus + settledAt terisi
+    expect(store['TOPUP:pt-top-1:NOWALLET'].status).toBe('SUCCESS');
+    expect(store['TOPUP:pt-top-1:NOWALLET'].providerStatus).toBe('SUCCESS');
+    expect(store['TOPUP:pt-top-1:NOWALLET'].settledAt).toBeInstanceOf(Date);
+  });
+
+  it('SYS-B-103: ORDER_ESCROW PENDING (bukan topup) tetap NOT_ELIGIBLE', async () => {
+    const svc = build({
+      ...danaSuccessPayment,
+      status: PaymentStatus.PENDING,
+      purpose: 'ORDER_ESCROW',
+    });
+    const res = await svc.refundAmount({ paymentDbId: 'pt-1', reason: 'x', idempotencyKey: 'K:PENDING' });
+    expect(res).toEqual({ refunded: false, reason: 'NOT_ELIGIBLE' });
+    expect(danaPayment.refundOrder).not.toHaveBeenCalled();
+  });
+
+  it('SYS-B-203: status refund ambigu (bukan SUCCESS) → attempt tetap EXECUTING, refundedAmount TIDAK di-increment', async () => {
+    const store: Record<string, any> = {};
+    const prisma = buildPrisma(danaSuccessPayment, store);
+    danaPayment.refundOrder.mockResolvedValue({ partnerRefundNo: 'RFD-x', referenceNo: '', status: 'PENDING' });
+    const svc = new DanaDirectRefundService(prisma as never, danaPayment as never);
+
+    await expect(
+      svc.refundAmount({ paymentDbId: 'pt-1', reason: 'x', idempotencyKey: 'K:AMBIG' }),
+    ).rejects.toThrow(DanaRefundNotConfirmedError);
+
+    // attempt TIDAK ditandai SUCCESS / FAILED — tetap EXECUTING dengan
+    // providerStatus ter-parse, agar sweep mengambil alih.
+    expect(store['K:AMBIG'].status).toBe('EXECUTING');
+    expect(store['K:AMBIG'].providerStatus).toBe('PENDING');
+    // uang belum pasti kembali → refundedAmount TIDAK di-increment, payment TIDAK di-update
+    expect(prisma.paymentTransaction.updateMany).not.toHaveBeenCalled();
   });
 
   it('refundPayment (kompat) mendelegasikan ke refundAmount penuh', async () => {

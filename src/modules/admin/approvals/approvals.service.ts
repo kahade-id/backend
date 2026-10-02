@@ -351,6 +351,30 @@ export class ApprovalsService {
     return rows.map((r) => this.toView(r));
   }
 
+  /**
+   * SYS-B-405: cari SATU usulan PENDING untuk pasangan (actionType, targetId).
+   * Dipakai rute kompatibilitas `configs/:key/approve|reject` yang bekerja
+   * per key (bukan per approval id). Mengembalikan null bila tidak ada yang
+   * PENDING dan belum kedaluwarsa.
+   */
+  async findPendingByActionTarget(
+    actionType: ApprovalActionType,
+    targetId: string,
+  ): Promise<ApprovalView | null> {
+    const row = await this.prisma.adminActionApproval.findFirst({
+      where: { actionType, targetId, status: 'PENDING' },
+      orderBy: { proposedAt: 'desc' },
+    });
+    if (!row) return null;
+    if (row.expiresAt <= new Date()) {
+      await this.prisma.adminActionApproval
+        .updateMany({ where: { id: row.id, status: 'PENDING' }, data: { status: 'EXPIRED' } })
+        .catch(() => undefined);
+      return null;
+    }
+    return this.toView(row);
+  }
+
   // ── Helpers ──────────────────────────────────────────────
 
   private assertPending(approval: { status: string; expiresAt: Date; id: string }): void {
@@ -412,6 +436,69 @@ export class ApprovalsService {
       }
       case 'DISBURSEMENT_REOPEN': {
         if (!targetId) bad('targetId (disbursement id) wajib');
+        break;
+      }
+      // SYS-B-401: FORCE_SUCCESS review NEEDS_REVIEW — selalu dual control.
+      case 'DISBURSEMENT_FORCE_SUCCESS': {
+        if (!targetId) bad('targetId (disbursement id) wajib');
+        if (payload.decision !== 'FORCE_SUCCESS') bad('decision harus FORCE_SUCCESS');
+        if (typeof payload.reason !== 'string' || payload.reason.trim().length < 10) {
+          bad('reason min 10 karakter');
+        }
+        break;
+      }
+      // SYS-B-402: pembuatan voucher bernilai di atas ambang dual control.
+      case 'VOUCHER_CREATE': {
+        const code = typeof payload.code === 'string' ? payload.code.trim().toUpperCase() : '';
+        if (!/^[A-Z0-9_-]{1,30}$/.test(code)) bad('payload.code voucher tidak valid');
+        if (typeof payload.name !== 'string' || payload.name.trim().length === 0) bad('payload.name wajib');
+        const flat = payload.discountAmount;
+        const cap = payload.maxDiscountAmount;
+        const hasFlat = Number.isInteger(flat) && (flat as number) > 0;
+        const hasCap = Number.isInteger(cap) && (cap as number) > 0;
+        if (!hasFlat && !hasCap) bad('payload.discountAmount atau payload.maxDiscountAmount wajib > 0');
+        break;
+      }
+      // SYS-B-402: aktivasi campaign bernilai di atas ambang dual control.
+      case 'CAMPAIGN_ACTIVATE': {
+        if (!targetId) bad('targetId (campaignId) wajib');
+        if (typeof payload.reason !== 'string' || payload.reason.trim().length < 5) {
+          bad('payload.reason min 5 karakter');
+        }
+        break;
+      }
+      // SYS-B-402: pemberian nilai subscription (grant gratis / kode promo).
+      case 'MONEY_VALUE_GRANT': {
+        const kind = payload.kind;
+        if (kind !== 'SUBSCRIPTION_GRANT' && kind !== 'PROMO_CODE_CREATE') {
+          bad('payload.kind harus SUBSCRIPTION_GRANT/PROMO_CODE_CREATE');
+        }
+        if (kind === 'SUBSCRIPTION_GRANT') {
+          if (typeof payload.userId !== 'string' || payload.userId.trim().length === 0) bad('payload.userId wajib');
+          if (payload.plan !== 'MONTHLY' && payload.plan !== 'YEARLY') bad('payload.plan harus MONTHLY/YEARLY');
+          if (!Number.isInteger(payload.durationDays) || (payload.durationDays as number) < 1 || (payload.durationDays as number) > 730) {
+            bad('payload.durationDays harus 1-730');
+          }
+        } else {
+          const code = typeof payload.code === 'string' ? payload.code.trim().toUpperCase() : '';
+          if (!/^[A-Z0-9_-]{3,32}$/.test(code)) bad('payload.code promo tidak valid');
+          if (!Number.isInteger(payload.durationDays) || (payload.durationDays as number) < 1 || (payload.durationDays as number) > 366) {
+            bad('payload.durationDays harus 1-366');
+          }
+        }
+        break;
+      }
+      // SYS-B-405: perubahan system config finansial/security-gated.
+      // Batas 5000 mengikuti UpdateConfigDto (nilai finansial praktis kecil).
+      case 'SYSTEM_CONFIG_CHANGE': {
+        if (!targetId) bad('targetId (key config) wajib');
+        if (typeof payload.value !== 'string' || payload.value.trim().length === 0) {
+          bad('payload.value (string tak-kosong) wajib');
+        }
+        if (payload.value.length > 5000) bad('payload.value maksimal 5000 karakter');
+        if (payload.description !== undefined && typeof payload.description !== 'string') {
+          bad('payload.description harus string bila diisi');
+        }
         break;
       }
       case 'OPS_SETTING_CHANGE': {

@@ -155,26 +155,43 @@ export class DailyReconciliationService {
         walletCursor = wallets[wallets.length - 1].id;
       }
 
+      // SYS-D-003: pola *Map — preload sekali lalu lookup via Map, bukan
+      // query per-user di dalam loop (N+1: 2 query × ribuan user).
+      // userId @unique di Wallet → findMany + Map ekuivalen dengan findFirst
+      // per user. Chunk 1000 agar klausa `in` tidak membengkak.
+      const userIds = [...allRelevantUserIds];
+      const walletByUserId = new Map<string, { id: string; userId: string; escrowBalance: bigint }>();
+      const lockedSumByBuyerId = new Map<string, bigint>();
+      for (let i = 0; i < userIds.length; i += BATCH_SIZE) {
+        const chunk = userIds.slice(i, i + BATCH_SIZE);
+        const [wallets, lockedOrders] = await Promise.all([
+          this.prisma.wallet.findMany({
+            where: { userId: { in: chunk } },
+            select: { id: true, userId: true, escrowBalance: true },
+          }),
+          this.prisma.order.findMany({
+            where: { buyerId: { in: chunk }, status: { in: activeOrderStatuses } },
+            select: { buyerId: true, buyerPayAmount: true },
+          }),
+        ]);
+        for (const w of wallets) walletByUserId.set(w.userId, w);
+        for (const o of lockedOrders) {
+          lockedSumByBuyerId.set(
+            o.buyerId,
+            (lockedSumByBuyerId.get(o.buyerId) ?? BigInt(0)) + o.buyerPayAmount,
+          );
+        }
+      }
+
       let escrowMismatches = 0;
       let walletsChecked = 0;
 
-      for (const userId of allRelevantUserIds) {
+      for (const userId of userIds) {
         walletsChecked++;
-        const wallet = await this.prisma.wallet.findFirst({
-          where: { userId },
-          select: { id: true, userId: true, escrowBalance: true },
-        });
+        const wallet = walletByUserId.get(userId);
         if (!wallet) continue;
 
-        const lockedOrders = await this.prisma.order.findMany({
-          where: {
-            buyerId: userId,
-            status: { in: activeOrderStatuses },
-          },
-          select: { buyerPayAmount: true },
-        });
-
-        const expectedEscrow = lockedOrders.reduce((sum, o) => sum + o.buyerPayAmount, BigInt(0));
+        const expectedEscrow = lockedSumByBuyerId.get(userId) ?? BigInt(0);
 
         if (wallet.escrowBalance !== expectedEscrow) {
           escrowMismatches++;

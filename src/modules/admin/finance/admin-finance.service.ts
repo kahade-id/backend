@@ -981,7 +981,7 @@ export class AdminFinanceService {
         }
         // SYS-B-504: nama pemilik rekening di-mask di list (pola maskDecrypt
         // admin-disbursement) — full name tidak dikembalikan per baris.
-        const decryptedAccName = await this.maskDecrypt(tx.bankAccount?.accountName);
+        const maskedAccName = await this.maskDecrypt(tx.bankAccount?.accountName);
         // ADM-205: kuorum dual approval untuk baris ini.
         const approverSet = approversByTx.get(tx.id) ?? new Set<string>();
         const approvalInfo: WithdrawalApprovalInfo = {
@@ -1002,7 +1002,7 @@ export class AdminFinanceService {
             ? {
                 ...tx.bankAccount,
                 accountNumber: maskedAccountNumber,
-                accountName: decryptedAccName,
+                accountName: maskedAccName,
               }
             : tx.bankAccount,
         };

@@ -175,7 +175,11 @@ describe('EscrowDisbursementService', () => {
 
     expect(res.outcome).toBe('PENDING');
     const updates = (prisma.escrowDisbursement.update as jest.Mock).mock.calls as any[][];
-    expect(updates[updates.length - 1][0].data.lastError).toMatch(/TRANSFER_ERROR: DANA timeout/);
+    // SYS-B-503: lastError hanya kode generik (pola SEC-204) — pesan mentah
+    // provider ('DANA timeout') TIDAK boleh bocor ke kolom DB.
+    const lastError = updates[updates.length - 1][0].data.lastError as string;
+    expect(lastError).toMatch(/^TRANSFER_ERROR: PROVIDER_TIMEOUT$/);
+    expect(lastError).not.toContain('DANA timeout');
   });
 
   it('transfer PROCESSING → status PROCESSING (menunggu notify)', async () => {

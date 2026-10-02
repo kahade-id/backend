@@ -13,6 +13,8 @@ import { AuditLogService } from '../../../common/services/audit-log.service';
 import { WalletAdjustDto, WalletAdjustType } from './dto/wallet-adjust.dto';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { toSen, toIdr, formatIdr } from '../../../common/utils/currency.util';
+// SYS-C-105: copy notifikasi mengikuti bahasa preferensi user.
+import { renderNotificationCopy, resolveNotificationLanguage } from '../../notifications/notification-copy.service';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
@@ -974,6 +976,15 @@ export class AdminUsersService implements OnModuleInit {
     const serial = await this.walletTxSerial.getNext();
     const txId = generateWalletTxId(serial);
 
+    // SYS-C-105: copy notifikasi mengikuti bahasa preferensi user (dihitung
+    // sebelum tx agar bisa dipakai di dalam tx maupun untuk realtime emit).
+    const notifType = isCredit ? NotificationType.WALLET_TOPUP_SUCCESS : NotificationType.WALLET_WITHDRAW_SUCCESS;
+    const adjustLang = await resolveNotificationLanguage(this.prisma, id);
+    const adjustCopy = renderNotificationCopy(notifType, adjustLang, { amount: formatIdr(amount) });
+    const reasonSuffix = adjustLang === 'id' ? ` Alasan: ${reason}` : ` Reason: ${reason}`;
+    const notifTitle = adjustCopy.title;
+    const notifBody = `${adjustCopy.body}${reasonSuffix}`;
+
     let balanceBefore!: bigint;
     let balanceAfter!: bigint;
     let walletId!: string;
@@ -1021,27 +1032,20 @@ export class AdminUsersService implements OnModuleInit {
         },
       });
 
-      const notifType = isCredit ? NotificationType.WALLET_TOPUP_SUCCESS : NotificationType.WALLET_WITHDRAW_SUCCESS;
       await tx.notification.create({
         data: {
           notifId: generateNotifId(),
           userId: id,
           type: notifType,
           category: getCategoryForType(notifType),
-          title: isCredit ? 'Balance Credited by Admin' : 'Balance Debited by Admin',
-          body: isCredit
-            ? `${formatIdr(amount)} has been added to your wallet balance. Reason: ${reason}`
-            : `${formatIdr(amount)} has been deducted from your wallet balance. Reason: ${reason}`,
+          title: notifTitle,
+          body: notifBody,
           isRead: false,
         },
       });
 
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
-    const notifTitle = isCredit ? 'Balance Credited by Admin' : 'Balance Debited by Admin';
-    const notifBody = isCredit
-      ? `${formatIdr(amount)} has been added to your wallet balance. Reason: ${reason}`
-      : `${formatIdr(amount)} has been deducted from your wallet balance. Reason: ${reason}`;
     this.prisma.emitNotificationCreated({ userId: id, title: notifTitle, body: notifBody, data: { type: 'WALLET_ADJUSTED' } });
 
     const auditAction = isCredit ? AuditAction.WALLET_CREDIT : AuditAction.WALLET_DEBIT;

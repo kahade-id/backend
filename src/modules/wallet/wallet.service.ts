@@ -3202,14 +3202,21 @@ export class WalletService implements OnModuleInit {
                     },
                   });
 
+                  // SYS-C-105: copy mengikuti bahasa preferensi user.
+                  const lockLang = await resolveNotificationLanguage(tx, paymentTx.userId);
+                  const lockCopy = renderNotificationCopy(
+                    NotificationType.SECURITY_ACCOUNT_LOCKED,
+                    lockLang,
+                    { reason: lockLang === 'id' ? ' Terkait masalah teknis pada pembayaran Anda.' : ' Due to a technical issue with your payment.' },
+                  );
                   await tx.notification.create({
                     data: {
                       notifId: generateNotifId(),
                       userId: paymentTx.userId,
                       type: NotificationType.SECURITY_ACCOUNT_LOCKED,
                       category: getCategoryForType(NotificationType.SECURITY_ACCOUNT_LOCKED),
-                      title: 'Wallet Locked',
-                      body: 'Your wallet has been automatically locked due to a technical issue with your payment. Please contact customer support for assistance.',
+                      title: lockCopy.title,
+                      body: lockCopy.body,
                       isRead: false,
                     },
                   });
@@ -3302,14 +3309,21 @@ export class WalletService implements OnModuleInit {
                   },
                 });
 
+                // SYS-C-105: copy mengikuti bahasa preferensi user.
+                const lockLang2 = await resolveNotificationLanguage(tx, paymentTx.userId);
+                const lockCopy2 = renderNotificationCopy(
+                  NotificationType.SECURITY_ACCOUNT_LOCKED,
+                  lockLang2,
+                  { reason: lockLang2 === 'id' ? ' Terkait masalah teknis pada pembayaran Anda.' : ' Due to a technical issue with your payment.' },
+                );
                 await tx.notification.create({
                   data: {
                     notifId: generateNotifId(),
                     userId: paymentTx.userId,
                     type: NotificationType.SECURITY_ACCOUNT_LOCKED,
                     category: getCategoryForType(NotificationType.SECURITY_ACCOUNT_LOCKED),
-                    title: 'Wallet Locked',
-                    body: 'Your wallet has been automatically locked due to a technical issue with your payment. Please contact customer support for assistance.',
+                    title: lockCopy2.title,
+                    body: lockCopy2.body,
                     isRead: false,
                   },
                 });

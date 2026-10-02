@@ -213,6 +213,9 @@ describe('MutualResolutionService', () => {
       mockPrisma.notification.create.mockResolvedValue({ id: 'n1' });
 
       await service.propose('disp-1', 'buyer-1', { buyerPercent: 50, sellerPercent: 50, reason: 'split it evenly' });
+      // SYS-C-105: notifikasi kini resolve bahasa dulu (await) di dalam
+      // post-commit task — flush microtask sebelum assert.
+      await new Promise((r) => setImmediate(r));
 
       expect(mockPrisma.notification.create).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ userId: 'seller-1' }) }),

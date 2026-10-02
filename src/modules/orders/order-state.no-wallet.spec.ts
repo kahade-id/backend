@@ -30,6 +30,15 @@ function buildTx() {
     // mock ini terpanggil, test di bawah gagal eksplisit.
     wallet: { findFirst: jest.fn(async () => { throw new Error('WALLET_TOUCHED'); }) },
     walletTransaction: { create: jest.fn(async () => { throw new Error('WALLET_TX_TOUCHED'); }) },
+    // SYS-B-205: intent refund durable dibuat di dalam tx cancel.
+    orderMilestone: { count: jest.fn(async () => 0) },
+    paymentTransaction: {
+      findFirst: jest.fn(async () => ({ id: 'pay-dana-1', grossAmount: orderRow.buyerPayAmount, refundedAmount: BigInt(0) })),
+    },
+    danaRefundAttempt: {
+      findUnique: jest.fn(async () => null),
+      create: jest.fn(async (args: unknown) => ({ id: 'att-1', ...(args as object) })),
+    },
   };
   return { tx, orderRow };
 }
@@ -74,6 +83,9 @@ function buildService(opts: { walletEnabled: boolean; danaPayment: boolean; lega
   };
   const danaDirectRefundService = {
     refundOrderEscrow: jest.fn(async () => ({ refunded: true, already: false, amountSen: orderRow.buyerPayAmount })),
+    // SYS-B-205: eksekusi via klaim attempt PENDING (refundAmount), bukan
+    // refundOrderEscrow langsung.
+    refundAmount: jest.fn(async () => ({ refunded: true, already: false })),
   };
   const realtime = { emitToOrder: jest.fn() };
   const walletTxSerialService = { getNext: jest.fn(async () => 42) };
@@ -113,12 +125,29 @@ describe('OrderStateService.adminCancelOrder (M3 no-wallet)', () => {
     expect(tx.wallet.findFirst).not.toHaveBeenCalled();
     expect(tx.walletTransaction.create).not.toHaveBeenCalled();
 
-    // Refund Midtrans tidak dipanggil; refund DANA dipanggil dengan orderDbId.
+    // SYS-B-205: baris intent refund durable dibuat DI DALAM tx cancel.
+    expect(tx.danaRefundAttempt.create).toHaveBeenCalledTimes(1);
+    expect(tx.danaRefundAttempt.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          idempotencyKey: `ORDER:${orderRow.id}:ADMIN_CANCEL`,
+          paymentTransactionId: 'pay-dana-1',
+          status: 'PENDING',
+        }),
+      }),
+    );
+
+    // Refund Midtrans tidak dipanggil; refund DANA dieksekusi post-commit
+    // via klaim atomik refundAmount (bukan refundOrderEscrow langsung).
     expect(orderQrisPaymentService.requestRefundForOrder).not.toHaveBeenCalled();
-    expect(danaDirectRefundService.refundOrderEscrow).toHaveBeenCalledTimes(1);
-    expect(danaDirectRefundService.refundOrderEscrow).toHaveBeenCalledWith(
-      orderRow.id,
-      expect.stringContaining('Admin cancelled order'),
+    expect(danaDirectRefundService.refundOrderEscrow).not.toHaveBeenCalled();
+    expect(danaDirectRefundService.refundAmount).toHaveBeenCalledTimes(1);
+    expect(danaDirectRefundService.refundAmount).toHaveBeenCalledWith(
+      expect.objectContaining({
+        paymentDbId: 'pay-dana-1',
+        amountSen: null,
+        idempotencyKey: `ORDER:${orderRow.id}:ADMIN_CANCEL`,
+      }),
     );
 
     // Copy notifikasi buyer menyebut metode bayar asal, bukan wallet.

@@ -227,11 +227,21 @@ export class DanaWebhookSettlementService {
       await this.settle(notify);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      // Gagal verifikasi / API (transient maupun final-non-sukses):
-      // tandai processed agar tidak retry tanpa henti untuk status final,
-      // tapi JANGAN pernah kredit.
       this.logger.error(`DANA webhook settlement gagal (${eventKey}): ${msg}`);
-      if (e instanceof ServiceUnavailableException) throw e;
+      // SEC-202: bila settle() melempar (jenis APAPUN, bukan hanya
+      // ServiceUnavailableException), JANGAN tandai isProcessed=true dan
+      // JANGAN ACK sukses — catat error + increment retryCount, lalu LEMPAR
+      // agar respons 5xx memicu retry DANA. Idempotency aman untuk retry via
+      // klaim PENDING di settleEscrow / eventKey webhookLog.
+      await this.prisma.webhookLog.update({
+        where: { id: webhookLog.id },
+        data: {
+          errorMessage: msg.slice(0, 2000),
+          retryCount: { increment: 1 },
+          lastAttemptAt: new Date(),
+        },
+      });
+      throw e;
     }
 
     await this.prisma.webhookLog.update({
@@ -312,8 +322,9 @@ export class DanaWebhookSettlementService {
       pt.purpose === PaymentPurpose.ORDER_ESCROW &&
       pt.danaPayKind
     ) {
+      let settleStatus: 'SETTLED' | 'ALREADY_SETTLED' | 'NOT_PENDING';
       try {
-        await this.danaDirectPaymentService.settleEscrow(pt.id);
+        settleStatus = await this.danaDirectPaymentService.settleEscrow(pt.id);
       } catch (e) {
         const code =
           e instanceof ServiceUnavailableException
@@ -337,6 +348,26 @@ export class DanaWebhookSettlementService {
         }
         throw e;
       }
+      if (settleStatus === 'NOT_PENDING') {
+        // SEC-201: payment dibatalkan/kedaluwarsa di DB tetapi dana TETAP
+        // diterima DANA (skenario "cancel lalu bayar" / race bayar-vs-cancel) —
+        // JANGAN tandai SUCCESS dan JANGAN danai escrow: kembalikan ke
+        // pembayar via DANA Refund API seperti jalur INELIGIBLE.
+        this.logger.warn(
+          `DANA webhook: payment ${pt.id} NOT_PENDING saat settle (status DB=${pt.status}) — refund ke sumber, tanpa tandai SUCCESS`,
+        );
+        await this.danaDirectRefundService.refundPayment(
+          pt.id,
+          'Payment dibatalkan/kedaluwarsa tetapi dana diterima DANA — dikembalikan ke pembayar',
+        );
+        return;
+      }
+      // SEC-201: SETTLED / ALREADY_SETTLED sudah ditangani settleEscrow
+      // (payment → SUCCESS di dalam tx-nya sendiri). JANGAN jalankan tail
+      // update SUCCESS generik untuk cabang DANA-direct — tidak ada status
+      // yang boleh ditimpa dari sini.
+      this.logger.log(`DANA webhook: DANA-direct escrow ${pt.id} → ${settleStatus}`);
+      return;
     } else if (pt.purpose === PaymentPurpose.TOPUP) {
       // Mode BI-safe: top-up DANA yang masih in-flight TIDAK BOLEH dikredit
       // ke wallet. Fail-closed: kembalikan ke metode bayar asal via DANA

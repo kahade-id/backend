@@ -12,7 +12,7 @@ import {
   WalletTransactionStatus,
   WalletTransactionType,
 } from '@prisma/client';
-import { toIdr } from '../../../common/utils/currency.util';
+import { toIdr, formatSen } from '../../../common/utils/currency.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { escapeLikePattern } from '../../../common/utils/search.util';
 import { generateNotifId, generateWalletTxId } from '../../../common/utils/id-generator.util';
@@ -377,7 +377,7 @@ export class AdminInsuranceClaimsService implements OnModuleInit {
             type: notifType,
             category: getCategoryForType(notifType),
             title: 'Klaim asuransi dibayar',
-            body: `Klaim asuransi Anda sebesar Rp ${toIdr(amountSen).toLocaleString('id-ID')} telah dibayarkan ke saldo wallet.`,
+            body: `Klaim asuransi Anda sebesar ${formatSen(amountSen)} telah dibayarkan ke saldo wallet.`,
             isRead: false,
           },
         });

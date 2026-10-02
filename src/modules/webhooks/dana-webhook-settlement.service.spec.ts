@@ -38,7 +38,10 @@ function signWebhook(privatePem: string, rawBody: string, timestamp: string): st
   return signer.toString('base64');
 }
 
-function makeDeps(publicPem: string, opts: { danaEnv?: string; test500Once?: string } = {}) {
+function makeDeps(
+  publicPem: string,
+  opts: { danaEnv?: string; test500Once?: string; merchantId?: string } = {},
+) {
   const prisma = {
     webhookLog: { upsert: jest.fn(), update: jest.fn() },
     paymentTransaction: { findUnique: jest.fn(), update: jest.fn() },
@@ -47,6 +50,7 @@ function makeDeps(publicPem: string, opts: { danaEnv?: string; test500Once?: str
     get: (k: string) => {
       if (k === 'dana.publicKey') return publicPem;
       if (k === 'dana.env') return opts.danaEnv ?? 'sandbox';
+      if (k === 'dana.merchantId') return opts.merchantId ?? 'M-1';
       if (k === 'DANA_WEBHOOK_TEST_5005601_ONCE') return opts.test500Once;
       return undefined;
     },
@@ -55,7 +59,7 @@ function makeDeps(publicPem: string, opts: { danaEnv?: string; test500Once?: str
   const walletService = { handleTopupSuccess: jest.fn() };
   const orderQrisPaymentService = { handleSettlement: jest.fn() };
   const danaDirectPaymentService = { settleEscrow: jest.fn() };
-  const danaDirectRefundService = { refundPayment: jest.fn() };
+  const danaDirectRefundService = { refundPayment: jest.fn(), refundAmount: jest.fn() };
   const walletMode = { isWalletEnabled: jest.fn(() => true) };
   const subscriptionsService = { activateDanaSubscription: jest.fn(async () => undefined) };
   const svc = new DanaWebhookSettlementService(
@@ -133,10 +137,9 @@ describe('dana-webhook-settlement.service', () => {
     expect(danaPaymentService.getPaymentDetail).toHaveBeenCalledWith('DANA-TOP-001');
     expect(walletService.handleTopupSuccess).toHaveBeenCalledTimes(1);
     expect(walletService.handleTopupSuccess).toHaveBeenCalledWith('KAHADE-TOP-1', '15000');
-    expect(prisma.paymentTransaction.update).toHaveBeenCalledWith({
-      where: { id: 'pt-1' },
-      data: { status: PaymentStatus.SUCCESS, danaReferenceNo: 'DANA-REF-9' },
-    });
+    // SYS-B-201: cabang TOPUP return awal — handleTopupSuccess menandai
+    // SUCCESS sendiri; tail update SUCCESS generik TIDAK boleh jalan.
+    expect(prisma.paymentTransaction.update).not.toHaveBeenCalled();
     expect(prisma.webhookLog.update).toHaveBeenCalled();
   });
 
@@ -195,6 +198,79 @@ describe('dana-webhook-settlement.service', () => {
     );
     expect(danaPaymentService.getPaymentDetail).not.toHaveBeenCalled();
     expect(walletService.handleTopupSuccess).not.toHaveBeenCalled();
+  });
+
+  it('SYS-B-202: status final-gagal DANA (04) → payment PENDING dipersist FAILED (bukan macet PENDING)', async () => {
+    const { svc, prisma, danaPaymentService } = makeDeps(publicPem);
+    const failedBody = JSON.stringify({ ...notifyBody, latestTransactionStatus: '04' });
+    const failedSig = signWebhook(privatePem, failedBody, timestamp);
+    prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: false });
+    prisma.paymentTransaction.findUnique.mockResolvedValue({
+      id: 'pt-1',
+      status: PaymentStatus.PENDING,
+      purpose: PaymentPurpose.TOPUP,
+      grossAmount: BigInt(1500000),
+      midtransOrderId: 'KAHADE-TOP-1',
+    });
+    const out = await svc.handleFinishNotify(
+      failedBody,
+      { 'x-signature': failedSig, 'x-timestamp': timestamp },
+      PATH,
+    );
+    expect(out.responseCode).toBe('2005600');
+    expect(danaPaymentService.getPaymentDetail).not.toHaveBeenCalled();
+    expect(prisma.paymentTransaction.update).toHaveBeenCalledWith({
+      where: { id: 'pt-1' },
+      data: { status: PaymentStatus.FAILED, failedAt: expect.any(Date) },
+    });
+  });
+
+  it('SYS-B-202: guard PENDING→FAILED — payment yang sudah final TIDAK diturunkan statusnya', async () => {
+    const { svc, prisma } = makeDeps(publicPem);
+    const failedBody = JSON.stringify({ ...notifyBody, latestTransactionStatus: '07' });
+    const failedSig = signWebhook(privatePem, failedBody, timestamp);
+    prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: false });
+    prisma.paymentTransaction.findUnique.mockResolvedValue({
+      id: 'pt-1',
+      status: PaymentStatus.SUCCESS, // sudah final
+      purpose: PaymentPurpose.TOPUP,
+      grossAmount: BigInt(1500000),
+      midtransOrderId: 'KAHADE-TOP-1',
+    });
+    const out = await svc.handleFinishNotify(
+      failedBody,
+      { 'x-signature': failedSig, 'x-timestamp': timestamp },
+      PATH,
+    );
+    expect(out.responseCode).toBe('2005600');
+    expect(prisma.paymentTransaction.update).not.toHaveBeenCalled();
+  });
+
+  it('SYS-B-204: merchantId notify tidak cocok dengan config → 403 WEBHOOK_MERCHANT_ID_MISMATCH', async () => {
+    const { svc, prisma } = makeDeps(publicPem, { merchantId: 'M-OTHER' });
+    prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: false });
+    prisma.paymentTransaction.findUnique.mockResolvedValue({
+      id: 'pt-1',
+      status: PaymentStatus.PENDING,
+      purpose: PaymentPurpose.TOPUP,
+      grossAmount: BigInt(1500000),
+      midtransOrderId: 'KAHADE-TOP-1',
+    });
+    await expect(svc.handleFinishNotify(rawBody, headers, PATH)).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'WEBHOOK_MERCHANT_ID_MISMATCH' }),
+    });
+    // Properti keamanan yang dikunci: TIDAK ADA perubahan settlement
+    // (paymentTransaction.update tidak dipanggil). webhookLog.update BOLEH
+    // dipanggil — itu bookkeeping error SEC-202 (catat errorMessage +
+    // retryCount), bukan pergerakan uang.
+    expect(prisma.paymentTransaction.update).not.toHaveBeenCalled();
+  });
+
+  it('SYS-B-406: env non-sandbox tanpa DANA_PUBLIC_KEY → tolak verifikasi (fail-closed, 503)', async () => {
+    const { svc } = makeDeps('', { danaEnv: 'production' });
+    await expect(svc.handleFinishNotify(rawBody, headers, PATH)).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'DANA_WEBHOOK_KEY_UNCONFIGURED' }),
+    });
   });
 
   it('partnerReferenceNo tak dikenal (notify uji portal) → ack tanpa settlement', async () => {
@@ -325,7 +401,7 @@ describe('dana-webhook-settlement.service', () => {
     expect(walletService.handleTopupSuccess).not.toHaveBeenCalled();
   });
 
-  it('mode tanpa-wallet: TOPUP in-flight TIDAK dikredit — refund ke sumber', async () => {
+  it('mode tanpa-wallet: TOPUP in-flight TIDAK dikredit — refund ke sumber via primitif kanonis (SYS-B-103)', async () => {
     const { svc, prisma, danaPaymentService, walletService, danaDirectRefundService, walletMode } =
       makeDeps(publicPem);
     walletMode.isWalletEnabled.mockReturnValue(false);
@@ -335,19 +411,32 @@ describe('dana-webhook-settlement.service', () => {
       status: PaymentStatus.PENDING,
       purpose: PaymentPurpose.TOPUP,
       provider: 'DANA',
+      danaPayKind: 'QRIS',
       danaPartnerReferenceNo: 'DANA-TOP-001',
       grossAmount: BigInt(1500000),
       midtransOrderId: 'KAHADE-TOP-1',
     });
     danaPaymentService.getPaymentDetail.mockResolvedValue({ status: 'SUCCESS', amountIdr: 15000 });
+    danaDirectRefundService.refundAmount.mockResolvedValue({
+      refunded: true,
+      already: false,
+      amountSen: BigInt(1500000),
+    });
     const out = await svc.handleFinishNotify(rawBody, headers, PATH);
     expect(out.responseCode).toBe('2005600');
     expect(walletService.handleTopupSuccess).not.toHaveBeenCalled();
-    // refund ke metode bayar asal (bukan ke wallet)
-    expect(danaPaymentService.refundOrder).toHaveBeenCalledWith(
-      expect.objectContaining({ partnerReferenceNo: 'DANA-TOP-001' }),
+    // SYS-B-103: refund topup lewat primitif kanonis (attempt durable +
+    // refundedAmount) — BUKAN refundOrder mentah.
+    expect(danaDirectRefundService.refundAmount).toHaveBeenCalledWith(
+      expect.objectContaining({
+        paymentDbId: 'pt-top-1',
+        idempotencyKey: 'TOPUP:pt-top-1:NOWALLET',
+      }),
     );
-    expect(danaDirectRefundService.refundPayment).not.toHaveBeenCalled(); // jalur topup pakai refund langsung
+    expect(danaPaymentService.refundOrder).not.toHaveBeenCalled();
+    // SYS-B-201: cabang TOPUP return awal — tail update SUCCESS generik TIDAK
+    // boleh jalan (payment ditandai REFUNDED oleh primitif refund).
+    expect(prisma.paymentTransaction.update).not.toHaveBeenCalled();
   });
 
   it('REGRESI (insiden 2026-09-29): triple finish-notify ASLI DANA sandbox terverifikasi', async () => {

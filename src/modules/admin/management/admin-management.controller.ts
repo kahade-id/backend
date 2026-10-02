@@ -9,7 +9,6 @@ import { UpdateAdminDto } from './dto/update-admin.dto';
 import { SuspendAdminDto } from './dto/suspend-admin.dto';
 import { ChangeAdminRoleDto } from './dto/change-admin-role.dto';
 import { CreateEmergencyGrantDto } from './dto/emergency-grant.dto';
-import { CreateHandoffDto, HandoffQueryDto } from './dto/create-handoff.dto';
 import { ResetAdminPasswordDto } from './dto/reset-admin-password.dto';
 import { AdminActionReasonDto, ReactivateAdminDto } from './dto/admin-action-reason.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
@@ -134,34 +133,6 @@ export class AdminManagementController {
   @ApiResponse({ status: 200, description: 'Access review list returned.' })
   accessReview(): Promise<object> {
     return this.service.accessReview();
-  }
-
-  @Get('handoffs/workload')
-  @ApiOperation({ summary: 'Beban kasus per petugas', description: 'Handoff diterima 30 hari terakhir + dispute aktif yang di-assign.' })
-  @ApiResponse({ status: 200, description: 'Workload returned.' })
-  handoffWorkload(): Promise<object> {
-    return this.service.handoffWorkload();
-  }
-
-  @Post('handoffs')
-  @UseGuards(UserThrottleGuard)
-  @Idempotency()
-  @ApiOperation({ summary: 'Catat handoff kasus antar petugas', description: 'Audit CASE_HANDOFF_CREATED.' })
-  @ApiResponse({ status: 201, description: 'Handoff created.' })
-  @ApiResponse({ status: 400, description: 'Invalid input (mis. from = to, admin tidak aktif).' })
-  createHandoff(
-    @Body() dto: CreateHandoffDto,
-    @CurrentAdmin('sub') adminId: string,
-    @Req() req: Request,
-  ): Promise<object> {
-    return this.service.createHandoff(dto, adminId, req.ip ?? '');
-  }
-
-  @Get('handoffs')
-  @ApiOperation({ summary: 'Riwayat handoff satu kasus', description: 'Query: caseType=kyc|dispute|report, caseId.' })
-  @ApiResponse({ status: 200, description: 'Handoff history returned.' })
-  listHandoffs(@Query() query: HandoffQueryDto): Promise<object> {
-    return this.service.listHandoffsByCase(query);
   }
 
   @Post(':id/review')

@@ -61,6 +61,40 @@ export class DanaRefundRetryService {
           `dana-refund-retry: retried=${refundResult.retried} succeeded=${refundResult.succeeded}`,
         );
       }
+      // SYS-B-205: baris PENDING yang basi (>15 menit) — post-commit pembuatnya
+      // tidak pernah jalan (crash/deploy di jendela commit → eksekusi).
+      // Klaim atomik PENDING → EXECUTING di refundAmount() menjamin tepat
+      // satu eksekutor per idempotency key; aman dipanggil cron tiap jam.
+      // (Batas 15 menit memberi kesempatan tugas post-commit normal selesai;
+      // race dengannya pun aman karena klaim atomik.)
+      const staleBefore = new Date(Date.now() - 15 * 60 * 1000);
+      const stalePending = await this.prisma.danaRefundAttempt.findMany({
+        where: { status: 'PENDING', updatedAt: { lt: staleBefore } },
+        orderBy: { updatedAt: 'asc' },
+        take: 50,
+        select: { idempotencyKey: true, paymentTransactionId: true, amountSen: true, reason: true },
+      });
+      let pendingSucceeded = 0;
+      for (const a of stalePending) {
+        try {
+          const res = await this.danaDirectRefundService.refundAmount({
+            paymentDbId: a.paymentTransactionId,
+            amountSen: a.amountSen,
+            reason: a.reason ?? 'Retry refund DANA PENDING basi (cron)',
+            idempotencyKey: a.idempotencyKey,
+          });
+          if (res.refunded) pendingSucceeded++;
+        } catch (e) {
+          this.logger.warn(
+            `dana-refund-retry: PENDING basi gagal key=${a.idempotencyKey}: ${(e as Error).message}`,
+          );
+        }
+      }
+      if (stalePending.length > 0) {
+        this.logger.log(
+          `dana-refund-retry: stale-pending retried=${stalePending.length} succeeded=${pendingSucceeded}`,
+        );
+      }
       const disbursed = await this.escrowDisbursementService.retryDue(50);
       if (disbursed > 0) {
         this.logger.log(`dana-refund-retry: disbursement retry settled=${disbursed}`);

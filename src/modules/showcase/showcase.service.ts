@@ -10,6 +10,7 @@ import * as ErrorCodes from '../../common/constants/error-codes';
 import { escapeLikePattern } from '../../common/utils/search.util';
 import { sanitizeShowcaseHtml } from '../../common/utils/sanitize-html.util';
 import { isBotUserAgent } from '../../common/utils/bot-detection.util';
+import { formatIdr } from '../../common/utils/currency.util';
 import {
   ORDER_MAX_VALUE,
   ORDER_MIN_VALUE,
@@ -3342,9 +3343,9 @@ export class ShowcaseService {
     const priceMax = toNumber(row.priceMax);
     const priceLabel =
       priceMin !== null && priceMax !== null && priceMin !== priceMax
-        ? `Rp ${priceMin} - Rp ${priceMax}`
+        ? `${formatIdr(priceMin)} - ${formatIdr(priceMax)}`
         : priceMin !== null
-          ? `Rp ${priceMin}`
+          ? formatIdr(priceMin)
           : 'Harga lewat diskusi';
 
     return {

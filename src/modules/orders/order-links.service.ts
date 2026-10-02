@@ -12,7 +12,7 @@ import { ORDER_SERIAL, ORDER_LINK_SERIAL } from '../../common/constants/redis-ke
 import { KYC_THRESHOLD, CONFIRMATION_DEADLINE_DAYS_MAP, ORDER_MIN_VALUE, ORDER_MAX_VALUE, DELIVERY_DEADLINE_DAYS_MIN, DELIVERY_DEADLINE_DAYS_MAX } from '../../common/constants/app.constants';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { ORDER_LINK_EXPIRY_HOURS } from '../../common/constants/app.constants';
-import { toIdr } from '../../common/utils/currency.util';
+import { toIdr, formatIdr } from '../../common/utils/currency.util';
 import { formatWIBDate, toWIB, parseDateBoundaryWIB } from '../../common/utils/date.util';
 import { NotificationQueueService } from '../queue/notification-queue.service';
 
@@ -74,7 +74,7 @@ export class OrderLinksService {
 
   async createLink(userId: string, dto: CreateOrderLinkDto): Promise<object> {
     if (!Number.isSafeInteger(dto.orderValue) || dto.orderValue < ORDER_MIN_VALUE || dto.orderValue > ORDER_MAX_VALUE) {
-      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Order value must be an integer between Rp ${ORDER_MIN_VALUE.toLocaleString('id-ID')} and Rp ${ORDER_MAX_VALUE.toLocaleString('id-ID')}` });
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Order value must be an integer between ${formatIdr(ORDER_MIN_VALUE)} and ${formatIdr(ORDER_MAX_VALUE)}` });
     }
     const creator = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true, isActive: true, isBanned: true } });
     if (!creator) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });

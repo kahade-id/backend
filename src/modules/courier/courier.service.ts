@@ -39,17 +39,42 @@ import { maskLocation } from './providers/mock-courier.provider';
 import {
   ApproveShippingRefundDto,
   BookShipmentDto,
-  CreateBillDto,
   CreateShipmentDto,
   DecideRefundDto,
   ManualResiDto,
   QuoteRequestDto,
   RequestRefundDto,
-  ToggleFlagDto,
   UpdateAdminProviderFlagDto,
-  UpdateCatalogDto,
   VoidShipmentDto,
 } from './dto/courier.dto';
+
+/**
+ * SYS-B-501: validasi nominal refund ongkir — fail-closed.
+ *
+ * cap = costBase − refundedAmount: total refund tidak boleh melebihi biaya
+ * ongkir yang benar-benar terjadi (aktual bila sudah ada, kalau belum maka
+ * estimasi). Seluruh nominal dalam BigInt agar presisi aman.
+ *
+ * Throw BadRequestException (400) bila amount ≤ 0 atau melebihi sisa.
+ */
+export function validateShippingRefundAmount(
+  shipment: { costBase: bigint; refundedAmount: bigint },
+  amount: bigint,
+): void {
+  if (amount <= 0n) {
+    throw new BadRequestException({
+      code: ErrorCodes.VALIDATION_ERROR,
+      message: 'Nominal refund harus lebih dari 0',
+    });
+  }
+  const remaining = shipment.costBase - shipment.refundedAmount;
+  if (amount > remaining) {
+    throw new BadRequestException({
+      code: ErrorCodes.VALIDATION_ERROR,
+      message: `Nominal refund (${amount}) melebihi sisa biaya yang bisa di-refund (${remaining})`,
+    });
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Normalisasi event provider → status internal (G236)
@@ -928,224 +953,28 @@ export class CourierService {
   }
 
   // -------------------------------------------------------------------------
-  // Admin: booking gagal, tracking macet, katalog & flag, rekonsiliasi (G247–G249)
+  // State machine refund ongkir: REQUESTED → APPROVED → PAID (tidak pernah
+  // menyentuh wallet langsung; payout mengikuti alur markRefundPaid).
+  // SYS-B-501: SEMUA pintu nominal (request, decide-APPROVED, mark-paid,
+  // admin approve) wajib lewat validateShippingRefundAmount — cap =
+  // costBase − refundedAmount.
   // -------------------------------------------------------------------------
 
-  async listFailedBookings(page = 1, limit = 20): Promise<{ data: MaskedShipment[]; total: number }> {
-    const where = { bookingState: ShipmentBookingState.FAILED };
-    const [total, rows] = await Promise.all([
-      this.prisma.shipment.count({ where }),
-      this.prisma.shipment.findMany({ where, orderBy: { updatedAt: 'desc' }, skip: (page - 1) * limit, take: limit }),
-    ]);
-    return { data: rows.map((r) => this.toMaskedShipment(r)), total };
-  }
-
-  /** Tracking macet (stale): tidak ada event > 48 jam & belum terminal & belum SLA-breach alert. */
-  async listStaleTracking(page = 1, limit = 20): Promise<{ data: Array<MaskedShipment & { hoursSinceLastEvent: number | null }>; total: number }> {
-    const cutoff = new Date(Date.now() - STALE_EVENT_THRESHOLD_HOURS * 3600 * 1000);
-    const where = {
-      bookingState: ShipmentBookingState.BOOKED,
-      status: { in: [ShipmentStatus.CREATED, ShipmentStatus.PICKED_UP, ShipmentStatus.IN_TRANSIT, ShipmentStatus.OUT_FOR_DELIVERY, ShipmentStatus.UNKNOWN] },
-      OR: [{ lastEventAt: { lt: cutoff } }, { lastEventAt: null, createdAt: { lt: cutoff } }],
-    };
-    const [total, rows] = await Promise.all([
-      this.prisma.shipment.count({ where }),
-      this.prisma.shipment.findMany({ where, orderBy: { lastEventAt: 'asc' }, skip: (page - 1) * limit, take: limit }),
-    ]);
-    return {
-      total,
-      data: rows.map((r) => ({
-        ...this.toMaskedShipment(r),
-        hoursSinceLastEvent: r.lastEventAt ? Math.round((Date.now() - r.lastEventAt.getTime()) / 3600000) : null,
-      })),
-    };
-  }
-
-  async updateCatalog(providerCode: string, serviceCode: string, dto: UpdateCatalogDto, adminId: string): Promise<unknown> {
-    const updated = await this.prisma.courierService.update({
-      where: { providerCode_serviceCode: { providerCode: providerCode.toLowerCase(), serviceCode } },
-      data: {
-        ...(dto.enabled !== undefined ? { enabled: dto.enabled } : {}),
-        ...(dto.regions !== undefined ? { regions: dto.regions } : {}),
-        ...(dto.slaGraceDays !== undefined ? { slaGraceDays: dto.slaGraceDays } : {}),
-        ...(dto.supportsPickup !== undefined ? { supportsPickup: dto.supportsPickup } : {}),
-        ...(dto.supportsDropoff !== undefined ? { supportsDropoff: dto.supportsDropoff } : {}),
-      },
-    });
-    this.logger.log(`Katalog kurir diubah admin=${adminId}: ${providerCode}/${serviceCode}`);
-    return updated;
-  }
-
-  async toggleRegionFlag(providerCode: string, region: string, dto: ToggleFlagDto, adminId: string): Promise<unknown> {
-    const code = providerCode.toLowerCase();
-    const flag = await this.prisma.courierRegionFlag.upsert({
-      where: { providerCode_region: { providerCode: code, region } },
-      update: { enabled: dto.enabled, note: dto.note },
-      create: { id: randomUUID(), providerCode: code, region, enabled: dto.enabled, note: dto.note },
-    });
-    this.logger.log(`Flag kurir diubah admin=${adminId}: ${code}/${region} → ${dto.enabled}`);
-    return flag;
-  }
-
-  /** Buat tagihan provider per periode (G248). */
-  async createBill(dto: CreateBillDto, adminId: string) {
-    return this.prisma.courierProviderBill.create({
-      data: {
-        id: randomUUID(),
-        providerCode: dto.providerCode.toLowerCase(),
-        period: dto.period,
-        billedAmount: BigInt(Math.round(dto.billedAmount)),
-        notes: dto.notes,
-        createdBy: adminId,
-      },
-    }).then((b) => ({ ...b, billedAmount: b.billedAmount.toString(), recordedAmount: b.recordedAmount.toString() }));
-  }
-
-  async addBillLines(billId: string, lines: Array<{ trackingNumber?: string; shipmentId?: string; billedAmount: number }>) {
-    const bill = await this.prisma.courierProviderBill.findUnique({ where: { id: billId } });
-    if (!bill) throw new NotFoundException({ code: ErrorCodes.COURIER_BILL_NOT_FOUND, message: 'Tagihan tidak ditemukan' });
-    const created = await this.prisma.$transaction(
-      lines.map((l) =>
-        this.prisma.courierBillLine.create({
-          data: {
-            id: randomUUID(),
-            billId,
-            shipmentId: l.shipmentId,
-            trackingNumber: l.trackingNumber,
-            billedAmount: BigInt(Math.round(l.billedAmount)),
-          },
-        }),
-      ),
-    );
-    return { added: created.length };
-  }
-
-  /**
-   * Rekonsiliasi: bandingkan total tagihan provider vs biaya tercatat
-   * (actualCost shipment BOOKED pada periode tsb). Selisih → MISMATCH (G248).
-   */
-  async reconcileBill(billId: string, adminId: string) {
-    const bill = await this.prisma.courierProviderBill.findUnique({
-      where: { id: billId },
-      include: { lines: true },
-    });
-    if (!bill) throw new NotFoundException({ code: ErrorCodes.COURIER_BILL_NOT_FOUND, message: 'Tagihan tidak ditemukan' });
-
-    const [year, month] = bill.period.split('-').map(Number);
-    const periodStart = new Date(Date.UTC(year, month - 1, 1));
-    const periodEnd = new Date(Date.UTC(year, month, 1));
-
-    const recorded = await this.prisma.shipment.aggregate({
-      where: {
-        providerCode: bill.providerCode,
-        bookingState: ShipmentBookingState.BOOKED,
-        createdAt: { gte: periodStart, lt: periodEnd },
-      },
-      _sum: { actualCost: true },
-    });
-    const recordedAmount = recorded._sum.actualCost ?? BigInt(0);
-
-    // Cocokkan per-baris bila ada nomor resi.
-    for (const line of bill.lines) {
-      if (!line.trackingNumber) continue;
-      const shipment = await this.prisma.shipment.findFirst({
-        where: { trackingNumber: line.trackingNumber },
-        select: { id: true, actualCost: true },
-      });
-      const rec = shipment?.actualCost ?? BigInt(0);
-      await this.prisma.courierBillLine.update({
-        where: { id: line.id },
-        data: {
-          shipmentId: shipment?.id ?? null,
-          recordedAmount: rec,
-          delta: line.billedAmount - rec,
-        },
-      });
-    }
-
-    const delta = bill.billedAmount - recordedAmount;
-    const status = delta === BigInt(0) ? CourierBillStatus.MATCHED : CourierBillStatus.MISMATCH;
-    const updated = await this.prisma.courierProviderBill.update({
-      where: { id: billId },
-      data: { recordedAmount, status },
-    });
-    this.logger.log(`Rekonsiliasi tagihan ${billId} oleh admin=${adminId}: billed=${bill.billedAmount} recorded=${recordedAmount} → ${status}`);
-    return {
-      id: updated.id,
-      providerCode: updated.providerCode,
-      period: updated.period,
-      billedAmount: updated.billedAmount.toString(),
-      recordedAmount: updated.recordedAmount.toString(),
-      delta: delta.toString(),
-      status: updated.status,
-    };
-  }
-
-  async listBills(page = 1, limit = 20) {
-    const [total, rows] = await Promise.all([
-      this.prisma.courierProviderBill.count(),
-      this.prisma.courierProviderBill.findMany({ orderBy: { period: 'desc' }, skip: (page - 1) * limit, take: limit, include: { _count: { select: { lines: true } } } }),
-    ]);
-    return {
-      total,
-      data: rows.map((b) => ({
-        ...b,
-        billedAmount: b.billedAmount.toString(),
-        recordedAmount: b.recordedAmount.toString(),
-        lineCount: b._count.lines,
-        _count: undefined,
-      })),
-    };
-  }
-
-  async getBillDetail(billId: string) {
-    const bill = await this.prisma.courierProviderBill.findUnique({ where: { id: billId }, include: { lines: true } });
-    if (!bill) throw new NotFoundException({ code: ErrorCodes.COURIER_BILL_NOT_FOUND, message: 'Tagihan tidak ditemukan' });
-    return {
-      ...bill,
-      billedAmount: bill.billedAmount.toString(),
-      recordedAmount: bill.recordedAmount.toString(),
-      lines: bill.lines.map((l) => ({ ...l, billedAmount: l.billedAmount.toString(), recordedAmount: l.recordedAmount.toString(), delta: l.delta.toString() })),
-    };
-  }
-
-  // -------------------------------------------------------------------------
-  // Refund ongkir (G247)
-  // -------------------------------------------------------------------------
-
-  async requestRefund(userId: string, shipmentId: string, dto: RequestRefundDto) {
-    const shipment = await this.prisma.shipment.findUnique({ where: { id: shipmentId } });
-    if (!shipment) throw new NotFoundException({ code: ErrorCodes.SHIPMENT_NOT_FOUND, message: 'Pengiriman tidak ditemukan' });
-    if (shipment.sellerId !== userId && shipment.buyerId !== userId) {
-      throw new ForbiddenException({ code: ErrorCodes.SHIPMENT_NOT_ORDER_PARTICIPANT, message: 'Bukan pihak order ini' });
-    }
-    const refund = await this.prisma.shippingCostRefund.create({
-      data: {
-        id: randomUUID(),
-        shipmentId,
-        orderId: shipment.orderId,
-        amount: BigInt(Math.round(dto.amount)),
-        reason: dto.reason,
-        requestedBy: userId,
-      },
-    });
-    return { ...refund, amount: refund.amount.toString() };
-  }
-
-  async listRefunds(status?: string, page = 1, limit = 20) {
-    const where = status ? { status: status as ShippingRefundStatus } : {};
-    const [total, rows] = await Promise.all([
-      this.prisma.shippingCostRefund.count({ where }),
-      this.prisma.shippingCostRefund.findMany({ where, orderBy: { createdAt: 'desc' }, skip: (page - 1) * limit, take: limit }),
-    ]);
-    return { total, data: rows.map((r) => ({ ...r, amount: r.amount.toString() })) };
-  }
-
+  /** Putuskan refund (REQUESTED → APPROVED/REJECTED) — admin. */
   async decideRefund(refundId: string, dto: DecideRefundDto, adminId: string) {
     const refund = await this.prisma.shippingCostRefund.findUnique({ where: { id: refundId } });
     if (!refund) throw new NotFoundException({ code: ErrorCodes.SHIPPING_REFUND_NOT_FOUND, message: 'Refund tidak ditemukan' });
     if (refund.status !== 'REQUESTED') {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Refund sudah diputus' });
+    }
+    // SYS-B-501: keputusan APPROVED memvalidasi ulang nominal terhadap sisa.
+    if (dto.decision === 'APPROVED') {
+      const shipment = await this.prisma.shipment.findUnique({ where: { id: refund.shipmentId } });
+      if (!shipment) throw new NotFoundException({ code: ErrorCodes.SHIPMENT_NOT_FOUND, message: 'Pengiriman tidak ditemukan' });
+      validateShippingRefundAmount(
+        { costBase: shipment.actualCost ?? shipment.estimatedCost, refundedAmount: shipment.refundedAmount },
+        refund.amount,
+      );
     }
     const updated = await this.prisma.shippingCostRefund.update({
       where: { id: refundId },
@@ -1167,6 +996,13 @@ export class CourierService {
     if (refund.status !== 'APPROVED') {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Hanya refund APPROVED yang bisa ditandai dibayar' });
     }
+    const shipment = await this.prisma.shipment.findUnique({ where: { id: refund.shipmentId } });
+    if (!shipment) throw new NotFoundException({ code: ErrorCodes.SHIPMENT_NOT_FOUND, message: 'Pengiriman tidak ditemukan' });
+    // SYS-B-501: pemeriksaan cap terakhir sebelum refundedAmount bertambah.
+    validateShippingRefundAmount(
+      { costBase: shipment.actualCost ?? shipment.estimatedCost, refundedAmount: shipment.refundedAmount },
+      refund.amount,
+    );
     const [updated] = await this.prisma.$transaction([
       this.prisma.shippingCostRefund.update({ where: { id: refundId }, data: { status: 'PAID' } }),
       this.prisma.shipment.update({
@@ -1184,6 +1020,36 @@ export class CourierService {
   // refund yang sudah ada (REQUESTED → APPROVED → PAID) dan TIDAK menyentuh
   // wallet langsung.
   // -------------------------------------------------------------------------
+
+  /**
+   * Pengajuan refund ongkir oleh user (POST /v1/courier/shipments/:id/refunds).
+   * Dipertahankan SYS-D-002: dipakai CourierController user-facing (bukan
+   * bagian klaster admin mati yang dihapus).
+   */
+  async requestRefund(userId: string, shipmentId: string, dto: RequestRefundDto) {
+    const shipment = await this.prisma.shipment.findUnique({ where: { id: shipmentId } });
+    if (!shipment) throw new NotFoundException({ code: ErrorCodes.SHIPMENT_NOT_FOUND, message: 'Pengiriman tidak ditemukan' });
+    if (shipment.sellerId !== userId && shipment.buyerId !== userId) {
+      throw new ForbiddenException({ code: ErrorCodes.SHIPMENT_NOT_ORDER_PARTICIPANT, message: 'Bukan pihak order ini' });
+    }
+    // SYS-B-501: tolak nominal > sisa sejak awal — bukan saat approve saja.
+    const amount = BigInt(Math.round(dto.amount));
+    validateShippingRefundAmount(
+      { costBase: shipment.actualCost ?? shipment.estimatedCost, refundedAmount: shipment.refundedAmount },
+      amount,
+    );
+    const refund = await this.prisma.shippingCostRefund.create({
+      data: {
+        id: randomUUID(),
+        shipmentId,
+        orderId: shipment.orderId,
+        amount,
+        reason: dto.reason,
+        requestedBy: userId,
+      },
+    });
+    return { ...refund, amount: refund.amount.toString() };
+  }
 
   /** Daftar shipment untuk halaman admin (filter bookingState/status/provider/stale/search). */
   async listAdminShipments(query: {
@@ -1286,11 +1152,21 @@ export class CourierService {
       }
     }
     if (dto.regionBlacklist !== undefined) {
-      for (const region of dto.regionBlacklist) {
-        await this.prisma.courierRegionFlag.upsert({
-          where: { providerCode_region: { providerCode: code, region } },
-          update: { enabled: false },
-          create: { id: randomUUID(), providerCode: code, region, enabled: false },
+      // SYS-D-003: pola batch — 1 updateMany + 1 createMany(skipDuplicates)
+      // menggantikan N upsert per region. Hasil akhir identik dengan upsert
+      // per region: yang sudah ada → enabled=false, yang belum ada → dibuat
+      // dengan enabled=false (skipDuplicates menahan race insert ganda).
+      const regions = [...new Set(dto.regionBlacklist)];
+      if (regions.length > 0) {
+        await this.prisma.courierRegionFlag.updateMany({
+          where: { providerCode: code, region: { in: regions } },
+          data: { enabled: false },
+        });
+        await this.prisma.courierRegionFlag.createMany({
+          data: regions.map((region) => ({
+            id: randomUUID(), providerCode: code, region, enabled: false,
+          })),
+          skipDuplicates: true,
         });
       }
     }
@@ -1374,14 +1250,11 @@ export class CourierService {
       throw new NotFoundException({ code: ErrorCodes.SHIPMENT_NOT_FOUND, message: 'Pengiriman tidak ditemukan' });
     }
     const amount = BigInt(dto.amountSen);
-    const costBase = shipment.actualCost ?? shipment.estimatedCost;
-    const remaining = costBase - shipment.refundedAmount;
-    if (amount > remaining) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: `Nominal refund (${amount}) melebihi sisa biaya yang bisa di-refund (${remaining})`,
-      });
-    }
+    // SYS-B-501: validasi terpusat — cap = costBase − refundedAmount.
+    validateShippingRefundAmount(
+      { costBase: shipment.actualCost ?? shipment.estimatedCost, refundedAmount: shipment.refundedAmount },
+      amount,
+    );
     const now = new Date();
     const refund = await this.prisma.$transaction(async (tx) => {
       const created = await tx.shippingCostRefund.create({

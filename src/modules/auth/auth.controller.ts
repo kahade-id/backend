@@ -690,7 +690,7 @@ export class AuthController {
     <p>${message}</p>
     ${success ? `
     <div id="actions">
-      <a class="btn" id="openAppBtn" href="kahade://email-verified">Buka Aplikasi Kahade</a>
+      <a class="btn" id="openAppBtn" href="kahade://verify-email">Buka Aplikasi Kahade</a>
       <a class="btn secondary" href="${webAppUrl}">Buka di Browser</a>
     </div>
     <div class="store-links" id="storeFallback">
@@ -702,7 +702,7 @@ export class AuthController {
       (function() {
         var openAppBtn = document.getElementById('openAppBtn');
         var storeFallback = document.getElementById('storeFallback');
-        var appScheme = 'kahade://email-verified';
+        var appScheme = 'kahade://verify-email';
         var attempted = false;
         function tryOpenApp() {
           if (attempted) return;

@@ -20,6 +20,7 @@ import {
   DELIVERY_DEADLINE_DAYS_MIN,
   DELIVERY_DEADLINE_DAYS_MAX,
 } from '../../../common/constants/app.constants';
+import { formatIdr } from '../../../common/utils/currency.util';
 
 function sanitizeText(value: unknown): unknown {
   if (typeof value !== 'string') return value;
@@ -65,10 +66,10 @@ export class CreateOrderDto {
   @IsEnum(['BUYER', 'SELLER'], { message: 'role must be BUYER or SELLER' })
   role!: 'BUYER' | 'SELLER';
 
-  @ApiProperty({ description: 'Username of the counterpart', minLength: 3, maxLength: 50 })
+  @ApiProperty({ description: 'Username of the counterpart', minLength: 3, maxLength: 30 })
   @IsString()
   @MinLength(3)
-  @MaxLength(50)
+  @MaxLength(30)
   counterpartUsername!: string;
 
   @ApiProperty({ description: 'Order title', minLength: 3, maxLength: 100 })
@@ -91,8 +92,8 @@ export class CreateOrderDto {
 
   @ApiProperty({ description: 'Order value in IDR', minimum: ORDER_MIN_VALUE, maximum: ORDER_MAX_VALUE })
   @IsInt()
-  @Min(ORDER_MIN_VALUE, { message: `Minimum order value is Rp ${ORDER_MIN_VALUE.toLocaleString()}` })
-  @Max(ORDER_MAX_VALUE, { message: `Maximum order value is Rp ${ORDER_MAX_VALUE.toLocaleString()}` })
+  @Min(ORDER_MIN_VALUE, { message: `Minimum order value is ${formatIdr(ORDER_MIN_VALUE)}` })
+  @Max(ORDER_MAX_VALUE, { message: `Maximum order value is ${formatIdr(ORDER_MAX_VALUE)}` })
   orderValue!: number;
 
   @ApiProperty({ description: 'Delivery deadline in days', minimum: DELIVERY_DEADLINE_DAYS_MIN, maximum: DELIVERY_DEADLINE_DAYS_MAX })

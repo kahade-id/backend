@@ -15,6 +15,10 @@ import { OrdersService } from '../orders/orders.service';
 import { TranslationService } from './translation/translation.service';
 import { ChatOrderHooks, ChatOrderEventKind, ChatOrderEventData } from './chat-order-hooks';
 import { generateNotifId } from '../../common/utils/id-generator.util';
+import {
+  renderNotificationCopy,
+  resolveNotificationLanguage,
+} from '../notifications/notification-copy.service';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import * as path from 'path';
 import * as ErrorCodes from '../../common/constants/error-codes';
@@ -1867,12 +1871,19 @@ export class ChatService implements OnModuleInit {
       // dedupe lama (room+user per 60 detik) justru menahan pesan kedua.
       // CN-019: refType/refId menunjuk ke RUANG (bukan pesan) agar konsisten
       // dengan actionUrl dan aman di-routing klien.
+      // SYS-C-105: judul mengikuti bahasa preferensi penerima (isi preview
+      // adalah konten pesan / label tipe media — tidak dilokalkan).
+      const chatCopy = renderNotificationCopy(
+        NotificationType.CHAT_NEW_MESSAGE,
+        await resolveNotificationLanguage(this.prisma, recipientId),
+        { senderName, preview },
+      );
       const notification = inAppEnabled
         ? await this.prisma.notification.create({
             data: {
               notifId: generateNotifId(), userId: recipientId,
               type: NotificationType.CHAT_NEW_MESSAGE, category: getCategoryForType(NotificationType.CHAT_NEW_MESSAGE),
-              title: `Message from ${senderName}`, body: preview, isRead: false,
+              title: chatCopy.title, body: chatCopy.body, isRead: false,
               refType: 'CHAT_ROOM', refId: room.id,
               actionUrl: `/chat/${encodeURIComponent(room.id)}`,
             },
@@ -1881,8 +1892,8 @@ export class ChatService implements OnModuleInit {
         : null;
       this.prisma.emitNotificationCreated({
         userId: recipientId,
-        title: `Message from ${senderName}`,
-        body: preview,
+        title: chatCopy.title,
+        body: chatCopy.body,
         data: { type: 'CHAT_NEW', notificationType: NotificationType.CHAT_NEW_MESSAGE, ...(notification ? { notificationId: notification.notifId } : {}), chatRoomId: room.id, roomId: room.id },
       });
     } catch (error) {
@@ -2025,8 +2036,8 @@ export class ChatService implements OnModuleInit {
      *
      * `ChatRoom.orderId` is the relation column and holds `Order.id` — the internal cuid
      * (`schema.prisma:1223`). Socket rooms are named after the human-readable `Order.orderId`:
-     * that is what `join-room` joins (`realtime.gateway.ts:478`), what `join_order` joins
-     * (`:421`), what the disconnect sweep enumerates (`:325`), and what the sibling emits in
+     * that is what `join-room` joins (`realtime.gateway.ts:478`), what the disconnect
+     * sweep enumerates (`:325`), and what the sibling emits in
      * this same service already use (`:412` and `:463` both pass `room.order.orderId`).
      *
      * Passing the cuid addressed `order:<cuid>` — a room no socket has ever joined — so

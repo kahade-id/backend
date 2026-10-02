@@ -6,6 +6,10 @@ import { CreateRatingDto } from './dto/create-rating.dto';
 import { UpdateRatingDto } from './dto/update-rating.dto';
 import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
 import { generateNotifId } from '../../common/utils/id-generator.util';
+import {
+  renderNotificationCopy,
+  resolveNotificationLanguage,
+} from '../notifications/notification-copy.service';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { Decimal } from '@prisma/client/runtime/library';
@@ -124,16 +128,26 @@ export class RatingsService {
     const giver = await this.prisma.user.findUnique({ where: { id: userId }, select: { fullName: true, username: true } });
     const giverName = giver?.fullName || giver?.username || 'User';
     try {
+      // SYS-C-105: copy mengikuti bahasa preferensi penerima.
+      const ratingCopy = renderNotificationCopy(
+        NotificationType.RATING_NEW,
+        await resolveNotificationLanguage(this.prisma, receiverId),
+        {
+          giverName,
+          stars: String(dto.stars),
+          comment: dto.comment ? ` "${dto.comment.slice(0, 60)}"` : '',
+        },
+      );
       await this.prisma.notification.create({
         data: {
           notifId: generateNotifId(), userId: receiverId,
           type: NotificationType.RATING_NEW, category: getCategoryForType(NotificationType.RATING_NEW),
-          title: 'New Rating',
-          body: `${giverName} gave you a ${dto.stars}-star rating.${dto.comment ? ` "${dto.comment.slice(0, 60)}"` : ''}`,
+          title: ratingCopy.title,
+          body: ratingCopy.body,
           isRead: false,
         },
       });
-      this.prisma.emitNotificationCreated({ userId: receiverId, title: 'New Rating', body: `${giverName} gave a ${dto.stars}-star rating`, data: { type: 'RATING_NEW' } });
+      this.prisma.emitNotificationCreated({ userId: receiverId, title: ratingCopy.title, body: ratingCopy.body, data: { type: 'RATING_NEW' } });
     } catch (notificationError: unknown) {
       this.logger.warn(`Rating notification failed after rating ${rating.id} was committed: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`);
     }

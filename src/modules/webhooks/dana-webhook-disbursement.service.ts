@@ -2,10 +2,15 @@ import {
   ForbiddenException,
   Injectable,
   Logger,
+  Optional,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { RedisService } from '../../redis/redis.service';
+// SYS-B-306: alert seketika untuk NEEDS_REVIEW.
+import { alertDisbursementNeedsAttention } from '../scheduler/common/money-alert.util';
 import {
   DANA_SANDBOX_WEBHOOK_PUBLIC_KEY,
   assertWebhookTimestampFresh,
@@ -20,18 +25,6 @@ export const DANA_DISBURSE_NOTIFY_ACK: DanaWebhookOutcome = {
   responseCode: '2004300',
   responseMessage: 'Successful',
 };
-
-/** Status DANA yang dikenal pada Transfer to Bank Notify. */
-const KNOWN_DISBURS_STATUSES = new Set([
-  '00', // sukses
-  '01',
-  '02',
-  '03', // pending
-  '04',
-  '05',
-  '06',
-  '07', // gagal
-]);
 
 /**
  * Webhook DANA Transfer to Bank Notify (disbursement).
@@ -75,11 +68,47 @@ export class DanaWebhookDisbursementService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
+    // SYS-B-306: Redis opsional untuk alert NEEDS_REVIEW seketika dari
+    // applyStatus. @Optional agar spec yang membangun service manual tetap
+    // jalan; bila tak ada, sweep disbursement-attention (10 mnt) yang
+    // meng-alert sebagai safety net.
+    @Optional() private readonly redis?: RedisService,
   ) {}
+
+  /**
+   * SYS-B-306: alert seketika saat baris masuk NEEDS_REVIEW (best-effort,
+   * tak pernah throw — sweep 10-menit tetap jadi safety net + dedup).
+   */
+  private alertNeedsReview(disbursementId: string, reason: string): void {
+    if (!this.redis) return;
+    alertDisbursementNeedsAttention({
+      prisma: this.prisma,
+      redis: this.redis,
+      logger: this.logger,
+      disbursementId,
+      status: 'NEEDS_REVIEW',
+      reason,
+    }).catch((err: unknown) =>
+      this.logger.warn(
+        `silent-catch: NEEDS_REVIEW alert gagal untuk ${disbursementId}: ${err instanceof Error ? err.message : String(err)}`,
+      ),
+    );
+  }
 
   private webhookPublicKey(): string {
     const fromEnv = this.config.get<string>('dana.publicKey') ?? '';
     if (fromEnv.trim()) return fromEnv;
+    // SYS-B-406: kunci publik sandbox DANA BERSIFAT PUBLIK (disalin dari SDK
+    // resmi dana-python) — HANYA boleh dipakai bila dana.env === 'sandbox'.
+    // Di luar sandbox, kunci yang hilang = config error → JANGAN verifikasi
+    // (fail-closed). Boot sudah fail-fast via env.validation.ts +
+    // dana.config.ts; ini pertahanan lapis kedua bila config dibangun manual.
+    if (this.config.get<string>('dana.env') !== 'sandbox') {
+      throw new ServiceUnavailableException({
+        code: 'DANA_WEBHOOK_KEY_UNCONFIGURED',
+        message: 'DANA_PUBLIC_KEY belum di-set untuk env non-sandbox — verifikasi webhook ditolak',
+      });
+    }
     return DANA_SANDBOX_WEBHOOK_PUBLIC_KEY;
   }
 
@@ -290,6 +319,8 @@ export class DanaWebhookDisbursementService {
         this.logger.error(
           `DANA disburs notify: nominal mismatch untuk disbursement ${disb.id} (dana=${notify.amountIdr}, expected=${expectedIdr}) → NEEDS_REVIEW`,
         );
+        // SYS-B-306: alert seketika (best-effort).
+        this.alertNeedsReview(disb.id, `nominal mismatch (dana=${notify.amountIdr}, expected=${expectedIdr})`);
         return;
       }
       await this.prisma.escrowDisbursement.update({
@@ -347,5 +378,7 @@ export class DanaWebhookDisbursementService {
     this.logger.error(
       `DANA disburs notify: disbursement ${disb.id} → NEEDS_REVIEW (status tak dikenal "${s}")`,
     );
+    // SYS-B-306: alert seketika (best-effort).
+    this.alertNeedsReview(disb.id, `status tak dikenal "${s}"`);
   }
 }

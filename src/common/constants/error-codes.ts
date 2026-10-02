@@ -253,6 +253,11 @@ export const VALIDATION_ERROR = 'VALIDATION_ERROR';
 export const TOO_MANY_REQUESTS = 'TOO_MANY_REQUESTS';
 
 export const PASSWORD_RECENTLY_USED = 'PASSWORD_RECENTLY_USED';
+// SYS-C-202 (audit sistemik ronde 3, 2026-10-03): password masuk blocklist
+// daftar umum/bocor — kode error spesifik agar FE bisa membedakan dari
+// VALIDATION_ERROR generik dan menampilkan copy yang jelas tanpa expose
+// isi blocklist ke klien.
+export const PASSWORD_TOO_COMMON = 'PASSWORD_TOO_COMMON';
 
 export const ACTIVE_ORDERS_PRESENT = 'ACTIVE_ORDERS_PRESENT';
 export const ESCROW_BALANCE_PRESENT = 'ESCROW_BALANCE_PRESENT';

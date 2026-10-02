@@ -6,6 +6,7 @@ import * as ErrorCodes from '../../common/constants/error-codes';
 import { UpdatePreferencesDto } from './dto/update-preferences.dto';
 import { customAlphabet } from 'nanoid';
 import { getMinutesInTimezone, isMinutesInRange } from '../../common/utils/timezone.util';
+import { resolveNotificationLanguage } from './notification-copy.service';
 
 const generateDeviceId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 16);
 const NOTIFICATION_DEDUP_WINDOW_MS = 60_000;
@@ -415,13 +416,13 @@ export class NotificationsService {
     }
   }
 
+  /**
+   * SYS-C-105: bahasa preferensi user — implementasi kanonis kini hidup di
+   * `resolveNotificationLanguage()` (notification-copy.service.ts); metode
+   * ini mendelegasikan ke sana agar tidak ada dua sumber kebenaran.
+   */
   async getUserLanguage(userId: string): Promise<'id' | 'en'> {
-    try {
-      const prefs = await this.prisma.notificationPreference.findUnique({ where: { userId } }) as any;
-      return prefs?.language === 'en' ? 'en' : 'id';
-    } catch {
-      return 'id';
-    }
+    return resolveNotificationLanguage(this.prisma, userId);
   }
 
   async deleteNotification(userId: string, notifId: string): Promise<{ message: string }> {

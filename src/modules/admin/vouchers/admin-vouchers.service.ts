@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, BadRequestException, ForbiddenException, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { ConflictException } from '@nestjs/common';
@@ -8,7 +8,10 @@ import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditAction, Prisma, VoucherType } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { ADMIN_VOUCHERS_LIST } from '../../../common/constants/redis-keys';
-import { toSen, toIdr } from '../../../common/utils/currency.util';
+import { toSen, toIdr, formatIdr } from '../../../common/utils/currency.util';
+// SYS-B-402: dual control untuk pembuatan voucher bernilai di atas ambang.
+import { ApprovalsService } from '../approvals/approvals.service';
+import { DUAL_CONTROL_THRESHOLD_SEN } from '../approvals/dual-control.constants';
 
 const VOUCHER_LIST_TTL = 300;
 /** G375: ambang alarm kuota voucher — flag bila pemakaian > 80% dari maxUsageTotal. */
@@ -39,14 +42,27 @@ function voucherQuota(v: { maxUsageTotal: number | null; currentUsage: number })
 }
 
 @Injectable()
-export class AdminVouchersService {
+export class AdminVouchersService implements OnModuleInit {
   private readonly logger = new Logger(AdminVouchersService.name);
 
   constructor(
     private prisma: PrismaService,
     private redis: RedisService,
     private auditLog: AuditLogService,
+    // SYS-B-402: modul ini mengeksekusi VOUCHER_CREATE yang disetujui
+    // (ApprovalsModule @Global — tanpa import modul).
+    private readonly approvals: ApprovalsService,
   ) {}
+
+  onModuleInit(): void {
+    this.approvals.registerExecutor('VOUCHER_CREATE', async (ctx) => {
+      const p = ctx.payload as Record<string, unknown>;
+      const dto = p as unknown as CreateVoucherDto;
+      // Jalur dual control: gate ambang dilewati (sudah dipenuhi saat propose
+      // + approve oleh dua admin berbeda); validasi penuh tetap jalan.
+      return this.createVoucher(ctx.decidedBy, dto, ctx.ipAddress, { viaDualControl: true });
+    });
+  }
 
   async listVouchers(page: number, limit: number, isActive?: string, search?: string): Promise<object> {
     const safePage = Math.max(1, Number.isFinite(page) ? Math.trunc(page) : 1);
@@ -168,7 +184,24 @@ export class AdminVouchersService {
     };
   }
 
-  async createVoucher(adminId: string, dto: CreateVoucherDto, ipAddress: string): Promise<object> {
+  async createVoucher(
+    adminId: string,
+    dto: CreateVoucherDto,
+    ipAddress: string,
+    opts: { viaDualControl?: boolean } = {},
+  ): Promise<object> {
+    // SYS-B-402: nilai voucher di atas ambang → WAJIB dual control.
+    // Voucher persen selalu punya maxDiscountAmount cap (divalidasi di bawah),
+    // jadi nilai = max(flat, cap) adalah batas eksposur per penukaran.
+    const valueSen = toSen(Math.max(dto.discountAmount ?? 0, dto.maxDiscountAmount ?? 0));
+    if (!opts.viaDualControl && valueSen > DUAL_CONTROL_THRESHOLD_SEN) {
+      throw new ForbiddenException({
+        code: ErrorCodes.DUAL_CONTROL_REQUIRED,
+        message:
+          'Nilai voucher di atas Rp1.000.000 wajib dual control ' +
+          '(usulkan via POST /v1/admin/approvals/propose dengan actionType VOUCHER_CREATE)',
+      });
+    }
     const code = dto.code.trim().toUpperCase();
     const name = dto.name.trim();
     const description = dto.description?.trim() || undefined;
@@ -201,13 +234,13 @@ export class AdminVouchersService {
     if (dto.discountAmount && dto.discountAmount > MAX_DISCOUNT_AMOUNT_IDR) {
       throw new BadRequestException({
         code: ErrorCodes.VALIDATION_ERROR,
-        message: `Discount amount cannot exceed Rp ${MAX_DISCOUNT_AMOUNT_IDR.toLocaleString('id-ID')}`,
+        message: `Discount amount cannot exceed ${formatIdr(MAX_DISCOUNT_AMOUNT_IDR)}`,
       });
     }
     if (dto.maxDiscountAmount && dto.maxDiscountAmount > MAX_DISCOUNT_AMOUNT_IDR) {
       throw new BadRequestException({
         code: ErrorCodes.VALIDATION_ERROR,
-        message: `Max discount amount cannot exceed Rp ${MAX_DISCOUNT_AMOUNT_IDR.toLocaleString('id-ID')}`,
+        message: `Max discount amount cannot exceed ${formatIdr(MAX_DISCOUNT_AMOUNT_IDR)}`,
       });
     }
     if (dto.discountPercent !== undefined && dto.discountPercent !== null) {

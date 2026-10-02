@@ -19,6 +19,7 @@ describe('AdminSystemService broadcast push delivery', () => {
       redis as never,
       auditLogService as never,
       notificationQueue as never,
+      { registerExecutor: jest.fn(), findPendingByActionTarget: jest.fn(), propose: jest.fn(), approve: jest.fn(), listPending: jest.fn() } as never,
     );
   });
 

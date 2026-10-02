@@ -2,7 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { toIdr } from '../../common/utils/currency.util';
+import { toIdr, formatSen } from '../../common/utils/currency.util';
 
 const OG_CACHE_TTL = 300;
 const DEFAULT_OG_IMAGE = 'https://kahade.id/og-default.png';
@@ -103,7 +103,7 @@ export class OgMetadataService {
     }
 
     const title = `${order.title} - Kahade`;
-    const description = `${order.orderType} order worth Rp ${toIdr(order.orderValue).toLocaleString('id-ID')} by ${order.seller.fullName || order.seller.username}`;
+    const description = `${order.orderType} order worth ${formatSen(order.orderValue)} by ${order.seller.fullName || order.seller.username}`;
     const image = order.seller.avatarUrl || DEFAULT_OG_IMAGE;
 
     const result = {

@@ -37,7 +37,12 @@ import {
   WalletTransactionStatus,
   WalletTransactionType,
 } from '@prisma/client';
-import { toIdr } from '../../common/utils/currency.util';
+import { toIdr, formatSen } from '../../common/utils/currency.util';
+import {
+  renderNotificationCopy,
+  resolveNotificationLanguage,
+  type NotificationCopyParams,
+} from '../notifications/notification-copy.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { generateDisputeId, generateNotifId, generateWalletTxId } from '../../common/utils/id-generator.util';
 import { DISPUTE_SLA_HOURS } from '../../common/constants/app.constants';
@@ -63,6 +68,11 @@ type Tx = Prisma.TransactionClient;
 
 const REVIEW_WINDOW_MS = 3 * 24 * 60 * 60 * 1000; // 3 hari review buyer (G183)
 const MAX_MILESTONES = 20;
+
+// SYS-B-307: tahap ACCEPTED tanpa pencairan > 7 hari dicairkan otomatis
+// (cron milestone-auto-release). Aktor audit untuk event auto-release.
+const MILESTONE_AUTO_RELEASE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+const MILESTONE_AUTO_RELEASE_ACTOR = 'system:auto-release';
 
 /** Rincian split dana per tahap. */
 export interface MilestoneSplit {
@@ -276,6 +286,27 @@ export class MilestonesService {
     } catch (err: unknown) {
       this.logger.warn(`silent-catch: milestone notification failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /**
+   * SYS-C-105 (audit sistemik ronde 3, 2026-10-03): varian notifyUser yang
+   * me-render copy dari template kanonis sesuai bahasa preferensi user.
+   * Dipakai di call-site yang template-nya mencakup semua nuansa semantik;
+   * call-site dengan nuansa khusus (aktor dinamis, batch multi-tahap)
+   * tetap memakai notifyUser(title, body) dengan catatan TODO SYS-C-105.
+   */
+  private async notifyUserLocalized(
+    userId: string,
+    type: NotificationType,
+    params: NotificationCopyParams,
+    refId: string,
+  ) {
+    const copy = renderNotificationCopy(
+      type,
+      await resolveNotificationLanguage(this.prisma, userId),
+      params,
+    );
+    return this.notifyUser(userId, type, copy.title, copy.body, refId);
   }
 
   // ------------------------------------------------------------ read (G200)
@@ -508,11 +539,10 @@ export class MilestonesService {
       return created;
     });
 
-    await this.notifyUser(
+    await this.notifyUserLocalized(
       order.buyerId,
       NotificationType.MILESTONE_SUBMITTED,
-      'Rencana Tahap Order',
-      `Penjual membuat rencana ${result.length} tahap untuk order "${order.title}".`,
+      { seq: '1', title: dto.milestones[0]?.title ?? '', orderTitle: order.title },
       result[0].id,
     );
     return { orderId: order.orderId, count: result.length, milestoneIds: result.map((m) => m.id) };
@@ -624,6 +654,8 @@ export class MilestonesService {
       } as Prisma.InputJsonValue);
     });
     const otherPartyId = isBuyer ? order.sellerId : order.buyerId;
+    // TODO SYS-C-105: copy aktor-dinamis (pembeli/penjual mengajukan perubahan)
+    // butuh varian template — belum dimigrasi ke notifyUserLocalized.
     await this.notifyUser(
       otherPartyId,
       NotificationType.MILESTONE_SUBMITTED,
@@ -779,11 +811,10 @@ export class MilestonesService {
         ...(note?.trim() ? { note: note.trim() } : {}),
       } as Prisma.InputJsonValue);
     });
-    await this.notifyUser(
+    await this.notifyUserLocalized(
       milestone.order.buyerId,
       NotificationType.MILESTONE_SUBMITTED,
-      'Tahap Diserahkan',
-      `Penjual menyerahkan tahap ${milestone.seq} "${milestone.title}". Mohon tinjau dalam 3 hari.`,
+      { seq: String(milestone.seq), title: milestone.title, orderTitle: milestone.order.title },
       milestoneId,
     );
     return { id: milestoneId, reviewDeadline };
@@ -856,11 +887,10 @@ export class MilestonesService {
         round: milestone.revisionRounds + 1,
       } as Prisma.InputJsonValue);
     });
-    await this.notifyUser(
+    await this.notifyUserLocalized(
       milestone.order.sellerId,
       NotificationType.MILESTONE_REVISION_REQUESTED,
-      'Revisi Diminta',
-      `Pembeli meminta revisi tahap ${milestone.seq} "${milestone.title}".`,
+      { seq: String(milestone.seq), title: milestone.title, orderTitle: milestone.order.title, note: '' },
       milestoneId,
     );
     return { id: milestoneId, revisionRound: milestone.revisionRounds + 1 };
@@ -906,14 +936,17 @@ export class MilestonesService {
       await this.runPostCommitMilestoneRelease(released.danaDisbursement);
     }
 
-    const noWallet = this.isNoWalletMode();
-    await this.notifyUser(
+    // SYS-C-105: nuansa destinasi (rekening bank vs wallet) ikut di catatan
+    // metadata — template kanonis hanya membawa fakta pencairan + nominal.
+    await this.notifyUserLocalized(
       milestone.order.sellerId,
       NotificationType.MILESTONE_RELEASED,
-      'Dana Tahap Cair',
-      noWallet
-        ? `Tahap ${milestone.seq} "${milestone.title}" diterima pembeli. Dana dicairkan ke rekening bank terdaftar Anda.`
-        : `Tahap ${milestone.seq} "${milestone.title}" diterima pembeli. Dana telah dicairkan ke wallet Anda.`,
+      {
+        amount: formatSen(milestone.amount),
+        seq: String(milestone.seq),
+        title: milestone.title,
+        orderTitle: milestone.order.title,
+      },
       milestoneId,
     );
     return { id: milestoneId, releasedTxId: released.releasedTxId };
@@ -1281,6 +1314,131 @@ export class MilestonesService {
   }
 
   /**
+   * SYS-B-307 (audit sistemik ronde 3): auto-release tahap ACCEPTED yang basi.
+   *
+   * Tahap yang sudah ACCEPTED (diterima buyer) tetapi tak pernah dicairkan —
+   * mis. crash di antara accept dan release pada versi alur lama, atau
+   * ACCEPTED yang lolos tanpa release — membuat dana seller tertahan di
+   * escrow tanpa batas waktu.
+   *
+   * Dipanggil cron harian `milestone-auto-release` (scheduler): tahap
+   * ACCEPTED dengan acceptedAt > 7 hari dicairkan otomatis via jalur release
+   * yang SAMA persis dengan `releaseMilestone()` — `releaseMilestoneFunds`
+   * atomik, idempoten, dengan concurrency guard `updateMany` berpredikat
+   * status=ACCEPTED.
+   *
+   * Fail-closed:
+   *  - Hanya bila milestone MASIH ACCEPTED saat dieksekusi (predikat di
+   *    dalam tx; race dengan release manual → tepat satu yang menang, tak
+   *    ada pencairan ganda).
+   *  - Order harus valid: `assertOrderAllowsMilestoneAction` (hanya
+   *    PROCESSING/IN_DELIVERY). Order DISPUTED/CANCELLED/COMPLETED → DITAHAN
+   *    (masuk daftar `held`) + alert oleh cron — butuh keputusan manusia,
+   *    bukan auto-release.
+   *  - Mode no-wallet: baris disbursement PENDING durable dibuat DI DALAM
+   *    tx yang sama (pola SEC-104); settlement post-commit best-effort,
+   *    cron dana-refund-retry mengambil alih bila gagal.
+   */
+  async autoReleaseStaleAccepted(limit = 50): Promise<{
+    checked: number;
+    released: number;
+    skipped: number;
+    held: string[];
+  }> {
+    const cutoff = new Date(Date.now() - MILESTONE_AUTO_RELEASE_AFTER_MS);
+    const stale = await this.prisma.orderMilestone.findMany({
+      where: { status: MilestoneStatus.ACCEPTED, acceptedAt: { lt: cutoff } },
+      select: { id: true },
+      orderBy: { acceptedAt: 'asc' },
+      take: Math.max(1, limit),
+    });
+
+    let released = 0;
+    let skipped = 0;
+    const held: string[] = [];
+    for (const s of stale) {
+      try {
+        const outcome = await this.autoReleaseOne(s.id);
+        if (outcome === 'released') released++;
+        else if (outcome === 'held') {
+          skipped++;
+          held.push(s.id);
+        } else skipped++;
+      } catch (e) {
+        skipped++;
+        this.logger.warn(
+          `auto-release tahap ${s.id} gagal: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
+    if (stale.length > 0) {
+      this.logger.log(
+        `milestone auto-release: checked=${stale.length} released=${released} skipped=${skipped} held=${held.length}`,
+      );
+    }
+    return { checked: stale.length, released, skipped, held };
+  }
+
+  /**
+   * Satu tahap auto-release. Mengembalikan 'released' | 'held' | 'skipped'.
+   * 'held' = order tak valid → JANGAN cairkan otomatis (fail-closed).
+   */
+  private async autoReleaseOne(milestoneId: string): Promise<'released' | 'held' | 'skipped'> {
+    const milestone = await this.prisma.orderMilestone.findUnique({
+      where: { id: milestoneId },
+      include: { order: true },
+    });
+    // Race: sudah berubah status (mis. dicairkan manual) → lewati.
+    if (!milestone || milestone.status !== MilestoneStatus.ACCEPTED) return 'skipped';
+
+    try {
+      this.assertOrderAllowsMilestoneAction(milestone.order);
+    } catch (e) {
+      // Fail-closed: order DISPUTED/CANCELLED/dsb — dana ditahan sampai ada
+      // keputusan manusia. Cron yang memanggil akan meng-alert daftar held.
+      this.logger.error(
+        `auto-release DITAHAN tahap ${milestoneId} (order ${milestone.order.orderId} ` +
+          `status=${milestone.order.status}): ${e instanceof Error ? e.message : String(e)}`,
+      );
+      return 'held';
+    }
+
+    const result = await this.prisma.$transaction(tx =>
+      this.releaseMilestoneFunds(tx, milestoneId, MILESTONE_AUTO_RELEASE_ACTOR),
+    );
+    // M5: settlement DANA post-commit (best-effort; baris PENDING durable
+    // sudah dibuat di dalam tx bila mode tanpa-wallet).
+    if (!result.skipped && 'danaDisbursement' in result && result.danaDisbursement) {
+      await this.runPostCommitMilestoneRelease(result.danaDisbursement);
+    }
+    if (result.skipped) return 'skipped';
+
+    await this.notifyUserLocalized(
+      milestone.order.buyerId,
+      NotificationType.MILESTONE_RELEASED,
+      {
+        amount: formatSen(milestone.amount),
+        seq: String(milestone.seq),
+        title: milestone.title,
+        orderTitle: milestone.order.title,
+      },
+      milestoneId,
+    );
+    await this.notifyUserLocalized(
+      milestone.order.sellerId,
+      NotificationType.MILESTONE_RELEASED,
+      {
+        amount: formatSen(milestone.amount),
+        seq: String(milestone.seq),
+        title: milestone.title,
+        orderTitle: milestone.order.title,
+      },
+      milestoneId,
+    );
+    return 'released';
+  }
+
+  /**
    * M5: re-drive settlement disbursement DANA untuk tahap yang sudah RELEASED
    * via kunci DANA (mis. crash setelah commit sebelum post-commit jalan, atau
    * HELD_NO_BANK yang rekeningnya baru ditambahkan). Idempoten.
@@ -1463,6 +1621,8 @@ export class MilestonesService {
       return { cancelled: remaining.length, refundedAmount: refunded };
     });
 
+    // TODO SYS-C-105: pembatalan batch (N tahap + info refund) tidak pas dengan
+    // template MILESTONE_CANCELLED yang per-tahap — butuh varian template batch.
     await this.notifyUser(
       role === MilestoneActorType.BUYER ? order.sellerId : order.buyerId,
       NotificationType.MILESTONE_CANCELLED,
@@ -1584,6 +1744,8 @@ export class MilestonesService {
       refunded += m.escrowHeld;
     }
 
+    // TODO SYS-C-105: pembatalan batch (N tahap + info refund) tidak pas dengan
+    // template MILESTONE_CANCELLED yang per-tahap — butuh varian template batch.
     await this.notifyUser(
       role === MilestoneActorType.BUYER ? order.sellerId : order.buyerId,
       NotificationType.MILESTONE_CANCELLED,

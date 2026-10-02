@@ -15,7 +15,7 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { toSen, toIdr } from '../../common/utils/currency.util';
+import { toSen, toIdr, formatIdr } from '../../common/utils/currency.util';
 import { startOfDayWIB } from '../../common/utils/date.util';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
@@ -598,7 +598,7 @@ export class ScheduledWithdrawalService {
     if (!Number.isInteger(minAmount) || minAmount < 1 || minAmount > MAX_SCHEDULE_MIN_AMOUNT) {
       throw new BadRequestException({
         code: ErrorCodes.INVALID_SCHEDULE,
-        message: `minAmount must be an integer from 1 to ${MAX_SCHEDULE_MIN_AMOUNT.toLocaleString('id-ID')}`,
+        message: `minAmount must be an integer from 1 to ${formatIdr(MAX_SCHEDULE_MIN_AMOUNT)}`,
       });
     }
   }

@@ -12,9 +12,12 @@ import { SESSION_REVOKED_KEY, USER_SUSPENDED_KEY } from '../../../common/constan
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { WalletAdjustDto, WalletAdjustType } from './dto/wallet-adjust.dto';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
-import { toSen, toIdr } from '../../../common/utils/currency.util';
+import { toSen, toIdr, formatIdr } from '../../../common/utils/currency.util';
+// SYS-C-105: copy notifikasi mengikuti bahasa preferensi user.
+import { renderNotificationCopy, resolveNotificationLanguage } from '../../notifications/notification-copy.service';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import * as ErrorCodes from '../../../common/constants/error-codes';
+import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
 import { OtpService } from '../../auth/otp.service';
 import { withCsvExportWatermark } from '../../../common/utils/csv-watermark.util';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
@@ -932,17 +935,18 @@ export class AdminUsersService implements OnModuleInit {
           'Aliran dana aktual via DANA.',
       });
     }
-    // SEC-601: re-auth password server-side (pola AUT-013) — JWT curian saja
-    // tidak cukup untuk menggerakkan saldo.
+    // SEC-601 + SYS-B-403: re-auth password server-side (pola AUT-013) — JWT
+    // curian saja tidak cukup untuk menggerakkan saldo.
     await this.adminPassword.verifyAdminPassword(adminId, dto.reauthPassword, 'wallet.adjust', userId, ipAddress);
-    // SEC-601: CREDIT di atas ambang → WAJIB dual control.
+    // SEC-601 + SYS-B-403: CREDIT maupun DEBIT di atas ambang → WAJIB dual
+    // control. Asimetri sebelumnya (hanya credit) memungkinkan satu admin
+    // menguras saldo user.
     const amountInSen = toSen(dto.amount);
-    const isCredit = dto.type === WalletAdjustType.CREDIT;
-    if (isCredit && amountInSen > DUAL_CONTROL_THRESHOLD_SEN) {
+    if (amountInSen > DUAL_CONTROL_THRESHOLD_SEN) {
       throw new ForbiddenException({
         code: ErrorCodes.DUAL_CONTROL_REQUIRED,
         message:
-          'Kredit wallet di atas Rp1.000.000 wajib dual control ' +
+          'Adjust wallet (kredit maupun debit) di atas Rp1.000.000 wajib dual control ' +
           '(usulkan via POST /v1/admin/approvals/propose dengan actionType WALLET_ADJUST)',
       });
     }
@@ -971,6 +975,15 @@ export class AdminUsersService implements OnModuleInit {
     // Serial generated before the transaction to avoid Redis incr gaps on rollback.
     const serial = await this.walletTxSerial.getNext();
     const txId = generateWalletTxId(serial);
+
+    // SYS-C-105: copy notifikasi mengikuti bahasa preferensi user (dihitung
+    // sebelum tx agar bisa dipakai di dalam tx maupun untuk realtime emit).
+    const notifType = isCredit ? NotificationType.WALLET_TOPUP_SUCCESS : NotificationType.WALLET_WITHDRAW_SUCCESS;
+    const adjustLang = await resolveNotificationLanguage(this.prisma, id);
+    const adjustCopy = renderNotificationCopy(notifType, adjustLang, { amount: formatIdr(amount) });
+    const reasonSuffix = adjustLang === 'id' ? ` Alasan: ${reason}` : ` Reason: ${reason}`;
+    const notifTitle = adjustCopy.title;
+    const notifBody = `${adjustCopy.body}${reasonSuffix}`;
 
     let balanceBefore!: bigint;
     let balanceAfter!: bigint;
@@ -1019,27 +1032,20 @@ export class AdminUsersService implements OnModuleInit {
         },
       });
 
-      const notifType = isCredit ? NotificationType.WALLET_TOPUP_SUCCESS : NotificationType.WALLET_WITHDRAW_SUCCESS;
       await tx.notification.create({
         data: {
           notifId: generateNotifId(),
           userId: id,
           type: notifType,
           category: getCategoryForType(notifType),
-          title: isCredit ? 'Balance Credited by Admin' : 'Balance Debited by Admin',
-          body: isCredit
-            ? `Rp ${amount.toLocaleString('id-ID')} has been added to your wallet balance. Reason: ${reason}`
-            : `Rp ${amount.toLocaleString('id-ID')} has been deducted from your wallet balance. Reason: ${reason}`,
+          title: notifTitle,
+          body: notifBody,
           isRead: false,
         },
       });
 
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
-    const notifTitle = isCredit ? 'Balance Credited by Admin' : 'Balance Debited by Admin';
-    const notifBody = isCredit
-      ? `Rp ${amount.toLocaleString('id-ID')} has been added to your wallet balance. Reason: ${reason}`
-      : `Rp ${amount.toLocaleString('id-ID')} has been deducted from your wallet balance. Reason: ${reason}`;
     this.prisma.emitNotificationCreated({ userId: id, title: notifTitle, body: notifBody, data: { type: 'WALLET_ADJUSTED' } });
 
     const auditAction = isCredit ? AuditAction.WALLET_CREDIT : AuditAction.WALLET_DEBIT;
@@ -1262,8 +1268,10 @@ export class AdminUsersService implements OnModuleInit {
     const kindOk = (source: 'system' | 'admin'): boolean =>
       !kindFilter || source === kindFilter;
     const actorFilter = query.actor;
-    const from = query.from ? new Date(query.from) : undefined;
-    const to = query.to ? new Date(query.to) : undefined;
+    // SYS-C-301: tanggal kalender diperlakukan sebagai hari WIB,
+    // bukan UTC midnight dari new Date() mentah.
+    const from = query.from ? parseDateBoundaryWIB(query.from, 'start') : undefined;
+    const to = query.to ? parseDateBoundaryWIB(query.to, 'end') : undefined;
     // BAI-061/BAI-073: paginasi nyata — page/limit dari DTO dipatuhi, bukan
     // selalu 200 pertama. limit di-cap 100 oleh PaginationDto.
     const page = query.page ?? 1;

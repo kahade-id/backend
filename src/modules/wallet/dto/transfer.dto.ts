@@ -18,6 +18,7 @@ import {
   WALLET_MIN_TRANSFER,
   WALLET_MAX_TRANSFER_PER_TX,
 } from '../../../common/constants/app.constants';
+import { formatIdr } from '../../../common/utils/currency.util';
 
 export class TransferDto {
   @ApiProperty({ description: 'Recipient user ID or username' })
@@ -42,10 +43,10 @@ export class TransferDto {
   @IsNumber()
   @IsInt({ message: 'amount must be a whole number (no decimals)' })
   @Min(WALLET_MIN_TRANSFER, {
-    message: `Minimum transfer is Rp ${WALLET_MIN_TRANSFER.toLocaleString()}`,
+    message: `Minimum transfer is ${formatIdr(WALLET_MIN_TRANSFER)}`,
   })
   @Max(WALLET_MAX_TRANSFER_PER_TX, {
-    message: `Maximum transfer is Rp ${WALLET_MAX_TRANSFER_PER_TX.toLocaleString()}`,
+    message: `Maximum transfer is ${formatIdr(WALLET_MAX_TRANSFER_PER_TX)}`,
   })
   amount!: number;
 

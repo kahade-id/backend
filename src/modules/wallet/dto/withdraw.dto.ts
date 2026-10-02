@@ -3,6 +3,7 @@ import { Transform, Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { LocationDto } from '../../auth/dto/location.dto';
 import { WALLET_MIN_WITHDRAW, WALLET_DAILY_WITHDRAW_LIMIT } from '../../../common/constants/app.constants';
+import { formatIdr } from '../../../common/utils/currency.util';
 import { IsValidId } from '../../../common/decorators/is-valid-id.decorator';
 
 export class WithdrawDto {
@@ -17,8 +18,8 @@ export class WithdrawDto {
   })
   @IsNumber()
   @IsInt({ message: 'amount must be a whole number (no decimals)' })
-  @Min(WALLET_MIN_WITHDRAW, { message: `Minimum withdrawal is Rp ${WALLET_MIN_WITHDRAW.toLocaleString()}` })
-  @Max(WALLET_DAILY_WITHDRAW_LIMIT, { message: `Maximum single withdrawal is Rp ${WALLET_DAILY_WITHDRAW_LIMIT.toLocaleString()}` })
+  @Min(WALLET_MIN_WITHDRAW, { message: `Minimum withdrawal is ${formatIdr(WALLET_MIN_WITHDRAW)}` })
+  @Max(WALLET_DAILY_WITHDRAW_LIMIT, { message: `Maximum single withdrawal is ${formatIdr(WALLET_DAILY_WITHDRAW_LIMIT)}` })
   amount!: number;
 
   @ApiProperty({ description: 'Bank account ID for withdrawal' })

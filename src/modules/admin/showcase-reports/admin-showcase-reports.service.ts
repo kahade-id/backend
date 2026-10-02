@@ -13,6 +13,7 @@ import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditAction, Prisma, ReportStatus, NotificationType, UserAuditAction, AdminRole } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
+import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
 import { mapWithConcurrency } from '../../../common/utils/bounded-concurrency.util';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { ShowcaseReportAction } from './dto/review-showcase-report.dto';
@@ -255,6 +256,13 @@ export class AdminShowcaseReportsService {
   // G416/G417 — notifikasi privasi-aware via pola yang sama dipakai modul lain
   // (prisma.notification.create + emitNotificationCreated, silent-catch).
   // -------------------------------------------------------------------------
+  /**
+   * SYS-C-402 — kontrak NotificationReference kanonis untuk notifikasi
+   * moderasi (dan pola acuan modul lain):
+   * - `refType`: nama entitas yang dirujuk ('ShowcaseReport' | 'UserShowcase' | ...).
+   * - `refId`: ID ENTITAS yang dirujuk — BUKAN userId pelapor/pemilik.
+   *   refId salah entitas = deep-link klien jatuh ke layar yang salah.
+   */
   private notifyUser(input: {
     userId: string;
     type: string;
@@ -297,19 +305,21 @@ export class AdminShowcaseReportsService {
   }
 
   /** G416 — kabari pelapor saat status laporannya berubah; TANPA identitas pemilik. */
-  private notifyReporterStatusChange(reporterId: string, itemTitle: string, outcome: string): void {
+  private notifyReporterStatusChange(reportId: string, reporterId: string, itemTitle: string, outcome: string): void {
     this.notifyUser({
       userId: reporterId,
       type: NOTIF_MODERATION_REPORT_UPDATE,
       title: 'Update laporan etalase Anda',
       body: `Laporan Anda terhadap item "${itemTitle}" telah ditinjau: ${outcome}. Terima kasih atas partisipasinya menjaga keamanan Kahade.`,
       refType: 'ShowcaseReport',
-      refId: reporterId,
+      // SYS-C-402: refId = ID LAPORAN (bukan reporterId).
+      refId: reportId,
     });
   }
 
   /** G417 — kabari pemilik item saat takedown/restrict + cara banding. */
   private notifyOwnerItemAction(
+    itemId: string,
     ownerId: string,
     itemTitle: string,
     temporary: boolean,
@@ -323,7 +333,8 @@ export class AdminShowcaseReportsService {
         ? `Item "${itemTitle}" disembunyikan sementara karena melanggar kebijakan Kahade. ${restoreInfo} Anda dapat mengajukan banding melalui aplikasi Kahade.`
         : `Item "${itemTitle}" dinonaktifkan karena melanggar kebijakan Kahade. Anda dapat mengajukan banding melalui aplikasi Kahade bila keberatan dengan keputusan ini.`,
       refType: 'UserShowcase',
-      refId: ownerId,
+      // SYS-C-402: refId = ID ITEM (bukan ownerId).
+      refId: itemId,
     });
   }
 
@@ -538,7 +549,7 @@ export class AdminShowcaseReportsService {
           metadata: { snapshot },
           auditDescription: `Dismissed showcase report ${reportId}${trimmedResolution ? `: ${trimmedResolution}` : ''}`,
         });
-        this.notifyReporterStatusChange(report.reporterId, report.showcase.title, 'ditolak');
+        this.notifyReporterStatusChange(reportId, report.reporterId, report.showcase.title, 'ditolak');
         return { message: 'Showcase report dismissed', reportId, status: ReportStatus.DISMISSED };
       }
       case 'no_action': {
@@ -553,7 +564,7 @@ export class AdminShowcaseReportsService {
           metadata: { snapshot },
           auditDescription: `Resolved showcase report ${reportId} with no action${trimmedResolution ? `: ${trimmedResolution}` : ''}`,
         });
-        this.notifyReporterStatusChange(report.reporterId, report.showcase.title, 'diselesaikan tanpa tindakan');
+        this.notifyReporterStatusChange(reportId, report.reporterId, report.showcase.title, 'diselesaikan tanpa tindakan');
         return { message: 'Showcase report resolved with no action', reportId, status: ReportStatus.RESOLVED_NO_ACTION };
       }
       case 'takedown': {
@@ -652,11 +663,11 @@ export class AdminShowcaseReportsService {
           `Took down showcase item ${report.showcaseId} ("${report.showcase.title}") via report ${reportId}${trimmedResolution ? `: ${trimmedResolution}` : ''}${relatedIds.length > 0 ? `; auto-resolved ${relatedIds.length} related open report(s): ${relatedIds.join(', ')}` : ''}`,
           ipAddress,
         );
-        this.notifyReporterStatusChange(report.reporterId, report.showcase.title, 'ditindaklanjuti (item dinonaktifkan)');
+        this.notifyReporterStatusChange(reportId, report.reporterId, report.showcase.title, 'ditindaklanjuti (item dinonaktifkan)');
         for (const rel of relatedOpen) {
-          this.notifyReporterStatusChange(rel.reporterId, report.showcase.title, 'ditindaklanjuti (item dinonaktifkan)');
+          this.notifyReporterStatusChange(rel.id, rel.reporterId, report.showcase.title, 'ditindaklanjuti (item dinonaktifkan)');
         }
-        this.notifyOwnerItemAction(report.showcase.userId, report.showcase.title, false, '');
+        this.notifyOwnerItemAction(report.showcaseId, report.showcase.userId, report.showcase.title, false, '');
         return {
           message: 'Showcase item taken down; report resolved',
           reportId,
@@ -916,6 +927,7 @@ export class AdminShowcaseReportsService {
       auditDescription: `Reopened showcase report ${reportId} (${report.status} → UNDER_REVIEW): ${trimmed}`,
     });
     this.notifyReporterStatusChange(
+      reportId,
       report.reporterId,
       item?.title ?? report.showcaseId,
       'dibuka kembali untuk peninjauan ulang',
@@ -1188,8 +1200,9 @@ export class AdminShowcaseReportsService {
       `Temporarily restricted showcase item ${report.showcaseId} for ${days} day(s) via report ${reportId}: ${trimmed}`,
       ipAddress,
     );
-    this.notifyReporterStatusChange(report.reporterId, report.showcase.title, 'ditindaklanjuti (item dibatasi sementara)');
+    this.notifyReporterStatusChange(reportId, report.reporterId, report.showcase.title, 'ditindaklanjuti (item dibatasi sementara)');
     this.notifyOwnerItemAction(
+      report.showcaseId,
       report.showcase.userId,
       report.showcase.title,
       true,
@@ -1810,9 +1823,13 @@ export class AdminShowcaseReportsService {
       where.status = query.status as Prisma.EnumReportStatusFilter;
     }
     if (query.from || query.to) {
+      // SYS-C-301: tanggal kalender = hari WIB (ekspor CSV/JSON — new Date()
+      // mentah bisa memotong data hampir sehari penuh di batas atas).
       where.createdAt = {};
-      if (query.from) where.createdAt.gte = new Date(query.from);
-      if (query.to) where.createdAt.lte = new Date(query.to);
+      const gte = query.from ? parseDateBoundaryWIB(query.from, 'start') : undefined;
+      const lte = query.to ? parseDateBoundaryWIB(query.to, 'end') : undefined;
+      if (gte) where.createdAt.gte = gte;
+      if (lte) where.createdAt.lte = lte;
     }
 
     const take = Math.min(query.limit ?? EXPORT_MAX_ROWS, EXPORT_MAX_ROWS);

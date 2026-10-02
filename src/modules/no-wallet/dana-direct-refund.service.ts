@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { PaymentProvider, PaymentStatus } from '@prisma/client';
+import { PaymentProvider, PaymentPurpose, PaymentStatus } from '@prisma/client';
 import { createHash } from 'node:crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { DanaPaymentService } from '../payment/dana/dana-payment.service';
@@ -24,6 +24,21 @@ export interface DanaRefundAmountParams {
 export type DanaRefundOutcome =
   | { refunded: true; already: boolean; amountSen: bigint }
   | { refunded: false; reason: 'NOT_ELIGIBLE' };
+
+/**
+ * SYS-B-203: refund DANA belum terkonfirmasi sukses (status provider ambigu).
+ * Attempt DIBIARKAN EXECUTING agar sweep mengambil alih — JANGAN tandai
+ * FAILED (klaim ulang FAILED dengan key sama memakai logika yang salah
+ * untuk kasus ini) dan JANGAN tandai SUCCESS (uang belum pasti kembali).
+ */
+export class DanaRefundNotConfirmedError extends Error {
+  constructor(public readonly providerStatus: string) {
+    super(
+      `DANA_REFUND_NOT_CONFIRMED: providerStatus=${providerStatus} — butuh rekonsiliasi refund`,
+    );
+    this.name = 'DanaRefundNotConfirmedError';
+  }
+}
 
 /**
  * partnerRefundNo DETERMINISTIK per idempotencyKey.
@@ -126,9 +141,16 @@ export class DanaDirectRefundService {
     if (payment.status === PaymentStatus.REFUNDED) {
       return { refunded: true, already: true, amountSen: payment.refundedAmount };
     }
-    if (payment.status !== PaymentStatus.SUCCESS) {
+    // SYS-B-103: top-up in-flight (PENDING, dana diterima tapi belum pernah
+    // dikredit ke mana pun) juga eligible untuk refund ke sumber — dipakai
+    // webhook settlement saat wallet nonaktif (mode BI-safe). Selain TOPUP,
+    // hanya payment SUCCESS yang boleh di-refund (fail-closed).
+    const isTopupInFlight =
+      payment.purpose === PaymentPurpose.TOPUP &&
+      payment.status === PaymentStatus.PENDING;
+    if (payment.status !== PaymentStatus.SUCCESS && !isTopupInFlight) {
       this.logger.warn(
-        `DANA refund skip: payment ${paymentDbId} status=${payment.status} (bukan SUCCESS)`,
+        `DANA refund skip: payment ${paymentDbId} status=${payment.status} (bukan SUCCESS / topup in-flight)`,
       );
       return { refunded: false, reason: 'NOT_ELIGIBLE' };
     }
@@ -219,9 +241,30 @@ export class DanaDirectRefundService {
         amountIdr,
         reason: reason.slice(0, 200),
       });
+      // SYS-B-203: JANGAN fabrikasi SUCCESS — tulis status aktual DANA ke
+      // attempt (providerStatus/settledAt). Bila belum terkonfirmasi sukses,
+      // biarkan attempt EXECUTING agar sweep mengambil alih; refundedAmount
+      // TIDAK di-increment dan payment TIDAK ditandai REFUNDED (fail-closed).
+      const providerStatus = result.status;
+      if (providerStatus !== 'SUCCESS') {
+        await this.prisma.danaRefundAttempt.update({
+          where: { id: attempt.id },
+          data: { providerStatus },
+        });
+        this.logger.error(
+          `DANA refund ${partnerRefundNo} belum terkonfirmasi sukses (providerStatus=${providerStatus}) — ` +
+            `attempt dibiarkan EXECUTING untuk sweep; refundedAmount TIDAK di-increment`,
+        );
+        throw new DanaRefundNotConfirmedError(providerStatus);
+      }
       await this.prisma.danaRefundAttempt.update({
         where: { id: attempt.id },
-        data: { status: 'SUCCESS', danaReferenceNo: result.referenceNo || undefined },
+        data: {
+          status: 'SUCCESS',
+          danaReferenceNo: result.referenceNo || undefined,
+          providerStatus,
+          settledAt: new Date(),
+        },
       });
       const fullyRefunded = alreadyRefunded + amountSen >= payment.grossAmount;
       // SEC-103: JANGAN overwrite refundedAmount dari snapshot basi — klaim
@@ -276,6 +319,9 @@ export class DanaDirectRefundService {
       );
       return { refunded: true, already: false, amountSen };
     } catch (error) {
+      // SYS-B-203: status refund ambigu (DanaRefundNotConfirmedError) → attempt
+      // DIBIARKAN EXECUTING agar sweep mengambil alih; JANGAN tandai FAILED.
+      if (error instanceof DanaRefundNotConfirmedError) throw error;
       await this.prisma.danaRefundAttempt
         .update({
           where: { id: attempt.id },

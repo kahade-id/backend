@@ -14,9 +14,9 @@ jest.mock('@aws-sdk/client-s3', () => ({
   GetObjectCommand: jest.fn(),
 }));
 
-jest.mock('@aws-sdk/s3-request-presigner', () => ({
-  getSignedUrl: jest.fn(),
-}));
+// SYS-D-006 (2026-10-03): mock @aws-sdk/s3-request-presigner dihapus —
+// paketnya di-uninstall (R2 dibuang 2026-09-26) dan tidak ada kode yang
+// mengimpornya; mock ini tidak pernah dipakai test manapun.
 
 const userId = 'user-001';
 const ktpFileKey = `uploads/kyc-ktp/${userId}/abc123-ktp.jpg`;

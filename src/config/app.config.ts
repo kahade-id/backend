@@ -159,6 +159,16 @@ export const appConfig = registerAs('app', () => ({
   paymentFeeAkulakuPercent: safePercent(process.env.PAYMENT_FEE_AKULAKU_PERCENT, 3.0),
   paymentFeeKredivoPercent: safePercent(process.env.PAYMENT_FEE_KREDIVO_PERCENT, 3.0),
 
+  // SYS-B-407: fee provider DANA per metode (basis points dari gross escrow)
+  // dibaca dana-direct-payment.service via app.danaPaymentFeeQrisBps /
+  // app.danaPaymentFeeVaBps. Registrasi eksplisit + validasi fail-fast:
+  // nilai tidak valid → boot GAGAL, bukan fallback diam-diam.
+  danaPaymentFeeQrisBps: parseFeeRateBps('DANA_PAYMENT_FEE_QRIS_BPS', 70),
+  danaPaymentFeeVaBps: parseFeeRateBps('DANA_PAYMENT_FEE_VA_BPS', 0),
+  // Batas kedaluwarsa pembayaran DANA (menit); dibaca expiryAt() via
+  // app.danaDirectExpiryMinutes. Batas keras provider 30 menit (SEC-208).
+  danaDirectExpiryMinutes: strictInt('DANA_DIRECT_EXPIRY_MINUTES', 30, 5, 30),
+
   // Upload limits
   uploadMaxAvatarMb: parseInt(process.env.UPLOAD_MAX_AVATAR_MB || '2', 10),
   uploadMaxChatMb: parseInt(process.env.UPLOAD_MAX_CHAT_MB || '10', 10),

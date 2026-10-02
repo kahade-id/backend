@@ -18,7 +18,6 @@ import {
   Min,
   MinLength,
   ValidateNested,
-  ArrayMinSize,
   ArrayMaxSize,
 } from 'class-validator';
 import { ShipmentMode, ShippingCostBearer } from '@prisma/client';
@@ -124,71 +123,11 @@ export class ManualResiDto {
   note?: string;
 }
 
-export class UpdateCatalogDto {
-  @IsBoolean() @IsOptional()
-  enabled?: boolean;
-
-  @IsArray() @IsString({ each: true }) @IsOptional()
-  regions?: string[];
-
-  @IsInt() @Min(0) @Max(30) @IsOptional()
-  slaGraceDays?: number;
-
-  @IsBoolean() @IsOptional()
-  supportsPickup?: boolean;
-
-  @IsBoolean() @IsOptional()
-  supportsDropoff?: boolean;
-}
-
-export class ToggleFlagDto {
-  @IsBoolean()
-  enabled!: boolean;
-
-  @IsString() @IsOptional() @MaxLength(300)
-  note?: string;
-}
-
-export class CreateBillDto {
-  @IsString() @IsNotEmpty() @MaxLength(20)
-  providerCode!: string;
-
-  @IsString() @Matches(/^\d{4}-\d{2}$/, { message: 'Periode harus format YYYY-MM' })
-  period!: string;
-
-  @IsNumber() @Min(0)
-  billedAmount!: number;
-
-  @IsString() @IsOptional() @MaxLength(500)
-  notes?: string;
-}
-
-export class BillLineDto {
-  @IsString() @IsOptional() @MaxLength(100)
-  trackingNumber?: string;
-
-  @IsString() @IsOptional()
-  shipmentId?: string;
-
-  @IsNumber() @Min(0)
-  billedAmount!: number;
-}
-
 /**
- * SEC-204: DTO tambah baris tagihan — validasi nested ketat.
- * Sebelumnya controller memakai body inline `{ lines: BillLineDto[] }`
- * sehingga decorator di BillLineDto tidak pernah dijalankan: NaN/negatif/
- * non-array lolos ke BigInt(Math.round(...)) dan merusak rekonsiliasi.
+ * Body POST /v1/courier/shipments/:id/refunds (user-facing).
+ * Dipertahankan SYS-D-002: dipakai CourierController, bukan bagian klaster
+ * admin mati yang dihapus.
  */
-export class AddBillLinesDto {
-  @IsArray({ message: 'lines harus berupa array.' })
-  @ArrayMinSize(1, { message: 'Minimal satu baris tagihan.' })
-  @ArrayMaxSize(500, { message: 'Maksimal 500 baris per permintaan.' })
-  @ValidateNested({ each: true })
-  @Type(() => BillLineDto)
-  lines!: BillLineDto[];
-}
-
 export class RequestRefundDto {
   @IsNumber() @Min(1)
   amount!: number;
@@ -197,6 +136,9 @@ export class RequestRefundDto {
   reason!: string;
 }
 
+/**
+ * SYS-B-501: body keputusan refund admin (REQUESTED → APPROVED/REJECTED).
+ */
 export class DecideRefundDto {
   @IsString() @IsIn(['APPROVED', 'REJECTED'])
   decision!: 'APPROVED' | 'REJECTED';

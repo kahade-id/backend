@@ -26,4 +26,13 @@ export const APPROVAL_STEP_UP_ACTIONS: Record<string, string> = {
   COMMERCE_REFUND: 'commerce.refund',
   DISBURSEMENT_REOPEN: 'disbursement.reopen',
   OPS_SETTING_CHANGE: 'opsSetting.update',
+  // SYS-B-401/402/405: satu niat mencakup propose maupun approve. Untuk
+  // DISBURSEMENT_FORCE_SUCCESS dipakai action endpoint review
+  // ('disbursement.review') karena FORCE_SUCCESS adalah salah satu keputusan
+  // review — konsisten dengan prinsip "sama dengan endpoint domain-nya".
+  DISBURSEMENT_FORCE_SUCCESS: 'disbursement.review',
+  VOUCHER_CREATE: 'voucher.create',
+  CAMPAIGN_ACTIVATE: 'campaign.activate',
+  MONEY_VALUE_GRANT: 'moneyValue.grant',
+  SYSTEM_CONFIG_CHANGE: 'systemConfig.update',
 };

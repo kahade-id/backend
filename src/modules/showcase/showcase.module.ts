@@ -6,7 +6,6 @@ import { UploadModule } from '../upload/upload.module';
 import { AuditLogModule } from '../../common/services/audit-log.module';
 import { VerificationBadgeModule } from '../users/verification-badge.module';
 import { ShowcaseController } from './showcase.controller';
-import { ShowcaseAppealsController } from './showcase-appeals.controller';
 import { ShowcaseService } from './showcase.service';
 import { HighlightsController } from './highlights/highlights.controller';
 import { HighlightsService } from './highlights/highlights.service';
@@ -22,14 +21,18 @@ import { AdminShowcaseReportsModule } from '../admin/showcase-reports/admin-show
  * /users/me/showcase*) dan DeepLinksController (halaman share) bisa memakainya
  * tanpa memindahkan route lama.
  *
- * AdminShowcaseReportsModule diimpor untuk endpoint banding user-facing
- * (G404: POST /v1/showcase/:id/appeals) — service logic terpusat di
- * AdminShowcaseReportsService; tidak ada siklus dependensi (modul admin hanya
- * bergantung pada AuditLogModule).
+ * AdminShowcaseReportsModule diimpor agar service moderasi
+ * (AdminShowcaseReportsService) tersedia bila dibutuhkan modul ini; tidak ada
+ * siklus dependensi (modul admin hanya bergantung pada AuditLogModule).
+ *
+ * SYS-D-002 (2026-10-03): endpoint banding user-facing
+ * (POST|GET /v1/showcase/:id/appeals, ShowcaseAppealsController) dihapus —
+ * tidak ada pemanggil di FE. Logika banding (fileAppeal/listOwnAppeals) tetap
+ * hidup di AdminShowcaseReportsService untuk jalur admin.
  */
 @Module({
   imports: [ConfigModule, PrismaModule, RedisModule, UploadModule, AuditLogModule, VerificationBadgeModule, SubscriptionsModule, AdminShowcaseReportsModule],
-  controllers: [ShowcaseController, ShowcaseAppealsController, HighlightsController],
+  controllers: [ShowcaseController, HighlightsController],
   providers: [ShowcaseService, HighlightsService],
   exports: [ShowcaseService, HighlightsService],
 })

@@ -16,9 +16,6 @@ import { AdminRole } from '@prisma/client';
 import { AdminShowcaseReportsService } from '../admin-showcase-reports.service';
 import { AdminShowcaseReportsController } from '../admin-showcase-reports.controller';
 import { ADMIN_ROLES_KEY } from '../../../../common/decorators/admin-roles.decorator';
-import { FileShowcaseAppealDto } from '../../../showcase/dto/file-showcase-appeal.dto';
-import { validate } from 'class-validator';
-import { plainToInstance } from 'class-transformer';
 import * as ErrorCodes from '../../../../common/constants/error-codes';
 
 const ADMIN_ID = 'super-admin-uuid';
@@ -210,29 +207,9 @@ describe('SH-A-003 — restoreTakedownItem', () => {
 });
 
 describe('SH-S-005 — appeal evidence must be verified file keys', () => {
-  it('DTO rejects free-form newEvidence and requires a non-empty file-key array', async () => {
-    // Bentuk lama (object bebas) tidak lagi dikenali sebagai field.
-    const legacy = plainToInstance(FileShowcaseAppealDto, {
-      reason: 'Alasan banding yang cukup panjang untuk lolos validasi minimal.',
-      newEvidence: { fotoPerbaikan: ['https://evil.example/x.jpg'] },
-    });
-    const legacyErrors = await validate(legacy);
-    expect(legacyErrors.some((e) => e.property === 'evidenceFileKeys')).toBe(true);
-
-    const empty = plainToInstance(FileShowcaseAppealDto, {
-      reason: 'Alasan banding yang cukup panjang untuk lolos validasi minimal.',
-      evidenceFileKeys: [],
-    });
-    const emptyErrors = await validate(empty);
-    expect(emptyErrors.some((e) => e.property === 'evidenceFileKeys')).toBe(true);
-
-    const ok = plainToInstance(FileShowcaseAppealDto, {
-      reason: 'Alasan banding yang cukup panjang untuk lolos validasi minimal.',
-      evidenceFileKeys: [`uploads/report-evidence/${OWNER_ID}/1700000000-a.jpg`],
-    });
-    expect(await validate(ok)).toHaveLength(0);
-  });
-
+  // SYS-D-002 (2026-10-03): uji validasi FileShowcaseAppealDto dihapus bersama
+  // DTO + endpoint banding user-facing yang mati. Validasi evidence tetap
+  // ditegakkan di service (diuji di bawah).
   it('fileAppeal verifies evidence via verifyEvidenceFileKeys(report-evidence) and stores the key list', async () => {
     jest.clearAllMocks();
     const prisma = makePrismaMock();

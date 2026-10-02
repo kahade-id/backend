@@ -15,6 +15,9 @@ import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator
 import { ParseIdPipe } from '../../../common/pipes/parse-id.pipe';
 import { Request } from 'express';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
+import { StepUpGuard } from '../../../common/guards/step-up.guard';
+import { RequireStepUp } from '../../../common/decorators/require-step-up.decorator';
+import { AdminJwtPayload } from '../../../common/types/jwt-payload.types';
 
 @ApiTags('admin-system')
 @ApiBearerAuth('access-token')
@@ -33,54 +36,63 @@ export class AdminSystemController {
   }
 
   @Put('configs/:key')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SYS-B-405: klasifikasi finansial/security eksplisit per key (registry).
+  // Key finansial/security-gated SELALU via dual control (tabel approvals) —
+  // endpoint ini hanya membuat usulan PENDING; eksekusi oleh admin kedua.
+  // admin_mfa_required = security-gated: tidak bisa dimatikan 1 admin.
+  @RequireStepUp('systemConfig.update', 'key')
   @Idempotency()
-  @ApiOperation({ summary: 'Update system config value', description: 'For financial configs (fee/commission related), the change is stored as pending and requires approval from a different admin.' })
+  @ApiOperation({ summary: 'Update system config value', description: 'SYS-B-405: requires X-Step-Up-Token (action systemConfig.update). Untuk key finansial/security-gated, perubahan disimpan sebagai usulan dual control (butuh approval admin kedua via POST /v1/admin/approvals/:id/approve atau rute kompatibilitas configs/:key/approve).' })
   @ApiResponse({ status: 200, description: 'System config updated or pending approval.' })
   @ApiResponse({ status: 404, description: 'Config key not found.' })
   updateConfig(
     @Param('key') key: string,
     @Body() dto: UpdateConfigDto,
-    @CurrentAdmin('sub') adminId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<object> {
-    return this.service.updateConfig(key, dto, adminId, req.ip ?? '');
+    return this.service.updateConfig(key, dto, admin.sub, admin.role, req.ip ?? '');
   }
 
   @Get('configs/pending')
-  @ApiOperation({ summary: 'List pending financial config changes awaiting approval' })
+  @ApiOperation({ summary: 'List pending financial/security config changes awaiting approval', description: 'SYS-B-405: dibaca dari tabel approvals (satu-satunya sistem dual control).' })
   @ApiResponse({ status: 200, description: 'Pending config changes list returned.' })
   listPendingConfigChanges(): Promise<object[]> {
     return this.service.listPendingConfigChanges();
   }
 
   @Post('configs/:key/approve')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SYS-B-405: rute kompatibilitas — diteruskan ke approvals (menjamin bukan
+  // pengusul sendiri + belum kedaluwarsa). Action step-up sama dengan
+  // pemetaan SYSTEM_CONFIG_CHANGE agar satu token berlaku untuk kedua rute.
+  @RequireStepUp('systemConfig.update', 'key')
   @Idempotency()
-  @ApiOperation({ summary: 'Approve a pending financial config change', description: 'Must be a different admin than the one who proposed the change.' })
+  @ApiOperation({ summary: 'Approve a pending financial config change', description: 'SYS-B-405: requires X-Step-Up-Token (action systemConfig.update). Must be a different admin than the one who proposed the change. Diteruskan ke sistem dual control terpusat (tabel approvals).' })
   @ApiResponse({ status: 200, description: 'Config change approved and applied.' })
   @ApiResponse({ status: 403, description: 'Cannot approve own change.' })
   @ApiResponse({ status: 404, description: 'No pending change found.' })
   approveConfigChange(
     @Param('key') key: string,
-    @CurrentAdmin('sub') adminId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<object> {
-    return this.service.approveConfigChange(key, adminId, req.ip ?? '');
+    return this.service.approveConfigChange(key, admin.sub, admin.role, req.ip ?? '');
   }
 
   @Post('configs/:key/reject')
   @UseGuards(UserThrottleGuard)
   @Idempotency()
-  @ApiOperation({ summary: 'Reject a pending financial config change' })
+  @ApiOperation({ summary: 'Reject a pending financial config change', description: 'SYS-B-405: diteruskan ke sistem dual control terpusat (tabel approvals).' })
   @ApiResponse({ status: 200, description: 'Config change rejected.' })
   @ApiResponse({ status: 404, description: 'No pending change found.' })
   rejectConfigChange(
     @Param('key') key: string,
-    @CurrentAdmin('sub') adminId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<{ message: string }> {
-    return this.service.rejectConfigChange(key, adminId, req.ip ?? '');
+    return this.service.rejectConfigChange(key, admin.sub, admin.role, req.ip ?? '');
   }
 
   @Get('audit-logs')

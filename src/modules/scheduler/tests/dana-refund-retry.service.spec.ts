@@ -26,8 +26,13 @@ describe('DanaRefundRetryService (M3 no-wallet)', () => {
       payoutPendingReferralRewards: jest.fn(async () => ({ attempted: 1, released: 1 })),
     };
     const walletMode = { isWalletEnabled: jest.fn(() => false) };
+    // SYS-B-301: retryStaleNoWalletMoney kini memindai danaRefundAttempt
+    // PENDING yang basi sebelum retry FAILED — mock harus menyediakannya.
+    const prisma = {
+      danaRefundAttempt: { findMany: jest.fn(async () => []) },
+    };
     const svc = new DanaRefundRetryService(
-      {} as never,
+      prisma as never,
       redis as never,
       danaDirectRefundService as never,
       escrowDisbursementService as never,

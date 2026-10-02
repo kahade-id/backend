@@ -5,6 +5,7 @@ import {
   WalletTransactionStatus,
   WalletTransactionType,
   EscrowDisbursementScope,
+  EscrowDisbursementStatus,
 } from '@prisma/client';
 import { generateWalletTxId } from './id-generator.util';
 import * as ErrorCodes from '../constants/error-codes';
@@ -125,12 +126,17 @@ export async function creditCashbackIfEligible(
 /**
  * M4 no-wallet — payout cashback via disbursement DANA (bukan wallet).
  *
- * Pola dua fase agar money-safe:
- *  1. `planDanaCashback(tx, ...)` — read-only di dalam tx completion pemanggil:
- *     cek eligibilitas voucher + guard idempotensi (disbursement untuk order
- *     ini sudah ada → null). TIDAK menyentuh wallet sama sekali.
- *  2. `executeDanaCashback(...)` — dipanggil pemanggil POST-COMMIT: mengeksekusi
- *     via EscrowDisbursementService.releaseFunds (idempoten, durable).
+ * Pola dua fase agar money-safe (SYS-B-205, pola SEC-104):
+ *  1. `planDanaCashback(tx, ...)` — DI DALAM tx completion pemanggil: cek
+ *     eligibilitas voucher + guard idempotensi, lalu BUAT baris
+ *     `escrowDisbursement` PENDING (durable) — mengikuti pola
+ *     milestones.service.ts:1153-1167. TIDAK menyentuh wallet sama sekali.
+ *  2. `executeDanaCashback(...)` — dipanggil pemanggil POST-COMMIT:
+ *     mengeksekusi via EscrowDisbursementService.releaseFunds (idempoten —
+ *     menemukan baris PENDING lalu settle dengan klaim atomik SEC-106).
+ *
+ * Crash/deploy di antara commit dan eksekusi → baris PENDING tetap ada dan
+ * dijemput scheduler retryDue() (EscrowDisbursementService).
  *
  * Kunci idempotensi stabil: `CASHBACK:<orderDbId>` — satu cashback per order.
  * Tanpa rekening bank terverifikasi → HELD_NO_BANK (fail-closed, tidak hangus;
@@ -149,8 +155,9 @@ export async function planDanaCashback(
   tx: Prisma.TransactionClient,
   params: CashbackCreditParams,
 ): Promise<DanaCashbackIntent | null> {
+  const key = danaCashbackKey(params.orderDbId);
   const existing = await tx.escrowDisbursement.findUnique({
-    where: { idempotencyKey: danaCashbackKey(params.orderDbId) },
+    where: { idempotencyKey: key },
     select: { id: true },
   });
   if (existing) return null;
@@ -169,6 +176,22 @@ export async function planDanaCashback(
   });
   const amount = usage?.discountApplied ?? BigInt(0);
   if (!usage || amount <= BigInt(0)) return null;
+
+  // SYS-B-205: baris durable PENDING dibuat DI DALAM tx completion pemanggil
+  // (pola milestones.service.ts:1153-1167) — bukan oleh langkah post-commit.
+  // executeDanaCashback() post-commit menemukan baris ini dan mengeksekusinya
+  // via releaseFunds() (idempoten + klaim atomik SEC-106).
+  await tx.escrowDisbursement.create({
+    data: {
+      idempotencyKey: key,
+      scope: EscrowDisbursementScope.CASHBACK,
+      scopeRefId: usage.id,
+      orderId: params.orderDbId,
+      sellerId: usage.userId, // penerima payout (kolom sellerId = penerima)
+      amountSen: amount,
+      status: EscrowDisbursementStatus.PENDING,
+    },
+  });
 
   return {
     userId: usage.userId,

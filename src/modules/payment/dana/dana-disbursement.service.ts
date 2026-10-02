@@ -11,6 +11,7 @@ import {
   DanaTransferToDanaParams,
 } from './dana.types';
 import { buildDanaHeaders, jakartaTimestamp, signSnapRequest } from './dana-snap.util';
+import { sanitizeProviderError } from '../../../common/utils/sanitize-provider-error';
 import { mapDanaTxStatus, parseDanaAmount, toDanaAmount } from './dana-payment.service';
 
 /**
@@ -102,10 +103,16 @@ export class DanaDisbursementService {
     } catch (e) {
       const err = e as AxiosError<{ responseMessage?: string }>;
       const detail = err.response?.data?.responseMessage ?? err.message;
-      this.logger.error(`DANA Disbursement POST ${resourcePath} gagal: ${detail}`);
+      // SYS-B-503: detail mentah provider (kerap meng-echo nomor rekening
+      // beneficiary) hanya ke log internal teredaksi; yang dilempar ke
+      // pemanggil hanya kode generik (pola SEC-204).
+      const sanitized = sanitizeProviderError(detail);
+      this.logger.error(
+        `DANA Disbursement POST ${resourcePath} gagal [${sanitized.code}]: ${sanitized.detailForLog}`,
+      );
       throw new ServiceUnavailableException({
         code: 'DANA_API_ERROR',
-        message: `DANA API error: ${detail}`,
+        message: `DANA API error: ${sanitized.code}`,
       });
     }
   }
@@ -128,9 +135,15 @@ export class DanaDisbursementService {
     })) as Record<string, any>;
     const responseCode = String(res.responseCode ?? '');
     if (!responseCode.startsWith('200') && !responseCode.startsWith('202')) {
+      // SYS-B-503: responseMessage mentah provider tidak di-interpolasi ke
+      // pesan error (bisa meng-echo PII) — hanya kode generik + responseCode.
+      const providerErr = sanitizeProviderError(res.responseMessage ?? '');
+      this.logger.warn(
+        `DANA transfer bank ditolak provider [${providerErr.code}] responseCode=${responseCode}: ${providerErr.detailForLog}`,
+      );
       throw new ServiceUnavailableException({
         code: 'DANA_TRANSFER_BANK_FAILED',
-        message: `DANA transfer bank gagal: ${res.responseMessage ?? responseCode}`,
+        message: `DANA transfer bank gagal: ${providerErr.code} (responseCode ${responseCode})`,
       });
     }
     return {
@@ -172,9 +185,15 @@ export class DanaDisbursementService {
     })) as Record<string, any>;
     const responseCode = String(res.responseCode ?? '');
     if (!responseCode.startsWith('200') && !responseCode.startsWith('202')) {
+      // SYS-B-503: responseMessage mentah provider tidak di-interpolasi ke
+      // pesan error (bisa meng-echo PII) — hanya kode generik + responseCode.
+      const providerErr = sanitizeProviderError(res.responseMessage ?? '');
+      this.logger.warn(
+        `DANA transfer to DANA ditolak provider [${providerErr.code}] responseCode=${responseCode}: ${providerErr.detailForLog}`,
+      );
       throw new ServiceUnavailableException({
         code: 'DANA_TRANSFER_DANA_FAILED',
-        message: `DANA transfer to DANA gagal: ${res.responseMessage ?? responseCode}`,
+        message: `DANA transfer to DANA gagal: ${providerErr.code} (responseCode ${responseCode})`,
       });
     }
     return {
@@ -233,9 +252,15 @@ export class DanaDisbursementService {
     })) as Record<string, any>;
     const responseCode = String(res.responseCode ?? '');
     if (!responseCode.startsWith('200') && !responseCode.startsWith('202')) {
+      // SYS-B-503: responseMessage mentah provider tidak di-interpolasi ke
+      // pesan error (bisa meng-echo PII) — hanya kode generik + responseCode.
+      const providerErr = sanitizeProviderError(res.responseMessage ?? '');
+      this.logger.warn(
+        `DANA topup balance ditolak provider [${providerErr.code}] responseCode=${responseCode}: ${providerErr.detailForLog}`,
+      );
       throw new ServiceUnavailableException({
         code: 'DANA_TOPUP_BALANCE_FAILED',
-        message: `DANA topup balance gagal: ${res.responseMessage ?? responseCode}`,
+        message: `DANA topup balance gagal: ${providerErr.code} (responseCode ${responseCode})`,
       });
     }
     return {

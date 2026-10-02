@@ -4,6 +4,8 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { bcryptCompare } from '../../../common/utils/crypto.util';
 import { OrderStatus, AuditAction, Prisma, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType, DisputeStatus, PaymentProvider } from '@prisma/client';
 import { getCategoryForType } from '../../notifications/notification-category.map';
+// SYS-C-105: copy notifikasi mengikuti bahasa preferensi penerima.
+import { renderNotificationCopy, resolveNotificationLanguage } from '../../notifications/notification-copy.service';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
@@ -18,7 +20,7 @@ import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
 import { AdminOrderQueryDto, ForceActionDto, ForceActionWithReauthDto } from './dto/admin-order-query.dto';
-import { toIdr } from '../../../common/utils/currency.util';
+import { toIdr, formatSen } from '../../../common/utils/currency.util';
 import { decryptPiiSafe } from '../../../common/utils/pii.util';
 import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
@@ -684,22 +686,28 @@ export class AdminOrdersService {
     });
 
     const recipients = [
-      { userId: order.buyerId, title: 'Order Completed by Admin', body: `Order "${order.title}" has been completed by the Kahade team.` },
-      { userId: order.sellerId, title: 'Funds Released by Admin', body: `Order "${order.title}" has been completed and funds have been released to your wallet.` },
+      { userId: order.buyerId, role: 'buyer' as const },
+      { userId: order.sellerId, role: 'seller' as const },
     ];
     for (const recipient of recipients) {
+      // SYS-C-105: copy mengikuti bahasa preferensi masing-masing penerima.
+      const copy = renderNotificationCopy(
+        NotificationType.ORDER_COMPLETED,
+        await resolveNotificationLanguage(this.prisma, recipient.userId),
+        { orderTitle: order.title, amount: formatSen(order.sellerReceiveAmount) },
+      );
       this.prisma.notification.create({
         data: {
           notifId: generateNotifId(),
           userId: recipient.userId,
           type: NotificationType.ORDER_COMPLETED,
           category: getCategoryForType(NotificationType.ORDER_COMPLETED),
-          title: recipient.title,
-          body: recipient.body,
+          title: copy.title,
+          body: copy.body,
           isRead: false,
         },
       }).catch((err: unknown) => this.logger.warn(`silent-catch: admin force-complete notification failed: ${err instanceof Error ? err.message : String(err)}`));
-      this.prisma.emitNotificationCreated({ userId: recipient.userId, title: recipient.title, body: recipient.body, data: { type: 'ORDER_COMPLETED', orderId: order.orderId } });
+      this.prisma.emitNotificationCreated({ userId: recipient.userId, title: copy.title, body: copy.body, data: { type: 'ORDER_COMPLETED', orderId: order.orderId } });
     }
 
     this.logger.log(`Admin ${adminId} force-completed order ${order.orderId}`);
@@ -711,15 +719,21 @@ export class AdminOrdersService {
       try {
         const danaRes = await executeDanaCashback(this.disbursement, forceCompleteDana.params, forceCompleteDana.intent);
         if (danaRes.outcome === 'RELEASED') {
-          const cashbackIdr = toIdr(forceCompleteDana.intent.amountSen).toLocaleString('id-ID');
+          const cashbackIdr = formatSen(forceCompleteDana.intent.amountSen);
+          // SYS-C-105: copy mengikuti bahasa preferensi penerima.
+          const danaCashbackCopy = renderNotificationCopy(
+            NotificationType.CAMPAIGN_CASHBACK_CREDITED,
+            await resolveNotificationLanguage(this.prisma, forceCompleteDana.intent.userId),
+            { amount: cashbackIdr, orderTitle: order.title },
+          );
           await this.prisma.notification.create({
             data: {
               notifId: generateNotifId(),
               userId: forceCompleteDana.intent.userId,
               type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
               category: getCategoryForType(NotificationType.CAMPAIGN_CASHBACK_CREDITED),
-              title: 'Cashback Terkirim',
-              body: `Cashback Rp ${cashbackIdr} dari order "${order.title}" telah dikirim ke rekening bank Anda.`,
+              title: danaCashbackCopy.title,
+              body: danaCashbackCopy.body,
               isRead: false,
             },
           }).catch((err: unknown) => this.logger.warn(`silent-catch: admin force-complete DANA cashback notification failed: ${err instanceof Error ? err.message : String(err)}`));
@@ -732,15 +746,21 @@ export class AdminOrdersService {
 
     // Batch 1-money (EO-005): beritahu penerima bila cashback dikredit.
     if (forceCompleteCashbackResult?.credited && forceCompleteCashbackResult.userId) {
-      const cashbackIdr = toIdr(forceCompleteCashbackResult.amount).toLocaleString('id-ID');
+      const cashbackIdr = formatSen(forceCompleteCashbackResult.amount);
+      // SYS-C-105: copy mengikuti bahasa preferensi penerima.
+      const walletCashbackCopy = renderNotificationCopy(
+        NotificationType.CAMPAIGN_CASHBACK_CREDITED,
+        await resolveNotificationLanguage(this.prisma, forceCompleteCashbackResult.userId),
+        { amount: cashbackIdr, orderTitle: order.title },
+      );
       this.prisma.notification.create({
         data: {
           notifId: generateNotifId(),
           userId: forceCompleteCashbackResult.userId,
           type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
           category: getCategoryForType(NotificationType.CAMPAIGN_CASHBACK_CREDITED),
-          title: 'Cashback Credited',
-          body: `Cashback Rp ${cashbackIdr} from order "${order.title}" has been credited to your wallet.`,
+          title: walletCashbackCopy.title,
+          body: walletCashbackCopy.body,
           isRead: false,
         },
       }).catch((err: unknown) => this.logger.warn(`silent-catch: admin force-complete cashback notification failed: ${err instanceof Error ? err.message : String(err)}`));

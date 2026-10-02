@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { EscrowDisbursementScope, PaymentProvider, PaymentPurpose, PaymentStatus } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { sanitizeProviderError } from '../../common/utils/sanitize-provider-error';
 import { DanaDirectRefundService } from './dana-direct-refund.service';
 import { EscrowDisbursementService, ReleaseResult } from './escrow-disbursement.service';
 
@@ -177,11 +178,16 @@ export class DisputeDanaSettlementService {
       });
       return result;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      // SYS-B-503: lastError hanya kode generik (pola SEC-204); pesan mentah
+      // (bisa mengandung PII provider) hanya ke log internal teredaksi.
+      const sanitized = sanitizeProviderError(err);
+      this.logger.error(
+        `Dispute settlement intent ${input.disputeId} FAILED [${sanitized.code}]: ${sanitized.detailForLog}`,
+      );
       await this.prisma.disputeSettlementIntent
         .update({
           where: { disputeId: input.disputeId },
-          data: { status: 'FAILED', lastError: msg.slice(0, 2000) },
+          data: { status: 'FAILED', lastError: sanitized.code },
         })
         .catch((markError: unknown) =>
           this.logger.error(

@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { createHmac, timingSafeEqual } from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CreateReceiptTokenDto, ReceiptKind } from './dto/create-receipt-token.dto';
+import { formatSen } from '../../common/utils/currency.util';
 
 /**
  * Data struk yang dikembalikan ke publik — SENGAJA tanpa PII.
@@ -67,8 +68,8 @@ function escapeHtml(value: string): string {
 
 function formatRupiah(sen: string): string {
   try {
-    const rupiah = BigInt(sen) / 100n;
-    return 'Rp ' + rupiah.toLocaleString('id-ID');
+    // SYS-C-101/102/104: helper kanonis — "Rp100.000", pecahan 2 desimal, negatif "-RpX".
+    return formatSen(BigInt(sen));
   } catch {
     return 'Rp -';
   }

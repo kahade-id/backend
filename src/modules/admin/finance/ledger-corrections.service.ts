@@ -39,7 +39,7 @@ import {
   WalletTransactionStatus,
   WalletTransactionType,
 } from '@prisma/client';
-import { toSen } from '../../../common/utils/currency.util';
+import { toSen, formatIdr } from '../../../common/utils/currency.util';
 import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
 import { getCategoryForType } from '../../notifications/notification-category.map';
@@ -225,7 +225,7 @@ export class LedgerCorrectionService {
     if (amountIdr > MAX_LEDGER_CORRECTION_IDR) {
       throw new UnprocessableEntityException({
         code: 'CORRECTION_AMOUNT_EXCEEDS_LIMIT',
-        message: `Nominal koreksi maksimal Rp${MAX_LEDGER_CORRECTION_IDR.toLocaleString('id-ID')} per koreksi`,
+        message: `Nominal koreksi maksimal ${formatIdr(MAX_LEDGER_CORRECTION_IDR)} per koreksi`,
       });
     }
   }
@@ -365,7 +365,7 @@ export class LedgerCorrectionService {
         action: AuditAction.MANUAL_LEDGER_CORRECTION,
         targetType: TARGET_REQUEST,
         targetId: requestId,
-        description: `Ledger correction requested (${dto.type} Rp${dto.amountIdr.toLocaleString('id-ID')}) for user ${internalUserId} (input: ${dto.userId}) — ticket ${dto.ticketRef}. Menunggu approval admin kedua.`,
+        description: `Ledger correction requested (${dto.type} ${formatIdr(dto.amountIdr)}) for user ${internalUserId} (input: ${dto.userId}) — ticket ${dto.ticketRef}. Menunggu approval admin kedua.`,
         after: payload as unknown as Prisma.InputJsonValue,
         ipAddress,
       },
@@ -530,8 +530,8 @@ export class LedgerCorrectionService {
           category: getCategoryForType(notifType),
           title: isCredit ? 'Koreksi Saldo oleh Admin' : 'Koreksi Saldo oleh Admin',
           body: isCredit
-            ? `Saldo Anda dikoreksi +Rp${req.amountIdr.toLocaleString('id-ID')} oleh tim keuangan Kahade (tiket ${req.ticketRef}).`
-            : `Saldo Anda dikoreksi -Rp${req.amountIdr.toLocaleString('id-ID')} oleh tim keuangan Kahade (tiket ${req.ticketRef}).`,
+            ? `Saldo Anda dikoreksi +${formatIdr(req.amountIdr)} oleh tim keuangan Kahade (tiket ${req.ticketRef}).`
+            : `Saldo Anda dikoreksi -${formatIdr(req.amountIdr)} oleh tim keuangan Kahade (tiket ${req.ticketRef}).`,
           isRead: false,
         },
       });
@@ -544,7 +544,7 @@ export class LedgerCorrectionService {
           targetId: requestId,
           description:
             `Ledger correction ${requestId} APPROVED by admin ${approverId} ` +
-            `(requested by ${req.requestedBy}): ${req.type} Rp${req.amountIdr.toLocaleString('id-ID')} → tx ${txId}`,
+            `(requested by ${req.requestedBy}): ${req.type} ${formatIdr(req.amountIdr)} → tx ${txId}`,
           after: {
             status: 'APPROVED',
             decidedBy: approverId,
@@ -559,7 +559,7 @@ export class LedgerCorrectionService {
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
     this.logger.log(
-      `Ledger correction ${requestId} executed: ${req.type} Rp${req.amountIdr.toLocaleString('id-ID')} ` +
+      `Ledger correction ${requestId} executed: ${req.type} ${formatIdr(req.amountIdr)} ` +
       `for user ${req.userId} (tx ${txId}), requested by ${req.requestedBy}, approved by ${approverId}`,
     );
 

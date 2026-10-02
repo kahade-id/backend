@@ -129,8 +129,38 @@ export class DanaWebhookSettlementService {
   private webhookPublicKey(): string {
     const fromEnv = this.config.get<string>('dana.publicKey') ?? '';
     if (fromEnv.trim()) return fromEnv;
+    // SYS-B-406: kunci publik sandbox DANA BERSIFAT PUBLIK (disalin dari SDK
+    // resmi dana-python) — HANYA boleh dipakai bila dana.env === 'sandbox'.
+    // Di luar sandbox, kunci yang hilang = config error → JANGAN verifikasi
+    // (fail-closed). Boot sudah fail-fast via env.validation.ts +
+    // dana.config.ts; ini pertahanan lapis kedua bila config dibangun manual.
+    if (this.config.get<string>('dana.env') !== 'sandbox') {
+      throw new ServiceUnavailableException({
+        code: 'DANA_WEBHOOK_KEY_UNCONFIGURED',
+        message: 'DANA_PUBLIC_KEY belum di-set untuk env non-sandbox — verifikasi webhook ditolak',
+      });
+    }
     // Sandbox: kunci publik bawaan SDK resmi DANA.
     return DANA_SANDBOX_WEBHOOK_PUBLIC_KEY;
+  }
+
+  /**
+   * SYS-B-204: ikat finish-notify ke merchant kita (pola sama dengan
+   * `validateNotifyHeaders` di webhook disbursement). Fail-closed: bila
+   * dana.merchantId belum dikonfigurasi atau tidak cocok dengan merchantId
+   * di body notify → 403.
+   */
+  private assertMerchantBinding(notifyMerchantId: string): void {
+    const expected = (this.config.get<string>('dana.merchantId') ?? '').trim();
+    if (!expected || notifyMerchantId !== expected) {
+      this.logger.warn(
+        `DANA webhook: merchant binding tidak valid (notify merchantId="${notifyMerchantId}") — ditolak`,
+      );
+      throw new ForbiddenException({
+        code: 'WEBHOOK_MERCHANT_ID_MISMATCH',
+        message: 'DANA webhook merchantId mismatch',
+      });
+    }
   }
 
   /** Parse payload FinishNotify → null bila field kunci hilang. */
@@ -266,6 +296,14 @@ export class DanaWebhookSettlementService {
       );
       return;
     }
+    // SYS-B-204: validasi merchant binding — notify harus ditujukan untuk
+    // merchant kita (pola sama dengan webhook disbursement). merchantId dari
+    // body SUDAH terverifikasi signature di handleFinishNotify, jadi aman
+    // dibandingkan dengan config. Ditempatkan SETELAH lookup payment (bukan
+    // di awal handler) agar notify uji mandatory portal DANA — yang memakai
+    // partnerReferenceNo tak dikenal — tetap di-ack 2005600 tanpa settlement,
+    // seperti sebelumnya.
+    this.assertMerchantBinding(notify.merchantId);
     if (pt.status === PaymentStatus.SUCCESS) {
       this.logger.log(`DANA webhook: paymentTransaction ${pt.id} sudah SUCCESS — idempoten skip`);
       return;
@@ -286,6 +324,22 @@ export class DanaWebhookSettlementService {
         });
         this.logger.log(
           `DANA webhook: paymentTransaction ${pt.id} → EXPIRED (notify ${notify.latestTransactionStatus})`,
+        );
+      } else if (
+        // SYS-B-202: status final-gagal DANA ('04'/'06'/'07') HARUS dipersist —
+        // payment yang gagal di DANA tidak boleh macet PENDING (buyer stuck
+        // tak bisa bayar ulang; FE polling "menunggu" untuk charge yang sudah
+        // mati). Guard PENDING → FAILED (fail-closed), pola sama seperti
+        // EXPIRED di atas.
+        ['04', '06', '07'].includes(notify.latestTransactionStatus) &&
+        pt.status === PaymentStatus.PENDING
+      ) {
+        await this.prisma.paymentTransaction.update({
+          where: { id: pt.id },
+          data: { status: PaymentStatus.FAILED, failedAt: new Date() },
+        });
+        this.logger.log(
+          `DANA webhook: paymentTransaction ${pt.id} → FAILED (notify ${notify.latestTransactionStatus} ${notify.transactionStatusDesc})`,
         );
       } else {
         this.logger.log(
@@ -381,6 +435,11 @@ export class DanaWebhookSettlementService {
       } else {
         await this.walletService.handleTopupSuccess(pt.midtransOrderId, grossAmount);
       }
+      // SYS-B-201: cabang TOPUP selesai di sini — JANGAN jatuh ke tail
+      // update SUCCESS generik di bawah. refundTopupToSource menandai
+      // REFUNDED (dan handleTopupSuccess menandai SUCCESS sendiri);
+      // tail update akan menimpa REFUNDED → SUCCESS tanpa guard.
+      return;
     } else if (pt.purpose === PaymentPurpose.ORDER_ESCROW) {
       // MFE-021: baris escrow DANA TANPA danaPayKind = baris ambigu —
       // JANGAN jatuh ke jalur wallet/QRIS lama (mode BI-safe: wallet tidak
@@ -423,8 +482,17 @@ export class DanaWebhookSettlementService {
   /**
    * Fail-closed untuk top-up DANA in-flight saat wallet nonaktif: kembalikan
    * dana ke metode bayar asal via DANA Refund API (bukan ke wallet).
-   * Idempoten via partnerRefundNo stabil; gagal → lempar agar webhookLog
-   * mencatat (tidak retry tanpa henti, admin rekonsiliasi manual).
+   *
+   * SYS-B-103: memakai primitif kanonis `DanaDirectRefundService.refundAmount`
+   * (bukan `refundOrder` mentah) — baris `DanaRefundAttempt` durable dibuat
+   * SEBELUM call DANA + `refundedAmount` di-increment kondisional, sehingga
+   * crash antara call DANA dan update DB tetap terlacak (sweep mengambil
+   * alih via baris attempt) dan invariant `REFUNDED ⇒ refundedAmount > 0`
+   * terjaga. Idempotency key stabil per payment: retry webhook yang sama
+   * tidak membuat refund kedua.
+   *
+   * Gagal / tidak eligible → lempar agar webhookLog mencatat (tidak retry
+   * tanpa henti, admin rekonsiliasi manual).
    */
   private async refundTopupToSource(pt: {
     id: string;
@@ -440,24 +508,22 @@ export class DanaWebhookSettlementService {
         message: 'Topup DANA tanpa referensi — butuh review manual',
       });
     }
-    const partnerRefundNo = `RFD-${pt.id}-nowallet-topup`;
     try {
-      await this.danaPaymentService.refundOrder({
-        partnerReferenceNo: pt.danaPartnerReferenceNo,
-        partnerRefundNo,
-        amountIdr: Math.round(Number(pt.grossAmount) / 100),
-        reason: 'Wallet disabled (BI-safe mode) — topup refunded to source',
+      const outcome = await this.danaDirectRefundService.refundAmount({
+        paymentDbId: pt.id,
+        amountSen: null, // penuh (sisa yang belum di-refund)
+        reason: 'Wallet nonaktif (mode BI-safe) — topup dikembalikan ke metode bayar asal',
+        idempotencyKey: `TOPUP:${pt.id}:NOWALLET`,
       });
-      await this.prisma.paymentTransaction.update({
-        where: { id: pt.id },
-        data: {
-          status: PaymentStatus.REFUNDED,
-          refundReference: partnerRefundNo,
-          refundRequestedAt: new Date(),
-          refundReason: 'Wallet nonaktif (mode BI-safe) — topup dikembalikan ke metode bayar asal',
-        },
-      });
-      this.logger.log(`DANA webhook: topup ${pt.id} di-refund ke sumber (wallet nonaktif)`);
+      if (!outcome.refunded) {
+        throw new ServiceUnavailableException({
+          code: 'DANA_TOPUP_REFUND_NOT_ELIGIBLE',
+          message: `Refund topup tidak eligible (${outcome.reason}) — butuh review manual`,
+        });
+      }
+      this.logger.log(
+        `DANA webhook: topup ${pt.id} di-refund ke sumber (wallet nonaktif, already=${outcome.already})`,
+      );
     } catch (e) {
       this.logger.error(
         `DANA webhook: refund topup ${pt.id} gagal — butuh review manual: ${

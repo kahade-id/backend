@@ -12,6 +12,8 @@ import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
 import { Request } from 'express';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
+import { StepUpGuard } from '../../../common/guards/step-up.guard';
+import { RequireStepUp } from '../../../common/decorators/require-step-up.decorator';
 
 @ApiTags('admin-subscriptions')
 @ApiBearerAuth('access-token')
@@ -30,8 +32,10 @@ export class AdminSubscriptionsController {
   }
 
   @Post('grant')
-  @UseGuards(UserThrottleGuard)
-  @ApiOperation({ summary: 'Grant a subscription manually (ACTIVE, tanpa pembayaran)' })
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SYS-B-402: grant = pemberian nilai uang (langganan gratis).
+  @RequireStepUp('subscription.grant')
+  @ApiOperation({ summary: 'Grant a subscription manually (ACTIVE, tanpa pembayaran)', description: 'SYS-B-402: requires X-Step-Up-Token (action subscription.grant). Nilai di atas Rp1.000.000 wajib dual control (actionType MONEY_VALUE_GRANT).' })
   @ApiResponse({ status: 201, description: 'Subscription granted.' })
   grantSubscription(
     @Body() dto: GrantSubscriptionDto,
@@ -52,7 +56,10 @@ export class AdminSubscriptionsController {
   // ---------- Kode promo gratis (keputusan produk 2026-09-26) ----------
 
   @Post('promo-codes')
-  @ApiOperation({ summary: 'Buat kode promo langganan gratis (durasi & batas pakai diatur admin)' })
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SYS-B-402: kode promo = penciptaan liabilitas (durasi gratis × batas pakai).
+  @RequireStepUp('subscription.promoCode.create')
+  @ApiOperation({ summary: 'Buat kode promo langganan gratis (durasi & batas pakai diatur admin)', description: 'SYS-B-402: requires X-Step-Up-Token (action subscription.promoCode.create). Nilai di atas Rp1.000.000 wajib dual control (actionType MONEY_VALUE_GRANT).' })
   @ApiResponse({ status: 201, description: 'Promo code created.' })
   createPromoCode(
     @Body() dto: CreatePromoCodeDto,
@@ -80,7 +87,10 @@ export class AdminSubscriptionsController {
   }
 
   @Post('promo-codes/:id/disable')
-  @ApiOperation({ summary: 'Nonaktifkan kode promo' })
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SYS-B-402: menonaktifkan kode promo mengubah liabilitas aktif.
+  @RequireStepUp('subscription.promoCode.toggle', 'id')
+  @ApiOperation({ summary: 'Nonaktifkan kode promo', description: 'SYS-B-402: requires X-Step-Up-Token (action subscription.promoCode.toggle).' })
   disablePromoCode(
     @Param('id', ParseIdPipe) id: string,
     @CurrentAdmin('sub') adminId: string,
@@ -90,7 +100,10 @@ export class AdminSubscriptionsController {
   }
 
   @Post('promo-codes/:id/enable')
-  @ApiOperation({ summary: 'Aktifkan kembali kode promo' })
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SYS-B-402: mengaktifkan kembali kode promo menghidupkan liabilitas.
+  @RequireStepUp('subscription.promoCode.toggle', 'id')
+  @ApiOperation({ summary: 'Aktifkan kembali kode promo', description: 'SYS-B-402: requires X-Step-Up-Token (action subscription.promoCode.toggle).' })
   enablePromoCode(
     @Param('id', ParseIdPipe) id: string,
     @CurrentAdmin('sub') adminId: string,

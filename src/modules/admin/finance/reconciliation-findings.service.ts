@@ -9,7 +9,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { RedisService } from '../../../redis/redis.service';
 import { AuditAction, ReconciliationFindingStatus, Prisma } from '@prisma/client';
-import { toIdr, toSen } from '../../../common/utils/currency.util';
+import { toIdr, toSen, formatIdr } from '../../../common/utils/currency.util';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import {
   FindingsQueryDto,
@@ -178,7 +178,7 @@ export class ReconciliationFindingsService {
         targetType: 'ReconciliationFinding',
         targetId: row.id,
         description:
-          `Reconciliation finding for user ${p.userId}: difference Rp${p.discrepancy.toLocaleString('id-ID')}` +
+          `Reconciliation finding for user ${p.userId}: difference ${formatIdr(p.discrepancy)}` +
           (p.urgent ? ' [URGENT]' : ''),
         after: {
           userId: p.userId,

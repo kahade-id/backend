@@ -8,8 +8,9 @@ import {
 
 /**
  * M4 — cashback tanpa wallet internal:
- * - planDanaCashback: read-only di dalam tx; guard idempotensi via
- *   escrowDisbursement `CASHBACK:<orderDbId>`; TIDAK menyentuh wallet.
+ * - planDanaCashback: DI DALAM tx — guard idempotensi via escrowDisbursement
+ *   `CASHBACK:<orderDbId>`, lalu BUAT baris PENDING durable (SYS-B-205, pola
+ *   SEC-104); TIDAK menyentuh wallet.
  * - executeDanaCashback: payout post-commit via releaseFunds scope CASHBACK.
  */
 describe('cashback DANA (M4 no-wallet)', () => {
@@ -20,6 +21,7 @@ describe('cashback DANA (M4 no-wallet)', () => {
     return {
       escrowDisbursement: {
         findUnique: jest.fn(async () => (opts.existingDisbursement ? { id: 'ed-1' } : null)),
+        create: jest.fn(async (args: unknown) => ({ id: 'ed-new', ...(args as object) })),
       },
       voucherUsage: {
         findFirst: jest.fn(async () =>
@@ -33,7 +35,7 @@ describe('cashback DANA (M4 no-wallet)', () => {
     };
   }
 
-  it('plan: eligible + belum ada disbursement → intent (wallet tak tersentuh)', async () => {
+  it('plan: eligible + belum ada disbursement → intent + baris PENDING durable (wallet tak tersentuh)', async () => {
     const tx = buildTx();
     const intent = await planDanaCashback(tx as never, params);
 
@@ -41,6 +43,18 @@ describe('cashback DANA (M4 no-wallet)', () => {
     expect(tx.escrowDisbursement.findUnique).toHaveBeenCalledWith({
       where: { idempotencyKey: 'CASHBACK:order-db-1' },
       select: { id: true },
+    });
+    // SYS-B-205: baris PENDING dibuat di dalam tx (durable sebelum commit).
+    expect(tx.escrowDisbursement.create).toHaveBeenCalledWith({
+      data: {
+        idempotencyKey: 'CASHBACK:order-db-1',
+        scope: EscrowDisbursementScope.CASHBACK,
+        scopeRefId: 'vu-1',
+        orderId: 'order-db-1',
+        sellerId: 'buyer-1',
+        amountSen: BigInt(1_000_000),
+        status: 'PENDING',
+      },
     });
     expect(tx.wallet.findUnique).not.toHaveBeenCalled();
     expect(tx.wallet.updateMany).not.toHaveBeenCalled();
@@ -51,11 +65,13 @@ describe('cashback DANA (M4 no-wallet)', () => {
     const tx = buildTx({ existingDisbursement: true });
     expect(await planDanaCashback(tx as never, params)).toBeNull();
     expect(tx.voucherUsage.findFirst).not.toHaveBeenCalled();
+    expect(tx.escrowDisbursement.create).not.toHaveBeenCalled();
   });
 
-  it('plan: tanpa voucherUsage cashback → null', async () => {
+  it('plan: tanpa voucherUsage cashback → null (tanpa baris PENDING)', async () => {
     const tx = buildTx({ usage: false });
     expect(await planDanaCashback(tx as never, params)).toBeNull();
+    expect(tx.escrowDisbursement.create).not.toHaveBeenCalled();
   });
 
   it('execute: memanggil releaseFunds dengan key stabil scope CASHBACK', async () => {

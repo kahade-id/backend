@@ -11,6 +11,7 @@ import { rollbackOrderVoucherUsage } from '../../../common/utils/voucher-rollbac
 // GAP-D (G256): pelepasan reservasi stok saat order kedaluwarsa — @Optional(),
 // best-effort, no-op untuk order tanpa order lines katalog.
 import { InventoryService } from '../../inventory/inventory.service';
+import { DanaPaymentService } from '../../payment/dana/dana-payment.service';
 
 @Injectable()
 export class ExpireUnpaidOrdersService {
@@ -19,6 +20,11 @@ export class ExpireUnpaidOrdersService {
   constructor(
     private prisma: PrismaService,
     private redis: RedisService,
+    // SYS-B-305c: batalkan order DANA yang belum dibayar + tandai payment
+    // EXPIRED. Inject langsung (bukan @Optional) — PaymentModule me-re-export
+    // DanaModule; bila wiring salah, lebih baik gagal saat startup daripada
+    // diam-diam melewatkan pembatalan provider.
+    private danaPayment: DanaPaymentService,
     @Optional() private inventoryService?: InventoryService,
   ) {}
 
@@ -31,6 +37,57 @@ export class ExpireUnpaidOrdersService {
     } catch (error: unknown) {
       this.logger.warn(
         `${label} realtime notification failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * SYS-B-305c: untuk order yang baru kedaluwarsa, batalkan payment DANA
+   * yang masih PENDING ke provider dan tandai EXPIRED di DB.
+   *
+   * Fail-closed: cancelOrder DANA yang gagal TIDAK menggagalkan expiry
+   * order — payment dibiarkan PENDING dan dipulihkan cron
+   * dana-payment-reconcile (getPaymentDetail → EXPIRED, atau bila ternyata
+   * sudah dibayar → NEEDS_MANUAL_REFUND karena order sudah CANCELLED).
+   */
+  private async cancelDanaPaymentsForOrder(orderDbId: string, orderPublicId: string): Promise<void> {
+    try {
+      const pendings = await this.prisma.paymentTransaction.findMany({
+        where: {
+          orderId: orderDbId,
+          provider: 'DANA',
+          status: 'PENDING',
+          danaPartnerReferenceNo: { not: null },
+        },
+        select: { id: true, danaPartnerReferenceNo: true },
+        take: 10,
+      });
+      for (const p of pendings) {
+        const refNo = p.danaPartnerReferenceNo as string;
+        try {
+          await this.danaPayment.cancelOrder(refNo, `Order ${orderPublicId} expired unpaid`);
+        } catch (cancelError: unknown) {
+          // Jangan tandai EXPIRED bila cancel ke DANA gagal — status sisi
+          // DANA belum pasti; reconcile cron yang memastikan.
+          this.logger.warn(
+            `expire-unpaid-orders: cancelOrder DANA gagal payment=${p.id} ref=${refNo} — ` +
+              `dibiarkan PENDING untuk dana-payment-reconcile: ` +
+              `${cancelError instanceof Error ? cancelError.message : String(cancelError)}`,
+          );
+          continue;
+        }
+        const marked = await this.prisma.paymentTransaction.updateMany({
+          where: { id: p.id, status: 'PENDING' },
+          data: { status: 'EXPIRED', failedAt: new Date() },
+        });
+        if (marked.count > 0) {
+          this.logger.log(`expire-unpaid-orders: payment ${p.id} dibatalkan ke DANA → EXPIRED`);
+        }
+      }
+    } catch (error: unknown) {
+      this.logger.warn(
+        `silent-catch: cancelDanaPaymentsForOrder gagal order=${orderPublicId}: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }
@@ -148,6 +205,15 @@ export class ExpireUnpaidOrdersService {
               const inventory = this.inventoryService;
               await inventory.safeReleaseForOrder(order.id, 'ORDER_EXPIRED:TIMEOUT_PAYMENT');
             }
+
+            // SYS-B-305c: batalkan ke DANA + tandai payment EXPIRED.
+            // Sebelumnya order mati tetapi paymentTransaction tetap PENDING
+            // selamanya (dana bisa mengendap di merchant tanpa pemilik jelas).
+            // Best-effort post-commit: cancelOrder gagal → payment dibiarkan
+            // PENDING dan cron dana-payment-reconcile akan menandai EXPIRED
+            // via getPaymentDetail (atau settle bila ternyata sudah dibayar —
+            // lalu NEEDS_MANUAL_REFUND karena order sudah CANCELLED).
+            await this.cancelDanaPaymentsForOrder(order.id, order.orderId);
 
             this.prisma.notification
               .create({

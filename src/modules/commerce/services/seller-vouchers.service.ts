@@ -2,7 +2,7 @@ import { Injectable, NotFoundException, BadRequestException, ConflictException }
 import { PrismaService } from '../../../prisma/prisma.service';
 import { Prisma, VoucherType } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
-import { toIdr, toSen } from '../../../common/utils/currency.util';
+import { toIdr, toSen, formatSen } from '../../../common/utils/currency.util';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { CreateSellerVoucherDto, ValidateSellerVoucherDto } from '../dto/commerce.dto';
 
@@ -233,7 +233,7 @@ export class SellerVouchersService {
     if (voucher.minOrderValue !== null && orderValueSen < voucher.minOrderValue) {
       throw new BadRequestException({
         code: ErrorCodes.VOUCHER_NOT_APPLICABLE,
-        message: `Minimal belanja Rp${toIdr(voucher.minOrderValue).toLocaleString('id-ID')}`,
+        message: `Minimal belanja ${formatSen(voucher.minOrderValue)}`,
       });
     }
     const usedByUser = await this.prisma.voucherUsage.count({ where: { voucherId: voucher.id, userId } });

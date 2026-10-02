@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, NotFoundException, Logger } from '@nestjs/common';
+import { Injectable, BadRequestException, ForbiddenException, NotFoundException, Logger, OnModuleInit } from '@nestjs/common';
 import { AuditAction, CampaignType, CampaignStatus, Prisma, Campaign, MembershipRank, VoucherType, VoucherApplicability, NotificationType } from '@prisma/client';
 import { createHash, randomBytes } from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -7,6 +7,9 @@ import { generateCampaignId } from '../../common/utils/id-generator.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { safeBigIntToNumber } from '../../common/utils/bigint.util';
 import { NotificationQueueService } from '../queue/notification-queue.service';
+// SYS-B-402: dual control untuk aktivasi campaign bernilai di atas ambang.
+import { ApprovalsService } from './approvals/approvals.service';
+import { DUAL_CONTROL_THRESHOLD_SEN } from './approvals/dual-control.constants';
 
 const MAX_CAMPAIGN_ID_RETRIES = 3;
 const CAMPAIGN_ISSUE_BATCH_SIZE = 100;
@@ -58,14 +61,32 @@ type CampaignMutationDto = {
 };
 
 @Injectable()
-export class CampaignService {
+export class CampaignService implements OnModuleInit {
   private readonly logger = new Logger(CampaignService.name);
 
   constructor(
     private prisma: PrismaService,
     private auditLog: AuditLogService,
     private notificationQueue: NotificationQueueService,
+    // SYS-B-402: modul ini mengeksekusi CAMPAIGN_ACTIVATE yang disetujui
+    // (ApprovalsModule @Global — tanpa import modul).
+    private readonly approvals: ApprovalsService,
   ) {}
+
+  onModuleInit(): void {
+    this.approvals.registerExecutor('CAMPAIGN_ACTIVATE', async (ctx) => {
+      if (!ctx.targetId) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'CAMPAIGN_ACTIVATE membutuhkan targetId (campaignId)',
+        });
+      }
+      const reason = typeof ctx.payload.reason === 'string' ? ctx.payload.reason : '';
+      // Jalur dual control: gate ambang dilewati (sudah dipenuhi saat propose
+      // + approve oleh dua admin berbeda).
+      return this.performActivateCampaign(ctx.targetId, ctx.decidedBy, { reason }, ctx.ipAddress);
+    });
+  }
 
   async createCampaign(adminId: string, dto: {
     name: string;
@@ -406,11 +427,41 @@ export class CampaignService {
    * - Idempoten di level service: campaign yang sudah ACTIVE tidak menerbitkan ulang.
    */
   async activateCampaign(campaignId: string, adminId: string, opts: { reason: string }, ipAddress: string = 'unknown'): Promise<object> {
+    // SYS-B-402: aktivasi = momen liabilitas finansial lahir. Nilai campaign
+    // (discountValue/maxDiscount, sen) di atas ambang → wajib dual control.
+    const campaign = await this.prisma.campaign.findUnique({ where: { campaignId } });
+    if (!campaign) throw new NotFoundException({ code: ErrorCodes.CAMPAIGN_NOT_FOUND, message: 'Campaign not found' });
+    const valueSen = [campaign.discountValue, campaign.maxDiscount]
+      .filter((v): v is bigint => v !== null && v !== undefined)
+      .reduce((m, v) => (v > m ? v : m), 0n);
+    if (valueSen > DUAL_CONTROL_THRESHOLD_SEN) {
+      throw new ForbiddenException({
+        code: ErrorCodes.DUAL_CONTROL_REQUIRED,
+        message:
+          'Nilai campaign di atas Rp1.000.000 wajib dual control ' +
+          '(usulkan via POST /v1/admin/approvals/propose dengan actionType CAMPAIGN_ACTIVATE)',
+      });
+    }
+    return this.performActivateCampaign(campaignId, adminId, opts, ipAddress, campaign);
+  }
+
+  /**
+   * Inti aktivasi campaign — dipakai activateCampaign (jalur langsung, setelah
+   * gate ambang) dan executor CAMPAIGN_ACTIVATE (jalur dual control; guard
+   * sudah dipenuhi saat propose + approve oleh dua admin berbeda).
+   */
+  private async performActivateCampaign(
+    campaignId: string,
+    adminId: string,
+    opts: { reason: string },
+    ipAddress: string = 'unknown',
+    preloaded?: Campaign,
+  ): Promise<object> {
     const reason = opts.reason?.trim() ?? '';
     if (reason.length < 5) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'reason wajib diisi (min 5 karakter)' });
     }
-    const campaign = await this.prisma.campaign.findUnique({ where: { campaignId } });
+    const campaign = preloaded ?? await this.prisma.campaign.findUnique({ where: { campaignId } });
     if (!campaign) throw new NotFoundException({ code: ErrorCodes.CAMPAIGN_NOT_FOUND, message: 'Campaign not found' });
 
     if (campaign.status === CampaignStatus.ACTIVE) {

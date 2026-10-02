@@ -312,10 +312,16 @@ export class DanaPaymentService {
         message: `DANA refund gagal: ${res.responseMessage ?? responseCode}`,
       });
     }
+    // SYS-B-203: baca status aktual dari respons DANA — JANGAN hardcode '00'.
+    // Bila respons tidak membawa status transaksi yang jelas, laporkan
+    // UNKNOWN agar caller tidak memfabrikasi SUCCESS (fail-closed).
+    const providerStatus = mapDanaTxStatus(
+      typeof res.latestTransactionStatus === 'string' ? res.latestTransactionStatus : null,
+    );
     return {
       partnerRefundNo: params.partnerRefundNo,
       referenceNo: String(res.refundNo ?? res.originalReferenceNo ?? ''),
-      status: mapDanaTxStatus('00'),
+      status: providerStatus,
     };
   }
 

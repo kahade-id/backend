@@ -37,33 +37,51 @@ export function toIdr(sen: bigint): number {
 }
 
 /**
- * Format IDR to currency string. Example: 100000 -> "Rp100.000"
+ * Format IDR to currency string. Example: 100000 -> "Rp100.000",
+ * 100000.5 -> "Rp100.000,50", -50000 -> "-Rp50.000".
  *
  * DBL-002 (audit integrasi 2026-10-01): kanonis "Rp100.000" TANPA SPASI,
  * selaras kontrak FE §13 (frontend `formatRupiah`, admin `formatIDR`).
  * Format manual — TIDAK memakai `Intl` currency style yang menghasilkan
  * "Rp 100.000" (dengan spasi).
  *
- * DBL-003: pecahan rupiah DIBULATKAN ke rupiah terdekat (Math.round),
- * mempertahankan perilaku lama (formatIdr(100000.5) -> "Rp100.001").
+ * SYS-C-101 (audit sistemik ronde 3, 2026-10-03): kebijakan pecahan
+ * kanonis lintas repo mengikuti BAI-052 (admin `formatIDR`) — pecahan
+ * sen DITAMPILKAN 2 desimal, BUKAN Math.round (DBL-003 dicabut).
+ * Bilangan bulat tetap tanpa desimal ("Rp100.000"); pecahan dibulatkan
+ * ke 2 desimal untuk kerapian tampil (Math.round(abs*100)/100, sama
+ * persis dengan algoritma admin `formatIDR`).
+ * SYS-C-104: tanda negatif kanonis "-RpX" (minus diekstrak sebelum "Rp").
  */
 export function formatIdr(amount: number): string {
-  const rounded = Math.round(amount);
-  const sign = rounded < 0 ? '-' : '';
-  const grouped = Math.abs(rounded)
-    .toString()
-    .replace(/\B(?=(\d{3})+(?!\d))/g, '.');
-  return `${sign}Rp${grouped}`;
+  if (typeof amount !== 'number' || !Number.isFinite(amount)) {
+    throw new RangeError(`formatIdr: input must be a finite number, got ${amount}`);
+  }
+  const sign = amount < 0 ? '-' : '';
+  const abs = Math.abs(amount);
+  if (Number.isInteger(abs)) {
+    return `${sign}Rp${abs.toLocaleString('id-ID')}`;
+  }
+  const rounded = Math.round(abs * 100) / 100;
+  return `${sign}Rp${rounded.toLocaleString('id-ID', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 /**
  * Format Sen (BigInt) directly to IDR currency string.
- * Example: 10000000n -> "Rp100.000"
- * DBL-004: sen bukan kelipatan 100 (mis. 1050n = Rp10,5) dibulatkan ke
- * rupiah terdekat via formatIdr (Math.round), selaras admin.
+ * Example: 10000000n -> "Rp100.000", 1050n -> "Rp10,50", -5000n -> "-Rp50".
+ *
+ * SYS-C-101: pecahan sen tampil 2 desimal (BAI-052), tanpa pembulatan
+ * diam-diam. String-based — eksak, tanpa kehilangan presisi float.
+ * SYS-C-104: tanda negatif kanonis "-RpX".
  */
 export function formatSen(sen: bigint): string {
-  return formatIdr(toIdr(sen));
+  const sign = sen < 0n ? '-' : '';
+  const abs = sen < 0n ? -sen : sen;
+  const whole = abs / 100n;
+  const frac = abs % 100n;
+  const grouped = whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+  if (frac === 0n) return `${sign}Rp${grouped}`;
+  return `${sign}Rp${grouped},${frac.toString().padStart(2, '0')}`;
 }
 
 /**

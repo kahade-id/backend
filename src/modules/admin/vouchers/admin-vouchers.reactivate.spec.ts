@@ -22,7 +22,7 @@ describe('AdminVouchersService.reactivateVoucher (ADM-218)', () => {
   const auditLog = { logAdminAction: jest.fn().mockResolvedValue(undefined) };
 
   const makeService = () =>
-    new AdminVouchersService(prisma as never, redis as never, auditLog as never);
+    new AdminVouchersService(prisma as never, redis as never, auditLog as never, { registerExecutor: jest.fn(), findPendingByActionTarget: jest.fn(), propose: jest.fn(), approve: jest.fn(), listPending: jest.fn() } as never);
 
   const makeVoucher = (overrides: Record<string, unknown> = {}) => ({
     id: 'v-internal-1',

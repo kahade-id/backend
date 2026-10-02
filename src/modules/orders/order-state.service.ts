@@ -11,10 +11,13 @@ import { OrderStatus, OrderCancelReason, ActorType, WalletTransactionType, Walle
 import { addDays, resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
 import { rollbackOrderVoucherUsage } from '../../common/utils/voucher-rollback.util';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
+import { formatSen } from '../../common/utils/currency.util';
+// SYS-C-105: copy notifikasi mengikuti bahasa preferensi penerima.
+import { renderNotificationCopy, resolveNotificationLanguage } from '../notifications/notification-copy.service';
 import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback, DanaCashbackIntent } from '../../common/utils/cashback-credit.util';
 import { EscrowDisbursementService } from '../no-wallet/escrow-disbursement.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
-import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
+import { DanaDirectRefundService, deriveDanaRefundNo } from '../no-wallet/dana-direct-refund.service';
 import { MilestonesService } from '../milestones/milestones.service';
 import { FeeCalculatorService } from './fee-calculator.service';
 import { NotificationQueueService } from '../queue/notification-queue.service';
@@ -219,9 +222,15 @@ export class OrderStateService {
     });
 
     this.runPostCommitBestEffort(async () => {
-      const order = await this.prisma.order.findUnique({ where: { orderId }, select: { sellerId: true, title: true } });
+      const order = await this.prisma.order.findUnique({ where: { orderId }, select: { sellerId: true, title: true, buyerPayAmount: true } });
       if (!order) return;
-      await this.notificationQueue.enqueue({ userId: order.sellerId, type: NotificationType.ORDER_PAYMENT_RECEIVED, title: 'Payment Received', body: `Payment for order "${order.title}" has been received. Please process the order.`, pushData: { type: 'ORDER_PAYMENT_RECEIVED', orderId } });
+      // SYS-C-105: copy mengikuti bahasa preferensi seller.
+      const payCopy = renderNotificationCopy(
+        NotificationType.ORDER_PAYMENT_RECEIVED,
+        await resolveNotificationLanguage(this.prisma, order.sellerId),
+        { amount: formatSen(order.buyerPayAmount), orderTitle: order.title },
+      );
+      await this.notificationQueue.enqueue({ userId: order.sellerId, type: NotificationType.ORDER_PAYMENT_RECEIVED, title: payCopy.title, body: payCopy.body, pushData: { type: 'ORDER_PAYMENT_RECEIVED', orderId } });
     }, 'PAY_ORDER_NOTIFICATION');
 
     // Batch 43 BE-CHAT: pesan sistem "bayar diterima" di room order.
@@ -258,20 +267,36 @@ export class OrderStateService {
     this.runRealtimeBestEffort(() => this.realtime.emitToOrder(orderId, 'order.status_changed', { orderId, status: 'COMPLETED' }), 'COMPLETE_ORDER_STATUS');
 
     this.runPostCommitBestEffort(async () => {
-      const order = await this.prisma.order.findUnique({ where: { orderId }, select: { id: true, buyerId: true, sellerId: true, title: true } });
+      const order = await this.prisma.order.findUnique({ where: { orderId }, select: { id: true, buyerId: true, sellerId: true, title: true, sellerReceiveAmount: true } });
       if (!order) return;
-      await this.notificationQueue.enqueue({ userId: order.sellerId, type: NotificationType.ORDER_COMPLETED, title: 'Order Completed', body: `Order "${order.title}" has been completed! Funds have been credited to your wallet.`, pushData: { type: 'ORDER_COMPLETED', orderId } });
-      await this.notificationQueue.enqueue({ userId: order.buyerId, type: NotificationType.WALLET_FUNDS_RELEASED, title: 'Escrow Released', body: `Escrow funds for order "${order.title}" have been released to the seller.`, pushData: { type: 'WALLET_FUNDS_RELEASED', orderId } });
+      // SYS-C-105: copy mengikuti bahasa preferensi masing-masing penerima.
+      const sellerCopy = renderNotificationCopy(
+        NotificationType.ORDER_COMPLETED,
+        await resolveNotificationLanguage(this.prisma, order.sellerId),
+        { orderTitle: order.title, amount: formatSen(order.sellerReceiveAmount) },
+      );
+      const buyerCopy = renderNotificationCopy(
+        NotificationType.WALLET_FUNDS_RELEASED,
+        await resolveNotificationLanguage(this.prisma, order.buyerId),
+        { orderTitle: order.title, amount: formatSen(order.sellerReceiveAmount) },
+      );
+      await this.notificationQueue.enqueue({ userId: order.sellerId, type: NotificationType.ORDER_COMPLETED, title: sellerCopy.title, body: sellerCopy.body, pushData: { type: 'ORDER_COMPLETED', orderId } });
+      await this.notificationQueue.enqueue({ userId: order.buyerId, type: NotificationType.WALLET_FUNDS_RELEASED, title: buyerCopy.title, body: buyerCopy.body, pushData: { type: 'WALLET_FUNDS_RELEASED', orderId } });
       const cashbackUsage = await this.prisma.voucherUsage.findFirst({
         where: { orderId: order.id, discountApplied: { gt: BigInt(0) }, voucher: { voucherType: VoucherType.WALLET_CASHBACK } },
         select: { userId: true, discountApplied: true },
       });
       if (cashbackUsage) {
+        const cashbackCopy = renderNotificationCopy(
+          NotificationType.CAMPAIGN_CASHBACK_CREDITED,
+          await resolveNotificationLanguage(this.prisma, cashbackUsage.userId),
+          { amount: formatSen(cashbackUsage.discountApplied), orderTitle: order.title },
+        );
         await this.notificationQueue.enqueue({
           userId: cashbackUsage.userId,
           type: NotificationType.CAMPAIGN_CASHBACK_CREDITED,
-          title: 'Cashback Credited',
-          body: `Cashback Rp ${(cashbackUsage.discountApplied / BigInt(100)).toLocaleString('id-ID')} from order "${order.title}" has been credited to your wallet.`,
+          title: cashbackCopy.title,
+          body: cashbackCopy.body,
           pushData: { type: 'CAMPAIGN_CASHBACK_CREDITED', orderId },
         });
       }
@@ -318,7 +343,13 @@ export class OrderStateService {
       const order = await this.prisma.order.findUnique({ where: { orderId }, select: { buyerId: true, sellerId: true, title: true } });
       if (!order) return;
       const recipientId = order.buyerId === userId ? order.sellerId : order.buyerId;
-      await this.notificationQueue.enqueue({ userId: recipientId, type: NotificationType.ORDER_CANCELLED, title: 'Order Cancelled', body: `Order "${order.title}" has been cancelled. Reason: ${normalizedReason}${note ? `. ${note}` : ''}`, pushData: { type: 'ORDER_CANCELLED', orderId } });
+      // SYS-C-105: copy mengikuti bahasa preferensi penerima.
+      const cancelCopy = renderNotificationCopy(
+        NotificationType.ORDER_CANCELLED,
+        await resolveNotificationLanguage(this.prisma, recipientId),
+        { orderTitle: order.title, reason: ` Reason: ${normalizedReason}${note ? `. ${note}` : ''}` },
+      );
+      await this.notificationQueue.enqueue({ userId: recipientId, type: NotificationType.ORDER_CANCELLED, title: cancelCopy.title, body: cancelCopy.body, pushData: { type: 'ORDER_CANCELLED', orderId } });
     }, 'CANCEL_ORDER_NOTIFICATION');
 
     // GAP-D (G256): lepaskan reservasi stok katalog setelah order dibatalkan.
@@ -1303,12 +1334,61 @@ export class OrderStateService {
         });
         }
       }
+
+      // SYS-B-205 (pola SEC-104): baris durable danaRefundAttempt PENDING —
+      // dibuat DI DALAM tx yang sama dengan cancel. Eksekusi post-commit via
+      // klaim atomik di refundAmount() (PENDING/FAILED → EXECUTING, hanya satu
+      // eksekutor menang); crash di antaranya → sweep dana-refund-retry
+      // menjemput baris PENDING yang basi.
+      //
+      // Kunci idempotency deterministik & unik per (order, aksi):
+      // `ORDER:<orderDbId>:ADMIN_CANCEL`. Nominal snapshot sisa refund saat
+      // rencana; refundAmount() menghitung ulang dari payment segar (fail-closed
+      // bila payment tidak lagi eligible).
+      //
+      // Order bertahap (milestone) TIDAK dibuatkan baris di sini — refundnya
+      // di-routing per tahap via adminCancelMilestonesNoWallet post-commit.
+      if (danaDirectMode) {
+        const milestoneCount = await tx.orderMilestone.count({ where: { orderId: order.id } });
+        if (milestoneCount === 0) {
+          const danaPayment = await tx.paymentTransaction.findFirst({
+            where: { orderId: order.id, provider: 'DANA', status: 'SUCCESS' },
+            orderBy: { settledAt: 'desc' },
+            select: { id: true, grossAmount: true, refundedAmount: true },
+          });
+          if (danaPayment) {
+            const remaining = danaPayment.grossAmount - (danaPayment.refundedAmount ?? BigInt(0));
+            if (remaining > BigInt(0)) {
+              const attemptKey = `ORDER:${order.id}:ADMIN_CANCEL`;
+              const existingAttempt = await tx.danaRefundAttempt.findUnique({
+                where: { idempotencyKey: attemptKey },
+                select: { id: true },
+              });
+              if (!existingAttempt) {
+                await tx.danaRefundAttempt.create({
+                  data: {
+                    idempotencyKey: attemptKey,
+                    paymentTransactionId: danaPayment.id,
+                    amountSen: remaining,
+                    partnerRefundNo: deriveDanaRefundNo(attemptKey),
+                    reason: `Admin cancelled order: ${reason}`.slice(0, 500),
+                    status: 'PENDING',
+                  },
+                });
+              }
+            }
+          }
+        }
+      }
     }), 'ADMIN_CANCEL_ORDER_TX');
 
     if (danaDirectMode && this.danaDirectRefundService) {
-      // M3 (no-wallet): refund ke metode bayar asal via DANA Refund API —
-      // best-effort (idempoten per ORDER:<orderDbId>; attempt FAILED dicoba
-      // ulang cron dana-refund-retry tiap jam).
+      // SYS-B-205: klaim attempt PENDING yang dibuat di dalam tx cancel di
+      // atas (idempoten per ORDER:<orderDbId>:ADMIN_CANCEL). refundAmount()
+      // mengklaim atomik PENDING/FAILED → EXECUTING lalu mengeksekusi; bila
+      // baris belum ada (mis. payment muncul setelah tx) ia membuatnya
+      // seperti jalur biasa. Attempt FAILED / PENDING-basi dicoba ulang cron
+      // dana-refund-retry tiap jam.
       const refundService = this.danaDirectRefundService;
       this.runPostCommitBestEffort(async () => {
         const cancelled = await this.prisma.order.findFirst({ where: { orderId }, select: { id: true } });
@@ -1323,7 +1403,18 @@ export class OrderStateService {
           );
           if (routed.routed) return;
         }
-        await refundService.refundOrderEscrow(cancelled.id, `Admin cancelled order: ${reason}`);
+        const danaPayment = await this.prisma.paymentTransaction.findFirst({
+          where: { orderId: cancelled.id, provider: 'DANA', status: 'SUCCESS' },
+          orderBy: { settledAt: 'desc' },
+          select: { id: true },
+        });
+        if (!danaPayment) return;
+        await refundService.refundAmount({
+          paymentDbId: danaPayment.id,
+          amountSen: null,
+          reason: `Admin cancelled order: ${reason}`,
+          idempotencyKey: `ORDER:${cancelled.id}:ADMIN_CANCEL`,
+        });
       }, 'ADMIN_CANCEL_ORDER_DANA_REFUND');
     } else {
       // Batch 1-money (WF-022): refund provider tetap best-effort di sini agar cancel admin
@@ -1339,7 +1430,7 @@ export class OrderStateService {
     this.runRealtimeBestEffort(() => this.realtime.emitToOrder(orderId, 'order.status_changed', { orderId, status: 'CANCELLED' }), 'ADMIN_CANCEL_ORDER_STATUS');
 
     this.runPostCommitBestEffort(async () => {
-      const adminOrder = await this.prisma.order.findUnique({ where: { orderId }, select: { buyerId: true, sellerId: true, title: true } });
+      const adminOrder = await this.prisma.order.findUnique({ where: { orderId }, select: { buyerId: true, sellerId: true, title: true, buyerPayAmount: true } });
       if (!adminOrder) return;
       for (const recipientId of [adminOrder.buyerId, adminOrder.sellerId]) {
         // M3 (no-wallet): jangan klaim "kembali ke wallet" — refund ke metode
@@ -1347,7 +1438,13 @@ export class OrderStateService {
         const refundNote = danaDirectMode && recipientId === adminOrder.buyerId
           ? ' Dana akan dikembalikan ke metode pembayaran asal Anda.'
           : '';
-        await this.notificationQueue.enqueue({ userId: recipientId, type: NotificationType.ORDER_CANCELLED, title: 'Order Cancelled by Admin', body: `Order "${adminOrder.title}" has been cancelled by an administrator.${reason ? ` Reason: ${reason}` : ''}${refundNote}`, pushData: { type: 'ORDER_CANCELLED', orderId } });
+        // SYS-C-105: copy mengikuti bahasa preferensi penerima.
+        const adminCancelCopy = renderNotificationCopy(
+          NotificationType.ORDER_CANCELLED,
+          await resolveNotificationLanguage(this.prisma, recipientId),
+          { orderTitle: adminOrder.title, reason: `${reason ? ` Reason: ${reason}` : ''}${refundNote}` },
+        );
+        await this.notificationQueue.enqueue({ userId: recipientId, type: NotificationType.ORDER_CANCELLED, title: adminCancelCopy.title, body: adminCancelCopy.body, pushData: { type: 'ORDER_CANCELLED', orderId } });
       }
       if (danaDirectMode) {
         // Notifikasi WALLET_REFUND_RECEIVED tidak berlaku — refund ke metode
@@ -1355,11 +1452,17 @@ export class OrderStateService {
       } else {
       // Buyer wajib tahu dananya kembali ke wallet — tanpa ini user panik
       // mengira uang hangus.
+      // SYS-C-105: copy mengikuti bahasa preferensi buyer.
+      const refundCopy = renderNotificationCopy(
+        NotificationType.WALLET_REFUND_RECEIVED,
+        await resolveNotificationLanguage(this.prisma, adminOrder.buyerId),
+        { amount: formatSen(adminOrder.buyerPayAmount), orderTitle: adminOrder.title },
+      );
       await this.notificationQueue.enqueue({
         userId: adminOrder.buyerId,
         type: NotificationType.WALLET_REFUND_RECEIVED,
-        title: 'Refund Received',
-        body: `Refund for order "${adminOrder.title}" has been credited to your wallet.`,
+        title: refundCopy.title,
+        body: refundCopy.body,
         pushData: { type: 'WALLET_REFUND_RECEIVED', orderId },
       });
       }

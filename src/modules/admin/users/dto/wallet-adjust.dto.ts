@@ -1,6 +1,7 @@
 import { IsString, IsEnum, IsNumber, IsInt, Min, Max, MinLength, MaxLength, IsOptional, IsNotEmpty } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { WALLET_DAILY_TOPUP_LIMIT } from '../../../../common/constants/app.constants';
+import { formatIdr } from '../../../../common/utils/currency.util';
 
 export enum WalletAdjustType {
   CREDIT = 'CREDIT',
@@ -12,7 +13,7 @@ export class WalletAdjustDto {
   @IsNumber()
   @IsInt({ message: 'amount must be a whole number (no decimals)' })
   @Min(1)
-  @Max(WALLET_DAILY_TOPUP_LIMIT, { message: `Maximum single adjustment is Rp ${WALLET_DAILY_TOPUP_LIMIT.toLocaleString()}` })
+  @Max(WALLET_DAILY_TOPUP_LIMIT, { message: `Maximum single adjustment is ${formatIdr(WALLET_DAILY_TOPUP_LIMIT)}` })
   amount!: number;
 
   @ApiProperty({ enum: WalletAdjustType, description: 'CREDIT to add funds, DEBIT to subtract funds' })

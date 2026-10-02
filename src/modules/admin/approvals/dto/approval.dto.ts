@@ -13,6 +13,13 @@ export const APPROVAL_ACTION_TYPES = [
   'COMMERCE_REFUND',
   'DISBURSEMENT_REOPEN',
   'OPS_SETTING_CHANGE',
+  // SYS-B-401/402/405 (audit 2026-10-03 ronde 3): retrofit dual control untuk
+  // aksi uang admin yang terlewat.
+  'DISBURSEMENT_FORCE_SUCCESS',
+  'VOUCHER_CREATE',
+  'CAMPAIGN_ACTIVATE',
+  'MONEY_VALUE_GRANT',
+  'SYSTEM_CONFIG_CHANGE',
 ] as const;
 
 export type ApprovalActionType = (typeof APPROVAL_ACTION_TYPES)[number];
@@ -28,6 +35,12 @@ export const APPROVAL_ACTION_ROLES: Record<ApprovalActionType, AdminRole[]> = {
   COMMERCE_REFUND: [AdminRole.SUPER_ADMIN, AdminRole.FINANCE_ADMIN],
   DISBURSEMENT_REOPEN: [AdminRole.SUPER_ADMIN],
   OPS_SETTING_CHANGE: [AdminRole.SUPER_ADMIN],
+  // SYS-B-401/402/405: role mengikuti guard @AdminRoles endpoint domain-nya.
+  DISBURSEMENT_FORCE_SUCCESS: [AdminRole.SUPER_ADMIN],
+  VOUCHER_CREATE: [AdminRole.SUPER_ADMIN, AdminRole.FINANCE_ADMIN],
+  CAMPAIGN_ACTIVATE: [AdminRole.SUPER_ADMIN],
+  MONEY_VALUE_GRANT: [AdminRole.SUPER_ADMIN, AdminRole.FINANCE_ADMIN],
+  SYSTEM_CONFIG_CHANGE: [AdminRole.SUPER_ADMIN],
 };
 
 export class ProposeApprovalDto {

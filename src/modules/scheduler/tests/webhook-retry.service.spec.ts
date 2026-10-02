@@ -46,7 +46,7 @@ describe('WebhookRetryService', () => {
     redis.del.mockResolvedValue(1);
     prisma.webhookLog.updateMany.mockResolvedValue({ count: 1 });
     prisma.webhookLog.count.mockResolvedValue(0);
-    service = new WebhookRetryService(prisma as never, redis as never, paymentService as never, config as never);
+    service = new WebhookRetryService(prisma as never, redis as never, paymentService as never, config as never, { reconcileByPartnerReferenceNo: jest.fn() } as never);
   });
 
   it('replays eligible inbox rows and records a heartbeat', async () => {

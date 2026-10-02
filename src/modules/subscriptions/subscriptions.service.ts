@@ -42,7 +42,7 @@ import {
   DANA_DIRECT_VA_BANKS,
 } from '../no-wallet/dana-direct-payment.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { toIdr, toSen, percentToBpsBigInt } from '../../common/utils/currency.util';
+import { toIdr, toSen, formatSen, percentToBpsBigInt } from '../../common/utils/currency.util';
 import { getWibMonthStart } from '../../common/utils/date.util';
 import { SUBSCRIPTION_PLANS_CACHE } from '../../common/constants/redis-keys';
 import { KAHADE_PLUS_BENEFITS, SubscriptionBenefit } from './subscription-benefits.constant';
@@ -769,7 +769,7 @@ export class SubscriptionsService {
               amount: effectivePrice,
               balanceBefore,
               balanceAfter,
-              description: `${planInfo.label} subscription payment${campaignDiscount.discountSen > BigInt(0) ? ` (discount Rp ${toIdr(campaignDiscount.discountSen).toLocaleString('id-ID')})` : ''}`,
+              description: `${planInfo.label} subscription payment${campaignDiscount.discountSen > BigInt(0) ? ` (discount ${formatSen(campaignDiscount.discountSen)})` : ''}`,
             },
           });
         }

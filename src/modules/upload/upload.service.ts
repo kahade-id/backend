@@ -91,7 +91,11 @@ export const MAX_FILE_SIZE: Record<UploadPurpose, number> = {
   [UploadPurpose.SHOWCASE_VIDEO]: SHOWCASE_VIDEO_MAX_BYTES,
   [UploadPurpose.AVATAR]: 2 * 1024 * 1024,
   [UploadPurpose.CHAT_ATTACHMENT]: 50 * 1024 * 1024,
-  [UploadPurpose.DISPUTE_EVIDENCE]: 50 * 1024 * 1024,
+  // SYS-C-303 (audit sistemik ronde 3, 2026-10-03): DISPUTE_EVIDENCE disamakan
+  // dengan batas consumer (dispute-message.service.ts & disputes.service.ts:
+  // 10 MB/file, controller menolak >10 MB). Sebelumnya 50 MiB — file 10–50 MB
+  // lolos upload tapi pasti ditolak saat dipakai (bandwidth terbuang).
+  [UploadPurpose.DISPUTE_EVIDENCE]: 10 * 1024 * 1024,
   [UploadPurpose.REPORT_EVIDENCE]: 10 * 1024 * 1024,
   [UploadPurpose.DELIVERY_PROOF]: 10 * 1024 * 1024,
   // BFI-097: bukti milestone — 10 MiB (sama seperti bukti laporan/pengiriman).

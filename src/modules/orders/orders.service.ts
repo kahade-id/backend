@@ -7,7 +7,7 @@ import { RealtimeService } from '../realtime/realtime.service';
 import { FeeCalculatorService } from './fee-calculator.service';
 import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, SubscriptionStatus, NotificationType, Prisma, Voucher, VoucherApplicability, VoucherType, CampaignStatus, ChatRoomType, PaymentPurpose, PaymentStatus } from '@prisma/client';
 import { generateOrderId } from '../../common/utils/id-generator.util';
-import { toSen, toIdr, percentToBpsBigInt } from '../../common/utils/currency.util';
+import { toSen, toIdr, formatIdr, percentToBpsBigInt } from '../../common/utils/currency.util';
 import { safeBigIntToNumber } from '../../common/utils/bigint.util';
 import { addDays, formatWIBDate, toWIB, parseDateBoundaryWIB } from '../../common/utils/date.util';
 import { ORDER_SERIAL, ORDER_AVG_DURATIONS_CACHE } from '../../common/constants/redis-keys';
@@ -358,7 +358,7 @@ export class OrdersService {
     if (!Number.isSafeInteger(dto.orderValue) || dto.orderValue < this.configuredMinOrderValue || dto.orderValue > this.configuredMaxOrderValue) {
       throw new BadRequestException({
         code: ErrorCodes.VALIDATION_ERROR,
-        message: `Order value must be between Rp ${this.configuredMinOrderValue.toLocaleString()} and Rp ${this.configuredMaxOrderValue.toLocaleString()}`,
+        message: `Order value must be between ${formatIdr(this.configuredMinOrderValue)} and ${formatIdr(this.configuredMaxOrderValue)}`,
       });
     }
 
@@ -897,7 +897,7 @@ export class OrdersService {
       const prefs = await this.prisma.notificationPreference.findUnique({ where: { userId: counterpartId } });
       const shouldNotify = !prefs || this.isOrderNotificationEnabled(prefs);
       if (shouldNotify) {
-        const escapedBody = this.escapePushBody(`${creatorName} created a new order "${notifTitle}" worth Rp ${dto.orderValue.toLocaleString('id-ID')}. Please confirm.`);
+        const escapedBody = this.escapePushBody(`${creatorName} created a new order "${notifTitle}" worth ${formatIdr(dto.orderValue)}. Please confirm.`);
         await this.notificationQueue.enqueue({
           userId: counterpartId,
           type: NotificationType.ORDER_NEW,
@@ -1382,7 +1382,7 @@ export class OrdersService {
     feeWaivedAmount: number;
   }> {
     if (!Number.isSafeInteger(dto.orderValue) || dto.orderValue < this.configuredMinOrderValue || dto.orderValue > this.configuredMaxOrderValue) {
-      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Order value must be an integer between Rp ${this.configuredMinOrderValue.toLocaleString('id-ID')} and Rp ${this.configuredMaxOrderValue.toLocaleString('id-ID')}` });
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `Order value must be an integer between ${formatIdr(this.configuredMinOrderValue)} and ${formatIdr(this.configuredMaxOrderValue)}` });
     }
     if (!Object.values(FeeResponsibility).includes(dto.feeResponsibility)) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid fee responsibility' });

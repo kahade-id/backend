@@ -12,6 +12,8 @@ import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
 import { Idempotency } from '../../../common/decorators/idempotency.decorator';
+import { StepUpGuard } from '../../../common/guards/step-up.guard';
+import { RequireStepUp } from '../../../common/decorators/require-step-up.decorator';
 
 @ApiTags('admin-vouchers')
 @ApiBearerAuth('access-token')
@@ -38,9 +40,11 @@ export class AdminVouchersController {
   }
 
   @Post()
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SYS-B-402: pembuatan voucher = penciptaan liabilitas finansial langsung.
+  @RequireStepUp('voucher.create')
   @Idempotency()
-  @ApiOperation({ summary: 'Create new voucher', description: 'ADM-219: requires Idempotency-Key — double submit tidak membuat voucher ganda.' })
+  @ApiOperation({ summary: 'Create new voucher', description: 'ADM-219 + SYS-B-402: requires Idempotency-Key + X-Step-Up-Token (action voucher.create). Nilai di atas Rp1.000.000 wajib dual control (actionType VOUCHER_CREATE). Double submit tidak membuat voucher ganda.' })
   @ApiResponse({ status: 201, description: 'Voucher created.' })
   createVoucher(
     @Body() dto: CreateVoucherDto,
@@ -51,10 +55,12 @@ export class AdminVouchersController {
   }
 
   @Post(':voucherId/deactivate')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SYS-B-402: perubahan status voucher memengaruhi liabilitas aktif.
+  @RequireStepUp('voucher.deactivate', 'voucherId')
   @Idempotency()
   @HttpCode(200)
-  @ApiOperation({ summary: 'Deactivate voucher', description: 'ADM-219: requires Idempotency-Key.' })
+  @ApiOperation({ summary: 'Deactivate voucher', description: 'ADM-219 + SYS-B-402: requires Idempotency-Key + X-Step-Up-Token (action voucher.deactivate).' })
   @ApiResponse({ status: 200, description: 'Voucher deactivated.' })
   @ApiResponse({ status: 404, description: 'Voucher not found.' })
   deactivateVoucher(
@@ -66,10 +72,12 @@ export class AdminVouchersController {
   }
 
   @Post(':voucherId/reactivate')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SYS-B-402: reaktivasi menghidupkan kembali liabilitas finansial.
+  @RequireStepUp('voucher.reactivate', 'voucherId')
   @Idempotency()
   @HttpCode(200)
-  @ApiOperation({ summary: 'Reactivate voucher', description: 'ADM-218: mengaktifkan kembali voucher yang dinonaktifkan (flag lunak). Fail-closed bila voucher masih aktif atau sudah kedaluwarsa. Requires Idempotency-Key.' })
+  @ApiOperation({ summary: 'Reactivate voucher', description: 'ADM-218 + SYS-B-402: mengaktifkan kembali voucher yang dinonaktifkan (flag lunak). Fail-closed bila voucher masih aktif atau sudah kedaluwarsa. Requires Idempotency-Key + X-Step-Up-Token (action voucher.reactivate).' })
   @ApiResponse({ status: 200, description: 'Voucher reactivated.' })
   @ApiResponse({ status: 404, description: 'Voucher not found.' })
   @ApiResponse({ status: 400, description: 'Voucher already active or expired.' })

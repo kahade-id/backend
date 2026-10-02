@@ -42,6 +42,19 @@ export const danaConfig = registerAs('dana', () => {
   const partnerId = process.env.DANA_PARTNER_ID || '';
   const privateKey = process.env.DANA_PRIVATE_KEY || '';
   const merchantId = process.env.DANA_MERCHANT_ID || '';
+  const publicKey = process.env.DANA_PUBLIC_KEY || '';
+
+  // SYS-B-406: di produksi, DANA_PUBLIC_KEY WAJIB ada. Tanpa itu, verifikasi
+  // signature webhook akan jatuh ke kunci publik SANDBOX yang bersifat publik
+  // (disalin dari SDK dana-python) → fail-open: signature bisa dipalsukan.
+  // Fail-fast saat startup (bukan warn) — tidak ada boot produksi yang jalan
+  // dengan verifikasi webhook terbuka.
+  if (isProduction && !publicKey) {
+    throw new Error(
+      'DANA_PUBLIC_KEY wajib di-set bila DANA_ENV=production — tanpa itu verifikasi ' +
+        'signature webhook jatuh ke kunci publik sandbox (fail-open, SYS-B-406).',
+    );
+  }
 
   if (!partnerId || !privateKey || !merchantId) {
     logger.warn(
@@ -61,8 +74,9 @@ export const danaConfig = registerAs('dana', () => {
     /**
      * Public key DANA (PEM) untuk verifikasi signature webhook finish-notify.
      * Kosong di sandbox → dipakai kunci publik sandbox bawaan SDK resmi.
+     * Di produksi kosong = fail-fast saat startup (SYS-B-406).
      */
-    publicKey: process.env.DANA_PUBLIC_KEY || '',
+    publicKey,
     /** Merchant ID DANA. */
     merchantId,
     /** Header ORIGIN. */

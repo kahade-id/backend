@@ -259,7 +259,11 @@ describe('dana-webhook-settlement.service', () => {
     await expect(svc.handleFinishNotify(rawBody, headers, PATH)).rejects.toMatchObject({
       response: expect.objectContaining({ code: 'WEBHOOK_MERCHANT_ID_MISMATCH' }),
     });
-    expect(prisma.webhookLog.update).not.toHaveBeenCalled();
+    // Properti keamanan yang dikunci: TIDAK ADA perubahan settlement
+    // (paymentTransaction.update tidak dipanggil). webhookLog.update BOLEH
+    // dipanggil — itu bookkeeping error SEC-202 (catat errorMessage +
+    // retryCount), bukan pergerakan uang.
+    expect(prisma.paymentTransaction.update).not.toHaveBeenCalled();
   });
 
   it('SYS-B-406: env non-sandbox tanpa DANA_PUBLIC_KEY → tolak verifikasi (fail-closed, 503)', async () => {

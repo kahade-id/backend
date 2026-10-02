@@ -6,7 +6,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { WalletModeService } from '../wallet-mode/wallet-mode.service';
-import { DisputeDanaSettlementService } from '../no-wallet/dispute-dana-settlement.service';
+import { DisputeDanaSettlementService, DisputeNoWalletSettlementResult } from '../no-wallet/dispute-dana-settlement.service';
 import { FeeCalculatorService } from '../orders/fee-calculator.service';
 import { generateWalletTxId, generateNotifId } from '../../common/utils/id-generator.util';
 import { getCategoryForType } from '../notifications/notification-category.map';
@@ -710,6 +710,20 @@ export class MutualResolutionService {
         },
       });
 
+      // SEC-104: baris durable "settlement intent" — dibuat DI DALAM tx yang
+      // sama dengan isExecuted=true (jalur no-wallet; eksekusi finansial
+      // post-commit via DisputeDanaSettlementService). Kegagalan APAPUN
+      // setelah commit tidak pernah kehilangan jejak: cron
+      // dispute-settlement-sweep retry via klaim CLAIMED.
+      await tx.disputeSettlementIntent.create({
+        data: {
+          disputeId: dispute.id,
+          status: 'PENDING',
+          buyerAmountSen: buyerAmount,
+          sellerAmountSen: sellerAmount,
+        },
+      });
+
       await tx.order.update({
         where: { id: dispute.order.id },
         data: {
@@ -755,20 +769,28 @@ export class MutualResolutionService {
       'ACCEPT_MUTUAL_SUBSCRIPTION_CACHE_INVALIDATION',
     );
 
-    // Eksekusi finansial post-commit: refund DANA (buyer) + disbursement (seller).
-    const settlement = await this.disputeDanaSettlement.settleDisputeNoWallet({
-      orderDbId: dispute.order.id,
-      disputeDbId: dispute.id,
-      decision: mutualDecisionType,
-      buyerAmountSen: buyerAmount,
-      sellerAmountSen: sellerAmount,
-      reason: `Mutual resolution accepted (proposal ${proposal.id}): ${proposal.buyerPercent}% buyer / ${proposal.sellerPercent}% seller`,
-    }).catch((err: unknown) => {
+    // SEC-104: eksekusi finansial post-commit via klaim intent (idempoten).
+    // Intent PENDING dibuat di dalam tx putusan di atas; claimAndSettleIntent
+    // mengklaimnya (PENDING/FAILED → CLAIMED), menandai DONE bila sukses,
+    // FAILED + lastError bila gagal. Error TIDAK ditelan jadi null —
+    // propagate ke pemanggil (fail-closed); cron dispute-settlement-sweep
+    // retry intent yang FAILED.
+    let settlement: DisputeNoWalletSettlementResult | null;
+    try {
+      settlement = await this.disputeDanaSettlement.claimAndSettleIntent({
+        disputeId: dispute.id,
+        orderDbId: dispute.order.id,
+        decision: mutualDecisionType,
+        buyerAmountSen: buyerAmount,
+        sellerAmountSen: sellerAmount,
+        reason: `Mutual resolution accepted (proposal ${proposal.id}): ${proposal.buyerPercent}% buyer / ${proposal.sellerPercent}% seller`,
+      });
+    } catch (err: unknown) {
       this.logger.error(
-        `MUTUAL_NO_WALLET_SETTLEMENT_FAILED dispute=${dispute.id}: ${err instanceof Error ? err.message : String(err)} — retry via dana-refund-retry cron`,
+        `MUTUAL_NO_WALLET_SETTLEMENT_FAILED dispute=${dispute.id}: ${err instanceof Error ? err.message : String(err)} — retry via dispute-settlement-sweep cron`,
       );
-      return null;
-    });
+      throw err;
+    }
 
     return { proposalId: proposal.id, status: 'ACCEPTED', buyerPercent: proposal.buyerPercent, sellerPercent: proposal.sellerPercent, settlement };
   }

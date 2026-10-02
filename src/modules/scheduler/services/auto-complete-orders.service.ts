@@ -1,4 +1,4 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Injectable, Logger, Optional, Inject } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import {
   OrderStatus,
@@ -7,6 +7,8 @@ import {
   ActorType,
   NotificationType,
   SubscriptionStatus,
+  EscrowDisbursementScope,
+  EscrowDisbursementStatus,
   Prisma,
 } from '@prisma/client';
 import { randomUUID, randomInt } from 'crypto';
@@ -18,7 +20,7 @@ import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
-import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback } from '../../../common/utils/cashback-credit.util';
+import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback, CashbackCreditResult } from '../../../common/utils/cashback-credit.util';
 import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
 import { EscrowDisbursementService } from '../../no-wallet/escrow-disbursement.service';
 import { alertMoneyCronSkippedRedisDown, ensureRedisAvailable } from '../../../common/utils/redis-health.util';
@@ -44,8 +46,13 @@ export class AutoCompleteDeliveredOrdersService {
     private membershipRankService: MembershipRankService,
     private feeCalculator: FeeCalculatorService,
     // M4 no-wallet: payout cashback via disbursement DANA bila wallet mati.
-    @Optional() private walletMode: WalletModeService | null,
-    @Optional() private disbursement: EscrowDisbursementService | null,
+    // @Inject EKSPLISIT (bukan hanya mengandalkan design:paramtypes):
+    // TypeScript meng-emit `Object` untuk tipe union `X | null`, sehingga
+    // tanpa @Inject kedua param @Optional ini SELALU undefined di runtime
+    // (Nest gagal resolve token Object dan @Optional menelannya diam-diam).
+    // Akibatnya cabang no-wallet tidak pernah jalan di production.
+    @Optional() @Inject(WalletModeService) private walletMode: WalletModeService | null,
+    @Optional() @Inject(EscrowDisbursementService) private disbursement: EscrowDisbursementService | null,
   ) {}
 
   private runRealtimeBestEffort(task: () => void, label: string): void {
@@ -247,6 +254,18 @@ export class AutoCompleteDeliveredOrdersService {
                     });
                     if (updated.count === 0) return;
 
+                    // SEC-101: cabang no-wallet vs wallet diputuskan SEKALI di sini.
+                    const walletEnabled = this.walletMode?.isWalletEnabled() ?? true;
+                    let danaCashback: {
+                      params: { orderDbId: string; orderPublicId: string; source: string };
+                      intent: { userId: string; amountSen: bigint; voucherCode: string | null; usageId: string };
+                    } | null = null;
+                    let cashbackResult: CashbackCreditResult | null = null;
+                    // SEC-101: no-wallet → baris escrowDisbursement PENDING dibuat di
+                    // dalam tx; releaseForOrder dieksekusi post-commit (di bawah).
+                    let danaEscrowRelease: { orderDbId: string; orderPublicId: string } | null = null;
+
+                    if (walletEnabled) {
                     const buyerWalletLookup = await tx.wallet.findUnique({
                       where: { userId: order.buyerId },
                       select: { id: true },
@@ -383,32 +402,15 @@ export class AutoCompleteDeliveredOrdersService {
 
                     // Batch 1-money (EO-005): cashback voucher juga dikredit pada
                     // auto-complete — sebelumnya hangus diam-diam.
-                    // M4 no-wallet: wallet mati -> rencanakan payout DANA (eksekusi post-tx).
-                    const walletEnabled = this.walletMode?.isWalletEnabled() ?? true;
-                    let danaCashback: {
-                      params: { orderDbId: string; orderPublicId: string; source: string };
-                      intent: { userId: string; amountSen: bigint; voucherCode: string | null; usageId: string };
-                    } | null = null;
-                    const cashbackResult = walletEnabled
-                      ? await creditCashbackIfEligible(
-                          tx,
-                          () => this.walletTxSerialService.getNext(),
-                          {
-                            orderDbId: order.id,
-                            orderPublicId: order.orderId,
-                            source: 'auto-complete',
-                          },
-                        )
-                      : null;
-                    if (!walletEnabled) {
-                      const params = {
+                    cashbackResult = await creditCashbackIfEligible(
+                      tx,
+                      () => this.walletTxSerialService.getNext(),
+                      {
                         orderDbId: order.id,
                         orderPublicId: order.orderId,
                         source: 'auto-complete',
-                      };
-                      const intent = await planDanaCashback(tx, params);
-                      danaCashback = intent ? { params, intent } : null;
-                    }
+                      },
+                    );
 
                     if (order.feeAmount > BigInt(0) && feeTxSerial !== null) {
                       const feeBalanceBefore = buyerWallet.totalBalance;
@@ -426,6 +428,46 @@ export class AutoCompleteDeliveredOrdersService {
                           description: `Platform fee for auto-completed order ${order.orderId}`,
                         },
                       });
+                    }
+                    } else {
+                      // SEC-101 (P1): cabang no-wallet — escrow DANA-direct TIDAK
+                      // punya baris ORDER_LOCK / escrowBalance; seluruh blok
+                      // ledger wallet di atas dilewati. Sebagai gantinya buat
+                      // baris escrowDisbursement PENDING di dalam tx yang sama
+                      // (durable), lalu eksekusi releaseForOrder post-commit —
+                      // pola yang sama dengan handleCompleteOrder
+                      // (order-state.service.ts).
+                      if (order.sellerReceiveAmount == null || order.sellerReceiveAmount <= BigInt(0)) {
+                        throw new Error(
+                          `ORDER_NOT_RELEASE_ELIGIBLE: auto-complete blocked for order ${order.orderId}`,
+                        );
+                      }
+                      const disbKey = `ORDER:${order.id}`;
+                      const existingDisb = await tx.escrowDisbursement.findUnique({
+                        where: { idempotencyKey: disbKey },
+                        select: { id: true },
+                      });
+                      if (!existingDisb) {
+                        await tx.escrowDisbursement.create({
+                          data: {
+                            idempotencyKey: disbKey,
+                            scope: EscrowDisbursementScope.ORDER_ESCROW,
+                            orderId: order.id,
+                            sellerId: order.sellerId,
+                            amountSen: order.sellerReceiveAmount,
+                            status: EscrowDisbursementStatus.PENDING,
+                          },
+                        });
+                      }
+                      // M4 no-wallet: rencanakan payout cashback DANA (eksekusi post-tx).
+                      const params = {
+                        orderDbId: order.id,
+                        orderPublicId: order.orderId,
+                        source: 'auto-complete',
+                      };
+                      const intent = await planDanaCashback(tx, params);
+                      danaCashback = intent ? { params, intent } : null;
+                      danaEscrowRelease = { orderDbId: order.id, orderPublicId: order.orderId };
                     }
 
                     const buyerRewardCredited = await this.referralService.createReferralRewardIfEligible(
@@ -527,7 +569,7 @@ export class AutoCompleteDeliveredOrdersService {
 
                     this.logger.log(`Auto-completed order ${order.orderId}`);
 
-                    return { completed: true as const, cashback: cashbackResult, danaCashback, referralRewardCredited };
+                    return { completed: true as const, cashback: cashbackResult, danaCashback, danaEscrowRelease, referralRewardCredited };
                   },
                   { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
                 ),
@@ -566,6 +608,27 @@ export class AutoCompleteDeliveredOrdersService {
             }
 
             if (!outcome?.completed) continue;
+
+            // SEC-101: eksekusi release escrow DANA post-commit untuk order
+            // no-wallet (idempoten, key ORDER:<orderDbId>). Baris PENDING sudah
+            // durable di dalam tx → bila post-commit ini gagal (atau proses
+            // mati), scheduler retryDue() mengambil alih. Gagal di sini TIDAK
+            // melempar (order sudah COMPLETED; jangan bakar failure counter).
+            if (outcome.danaEscrowRelease && this.disbursement) {
+              const { orderDbId, orderPublicId } = outcome.danaEscrowRelease;
+              try {
+                const danaRes = await this.disbursement.releaseForOrder(orderDbId);
+                if (danaRes.outcome === 'HELD_NO_BANK') {
+                  this.logger.warn(
+                    `auto-complete escrow-release-dana ${orderPublicId}: HELD_NO_BANK — menunggu rekening bank seller`,
+                  );
+                }
+              } catch (err) {
+                this.logger.warn(
+                  `auto-complete escrow-release-dana gagal untuk order ${orderPublicId} — retry via retryDue: ${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+            }
 
             // SP-047: reward referral mengubah totalRewardEarned — invalidasi
             // leaderboard cache setelah tx commit.

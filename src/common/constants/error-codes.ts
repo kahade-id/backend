@@ -341,6 +341,9 @@ export const EXTENSION_RATE_LIMITED = 'EXTENSION_RATE_LIMITED';
 export const DELIVERY_PROOF_REQUIRED = 'DELIVERY_PROOF_REQUIRED';
 
 export const CHAT_ROOM_CLOSED = 'CHAT_ROOM_CLOSED';
+// Audit 2026-10-03 (BFE-008): room chat tidak ditemukan — kode khusus agar
+// klien bisa membedakan dari NOT_FOUND generik (dipetakan FE error-codes.ts).
+export const ROOM_NOT_FOUND = 'ROOM_NOT_FOUND';
 
 // Chat — Trust & Safety (audit 2026-09-13).
 // CHAT_MESSAGE_BLOCKED: pesan ditolak detektor circumvention/moderation.

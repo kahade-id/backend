@@ -18,6 +18,7 @@ import {
 import {
   CHAT_VOICE_MAX_DURATION_SECONDS,
   CHAT_VOICE_MIN_DURATION_SECONDS,
+  CHAT_ATTACHMENT_MAX_BYTES,
 } from '../../../common/constants/app.constants';
 import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
@@ -44,6 +45,9 @@ const ALLOWED_CHAT_MIME_TYPES = [
   'image/gif',
   'image/webp',
   'image/heic',
+  // Audit 2026-10-03 (BFE-004): format default kamera iPhone; selaras dengan
+  // ALLOWED_CONTENT_TYPES[CHAT_ATTACHMENT] di upload.service.ts.
+  'image/heif',
   'video/mp4',
   'video/quicktime',
   'video/webm',
@@ -111,10 +115,10 @@ export class ChatAttachmentDto {
   @Matches(/^https:\/\//, { message: 'thumbnailUrl must be a valid HTTPS URL' })
   thumbnailUrl?: string;
 
-  @ApiProperty({ description: 'File size in bytes', minimum: 1, maximum: 10485760 })
+  @ApiProperty({ description: 'File size in bytes', minimum: 1, maximum: CHAT_ATTACHMENT_MAX_BYTES })
   @IsInt()
   @Min(1)
-  @Max(10485760)
+  @Max(CHAT_ATTACHMENT_MAX_BYTES)
   fileSize!: number;
 }
 

@@ -143,4 +143,35 @@ export class AdminChatController {
       includeDeleted: includeDeleted === 'true',
     });
   }
+
+  @Get('polls/:pollId')
+  @ApiOperation({
+    summary: 'Get poll detail with vote results (Trust & Safety)',
+    description:
+      'Audit 2026-10-03 (FAL-003): read-only hasil polling (pertanyaan, opsi, hitungan suara) agar polling manipulatif/spam bisa ditinjau.',
+  })
+  @ApiResponse({ status: 200, description: 'Poll returned.' })
+  @ApiResponse({ status: 404, description: 'Poll not found.' })
+  getPoll(@Param('pollId', ParseIdPipe) pollId: string): Promise<object> {
+    return this.service.getPollDetail(pollId);
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Idempotency()
+  @AdminRoles(AdminRole.SUPER_ADMIN, AdminRole.DISPUTE_ADMIN)
+  @Post('polls/:pollId/close')
+  @ApiOperation({
+    summary: 'Force-close a poll (Trust & Safety)',
+    description:
+      'Audit 2026-10-03 (FAL-003): tutup paksa polling bermasalah. Dicatat di audit log admin.',
+  })
+  @ApiResponse({ status: 200, description: 'Poll closed.' })
+  @ApiResponse({ status: 404, description: 'Poll not found.' })
+  closePoll(
+    @Param('pollId', ParseIdPipe) pollId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.closePollForAdmin(pollId, admin.sub, req.ip ?? 'unknown');
+  }
 }

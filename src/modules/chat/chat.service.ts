@@ -1244,7 +1244,19 @@ export class ChatService implements OnModuleInit {
   // ============================================================
 
   async getMessages(userId: string, roomId: string, cursor?: string, limit: number = 50, excludeIds?: string[], afterMessageId?: string): Promise<object> {
-    const room = await this.validateRoomAccess(userId, roomId);
+    // Audit 2026-10-03 (BFE-008): room tidak ada → 404 dengan kode khusus
+    // ROOM_NOT_FOUND (bukan list kosong, bukan NOT_FOUND generik).
+    try {
+      await this.validateRoomAccess(userId, roomId);
+    } catch (e) {
+      if (e instanceof NotFoundException) {
+        throw new NotFoundException({
+          code: ErrorCodes.ROOM_NOT_FOUND,
+          message: 'Chat room not found',
+        });
+      }
+      throw e;
+    }
 
     const safeLimit = Math.min(Math.max(1, limit), 100);
 
@@ -3385,6 +3397,43 @@ export class ChatService implements OnModuleInit {
         message: `Poll must have at least ${CHAT_POLL_MIN_OPTIONS} unique non-empty options`,
       });
     }
+    // Audit 2026-10-03 (FAL-002): question + tiap opsi melewati detektor
+    // anti-circumvention yang sama seperti pesan biasa (moderateText) — nomor
+    // WA/tautan/ajakan "lanjut di luar app" tidak boleh lolos lewat polling.
+    const pollTexts = [question, ...options];
+    const pollVerdicts = pollTexts.map((text) =>
+      moderateText(text, { maxAction: this.circumventionAction() }),
+    );
+    const blockedPollVerdict = pollVerdicts.find((verdict) => verdict.blocked);
+    if (blockedPollVerdict) {
+      // Polling tidak disimpan, jadi event moderasi adalah satu-satunya jejak.
+      await this.recordModerationEvents({
+        room,
+        userId,
+        verdict: blockedPollVerdict,
+        messageId: null,
+      });
+      throw new BadRequestException({
+        code: ErrorCodes.CHAT_MESSAGE_BLOCKED,
+        message: blockedPollVerdict.blockReason ?? 'Polling tidak dapat dibuat karena melanggar kebijakan Kahade.',
+      });
+    }
+    // Redacted → sanitasi seperti sendMessage; dedupe ulang karena sanitasi
+    // bisa menggabungkan opsi yang tadinya unik.
+    const sanitizedQuestion = sanitizeText(pollVerdicts[0].text.trim()).slice(0, CHAT_POLL_QUESTION_MAX_LENGTH);
+    const sanitizedOptions = [
+      ...new Set(
+        pollVerdicts.slice(1).map((verdict) => sanitizeText(verdict.text.trim())).filter((o) => o.length > 0),
+      ),
+    ];
+    if (sanitizedOptions.length < CHAT_POLL_MIN_OPTIONS) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: `Poll must have at least ${CHAT_POLL_MIN_OPTIONS} unique non-empty options after moderation`,
+      });
+    }
+    const finalQuestion = sanitizedQuestion;
+    const finalOptions = sanitizedOptions;
     let deadline: Date | null = null;
     if (dto.deadline) {
       deadline = new Date(dto.deadline);
@@ -3395,20 +3444,20 @@ export class ChatService implements OnModuleInit {
     const poll = await this.prisma.chatPoll.create({
       data: {
         roomId,
-        question: question.slice(0, CHAT_POLL_QUESTION_MAX_LENGTH),
-        options,
+        question: finalQuestion.slice(0, CHAT_POLL_QUESTION_MAX_LENGTH),
+        options: finalOptions,
         allowMultiple: dto.allowMultiple === true,
         deadline,
         createdById: userId,
       },
       select: { id: true },
     });
-    this.emitChatEvent(room, 'chat.poll_created', { roomId, pollId: poll.id, question });
+    this.emitChatEvent(room, 'chat.poll_created', { roomId, pollId: poll.id, question: finalQuestion });
 
     // Polling sebagai pesan: buat ChatMessage bertipe POLL agar polling
     // muncul di thread chat seperti pesan biasa (realtime chat.new_message).
     // Event chat.poll_created di atas TETAP di-emit (kompatibilitas klien lama).
-    const pollQuestion = question.slice(0, CHAT_POLL_QUESTION_MAX_LENGTH);
+    const pollQuestion = finalQuestion.slice(0, CHAT_POLL_QUESTION_MAX_LENGTH);
     const pollMessage = (await this.prisma.chatMessage.create({
       data: {
         id: createId(),
@@ -3481,7 +3530,7 @@ export class ChatService implements OnModuleInit {
     return this.serializePoll(pollId, userId);
   }
 
-  private async serializePoll(pollId: string, viewerId: string): Promise<object> {
+  private async serializePoll(pollId: string, viewerId: string | null): Promise<object> {
     const poll = await this.prisma.chatPoll.findUnique({
       where: { id: pollId },
       select: POLL_MESSAGE_SELECT,
@@ -3548,6 +3597,25 @@ export class ChatService implements OnModuleInit {
     await this.prisma.chatPoll.update({ where: { id: pollId }, data: { isClosed: true } });
     this.emitChatEvent(room, 'chat.poll_closed', { roomId, pollId });
     return this.serializePoll(pollId, userId);
+  }
+
+  /**
+   * Audit 2026-10-03 (FAL-003): penutupan paksa polling oleh admin Trust &
+   * Safety (bypass pembuat). Tidak memeriksa akses room — otorisasi di lapisan
+   * admin (AdminRolesGuard). Memancarkan event 'chat.poll_closed' agar klien
+   * yang sedang membuka room memperbarui kartu polling.
+   */
+  async closePollByAdmin(pollId: string): Promise<object> {
+    const poll = await this.prisma.chatPoll.findUnique({
+      where: { id: pollId },
+      select: { id: true, roomId: true, isClosed: true },
+    });
+    if (!poll) {
+      throw new NotFoundException({ code: ErrorCodes.CHAT_POLL_NOT_FOUND, message: 'Poll not found' });
+    }
+    await this.prisma.chatPoll.update({ where: { id: pollId }, data: { isClosed: true } });
+    this.realtime.emitToChatRoom(poll.roomId, 'chat.poll_closed', { roomId: poll.roomId, pollId });
+    return this.serializePoll(pollId, null);
   }
 
   // ============================================================

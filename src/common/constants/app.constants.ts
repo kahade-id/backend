@@ -124,6 +124,10 @@ export const CHAT_POLL_MAX_OPTIONS = 10;
 export const CHAT_POLL_QUESTION_MAX_LENGTH = 300;
 // Batch 43 BE-CHAT: template balasan "/" — maks 50 template per user.
 export const CHAT_MAX_REPLY_TEMPLATES_PER_USER = 50;
+// Audit 2026-10-03 (BFE-002): satu angka batas ukuran lampiran chat — dipakai
+// di FileInterceptor upload (controller) DAN @Max ChatAttachmentDto.fileSize.
+// Harus sama dengan batas UploadPurpose.CHAT_ATTACHMENT (50 MiB).
+export const CHAT_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 
 export const TYPING_SERVER_AUTO_STOP_MS = 4000;
 /**

@@ -37,7 +37,12 @@ import {
   WalletTransactionStatus,
   WalletTransactionType,
 } from '@prisma/client';
-import { toIdr } from '../../common/utils/currency.util';
+import { toIdr, formatSen } from '../../common/utils/currency.util';
+import {
+  renderNotificationCopy,
+  resolveNotificationLanguage,
+  type NotificationCopyParams,
+} from '../notifications/notification-copy.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { generateDisputeId, generateNotifId, generateWalletTxId } from '../../common/utils/id-generator.util';
 import { DISPUTE_SLA_HOURS } from '../../common/constants/app.constants';
@@ -283,6 +288,27 @@ export class MilestonesService {
     }
   }
 
+  /**
+   * SYS-C-105 (audit sistemik ronde 3, 2026-10-03): varian notifyUser yang
+   * me-render copy dari template kanonis sesuai bahasa preferensi user.
+   * Dipakai di call-site yang template-nya mencakup semua nuansa semantik;
+   * call-site dengan nuansa khusus (aktor dinamis, batch multi-tahap)
+   * tetap memakai notifyUser(title, body) dengan catatan TODO SYS-C-105.
+   */
+  private async notifyUserLocalized(
+    userId: string,
+    type: NotificationType,
+    params: NotificationCopyParams,
+    refId: string,
+  ) {
+    const copy = renderNotificationCopy(
+      type,
+      await resolveNotificationLanguage(this.prisma, userId),
+      params,
+    );
+    return this.notifyUser(userId, type, copy.title, copy.body, refId);
+  }
+
   // ------------------------------------------------------------ read (G200)
 
   /** Daftar milestone sebuah order + ringkasan dana (G193, G200). */
@@ -513,11 +539,10 @@ export class MilestonesService {
       return created;
     });
 
-    await this.notifyUser(
+    await this.notifyUserLocalized(
       order.buyerId,
       NotificationType.MILESTONE_SUBMITTED,
-      'Rencana Tahap Order',
-      `Penjual membuat rencana ${result.length} tahap untuk order "${order.title}".`,
+      { seq: '1', title: dto.milestones[0]?.title ?? '', orderTitle: order.title },
       result[0].id,
     );
     return { orderId: order.orderId, count: result.length, milestoneIds: result.map((m) => m.id) };
@@ -629,6 +654,8 @@ export class MilestonesService {
       } as Prisma.InputJsonValue);
     });
     const otherPartyId = isBuyer ? order.sellerId : order.buyerId;
+    // TODO SYS-C-105: copy aktor-dinamis (pembeli/penjual mengajukan perubahan)
+    // butuh varian template — belum dimigrasi ke notifyUserLocalized.
     await this.notifyUser(
       otherPartyId,
       NotificationType.MILESTONE_SUBMITTED,
@@ -784,11 +811,10 @@ export class MilestonesService {
         ...(note?.trim() ? { note: note.trim() } : {}),
       } as Prisma.InputJsonValue);
     });
-    await this.notifyUser(
+    await this.notifyUserLocalized(
       milestone.order.buyerId,
       NotificationType.MILESTONE_SUBMITTED,
-      'Tahap Diserahkan',
-      `Penjual menyerahkan tahap ${milestone.seq} "${milestone.title}". Mohon tinjau dalam 3 hari.`,
+      { seq: String(milestone.seq), title: milestone.title, orderTitle: milestone.order.title },
       milestoneId,
     );
     return { id: milestoneId, reviewDeadline };
@@ -861,11 +887,10 @@ export class MilestonesService {
         round: milestone.revisionRounds + 1,
       } as Prisma.InputJsonValue);
     });
-    await this.notifyUser(
+    await this.notifyUserLocalized(
       milestone.order.sellerId,
       NotificationType.MILESTONE_REVISION_REQUESTED,
-      'Revisi Diminta',
-      `Pembeli meminta revisi tahap ${milestone.seq} "${milestone.title}".`,
+      { seq: String(milestone.seq), title: milestone.title, orderTitle: milestone.order.title, note: '' },
       milestoneId,
     );
     return { id: milestoneId, revisionRound: milestone.revisionRounds + 1 };
@@ -911,14 +936,17 @@ export class MilestonesService {
       await this.runPostCommitMilestoneRelease(released.danaDisbursement);
     }
 
-    const noWallet = this.isNoWalletMode();
-    await this.notifyUser(
+    // SYS-C-105: nuansa destinasi (rekening bank vs wallet) ikut di catatan
+    // metadata — template kanonis hanya membawa fakta pencairan + nominal.
+    await this.notifyUserLocalized(
       milestone.order.sellerId,
       NotificationType.MILESTONE_RELEASED,
-      'Dana Tahap Cair',
-      noWallet
-        ? `Tahap ${milestone.seq} "${milestone.title}" diterima pembeli. Dana dicairkan ke rekening bank terdaftar Anda.`
-        : `Tahap ${milestone.seq} "${milestone.title}" diterima pembeli. Dana telah dicairkan ke wallet Anda.`,
+      {
+        amount: formatSen(milestone.amount),
+        seq: String(milestone.seq),
+        title: milestone.title,
+        orderTitle: milestone.order.title,
+      },
       milestoneId,
     );
     return { id: milestoneId, releasedTxId: released.releasedTxId };
@@ -1385,21 +1413,26 @@ export class MilestonesService {
     }
     if (result.skipped) return 'skipped';
 
-    const noWallet = this.isNoWalletMode();
-    await this.notifyUser(
+    await this.notifyUserLocalized(
       milestone.order.buyerId,
       NotificationType.MILESTONE_RELEASED,
-      'Tahap Dicairkan Otomatis',
-      `Tahap ${milestone.seq} "${milestone.title}" dicairkan otomatis setelah 7 hari tanpa pencairan manual.`,
+      {
+        amount: formatSen(milestone.amount),
+        seq: String(milestone.seq),
+        title: milestone.title,
+        orderTitle: milestone.order.title,
+      },
       milestoneId,
     );
-    await this.notifyUser(
+    await this.notifyUserLocalized(
       milestone.order.sellerId,
       NotificationType.MILESTONE_RELEASED,
-      'Dana Tahap Cair Otomatis',
-      noWallet
-        ? `Tahap ${milestone.seq} "${milestone.title}" dicairkan otomatis ke rekening bank terdaftar Anda.`
-        : `Tahap ${milestone.seq} "${milestone.title}" dicairkan otomatis ke wallet Anda.`,
+      {
+        amount: formatSen(milestone.amount),
+        seq: String(milestone.seq),
+        title: milestone.title,
+        orderTitle: milestone.order.title,
+      },
       milestoneId,
     );
     return 'released';
@@ -1588,6 +1621,8 @@ export class MilestonesService {
       return { cancelled: remaining.length, refundedAmount: refunded };
     });
 
+    // TODO SYS-C-105: pembatalan batch (N tahap + info refund) tidak pas dengan
+    // template MILESTONE_CANCELLED yang per-tahap — butuh varian template batch.
     await this.notifyUser(
       role === MilestoneActorType.BUYER ? order.sellerId : order.buyerId,
       NotificationType.MILESTONE_CANCELLED,
@@ -1709,6 +1744,8 @@ export class MilestonesService {
       refunded += m.escrowHeld;
     }
 
+    // TODO SYS-C-105: pembatalan batch (N tahap + info refund) tidak pas dengan
+    // template MILESTONE_CANCELLED yang per-tahap — butuh varian template batch.
     await this.notifyUser(
       role === MilestoneActorType.BUYER ? order.sellerId : order.buyerId,
       NotificationType.MILESTONE_CANCELLED,

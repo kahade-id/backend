@@ -13,6 +13,7 @@ import { CreateHandoffDto, HandoffQueryDto } from './dto/create-handoff.dto';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditAction } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
+import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
 import { bcryptHash } from '../../../common/utils/crypto.util';
 import { BCRYPT_ROUNDS_ADMIN } from '../../../common/constants/app.constants';
 import { escapeLikePattern } from '../../../common/utils/search.util';
@@ -1009,13 +1010,15 @@ export class AdminManagementService {
       where.action = filters.action as AuditAction;
     }
     const createdAt: Record<string, Date> = {};
+    // SYS-C-301: tanggal kalender diperlakukan sebagai hari WIB, bukan
+    // UTC midnight dari new Date() mentah.
     if (filters.from) {
-      const from = new Date(filters.from);
-      if (!Number.isNaN(from.getTime())) createdAt.gte = from;
+      const from = parseDateBoundaryWIB(filters.from, 'start');
+      if (from) createdAt.gte = from;
     }
     if (filters.to) {
-      const to = new Date(filters.to);
-      if (!Number.isNaN(to.getTime())) createdAt.lte = to;
+      const to = parseDateBoundaryWIB(filters.to, 'end');
+      if (to) createdAt.lte = to;
     }
     if (Object.keys(createdAt).length > 0) where.createdAt = createdAt;
     return where;

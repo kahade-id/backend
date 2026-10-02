@@ -18,6 +18,7 @@ import { NotificationsService } from '../../notifications/notifications.service'
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
+import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
 import {
   AdminFeedbackAssignDto,
   AdminFeedbackCloseDto,
@@ -134,10 +135,14 @@ export class AdminFeedbackService {
     if (query.status) where.status = query.status;
     if (query.account === 'guest') where.userId = null;
     if (query.account === 'user') where.userId = { not: null };
+    // SYS-C-301: batas tanggal kalender diperlakukan sebagai hari WIB
+    // (00:00:00–23:59:59.999 Asia/Jakarta), bukan UTC midnight.
     if (query.dateFrom || query.dateTo) {
+      const gte = query.dateFrom ? parseDateBoundaryWIB(query.dateFrom, 'start') : undefined;
+      const lte = query.dateTo ? parseDateBoundaryWIB(query.dateTo, 'end') : undefined;
       where.createdAt = {
-        ...(query.dateFrom ? { gte: new Date(query.dateFrom) } : {}),
-        ...(query.dateTo ? { lte: new Date(query.dateTo) } : {}),
+        ...(gte ? { gte } : {}),
+        ...(lte ? { lte } : {}),
       };
     }
     // G156: pencarian teks aman (parameterized contains, panjang dibatasi DTO)

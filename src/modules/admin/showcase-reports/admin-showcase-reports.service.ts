@@ -13,6 +13,7 @@ import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import { AuditAction, Prisma, ReportStatus, NotificationType, UserAuditAction, AdminRole } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
+import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
 import { mapWithConcurrency } from '../../../common/utils/bounded-concurrency.util';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { ShowcaseReportAction } from './dto/review-showcase-report.dto';
@@ -1810,9 +1811,13 @@ export class AdminShowcaseReportsService {
       where.status = query.status as Prisma.EnumReportStatusFilter;
     }
     if (query.from || query.to) {
+      // SYS-C-301: tanggal kalender = hari WIB (ekspor CSV/JSON — new Date()
+      // mentah bisa memotong data hampir sehari penuh di batas atas).
       where.createdAt = {};
-      if (query.from) where.createdAt.gte = new Date(query.from);
-      if (query.to) where.createdAt.lte = new Date(query.to);
+      const gte = query.from ? parseDateBoundaryWIB(query.from, 'start') : undefined;
+      const lte = query.to ? parseDateBoundaryWIB(query.to, 'end') : undefined;
+      if (gte) where.createdAt.gte = gte;
+      if (lte) where.createdAt.lte = lte;
     }
 
     const take = Math.min(query.limit ?? EXPORT_MAX_ROWS, EXPORT_MAX_ROWS);

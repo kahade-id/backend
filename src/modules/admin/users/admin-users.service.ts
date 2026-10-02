@@ -15,6 +15,7 @@ import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial
 import { toSen, toIdr, formatIdr } from '../../../common/utils/currency.util';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import * as ErrorCodes from '../../../common/constants/error-codes';
+import { parseDateBoundaryWIB } from '../../../common/utils/date.util';
 import { OtpService } from '../../auth/otp.service';
 import { withCsvExportWatermark } from '../../../common/utils/csv-watermark.util';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
@@ -1263,8 +1264,10 @@ export class AdminUsersService implements OnModuleInit {
     const kindOk = (source: 'system' | 'admin'): boolean =>
       !kindFilter || source === kindFilter;
     const actorFilter = query.actor;
-    const from = query.from ? new Date(query.from) : undefined;
-    const to = query.to ? new Date(query.to) : undefined;
+    // SYS-C-301: tanggal kalender diperlakukan sebagai hari WIB,
+    // bukan UTC midnight dari new Date() mentah.
+    const from = query.from ? parseDateBoundaryWIB(query.from, 'start') : undefined;
+    const to = query.to ? parseDateBoundaryWIB(query.to, 'end') : undefined;
     // BAI-061/BAI-073: paginasi nyata — page/limit dari DTO dipatuhi, bukan
     // selalu 200 pertama. limit di-cap 100 oleh PaginationDto.
     const page = query.page ?? 1;

@@ -1,6 +1,7 @@
 import { Body, Controller, Get, HttpCode, Ip, Post, Query, UseGuards } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { Idempotency } from '../../common/decorators/idempotency.decorator';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import { LegacyPayoutService } from './legacy-payout.service';
 import { EscrowDisbursementService } from './escrow-disbursement.service';
@@ -25,6 +26,9 @@ export class LegacyPayoutController {
   @UseGuards(UserThrottleGuard)
   @Post()
   @HttpCode(200)
+  // SYS-B-102: payout satu arah adalah pergerakan uang — wajib Idempotency-Key
+  // (UUID v4) di header; double submit tidak men-debit ganda.
+  @Idempotency()
   async request(
     @CurrentUser('sub') userId: string,
     @Body() dto: LegacyPayoutDto,

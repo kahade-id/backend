@@ -492,10 +492,11 @@ export class ApprovalsService {
       // Batas 5000 mengikuti UpdateConfigDto (nilai finansial praktis kecil).
       case 'SYSTEM_CONFIG_CHANGE': {
         if (!targetId) bad('targetId (key config) wajib');
-        if (typeof payload.value !== 'string' || payload.value.trim().length === 0) {
+        const cfgValue: unknown = payload.value;
+        if (typeof cfgValue !== 'string' || cfgValue.trim().length === 0) {
           bad('payload.value (string tak-kosong) wajib');
         }
-        if (payload.value.length > 5000) bad('payload.value maksimal 5000 karakter');
+        if ((cfgValue as string).length > 5000) bad('payload.value maksimal 5000 karakter');
         if (payload.description !== undefined && typeof payload.description !== 'string') {
           bad('payload.description harus string bila diisi');
         }

@@ -361,7 +361,9 @@ export class AdminDisbursementService implements OnModuleInit {
       data: {
         status: nextStatus,
         lastError: note,
-        ...(nextStatus === EscrowDisbursementStatus.SUCCESS ? { releasedAt: new Date() } : {}),
+        // SYS-B-401: FORCE_SUCCESS tidak lagi dieksekusi langsung — selalu via
+        // dual control (requestForceSuccess → executor). nextStatus di sini
+        // hanya PENDING (RETRY) atau CANCELLED; tidak ada cabang SUCCESS.
       },
     });
 

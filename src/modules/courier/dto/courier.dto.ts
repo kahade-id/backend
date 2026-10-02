@@ -124,6 +124,30 @@ export class ManualResiDto {
 }
 
 /**
+ * Body POST /v1/courier/shipments/:id/refunds (user-facing).
+ * Dipertahankan SYS-D-002: dipakai CourierController, bukan bagian klaster
+ * admin mati yang dihapus.
+ */
+export class RequestRefundDto {
+  @IsNumber() @Min(1)
+  amount!: number;
+
+  @IsString() @IsNotEmpty() @MinLength(5) @MaxLength(500)
+  reason!: string;
+}
+
+/**
+ * SYS-B-501: body keputusan refund admin (REQUESTED → APPROVED/REJECTED).
+ */
+export class DecideRefundDto {
+  @IsString() @IsIn(['APPROVED', 'REJECTED'])
+  decision!: 'APPROVED' | 'REJECTED';
+
+  @IsString() @IsOptional() @MaxLength(500)
+  note?: string;
+}
+
+/**
  * Wave 2 integritas-139: body PATCH /v1/admin/courier/providers/:providerCode.
  * Operasional provider: on/off global, daftar wilayah allow/block, prioritas.
  */

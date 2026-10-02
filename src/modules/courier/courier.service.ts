@@ -40,12 +40,41 @@ import {
   ApproveShippingRefundDto,
   BookShipmentDto,
   CreateShipmentDto,
+  DecideRefundDto,
   ManualResiDto,
   QuoteRequestDto,
   RequestRefundDto,
   UpdateAdminProviderFlagDto,
   VoidShipmentDto,
 } from './dto/courier.dto';
+
+/**
+ * SYS-B-501: validasi nominal refund ongkir — fail-closed.
+ *
+ * cap = costBase − refundedAmount: total refund tidak boleh melebihi biaya
+ * ongkir yang benar-benar terjadi (aktual bila sudah ada, kalau belum maka
+ * estimasi). Seluruh nominal dalam BigInt agar presisi aman.
+ *
+ * Throw BadRequestException (400) bila amount ≤ 0 atau melebihi sisa.
+ */
+export function validateShippingRefundAmount(
+  shipment: { costBase: bigint; refundedAmount: bigint },
+  amount: bigint,
+): void {
+  if (amount <= 0n) {
+    throw new BadRequestException({
+      code: ErrorCodes.VALIDATION_ERROR,
+      message: 'Nominal refund harus lebih dari 0',
+    });
+  }
+  const remaining = shipment.costBase - shipment.refundedAmount;
+  if (amount > remaining) {
+    throw new BadRequestException({
+      code: ErrorCodes.VALIDATION_ERROR,
+      message: `Nominal refund (${amount}) melebihi sisa biaya yang bisa di-refund (${remaining})`,
+    });
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Normalisasi event provider → status internal (G236)
@@ -924,11 +953,103 @@ export class CourierService {
   }
 
   // -------------------------------------------------------------------------
+  // State machine refund ongkir: REQUESTED → APPROVED → PAID (tidak pernah
+  // menyentuh wallet langsung; payout mengikuti alur markRefundPaid).
+  // SYS-B-501: SEMUA pintu nominal (request, decide-APPROVED, mark-paid,
+  // admin approve) wajib lewat validateShippingRefundAmount — cap =
+  // costBase − refundedAmount.
+  // -------------------------------------------------------------------------
+
+  /** Putuskan refund (REQUESTED → APPROVED/REJECTED) — admin. */
+  async decideRefund(refundId: string, dto: DecideRefundDto, adminId: string) {
+    const refund = await this.prisma.shippingCostRefund.findUnique({ where: { id: refundId } });
+    if (!refund) throw new NotFoundException({ code: ErrorCodes.SHIPPING_REFUND_NOT_FOUND, message: 'Refund tidak ditemukan' });
+    if (refund.status !== 'REQUESTED') {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Refund sudah diputus' });
+    }
+    // SYS-B-501: keputusan APPROVED memvalidasi ulang nominal terhadap sisa.
+    if (dto.decision === 'APPROVED') {
+      const shipment = await this.prisma.shipment.findUnique({ where: { id: refund.shipmentId } });
+      if (!shipment) throw new NotFoundException({ code: ErrorCodes.SHIPMENT_NOT_FOUND, message: 'Pengiriman tidak ditemukan' });
+      validateShippingRefundAmount(
+        { costBase: shipment.actualCost ?? shipment.estimatedCost, refundedAmount: shipment.refundedAmount },
+        refund.amount,
+      );
+    }
+    const updated = await this.prisma.shippingCostRefund.update({
+      where: { id: refundId },
+      data: {
+        status: dto.decision as ShippingRefundStatus,
+        decidedBy: adminId,
+        decidedAt: new Date(),
+        reason: dto.note ? `${refund.reason}\n[Admin] ${dto.note}` : refund.reason,
+      },
+    });
+    this.logger.log(`Refund ongkir ${refundId} diputus ${dto.decision} oleh admin=${adminId}`);
+    return { ...updated, amount: updated.amount.toString() };
+  }
+
+  /** Tandai refund sudah dibayar — menambah refundedAmount di shipment (audit). */
+  async markRefundPaid(refundId: string, adminId: string) {
+    const refund = await this.prisma.shippingCostRefund.findUnique({ where: { id: refundId } });
+    if (!refund) throw new NotFoundException({ code: ErrorCodes.SHIPPING_REFUND_NOT_FOUND, message: 'Refund tidak ditemukan' });
+    if (refund.status !== 'APPROVED') {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Hanya refund APPROVED yang bisa ditandai dibayar' });
+    }
+    const shipment = await this.prisma.shipment.findUnique({ where: { id: refund.shipmentId } });
+    if (!shipment) throw new NotFoundException({ code: ErrorCodes.SHIPMENT_NOT_FOUND, message: 'Pengiriman tidak ditemukan' });
+    // SYS-B-501: pemeriksaan cap terakhir sebelum refundedAmount bertambah.
+    validateShippingRefundAmount(
+      { costBase: shipment.actualCost ?? shipment.estimatedCost, refundedAmount: shipment.refundedAmount },
+      refund.amount,
+    );
+    const [updated] = await this.prisma.$transaction([
+      this.prisma.shippingCostRefund.update({ where: { id: refundId }, data: { status: 'PAID' } }),
+      this.prisma.shipment.update({
+        where: { id: refund.shipmentId },
+        data: { refundedAmount: { increment: refund.amount } },
+      }),
+    ]);
+    this.logger.log(`Refund ongkir ${refundId} ditandai PAID oleh admin=${adminId}`);
+    return { ...updated, amount: updated.amount.toString() };
+  }
+
+  // -------------------------------------------------------------------------
   // Wave 2 integritas-139: endpoint yang dipanggil halaman admin kurir aktif.
   // Guard role di controller; semua mutasi finansial memakai state machine
   // refund yang sudah ada (REQUESTED → APPROVED → PAID) dan TIDAK menyentuh
   // wallet langsung.
   // -------------------------------------------------------------------------
+
+  /**
+   * Pengajuan refund ongkir oleh user (POST /v1/courier/shipments/:id/refunds).
+   * Dipertahankan SYS-D-002: dipakai CourierController user-facing (bukan
+   * bagian klaster admin mati yang dihapus).
+   */
+  async requestRefund(userId: string, shipmentId: string, dto: RequestRefundDto) {
+    const shipment = await this.prisma.shipment.findUnique({ where: { id: shipmentId } });
+    if (!shipment) throw new NotFoundException({ code: ErrorCodes.SHIPMENT_NOT_FOUND, message: 'Pengiriman tidak ditemukan' });
+    if (shipment.sellerId !== userId && shipment.buyerId !== userId) {
+      throw new ForbiddenException({ code: ErrorCodes.SHIPMENT_NOT_ORDER_PARTICIPANT, message: 'Bukan pihak order ini' });
+    }
+    // SYS-B-501: tolak nominal > sisa sejak awal — bukan saat approve saja.
+    const amount = BigInt(Math.round(dto.amount));
+    validateShippingRefundAmount(
+      { costBase: shipment.actualCost ?? shipment.estimatedCost, refundedAmount: shipment.refundedAmount },
+      amount,
+    );
+    const refund = await this.prisma.shippingCostRefund.create({
+      data: {
+        id: randomUUID(),
+        shipmentId,
+        orderId: shipment.orderId,
+        amount,
+        reason: dto.reason,
+        requestedBy: userId,
+      },
+    });
+    return { ...refund, amount: refund.amount.toString() };
+  }
 
   /** Daftar shipment untuk halaman admin (filter bookingState/status/provider/stale/search). */
   async listAdminShipments(query: {
@@ -1119,14 +1240,11 @@ export class CourierService {
       throw new NotFoundException({ code: ErrorCodes.SHIPMENT_NOT_FOUND, message: 'Pengiriman tidak ditemukan' });
     }
     const amount = BigInt(dto.amountSen);
-    const costBase = shipment.actualCost ?? shipment.estimatedCost;
-    const remaining = costBase - shipment.refundedAmount;
-    if (amount > remaining) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
-        message: `Nominal refund (${amount}) melebihi sisa biaya yang bisa di-refund (${remaining})`,
-      });
-    }
+    // SYS-B-501: validasi terpusat — cap = costBase − refundedAmount.
+    validateShippingRefundAmount(
+      { costBase: shipment.actualCost ?? shipment.estimatedCost, refundedAmount: shipment.refundedAmount },
+      amount,
+    );
     const now = new Date();
     const refund = await this.prisma.$transaction(async (tx) => {
       const created = await tx.shippingCostRefund.create({

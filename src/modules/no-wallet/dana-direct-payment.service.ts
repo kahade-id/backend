@@ -36,6 +36,8 @@ export function generateDanaPartnerReferenceNo(): string {
   return `KDH-${randomBytes(9).toString('base64url').toUpperCase().replace(/[^A-Z0-9]/g, 'X').slice(0, 12)}`;
 }
 
+export type DanaDirectSettleStatus = 'SETTLED' | 'ALREADY_SETTLED' | 'NOT_PENDING';
+
 export interface DanaDirectPayResult {
   paymentTxId: string;
   orderId: string;
@@ -160,7 +162,10 @@ export class DanaDirectPaymentService {
   private expiryAt(): Date {
     const configured =
       this.config.get<number>('app.danaDirectExpiryMinutes') ?? DEFAULT_DANA_EXPIRY_MINUTES;
-    const minutes = Math.min(Math.max(Math.floor(configured), 5), 24 * 60);
+    // SEC-208: 30 menit adalah BATAS KERAS provider DANA (validUpTo) — expiredAt
+    // DB tidak boleh melebihinya, atau buyer menatap QR/VA yang sebenarnya
+    // sudah mati di DANA dan tak bisa buat charge baru sampai expiredAt DB lewat.
+    const minutes = Math.min(Math.max(Math.floor(configured), 5), 30);
     return new Date(Date.now() + minutes * 60_000);
   }
 
@@ -272,9 +277,14 @@ export class DanaDirectPaymentService {
       orderBy: { createdAt: 'desc' },
     });
     if (activePayment) {
-      // Charge PENDING yang masih hidup dikembalikan (idempoten) — buyer
-      // melanjutkan pembayaran yang sama, bukan charge ganda.
-      return this.serialize(activePayment, orderId);
+      if (activePayment.danaPayKind === payKind) {
+        // Charge PENDING yang masih hidup dikembalikan (idempoten) — buyer
+        // melanjutkan pembayaran yang sama, bukan charge ganda.
+        return this.serialize(activePayment, orderId);
+      }
+      // BFE-074: payKind BERUBAH (mis. QRIS → VA) — charge PENDING lama tidak
+      // bisa dipakai ulang; tandai CANCELLED di dalam tx pembuatan charge baru
+      // (di bawah) agar tidak ada dua charge hidup untuk satu order.
     }
 
     const escrowAmount = toIdr(order.buyerPayAmount);
@@ -302,6 +312,15 @@ export class DanaDirectPaymentService {
         },
         data: { status: PaymentStatus.EXPIRED, failedAt: now },
       });
+      // BFE-074: charge PENDING lama dengan payKind berbeda dibatalkan di tx
+      // yang sama (guard status PENDING — bila sudah ter-settle konkuren,
+      // count=0 dan charge itu dibiarkan apa adanya).
+      if (activePayment && activePayment.danaPayKind !== payKind) {
+        await tx.paymentTransaction.updateMany({
+          where: { id: activePayment.id, status: PaymentStatus.PENDING },
+          data: { status: PaymentStatus.CANCELLED, failedAt: now },
+        });
+      }
       return tx.paymentTransaction.create({
         data: {
           midtransOrderId: paymentTxId,
@@ -454,17 +473,27 @@ export class DanaDirectPaymentService {
    * TIDAK menyentuh wallet: escrow "pot"-nya adalah PaymentTransaction
    * (status SUCCESS, purpose ORDER_ESCROW, provider DANA); order → PROCESSING.
    * Dana hanya numpang lewat: buyer → DANA → escrow → (release) rekening bank seller.
+   *
+   * SEC-201: mengembalikan status eksplisit (bukan silent return) —
+   * - 'SETTLED': escrow didanai (payment PENDING → SUCCESS, order → PROCESSING).
+   * - 'ALREADY_SETTLED': payment sudah SUCCESS/REFUNDED — idempoten, tanpa aksi.
+   * - 'NOT_PENDING': payment tidak dalam status PENDING yang bisa di-settle
+   *   (mis. CANCELLED/EXPIRED/FAILED — skenario "dibatalkan lalu tetap dibayar"
+   *   di DANA). Caller WAJIB me-refund ke pembayar, JANGAN menandai SUCCESS.
    */
-  async settleEscrow(paymentDbId: string): Promise<void> {
-    await this.prisma.$transaction(
+  async settleEscrow(paymentDbId: string): Promise<DanaDirectSettleStatus> {
+    return this.prisma.$transaction(
       async tx => {
         const payment = await tx.paymentTransaction.findUnique({
           where: { id: paymentDbId },
           include: { order: true },
         });
-        if (!payment || payment.purpose !== PaymentPurpose.ORDER_ESCROW) return;
+        if (!payment || payment.purpose !== PaymentPurpose.ORDER_ESCROW) return 'NOT_PENDING';
         // Idempoten: webhook retry / race tidak double-settle.
-        if (payment.status !== PaymentStatus.PENDING) return;
+        if (payment.status === PaymentStatus.SUCCESS || payment.status === PaymentStatus.REFUNDED) {
+          return 'ALREADY_SETTLED';
+        }
+        if (payment.status !== PaymentStatus.PENDING) return 'NOT_PENDING';
         const order = payment.order;
         if (!order) {
           // Order terhapus — tandai SUCCESS agar tidak retry; dana dikembalikan
@@ -543,6 +572,7 @@ export class DanaDirectPaymentService {
           where: { id: payment.id },
           data: { status: PaymentStatus.SUCCESS, paidAt: new Date(), settledAt: new Date() },
         });
+        return 'SETTLED';
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );

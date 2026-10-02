@@ -131,6 +131,9 @@ describe('DanaDirectPaymentService.initiate', () => {
       grossAmount: BigInt(1510500),
       expiredAt: new Date(),
       danaPayKind: 'QRIS',
+      refundedAmount: BigInt(0),
+      refundRequestedAt: null,
+      refundReference: null,
       ...(args.data as object),
     }));
 
@@ -164,6 +167,9 @@ describe('DanaDirectPaymentService.initiate', () => {
       expiredAt: new Date(Date.now() + 600000),
       danaPayKind: 'BALANCE',
       providerInstructions: {},
+      refundedAmount: BigInt(0),
+      refundRequestedAt: null,
+      refundReference: null,
     });
     const res = await build(prisma).initiate('ORD-20260929-000001', 'buyer-1', {
       payKind: DanaDirectPayKind.BALANCE,
@@ -192,6 +198,9 @@ describe('DanaDirectPaymentService.initiate', () => {
       grossAmount: BigInt(1500000),
       expiredAt: new Date(),
       danaPayKind: 'VA',
+      refundedAmount: BigInt(0),
+      refundRequestedAt: null,
+      refundReference: null,
       ...(args.data as object),
     }));
     const res = await build(prisma).initiate('ORD-20260929-000001', 'buyer-1', {
@@ -204,6 +213,54 @@ describe('DanaDirectPaymentService.initiate', () => {
     const created = txMocks.paymentTransactionCreate.mock.calls[0][0].data as Record<string, unknown>;
     expect(created.method).toBe('VIRTUAL_ACCOUNT_BCA');
     expect(res.paymentCode).toBe('88081234567890');
+  });
+
+  it('BFE-074: charge PENDING lama dengan payKind BERBEDA ditandai CANCELLED dalam tx yang sama', async () => {
+    const { prisma, txMocks } = buildPrisma();
+    (prisma.order.findFirst as jest.Mock).mockResolvedValue(baseOrder);
+    (prisma.paymentTransaction.findFirst as jest.Mock).mockResolvedValue({
+      id: 'pt-old',
+      danaPayKind: 'QRIS', // lama QRIS, baru diminta VA → tidak bisa dipakai ulang
+      status: PaymentStatus.PENDING,
+      expiredAt: new Date(Date.now() + 600000),
+    });
+    danaPayment.createOrder.mockResolvedValue({
+      partnerReferenceNo: 'KDH-NEW',
+      referenceNo: 'DANA-REF-2',
+      paymentCode: '88081234567890',
+      amountIdr: 15105,
+      expiresAt: new Date(),
+    });
+    (prisma.paymentTransaction.update as jest.Mock).mockImplementation(async (args: { data: unknown; where: unknown }) => ({
+      id: 'pt-new',
+      midtransOrderId: 'PAY-NEW',
+      status: PaymentStatus.PENDING,
+      amount: BigInt(1500000),
+      paymentFee: BigInt(10500),
+      grossAmount: BigInt(1510500),
+      expiredAt: new Date(),
+      danaPayKind: 'VA',
+      refundedAmount: BigInt(0),
+      refundRequestedAt: null,
+      refundReference: null,
+      ...(args.data as object),
+    }));
+
+    const res = await build(prisma).initiate('ORD-20260929-000001', 'buyer-1', {
+      payKind: DanaDirectPayKind.VA,
+      bankCode: 'BCA',
+    });
+
+    // Di dalam SATU tx: (1) expire charge basi, (2) CANCELLED charge lama yang
+    // payKind-nya berubah — tidak ada dua charge hidup untuk satu order.
+    const txUpdateManyCalls = (txMocks.paymentTransactionUpdateMany as jest.Mock).mock.calls;
+    expect(txUpdateManyCalls.length).toBe(2);
+    expect(txUpdateManyCalls[1][0]).toEqual({
+      where: { id: 'pt-old', status: PaymentStatus.PENDING },
+      data: { status: PaymentStatus.CANCELLED, failedAt: expect.any(Date) },
+    });
+    expect(txMocks.paymentTransactionCreate).toHaveBeenCalledTimes(1);
+    expect(res.payKind).toBe(DanaDirectPayKind.VA);
   });
 });
 
@@ -225,7 +282,9 @@ describe('DanaDirectPaymentService.settleEscrow', () => {
     txState.orderUpdateMany.mockResolvedValue({ count: 1 });
 
     const svc = new DanaDirectPaymentService(prisma as never, danaPayment as never, config as never, serial as never, walletMode as never);
-    await svc.settleEscrow('pt-1');
+    const status = await svc.settleEscrow('pt-1');
+    // SEC-201: status eksplisit, bukan silent return.
+    expect(status).toBe('SETTLED');
 
     // order → PROCESSING + referensi DANA tersimpan (kolom aditif)
     expect(txState.orderUpdateMany).toHaveBeenCalledWith(
@@ -298,8 +357,38 @@ describe('DanaDirectPaymentService.settleEscrow', () => {
       order: baseOrder,
     });
     const svc = new DanaDirectPaymentService(prisma as never, danaPayment as never, config as never, serial as never, walletMode as never);
-    await svc.settleEscrow('pt-1');
+    // SEC-201: ALREADY_SETTLED (bukan silent) — caller tahu tidak ada aksi.
+    expect(await svc.settleEscrow('pt-1')).toBe('ALREADY_SETTLED');
     expect(txState.orderUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it('SEC-201: payment REFUNDED → ALREADY_SETTLED (tanpa aksi)', async () => {
+    const { prisma, txState } = buildPrisma();
+    txState.paymentTransactionFindUnique.mockResolvedValue({
+      id: 'pt-1',
+      purpose: PaymentPurpose.ORDER_ESCROW,
+      status: PaymentStatus.REFUNDED,
+      order: baseOrder,
+    });
+    const svc = new DanaDirectPaymentService(prisma as never, danaPayment as never, config as never, serial as never, walletMode as never);
+    expect(await svc.settleEscrow('pt-1')).toBe('ALREADY_SETTLED');
+    expect(txState.orderUpdateMany).not.toHaveBeenCalled();
+    expect(txState.paymentTransactionUpdate).not.toHaveBeenCalled();
+  });
+
+  it('SEC-201: payment CANCELLED ("dibatalkan lalu tetap dibayar") → NOT_PENDING, caller wajib refund', async () => {
+    const { prisma, txState } = buildPrisma();
+    txState.paymentTransactionFindUnique.mockResolvedValue({
+      id: 'pt-1',
+      purpose: PaymentPurpose.ORDER_ESCROW,
+      status: PaymentStatus.CANCELLED,
+      order: baseOrder,
+    });
+    const svc = new DanaDirectPaymentService(prisma as never, danaPayment as never, config as never, serial as never, walletMode as never);
+    expect(await svc.settleEscrow('pt-1')).toBe('NOT_PENDING');
+    // TIDAK ada tail update SUCCESS — dana tidak boleh dianggap escrow.
+    expect(txState.orderUpdateMany).not.toHaveBeenCalled();
+    expect(txState.paymentTransactionUpdate).not.toHaveBeenCalled();
   });
 
   it('fail-closed: order tak eligible → lempar DANA_DIRECT_ORDER_INELIGIBLE (webhook me-refund)', async () => {

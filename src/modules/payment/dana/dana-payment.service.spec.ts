@@ -122,9 +122,12 @@ describe('dana-payment.service', () => {
       expect(sentBody.payOptionDetails[0].payMethod).toBe('BALANCE');
     });
 
-    it('additionalInfo selalu memuat field wajib DANA (buyer, mcc, orderTerminalType)', async () => {
-      // Tanpa ketiga field ini DANA mengembalikan 4005401 Invalid Field Format
-      // (terbukti di E2E sandbox 2026-09-29; buyer boleh object kosong).
+    it('additionalInfo selalu memuat field wajib DANA (mcc, orderTerminalType); buyer hanya bila ada externalUserId', async () => {
+      // Tanpa mcc/orderTerminalType/sourcePlatform DANA mengembalikan
+      // 4005401 Invalid Field Format (terbukti E2E sandbox 2026-09-29).
+      // E2E 2026-09-30 (2cd2e7e): object kosong buyer:{} JUSTRU ditolak
+      // DANA ("Invalid Field Format") — buyer hanya dikirim bila ada
+      // buyerExternalUserId, tidak pernah sebagai object kosong.
       mockedAxios.post.mockResolvedValueOnce({
         data: { responseCode: '2005400', referenceNo: 'DANA-REF-4', additionalInfo: { paymentCode: 'X' } },
       });
@@ -136,7 +139,7 @@ describe('dana-payment.service', () => {
         bankCode: 'BRI',
       });
       const sentBody = JSON.parse(mockedAxios.post.mock.calls[0][1] as string);
-      expect(sentBody.additionalInfo.order.buyer).toEqual({});
+      expect(sentBody.additionalInfo.order.buyer).toBeUndefined();
       expect(sentBody.additionalInfo.mcc).toBe('5732');
       expect(sentBody.additionalInfo.envInfo.orderTerminalType).toBe('WEB');
       expect(sentBody.additionalInfo.envInfo.sourcePlatform).toBe('IPG');

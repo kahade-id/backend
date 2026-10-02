@@ -1505,7 +1505,9 @@ export class SubscriptionsService {
       include: { paymentTx: true },
     });
     if (!subscription) {
-      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Subscription not found' });
+      // Audit 2026-10-03 (BFE-080): langganan tidak ada → 404
+      // SUBSCRIPTION_NOT_FOUND (bukan 400 VALIDATION_ERROR).
+      throw new NotFoundException({ code: ErrorCodes.SUBSCRIPTION_NOT_FOUND, message: 'Subscription not found' });
     }
     const pt = subscription.paymentTx;
     const instructions = (pt?.providerInstructions ?? {}) as Record<string, unknown>;
@@ -1691,7 +1693,9 @@ export class SubscriptionsService {
       include: { paymentTx: true },
     });
     if (!subscription) {
-      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Subscription not found' });
+      // Audit 2026-10-03 (BFE-080, pola sama): langganan tidak ada → 404
+      // SUBSCRIPTION_NOT_FOUND (bukan 400 VALIDATION_ERROR).
+      throw new NotFoundException({ code: ErrorCodes.SUBSCRIPTION_NOT_FOUND, message: 'Subscription not found' });
     }
     // Sinkronisasi ringan: tanya Flash bila masih PENDING dan belum kedaluwarsa.
     if (

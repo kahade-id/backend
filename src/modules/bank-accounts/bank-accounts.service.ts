@@ -12,6 +12,7 @@ import { DanaDisbursementService } from '../payment/dana/dana-disbursement.servi
 import { BANK_CODE_TO_SNAP } from '../no-wallet/escrow-disbursement.service';
 import { PasskeyService } from '../auth/passkey.service';
 import { encryptAES, hmacSHA256, decryptAES } from '../../common/utils/crypto.util';
+import { AuditLogService } from '../../common/services/audit-log.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { MAX_BANK_ACCOUNTS } from '../../common/constants/app.constants';
 
@@ -80,6 +81,10 @@ export class BankAccountsService {
     // AuthModule — tetapi assertBankChangeReauth FAIL CLOSED: bila
     // PasskeyService tidak ter-inject, mutasi DITOLAK (bukan dilewati).
     @Optional() private passkeyService?: PasskeyService,
+    // SEC-204 (audit 2026-10-03): audit log untuk upaya verifikasi rekening.
+    // @Optional agar unit test lama yang menginstansiasi service tanpa
+    // AuditLogModule tetap jalan — pemanggilan di-guard (best-effort).
+    @Optional() private auditLog?: AuditLogService,
   ) {}
 
   /**
@@ -223,6 +228,11 @@ export class BankAccountsService {
           this.logger.error(
             `Bank inquiry not verified by DANA for bank=${bankCode}; refusing verification`,
           );
+          // SEC-204: SATU kode error generik untuk SEMUA kegagalan verifikasi
+          // (verified/accountName/similarity) — kode yang dapat dibedakan
+          // (NAME_MISMATCH vs VERIFICATION_FAILED) adalah oracle biner untuk
+          // menebak nama pemilik rekening. Pesan juga disamakan.
+          this.logVerificationAttempt(userId, bankCode, false);
           throw new BadRequestException({
             code: 'BANK_ACCOUNT_VERIFICATION_FAILED',
             message: 'Bank could not verify this account. Please check the account number and try again.',
@@ -234,9 +244,10 @@ export class BankAccountsService {
           this.logger.error(
             `Bank inquiry returned no account name for bank=${bankCode}; refusing verification`,
           );
+          this.logVerificationAttempt(userId, bankCode, false);
           throw new BadRequestException({
-            code: 'BANK_ACCOUNT_NAME_MISMATCH',
-            message: 'Bank account verification did not return an account name.',
+            code: 'BANK_ACCOUNT_VERIFICATION_FAILED',
+            message: 'Bank could not verify this account. Please check the account number and try again.',
           });
         }
         verifiedAccountName = inquiry.accountName;
@@ -247,13 +258,15 @@ export class BankAccountsService {
         );
 
         if (similarity < NAME_SIMILARITY_THRESHOLD) {
+          this.logVerificationAttempt(userId, bankCode, false);
           throw new BadRequestException({
-            code: 'BANK_ACCOUNT_NAME_MISMATCH',
-            message: 'Account name does not match bank records',
+            code: 'BANK_ACCOUNT_VERIFICATION_FAILED',
+            message: 'Bank could not verify this account. Please check the account number and try again.',
           });
         }
 
         isVerified = true;
+        this.logVerificationAttempt(userId, bankCode, true);
       } catch (err) {
         if (err instanceof BadRequestException) {
           throw err;
@@ -368,7 +381,30 @@ export class BankAccountsService {
         throw err;
       });
 
-    return { ...created, accountName: verifiedAccountName };
+    return { ...created, accountName: accountName.trim() };
+  }
+
+  /**
+   * Audit 2026-10-03 (SEC-204): catat setiap upaya verifikasi rekening ke
+   * audit log. TIDAK mencatat PII — hanya bankCode + hasil (tanpa nomor
+   * rekening / nama pemilik), agar log tidak menjadi oracle pengganti.
+   * Best-effort: kegagalan tulis log tidak menggagalkan alur.
+   */
+  private logVerificationAttempt(userId: string, bankCode: string, verified: boolean): void {
+    try {
+      this.auditLog?.logUserAction({
+        userId,
+        action: 'BANK_ACCOUNT_ADDED',
+        entityType: 'BankAccount',
+        entityId: '',
+        description: verified
+          ? `Bank account verification succeeded (bank=${bankCode})`
+          : `Bank account verification failed (bank=${bankCode})`,
+        after: { bankCode, verified },
+      });
+    } catch (err) {
+      this.logger.warn(`Failed to write bank verification audit log: ${(err as Error).message}`);
+    }
   }
 
   async deleteBankAccount(
@@ -513,11 +549,38 @@ export class BankAccountsService {
     const account = await this.prisma.bankAccount.findFirst({ where: { id: bankAccountId, userId, deletedAt: null } });
     if (!account) throw new NotFoundException({ code: ErrorCodes.BANK_ACCOUNT_NOT_FOUND, message: 'Bank account not found' });
     const encrypted = await encryptAES(accountName.trim());
+    // Audit 2026-10-03 (SEC-207): ganti nama pemilik = verifikasi ulang WAJIB.
+    // Nama arbitrer tidak boleh mewarisi flag isVerified=true — kalau tidak,
+    // disbursement fail-closed berulang (BANK_ACCOUNT_NAME_MISMATCH) dan dana
+    // escrow tertahan. Bila akun ini primary, primary-nya ikut dicabut agar
+    // payout tidak mengarah ke rekening yang belum terverifikasi ulang.
     const updated = await this.prisma.bankAccount.update({
       where: { id: bankAccountId },
-      data: { accountName: encrypted },
+      data: {
+        accountName: encrypted,
+        isVerified: false,
+        ...(account.isPrimary ? { isPrimary: false } : {}),
+      },
       select: { id: true, bankCode: true, bankName: true, accountName: true, isPrimary: true, isVerified: true },
     });
-    return { ...updated, accountName: accountName.trim() };
+    try {
+      this.auditLog?.logUserAction({
+        userId,
+        action: 'BANK_ACCOUNT_ADDED',
+        entityType: 'BankAccount',
+        entityId: bankAccountId,
+        description: `Bank account name changed by user — verification reset (bank=${account.bankCode})`,
+        before: { isVerified: account.isVerified, isPrimary: account.isPrimary },
+        after: { isVerified: false, isPrimary: updated.isPrimary },
+      });
+    } catch (err) {
+      this.logger.warn(`Failed to write bank name-change audit log: ${(err as Error).message}`);
+    }
+    return {
+      ...updated,
+      accountName: accountName.trim(),
+      verificationRequired: true,
+      message: 'Nama pemilik rekening diubah. Verifikasi ulang diperlukan sebelum rekening ini dapat dipakai.',
+    };
   }
 }

@@ -345,16 +345,40 @@ export class OrdersController {
    * service QRIS lama HANYA bila tidak ada baris DANA-direct (null) — untuk
    * intent QRIS lawas pra-migrasi. Tanpa fallback ini, FE tidak bisa
    * memulihkan QR/kode VA DANA setelah app restart.
+   *
+   * Audit 2026-10-03 (SEC-401): respons kini memuat status pembayaran
+   * KANONIS `{ orderId, status, paidAt }` di top-level (satu-satunya sumber
+   * kebenaran yang boleh dirender klien sebagai "berhasil" — jangan percaya
+   * query params/deep link). Akses: hanya buyer/seller (selain itu 403).
+   * Field `payment` dipertahankan untuk kompatibilitas klien lama.
    */
   @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Get(':orderId/payment-status')
+  @ApiOperation({
+    summary: 'Status pembayaran kanonis untuk order (SEC-401)',
+    description:
+      'Audit 2026-10-03 (SEC-401): satu-satunya sumber kebenaran status ' +
+      'pembayaran. Frontend WAJIB memanggil ini sebelum merender status sukses ' +
+      '(jangan percaya query params). PAID hanya bila terverifikasi di server.',
+  })
   async getOrderPaymentStatus(
     @CurrentUser('sub') userId: string,
     @Param('orderId', ParseIdPipe) orderId: string,
-  ): Promise<{ payment: DanaDirectPayResult | OrderQrisPaymentResult | null }> {
-    const dana = await this.danaDirectPaymentService.getStatus(orderId, userId);
-    if (dana) return { payment: dana };
-    return { payment: await this.orderQrisPaymentService.getStatus(orderId, userId) };
+  ): Promise<{
+    orderId: string;
+    status: string;
+    paidAt: Date | null;
+    payment: DanaDirectPayResult | OrderQrisPaymentResult | null;
+  }> {
+    const { isBuyer, ...canonical } = await this.ordersService.getCanonicalPaymentStatus(orderId, userId);
+    // Detail intent pembayaran (QR/kode VA) hanya untuk buyer — service
+    // getStatus di bawah memang buyer-only (403 untuk non-buyer).
+    let payment: DanaDirectPayResult | OrderQrisPaymentResult | null = null;
+    if (isBuyer) {
+      const dana = await this.danaDirectPaymentService.getStatus(orderId, userId);
+      payment = dana ?? (await this.orderQrisPaymentService.getStatus(orderId, userId));
+    }
+    return { ...canonical, payment };
   }
 
   @Throttle({ default: { ttl: 60000, limit: 120 } })

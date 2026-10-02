@@ -5,7 +5,7 @@ import { ActionLocationService, type ActionLocationContext } from '../action-loc
 import { RedisService } from '../../redis/redis.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { FeeCalculatorService } from './fee-calculator.service';
-import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, SubscriptionStatus, NotificationType, Prisma, Voucher, VoucherApplicability, VoucherType, CampaignStatus, ChatRoomType } from '@prisma/client';
+import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, SubscriptionStatus, NotificationType, Prisma, Voucher, VoucherApplicability, VoucherType, CampaignStatus, ChatRoomType, PaymentPurpose, PaymentStatus } from '@prisma/client';
 import { generateOrderId } from '../../common/utils/id-generator.util';
 import { toSen, toIdr, percentToBpsBigInt } from '../../common/utils/currency.util';
 import { safeBigIntToNumber } from '../../common/utils/bigint.util';
@@ -46,6 +46,31 @@ function getConfirmationDeadlineDays(orderType: OrderType): number {
 
 const ORDER_CREATE_MAX_RETRIES = 3;
 const ORDER_TRANSITION_MAX_RETRIES = 3;
+
+/**
+ * Audit 2026-10-03 (SEC-401): peta status PaymentTransaction (enum DB:
+ * PENDING/SUCCESS/FAILED/EXPIRED/CANCELLED/REFUNDED) ke status pembayaran
+ * kanonis yang dipahami klien. SUCCESS → PAID (satu-satunya status yang
+ * membolehkan klien merender "pembayaran berhasil").
+ */
+function mapPaymentStatusToCanonical(status: PaymentStatus): string {
+  switch (status) {
+    case PaymentStatus.SUCCESS:
+      return 'PAID';
+    case PaymentStatus.PENDING:
+      return 'PENDING';
+    case PaymentStatus.EXPIRED:
+      return 'EXPIRED';
+    case PaymentStatus.CANCELLED:
+      return 'CANCELLED';
+    case PaymentStatus.FAILED:
+      return 'FAILED';
+    case PaymentStatus.REFUNDED:
+      return 'REFUNDED';
+    default:
+      return 'PENDING';
+  }
+}
 
 // Allowed CDN domains for order attachments (same as upload module)
 const ALLOWED_ATTACHMENT_DOMAINS = [
@@ -1815,5 +1840,53 @@ export class OrdersService {
     await this.redis.set(ORDER_AVG_DURATIONS_CACHE, JSON.stringify(result), 3600);
 
     return result;
+  }
+
+  /**
+   * Audit 2026-10-03 (SEC-401): status pembayaran KANONIS untuk order —
+   * SATU-SATUNYA sumber kebenaran status pembayaran yang boleh dirender
+   * klien. Frontend WAJIB memanggil ini (bukan mempercayai query params /
+   * deep link) sebelum menampilkan status sukses.
+   *
+   * Akses: hanya buyer/seller order (selain itu 403). Order tidak ada → 404.
+   * `PAID` hanya bila ada paymentTransaction ORDER_ESCROW berstatus SUCCESS
+   * yang terverifikasi di server — tidak pernah diturunkan dari input klien.
+   */
+  async getCanonicalPaymentStatus(
+    orderId: string,
+    userId: string,
+  ): Promise<{ orderId: string; status: string; paidAt: Date | null; isBuyer: boolean }> {
+    const order = await this.prisma.order.findUnique({
+      where: { orderId },
+      select: { id: true, orderId: true, buyerId: true, sellerId: true },
+    });
+    if (!order) {
+      throw new NotFoundException({
+        code: ErrorCodes.ORDER_NOT_FOUND,
+        message: 'Order not found',
+      });
+    }
+    const isBuyer = order.buyerId === userId;
+    if (!isBuyer && order.sellerId !== userId) {
+      throw new ForbiddenException({
+        code: ErrorCodes.NOT_ORDER_PARTICIPANT,
+        message: 'Not authorized to view this payment status',
+      });
+    }
+    const payment = await this.prisma.paymentTransaction.findFirst({
+      where: { orderId: order.id, purpose: PaymentPurpose.ORDER_ESCROW },
+      orderBy: { createdAt: 'desc' },
+      select: { status: true, paidAt: true },
+    });
+    if (!payment) {
+      return { orderId: order.orderId, status: 'PENDING', paidAt: null, isBuyer };
+    }
+    const status = mapPaymentStatusToCanonical(payment.status);
+    return {
+      orderId: order.orderId,
+      status,
+      paidAt: status === 'PAID' ? payment.paidAt : null,
+      isBuyer,
+    };
   }
 }

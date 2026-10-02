@@ -43,6 +43,7 @@ export class SessionsService {
         skip: (safePage - 1) * safeLimit,
         select: {
           id: true,
+          deviceId: true,
           deviceInfo: true,
           ipAddress: true,
           lastActiveAt: true,
@@ -52,9 +53,26 @@ export class SessionsService {
       this.prisma.userSession.count({ where }),
     ]);
 
+    // Audit 2026-10-03 (BFE-046): sertakan deviceId (kolom UserSession.deviceId
+    // sudah ada di skema) + status trusted. Tidak ada kolom `trusted` di
+    // UserSession — status kepercayaan perangkat tinggal di
+    // UserDevice.isTrusted (unik per [userId, deviceId]); bila tidak ada baris
+    // perangkat yang cocok, trusted = null (tidak diketahui), bukan false.
+    const sessionDeviceIds = [...new Set(sessions.map((s) => s.deviceId).filter((d): d is string => !!d))];
+    const trustedByDevice = new Map<string, boolean>();
+    if (sessionDeviceIds.length > 0) {
+      const devices = await this.prisma.userDevice.findMany({
+        where: { userId, deviceId: { in: sessionDeviceIds } },
+        select: { deviceId: true, isTrusted: true },
+      });
+      for (const d of devices) trustedByDevice.set(d.deviceId, d.isTrusted);
+    }
+
     return {
       sessions: sessions.map((session) => ({
         id: session.id,
+        deviceId: session.deviceId ?? null,
+        trusted: session.deviceId ? (trustedByDevice.get(session.deviceId) ?? null) : null,
         deviceInfo: session.deviceInfo,
         ipAddress: this.maskIpAddress(session.ipAddress),
         lastActiveAt: session.lastActiveAt,

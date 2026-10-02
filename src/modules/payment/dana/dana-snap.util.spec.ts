@@ -1,6 +1,9 @@
 import { createSign, createVerify, generateKeyPairSync } from 'crypto';
+import { ForbiddenException } from '@nestjs/common';
 import {
+  assertWebhookTimestampFresh,
   buildDanaHeaders,
+  isWebhookTimestampFresh,
   jakartaTimestamp,
   normalizePemKey,
   sha256HexLower,
@@ -210,6 +213,81 @@ describe('dana-snap.util', () => {
     it('selalu menyertakan raw body', () => {
       const c = webhookBodyCandidates('not-json{{{');
       expect(c).toEqual(['not-json{{{']);
+    });
+  });
+
+  describe('isWebhookTimestampFresh / assertWebhookTimestampFresh (SEC-206)', () => {
+    const NOW = Date.parse('2026-10-03T10:00:00+07:00');
+    const freshPath = '/v1/webhooks/dana/payment';
+    const freshBody = { originalPartnerReferenceNo: 'DANA-QR-001', latestTransactionStatus: '00' };
+    const ts = (offsetMs: number) => new Date(NOW + offsetMs).toISOString();
+    /** Mensimulasikan DANA menandatangani webhook (duplikat lokal agar mandiri). */
+    function signLocal(rawBody: string, privateKey: string, timestamp: string): string {
+      const stringToVerify = `POST:${freshPath}:${sha256HexLower(rawBody)}:${timestamp}`;
+      return createSign('RSA-SHA256').update(stringToVerify, 'utf8').sign(privateKey, 'base64');
+    }
+
+    it('timestamp kini → fresh', () => {
+      expect(isWebhookTimestampFresh(ts(0), NOW)).toBe(true);
+    });
+
+    it('di batas ±5 menit → fresh; di luar batas → basi', () => {
+      expect(isWebhookTimestampFresh(ts(5 * 60 * 1000), NOW)).toBe(true);
+      expect(isWebhookTimestampFresh(ts(-5 * 60 * 1000), NOW)).toBe(true);
+      expect(isWebhookTimestampFresh(ts(5 * 60 * 1000 + 1), NOW)).toBe(false);
+      expect(isWebhookTimestampFresh(ts(-6 * 60 * 1000), NOW)).toBe(false);
+      expect(isWebhookTimestampFresh(ts(60 * 60 * 1000), NOW)).toBe(false);
+    });
+
+    it('format SNAP Jakarta (+07:00) bisa di-parse', () => {
+      expect(isWebhookTimestampFresh('2026-10-03T10:04:59+07:00', NOW)).toBe(true);
+      expect(isWebhookTimestampFresh('2026-10-03T09:54:00+07:00', NOW)).toBe(false);
+    });
+
+    it('timestamp kosong / tidak valid → basi (fail-closed)', () => {
+      expect(isWebhookTimestampFresh('', NOW)).toBe(false);
+      expect(isWebhookTimestampFresh('bukan-timestamp', NOW)).toBe(false);
+    });
+
+    it('assertWebhookTimestampFresh: fresh → tidak throw; basi → 403 WEBHOOK_TIMESTAMP_STALE', () => {
+      expect(() => assertWebhookTimestampFresh(ts(0), NOW)).not.toThrow();
+      try {
+        assertWebhookTimestampFresh(ts(-10 * 60 * 1000), NOW);
+        throw new Error('harusnya melempar');
+      } catch (e: any) {
+        expect(e).toBeInstanceOf(ForbiddenException);
+        expect(e.response.code).toBe('WEBHOOK_TIMESTAMP_STALE');
+        expect(e.status).toBe(403);
+      }
+    });
+
+    it('verifyDanaWebhookSignature + enforceFreshness: basi → throw SEBELUM verifikasi RSA', () => {
+      const { privateKey, publicKey } = makeKeyPair();
+      const rawBody = JSON.stringify(freshBody);
+      // Signature VALID untuk timestamp basi 2026-09-30.
+      const staleTs = '2026-09-30T15:00:00+07:00';
+      const signature = signLocal(rawBody, privateKey, staleTs);
+      expect(() =>
+        verifyDanaWebhookSignature({
+          method: 'POST',
+          path: freshPath,
+          rawBody,
+          timestamp: staleTs,
+          signature,
+          publicKeyPem: publicKey,
+          enforceFreshness: true,
+        }),
+      ).toThrow(expect.objectContaining({ response: expect.objectContaining({ code: 'WEBHOOK_TIMESTAMP_STALE' }) }));
+    });
+
+    it('verifyDanaWebhookSignature tanpa enforceFreshness: perilaku lama (boolean)', () => {
+      const { privateKey, publicKey } = makeKeyPair();
+      const rawBody = JSON.stringify(freshBody);
+      const timestamp = jakartaTimestamp();
+      const signature = signLocal(rawBody, privateKey, timestamp);
+      expect(
+        verifyDanaWebhookSignature({ method: 'POST', path: freshPath, rawBody, timestamp, signature, publicKeyPem: publicKey }),
+      ).toBe(true);
     });
   });
 });

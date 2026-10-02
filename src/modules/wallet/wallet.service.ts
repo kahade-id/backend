@@ -2891,8 +2891,14 @@ export class WalletService implements OnModuleInit {
     }
 
     if (topupBonusSen > BigInt(0)) {
-      const bonusTitle = 'Top-up Bonus Credited';
-      const bonusBody = `Bonus top-up ${formatSen(topupBonusSen)} has been credited to your wallet.`;
+      // SYS-C-105: copy mengikuti bahasa preferensi user.
+      const bonusCopy = renderNotificationCopy(
+        NotificationType.TOPUP_BONUS_CREDITED,
+        await resolveNotificationLanguage(this.prisma, paymentTx.userId),
+        { amount: formatSen(topupBonusSen) },
+      );
+      const bonusTitle = bonusCopy.title;
+      const bonusBody = bonusCopy.body;
       await this.prisma.notification
         .create({
           data: {

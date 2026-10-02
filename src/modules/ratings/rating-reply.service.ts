@@ -125,6 +125,9 @@ export class RatingReplyService {
   private async sendReplyNotification(replierId: string, giverId: string, content: string): Promise<void> {
     const replier = await this.prisma.user.findUnique({ where: { id: replierId }, select: { fullName: true, username: true } });
     const replierName = replier?.fullName || replier?.username || 'User';
+    // TODO SYS-C-105: balasan rating memakai tipe RATING_NEW tetapi semantiknya
+    // berbeda ("membalas ulasan", bukan "memberi ulasan") — butuh tipe/varian
+    // template tersendiri agar tidak me-render copy yang menyesatkan.
     await this.prisma.notification.create({
       data: {
         notifId: generateNotifId(),

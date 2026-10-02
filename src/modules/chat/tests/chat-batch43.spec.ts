@@ -1,5 +1,5 @@
 import { BadRequestException, ForbiddenException, HttpException, NotFoundException } from '@nestjs/common';
-import { ChatService, filterReadAtForViewer } from '../chat.service';
+import { ChatService, filterReadAtForViewer, serializeMessage } from '../chat.service';
 import { ChatEphemeralPurgeService } from '../chat-ephemeral-purge.service';
 import { ChatOrderHooks } from '../chat-order-hooks';
 // NOTE: enum Prisma baru (DmPolicy) tidak bisa di-import sebagai nilai di
@@ -302,6 +302,141 @@ describe('ChatService batch-43', () => {
     it('menolak opsi kurang dari 2', async () => {
       makeService();
       await expect(service.createPoll('user-1', 'room-1', { question: 'Q?', options: ['satu'] } as never)).rejects.toThrow(BadRequestException);
+      // Polling invalid tidak boleh membuat pesan POLL.
+      expect(mockPrisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
+    it('createPoll membuat pesan POLL di thread + emit chat.new_message', async () => {
+      makeService();
+      mockPrisma.chatPoll.create.mockResolvedValue({ id: 'p1' });
+      const pollRow = {
+        id: 'p1', roomId: 'room-1', question: 'Makan apa?', options: ['Nasi', 'Mie'],
+        allowMultiple: false, deadline: null, isClosed: false, createdAt: new Date(),
+        createdBy: { userId: 'user-1', fullName: 'A' },
+        votes: [
+          { userId: 'user-2', optionIndex: 0 },
+          { userId: 'user-2', optionIndex: 0 },
+        ],
+      };
+      const rawMessage = {
+        id: 'm1', roomId: 'room-1', messageType: 'POLL', content: 'Makan apa?',
+        isEdited: false, editedAt: null, isDeleted: false, deletedAt: null,
+        isPinned: false, pinnedAt: null, durationSeconds: null, forwardedFromId: null,
+        readAt: null, ephemeralTtlSeconds: null, expiresAt: null, viewOnce: false,
+        viewOnceViewedAt: null, locationLat: null, locationLng: null, locationLabel: null,
+        cardSnapshot: null, pollId: 'p1', poll: pollRow,
+        createdAt: new Date(), updatedAt: new Date(),
+        replyToId: null, replyTo: null, forwardedFrom: null,
+        sender: { id: 'user-1', userId: 'user-1', fullName: 'A', avatarUrl: null },
+        attachments: [], reactions: [],
+      };
+      mockPrisma.chatMessage.create.mockResolvedValue(rawMessage);
+      mockPrisma.chatRoom.update.mockResolvedValue({ id: 'room-1' });
+      mockPrisma.chatPoll.findFirst.mockResolvedValue({ id: 'p1' });
+      mockPrisma.chatPoll.findUnique.mockResolvedValue(pollRow);
+
+      const result = (await service.createPoll('user-1', 'room-1', {
+        question: 'Makan apa?',
+        options: ['Nasi', 'Mie'],
+      } as never)) as Record<string, unknown>;
+
+      // Pesan POLL dibuat: pollId + content = question + sender.
+      expect(mockPrisma.chatMessage.create).toHaveBeenCalledTimes(1);
+      const createArg = mockPrisma.chatMessage.create.mock.calls[0][0];
+      expect(createArg.data.messageType).toBe('POLL');
+      expect(createArg.data.pollId).toBe('p1');
+      expect(createArg.data.content).toBe('Makan apa?');
+      expect(createArg.data.senderId).toBe('user-1');
+      expect(createArg.data.roomId).toBe('room-1');
+      // Room di-bump + unread counter lawan bicara.
+      expect(mockPrisma.chatRoom.update).toHaveBeenCalled();
+      expect(mockPrisma.chatRoomMember.upsert).toHaveBeenCalled();
+      // Emit chat.new_message ke room (payload netral) + ke kedua user.
+      expect(mockRealtime.emitToChatRoom).toHaveBeenCalledWith('room-1', 'chat.new_message', expect.anything());
+      const roomPayload = mockRealtime.emitToChatRoom.mock.calls.find((c: unknown[]) => c[1] === 'chat.new_message')[2] as Record<string, unknown>;
+      expect(roomPayload.messageType).toBe('POLL');
+      expect(roomPayload.pollId).toBe('p1');
+      expect((roomPayload.poll as Record<string, unknown>).question).toBe('Makan apa?');
+      expect((roomPayload.poll as Record<string, unknown>).options).toEqual([
+        { index: 0, text: 'Nasi', votes: 2 },
+        { index: 1, text: 'Mie', votes: 0 },
+      ]);
+      expect(mockRealtime.emitToUser).toHaveBeenCalledWith('user-1', 'chat.new_message', expect.anything());
+      expect(mockRealtime.emitToUser).toHaveBeenCalledWith('user-2', 'chat.new_message', expect.anything());
+      // Return value TETAP objek poll (kompatibilitas API lama).
+      expect(result.id).toBe('p1');
+      expect(result.question).toBe('Makan apa?');
+    });
+
+    it('serializeMessage embed poll untuk pesan POLL (hitungan + myVotes)', () => {
+      const pollRow = {
+        id: 'p1', roomId: 'room-1', question: 'Makan apa?', options: ['Nasi', 'Mie'],
+        allowMultiple: false, deadline: null, isClosed: false, createdAt: new Date(),
+        createdBy: { userId: 'user-1', fullName: 'A' },
+        votes: [
+          { userId: 'user-2', optionIndex: 0 },
+          { userId: 'user-1', optionIndex: 1 },
+        ],
+      };
+      const rawMessage = {
+        id: 'm1', roomId: 'room-1', messageType: 'POLL', content: 'Makan apa?',
+        isEdited: false, editedAt: null, isDeleted: false, deletedAt: null,
+        isPinned: false, pinnedAt: null, durationSeconds: null, forwardedFromId: null,
+        readAt: null, ephemeralTtlSeconds: null, expiresAt: null, viewOnce: false,
+        viewOnceViewedAt: null, locationLat: null, locationLng: null, locationLabel: null,
+        cardSnapshot: null, pollId: 'p1', poll: pollRow,
+        createdAt: new Date(), updatedAt: new Date(),
+        replyToId: null, replyTo: null, forwardedFrom: null,
+        sender: { id: 'user-1', userId: 'user-1', fullName: 'A', avatarUrl: null },
+        attachments: [], reactions: [],
+      };
+      const view = serializeMessage(rawMessage as never, { viewerId: 'user-2' }) as unknown as Record<string, unknown>;
+      expect(view.pollId).toBe('p1');
+      const poll = view.poll as Record<string, unknown>;
+      expect(poll.question).toBe('Makan apa?');
+      expect(poll.options).toEqual([
+        { index: 0, text: 'Nasi', votes: 1 },
+        { index: 1, text: 'Mie', votes: 1 },
+      ]);
+      // myVotes dari sudut pandang viewer (user-2).
+      expect(poll.myVotes).toEqual([0]);
+      // Pesan non-POLL tidak embed poll.
+      const textView = serializeMessage({ ...rawMessage, messageType: 'TEXT', pollId: null, poll: null } as never, {}) as unknown as Record<string, unknown>;
+      expect(textView.poll).toBeNull();
+    });
+
+    it('replyTo pesan POLL menyertakan pollId', () => {
+      const rawMessage = {
+        id: 'm2', roomId: 'room-1', messageType: 'TEXT', content: 'Setuju',
+        isEdited: false, editedAt: null, isDeleted: false, deletedAt: null,
+        isPinned: false, pinnedAt: null, durationSeconds: null, forwardedFromId: null,
+        readAt: null, ephemeralTtlSeconds: null, expiresAt: null, viewOnce: false,
+        viewOnceViewedAt: null, locationLat: null, locationLng: null, locationLabel: null,
+        cardSnapshot: null, pollId: null, poll: null,
+        createdAt: new Date(), updatedAt: new Date(),
+        replyToId: 'm1',
+        replyTo: {
+          id: 'm1', content: 'Makan apa?', messageType: 'POLL', isDeleted: false,
+          pollId: 'p1', sender: { id: 'user-1', userId: 'user-1', fullName: 'A', avatarUrl: null },
+          attachments: [],
+        },
+        forwardedFrom: null,
+        sender: { id: 'user-2', userId: 'user-2', fullName: 'B', avatarUrl: null },
+        attachments: [], reactions: [],
+      };
+      const view = serializeMessage(rawMessage as never, {}) as unknown as Record<string, unknown>;
+      const replyTo = view.replyTo as Record<string, unknown>;
+      expect(replyTo.messageType).toBe('POLL');
+      expect(replyTo.pollId).toBe('p1');
+      expect(replyTo.content).toBe('Makan apa?');
+    });
+
+    it('pesan POLL tidak bisa diedit (fail-closed)', async () => {
+      makeService();
+      mockPrisma.chatMessage.findFirst.mockResolvedValue({
+        id: 'm1', senderId: 'user-1', content: 'Makan apa?', messageType: 'POLL', createdAt: new Date(),
+      });
+      await expect(service.editMessage('user-1', 'room-1', 'm1', 'baru')).rejects.toThrow(BadRequestException);
     });
 
     it('vote pada poll tertutup ditolak', async () => {

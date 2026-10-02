@@ -52,6 +52,24 @@ function sanitizeText(text: string): string {
   return text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
 }
 
+/**
+ * Polling sebagai pesan: select untuk embed data poll di dalam pesan POLL.
+ * Sama dengan select di serializePoll supaya bentuk payload identik dengan
+ * endpoint GET /polls.
+ */
+const POLL_MESSAGE_SELECT = {
+  id: true,
+  roomId: true,
+  question: true,
+  options: true,
+  allowMultiple: true,
+  deadline: true,
+  isClosed: true,
+  createdAt: true,
+  createdBy: { select: { userId: true, fullName: true } },
+  votes: { select: { userId: true, optionIndex: true } },
+};
+
 const MESSAGE_SELECT = {
   id: true,
   roomId: true,
@@ -75,6 +93,9 @@ const MESSAGE_SELECT = {
   locationLng: true,
   locationLabel: true,
   cardSnapshot: true,
+  // Polling sebagai pesan (messageType POLL).
+  pollId: true,
+  poll: { select: POLL_MESSAGE_SELECT },
   createdAt: true,
   updatedAt: true,
   replyToId: true,
@@ -84,6 +105,7 @@ const MESSAGE_SELECT = {
       content: true,
       messageType: true,
       isDeleted: true,
+      pollId: true,
       sender: { select: { id: true, userId: true, fullName: true, avatarUrl: true } },
       attachments: { select: { fileName: true }, take: 1 },
     },
@@ -128,6 +150,7 @@ type RawReplyTo = {
   content: string | null;
   messageType: string;
   isDeleted: boolean;
+  pollId: string | null;
   sender: { id: string; userId: string; fullName: string; avatarUrl: string | null } | null;
   attachments: { fileName: string }[];
 } | null;
@@ -145,6 +168,20 @@ type RawReaction = {
   emoji: string;
   userId: string;
   user: { userId: string; fullName: string } | null;
+};
+
+/** Baris poll hasil select POLL_MESSAGE_SELECT. */
+type RawPoll = {
+  id: string;
+  roomId: string;
+  question: string;
+  options: unknown;
+  allowMultiple: boolean;
+  deadline: Date | null;
+  isClosed: boolean;
+  createdAt: Date;
+  createdBy: { userId: string; fullName: string | null };
+  votes: { userId: string; optionIndex: number }[];
 };
 
 type RawMessage = {
@@ -170,6 +207,9 @@ type RawMessage = {
   locationLng: number | null;
   locationLabel: string | null;
   cardSnapshot: unknown;
+  // Polling sebagai pesan.
+  pollId: string | null;
+  poll?: RawPoll | null;
   createdAt: Date;
   updatedAt: Date;
   replyToId?: string | null;
@@ -258,13 +298,47 @@ function summarizeReactions(reactions: RawReaction[], viewerId?: string | null):
   return [...byEmoji.values()];
 }
 
-function serializeMessage(msg: RawMessage, options: SerializeMessageOptions = {}) {
+/**
+ * Bentuk view satu poll (dipakai endpoint GET /polls DAN embed di pesan
+ * POLL). Hitung jumlah suara per opsi + suara viewer sendiri.
+ *
+ * Diekspor untuk unit test.
+ */
+export function serializePollView(poll: RawPoll, viewerId?: string | null): object {
+  const options = (poll.options as string[]) ?? [];
+  const counts = new Array(options.length).fill(0) as number[];
+  const myVotes: number[] = [];
+  const voters = new Set<string>();
+  for (const vote of poll.votes ?? []) {
+    if (vote.optionIndex >= 0 && vote.optionIndex < counts.length) counts[vote.optionIndex] += 1;
+    voters.add(vote.userId);
+    if (viewerId && vote.userId === viewerId && !myVotes.includes(vote.optionIndex)) myVotes.push(vote.optionIndex);
+  }
+  return {
+    id: poll.id,
+    roomId: poll.roomId,
+    question: poll.question,
+    options: options.map((text, index) => ({ index, text, votes: counts[index] ?? 0 })),
+    totalVotes: voters.size,
+    allowMultiple: poll.allowMultiple,
+    deadline: poll.deadline,
+    isClosed: poll.isClosed || (poll.deadline != null && poll.deadline.getTime() <= Date.now()),
+    myVotes: myVotes.sort((a, b) => a - b),
+    createdBy: { userId: poll.createdBy.userId, fullName: poll.createdBy.fullName },
+    createdAt: poll.createdAt,
+  };
+}
+
+/** Diekspor untuk unit test. */
+export function serializeMessage(msg: RawMessage, options: SerializeMessageOptions = {}) {
   const replyTo = msg.replyTo
     ? {
         id: msg.replyTo.id,
         content: msg.replyTo.isDeleted ? null : msg.replyTo.content,
         messageType: msg.replyTo.messageType,
         isDeleted: msg.replyTo.isDeleted,
+        // Polling sebagai pesan: FE memakai ini untuk label preview "Polling".
+        pollId: msg.replyTo.pollId ?? null,
         senderName: msg.replyTo.sender?.fullName ?? null,
         senderId: msg.replyTo.sender?.userId ?? null,
         fileName: msg.replyTo.attachments?.[0]?.fileName ?? null,
@@ -318,6 +392,13 @@ function serializeMessage(msg: RawMessage, options: SerializeMessageOptions = {}
           })()
         : null,
     card: (msg.cardSnapshot as Record<string, unknown> | null) ?? null,
+    // Polling sebagai pesan: embed data poll (hitungan suara + suara viewer)
+    // supaya pesan POLL langsung bisa dirender sebagai kartu polling.
+    pollId: msg.pollId ?? null,
+    poll:
+      msg.messageType === 'POLL' && msg.poll
+        ? serializePollView(msg.poll, options.viewerId)
+        : null,
     createdAt: msg.createdAt,
     updatedAt: msg.updatedAt,
     attachments: msg.isDeleted ? [] : msg.attachments,
@@ -3323,6 +3404,57 @@ export class ChatService implements OnModuleInit {
       select: { id: true },
     });
     this.emitChatEvent(room, 'chat.poll_created', { roomId, pollId: poll.id, question });
+
+    // Polling sebagai pesan: buat ChatMessage bertipe POLL agar polling
+    // muncul di thread chat seperti pesan biasa (realtime chat.new_message).
+    // Event chat.poll_created di atas TETAP di-emit (kompatibilitas klien lama).
+    const pollQuestion = question.slice(0, CHAT_POLL_QUESTION_MAX_LENGTH);
+    const pollMessage = (await this.prisma.chatMessage.create({
+      data: {
+        id: createId(),
+        roomId,
+        senderId: userId,
+        messageType: 'POLL',
+        content: pollQuestion,
+        pollId: poll.id,
+      },
+      select: MESSAGE_SELECT,
+    })) as unknown as RawMessage;
+    await this.prisma.chatRoom.update({
+      where: { id: room.id },
+      data: { updatedAt: new Date() },
+    });
+    // Unread counter peserta lain (pola sama seperti bumpUnreadCountersTx).
+    const pollRecipients = [...new Set((room.participants ?? []).filter((id) => id && id !== userId))];
+    await Promise.all(
+      pollRecipients.map((rid) =>
+        this.prisma.chatRoomMember.upsert({
+          where: { roomId_userId: { roomId: room.id, userId: rid } },
+          create: { roomId: room.id, userId: rid, role: this.roleFor(room, rid), unreadCount: 1 },
+          update: { unreadCount: { increment: 1 } },
+          select: { id: true },
+        }),
+      ),
+    );
+    // CN-004: serialisasi per penerima (pola sama seperti createMessage).
+    const pollRecipientId = this.resolveCounterpart(room, userId);
+    const pollSenderView = serializeMessage(pollMessage, { viewerId: userId });
+    const pollRecipientView = pollRecipientId ? serializeMessage(pollMessage, { viewerId: pollRecipientId }) : null;
+    const pollNeutralView = serializeMessage(pollMessage, {});
+    this.emitChatEvent(room, 'chat.new_message', pollNeutralView);
+    this.realtime.emitToUser(userId, 'chat.new_message', pollSenderView);
+    if (pollRecipientId && pollRecipientView) {
+      this.realtime.emitToUser(pollRecipientId, 'chat.new_message', pollRecipientView);
+      await this.notifyNewMessage(
+        room,
+        pollRecipientId,
+        userId,
+        pollMessage.id,
+        pollQuestion,
+        'POLL' as unknown as UserChatMessageType,
+      );
+    }
+
     return this.getPoll(userId, roomId, poll.id);
   }
 
@@ -3352,38 +3484,12 @@ export class ChatService implements OnModuleInit {
   private async serializePoll(pollId: string, viewerId: string): Promise<object> {
     const poll = await this.prisma.chatPoll.findUnique({
       where: { id: pollId },
-      select: {
-        id: true, roomId: true, question: true, options: true,
-        allowMultiple: true, deadline: true, isClosed: true, createdAt: true,
-        createdBy: { select: { userId: true, fullName: true } },
-        votes: { select: { userId: true, optionIndex: true } },
-      },
+      select: POLL_MESSAGE_SELECT,
     });
     if (!poll) {
       throw new NotFoundException({ code: ErrorCodes.CHAT_POLL_NOT_FOUND, message: 'Poll not found' });
     }
-    const options = (poll.options as string[]) ?? [];
-    const counts = new Array(options.length).fill(0) as number[];
-    const myVotes: number[] = [];
-    const voters = new Set<string>();
-    for (const vote of poll.votes) {
-      if (vote.optionIndex >= 0 && vote.optionIndex < counts.length) counts[vote.optionIndex] += 1;
-      voters.add(vote.userId);
-      if (vote.userId === viewerId && !myVotes.includes(vote.optionIndex)) myVotes.push(vote.optionIndex);
-    }
-    return {
-      id: poll.id,
-      roomId: poll.roomId,
-      question: poll.question,
-      options: options.map((text, index) => ({ index, text, votes: counts[index] ?? 0 })),
-      totalVotes: voters.size,
-      allowMultiple: poll.allowMultiple,
-      deadline: poll.deadline,
-      isClosed: poll.isClosed || (poll.deadline != null && poll.deadline.getTime() <= Date.now()),
-      myVotes: myVotes.sort((a, b) => a - b),
-      createdBy: { userId: poll.createdBy.userId, fullName: poll.createdBy.fullName },
-      createdAt: poll.createdAt,
-    };
+    return serializePollView(poll as unknown as RawPoll, viewerId);
   }
 
   async votePoll(userId: string, roomId: string, pollId: string, optionIndexes: number[]): Promise<object> {

@@ -505,6 +505,9 @@ enum ChatMessageType {
   // NCC-009: DTO send-message mengizinkan VIDEO — enum DB harus selaras
   // (sebelumnya pesan VIDEO lolos validasi lalu 500 saat write DB).
   VIDEO
+  // Polling sebagai pesan: createPoll membuat ChatMessage bertipe POLL yang
+  // menaut ke ChatPoll agar polling muncul di thread chat (chat.new_message).
+  POLL
 }
 
 // ORDER  : percakapan yang melekat pada satu order (1 room per order).
@@ -2187,6 +2190,11 @@ model ChatMessage {
   // (messageType PRODUCT_CARD / ORDER_CARD). JSON agar tidak jadi FK kaku.
   cardSnapshot Json?
 
+  // Polling sebagai pesan (messageType POLL): menaut ke ChatPoll.
+  // onDelete SetNull — penghapusan poll tidak menghapus baris pesannya.
+  pollId String?
+  poll   ChatPoll? @relation("ChatPollMessages", fields: [pollId], references: [id], onDelete: SetNull)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -2367,6 +2375,9 @@ model ChatPoll {
 
   createdAt DateTime       @default(now())
   votes     ChatPollVote[]
+
+  // Pesan POLL di thread chat yang menaut ke polling ini.
+  messages ChatMessage[] @relation("ChatPollMessages")
 
   @@index([roomId, createdAt])
   @@map("chat_polls")

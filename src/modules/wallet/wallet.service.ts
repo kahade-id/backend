@@ -2317,6 +2317,8 @@ export class WalletService implements OnModuleInit {
       // Money movement is already committed; notification persistence is best-effort and
       // must never roll back or mask a successful transfer.
       // SYS-C-105: copy notifikasi mengikuti bahasa preferensi masing-masing user.
+      // (dideklarasikan di sini agar tersedia sebelum pemakaian pertama.)
+      const sanitizeName = (n: string | null) => (n ?? '').replace(/[<>&"']/g, '').slice(0, 100);
       const senderCopy = renderNotificationCopy(
         NotificationType.WALLET_TRANSFER_SENT,
         await resolveNotificationLanguage(this.prisma, sender.id),
@@ -2398,7 +2400,6 @@ export class WalletService implements OnModuleInit {
         after: { amount, senderId: sender.id, senderUserId: sender.userId, txId: receivedTxId },
       });
 
-      const sanitizeName = (n: string | null) => (n ?? '').replace(/[<>&"']/g, '').slice(0, 100);
       void Promise.resolve()
         .then(() =>
           this.emailQueue.add('send', {

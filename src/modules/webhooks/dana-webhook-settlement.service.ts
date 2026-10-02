@@ -16,6 +16,7 @@ import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 import {
   DANA_SANDBOX_WEBHOOK_PUBLIC_KEY,
+  assertWebhookTimestampFresh,
   verifyDanaWebhookSignature,
 } from '../payment/dana/dana-snap.util';
 import {
@@ -165,6 +166,9 @@ export class DanaWebhookSettlementService {
   ): Promise<DanaWebhookOutcome> {
     const signature = String(headers['x-signature'] ?? '');
     const timestamp = String(headers['x-timestamp'] ?? '');
+    // SEC-206: tolak replay — X-TIMESTAMP di luar ±5 menit → 403
+    // WEBHOOK_TIMESTAMP_STALE, SEBELUM verifikasi signature RSA.
+    assertWebhookTimestampFresh(timestamp);
     const ok = verifyDanaWebhookSignature({
       method: 'POST',
       path,

@@ -8,6 +8,9 @@ import * as ErrorCodes from '../../common/constants/error-codes';
  *   (keputusan produk: mengurangi friksi, kekuatan dijamin oleh
  *   rate-limit, lockout progresif, dan 2FA opsional).
  * - Menolak password yang masuk daftar umum/bocor (blocklist).
+ *   SYS-C-202: penolakan blocklist memakai kode error spesifik
+ *   `PASSWORD_TOO_COMMON` (bukan VALIDATION_ERROR generik) agar FE bisa
+ *   membedakannya — isi blocklist TIDAK di-expose ke klien.
  *
  * AUT-009 cross-reference: kebijakan ADMIN (min 12 + kompleksitas) hidup di
  * `src/modules/admin/admin-password-policy.ts` — disengaja lebih ketat
@@ -55,8 +58,10 @@ export function validatePasswordPolicy(password: string): void {
     });
   }
   if (isCommonPassword(password)) {
+    // SYS-C-202: kode error spesifik (bukan VALIDATION_ERROR generik) agar
+    // FE bisa membedakan penolakan blocklist dan menampilkan copy jelas.
     throw new BadRequestException({
-      code: ErrorCodes.VALIDATION_ERROR,
+      code: ErrorCodes.PASSWORD_TOO_COMMON,
       message: 'Password terlalu umum. Gunakan kombinasi yang lebih unik.',
     });
   }

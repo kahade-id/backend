@@ -72,14 +72,15 @@ export class AdminOrdersController {
       'Wave 3 P0: pemicu manual untuk SATU order yang melewati batas kirim tanpa pengiriman — ' +
       'cancel + auto-refund penuh ke wallet buyer. Guard sama seperti sweep otomatis ' +
       '(PROCESSING + belum dikirim + lewat batas kirim + tanpa dispute berjalan); ' +
-      'order yang belum due / sudah dikirim / dalam dispute ditolak (fail closed).',
+      'order yang belum due / sudah dikirim / dalam dispute ditolak (fail closed). ' +
+      'SEC-603: wajib password admin di body (re-auth server-side).',
   })
   @ApiResponse({ status: 200, description: 'Cancel-unshipped dieksekusi (lihat outcome).' })
   @ApiResponse({ status: 400, description: 'Order tidak memenuhi syarat cancel-unshipped.' })
   @ApiResponse({ status: 404, description: 'Order tidak ditemukan.' })
   cancelUnshipped(
     @Param('orderId', ParseIdPipe) orderId: string,
-    @Body() dto: ForceActionDto,
+    @Body() dto: ForceActionWithReauthDto,
     @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<{ orderId: string; status: string; outcome: string; detail?: string }> {

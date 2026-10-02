@@ -3,6 +3,7 @@ import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { SearchTrendsService } from '../services/search-trends.service';
 import { RecordSearchDto } from '../dto/commerce.dto';
+import { Public } from '../../../common/decorators/public.decorator';
 
 @ApiTags('commerce-trends')
 @ApiBearerAuth('access-token')
@@ -19,6 +20,8 @@ export class SearchTrendsController {
   }
 
   @Throttle({ default: { ttl: 60000, limit: 120 } })
+  // BFE-116: didokumentasikan publik.
+  @Public()
   @Get()
   @ApiOperation({ summary: 'Kata kunci pencarian terpopuler (publik)' })
   trending(@Query('limit') limit?: string) {

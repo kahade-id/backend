@@ -1,6 +1,8 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { encryptPii, decryptPiiSafe } from '../../common/utils/pii.util';
+// BAD-004: validasi IP whitelist Fonnte.
+import * as net from 'net';
 import {
   MANAGEABLE_SETTINGS,
   MANAGEABLE_SETTING_MAP,
@@ -11,6 +13,10 @@ import {
 // SEC-201: validasi SSRF untuk FONNTE_API_URL sebelum disimpan — pola yang
 // sama dipakai webhook mitra (partner/ssrf.util.ts).
 import { validateWebhookUrl, WebhookUrlValidationError } from '../partner/ssrf.util';
+// SEC-506: modul ini mengeksekusi OPS_SETTING_CHANGE yang disetujui
+// (ApprovalsModule @Global — tanpa import modul).
+import { ApprovalsService } from '../admin/approvals/approvals.service';
+import { AdminRole } from '@prisma/client';
 
 /** Default endpoint kirim Fonnte — dipakai test koneksi bila FONNTE_API_URL belum diset. */
 const DEFAULT_FONNTE_SEND_URL = 'https://api.fonnte.com/send';
@@ -73,7 +79,10 @@ export class OpsSettingsService implements OnModuleInit, OnModuleDestroy {
   private readonly decryptFailed = new Set<string>();
   private refreshTimer?: NodeJS.Timeout;
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly approvals: ApprovalsService,
+  ) {}
 
   async onModuleInit(): Promise<void> {
     await this.reload();
@@ -82,6 +91,51 @@ export class OpsSettingsService implements OnModuleInit, OnModuleDestroy {
       void this.reload().catch((e) => this.logger.warn(`Ops settings refresh failed: ${e}`));
     }, 60_000);
     if (this.refreshTimer.unref) this.refreshTimer.unref();
+    // BAD-004/BAD-024: validasi fail-fast saat startup — config finansial /
+    // keamanan yang cacat harus menggagalkan boot, bukan berjalan diam-diam.
+    this.validateStartupConfig();
+    // SEC-506: executor untuk OPS_SETTING_CHANGE yang disetujui dual control.
+    this.approvals.registerExecutor('OPS_SETTING_CHANGE', async (ctx) => {
+      if (!ctx.targetId) {
+        throw new Error('OPS_SETTING_CHANGE membutuhkan targetId (key setting)');
+      }
+      const payload = ctx.payload as { value?: unknown; delete?: unknown };
+      if (payload.delete === true) {
+        return this.delete(ctx.targetId, ctx.decidedBy);
+      }
+      if (typeof payload.value !== 'string') {
+        throw new Error('OPS_SETTING_CHANGE membutuhkan payload.value (string)');
+      }
+      return this.set(ctx.targetId, payload.value, ctx.decidedBy);
+    });
+  }
+
+  /**
+   * BAD-004/BAD-024: validasi fail-fast saat startup.
+   * - WALLET_ENABLED efektif (DB panel > .env) hanya boleh "true"/"false"
+   *   (case-insensitive) atau tidak diset — nilai lain = boot GAGAL.
+   * - FONNTE_WEBHOOK_IPS efektif: setiap entri koma harus lolos net.isIP() —
+   *   entri cacat = boot GAGAL (whitelist keamanan tidak boleh ambigu).
+   */
+  private validateStartupConfig(): void {
+    const walletEnabled = this.get('WALLET_ENABLED');
+    if (walletEnabled !== undefined && !['true', 'false'].includes(walletEnabled.trim().toLowerCase())) {
+      throw new Error(
+        `BAD-024: WALLET_ENABLED="${walletEnabled}" tidak valid — hanya "true"/"false" yang diizinkan. Perbaiki .env / ops-setting sebelum start.`,
+      );
+    }
+    const fonnteIps = this.get('FONNTE_WEBHOOK_IPS');
+    if (fonnteIps) {
+      for (const entry of fonnteIps.split(',')) {
+        const ip = entry.trim();
+        if (!ip) continue;
+        if (net.isIP(ip) === 0) {
+          throw new Error(
+            `BAD-004: FONNTE_WEBHOOK_IPS memuat entri bukan IP: "${ip}". Perbaiki sebelum start.`,
+          );
+        }
+      }
+    }
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -200,8 +254,25 @@ export class OpsSettingsService implements OnModuleInit, OnModuleDestroy {
     // DITOLAK (400), bukan diam-diam dianggap false. Middleware hanya
     // menganggap "true" sebagai aktif, jadi "yes"/"1"/"on" sebelumnya bisa
     // menyesatkan admin.
-    if (key === 'MAINTENANCE_MODE' && !['true', 'false'].includes(trimmed.toLowerCase())) {
-      throw new Error(`MAINTENANCE_MODE hanya menerima "true" atau "false".`);
+    // BAD-024: WALLET_ENABLED (kill-switch finansial) ikut aturan ketat yang
+    // sama — nilai lain DITOLAK (400), bukan disimpan lalu diabaikan.
+    if (
+      (key === 'MAINTENANCE_MODE' || key === 'WALLET_ENABLED') &&
+      !['true', 'false'].includes(trimmed.toLowerCase())
+    ) {
+      throw new Error(`${key} hanya menerima "true" atau "false".`);
+    }
+    // BAD-004: FONNTE_WEBHOOK_IPS adalah whitelist keamanan — setiap entri
+    // (dipisah koma) WAJIB lolos net.isIP(). Entri cacat DITOLAK (400),
+    // bukan disimpan lalu gagal diam-diam saat verifikasi webhook.
+    if (key === 'FONNTE_WEBHOOK_IPS') {
+      for (const entry of trimmed.split(',')) {
+        const ip = entry.trim();
+        if (!ip) continue;
+        if (net.isIP(ip) === 0) {
+          throw new Error(`FONNTE_WEBHOOK_IPS: "${ip}" bukan alamat IP yang valid.`);
+        }
+      }
     }
     // SEC-201: FONNTE_API_URL dipakai sebagai target fetch server-side —
     // validasi anti-SSRF (HTTPS saja, tanpa kredensial, port 443, hostname

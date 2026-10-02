@@ -30,6 +30,7 @@ import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import {
   CHAT_SEARCH_MAX_LIMIT,
   CHAT_SEARCH_MIN_QUERY_LENGTH,
+  CHAT_ATTACHMENT_MAX_BYTES,
 } from '../../common/constants/app.constants';
 
 interface MulterFile {
@@ -626,7 +627,7 @@ export class ChatController {
   @HttpCode(200)
   @ApiOperation({ summary: 'Upload a file attachment to a chat room' })
   @ApiConsumes('multipart/form-data')
-  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 50 * 1024 * 1024 } }))
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: CHAT_ATTACHMENT_MAX_BYTES } }))
   async uploadChatFile(
     @CurrentUser('sub') userId: string,
     @Param('roomId', ParseIdPipe) roomId: string,

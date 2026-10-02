@@ -12,7 +12,7 @@ describe('AdminAuthController refresh cookie lifecycle', () => {
     const adminAuthService = {
       refreshAdminToken: jest.fn().mockRejectedValue(new UnauthorizedException('revoked')),
     };
-    const controller = new AdminAuthController(adminAuthService as never, configService as never, { generateChallenge: jest.fn() } as never);
+    const controller = new AdminAuthController(adminAuthService as never, configService as never, { generateChallenge: jest.fn() } as never, { issueStepUpToken: jest.fn(), consumeStepUpToken: jest.fn() } as never);
     const res = { cookie: jest.fn(), clearCookie: jest.fn() };
 
     await expect(controller.refreshToken({ cookies: { kahade_admin_refresh: 'stale-token' } } as never, res as never)).rejects.toThrow(UnauthorizedException);
@@ -22,7 +22,7 @@ describe('AdminAuthController refresh cookie lifecycle', () => {
 
   it('clears the admin refresh cookie when a refresh request carries no token', async () => {
     const adminAuthService = { refreshAdminToken: jest.fn() };
-    const controller = new AdminAuthController(adminAuthService as never, configService as never, { generateChallenge: jest.fn() } as never);
+    const controller = new AdminAuthController(adminAuthService as never, configService as never, { generateChallenge: jest.fn() } as never, { issueStepUpToken: jest.fn(), consumeStepUpToken: jest.fn() } as never);
     const res = { cookie: jest.fn(), clearCookie: jest.fn() };
 
     await expect(controller.refreshToken({ cookies: {} } as never, res as never)).rejects.toThrow(UnauthorizedException);

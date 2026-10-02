@@ -4,6 +4,7 @@ import { Throttle } from '@nestjs/throttler';
 import { ProductCommerceService } from '../services/product-commerce.service';
 import { UpdateProductCommerceDto } from '../dto/commerce.dto';
 import { CurrentUser } from '../../../common/decorators/current-user.decorator';
+import { Public } from '../../../common/decorators/public.decorator';
 
 @ApiTags('commerce-products')
 @ApiBearerAuth('access-token')
@@ -23,6 +24,8 @@ export class ProductCommerceController {
   }
 
   @Throttle({ default: { ttl: 60000, limit: 120 } })
+  // BFE-116: didokumentasikan publik — klik anonim tercatat untuk data "Populer".
+  @Public()
   @Post(':id/click')
   @HttpCode(200)
   @ApiOperation({ summary: 'Catat hit klik produk (publik)' })
@@ -38,6 +41,8 @@ export class ProductCommerceController {
   }
 
   @Throttle({ default: { ttl: 60000, limit: 120 } })
+  // BFE-116: didokumentasikan publik — viewer anonim melihat badge.
+  @Public()
   @Get(':id/badges')
   @ApiOperation({ summary: 'Badge produk (TERLARIS/DISKON) — komputasi on-read, publik' })
   getBadges(@Param('id') id: string) {

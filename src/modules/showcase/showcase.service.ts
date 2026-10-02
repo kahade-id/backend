@@ -1,6 +1,6 @@
 import { Injectable, Logger, BadRequestException, NotFoundException, ForbiddenException, ConflictException, GoneException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { ContentHiddenReason, OrderStatus, Prisma, ShowcaseVisibility } from '@prisma/client';
+import { AuditAction, ContentHiddenReason, OrderStatus, Prisma, ShowcaseVisibility } from '@prisma/client';
 import { createHash } from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
@@ -2574,6 +2574,23 @@ export class ShowcaseService {
       parentId: null,
       user: authorFilter,
       ...(visible.isOwner ? {} : { isHidden: false }),
+      // FAL-027 (audit 2026-10-03): komentar yang di-soft-delete disembunyikan
+      // dari daftar publik — KECUALI root yang masih punya balasan yang
+      // tampil; parent-nya diserialkan sebagai placeholder "komentar dihapus"
+      // agar thread balasan tidak yatim.
+      OR: [
+        { deletedAt: null },
+        {
+          deletedAt: { not: null },
+          replies: {
+            some: {
+              deletedAt: null,
+              user: authorFilter,
+              ...(visible.isOwner ? {} : { isHidden: false }),
+            },
+          },
+        },
+      ],
     };
     // NP-008 (perf-fix): keyset cursor bila diminta — tanpa `skip` besar.
     // Arah keyset mengikuti rootOrder (newest=desc, oldest=asc).
@@ -2611,6 +2628,9 @@ export class ShowcaseService {
     // dan hanya dijalankan untuk root yang memang punya balasan.
     const rootIds = roots.map((root) => root.id);
     const replyWhere: Prisma.ShowcaseCommentWhereInput = {
+      // FAL-027: balasan yang di-soft-delete tidak pernah tampil (tidak ada
+      // placeholder untuk balasan).
+      deletedAt: null,
       user: authorFilter,
       ...(visible.isOwner ? {} : { isHidden: false }),
     };
@@ -2658,10 +2678,24 @@ export class ShowcaseService {
     }
     const sealTierMap = await this.verificationBadgeService.getSealTierMap(Array.from(authorIds));
 
+    // BFE-117/FAL-009: ringkasan reaksi untuk semua komentar yang tampil
+    // (roots + replies) dalam 2 query batch.
+    const allCommentIds = roots.flatMap((root) => [
+      root.id,
+      ...(repliesByParent.get(root.id) ?? []).map((reply) => reply.id),
+    ]);
+    const { counts: reactionCounts, userVotes } = await this.getCommentReactionMaps(allCommentIds, viewerId);
+
     const data = roots.map((root) => ({
-      ...this.serializeComment(root as CommentRow, sealTierMap),
+      ...this.serializeComment(
+        root as CommentRow,
+        sealTierMap,
+        this.reactionSummaryFor(root.id, reactionCounts, userVotes),
+      ),
       replyCount: replyCountByParent.get(root.id) ?? 0,
-      replies: (repliesByParent.get(root.id) ?? []).map((reply) => this.serializeComment(reply, sealTierMap)),
+      replies: (repliesByParent.get(root.id) ?? []).map((reply) =>
+        this.serializeComment(reply, sealTierMap, this.reactionSummaryFor(reply.id, reactionCounts, userVotes)),
+      ),
     }));
 
     const totalPages = Math.ceil(total / safeLimit);
@@ -2682,14 +2716,29 @@ export class ShowcaseService {
     };
   }
 
-  private serializeComment(row: CommentRow, sealTierMap?: Map<string, string | null>): Record<string, unknown> {
+  /**
+   * Audit 2026-10-03 (BFE-117/FAL-009, FAL-027): serializer komentar memuat
+   * ringkasan reaksi (likes/dislikes/userVote) + penanda soft-delete.
+   * Komentar yang di-soft-delete diserialkan sebagai placeholder ("komentar
+   * dihapus"): content=null agar thread balasan tidak yatim.
+   */
+  private serializeComment(
+    row: CommentRow,
+    sealTierMap?: Map<string, string | null>,
+    reactions?: { likes: number; dislikes: number; userVote: number },
+  ): Record<string, unknown> {
+    const isDeleted = row.deletedAt != null;
     return {
       id: row.id,
       showcaseId: row.showcaseId,
       parentId: row.parentId,
-      content: row.content,
+      content: isDeleted ? null : row.content,
+      isDeleted,
       isHidden: row.isHidden,
       hiddenReason: row.isHidden ? row.hiddenReason : null,
+      likes: reactions?.likes ?? 0,
+      dislikes: reactions?.dislikes ?? 0,
+      userVote: reactions?.userVote ?? 0,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
       author: {
@@ -2703,6 +2752,51 @@ export class ShowcaseService {
         isKycVerified: row.user.kycStatus === 'APPROVED',
       },
     };
+  }
+
+  /**
+   * Audit 2026-10-03 (BFE-117/FAL-009): agregat reaksi untuk sekumpulan
+   * komentar dalam 2 query (tanpa N+1): groupBy hitungan per value + vote
+   * viewer sendiri.
+   */
+  private async getCommentReactionMaps(
+    commentIds: string[],
+    viewerId?: string,
+  ): Promise<{
+    counts: Map<string, { likes: number; dislikes: number }>;
+    userVotes: Map<string, number>;
+  }> {
+    const counts = new Map<string, { likes: number; dislikes: number }>();
+    const userVotes = new Map<string, number>();
+    if (commentIds.length === 0) return { counts, userVotes };
+    const rows = await this.prisma.showcaseCommentReaction.groupBy({
+      by: ['commentId', 'value'],
+      where: { commentId: { in: commentIds } },
+      _count: { _all: true },
+    });
+    for (const row of rows) {
+      const entry = counts.get(row.commentId) ?? { likes: 0, dislikes: 0 };
+      if (row.value === 1) entry.likes = row._count._all;
+      else if (row.value === -1) entry.dislikes = row._count._all;
+      counts.set(row.commentId, entry);
+    }
+    if (viewerId) {
+      const mine = await this.prisma.showcaseCommentReaction.findMany({
+        where: { commentId: { in: commentIds }, userId: viewerId },
+        select: { commentId: true, value: true },
+      });
+      for (const r of mine) userVotes.set(r.commentId, r.value);
+    }
+    return { counts, userVotes };
+  }
+
+  private reactionSummaryFor(
+    commentId: string,
+    counts: Map<string, { likes: number; dislikes: number }>,
+    userVotes: Map<string, number>,
+  ): { likes: number; dislikes: number; userVote: number } {
+    const c = counts.get(commentId) ?? { likes: 0, dislikes: 0 };
+    return { likes: c.likes, dislikes: c.dislikes, userVote: userVotes.get(commentId) ?? 0 };
   }
 
   async addComment(userId: string, showcaseId: string, dto: CreateShowcaseCommentDto): Promise<object> {
@@ -2726,7 +2820,8 @@ export class ShowcaseService {
     let parentId: string | null = null;
     if (dto.parentId) {
       const parent = await this.prisma.showcaseComment.findFirst({
-        where: { id: dto.parentId, showcaseId },
+        // FAL-027: parent yang di-soft-delete dianggap tidak ada.
+        where: { id: dto.parentId, showcaseId, deletedAt: null },
         select: { id: true, parentId: true, isHidden: true },
       });
       if (!parent) {
@@ -2791,9 +2886,9 @@ export class ShowcaseService {
 
     const existing = await this.prisma.showcaseComment.findUnique({
       where: { id: commentId },
-      select: { id: true, userId: true, isHidden: true },
+      select: { id: true, userId: true, isHidden: true, deletedAt: true },
     });
-    if (!existing) {
+    if (!existing || existing.deletedAt) {
       throw new NotFoundException({
         code: ErrorCodes.SHOWCASE_COMMENT_NOT_FOUND,
         message: 'Comment not found',
@@ -2815,15 +2910,23 @@ export class ShowcaseService {
       include: COMMENT_INCLUDE,
     })) as unknown as CommentRow;
     const sealTierMap = await this.verificationBadgeService.getSealTierMap([updated.user.id]);
-    return this.serializeComment(updated, sealTierMap);
+    const { counts: reactionCounts, userVotes } = await this.getCommentReactionMaps([updated.id], userId);
+    return this.serializeComment(updated, sealTierMap, this.reactionSummaryFor(updated.id, reactionCounts, userVotes));
   }
 
-  async deleteComment(userId: string, commentId: string): Promise<{ message: string }> {
+  /**
+   * Audit 2026-10-03 (FAL-027): hapus komentar = SOFT-DELETE — set
+   * deletedAt/deletedBy/deleteReason, JANGAN hapus balasan. Parent yang
+   * dihapus tampil sebagai placeholder "komentar dihapus" selama masih punya
+   * balasan yang tampil (lihat listComments). Komentar yang sedang hidden
+   * tidak mengubah commentCount (sudah dikurangi saat di-hide).
+   */
+  async deleteComment(userId: string, commentId: string, reason?: string): Promise<{ message: string }> {
     const existing = await this.prisma.showcaseComment.findUnique({
       where: { id: commentId },
-      select: { id: true, userId: true, showcaseId: true, parentId: true, isHidden: true },
+      select: { id: true, userId: true, showcaseId: true, parentId: true, isHidden: true, deletedAt: true },
     });
-    if (!existing) {
+    if (!existing || existing.deletedAt) {
       throw new NotFoundException({
         code: ErrorCodes.SHOWCASE_COMMENT_NOT_FOUND,
         message: 'Comment not found',
@@ -2845,25 +2948,21 @@ export class ShowcaseService {
     }
 
     await this.prisma.$transaction(async (tx) => {
-      // Menghapus root ikut menghapus balasannya (FK ON DELETE CASCADE), jadi
-      // counter harus dikurangi sebanyak komentar + balasan yang masih tampil.
-      // Root yang sedang hidden sudah tidak termasuk dalam commentCount
-      // (dikurangi saat di-hide di setCommentHidden), jadi saat dihapus hanya
-      // balasannya yang masih tampil yang perlu dikurangi.
-      let removed: number;
-      if (existing.parentId === null) {
-        const visibleReplies = await tx.showcaseComment.count({
-          where: { parentId: commentId, isHidden: false },
-        });
-        removed = existing.isHidden ? visibleReplies : 1 + visibleReplies;
-      } else {
-        removed = existing.isHidden ? 0 : 1;
-      }
-      await tx.showcaseComment.delete({ where: { id: commentId } });
-      if (removed > 0) {
+      await tx.showcaseComment.update({
+        where: { id: commentId },
+        data: {
+          deletedAt: new Date(),
+          deletedBy: userId,
+          deleteReason: reason?.trim() ? reason.trim().slice(0, 500) : null,
+        },
+      });
+      // commentCount hanya menghitung komentar yang tampil. Yang sedang hidden
+      // sudah dikurangi saat di-hide; balasan TIDAK ikut terhapus sehingga
+      // counter-nya tidak berubah.
+      if (!existing.isHidden) {
         await tx.userShowcase.updateMany({
-          where: { id: existing.showcaseId, commentCount: { gte: removed } },
-          data: { commentCount: { decrement: removed } },
+          where: { id: existing.showcaseId, commentCount: { gt: 0 } },
+          data: { commentCount: { decrement: 1 } },
         });
       }
     });
@@ -2884,9 +2983,9 @@ export class ShowcaseService {
   ): Promise<object> {
     const existing = await this.prisma.showcaseComment.findUnique({
       where: { id: commentId },
-      select: { id: true, showcaseId: true, isHidden: true },
+      select: { id: true, showcaseId: true, isHidden: true, deletedAt: true },
     });
-    if (!existing) {
+    if (!existing || existing.deletedAt) {
       throw new NotFoundException({
         code: ErrorCodes.SHOWCASE_COMMENT_NOT_FOUND,
         message: 'Comment not found',
@@ -2940,7 +3039,281 @@ export class ShowcaseService {
     })) as unknown as CommentRow;
 
     const sealTierMap = await this.verificationBadgeService.getSealTierMap([updated.user.id]);
-    return this.serializeComment(updated, sealTierMap);
+    const { counts: reactionCounts, userVotes } = await this.getCommentReactionMaps([updated.id], userId);
+    return this.serializeComment(updated, sealTierMap, this.reactionSummaryFor(updated.id, reactionCounts, userVotes));
+  }
+
+  /**
+   * Audit 2026-10-03 (BFE-117/FAL-009): like/dislike komentar, persisten per
+   * user, toggle idempoten via @@unique([commentId, userId]).
+   * value: 1 = suka, -1 = tidak suka, 0 = hapus reaksi.
+   * Komentar yang di-soft-delete / hidden tidak bisa di-like (404/403).
+   */
+  async toggleCommentLike(
+    userId: string,
+    commentId: string,
+    value: number,
+  ): Promise<{ likes: number; dislikes: number; userVote: number }> {
+    if (value !== 1 && value !== -1 && value !== 0) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'value must be 1 (like), -1 (dislike), or 0 (remove)',
+      });
+    }
+    const comment = await this.prisma.showcaseComment.findUnique({
+      where: { id: commentId },
+      select: { id: true, isHidden: true, deletedAt: true },
+    });
+    if (!comment || comment.deletedAt) {
+      throw new NotFoundException({
+        code: ErrorCodes.SHOWCASE_COMMENT_NOT_FOUND,
+        message: 'Comment not found',
+      });
+    }
+    if (comment.isHidden) {
+      throw new ForbiddenException({
+        code: ErrorCodes.SHOWCASE_COMMENT_HIDDEN,
+        message: 'Hidden comments cannot be liked',
+      });
+    }
+    if (value === 0) {
+      await this.prisma.showcaseCommentReaction.deleteMany({ where: { commentId, userId } });
+    } else {
+      await this.prisma.showcaseCommentReaction.upsert({
+        where: { commentId_userId: { commentId, userId } },
+        create: { commentId, userId, value },
+        update: { value },
+      });
+    }
+    const { counts, userVotes } = await this.getCommentReactionMaps([commentId], userId);
+    return this.reactionSummaryFor(commentId, counts, userVotes);
+  }
+
+  // ==================================================================
+  // Moderasi komentar oleh admin (audit 2026-10-03, FAL-010)
+  // ==================================================================
+
+  /**
+   * Daftar komentar untuk panel Trust & Safety.
+   * status: 'all' | 'visible' | 'hidden' | 'deleted'.
+   * search: cocokkan isi komentar / username / nama author.
+   */
+  async adminListComments(
+    status: string,
+    search: string | undefined,
+    page: number,
+    limit: number,
+  ): Promise<object> {
+    const normalizedStatus = (status ?? 'all').toLowerCase();
+    if (!['all', 'visible', 'hidden', 'deleted'].includes(normalizedStatus)) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'status must be one of: all, visible, hidden, deleted',
+      });
+    }
+    const statusWhere: Prisma.ShowcaseCommentWhereInput =
+      normalizedStatus === 'visible'
+        ? { deletedAt: null, isHidden: false }
+        : normalizedStatus === 'hidden'
+          ? { deletedAt: null, isHidden: true }
+          : normalizedStatus === 'deleted'
+            ? { deletedAt: { not: null } }
+            : {};
+    const trimmedSearch = search?.trim();
+    const where: Prisma.ShowcaseCommentWhereInput = {
+      ...statusWhere,
+      ...(trimmedSearch
+        ? {
+            OR: [
+              { content: { contains: trimmedSearch, mode: 'insensitive' } },
+              { user: { username: { contains: trimmedSearch, mode: 'insensitive' } } },
+              { user: { fullName: { contains: trimmedSearch, mode: 'insensitive' } } },
+            ],
+          }
+        : {}),
+    };
+    const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
+    const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 100) : 20;
+    const [rows, total] = await Promise.all([
+      this.prisma.showcaseComment.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: (safePage - 1) * safeLimit,
+        take: safeLimit,
+        include: {
+          user: { select: { userId: true, username: true, fullName: true, avatarUrl: true } },
+          showcase: { select: { id: true } },
+        },
+      }),
+      this.prisma.showcaseComment.count({ where }),
+    ]);
+    return {
+      data: rows.map((row) => ({
+        id: row.id,
+        showcaseId: row.showcaseId,
+        parentId: row.parentId,
+        content: row.deletedAt ? null : row.content,
+        isHidden: row.isHidden,
+        hiddenReason: row.isHidden ? row.hiddenReason : null,
+        hiddenAt: row.hiddenAt,
+        hiddenBy: row.hiddenBy,
+        isDeleted: row.deletedAt != null,
+        deletedAt: row.deletedAt,
+        deletedBy: row.deletedBy,
+        deleteReason: row.deleteReason,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+        author: row.user,
+        showcase: row.showcase,
+      })),
+      total,
+      page: safePage,
+      limit: safeLimit,
+      totalPages: Math.ceil(total / safeLimit),
+      status: normalizedStatus,
+    };
+  }
+
+  /**
+   * Aksi moderasi admin pada komentar: 'hide' | 'unhide' | 'delete'.
+   * - hide: pakai field isHidden/hiddenReason/hiddenAt/hiddenBy (seperti
+   *   pemilik item); commentCount dikurangi bila komentar sedang tampil.
+   * - unhide: kebalikan hide.
+   * - delete: soft-delete (FAL-027): set deletedAt/deletedBy/deleteReason;
+   *   commentCount dikurangi bila komentar sedang tampil (hidden sudah
+   *   dikurangi saat hide).
+   * Setiap aksi dicatat di audit log admin.
+   */
+  async adminModerateComment(
+    adminId: string,
+    commentId: string,
+    action: 'hide' | 'unhide' | 'delete',
+    reason: string | undefined,
+    ipAddress: string,
+  ): Promise<object> {
+    const existing = await this.prisma.showcaseComment.findUnique({
+      where: { id: commentId },
+      select: {
+        id: true,
+        showcaseId: true,
+        isHidden: true,
+        hiddenReason: true,
+        deletedAt: true,
+      },
+    });
+    if (!existing) {
+      throw new NotFoundException({
+        code: ErrorCodes.SHOWCASE_COMMENT_NOT_FOUND,
+        message: 'Comment not found',
+      });
+    }
+    const before = { isHidden: existing.isHidden, isDeleted: existing.deletedAt != null };
+    let after: Record<string, unknown>;
+    let description: string;
+
+    if (action === 'hide') {
+      if (existing.deletedAt) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'Deleted comments cannot be hidden',
+        });
+      }
+      if (existing.isHidden) {
+        throw new ConflictException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'Comment is already hidden',
+        });
+      }
+      const hiddenReason = this.parseAdminHiddenReason(reason);
+      await this.prisma.$transaction(async (tx) => {
+        await tx.showcaseComment.update({
+          where: { id: commentId },
+          data: { isHidden: true, hiddenReason, hiddenAt: new Date(), hiddenBy: adminId },
+        });
+        await tx.userShowcase.updateMany({
+          where: { id: existing.showcaseId, commentCount: { gt: 0 } },
+          data: { commentCount: { decrement: 1 } },
+        });
+      });
+      after = { isHidden: true, hiddenReason };
+      description = `Admin hid showcase comment ${commentId} (reason: ${hiddenReason})`;
+    } else if (action === 'unhide') {
+      if (existing.deletedAt) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'Deleted comments cannot be unhidden',
+        });
+      }
+      if (!existing.isHidden) {
+        throw new ConflictException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'Comment is not hidden',
+        });
+      }
+      await this.prisma.$transaction(async (tx) => {
+        await tx.showcaseComment.update({
+          where: { id: commentId },
+          data: { isHidden: false, hiddenReason: null, hiddenAt: null, hiddenBy: null },
+        });
+        await tx.userShowcase.update({
+          where: { id: existing.showcaseId },
+          data: { commentCount: { increment: 1 } },
+        });
+      });
+      after = { isHidden: false };
+      description = `Admin unhid showcase comment ${commentId}`;
+    } else {
+      // delete → soft-delete (FAL-027).
+      if (existing.deletedAt) {
+        throw new ConflictException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'Comment is already deleted',
+        });
+      }
+      await this.prisma.$transaction(async (tx) => {
+        await tx.showcaseComment.update({
+          where: { id: commentId },
+          data: {
+            deletedAt: new Date(),
+            deletedBy: adminId,
+            deleteReason: reason?.trim() ? reason.trim().slice(0, 500) : null,
+          },
+        });
+        if (!existing.isHidden) {
+          await tx.userShowcase.updateMany({
+            where: { id: existing.showcaseId, commentCount: { gt: 0 } },
+            data: { commentCount: { decrement: 1 } },
+          });
+        }
+      });
+      after = { isDeleted: true };
+      description = `Admin soft-deleted showcase comment ${commentId}`;
+    }
+
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'ShowcaseComment',
+      targetId: commentId,
+      description,
+      before,
+      after: { ...after, reason: reason ?? null },
+      ipAddress,
+    });
+    this.logger.log(`Showcase comment ${commentId} ${action} by admin ${adminId}`);
+    return { ok: true, action, commentId };
+  }
+
+  private parseAdminHiddenReason(reason: string | undefined): ContentHiddenReason {
+    const normalized = (reason ?? 'OTHER').trim().toUpperCase();
+    const allowed: ContentHiddenReason[] = ['SPAM', 'INAPPROPRIATE', 'HARASSMENT', 'OTHER'];
+    if (!allowed.includes(normalized as ContentHiddenReason)) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'reason must be one of: SPAM, INAPPROPRIATE, HARASSMENT, OTHER',
+      });
+    }
+    return normalized as ContentHiddenReason;
   }
 
   // ==================================================================

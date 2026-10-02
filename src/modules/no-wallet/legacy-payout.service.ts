@@ -9,6 +9,7 @@ import {
 import {
   EscrowDisbursementScope,
   EscrowDisbursementStatus,
+  Prisma,
   WalletTransactionStatus,
   WalletTransactionType,
 } from '@prisma/client';
@@ -77,19 +78,13 @@ export class LegacyPayoutService {
     const clientKey = dto.idempotencyKey?.trim() || null;
 
     // 1) Debit atomik (idempoten bila clientKey diulang)
+    // SEC-203: idempotency via KOLOM idempotencyKey + unique constraint
+    // (klaim atomik saat insert), BUKAN read-check-then-write di metadata JSON
+    // — dua request konkuren dengan key sama tidak bisa double-debit: yang
+    // kalah kena P2002 lalu membaca baris pemenang.
     const debit = await this.prisma.$transaction(async tx => {
       const w = await tx.wallet.findUnique({ where: { id: wallet.id } });
       if (!w) throw new NotFoundException({ code: 'WALLET_NOT_FOUND', message: 'Wallet tidak ditemukan' });
-
-      if (clientKey) {
-        const existing = await tx.walletTransaction.findFirst({
-          where: { walletId: w.id, metadata: { path: ['idempotencyKey'], equals: clientKey } },
-          orderBy: { createdAt: 'desc' },
-        });
-        if (existing) {
-          return { walletTx: existing, fresh: false };
-        }
-      }
 
       if (w.availableBalance < amountSen) {
         throw new ConflictException({
@@ -99,20 +94,41 @@ export class LegacyPayoutService {
       }
 
       const txId = generateWalletTxId(await this.serial.getNextForPrefix('WLT'));
-      const walletTx = await tx.walletTransaction.create({
-        data: {
-          txId,
-          walletId: w.id,
-          type: WalletTransactionType.WITHDRAW,
-          status: WalletTransactionStatus.PENDING,
-          amount: amountSen,
-          balanceBefore: w.availableBalance,
-          balanceAfter: w.availableBalance - amountSen,
-          bankAccountId: bank.id,
-          description: `Legacy payout saldo lama ke rekening bank (${bank.bankName})`,
-          metadata: clientKey ? { idempotencyKey: clientKey, kind: 'LEGACY_PAYOUT' } : { kind: 'LEGACY_PAYOUT' },
-        },
-      });
+      let walletTx;
+      try {
+        walletTx = await tx.walletTransaction.create({
+          data: {
+            txId,
+            walletId: w.id,
+            type: WalletTransactionType.WITHDRAW,
+            status: WalletTransactionStatus.PENDING,
+            amount: amountSen,
+            balanceBefore: w.availableBalance,
+            balanceAfter: w.availableBalance - amountSen,
+            bankAccountId: bank.id,
+            description: `Legacy payout saldo lama ke rekening bank (${bank.bankName})`,
+            // Kunci idempotensi dedikasi (kolom, unique) — klaim atomik.
+            ...(clientKey ? { idempotencyKey: clientKey } : {}),
+            metadata: clientKey ? { idempotencyKey: clientKey, kind: 'LEGACY_PAYOUT' } : { kind: 'LEGACY_PAYOUT' },
+          },
+        });
+      } catch (e) {
+        if (
+          clientKey &&
+          e instanceof Prisma.PrismaClientKnownRequestError &&
+          e.code === 'P2002' &&
+          ((e.meta?.target as string[] | undefined)?.includes('idempotencyKey') ?? true)
+        ) {
+          // Pemenang sudah insert duluan — baca barisnya, jangan debit lagi.
+          const existing = await tx.walletTransaction.findUnique({
+            where: { idempotencyKey: clientKey },
+          });
+          if (existing) {
+            return { walletTx: existing, fresh: false };
+          }
+        }
+        throw e;
+      }
       await tx.wallet.update({
         where: { id: w.id },
         data: {

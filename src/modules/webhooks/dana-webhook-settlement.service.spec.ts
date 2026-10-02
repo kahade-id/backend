@@ -3,6 +3,18 @@ import { ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PaymentPurpose, PaymentStatus } from '@prisma/client';
 import { DanaWebhookSettlementService } from './dana-webhook-settlement.service';
+import * as danaSnapUtil from '../payment/dana/dana-snap.util';
+
+// Tangkap implementasi ASLI sebelum spyOn di bawah menimpa export —
+// (import binding bersifat live; mengambilnya setelah spyOn akan
+// mengembalikan mock itu sendiri → rekursi tak berujung.)
+const realAssertWebhookTimestampFresh = danaSnapUtil.assertWebhookTimestampFresh;
+
+// SEC-206: sebagian besar test memakai X-TIMESTAMP fixed 2026-09-29
+// (termasuk vektor SDK resmi — signature terikat timestamp, tidak bisa
+// diganti fresh). Lewati freshness check di test-test itu; perilaku
+// freshness diuji eksplisit pada describe SEC-206 di bawah.
+const freshnessMock = jest.spyOn(danaSnapUtil, 'assertWebhookTimestampFresh');
 
 // DANA menandatangani notify terhadap path callback URL milik merchant —
 // untuk server kita: route lokal /v1/webhooks/dana/payment (req.path).
@@ -79,7 +91,10 @@ describe('dana-webhook-settlement.service', () => {
   const signature = signWebhook(privatePem, rawBody, timestamp);
   const headers = { 'x-signature': signature, 'x-timestamp': timestamp };
 
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    freshnessMock.mockImplementation(() => undefined);
+  });
 
   it('menolak signature invalid (403) tanpa menyentuh DB', async () => {
     const { svc, prisma } = makeDeps(publicPem);
@@ -359,5 +374,44 @@ describe('dana-webhook-settlement.service', () => {
     );
     expect(out.responseCode).toBe('2005600');
     expect(prisma.webhookLog.upsert).toHaveBeenCalled();
+  });
+
+  describe('SEC-206: freshness X-TIMESTAMP (±5 menit)', () => {
+    it('timestamp basi (>5 menit) → 403 WEBHOOK_TIMESTAMP_STALE SEBELUM cek signature', async () => {
+      const { svc } = makeDeps(publicPem);
+      // Pakai implementasi asli (bukan mock no-op) untuk test ini.
+      freshnessMock.mockImplementation(realAssertWebhookTimestampFresh);
+      await expect(
+        svc.handleFinishNotify(
+          rawBody,
+          { 'x-signature': 'apapun', 'x-timestamp': '2020-01-01T00:00:00+07:00' },
+          PATH,
+        ),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'WEBHOOK_TIMESTAMP_STALE' }),
+      });
+    });
+
+    it('timestamp fresh + signature invalid → tetap 403 WEBHOOK_SIGNATURE_INVALID (freshness lolos dulu)', async () => {
+      const { svc, prisma } = makeDeps(publicPem);
+      freshnessMock.mockImplementation(realAssertWebhookTimestampFresh);
+      const fresh = new Date().toISOString();
+      // Signature bogus dengan timestamp fresh → freshness lolos, RSA yang menolak.
+      await expect(
+        svc.handleFinishNotify(rawBody, { 'x-signature': 'bogus', 'x-timestamp': fresh }, PATH),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'WEBHOOK_SIGNATURE_INVALID' }),
+      });
+      expect(prisma.webhookLog.upsert).not.toHaveBeenCalled();
+      // Signature valid + timestamp fresh → lolos ke pipeline normal.
+      const freshSig = signWebhook(privatePem, rawBody, fresh);
+      prisma.webhookLog.upsert.mockResolvedValue({ id: 'wl-1', isProcessed: true });
+      const out = await svc.handleFinishNotify(
+        rawBody,
+        { 'x-signature': freshSig, 'x-timestamp': fresh },
+        PATH,
+      );
+      expect(out.responseCode).toBe('2005600');
+    });
   });
 });

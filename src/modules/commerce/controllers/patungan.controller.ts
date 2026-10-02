@@ -6,6 +6,7 @@ import { CreatePatunganGroupDto, JoinPatunganDto, LinkPatunganOrderDto } from '.
 import { CurrentUser } from '../../../common/decorators/current-user.decorator';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
 import { PatunganStatus } from '@prisma/client';
+import { Public } from '../../../common/decorators/public.decorator';
 
 @ApiTags('patungan')
 @ApiBearerAuth('access-token')
@@ -21,6 +22,8 @@ export class PatunganController {
   }
 
   @Throttle({ default: { ttl: 60000, limit: 120 } })
+  // BFE-116: didokumentasikan publik — anonim boleh melihat daftar grup.
+  @Public()
   @Get('groups')
   @ApiOperation({ summary: 'Daftar grup patungan (publik, bisa filter status)' })
   listGroups(@Query('status') status: PatunganStatus | undefined, @Query() pagination: PaginationDto) {

@@ -2,6 +2,7 @@ import { createHash, generateKeyPairSync, sign as cryptoSign } from 'crypto';
 import { ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { DanaWebhookDisbursementService } from './dana-webhook-disbursement.service';
+import * as danaSnapUtil from '../payment/dana/dana-snap.util';
 import {
   sha256HexLower,
   verifyDanaWebhookSignature,
@@ -170,6 +171,7 @@ describe('DanaWebhookDisbursementService', () => {
       id: 'd1',
       status: 'PROCESSING',
       danaReferenceNo: null,
+      amountSen: BigInt(10000000), // Rp100.000 — cocok dengan notifyBody '100000.00'
     });
     const out = await callNotify(svc, privatePem, notifyBody('REF-OK', '00'));
     expect(out).toEqual({ responseCode: '2004300', responseMessage: 'Successful' });
@@ -280,7 +282,43 @@ describe('DanaWebhookDisbursementService', () => {
     expect(prisma.escrowDisbursement.update).not.toHaveBeenCalled();
   });
 
+  it('SEC-206: X-TIMESTAMP basi → 403 WEBHOOK_TIMESTAMP_STALE sebelum cek signature (walau signature valid)', async () => {
+    const { publicPem, privatePem } = makeKeypair();
+    const { svc, prisma } = makeDeps(publicPem);
+    const staleBody = notifyBody('REF-STALE', '00');
+    const staleTs = '2020-01-01T00:00:00+07:00';
+    // Signature VALID untuk timestamp basi itu — freshness harus menolak duluan.
+    const sig = signWebhook(privatePem, staleBody, staleTs);
+    await expect(
+      svc.handleDisbursNotify(
+        staleBody,
+        {
+          'x-signature': sig,
+          'x-timestamp': staleTs,
+          'x-partner-id': PARTNER_ID,
+          'x-external-id': 'EXT-1',
+          'channel-id': CHANNEL_ID,
+        },
+        PATH,
+      ),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'WEBHOOK_TIMESTAMP_STALE' }),
+    });
+    expect(prisma.webhookLog.upsert).not.toHaveBeenCalled();
+  });
+
   describe('kompatibilitas signature SDK resmi DANA', () => {
+    // Vektor SDK resmi memakai X-TIMESTAMP fixed 2026-09-30 — signature
+    // terikat pada timestamp itu sehingga tidak bisa diganti fresh.
+    // Lewati freshness check SEC-206 KHUSUS untuk vektor ini (test saja,
+    // bukan production).
+    beforeAll(() => {
+      jest.spyOn(danaSnapUtil, 'assertWebhookTimestampFresh').mockImplementation(() => undefined);
+    });
+    afterAll(() => {
+      jest.restoreAllMocks();
+    });
+
     it('stringToVerify byte-identik dengan dana-python WebhookParser', () => {
       const ours = `POST:${PATH}:${sha256HexLower(SDK_VECTOR.body)}:${SDK_VECTOR.timestamp}`;
       expect(ours).toBe(SDK_VECTOR.stringToVerify);
@@ -306,6 +344,7 @@ describe('DanaWebhookDisbursementService', () => {
         id: 'dSDK',
         status: 'PROCESSING',
         danaReferenceNo: null,
+        amountSen: BigInt(15000000), // Rp150.000 — cocok dengan SDK_VECTOR '150000.00'
       });
       const out = await svc.handleDisbursNotify(
         SDK_VECTOR.body,

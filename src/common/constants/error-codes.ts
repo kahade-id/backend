@@ -206,6 +206,8 @@ export const INVALID_STATUS = 'INVALID_STATUS';
 export const WEBHOOK_NOT_FOUND = 'WEBHOOK_NOT_FOUND';
 export const WEBHOOK_ALREADY_PROCESSED = 'WEBHOOK_ALREADY_PROCESSED';
 export const WEBHOOK_MAX_RETRY_EXCEEDED = 'WEBHOOK_MAX_RETRY_EXCEEDED';
+// SEC-206 (audit 2026-10-03): X-TIMESTAMP webhook di luar jendela ±5 menit.
+export const WEBHOOK_TIMESTAMP_STALE = 'WEBHOOK_TIMESTAMP_STALE';
 export const INVALID_DATE_RANGE = 'INVALID_DATE_RANGE';
 export const DATE_RANGE_TOO_LARGE = 'DATE_RANGE_TOO_LARGE';
 export const INVALID_FORMAT = 'INVALID_FORMAT';
@@ -341,6 +343,9 @@ export const EXTENSION_RATE_LIMITED = 'EXTENSION_RATE_LIMITED';
 export const DELIVERY_PROOF_REQUIRED = 'DELIVERY_PROOF_REQUIRED';
 
 export const CHAT_ROOM_CLOSED = 'CHAT_ROOM_CLOSED';
+// Audit 2026-10-03 (BFE-008): room chat tidak ditemukan — kode khusus agar
+// klien bisa membedakan dari NOT_FOUND generik (dipetakan FE error-codes.ts).
+export const ROOM_NOT_FOUND = 'ROOM_NOT_FOUND';
 
 // Chat — Trust & Safety (audit 2026-09-13).
 // CHAT_MESSAGE_BLOCKED: pesan ditolak detektor circumvention/moderation.
@@ -493,3 +498,26 @@ export const ORDER_ALREADY_LINKED = 'ORDER_ALREADY_LINKED';
 export const BANNER_NOT_FOUND = 'BANNER_NOT_FOUND';
 export const INSTALLMENT_PLAN_EXISTS = 'INSTALLMENT_PLAN_EXISTS';
 export const INSTALLMENT_INVALID_ORDER = 'INSTALLMENT_INVALID_ORDER';
+// SEC-503 (audit 2026-10-03): step-up re-auth server-side — token sekali pakai
+// ber-TTL pendek hasil verifikasi password, terikat aksi+target.
+export const STEP_UP_REQUIRED = 'STEP_UP_REQUIRED';
+export const STEP_UP_INVALID = 'STEP_UP_INVALID';
+export const STEP_UP_EXPIRED = 'STEP_UP_EXPIRED';
+export const STEP_UP_MISMATCH = 'STEP_UP_MISMATCH';
+// SEC-501/502/601/602 + BAD-001 (audit 2026-10-03): dual control — maker-checker
+// untuk aksi sensitif admin.
+export const SELF_APPROVAL = 'SELF_APPROVAL';
+export const DUAL_CONTROL_REQUIRED = 'DUAL_CONTROL_REQUIRED';
+export const APPROVAL_NOT_FOUND = 'APPROVAL_NOT_FOUND';
+export const APPROVAL_INVALID_STATE = 'APPROVAL_INVALID_STATE';
+export const APPROVAL_EXPIRED = 'APPROVAL_EXPIRED';
+export const APPROVAL_FORBIDDEN_ACTION = 'APPROVAL_FORBIDDEN_ACTION';
+// BAD-008: mutasi wallet legacy ditolak saat kill-switch nonaktif.
+export const WALLET_DISABLED = 'WALLET_DISABLED';
+// BAD-022: kode error khusus recheck disbursement (sebelumnya salah pakai
+// DISBURSEMENT_NOT_REQUEUABLE milik alur requeue).
+export const DISBURSEMENT_NOT_RECHECKABLE = 'DISBURSEMENT_NOT_RECHECKABLE';
+// BAD-001: CANCELLED hanya bisa dihidupkan via dual control eksplisit.
+export const DISBURSEMENT_NOT_REOPENABLE = 'DISBURSEMENT_NOT_REOPENABLE';
+// SEC-506: perubahan setting finansial butuh persetujuan admin kedua.
+export const OPS_SETTING_PENDING_APPROVAL = 'OPS_SETTING_PENDING_APPROVAL';

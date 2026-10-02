@@ -1163,7 +1163,10 @@ export class OrderStateService {
       }
 
       const adminCancelUpdated = await tx.order.updateMany({
-        where: { id: order.id, status: { in: adminCancellableStatuses }, deletedAt: null }, // AUDIT-16
+        // SEC-105: shippedAt:null DI DALAM tx — seller yang kirim tepat di
+        // jendela race (read ulang → ship → commit) tidak boleh di-cancel +
+        // refund penuh (buyer dapat barang + uang). Guard pre-tx saja tidak cukup.
+        where: { id: order.id, status: { in: adminCancellableStatuses }, shippedAt: null, deletedAt: null }, // AUDIT-16
         data: {
           status: OrderStatus.CANCELLED,
           cancelledAt: new Date(),
@@ -1173,6 +1176,18 @@ export class OrderStateService {
       });
 
       if (adminCancelUpdated.count === 0) {
+        // Bedakan "sudah dikirim" dari konflik status biasa — caller (mis.
+        // sweep expire-unshipped) butuh tahu ini SKIPPED_SHIPPED, bukan error generik.
+        const fresh = await tx.order.findUnique({
+          where: { id: order.id },
+          select: { status: true, shippedAt: true },
+        });
+        if (fresh?.shippedAt) {
+          throw new ConflictException({
+            code: 'SKIPPED_SHIPPED',
+            message: 'Order sudah dikirim (shippedAt terisi) — pembatalan dibatalkan (fail-closed).',
+          });
+        }
         throw new ConflictException({
           code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT,
           message: 'Order status has already changed, please retry',

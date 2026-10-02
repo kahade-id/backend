@@ -104,15 +104,25 @@ export class AdminAnalyticsController {
   }
 
   @Get('top-users')
-  @ApiOperation({ summary: 'Get top users by metric' })
+  @ApiOperation({
+    summary: 'Get top users by metric',
+    description:
+      'BAD-034: startDate/endDate opsional ("YYYY-MM-DD" = batas hari WIB penuh). ' +
+      'Bila diberikan, peringkat dihitung dari agregat order/rating DALAM rentang; ' +
+      'bila tidak, memakai counter all-time.',
+  })
   async getTopUsers(
     @Query('limit', new DefaultValuePipe(10), ParseIntPipe, new ClampLimitPipe(100)) limit: number,
     @Query('metric', new DefaultValuePipe('orders'), new ParseEnumQueryPipe('metric', ['orders', 'volume', 'rating'])) metric: string,
+    @Query('startDate', new ParseDateQueryPipe('startDate')) startDate?: string,
+    @Query('endDate', new ParseDateQueryPipe('endDate')) endDate?: string,
     @CurrentAdmin('sub') adminId?: string,
     @Req() req?: Request,
   ): Promise<object[]> {
-    this.logAdminAccess(adminId ?? 'unknown', 'analytics/top-users', { limit, metric }, req!);
-    return this.analyticsService.getTopUsers(limit, metric as 'orders' | 'volume' | 'rating');
+    const start = parseOptionalDate(startDate, 'startDate', 'start');
+    const end = parseOptionalDate(endDate, 'endDate', 'end');
+    this.logAdminAccess(adminId ?? 'unknown', 'analytics/top-users', { limit, metric, startDate, endDate }, req!);
+    return this.analyticsService.getTopUsers(limit, metric as 'orders' | 'volume' | 'rating', start, end);
   }
 
   @Get('user-growth')

@@ -19,7 +19,6 @@ import { FinanceTransactionQueryDto } from './dto/finance-query.dto';
 import { FindingsQueryDto, AcknowledgeFindingDto, BatchDiscrepanciesQueryDto } from './dto/finance-findings.dto';
 import { RequestCorrectionDto, DecideCorrectionDto, CorrectionsQueryDto } from './dto/ledger-correction.dto';
 import { WithdrawalApproveDto, WithdrawalRejectDto } from './dto/withdrawal-action.dto';
-import { DisbursementListQueryDto } from './dto/disbursement-query.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
 import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { WalletKillSwitchGuard } from '../../../modules/wallet-mode/wallet-kill-switch.guard';
@@ -27,6 +26,8 @@ import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
+import { StepUpGuard } from '../../../common/guards/step-up.guard';
+import { RequireStepUp } from '../../../common/decorators/require-step-up.decorator';
 
 @ApiTags('admin-finance')
 @ApiBearerAuth('access-token')
@@ -98,7 +99,10 @@ export class AdminFinanceController {
   // Pencairan dana kini via EscrowDisbursement — lihat
   // GET /v1/admin/finance/disbursements.
   @Post('withdrawals/:txId/approve')
-  @UseGuards(WalletKillSwitchGuard, UserThrottleGuard)
+  @UseGuards(WalletKillSwitchGuard, UserThrottleGuard, StepUpGuard)
+  // BAD-012(keuangan)/503: approve withdrawal wajib step-up server-side
+  // (meski jalur legacy ini di-sunset 410 — pertahanan berlapis).
+  @RequireStepUp('withdrawal.approve', 'txId')
   @Idempotency()
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @ApiOperation({ summary: 'Approve pending withdrawal (legacy — DINONAKTIFKAN)', description: 'BAI-041: jalur payout Midtrans Iris sudah di-sunset (410 GONE). Endpoint ini TIDAK LAGI mengeksekusi payout. Pencairan dana era DANA tercatat di EscrowDisbursement — lihat GET /v1/admin/finance/disbursements. Requires Idempotency-Key.' })
@@ -109,7 +113,9 @@ export class AdminFinanceController {
   }
 
   @Post('withdrawals/:txId/reject')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // BAD-012(keuangan)/503: reject withdrawal wajib step-up server-side.
+  @RequireStepUp('withdrawal.reject', 'txId')
   @Idempotency()
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @ApiOperation({ summary: 'Reject pending withdrawal', description: 'Reject a pending withdrawal transaction and refund the balance. Requires Idempotency-Key.' })
@@ -156,25 +162,6 @@ export class AdminFinanceController {
   @ApiResponse({ status: 200, description: 'Revenue data returned.' })
   getRevenue(): Promise<object> {
     return this.service.getRevenue();
-  }
-
-  /**
-   * MFE-015: antrean disbursement escrow untuk admin — visibilitas atas dana
-   * DANA-direct yang keluar ke rekening bank seller (incl. HELD_NO_BANK &
-   * NEEDS_REVIEW yang butuh tindak lanjut manual). Read-only.
-   */
-  @Get('disbursements')
-  @ApiOperation({
-    summary: 'List escrow disbursements (DANA payouts)',
-    description:
-      'Paginated escrow disbursement queue with status/scope/q filters. ' +
-      'Highlight filters: HELD_NO_BANK (seller has no verified bank account — fail-closed) ' +
-      'and NEEDS_REVIEW (unknown DANA status — manual review required). Read-only.',
-  })
-  @ApiResponse({ status: 200, description: 'Disbursement list returned.' })
-  @ApiResponse({ status: 400, description: 'Invalid query (ErrorCode 1101).' })
-  listDisbursements(@Query() query: DisbursementListQueryDto): Promise<object> {
-    return this.service.listDisbursements(query);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 5 } })
@@ -273,29 +260,21 @@ export class AdminFinanceController {
 
   @Get('export/csv')
   @AdminRoles('SUPER_ADMIN', 'FINANCE_ADMIN')
-  @ApiOperation({ summary: 'Export finance summary CSV (19.4)' })
+  @ApiOperation({
+    summary: 'Export finance transactions CSV',
+    description:
+      'BAD-033: mengekspor DAFTAR TRANSAKSI (bukan ringkasan) dengan filter ' +
+      'aktif yang sama dengan list: type, status, q + startDate/endDate wajib. ' +
+      'PII minimal (tanpa email/telepon).',
+  })
   async exportCsv(
-    @Query('from') from?: string,
-    @Query('to') to?: string,
+    @Query() query: FinanceTransactionQueryDto,
     @CurrentAdmin('sub') adminId?: string,
     @Res() res?: Response,
   ): Promise<void> {
-    // CW-022: dukung rentang tanggal (default 30 hari terakhir, maks 365 hari).
-    const toDate = to ? parseDateBoundaryWIB(to, 'end') : new Date();
-    const fromDate = from ? parseDateBoundaryWIB(from, 'start') : new Date((toDate ?? new Date()).getTime() - 30 * 24 * 60 * 60 * 1000);
-    if (!fromDate || !toDate) {
-      throw new BadRequestException({ code: 'INVALID_DATE_FORMAT', message: 'from and to must be valid ISO date strings' });
-    }
-    if (fromDate > toDate) {
-      throw new BadRequestException({ code: 'INVALID_DATE_RANGE', message: 'from must be before or equal to to' });
-    }
-    const diffDays = Math.ceil((toDate.getTime() - fromDate.getTime()) / (1000 * 60 * 60 * 24));
-    if (diffDays > 365) {
-      throw new BadRequestException({ code: 'DATE_RANGE_TOO_LARGE', message: 'Export date range cannot exceed 365 days' });
-    }
-    const csv = await this.service.buildFinanceCsvExport(fromDate, toDate, adminId ?? 'unknown');
+    const csv = await this.service.buildTransactionCsvExport(query, adminId ?? 'unknown');
     res!.setHeader('Content-Type', 'text/csv');
-    res!.setHeader('Content-Disposition', 'attachment; filename="finance-export.csv"');
+    res!.setHeader('Content-Disposition', 'attachment; filename="finance-transactions.csv"');
     res!.send(csv);
   }
 
@@ -410,14 +389,15 @@ export class AdminFinanceController {
   }
 
   @Get('reconcile/findings/export/csv')
-  @ApiOperation({ summary: 'Export reconciliation findings CSV (tanpa PII)', description: 'Findings report with user identities reduced to initials — no userId, email, or phone numbers.' })
+  @ApiOperation({ summary: 'Export reconciliation findings CSV (tanpa PII)', description: 'Findings report with user identities reduced to initials — no userId, email, or phone numbers. BAD-020: menghormati filter FindingsQueryDto yang sama dengan list (status, minDifferenceIdr, maxAgeDays, invariant, urgentOnly).' })
   @ApiResponse({ status: 200, description: 'CSV exported.' })
   async exportFindingsCsv(
+    @Query() query: FindingsQueryDto,
     @CurrentAdmin('sub') adminId: string,
     @Req() req: Request,
     @Res() res?: Response,
   ): Promise<void> {
-    const csv = await this.service.buildFindingsCsvExport(adminId);
+    const csv = await this.service.buildFindingsCsvExport(adminId, query);
     this.service.logReconciliation(adminId, 'findings-export', true, req.ip || 'unknown');
     res!.setHeader('Content-Type', 'text/csv');
     res!.setHeader('Content-Disposition', 'attachment; filename="reconciliation-findings.csv"');

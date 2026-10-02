@@ -206,6 +206,8 @@ export class AdminKycController {
   }
 
   @Delete(':kycId/assign')
+  // BAD-030: throttle guard (konsisten dengan POST assign di atas).
+  @UseGuards(UserThrottleGuard)
   @AdminRoles('SUPER_ADMIN', 'KYC_ADMIN')
   @ApiOperation({ summary: 'Release the active reviewer assignment' })
   @ApiResponse({ status: 200, description: 'Assignment released.' })

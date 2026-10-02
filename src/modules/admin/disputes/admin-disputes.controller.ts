@@ -22,6 +22,8 @@ import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
+import { StepUpGuard } from '../../../common/guards/step-up.guard';
+import { RequireStepUp } from '../../../common/decorators/require-step-up.decorator';
 
 @ApiTags('admin-disputes')
 @ApiBearerAuth('access-token')
@@ -208,11 +210,14 @@ export class AdminDisputesController {
 
   // B-32 (audit-fix): resolve mutates wallet balances and MUST be idempotent
   // -- a network-retry / stale React-Query cache must not double-credit.
+  // SEC-501/503: wajib step-up server-side; nominal escrow > Rp1jt → dual
+  // control (403 DUAL_CONTROL_REQUIRED — usulkan via /v1/admin/approvals/propose).
   @Post(':disputeId/resolve')
   @Idempotency()
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  @RequireStepUp('dispute.resolve', 'disputeId')
   @AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN')
-  @ApiOperation({ summary: 'Resolve dispute', description: 'Creates a DisputeDecision record with FULL_BUYER, FULL_SELLER, or SPLIT decision type. Dispute must be in UNDER_REVIEW or ESCALATED status. Requires Idempotency-Key.' })
+  @ApiOperation({ summary: 'Resolve dispute', description: 'Creates a DisputeDecision record with FULL_BUYER, FULL_SELLER, or SPLIT decision type. Dispute must be in UNDER_REVIEW or ESCALATED status. Requires Idempotency-Key. SEC-501/503: requires X-Step-Up-Token (action dispute.resolve); escrow > Rp1.000.000 requires dual control via POST /v1/admin/approvals/propose.' })
   @ApiResponse({ status: 201, description: 'Dispute resolved — DecisionRecord created and order status updated to COMPLETED.' })
   @ApiResponse({ status: 400, description: 'Invalid status or split percentages do not sum to 100.' })
   @ApiResponse({ status: 404, description: 'Dispute not found.' })

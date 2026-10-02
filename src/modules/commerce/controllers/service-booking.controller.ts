@@ -5,6 +5,7 @@ import { ServiceBookingService } from '../services/service-booking.service';
 import { CreateServiceSlotDto } from '../dto/commerce.dto';
 import { CurrentUser } from '../../../common/decorators/current-user.decorator';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
+import { Public } from '../../../common/decorators/public.decorator';
 
 @ApiTags('commerce-service-slots')
 @ApiBearerAuth('access-token')
@@ -20,6 +21,8 @@ export class ServiceBookingController {
   }
 
   @Throttle({ default: { ttl: 60000, limit: 120 } })
+  // BFE-116: didokumentasikan publik — slot jasa terlihat anonim.
+  @Public()
   @Get('showcase/:showcaseId')
   @ApiOperation({ summary: 'Daftar slot tersedia per produk (publik)' })
   listSlots(

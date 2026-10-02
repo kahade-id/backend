@@ -15,7 +15,7 @@ import { ParseIdPipe } from '../../common/pipes/parse-id.pipe';
 import { ParseQueryStringPipe } from '../../common/pipes/parse-query-string.pipe';
 import { PaginationDto } from '../../common/dto/pagination.dto';
 import { ShowcaseFeedQueryDto } from './dto/showcase-feed-query.dto';
-import { CreateShowcaseCommentDto, UpdateShowcaseCommentDto } from './dto/showcase-comment.dto';
+import { CreateShowcaseCommentDto, DeleteCommentDto, ToggleCommentLikeDto, UpdateShowcaseCommentDto } from './dto/showcase-comment.dto';
 import { ReportShowcaseDto } from './dto/report-showcase.dto';
 
 class SetCommentHiddenDto {
@@ -175,12 +175,35 @@ export class ShowcaseController {
   @Throttle({ default: { ttl: 60000, limit: 20 } })
   @Delete('comments/:commentId')
   @Idempotency()
-  @ApiOperation({ summary: 'Delete a showcase comment (author or showcase owner)' })
+  @ApiOperation({
+    summary: 'Delete a showcase comment (author or showcase owner)',
+    description:
+      'Audit 2026-10-03 (FAL-027): soft-delete — komentar ditandai dihapus, ' +
+      'balasan TIDAK ikut terhapus (parent tampil sebagai "komentar dihapus").',
+  })
   async deleteComment(
     @CurrentUser('sub') userId: string,
     @Param('commentId', ParseIdPipe) commentId: string,
+    @Body() dto?: DeleteCommentDto,
   ): Promise<{ message: string }> {
-    return this.showcaseService.deleteComment(userId, commentId);
+    return this.showcaseService.deleteComment(userId, commentId, dto?.reason);
+  }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Post('comments/:commentId/like')
+  @ApiOperation({
+    summary: 'Like/dislike a showcase comment (idempotent toggle)',
+    description:
+      'Audit 2026-10-03 (BFE-117/FAL-009): value 1 = suka, -1 = tidak suka, ' +
+      '0 = hapus reaksi. Idempoten per user.',
+  })
+  async toggleCommentLike(
+    @CurrentUser('sub') userId: string,
+    @Param('commentId', ParseIdPipe) commentId: string,
+    @Body() dto: ToggleCommentLikeDto,
+  ): Promise<object> {
+    return this.showcaseService.toggleCommentLike(userId, commentId, dto.value);
   }
 
   @UseGuards(UserThrottleGuard)

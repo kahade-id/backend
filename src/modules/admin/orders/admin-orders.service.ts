@@ -367,7 +367,10 @@ export class AdminOrdersService {
    * force-cancel buta: order yang belum due / sudah dikirim / dispute
    * ditolak dengan 400.
    */
-  async cancelUnshipped(orderId: string, adminId: string, dto: ForceActionDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: string; outcome: string; detail?: string }> {
+  async cancelUnshipped(orderId: string, adminId: string, dto: ForceActionWithReauthDto, ipAddress: string = 'unknown'): Promise<{ orderId: string; status: string; outcome: string; detail?: string }> {
+    // SEC-603: cancel-unshipped menggerakkan escrow (cancel + auto-refund) —
+    // wajib re-auth password server-side seperti force-cancel/force-complete.
+    await this.verifyAdminPasswordForForceAction(adminId, dto.password, 'cancel-unshipped', orderId, ipAddress);
     const result = await this.unshippedCancelService.cancelUnshippedOrder(
       orderId,
       `admin:${adminId}`,

@@ -8,6 +8,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import {
   DANA_SANDBOX_WEBHOOK_PUBLIC_KEY,
+  assertWebhookTimestampFresh,
   verifyDanaWebhookSignature,
 } from '../payment/dana/dana-snap.util';
 import { DanaDisbursementNotify } from '../payment/dana/dana.types';
@@ -114,6 +115,9 @@ export class DanaWebhookDisbursementService {
 
     const signature = String(headers['x-signature'] ?? '');
     const timestamp = String(headers['x-timestamp'] ?? '');
+    // SEC-206: tolak replay — X-TIMESTAMP di luar ±5 menit → 403
+    // WEBHOOK_TIMESTAMP_STALE, SEBELUM verifikasi signature RSA.
+    assertWebhookTimestampFresh(timestamp);
     const ok = verifyDanaWebhookSignature({
       method: 'POST',
       path,

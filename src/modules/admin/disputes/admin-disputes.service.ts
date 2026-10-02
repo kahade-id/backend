@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger, Optional } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger, Optional, OnModuleInit } from '@nestjs/common';
 import { Decimal } from '@prisma/client/runtime/library';
 import { randomBytes, randomInt } from 'crypto';
 import { Prisma, DisputeDecisionType, DisputeCategory, DisputeStatus, OrderStatus, ActorType, WalletTransactionType, WalletTransactionStatus, AuditAction, NotificationType, VoucherApplicability, VoucherType } from '@prisma/client';
@@ -25,12 +25,15 @@ import { RealtimeService } from '../../realtime/realtime.service';
 import { escapeLikePattern } from '../../../common/utils/search.util';
 import { ChatService } from '../../chat/chat.service';
 import { DashboardService } from '../dashboard/dashboard.service';
+// SEC-501: dual control untuk resolve nominal besar.
+import { ApprovalsService } from '../approvals/approvals.service';
+import { DUAL_CONTROL_THRESHOLD_SEN } from '../approvals/dual-control.constants';
 
 const DISPUTE_APOLOGY_VOUCHER_AMOUNT = BigInt(10_000 * 100);
 const DISPUTE_APOLOGY_VALID_DAYS = 30;
 
 @Injectable()
-export class AdminDisputesService {
+export class AdminDisputesService implements OnModuleInit {
   private readonly logger = new Logger(AdminDisputesService.name);
 
   constructor(
@@ -46,7 +49,24 @@ export class AdminDisputesService {
     private readonly dashboard: DashboardService,
     // M4 no-wallet: payout cashback via disbursement DANA.
     @Optional() private escrowDisbursement: EscrowDisbursementService | null,
+    // SEC-501: dual control — modul ini mengeksekusi DISPUTE_RESOLVE yang disetujui.
+    private readonly approvals: ApprovalsService,
   ) {}
+
+  onModuleInit(): void {
+    this.approvals.registerExecutor('DISPUTE_RESOLVE', async (ctx) => {
+      const dto = ctx.payload as unknown as DisputeDecisionDto;
+      if (!ctx.targetId) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'DISPUTE_RESOLVE membutuhkan targetId (disputeId)',
+        });
+      }
+      return this.resolveDispute(ctx.targetId, ctx.decidedBy, dto, ctx.ipAddress, {
+        viaDualControl: true,
+      });
+    });
+  }
 
   private apologyVoucherCode(disputeId: string): string {
     const safeDispute = disputeId.replace(/[^A-Z0-9]/gi, '').slice(-8).toUpperCase();
@@ -362,7 +382,13 @@ export class AdminDisputesService {
     };
   }
 
-  async resolveDispute(disputeId: string, adminId: string, dto: DisputeDecisionDto, ipAddress: string = 'internal'): Promise<object> {
+  async resolveDispute(
+    disputeId: string,
+    adminId: string,
+    dto: DisputeDecisionDto,
+    ipAddress: string = 'internal',
+    opts: { viaDualControl?: boolean } = {},
+  ): Promise<object> {
     validateSplitPercents(dto);
 
     const dispute = await this.prisma.dispute.findFirst({
@@ -399,6 +425,18 @@ export class AdminDisputesService {
       totalDisbursement,
       isPostCompletionDispute,
     } = amounts;
+
+    // SEC-501: nominal escrow di atas ambang → WAJIB dual control. Jalur
+    // langsung (tanpa viaDualControl) ditolak fail-closed; klien mengusulkan
+    // via POST /v1/admin/approvals/propose (actionType DISPUTE_RESOLVE).
+    if (!opts.viaDualControl && escrowedAmount > DUAL_CONTROL_THRESHOLD_SEN) {
+      throw new ForbiddenException({
+        code: ErrorCodes.DUAL_CONTROL_REQUIRED,
+        message:
+          'Nominal escrow di atas Rp1.000.000 — resolve sengketa wajib dual control ' +
+          '(usulkan via POST /v1/admin/approvals/propose dengan actionType DISPUTE_RESOLVE)',
+      });
+    }
 
     // M3 (no-wallet): order dibayar via DANA-direct (QRIS/VA/BALANCE). Putusan
     // sengketa dieksekusi TANPA wallet: refund DANA ke metode bayar asal

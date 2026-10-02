@@ -44,7 +44,7 @@ import { DISPUTE_SLA_HOURS } from '../../common/constants/app.constants';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import { PrismaService } from '../../prisma/prisma.service';
-import { Optional } from '@nestjs/common';
+import { Inject, Optional } from '@nestjs/common';
 import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { EscrowDisbursementService } from '../no-wallet/escrow-disbursement.service';
 import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
@@ -109,9 +109,13 @@ export class MilestonesService {
     private readonly prisma: PrismaService,
     private readonly txSerial: WalletTxSerialService,
     // M5 no-wallet: release via disbursement DANA + refund parsial per tahap.
-    @Optional() private readonly walletMode?: WalletModeService | null,
-    @Optional() private readonly disbursement?: EscrowDisbursementService | null,
-    @Optional() private readonly danaRefund?: DanaDirectRefundService | null,
+    // @Inject EKSPLISIT: design:paramtypes untuk `X | null` = Object (TS tidak
+    // bisa emit union) — tanpa @Inject, ketiga param @Optional ini SELALU
+    // undefined di runtime dan seluruh jalur no-wallet mati diam-diam
+    // (isNoWalletMode() selalu false, refund selalu NO_WALLET_PROVIDER_UNAVAILABLE).
+    @Optional() @Inject(WalletModeService) private readonly walletMode?: WalletModeService | null,
+    @Optional() @Inject(EscrowDisbursementService) private readonly disbursement?: EscrowDisbursementService | null,
+    @Optional() @Inject(DanaDirectRefundService) private readonly danaRefund?: DanaDirectRefundService | null,
   ) {}
 
   /** Kunci idempotensi disbursement per tahap — stabil. */
@@ -1474,12 +1478,17 @@ export class MilestonesService {
    * per tahap ke metode bayar asal (buyerAmount/escrowHeld tahap yang masih
    * ditahan). Tahap yang sudah RELEASED tidak disentuh.
    *
-   * Urutan money-first (fail-closed, self-healing):
-   * - Refund DANA parsial per tahap DULU (idempoten via kunci stabil
-   *   `MILESTONE_CANCEL:<milestoneId>`; refundAmount melempar bila gagal).
-   * - Baru tandai CANCELLED di dalam tx. Crash di antara keduanya → retry
-   *   menemukan attempt yang sudah ada (tidak refund ganda) lalu menandai
-   *   CANCELLED.
+   * Urutan CLAIM-DULU (fail-closed, SEC-102 audit 2026-10-03):
+   * - KLAIM tiap tahap DI DALAM tx via updateMany kondisional
+   *   (status masih OPEN + escrowHeld sama dengan snapshot) → CANCELLED +
+   *   escrowHeld=0. Bila count === 0 (tahap berubah status di tengah jalan,
+   *   mis. buyer accept konkuren) → THROW, tidak ada refund untuk tahap itu.
+   * - Refund DANA parsial per tahap HANYA untuk tahap yang berhasil diklaim
+   *   (idempoten via kunci stabil `MILESTONE_CANCEL:<milestoneId>`;
+   *   refundAmount melempar bila gagal). Crash di antara klaim dan refund →
+   *   retry menemukan attempt yang sudah ada (tidak refund ganda) lalu
+   *   menandai CANCELLED — tahap sudah CANCELLED dari klaim, refund
+   *   dikejar cron dana-refund-retry.
    * - Tanpa payment DANA SUCCESS untuk order → tolak (fail-closed), jangan
    *   tandai CANCELLED.
    */
@@ -1526,9 +1535,39 @@ export class MilestonesService {
       return { orderId: order.orderId, cancelled: 0, refundedIdr: 0 };
     }
 
-    // Money-first: refund parsial per tahap (idempoten). Tahap DRAFT murni
-    // (escrowHeld=0) tidak butuh refund.
-    for (const m of remaining) {
+    // SEC-102: KLAIM DULU di dalam tx SEBELUM uang keluar. updateMany
+    // kondisional (status masih OPEN + escrowHeld tak berubah) = klaim atomik
+    // per tahap; count === 0 → tahap sudah bergerak (mis. accept konkuren) →
+    // THROW agar tidak ada refund untuk tahap yang tidak kita kunci.
+    const claimed = await this.prisma.$transaction(async (tx) => {
+      const claimedMilestones: Array<{ id: string; seq: number; escrowHeld: bigint }> = [];
+      for (const m of remaining) {
+        const res = await tx.orderMilestone.updateMany({
+          where: { id: m.id, status: { in: OPEN }, escrowHeld: m.escrowHeld },
+          data: { status: MilestoneStatus.CANCELLED, escrowHeld: 0n },
+        });
+        if (res.count === 0) {
+          throw new ConflictException({
+            code: 'MILESTONE_CLAIM_FAILED',
+            message: `Tahap ${m.seq} berubah status/nominal selama pembatalan — dibatalkan (fail-closed), tidak ada refund untuk tahap ini.`,
+          });
+        }
+        claimedMilestones.push({ id: m.id, seq: m.seq, escrowHeld: m.escrowHeld });
+        await this.recordEvent(tx, m.id, role, MilestoneEventType.CANCELLED, userId, {
+          refunded: m.escrowHeld.toString(),
+          noWallet: true,
+          danaRefundKey: this.milestoneCancelRefundKey(m.id),
+        } as Prisma.InputJsonValue);
+      }
+      // Finalisasi order bila semua tahap sudah terminal (tanpa release legacy).
+      await this.maybeFinalizeMilestoneOrder(tx, order.id);
+      return claimedMilestones;
+    });
+
+    // Refund DANA HANYA untuk tahap yang berhasil diklaim di atas.
+    // Tahap DRAFT murni (escrowHeld=0) tidak butuh refund.
+    let refunded = 0n;
+    for (const m of claimed) {
       if (m.escrowHeld <= 0n) continue;
       const outcome = await this.danaRefund.refundAmount({
         paymentDbId: payment.id,
@@ -1539,38 +1578,20 @@ export class MilestonesService {
       if (!outcome.refunded) {
         throw new ServiceUnavailableException({
           code: 'MILESTONE_CANCEL_REFUND_FAILED',
-          message: `Refund DANA tahap ${m.seq} gagal (${outcome.reason}) — pembatalan dibatalkan (fail-closed).`,
+          message: `Refund DANA tahap ${m.seq} gagal (${outcome.reason}) — tahap sudah CANCELLED, refund dikejar via retry (fail-closed).`,
         });
       }
+      refunded += m.escrowHeld;
     }
-
-    const result = await this.prisma.$transaction(async (tx) => {
-      let refunded = 0n;
-      for (const m of remaining) {
-        await tx.orderMilestone.updateMany({
-          where: { id: m.id, status: { in: OPEN } },
-          data: { status: MilestoneStatus.CANCELLED, escrowHeld: 0n },
-        });
-        if (m.escrowHeld > 0n) refunded += m.escrowHeld;
-        await this.recordEvent(tx, m.id, role, MilestoneEventType.CANCELLED, userId, {
-          refunded: m.escrowHeld.toString(),
-          noWallet: true,
-          danaRefundKey: this.milestoneCancelRefundKey(m.id),
-        } as Prisma.InputJsonValue);
-      }
-      // Finalisasi order bila semua tahap sudah terminal (tanpa release legacy).
-      await this.maybeFinalizeMilestoneOrder(tx, order.id);
-      return { cancelled: remaining.length, refundedAmount: refunded };
-    });
 
     await this.notifyUser(
       role === MilestoneActorType.BUYER ? order.sellerId : order.buyerId,
       NotificationType.MILESTONE_CANCELLED,
       'Sisa Tahap Dibatalkan',
-      `${result.cancelled} tahap tersisa order "${order.orderId}" dibatalkan. Dana tahap tersebut dikembalikan ke metode pembayaran asal.`,
+      `${claimed.length} tahap tersisa order "${order.orderId}" dibatalkan. Dana tahap tersebut dikembalikan ke metode pembayaran asal.`,
       orderId,
     );
-    return { orderId: order.orderId, cancelled: result.cancelled, refundedIdr: Number(result.refundedAmount) / 100 };
+    return { orderId: order.orderId, cancelled: claimed.length, refundedIdr: Number(refunded) / 100 };
   }
 
   /**

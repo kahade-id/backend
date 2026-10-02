@@ -366,21 +366,81 @@ describe('M5 cancelRemaining no-wallet (refund parsial DANA)', () => {
     expect(db.orderMilestone[0].status).toBe(MilestoneStatus.AWAITING_ACTIVATION);
   });
 
-  it('fail-closed bila refund DANA gagal — tahap tidak dibatalkan', async () => {
+  it('SEC-102: refund DANA gagal SETELAH klaim — tahap tetap CANCELLED (terkunci), refund dikejar retry idempoten', async () => {
     const danaRefund = {
       refundAmount: jest.fn().mockResolvedValue({ refunded: false, reason: 'NOT_ELIGIBLE' }),
     };
     const { svc, prisma, db } = makeSvc({ walletEnabled: false, danaRefund });
     seedOrder(db);
     seedDanaPayment(db);
-    seedMilestone(db, { status: MilestoneStatus.AWAITING_ACTIVATION, escrowHeld: sen(50000) });
+    const m1 = seedMilestone(db, { status: MilestoneStatus.AWAITING_ACTIVATION, escrowHeld: sen(50000) });
     const order = db.order[0];
     await expect(
       (svc as any).cancelRemainingNoWallet(order, 'ord-1', 'buyer-1', MilestoneActorType.BUYER),
     ).rejects.toMatchObject({
       response: expect.objectContaining({ code: 'MILESTONE_CANCEL_REFUND_FAILED' }),
     });
-    expect(db.orderMilestone[0].status).toBe(MilestoneStatus.AWAITING_ACTIVATION);
+    // Klaim sudah terjadi SEBELUM refund: tahap terkunci CANCELLED + escrowHeld=0
+    // → accept konkuren tidak bisa cair lagi; refund dikejar via retry
+    // idempoten (cron dana-refund-retry, key MILESTONE_CANCEL:<id>).
+    expect(db.orderMilestone.find((m) => m.id === m1.id)!.status).toBe(MilestoneStatus.CANCELLED);
+    expect(db.orderMilestone.find((m) => m.id === m1.id)!.escrowHeld).toBe(0n);
+    expect(danaRefund.refundAmount).toHaveBeenCalledTimes(1);
+    expect(danaRefund.refundAmount).toHaveBeenCalledWith(expect.objectContaining({
+      idempotencyKey: `MILESTONE_CANCEL:${m1.id}`,
+    }));
+  });
+
+  it('SEC-102: klaim terjadi SEBELUM refund DANA dipanggil', async () => {
+    const seenStatusAtRefund: string[] = [];
+    const danaRefund = {
+      refundAmount: jest.fn().mockImplementation(async () => {
+        // Saat refund dipanggil, tahap HARUS sudah CANCELLED (terklaim).
+        seenStatusAtRefund.push(db.orderMilestone[0].status);
+        return { refunded: true, already: false, amountSen: sen(50000) };
+      }),
+    };
+    const { svc, db } = makeSvc({ walletEnabled: false, danaRefund });
+    seedOrder(db);
+    seedDanaPayment(db);
+    seedMilestone(db, { status: MilestoneStatus.SUBMITTED, escrowHeld: sen(50000) });
+    const order = db.order[0];
+    await (svc as any).cancelRemainingNoWallet(order, 'ord-1', 'buyer-1', MilestoneActorType.BUYER);
+    expect(danaRefund.refundAmount).toHaveBeenCalledTimes(1);
+    expect(seenStatusAtRefund).toEqual([MilestoneStatus.CANCELLED]);
+  });
+
+  it('SEC-102: dua cancel konkuren — hanya satu yang refund (klaim atomik)', async () => {
+    const danaRefund = {
+      refundAmount: jest.fn().mockResolvedValue({ refunded: true, already: false, amountSen: sen(50000) }),
+    };
+    const { svc, prisma, db } = makeSvc({ walletEnabled: false, danaRefund });
+    seedOrder(db);
+    seedDanaPayment(db);
+    const m1 = seedMilestone(db, { status: MilestoneStatus.SUBMITTED, escrowHeld: sen(50000) });
+    const order = db.order[0];
+
+    const [r1, r2] = await Promise.allSettled([
+      (svc as any).cancelRemainingNoWallet(order, 'ord-1', 'buyer-1', MilestoneActorType.BUYER),
+      (svc as any).cancelRemainingNoWallet(order, 'ord-1', 'buyer-1', MilestoneActorType.BUYER),
+    ]);
+
+    const fulfilled = [r1, r2].filter((r) => r.status === 'fulfilled');
+    const rejected = [r1, r2].filter((r) => r.status === 'rejected');
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    // Yang kalah: klaim gagal (fail-closed) — bukan refund ganda, bukan silent.
+    expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({
+      response: expect.objectContaining({ code: 'MILESTONE_CLAIM_FAILED' }),
+    });
+    // Hanya SATU refund DANA untuk milestone itu.
+    expect(danaRefund.refundAmount).toHaveBeenCalledTimes(1);
+    expect(danaRefund.refundAmount).toHaveBeenCalledWith(expect.objectContaining({
+      idempotencyKey: `MILESTONE_CANCEL:${m1.id}`,
+      amountSen: sen(50000),
+    }));
+    expect((fulfilled[0] as PromiseFulfilledResult<any>).value.cancelled).toBe(1);
+    expect(db.orderMilestone.find((m) => m.id === m1.id)!.status).toBe(MilestoneStatus.CANCELLED);
   });
 });
 

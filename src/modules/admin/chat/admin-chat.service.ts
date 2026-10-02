@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, BadRequestException, Logger } from '@nes
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
+import { ChatService } from '../../chat/chat.service';
 import {
   AuditAction,
   ChatModerationAction,
@@ -44,6 +45,7 @@ export class AdminChatService {
   constructor(
     private prisma: PrismaService,
     private auditLog: AuditLogService,
+    private chatService: ChatService,
   ) {}
 
   async listModerationEvents(query: ModerationEventQuery): Promise<object> {
@@ -148,6 +150,9 @@ export class AdminChatService {
         createdAt: true,
         updatedAt: true,
         messageId: true,
+        // Audit 2026-10-03 (BAD-007): roomId eksplisit di detail agar tombol
+        // "Lihat room" panel admin bisa tampil tanpa parse dari objek room.
+        roomId: true,
         user: {
           select: {
             id: true,
@@ -263,6 +268,7 @@ export class AdminChatService {
         action: true,
         status: true,
         createdAt: true,
+        // Audit 2026-10-03 (BAD-007): roomId agar tombol "Lihat room" bisa tampil.
         roomId: true,
       },
     });
@@ -319,5 +325,80 @@ export class AdminChatService {
       });
     }
     return normalized;
+  }
+
+  /**
+   * Audit 2026-10-03 (FAL-003): detail polling untuk Trust & Safety —
+   * hasil vote per opsi agar polling manipulatif/spam bisa ditinjau.
+   */
+  async getPollDetail(pollId: string): Promise<object> {
+    const poll = await this.prisma.chatPoll.findUnique({
+      where: { id: pollId },
+      select: {
+        id: true,
+        roomId: true,
+        question: true,
+        options: true,
+        isClosed: true,
+        createdAt: true,
+        createdBy: { select: { userId: true, fullName: true } },
+        votes: { select: { userId: true, optionIndex: true } },
+      },
+    });
+    if (!poll) {
+      throw new NotFoundException({ code: ErrorCodes.CHAT_POLL_NOT_FOUND, message: 'Poll not found' });
+    }
+    const options = (poll.options as string[]) ?? [];
+    const voteCounts = new Array(options.length).fill(0) as number[];
+    const voters = new Set<string>();
+    for (const vote of poll.votes) {
+      if (vote.optionIndex >= 0 && vote.optionIndex < voteCounts.length) {
+        voteCounts[vote.optionIndex] += 1;
+      }
+      voters.add(vote.userId);
+    }
+    return {
+      poll: {
+        id: poll.id,
+        question: poll.question,
+        options: options.map((text, index) => ({
+          id: index,
+          text,
+          voteCount: voteCounts[index] ?? 0,
+        })),
+        totalVotes: voters.size,
+        isClosed: poll.isClosed,
+        createdAt: poll.createdAt,
+        createdBy: poll.createdBy,
+        roomId: poll.roomId,
+      },
+    };
+  }
+
+  /**
+   * Audit 2026-10-03 (FAL-003): penutupan paksa polling bermasalah oleh admin.
+   * Dicatat di audit log admin (sebelum & sesudah status).
+   */
+  async closePollForAdmin(pollId: string, adminId: string, ipAddress: string): Promise<object> {
+    const before = await this.prisma.chatPoll.findUnique({
+      where: { id: pollId },
+      select: { id: true, question: true, isClosed: true, roomId: true },
+    });
+    if (!before) {
+      throw new NotFoundException({ code: ErrorCodes.CHAT_POLL_NOT_FOUND, message: 'Poll not found' });
+    }
+    await this.chatService.closePollByAdmin(pollId);
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'ChatPoll',
+      targetId: pollId,
+      description: `Admin force-closed poll ${pollId} (room ${before.roomId})`,
+      before: { isClosed: before.isClosed },
+      after: { isClosed: true },
+      ipAddress,
+    });
+    this.logger.log(`Chat poll ${pollId} force-closed by admin ${adminId}`);
+    return { ok: true };
   }
 }

@@ -24,6 +24,8 @@ import { SuspendUserDto } from './dto/suspend-user.dto';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
 import { Idempotency } from '../../../common/decorators/idempotency.decorator';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
+import { StepUpGuard } from '../../../common/guards/step-up.guard';
+import { RequireStepUp } from '../../../common/decorators/require-step-up.decorator';
 
 @ApiTags('admin-users')
 @ApiBearerAuth('access-token')
@@ -96,10 +98,14 @@ export class AdminUsersController {
   }
 
   @Post(':userId/wallet/adjust')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // SEC-601/503: mutasi saldo manual wajib step-up server-side (+ reauthPassword
+  // di body, diverifikasi server-side pola AUT-013). BAD-008: ditolak 403
+  // WALLET_DISABLED bila kill-switch nonaktif. CREDIT > Rp1jt → dual control.
+  @RequireStepUp('wallet.adjust', 'userId')
   @AdminRoles('SUPER_ADMIN')
   @Idempotency()
-  @ApiOperation({ summary: 'Adjust user wallet', description: 'Manual wallet credit or debit. SUPER_ADMIN only.' })
+  @ApiOperation({ summary: 'Adjust user wallet', description: 'Manual wallet credit or debit. SUPER_ADMIN only. SEC-601/503: requires X-Step-Up-Token (action wallet.adjust) + reauthPassword in body. Rejected 403 WALLET_DISABLED when wallet kill-switch is off. CREDIT above Rp1.000.000 requires dual control via POST /v1/admin/approvals/propose.' })
   @ApiResponse({ status: 200, description: 'Wallet adjusted.' })
   @ApiResponse({ status: 403, description: 'Insufficient admin role.' })
   @ApiResponse({ status: 404, description: 'User or wallet not found.' })

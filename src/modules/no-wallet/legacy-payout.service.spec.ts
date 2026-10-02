@@ -1,15 +1,25 @@
 import { ConflictException } from '@nestjs/common';
-import { WalletTransactionStatus } from '@prisma/client';
+import { Prisma, WalletTransactionStatus } from '@prisma/client';
 import { LegacyPayoutService } from './legacy-payout.service';
 
 const wallet = { id: 'w-1', userId: 'u-1', availableBalance: BigInt(5000000), totalBalance: BigInt(5000000) };
 const bank = { id: 'b-1', bankName: 'BCA' };
+
+/** Error P2002 (unique constraint) seperti yang dilempar Prisma asli. */
+function p2002() {
+  return new Prisma.PrismaClientKnownRequestError('Unique constraint failed on the fields: (`idempotencyKey`)', {
+    code: 'P2002',
+    clientVersion: '5.0.0',
+    meta: { target: ['idempotencyKey'] },
+  });
+}
 
 function buildDeps() {
   const txState = {
     walletFindUnique: jest.fn(async () => ({ ...wallet })),
     walletUpdate: jest.fn(async () => ({})),
     walletTxFindFirst: jest.fn(async () => null),
+    walletTxFindUnique: jest.fn(async () => null),
     walletTxCreate: jest.fn(async (args: { data: Record<string, unknown> }) => ({
       id: 'wtx-1',
       txId: 'WLT-20260929-000001-x',
@@ -23,6 +33,7 @@ function buildDeps() {
     wallet: { findUnique: txState.walletFindUnique, update: txState.walletUpdate },
     walletTransaction: {
       findFirst: txState.walletTxFindFirst,
+      findUnique: txState.walletTxFindUnique,
       create: txState.walletTxCreate,
       update: txState.walletTxUpdate,
     },
@@ -126,17 +137,49 @@ describe('LegacyPayoutService', () => {
 
   it('idempoten: idempotencyKey sama → tanpa debit kedua', async () => {
     const { svc, txState, escrowDisbursement } = buildDeps();
-    (txState.walletTxFindFirst as jest.Mock).mockResolvedValue({
+    const winner = {
       id: 'wtx-old',
       txId: 'WLT-OLD',
       status: WalletTransactionStatus.SUCCESS,
       amount: BigInt(1000000),
-    });
+      idempotencyKey: 'k-1',
+    };
+    // SEC-203: tanpa read-check-then-write — request kedua langsung kena
+    // P2002 saat insert (klaim atomik), lalu membaca baris pemenang.
+    (txState.walletTxCreate as jest.Mock).mockRejectedValueOnce(p2002());
+    (txState.walletTxFindUnique as jest.Mock).mockResolvedValue(winner);
     const res = await svc.requestPayout('u-1', dto({ idempotencyKey: 'k-1' }));
     expect(res.status).toBe('RELEASED');
     expect(res.walletTxId).toBe('WLT-OLD');
-    expect(txState.walletTxCreate).not.toHaveBeenCalled();
+    // Tanpa debit kedua: wallet tidak di-decrement.
+    expect(txState.walletUpdate).not.toHaveBeenCalled();
     expect(escrowDisbursement.releaseFunds).not.toHaveBeenCalled();
+  });
+
+  it('SEC-203: dua request konkuren dengan key sama — hanya satu yang debit', async () => {
+    const { svc, txState } = buildDeps();
+    const winner = {
+      id: 'wtx-1',
+      txId: 'WLT-20260929-000001-x',
+      status: WalletTransactionStatus.PENDING,
+      amount: BigInt(1000000),
+      idempotencyKey: 'k-race',
+    };
+    // Pemenang insert duluan; yang kalah kena P2002 lalu baca pemenang.
+    (txState.walletTxCreate as jest.Mock)
+      .mockResolvedValueOnce(winner)
+      .mockRejectedValueOnce(p2002());
+    (txState.walletTxFindUnique as jest.Mock).mockResolvedValue(winner);
+
+    const [r1, r2] = await Promise.all([
+      svc.requestPayout('u-1', dto({ idempotencyKey: 'k-race' })),
+      svc.requestPayout('u-1', dto({ idempotencyKey: 'k-race' })),
+    ]);
+
+    // Kedua response konsisten menunjuk baris pemenang yang sama.
+    expect(r1.walletTxId).toBe(r2.walletTxId);
+    // Hanya SATU debit (satu wallet.update) — tanpa double-debit.
+    expect(txState.walletUpdate).toHaveBeenCalledTimes(1);
   });
 
   it('race HELD_NO_BANK → debit dibatalkan via kompensasi (saldo utuh)', async () => {

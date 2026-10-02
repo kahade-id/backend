@@ -1,4 +1,6 @@
 import { createHash, createSign, createVerify, randomUUID } from 'crypto';
+import { ForbiddenException } from '@nestjs/common';
+import { WEBHOOK_TIMESTAMP_STALE } from '../../../common/constants/error-codes';
 
 /**
  * Util signature SNAP DANA (asymmetric RSA-SHA256, PKCS1v15).
@@ -34,6 +36,46 @@ export function jakartaTimestamp(date: Date = new Date()): string {
 
 export function sha256HexLower(data: string): string {
   return createHash('sha256').update(data, 'utf8').digest('hex');
+}
+
+/**
+ * Audit 2026-10-03 (SEC-206): jendela kesegaran X-TIMESTAMP webhook DANA.
+ * Timestamp di luar ±5 menit dari jam server ditolak SEBELUM verifikasi
+ * signature RSA (defense-in-depth terhadap replay; dedup eventKey saja
+ * tidak cukup sebagai satu-satunya pertahanan).
+ */
+export const WEBHOOK_TIMESTAMP_TOLERANCE_MS = 5 * 60 * 1000;
+
+/**
+ * True bila X-TIMESTAMP (format SNAP `YYYY-MM-DDTHH:mm:ss+07:00`) berada
+ * dalam ±`toleranceMs` dari `nowMs`. Timestamp yang tidak bisa di-parse
+ * dianggap basi (fail-closed).
+ */
+export function isWebhookTimestampFresh(
+  timestamp: string,
+  nowMs: number = Date.now(),
+  toleranceMs: number = WEBHOOK_TIMESTAMP_TOLERANCE_MS,
+): boolean {
+  if (!timestamp) return false;
+  const parsed = Date.parse(timestamp);
+  if (!Number.isFinite(parsed)) return false;
+  return Math.abs(nowMs - parsed) <= toleranceMs;
+}
+
+/**
+ * SEC-206: tolak webhook dengan X-TIMESTAMP basi → 403 WEBHOOK_TIMESTAMP_STALE.
+ * Dipanggil handler webhook SEBELUM verifyDanaWebhookSignature.
+ */
+export function assertWebhookTimestampFresh(
+  timestamp: string,
+  nowMs: number = Date.now(),
+): void {
+  if (!isWebhookTimestampFresh(timestamp, nowMs)) {
+    throw new ForbiddenException({
+      code: WEBHOOK_TIMESTAMP_STALE,
+      message: 'Webhook timestamp is outside the allowed ±5 minute window',
+    });
+  }
 }
 
 /**
@@ -141,14 +183,23 @@ export interface VerifyWebhookInput {
   signature: string;
   /** Public key DANA (PEM). */
   publicKeyPem: string;
+  /**
+   * SEC-206: bila true, X-TIMESTAMP di luar ±5 menit langsung melempar
+   * 403 WEBHOOK_TIMESTAMP_STALE SEBELUM verifikasi RSA (bukan sekadar
+   * mengembalikan false). Default false demi kompatibilitas pemanggil lama.
+   */
+  enforceFreshness?: boolean;
 }
 
 /**
  * Verifikasi signature webhook finish-notify DANA.
  * @returns true bila signature valid untuk salah satu bentuk body.
+ * @throws ForbiddenException WEBHOOK_TIMESTAMP_STALE bila
+ * `enforceFreshness=true` dan X-TIMESTAMP basi.
  */
 export function verifyDanaWebhookSignature(input: VerifyWebhookInput): boolean {
   if (!input.timestamp || !input.signature) return false;
+  if (input.enforceFreshness) assertWebhookTimestampFresh(input.timestamp);
   const path = input.path.startsWith('/') ? input.path : `/${input.path}`;
   let signatureBytes: Buffer;
   try {

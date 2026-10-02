@@ -10,6 +10,8 @@ import { AdminMfaSetupDto } from './dto/admin-mfa-setup.dto';
 import { AdminMfaEnableDto } from './dto/admin-mfa-enable.dto';
 import { AdminChangePasswordDto } from './dto/admin-change-password.dto';
 import { AdminFirstPasswordChangeDto } from './dto/admin-first-password-change.dto';
+import { StepUpRequestDto } from './dto/step-up.dto';
+import { AdminStepUpService } from './step-up.service';
 import { CaptchaService } from '../../auth/captcha.service';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
@@ -29,6 +31,8 @@ export class AdminAuthController {
     private readonly configService: ConfigService,
     // AUT-003: tantangan captcha slider untuk endpoint publik generate.
     private readonly captchaService: CaptchaService,
+    // SEC-503: penerbit token step-up re-auth server-side.
+    private readonly stepUpService: AdminStepUpService,
   ) {}
 
   private getRefreshCookiePath(): string {
@@ -279,6 +283,38 @@ export class AdminAuthController {
     @Req() req: Request,
   ): Promise<{ message: string }> {
     return this.adminAuthService.changePassword(adminId, dto.currentPassword, dto.newPassword, req.ip || 'unknown');
+  }
+
+  /**
+   * SEC-503: minta token step-up untuk SATU aksi sensitif.
+   *
+   * Verifikasi password admin (re-auth), lalu terbitkan token crypto-random
+   * 32 byte (disimpan sebagai hash SHA-256): sekali pakai, TTL 3 menit,
+   * terikat `action` (+ `targetId` opsional). Token dikirim via header
+   * `X-Step-Up-Token` pada endpoint yang dijaga @RequireStepUp().
+   * Gagal verifikasi → 401; token salah/kedaluwarsa/terpakai/salah
+   * aksi-target → 403 STEP_UP_*.
+   */
+  @UseGuards(JwtAdminGuard, UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @Post('step-up')
+  @HttpCode(HttpStatus.OK)
+  @ApiBearerAuth('access-token')
+  @ApiOperation({ summary: 'Minta token step-up re-auth (sekali pakai, TTL 3 menit)' })
+  @ApiResponse({ status: 200, description: 'Step-up token issued.' })
+  @ApiResponse({ status: 401, description: 'Password salah.' })
+  async stepUp(
+    @Body() dto: StepUpRequestDto,
+    @CurrentAdmin('sub') adminId: string,
+    @Req() req: Request,
+  ): Promise<{ stepUpToken: string; expiresAt: string }> {
+    return this.stepUpService.issueStepUpToken(
+      adminId,
+      dto.password,
+      dto.action,
+      dto.targetId,
+      req.ip || 'unknown',
+    );
   }
 
   /**

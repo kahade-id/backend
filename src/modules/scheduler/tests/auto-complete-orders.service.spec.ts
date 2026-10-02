@@ -360,3 +360,138 @@ describe('AutoCompleteDeliveredOrdersService — escrow release guards', () => {
     });
   });
 });
+
+describe('SEC-101: cabang no-wallet (DANA-direct) — tanpa ORDER_LOCK/ledger wallet', () => {
+  let nwService: AutoCompleteDeliveredOrdersService;
+  let nwPrisma: Record<string, any>;
+  let nwRedis: Record<string, any>;
+  let nwTx: Record<string, any>;
+  let walletMode: { isWalletEnabled: jest.Mock };
+  let disbursement: { releaseForOrder: jest.Mock };
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    walletMode = { isWalletEnabled: jest.fn(() => false) };
+    disbursement = {
+      releaseForOrder: jest.fn(async () => ({
+        outcome: 'RELEASED',
+        disbursementId: 'disb-1',
+        danaReferenceNo: 'DANA-DSB-1',
+      })),
+    };
+
+    nwTx = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      $executeRaw: jest.fn().mockResolvedValue(1),
+      deliveryProof: {
+        findFirst: jest.fn(async ({ where }: any) =>
+          where.status === 'ACCEPTED' ? { id: 'dp-1' } : null,
+        ),
+      },
+      order: {
+        findUnique: jest.fn().mockResolvedValue({
+          status: OrderStatus.IN_DELIVERY,
+          deliveryDeadlineAt: ORDER.deliveryDeadlineAt,
+          dispute: null,
+        }),
+        updateMany: jest.fn(async () => ({ count: 1 })),
+      },
+      // SENGAJA tanpa wallet/walletTransaction — cabang no-wallet tidak boleh menyentuhnya.
+      escrowDisbursement: {
+        findUnique: jest.fn(async () => null),
+        create: jest.fn(async (args: any) => ({ id: 'disb-1', ...args.data })),
+      },
+      voucherUsage: { findFirst: jest.fn(async () => null) },
+      notification: { create: jest.fn().mockResolvedValue({}) },
+      orderStatusHistory: { create: jest.fn().mockResolvedValue({}) },
+      user: { update: jest.fn().mockResolvedValue({}) },
+      subscription: { findFirst: jest.fn().mockResolvedValue(null) },
+    };
+
+    let served = false;
+    nwPrisma = {
+      order: {
+        findMany: jest.fn(async () => {
+          if (served) return [];
+          served = true;
+          return [ORDER];
+        }),
+      },
+      notification: { create: jest.fn().mockResolvedValue({}) },
+      $transaction: jest.fn(async (cb: any) => cb(nwTx)),
+      emitNotificationCreated: jest.fn(),
+    };
+    nwRedis = {
+      isHealthy: jest.fn().mockResolvedValue(true),
+      setNx: jest.fn().mockResolvedValue(true),
+      get: jest.fn().mockResolvedValue(null),
+      setex: jest.fn().mockResolvedValue('OK'),
+      del: jest.fn().mockResolvedValue(1),
+      incr: jest.fn().mockResolvedValue(1),
+      expire: jest.fn().mockResolvedValue(1),
+      releaseLock: jest.fn().mockResolvedValue(undefined),
+    };
+    // Pola kepemilikan lock yang sama dengan arrange() utama: get(lockKey)
+    // harus mengembalikan token yang diberikan saat setNx.
+    let nwLockToken: string | undefined;
+    (nwRedis.setNx as jest.Mock).mockImplementation(async (_key: string, token: string) => {
+      nwLockToken = token;
+      return true;
+    });
+    (nwRedis.get as jest.Mock).mockImplementation(async (key: string) =>
+      key.startsWith('auto_complete_grace:') ? null : nwLockToken,
+    );
+
+    const { WalletModeService } = await import('../../wallet-mode/wallet-mode.service');
+    const { EscrowDisbursementService } = await import('../../no-wallet/escrow-disbursement.service');
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        AutoCompleteDeliveredOrdersService,
+        { provide: PrismaService, useValue: nwPrisma },
+        { provide: RedisService, useValue: nwRedis },
+        { provide: WalletTxSerialService, useValue: { getNext: jest.fn().mockResolvedValue(1) } },
+        { provide: ReferralService, useValue: { createReferralRewardIfEligible: jest.fn() } },
+        { provide: MembershipRankService, useValue: { checkAndUpdateMembershipRank: jest.fn() } },
+        { provide: FeeCalculatorService, useValue: { getFeeConfig: jest.fn(), getPlusSavingsSen: jest.fn() } },
+        { provide: WalletModeService, useValue: walletMode },
+        { provide: EscrowDisbursementService, useValue: disbursement },
+      ],
+    }).compile();
+    nwService = module.get(AutoCompleteDeliveredOrdersService);
+  });
+
+  it('no-wallet: LEWATI blok ORDER_LOCK/ledger wallet; buat escrowDisbursement PENDING; releaseForOrder post-commit', async () => {
+    await nwService.autoComplete();
+
+    // Baris escrowDisbursement PENDING dibuat di dalam tx (durable).
+    expect(nwTx.escrowDisbursement.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          idempotencyKey: `ORDER:${ORDER.id}`,
+          sellerId: ORDER.sellerId,
+          amountSen: ORDER.sellerReceiveAmount,
+          status: 'PENDING',
+        }),
+      }),
+    );
+    // Blok ledger wallet DILEWATI — tx.wallet tidak pernah disediakan/disentuk.
+    expect(nwTx.wallet).toBeUndefined();
+    // Post-commit: releaseForOrder dieksekusi (idempoten, key ORDER:<orderDbId>).
+    expect(disbursement.releaseForOrder).toHaveBeenCalledWith(ORDER.id);
+    // Order tetap → COMPLETED.
+    expect(nwTx.order.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: 'COMPLETED' }) }),
+    );
+  });
+
+  it('no-wallet: releaseForOrder gagal post-commit TIDAK membakar order (retry via retryDue)', async () => {
+    disbursement.releaseForOrder.mockRejectedValueOnce(new Error('DANA timeout'));
+    await nwService.autoComplete();
+
+    // Baris PENDING tetap durable di tx; order COMPLETED; failure tidak dilempar.
+    expect(nwTx.escrowDisbursement.create).toHaveBeenCalledTimes(1);
+    expect(nwTx.order.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: 'COMPLETED' }) }),
+    );
+  });
+});

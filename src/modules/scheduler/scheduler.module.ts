@@ -42,6 +42,7 @@ import {
   ModerationSlaService,
   NotificationDigestService,
   DanaRefundRetryService,
+  DisputeSettlementSweepService,
 } from './services';
 import { AdminFinanceModule } from '../admin/finance/admin-finance.module';
 import { WithdrawalsModule } from '../withdrawals/withdrawals.module';
@@ -114,6 +115,7 @@ import { UsersModule } from '../users/users.module';
     ExpireExtensionRequestsService,
     RefundReconciliationService,
     DanaRefundRetryService,
+    DisputeSettlementSweepService,
     FeedbackGuestContactRedactionService,
     MilestoneReminderService, // GAP-C (G182)
     ModerationSlaService, // GAP-F (G419/G423): terdaftar sebagai provider agar cron SLA moderasi berjalan

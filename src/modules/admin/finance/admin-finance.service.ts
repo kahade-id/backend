@@ -24,7 +24,8 @@ import { parseDateBoundaryWIB, startOfDayWIB, toWIB } from '../../../common/util
 import { DashboardService } from '../dashboard/dashboard.service';
 import { maskSecretsDeep, toInitials } from './finance-secrets.util';
 import { withCsvExportWatermark } from '../../../common/utils/csv-watermark.util';
-import { URGENT_INVARIANT } from './reconciliation-findings.service';
+import { URGENT_INVARIANT, buildFindingsWhereInput } from './reconciliation-findings.service';
+import { FindingsQueryDto } from './dto/finance-findings.dto';
 
 export type TimelineEventKind = 'LEDGER' | 'WEBHOOK' | 'PROVIDER' | 'REVERSAL';
 
@@ -660,10 +661,15 @@ export class AdminFinanceService {
   /**
    * E3: ekspor CSV laporan rekonsiliasi TANPA PII — identitas pengguna hanya
    * inisial (tanpa userId/email/nomor telepon).
+   *
+   * BAD-020: ekspor WAJIB memakai filter yang sama dengan list
+   * (buildFindingsWhereInput) — admin mendapat CSV yang sama dengan
+   * daftar yang sedang dilihatnya.
    */
   // ADM-429: exporterAdminId dipakai untuk watermark keterlacakan di baris awal CSV.
-  async buildFindingsCsvExport(exporterAdminId: string): Promise<string> {
+  async buildFindingsCsvExport(exporterAdminId: string, query: FindingsQueryDto = {}): Promise<string> {
     const findings = await this.prisma.reconciliationFinding.findMany({
+      where: buildFindingsWhereInput(query),
       orderBy: { createdAt: 'desc' },
       take: 5000,
     });
@@ -820,151 +826,65 @@ export class AdminFinanceService {
   }
 
   /**
-   * CW-022: export CSV keuangan yang bisa dipakai rekonsiliasi — bukan cuma
-   * ringkasan kasar. Isi: (1) ringkasan agregat, (2) breakdown HARIAN
-   * (topup/withdrawal/fee + count) dalam rentang yang diminta. Semua angka
-   * agregat — tanpa PII. Nilai dikutip (CSV-safe) dan nested object
-   * di-flatten agar tidak ada sel JSON mentah.
+   * BAD-033: ekspor CSV DAFTAR TRANSAKSI (bukan ringkasan agregat) —
+   * menghormati filter aktif yang SAMA dengan list (type/status/q +
+   * startDate/endDate wajib) via buildTransactionListFilter (AW-002).
+   *
+   * Admin yang memfilter "hanya WITHDRAWAL gagal" lalu mengekspor kini
+   * menerima tepat baris yang difilter, bukan seluruh ledger.
+   * PII minimal: userId internal + nama lengkap (tanpa email/telepon).
    */
   // ADM-429: exporterAdminId dipakai untuk watermark keterlacakan di baris awal CSV.
-  async buildFinanceCsvExport(from: Date, to: Date, exporterAdminId: string): Promise<string> {
-    const summary = (await this.getFinancialSummary()) as Record<string, unknown>;
-
-    type DailyRow = { day: Date; total: bigint; cnt: bigint };
-    const [topupDaily, withdrawDaily, feeDaily] = await Promise.all([
-      this.prisma.$queryRaw<DailyRow[]>`
-        SELECT date_trunc('day', "createdAt")::date AS day,
-               COALESCE(SUM(amount), 0)::bigint AS total,
-               COUNT(*)::bigint AS cnt
-        FROM wallet_transactions
-        WHERE type = 'TOP_UP' AND status = 'SUCCESS'
-          AND "createdAt" >= ${from} AND "createdAt" <= ${to}
-        GROUP BY 1 ORDER BY 1`,
-      this.prisma.$queryRaw<DailyRow[]>`
-        SELECT date_trunc('day', "createdAt")::date AS day,
-               COALESCE(SUM(amount), 0)::bigint AS total,
-               COUNT(*)::bigint AS cnt
-        FROM wallet_transactions
-        WHERE type = 'WITHDRAW' AND status = 'SUCCESS'
-          AND "createdAt" >= ${from} AND "createdAt" <= ${to}
-        GROUP BY 1 ORDER BY 1`,
-      this.prisma.$queryRaw<DailyRow[]>`
-        SELECT date_trunc('day', "completedAt")::date AS day,
-               COALESCE(SUM("feeAmount"), 0)::bigint AS total,
-               COUNT(*)::bigint AS cnt
-        FROM orders
-        WHERE status = 'COMPLETED'
-          AND "completedAt" >= ${from} AND "completedAt" <= ${to}
-        GROUP BY 1 ORDER BY 1`,
-    ]);
-
-    // BAI-055 (P2): di era DANA-direct, pergerakan uang riil (disbursement ke
-    // seller, refund DANA ke buyer, payment masuk) TIDAK tercatat di
-    // wallet_transactions — export "rekonsiliasi" wajib mencakupnya.
-    // Semua agregat, tanpa PII.
-    type DanaDailyRow = { day: Date; scope: string; status: string; total: bigint; cnt: bigint };
-    const [disbursementDaily, refundDaily] = await Promise.all([
-      this.prisma.$queryRaw<DanaDailyRow[]>`
-        SELECT date_trunc('day', "createdAt")::date AS day,
-               scope::text AS scope,
-               status::text AS status,
-               COALESCE(SUM("amountSen"), 0)::bigint AS total,
-               COUNT(*)::bigint AS cnt
-        FROM escrow_disbursements
-        WHERE "createdAt" >= ${from} AND "createdAt" <= ${to}
-        GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`,
-      this.prisma.$queryRaw<DanaDailyRow[]>`
-        SELECT date_trunc('day', "createdAt")::date AS day,
-               'DANA_REFUND' AS scope,
-               status AS status,
-               COALESCE(SUM("amountSen"), 0)::bigint AS total,
-               COUNT(*)::bigint AS cnt
-        FROM dana_refund_attempts
-        WHERE "createdAt" >= ${from} AND "createdAt" <= ${to}
-        GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`,
-    ]);
-    type PaymentDailyRow = { day: Date; status: string; total: bigint; cnt: bigint };
-    const paymentDaily = await this.prisma.$queryRaw<PaymentDailyRow[]>`
-      SELECT date_trunc('day', "createdAt")::date AS day,
-             status::text AS status,
-             COALESCE(SUM("amount"), 0)::bigint AS total,
-             COUNT(*)::bigint AS cnt
-      FROM payment_transactions
-      WHERE "createdAt" >= ${from} AND "createdAt" <= ${to}
-      GROUP BY 1, 2 ORDER BY 1, 2`;
-
-    const dayKey = (d: Date | string): string =>
-      d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10);
-    const toMap = (rows: DailyRow[]): Map<string, DailyRow> =>
-      new Map(rows.map((r) => [dayKey(r.day), r]));
-    const topupMap = toMap(topupDaily);
-    const withdrawMap = toMap(withdrawDaily);
-    const feeMap = toMap(feeDaily);
-    const allDays = [...new Set([...topupMap.keys(), ...withdrawMap.keys(), ...feeMap.keys()])].sort();
+  async buildTransactionCsvExport(query: FinanceTransactionQueryDto, exporterAdminId: string): Promise<string> {
+    const { where, start, end } = this.buildTransactionListFilter(query);
+    const rows = await this.prisma.walletTransaction.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: 5000,
+      select: {
+        txId: true,
+        type: true,
+        status: true,
+        amount: true,
+        balanceBefore: true,
+        balanceAfter: true,
+        description: true,
+        createdAt: true,
+        wallet: { select: { user: { select: { userId: true, fullName: true } } } },
+        order: { select: { orderId: true } },
+      },
+    });
     const csvCell = (v: unknown): string => {
       const s = v === null || v === undefined ? '' : String(v);
       return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
+    const dayKey = (d: Date): string => d.toISOString().slice(0, 10);
     const lines: string[] = [];
-    lines.push(`# finance export generated_at=${new Date().toISOString()} range=${dayKey(from)}..${dayKey(to)} (WIB)`);
-    lines.push('');
-    lines.push('[summary]');
-    lines.push('metric,value');
-    for (const [k, v] of Object.entries(summary)) {
-      // Flatten: tidak ada lagi sel JSON mentah (temuan CW-022).
-      if (v !== null && typeof v === 'object') {
-        for (const [sk, sv] of Object.entries(v as Record<string, unknown>)) {
-          lines.push(`${csvCell(`${k}.${sk}`)},${csvCell(sv)}`);
-        }
-      } else {
-        lines.push(`${csvCell(k)},${csvCell(v)}`);
-      }
-    }
-    lines.push('');
-    lines.push('[daily]');
-    lines.push('date,topup_idr,topup_count,withdrawal_idr,withdrawal_count,fee_idr,fee_count');
-    for (const day of allDays) {
-      const t = topupMap.get(day);
-      const w = withdrawMap.get(day);
-      const f = feeMap.get(day);
+    lines.push(
+      `# finance transactions export generated_at=${new Date().toISOString()} ` +
+        `range=${dayKey(start)}..${dayKey(end)} ` +
+        `filters=${JSON.stringify({ type: query.type ?? null, status: query.status ?? null, q: query.q ?? null })}`,
+    );
+    lines.push('tx_id,dibuat_pada,tipe,status,jumlah_idr,saldo_sebelum_idr,saldo_sesudah_idr,deskripsi,order_publik,user_id,nama_pengguna');
+    for (const r of rows) {
       lines.push(
         [
-          day,
-          t ? toIdr(t.total) : 0,
-          t ? Number(t.cnt) : 0,
-          w ? toIdr(w.total) : 0,
-          w ? Number(w.cnt) : 0,
-          f ? toIdr(f.total) : 0,
-          f ? Number(f.cnt) : 0,
-        ].map(csvCell).join(','),
+          r.txId,
+          r.createdAt.toISOString(),
+          r.type,
+          r.status,
+          toIdr(r.amount),
+          toIdr(r.balanceBefore),
+          toIdr(r.balanceAfter),
+          r.description ?? '',
+          r.order?.orderId ?? '',
+          r.wallet?.user?.userId ?? '',
+          r.wallet?.user?.fullName ?? '',
+        ]
+          .map(csvCell)
+          .join(','),
       );
     }
-    // BAI-055: pergerakan dana DANA aktual (bukan wallet legacy).
-    lines.push('');
-    lines.push('[disbursement_daily]');
-    lines.push('date,scope,status,count,total_idr');
-    for (const r of disbursementDaily) {
-      lines.push(
-        [dayKey(r.day), r.scope, r.status, Number(r.cnt), toIdr(r.total)].map(csvCell).join(','),
-      );
-    }
-    lines.push('');
-    lines.push('[dana_refund_daily]');
-    lines.push('date,scope,status,count,total_idr');
-    for (const r of refundDaily) {
-      lines.push(
-        [dayKey(r.day), r.scope, r.status, Number(r.cnt), toIdr(r.total)].map(csvCell).join(','),
-      );
-    }
-    lines.push('');
-    lines.push('[payment_daily]');
-    lines.push('date,status,count,total_idr');
-    for (const r of paymentDaily) {
-      lines.push(
-        [dayKey(r.day), r.status, Number(r.cnt), toIdr(r.total)].map(csvCell).join(','),
-      );
-    }
-    // ADM-429: watermark pengekspor di baris awal CSV untuk keterlacakan kebocoran.
     return withCsvExportWatermark(lines.join('\n') + '\n', exporterAdminId, 'admin/finance/export');
   }
 
@@ -1428,87 +1348,6 @@ export class AdminFinanceService {
       source: 'WALLET_BASED',
       ...danaFields,
     };
-  }
-
-  /**
-   * MFE-015: antrean disbursement escrow untuk admin (visibilitas operasional
-   * atas dana DANA-direct yang keluar ke rekening bank seller).
-   *
-   * Filter yang penting: status HELD_NO_BANK (seller belum punya rekening
-   * terverifikasi — fail-closed, butuh tindak lanjut) dan NEEDS_REVIEW
-   * (status DANA tak dikenal — butuh review manual sebelum retry/FAILED).
-   * Read-only: tidak ada aksi mutasi di sini (retry manual ditangani modul
-   * disbursement / cron retryDue).
-   */
-  async listDisbursements(query: {
-    page?: number;
-    limit?: number;
-    status?: EscrowDisbursementStatus;
-    scope?: string;
-    q?: string;
-    sortBy?: 'createdAt' | 'updatedAt' | 'amountSen';
-    sortOrder?: 'asc' | 'desc';
-  }): Promise<object> {
-    const page = Math.max(1, query.page ?? 1);
-    const safeLimit = Math.min(Math.max(query.limit ?? 20, 1), 100);
-    const where: Prisma.EscrowDisbursementWhereInput = {};
-    if (query.status) where.status = query.status;
-    const scopes = Object.values(EscrowDisbursementScope) as string[];
-    if (query.scope && scopes.includes(query.scope)) {
-      where.scope = query.scope as EscrowDisbursementScope;
-    }
-    const q = query.q?.trim();
-    if (q) {
-      where.OR = [
-        { danaPartnerReferenceNo: { contains: q, mode: 'insensitive' } },
-        { sellerId: { contains: q, mode: 'insensitive' } },
-        { orderId: { contains: q, mode: 'insensitive' } },
-      ];
-    }
-    const orderBy: Prisma.EscrowDisbursementOrderByWithRelationInput =
-      query.sortBy === 'amountSen'
-        ? { amountSen: query.sortOrder ?? 'desc' }
-        : query.sortBy === 'updatedAt'
-          ? { updatedAt: query.sortOrder ?? 'desc' }
-          : { createdAt: query.sortOrder ?? 'desc' };
-
-    const [rows, total] = await Promise.all([
-      this.prisma.escrowDisbursement.findMany({
-        where,
-        orderBy,
-        skip: (page - 1) * safeLimit,
-        take: safeLimit,
-        include: {
-          seller: { select: { userId: true, username: true, fullName: true, email: true } },
-          bankAccount: { select: { id: true, bankCode: true, accountName: true, accountNumber: true } },
-        },
-      }),
-      this.prisma.escrowDisbursement.count({ where }),
-    ]);
-
-    return createPaginatedResponse(
-      rows.map(r => ({
-        id: r.id,
-        scope: r.scope,
-        scopeRefId: r.scopeRefId,
-        orderId: r.orderId,
-        amount: toIdr(r.amountSen),
-        status: r.status,
-        heldReason: r.heldReason,
-        lastError: r.lastError,
-        danaPartnerReferenceNo: r.danaPartnerReferenceNo,
-        danaReferenceNo: r.danaReferenceNo,
-        attemptCount: r.attemptCount,
-        releasedAt: r.releasedAt,
-        createdAt: r.createdAt,
-        updatedAt: r.updatedAt,
-        seller: r.seller,
-        bankAccount: r.bankAccount,
-      })),
-      total,
-      page,
-      safeLimit,
-    );
   }
 
   async getRevenue(): Promise<object> {

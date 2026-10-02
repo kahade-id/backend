@@ -254,7 +254,7 @@ export class AdminManagementService {
     return updated;
   }
 
-  async resetAdmin2fa(targetId: string, updaterId: string, ipAddress: string): Promise<{ message: string }> {
+  async resetAdmin2fa(targetId: string, updaterId: string, ipAddress: string, reason?: string): Promise<{ message: string }> {
     const admin = await this.prisma.adminUser.findFirst({ where: { id: targetId, deletedAt: null } });
     if (!admin) {
       throw new NotFoundException({ code: ErrorCodes.ADMIN_NOT_FOUND, message: 'Admin not found' });
@@ -283,7 +283,7 @@ export class AdminManagementService {
       action: AuditAction.ADMIN_ACTION,
       targetType: 'AdminUser',
       targetId: admin.id,
-      description: `Reset 2FA for admin "${admin.fullName}" (${admin.adminId})`,
+      description: `Reset 2FA for admin "${admin.fullName}" (${admin.adminId})${reason ? ` — alasan: ${reason}` : ''}`,
       ipAddress,
     });
 
@@ -308,6 +308,7 @@ export class AdminManagementService {
     updaterId: string,
     ipAddress: string,
     temporaryPassword?: string,
+    reason?: string,
   ): Promise<{ message: string; temporaryPassword: string }> {
     const admin = await this.prisma.adminUser.findFirst({ where: { id: targetId, deletedAt: null } });
     if (!admin) {
@@ -344,7 +345,7 @@ export class AdminManagementService {
       action: AuditAction.ADMIN_ACTION,
       targetType: 'AdminUser',
       targetId: admin.id,
-      description: `Reset password for admin "${admin.fullName}" (${admin.adminId}) — must change on next login`,
+      description: `Reset password for admin "${admin.fullName}" (${admin.adminId}) — must change on next login${reason ? ` — alasan: ${reason}` : ''}`,
       ipAddress,
     });
 
@@ -372,7 +373,7 @@ export class AdminManagementService {
     return chars.join('');
   }
 
-  async unlockAdmin(targetId: string, updaterId: string, ipAddress: string): Promise<{ message: string }> {
+  async unlockAdmin(targetId: string, updaterId: string, ipAddress: string, reason?: string): Promise<{ message: string }> {
     const admin = await this.prisma.adminUser.findFirst({ where: { id: targetId, deletedAt: null } });
     if (!admin) {
       throw new NotFoundException({ code: ErrorCodes.ADMIN_NOT_FOUND, message: 'Admin not found' });
@@ -398,14 +399,14 @@ export class AdminManagementService {
       action: AuditAction.ADMIN_ACTION,
       targetType: 'AdminUser',
       targetId: admin.id,
-      description: `Unlocked admin "${admin.fullName}" (${admin.adminId})`,
+      description: `Unlocked admin "${admin.fullName}" (${admin.adminId})${reason ? ` — alasan: ${reason}` : ''}`,
       ipAddress,
     });
 
     return { message: 'Admin account unlocked successfully' };
   }
 
-  async deleteAdmin(targetId: string, deleterId: string, ipAddress: string): Promise<{ message: string }> {
+  async deleteAdmin(targetId: string, deleterId: string, ipAddress: string, reason?: string): Promise<{ message: string }> {
     if (targetId === deleterId) {
       throw new ForbiddenException({ code: 'CANNOT_DELETE_SELF', message: 'Cannot delete your own account' });
     }
@@ -439,7 +440,7 @@ export class AdminManagementService {
       action: AuditAction.ADMIN_ACTION,
       targetType: 'AdminUser',
       targetId: admin.id,
-      description: `Soft-deleted admin "${admin.fullName}" (${admin.adminId})`,
+      description: `Soft-deleted admin "${admin.fullName}" (${admin.adminId})${reason ? ` — alasan: ${reason}` : ''}`,
       ipAddress,
     });
 
@@ -572,7 +573,7 @@ export class AdminManagementService {
   }
 
   /** Aktifkan kembali akun admin yang di-suspend (audit ADMIN_REACTIVATED). */
-  async reactivateAdmin(targetId: string, actorId: string, ipAddress: string): Promise<object> {
+  async reactivateAdmin(targetId: string, actorId: string, ipAddress: string, reason: string): Promise<object> {
     const admin = await this.findAdminOrThrow(targetId);
     if (admin.isActive) {
       throw new ConflictException({ code: 'ALREADY_ACTIVE', message: 'Admin sudah aktif' });
@@ -588,7 +589,7 @@ export class AdminManagementService {
       action: AuditAction.ADMIN_REACTIVATED,
       targetType: 'AdminUser',
       targetId: admin.id,
-      description: `Reactivated admin "${admin.fullName}" (${admin.adminId})`,
+      description: `Reactivated admin "${admin.fullName}" (${admin.adminId}) — alasan: ${reason}`,
       before: { isActive: false },
       after: { isActive: true },
       ipAddress,
@@ -921,10 +922,19 @@ export class AdminManagementService {
 
   /** Riwayat handoff untuk satu kasus (dipakai di detail kasus). */
   async listHandoffsByCase(query: HandoffQueryDto): Promise<object> {
-    const handoffs = await this.prisma.adminCaseHandoff.findMany({
-      where: { caseType: query.caseType, caseId: query.caseId },
-      orderBy: { createdAt: 'desc' },
-    });
+    // BAD-013: paginasi opsional (default page=1, limit=20).
+    const page = Math.max(1, query.page ?? 1);
+    const limit = Math.min(100, Math.max(1, query.limit ?? 20));
+    const where = { caseType: query.caseType, caseId: query.caseId };
+    const [handoffs, total] = await Promise.all([
+      this.prisma.adminCaseHandoff.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.adminCaseHandoff.count({ where }),
+    ]);
     const adminIds = [...new Set(handoffs.flatMap((h) => [h.fromAdminId, h.toAdminId]))];
     const admins = adminIds.length > 0
       ? await this.prisma.adminUser.findMany({
@@ -933,14 +943,16 @@ export class AdminManagementService {
         })
       : [];
     const byId = new Map(admins.map((a) => [a.id, a]));
-    return {
-      data: handoffs.map((h) => ({
+    return createPaginatedResponse(
+      handoffs.map((h) => ({
         ...h,
         fromAdmin: byId.get(h.fromAdminId) ?? null,
         toAdmin: byId.get(h.toAdminId) ?? null,
       })),
-      total: handoffs.length,
-    };
+      total,
+      page,
+      limit,
+    );
   }
 
   /**

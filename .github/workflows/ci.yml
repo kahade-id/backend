@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same ref when a new commit lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  openapi-contract:
+    name: OpenAPI contract (generate + diff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Generate Prisma client
+        run: npm run prisma:generate
+
+      # scripts/generate-openapi.ts stubs every env var itself (deterministic,
+      # OPENAPI_GENERATE=true) — only a reachable Redis is required, provided
+      # by the service above. No database needed.
+      - name: Regenerate openapi.json
+        run: npm run openapi:generate
+
+      - name: Fail if openapi.json differs from the committed spec
+        run: |
+          if ! git diff --exit-code -- openapi.json; then
+            echo "::error::openapi.json is stale — the committed spec does not match a fresh generation."
+            echo "::error::Run 'npm run openapi:generate' locally and commit the regenerated openapi.json."
+            exit 1
+          fi

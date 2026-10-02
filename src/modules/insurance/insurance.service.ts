@@ -6,7 +6,17 @@ import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pag
 import { toIdr, toSen } from '../../common/utils/currency.util';
 import { INSURANCE_DEFAULT_CAP_IDR } from '../../common/constants/app.constants';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { CreateInsuranceClaimDto } from './dto/insurance-claim.dto';
+
+/**
+ * SYS-D-002 (2026-10-03): DTO HTTP (CreateInsuranceClaimDto) dihapus bersama
+ * endpoint /v1/insurance/* yang mati — service menerima input struktural
+ * minimal (bentuk yang sama: orderId opsional, claimType, amount IDR).
+ */
+export interface CreateInsuranceClaimInput {
+  orderId?: string;
+  claimType: string;
+  amount: number;
+}
 
 /**
  * Benefit 3 Kahade+ — Asuransi.
@@ -24,7 +34,7 @@ export class InsuranceService {
     private readonly subscriptionsService: SubscriptionsService,
   ) {}
 
-  async createClaim(userId: string, dto: CreateInsuranceClaimDto): Promise<Record<string, unknown>> {
+  async createClaim(userId: string, dto: CreateInsuranceClaimInput): Promise<Record<string, unknown>> {
     const active = await this.subscriptionsService.isActive(userId);
     if (!active) {
       throw new ForbiddenException({

@@ -23,4 +23,6 @@ coverage/
 # Local uploads and backups
 uploads/
 backups/
-openapi.json
+# SYS-A-030 (2026-10-03): openapi.json is TRACKED — CI fails when a fresh
+# `npm run openapi:generate` differs from the committed spec (contract drift
+# guard). Keep it out of .gitignore.

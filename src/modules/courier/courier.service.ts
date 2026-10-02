@@ -1152,11 +1152,21 @@ export class CourierService {
       }
     }
     if (dto.regionBlacklist !== undefined) {
-      for (const region of dto.regionBlacklist) {
-        await this.prisma.courierRegionFlag.upsert({
-          where: { providerCode_region: { providerCode: code, region } },
-          update: { enabled: false },
-          create: { id: randomUUID(), providerCode: code, region, enabled: false },
+      // SYS-D-003: pola batch — 1 updateMany + 1 createMany(skipDuplicates)
+      // menggantikan N upsert per region. Hasil akhir identik dengan upsert
+      // per region: yang sudah ada → enabled=false, yang belum ada → dibuat
+      // dengan enabled=false (skipDuplicates menahan race insert ganda).
+      const regions = [...new Set(dto.regionBlacklist)];
+      if (regions.length > 0) {
+        await this.prisma.courierRegionFlag.updateMany({
+          where: { providerCode: code, region: { in: regions } },
+          data: { enabled: false },
+        });
+        await this.prisma.courierRegionFlag.createMany({
+          data: regions.map((region) => ({
+            id: randomUUID(), providerCode: code, region, enabled: false,
+          })),
+          skipDuplicates: true,
         });
       }
     }

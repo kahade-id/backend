@@ -18,21 +18,34 @@ const bank = {
 
 function buildDeps(overrides: Record<string, unknown> = {}) {
   const rows: Record<string, unknown> = {};
+  const rowsById: Record<string, any> = {};
   const prisma = {
     order: { findUnique: jest.fn(async () => null) },
     bankAccount: { findFirst: jest.fn(async () => bank) },
     escrowDisbursement: {
-      findUnique: jest.fn(async ({ where: { idempotencyKey } }: { where: { idempotencyKey: string } }) =>
-        rows[idempotencyKey] ?? null,
-      ),
+      findUnique: jest.fn(async ({ where }: { where: { idempotencyKey?: string; id?: string } }) => {
+        if (where.id) return rowsById[where.id] ?? null;
+        return rows[where.idempotencyKey!] ?? null;
+      }),
       create: jest.fn(async ({ data }: { data: unknown }) => {
-        const row = { id: 'disb-1', ...(data as object) };
+        const row = { id: 'disb-1', status: EscrowDisbursementStatus.PENDING, ...(data as object) };
         rows[(data as { idempotencyKey: string }).idempotencyKey] = row;
+        rowsById[row.id] = row;
         return row;
       }),
       update: jest.fn(async ({ where, data }: { where: { id: string }; data: unknown }) => {
-        const row = { id: where.id, ...(data as object) };
+        const row = { ...(rowsById[where.id] ?? { id: where.id }), ...(data as object) };
+        rowsById[where.id] = row;
         return row;
+      }),
+      // SEC-106: semantik kondisional seperti Prisma asli — hanya baris yang
+      // statusnya cocok yang di-update; count dipakai sebagai klaim atomik.
+      updateMany: jest.fn(async ({ where, data }: { where: { id: string; status?: { in: string[] } }; data: unknown }) => {
+        const row = rowsById[where.id];
+        if (!row) return { count: 0 };
+        if (where.status && !where.status.in.includes(row.status)) return { count: 0 };
+        Object.assign(row, data);
+        return { count: 1 };
       }),
       findMany: jest.fn(async () => []),
     },
@@ -49,7 +62,14 @@ function buildDeps(overrides: Record<string, unknown> = {}) {
     walletMode as never,
     notificationQueue as never,
   );
-  return { svc, prisma, danaDisbursement, walletMode, notificationQueue, ...overrides };
+  // Seed baris langsung ke store by-id (untuk jalur settle/retryDue).
+  const seedRow = (row: Record<string, unknown>) => {
+    const full = { status: EscrowDisbursementStatus.PENDING, ...row };
+    rowsById[row.id as string] = full;
+    if (row.idempotencyKey) rows[row.idempotencyKey as string] = full;
+    return full;
+  };
+  return { svc, prisma, danaDisbursement, walletMode, notificationQueue, seedRow, ...overrides };
 }
 
 describe('EscrowDisbursementService', () => {
@@ -134,7 +154,14 @@ describe('EscrowDisbursementService', () => {
     expect(danaDisbursement.transferToBank).not.toHaveBeenCalled();
     const updates = (prisma.escrowDisbursement.update as jest.Mock).mock.calls as any[][];
     expect(updates[updates.length - 1][0].data.status).toBe(EscrowDisbursementStatus.FAILED);
-    expect(updates[updates.length - 1][0].data.lastError).toMatch(/BANK_ACCOUNT_NAME_MISMATCH/);
+    const lastError = updates[updates.length - 1][0].data.lastError as string;
+    expect(lastError).toMatch(/BANK_ACCOUNT_NAME_MISMATCH/);
+    // SEC-205: nama rekening plaintext TIDAK boleh ada di lastError DB/log —
+    // hanya flag + SHA-256 hash.
+    expect(lastError).not.toContain('SELLER NAME');
+    expect(lastError).not.toContain('ORANG LAIN');
+    expect(lastError).toMatch(/sha256\(terdaftar\)=[0-9a-f]{64}/);
+    expect(lastError).toMatch(/sha256\(inquiry\)=[0-9a-f]{64}/);
   });
 
   it('transfer error → FAILED + lastError (retry aman via idempotencyKey)', async () => {
@@ -175,17 +202,108 @@ describe('EscrowDisbursementService', () => {
   });
 
   it('retryDue memproses baris PENDING/FAILED', async () => {
-    const { svc, prisma, danaDisbursement } = buildDeps();
+    const { svc, prisma, danaDisbursement, seedRow } = buildDeps();
+    seedRow({ id: 'd-1', idempotencyKey: 'ORDER:o-9', sellerId: 's-1', amountSen: BigInt(1500000), danaPartnerReferenceNo: null });
     (prisma.escrowDisbursement.findMany as jest.Mock).mockResolvedValue([
-      { id: 'd-1', idempotencyKey: 'ORDER:o-9', sellerId: 's-1', amountSen: BigInt(1500000), danaPartnerReferenceNo: null },
+      { id: 'd-1', idempotencyKey: 'ORDER:o-9', sellerId: 's-1', amountSen: BigInt(1500000), danaPartnerReferenceNo: null, status: EscrowDisbursementStatus.PENDING },
     ]);
     const n = await svc.retryDue(10);
     expect(n).toBe(1);
     expect(danaDisbursement.transferToBank as jest.Mock).toHaveBeenCalledTimes(1);
   });
 
-  it('scope MILESTONE/REBATE dipetakan ke enum Prisma', async () => {
-    const { svc, prisma } = buildDeps();
+  describe('BAD-001: CANCELLED = terminal (tidak bisa revive)', () => {
+    it('releaseFunds pada baris CANCELLED melempar DISBURSEMENT_CANCELLED, tanpa transfer', async () => {
+      const { svc, prisma, danaDisbursement } = buildDeps();
+      prisma.escrowDisbursement.findUnique.mockResolvedValue({
+        id: 'disb-cancelled',
+        idempotencyKey: 'ORDER:o-x',
+        status: EscrowDisbursementStatus.CANCELLED,
+      });
+      await expect(
+        svc.releaseFunds({
+          idempotencyKey: 'ORDER:o-x',
+          scope: EscrowDisbursementScope.ORDER_ESCROW,
+          sellerId: 's-1',
+          amountSen: BigInt(1000000),
+          reason: 'coba revive',
+        }),
+      ).rejects.toThrow('DISBURSEMENT_CANCELLED');
+      expect(danaDisbursement.bankAccountInquiry).not.toHaveBeenCalled();
+      expect(danaDisbursement.transferToBank).not.toHaveBeenCalled();
+    });
+
+    it('settle() langsung pada baris CANCELLED juga melempar (defense-in-depth)', async () => {
+      const { svc, danaDisbursement } = buildDeps();
+      const row = {
+        id: 'd-x',
+        idempotencyKey: 'ORDER:o-x',
+        sellerId: 's-1',
+        amountSen: BigInt(1000000),
+        danaPartnerReferenceNo: null,
+        orderId: 'o-x',
+        status: EscrowDisbursementStatus.CANCELLED,
+      };
+      await expect((svc as any).settle(row)).rejects.toThrow('DISBURSEMENT_CANCELLED');
+      expect(danaDisbursement.transferToBank).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('SEC-106: klaim atomik sebelum transfer', () => {
+    it('dua settle konkuren — hanya satu yang transfer', async () => {
+      const { svc, danaDisbursement, seedRow } = buildDeps();
+      seedRow({
+        id: 'd-c',
+        idempotencyKey: 'ORDER:o-c',
+        sellerId: 's-1',
+        amountSen: BigInt(1500000),
+        danaPartnerReferenceNo: null,
+        orderId: 'o-c',
+      });
+      const row = {
+        id: 'd-c',
+        idempotencyKey: 'ORDER:o-c',
+        sellerId: 's-1',
+        amountSen: BigInt(1500000),
+        danaPartnerReferenceNo: null,
+        orderId: 'o-c',
+        status: EscrowDisbursementStatus.PENDING,
+      };
+      const [r1, r2] = await Promise.all([(svc as any).settle(row), (svc as any).settle(row)]);
+
+      // Tepat satu transfer ke DANA meskipun dua eksekutor berlomba.
+      expect(danaDisbursement.transferToBank).toHaveBeenCalledTimes(1);
+      const outcomes = [r1.outcome, r2.outcome].sort();
+      expect(outcomes).toEqual(['PENDING', 'RELEASED']);
+    });
+
+    it('settle pada baris yang sudah SUCCESS (kalah klaim) → RELEASED tanpa transfer ulang', async () => {
+      const { svc, danaDisbursement, seedRow } = buildDeps();
+      seedRow({
+        id: 'd-s',
+        idempotencyKey: 'ORDER:o-s',
+        sellerId: 's-1',
+        amountSen: BigInt(1500000),
+        danaPartnerReferenceNo: 'DSB-X',
+        status: EscrowDisbursementStatus.SUCCESS,
+        danaReferenceNo: 'DANA-OLD',
+      });
+      const row = {
+        id: 'd-s',
+        idempotencyKey: 'ORDER:o-s',
+        sellerId: 's-1',
+        amountSen: BigInt(1500000),
+        danaPartnerReferenceNo: 'DSB-X',
+        orderId: 'o-s',
+        status: EscrowDisbursementStatus.PENDING, // snapshot basi
+      };
+      const res = await (svc as any).settle(row);
+      expect(res).toEqual({ outcome: 'RELEASED', disbursementId: 'd-s', danaReferenceNo: 'DANA-OLD' });
+      expect(danaDisbursement.transferToBank).not.toHaveBeenCalled();
+    });
+  });
+
+  it('scope MILESTONE/REBATE dipetakan ke enum Prisma', async () => {    const { svc, prisma } = buildDeps();
     (prisma.order.findUnique as jest.Mock).mockResolvedValue({
       id: 'o-6', status: 'COMPLETED', sellerId: 's-1', buyerPayAmount: BigInt(1500000),
     });

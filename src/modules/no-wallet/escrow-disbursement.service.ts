@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 import { EscrowDisbursementScope, EscrowDisbursementStatus, NotificationType } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { DanaDisbursementService } from '../payment/dana/dana-disbursement.service';
@@ -111,7 +112,14 @@ export class EscrowDisbursementService {
       if (existing.status === EscrowDisbursementStatus.HELD_NO_BANK) {
         return { outcome: 'HELD_NO_BANK', disbursementId: existing.id };
       }
-      // PROCESSING / FAILED / CANCELLED → coba reconcile/ulang di bawah
+      // BAD-001 (P0, audit 2026-10-03): CANCELLED = TERMINAL. Keputusan batal
+      // admin tidak boleh dibangkitkan diam-diam oleh settle() — uang bergerak
+      // berlawanan dengan keputusan eksplisit admin. Reopen hanya via endpoint
+      // admin eksplisit CANCELLED → PENDING yang diaudit (bukan implisit di sini).
+      if (existing.status === EscrowDisbursementStatus.CANCELLED) {
+        throw new Error(`DISBURSEMENT_CANCELLED: ${params.idempotencyKey}`);
+      }
+      // PROCESSING / FAILED → coba reconcile/ulang di bawah
       return this.settle(existing);
     }
 
@@ -217,8 +225,21 @@ export class EscrowDisbursementService {
   }
 
   private async settle(
-    row: { id: string; idempotencyKey: string; sellerId: string; amountSen: bigint; danaPartnerReferenceNo: string | null; orderId: string | null },
+    row: {
+      id: string;
+      idempotencyKey: string;
+      sellerId: string;
+      amountSen: bigint;
+      danaPartnerReferenceNo: string | null;
+      orderId: string | null;
+      status: EscrowDisbursementStatus;
+    },
   ): Promise<ReleaseResult> {
+    // BAD-001 (defense-in-depth): baris CANCELLED tidak boleh pernah di-settle,
+    // dari jalur mana pun settle() dipanggil.
+    if (row.status === EscrowDisbursementStatus.CANCELLED) {
+      throw new Error(`DISBURSEMENT_CANCELLED: ${row.idempotencyKey}`);
+    }
     // 1) Rekening bank seller wajib ada (primary, tidak dihapus)
     const bank = await this.prisma.bankAccount.findFirst({
       where: { userId: row.sellerId, isPrimary: true, deletedAt: null },
@@ -290,10 +311,17 @@ export class EscrowDisbursementService {
       const registered = normalize(accountName);
       const returned = normalize(inquiry.accountName ?? '');
       if (returned && registered && returned !== registered) {
-        return this.fail(
-          row,
-          `BANK_ACCOUNT_NAME_MISMATCH: terdaftar="${registered}" inquiry="${returned}"`,
+        // SEC-205: JANGAN simpan/log nama rekening plaintext — hanya flag +
+        // SHA-256 kedua nama (cukup untuk diagnosa: pasangan mismatch yang
+        // sama menghasilkan hash yang sama).
+        const sha256 = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex');
+        const lastError =
+          `BANK_ACCOUNT_NAME_MISMATCH: sha256(terdaftar)=${sha256(registered)} ` +
+          `sha256(inquiry)=${sha256(returned)}`;
+        this.logger.warn(
+          `Disbursement gagal: key=${row.idempotencyKey}: BANK_ACCOUNT_NAME_MISMATCH (nama di-hash, bukan plaintext)`,
         );
+        return this.fail(row, lastError);
       }
       await this.prisma.escrowDisbursement.update({
         where: { id: row.id },
@@ -304,6 +332,26 @@ export class EscrowDisbursementService {
     }
 
     // 4) Transfer ke bank (idempoten via partnerReferenceNo stabil)
+    // SEC-106: klaim atomik PENDING/FAILED → PROCESSING SEBELUM transfer —
+    // hanya SATU eksekutor yang menang; yang kalah berhenti (dedup sisi DANA
+    // hanya lapis kedua, bukan satu-satunya pencegah transfer ganda).
+    const claimed = await this.prisma.escrowDisbursement.updateMany({
+      where: { id: row.id, status: { in: [EscrowDisbursementStatus.PENDING, EscrowDisbursementStatus.FAILED] } },
+      data: { status: EscrowDisbursementStatus.PROCESSING },
+    });
+    if (claimed.count === 0) {
+      // Sudah diklaim pihak lain (atau pindah ke HELD_NO_BANK/SUCCESS/
+      // CANCELLED) — JANGAN transfer; baca status terakhir untuk hasil jujur.
+      const fresh = await this.prisma.escrowDisbursement.findUnique({ where: { id: row.id } });
+      if (fresh?.status === EscrowDisbursementStatus.SUCCESS) {
+        return { outcome: 'RELEASED', disbursementId: fresh.id, danaReferenceNo: fresh.danaReferenceNo };
+      }
+      if (fresh?.status === EscrowDisbursementStatus.HELD_NO_BANK) {
+        return { outcome: 'HELD_NO_BANK', disbursementId: fresh.id };
+      }
+      this.logger.warn(`Disbursement kalah klaim (tidak transfer): key=${row.idempotencyKey}`);
+      return { outcome: 'PENDING', disbursementId: row.id };
+    }
     try {
       const transfer = await this.danaDisbursement.transferToBank({
         partnerReferenceNo: partnerRef,

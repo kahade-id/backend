@@ -2,6 +2,9 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 import { AdminUsersService } from '../admin-users.service';
+import { WalletModeService } from '../../../wallet-mode/wallet-mode.service';
+import { AdminPasswordService } from '../../auth/admin-password.service';
+import { ApprovalsService } from '../../approvals/approvals.service';
 import { PrismaService } from '../../../../prisma/prisma.service';
 import { RedisService } from '../../../../redis/redis.service';
 import { AuditLogService } from '../../../../common/services/audit-log.service';
@@ -27,7 +30,7 @@ const mockPrisma: any = {
   user: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
   userSession: { findMany: jest.fn(), updateMany: jest.fn() },
 };
-const mockRedis = { setex: jest.fn(), get: jest.fn(), del: jest.fn() };
+const mockRedis = { setex: jest.fn(), get: jest.fn(), del: jest.fn(), exists: jest.fn().mockResolvedValue(0) };
 const mockConfig = { get: jest.fn(() => '15m') };
 const mockAudit = { logAdminAction: jest.fn() };
 const mockSerial = { next: jest.fn() };
@@ -63,6 +66,10 @@ describe('AdminUsersService — siklus hidup flaggedForReview (Section 6)', () =
         { provide: DashboardService, useValue: { invalidateSummaryCache: jest.fn() } },
         // GAP-E (G380): signed URL ekspor async — tidak dipakai di suite ini.
         { provide: UploadService, useValue: { generateDownloadUrl: jest.fn() } },
+        // BAD-008/SEC-601: kill-switch + re-auth + dual control (mock).
+        { provide: WalletModeService, useValue: { isWalletEnabled: () => true } },
+        { provide: AdminPasswordService, useValue: { verifyAdminPassword: jest.fn() } },
+        { provide: ApprovalsService, useValue: { registerExecutor: jest.fn(), propose: jest.fn() } },
         { provide: LocalStorageService, useValue: { saveFile: jest.fn() } },
       ],
     }).compile();

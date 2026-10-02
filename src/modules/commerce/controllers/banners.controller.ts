@@ -4,6 +4,7 @@ import { Throttle } from '@nestjs/throttler';
 import { BannersService } from '../services/banners.service';
 import { CreateBannerDto, UpdateBannerDto } from '../dto/commerce.dto';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
+import { Public } from '../../../common/decorators/public.decorator';
 
 /** GET /v1/banners/active — publik. */
 @ApiTags('banners')
@@ -12,6 +13,7 @@ export class BannersController {
   constructor(private readonly service: BannersService) {}
 
   @Throttle({ default: { ttl: 60000, limit: 120 } })
+  @Public()
   @Get('active')
   @ApiOperation({ summary: 'Banner aktif (publik, filter tanggal tayang)' })
   active(@Query('position') position?: string) {

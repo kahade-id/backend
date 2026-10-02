@@ -1334,7 +1334,10 @@ export class ChatService implements OnModuleInit {
         data: { viewOnceViewedAt: now, expiresAt: graceUntil },
       });
       for (const messageId of consumedViewOnce) {
-        this.emitChatEvent(room, 'chat.message_view_once_consumed', { roomId, messageId, viewerId: userId });
+        // FIX 2026-10-03 (drive-by, pre-existing): `room` tidak ada di scope
+        // getMessages — hanya roomId. Emit memakai konteks minimal (id saja);
+        // order undefined → emitToOrder dilewati (optional chaining).
+        this.emitChatEvent({ id: roomId } as RoomContext, 'chat.message_view_once_consumed', { roomId, messageId, viewerId: userId });
       }
     }
 

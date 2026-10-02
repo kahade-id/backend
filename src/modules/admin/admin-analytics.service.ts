@@ -178,14 +178,27 @@ export class AdminAnalyticsService {
     }));
   }
 
-  async getTopUsers(limit = 10, metric: 'orders' | 'volume' | 'rating' = 'orders'): Promise<object[]> {
+  async getTopUsers(
+    limit = 10,
+    metric: 'orders' | 'volume' | 'rating' = 'orders',
+    startDate?: Date,
+    endDate?: Date,
+  ): Promise<object[]> {
+    this.assertDateRange(startDate, endDate);
+    const safeLimit = Math.min(Math.max(1, Math.floor(limit)), 100);
+
+    // BAD-034: bila rentang tanggal diberikan, peringkat dihitung dari
+    // agregat Order/Rating DALAM rentang (bukan counter all-time).
+    if (startDate || endDate) {
+      return this.getTopUsersInRange(safeLimit, metric, startDate, endDate);
+    }
+
     const orderBy = metric === 'orders'
       ? { totalOrdersCompleted: 'desc' as const }
       : metric === 'volume'
         ? { totalTransactionValue: 'desc' as const }
         : { averageRating: 'desc' as const };
 
-    const safeLimit = Math.min(Math.max(1, Math.floor(limit)), 100);
     const users = await this.prisma.user.findMany({
       where: { deletedAt: null },
       orderBy,
@@ -218,8 +231,116 @@ export class AdminAnalyticsService {
     }));
   }
 
-  async getUserGrowth(startDate?: Date, endDate?: Date): Promise<object[]> {
-    this.assertDateRange(startDate, endDate);
+  /**
+   * BAD-034: peringkat dalam rentang tanggal — agregat dari Order COMPLETED
+   * (completedAt dalam rentang; buyer + seller digabung seperti counter
+   * all-time) dan Rating (receiver, createdAt dalam rentang) untuk metrik
+   * rating. Tanpa rentang → pemanggil memakai jalur counter all-time.
+   */
+  private async getTopUsersInRange(
+    safeLimit: number,
+    metric: 'orders' | 'volume' | 'rating',
+    startDate?: Date,
+    endDate?: Date,
+  ): Promise<object[]> {
+    const start = startDate ?? new Date('2020-01-01');
+    const end = endDate ?? new Date();
+    const userSelect = {
+      id: true,
+      userId: true,
+      username: true,
+      fullName: true,
+      avatarUrl: true,
+      membershipRank: true,
+      averageRating: true,
+      totalRatingCount: true,
+      kycStatus: true,
+    } as const;
+
+    if (metric === 'rating') {
+      const groups = await this.prisma.rating.groupBy({
+        by: ['receiverId'],
+        where: { createdAt: { gte: start, lte: end } },
+        _avg: { stars: true },
+        _count: { _all: true },
+        orderBy: { _avg: { stars: 'desc' } },
+        take: safeLimit,
+      });
+      const users = await this.prisma.user.findMany({
+        where: { id: { in: groups.map((g) => g.receiverId) }, deletedAt: null },
+        select: userSelect,
+      });
+      const byId = new Map(users.map((u) => [u.id, u]));
+      return groups.flatMap((g) => {
+        const u = byId.get(g.receiverId);
+        if (!u) return [];
+        return [{
+          userId: u.userId,
+          username: u.username,
+          fullName: u.fullName,
+          avatarUrl: u.avatarUrl,
+          membershipRank: u.membershipRank,
+          avgRating: g._avg.stars ?? 0,
+          ratingCount: g._count._all,
+          totalOrders: null,
+          totalVolume: null,
+          isKycVerified: u.kycStatus === 'APPROVED',
+        }];
+      });
+    }
+
+    const orderWhere = {
+      status: 'COMPLETED' as const,
+      completedAt: { gte: start, lte: end },
+    };
+    const [byBuyer, bySeller] = await Promise.all([
+      this.prisma.order.groupBy({
+        by: ['buyerId'], where: orderWhere, _count: { _all: true }, _sum: { orderValue: true },
+      }),
+      this.prisma.order.groupBy({
+        by: ['sellerId'], where: orderWhere, _count: { _all: true }, _sum: { orderValue: true },
+      }),
+    ]);
+    const agg = new Map<string, { orders: number; volume: bigint }>();
+    const add = (id: string, orders: number, volume: bigint | null): void => {
+      const cur = agg.get(id) ?? { orders: 0, volume: 0n };
+      cur.orders += orders;
+      cur.volume += volume ?? 0n;
+      agg.set(id, cur);
+    };
+    for (const g of byBuyer) add(g.buyerId, g._count._all, g._sum.orderValue);
+    for (const g of bySeller) add(g.sellerId, g._count._all, g._sum.orderValue);
+    const ranked = [...agg.entries()]
+      .sort((a, b) =>
+        metric === 'volume'
+          ? b[1].volume > a[1].volume ? 1 : b[1].volume < a[1].volume ? -1 : 0
+          : b[1].orders - a[1].orders,
+      )
+      .slice(0, safeLimit);
+    const users = await this.prisma.user.findMany({
+      where: { id: { in: ranked.map(([id]) => id) }, deletedAt: null },
+      select: userSelect,
+    });
+    const byId = new Map(users.map((u) => [u.id, u]));
+    return ranked.flatMap(([id, a]) => {
+      const u = byId.get(id);
+      if (!u) return [];
+      return [{
+        userId: u.userId,
+        username: u.username,
+        fullName: u.fullName,
+        avatarUrl: u.avatarUrl,
+        membershipRank: u.membershipRank,
+        avgRating: u.averageRating,
+        ratingCount: u.totalRatingCount,
+        totalOrders: a.orders,
+        totalVolume: toIdr(a.volume),
+        isKycVerified: u.kycStatus === 'APPROVED',
+      }];
+    });
+  }
+
+  async getUserGrowth(startDate?: Date, endDate?: Date): Promise<object[]> {    this.assertDateRange(startDate, endDate);
     const start = startDate || new Date('2020-01-01');
     const end = endDate || new Date();
 

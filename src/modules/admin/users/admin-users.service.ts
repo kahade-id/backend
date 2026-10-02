@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Logger } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bull';
@@ -21,11 +21,17 @@ import { VerificationBadgeService } from '../../users/verification-badge.service
 import { EMAIL_QUEUE, EmailJobData } from '../../queue/processors/email.processor';
 import { generateNotifId, generateWalletTxId } from '../../../common/utils/id-generator.util';
 import { parseJwtTtl } from '../../../common/utils/jwt.util';
-import { decryptPiiSafe, hashPhoneNumber, normalizePhoneNumber } from '../../../common/utils/pii.util';
+import { decryptPiiSafe, hashPhoneNumber } from '../../../common/utils/pii.util';
+import { normalizeIndonesianPhone } from '../../../common/utils/phone.util';
 import { escapeLikePattern } from '../../../common/utils/search.util';
 import { DashboardService } from '../dashboard/dashboard.service';
 import { UploadService } from '../../upload/upload.service';
 import { LocalStorageService } from '../../upload/local-storage.service';
+// SEC-601/BAD-008: kill-switch wallet + re-auth password + dual control.
+import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
+import { AdminPasswordService } from '../auth/admin-password.service';
+import { ApprovalsService } from '../approvals/approvals.service';
+import { DUAL_CONTROL_THRESHOLD_SEN } from '../approvals/dual-control.constants';
 import { encryptAES } from '../../../common/utils/crypto.util';
 import { applyUserMask, PII_UNMASKED_ROLES, maskIp } from '../../../common/maskPiiByRole';
 import { walletTxDirection } from '../../../common/utils/wallet-direction.util';
@@ -35,7 +41,7 @@ import { UpdateUserDto } from './dto/update-user.dto';
 import { SuspendUserDto } from './dto/suspend-user.dto';
 
 @Injectable()
-export class AdminUsersService {
+export class AdminUsersService implements OnModuleInit {
   private readonly logger = new Logger(AdminUsersService.name);
   private readonly accessTokenTtlSeconds: number;
 
@@ -54,10 +60,44 @@ export class AdminUsersService {
     // GAP-E (G380): signed URL 15 menit untuk hasil ekspor async.
     private readonly uploadService: UploadService,
     private readonly localStorage: LocalStorageService,
+    // BAD-008: kill-switch WALLET_ENABLED (fail-closed bila nonaktif).
+    private readonly walletMode: WalletModeService,
+    // SEC-601: verifikasi password admin server-side (pola AUT-013).
+    private readonly adminPassword: AdminPasswordService,
+    // SEC-601: dual control untuk CREDIT > Rp1jt.
+    private readonly approvals: ApprovalsService,
   ) {
     this.accessTokenTtlSeconds = parseJwtTtl(
       this.configService.get<string>('jwt.expiresIn') ?? '15m',
     );
+  }
+
+  onModuleInit(): void {
+    this.approvals.registerExecutor('WALLET_ADJUST', async (ctx) => {
+      if (!ctx.targetId) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'WALLET_ADJUST membutuhkan targetId (userId)',
+        });
+      }
+      const p = ctx.payload;
+      // Guard BAD-008 juga berlaku di jalur dual: executor menolak bila
+      // wallet nonaktif saat eksekusi (keputusan checker bisa basi).
+      if (!this.walletMode.isWalletEnabled()) {
+        throw new ForbiddenException({
+          code: ErrorCodes.WALLET_DISABLED,
+          message: 'Wallet internal nonaktif (mode BI-safe) — eksekusi WALLET_ADJUST dibatalkan.',
+        });
+      }
+      return this.applyWalletAdjust(
+        ctx.targetId,
+        p.type as WalletAdjustType,
+        p.amount as number,
+        p.reason as string,
+        ctx.decidedBy,
+        ctx.ipAddress,
+      );
+    });
   }
 
 
@@ -127,7 +167,9 @@ export class AdminUsersService {
       const digitsOnly = search.replace(/\D/g, '');
       if (digitsOnly.length >= 8) {
         try {
-          const normalized = normalizePhoneNumber(search);
+          // FAL-024: normalisasi STRICT yang sama dengan saat registrasi
+          // (auth.service) — hash cocok dengan phoneNumberHash tersimpan.
+          const normalized = normalizeIndonesianPhone(search);
           orClauses.push({ phoneNumberHash: hashPhoneNumber(normalized) });
         } catch {
           /* ignore — invalid phone format, fall back to other fields */
@@ -880,10 +922,50 @@ export class AdminUsersService {
   }
 
   async adjustWallet(userId: string, dto: WalletAdjustDto, adminId: string, ipAddress: string = 'internal'): Promise<{ txId: string; type: string; amount: number; reason: string; balanceAfter: number }> {
-    const id = await this.resolveUserId(userId);
-
+    // BAD-008: mutasi wallet legacy DITOLAK saat kill-switch nonaktif
+    // (fail-closed, konsisten dengan ledger-corrections BAI-054).
+    if (!this.walletMode.isWalletEnabled()) {
+      throw new ForbiddenException({
+        code: ErrorCodes.WALLET_DISABLED,
+        message:
+          'Wallet internal nonaktif (mode BI-safe) — adjust saldo wallet ditolak. ' +
+          'Aliran dana aktual via DANA.',
+      });
+    }
+    // SEC-601: re-auth password server-side (pola AUT-013) — JWT curian saja
+    // tidak cukup untuk menggerakkan saldo.
+    await this.adminPassword.verifyAdminPassword(adminId, dto.reauthPassword, 'wallet.adjust', userId, ipAddress);
+    // SEC-601: CREDIT di atas ambang → WAJIB dual control.
     const amountInSen = toSen(dto.amount);
     const isCredit = dto.type === WalletAdjustType.CREDIT;
+    if (isCredit && amountInSen > DUAL_CONTROL_THRESHOLD_SEN) {
+      throw new ForbiddenException({
+        code: ErrorCodes.DUAL_CONTROL_REQUIRED,
+        message:
+          'Kredit wallet di atas Rp1.000.000 wajib dual control ' +
+          '(usulkan via POST /v1/admin/approvals/propose dengan actionType WALLET_ADJUST)',
+      });
+    }
+    return this.applyWalletAdjust(userId, dto.type, dto.amount, dto.reason, adminId, ipAddress);
+  }
+
+  /**
+   * Inti mutasi wallet — dipakai adjustWallet (jalur langsung, setelah semua
+   * guard) dan executor WALLET_ADJUST (jalur dual control; guard sudah
+   * dipenuhi saat propose + approve oleh dua admin berbeda).
+   */
+  async applyWalletAdjust(
+    userId: string,
+    type: WalletAdjustType,
+    amount: number,
+    reason: string,
+    adminId: string,
+    ipAddress: string = 'internal',
+  ): Promise<{ txId: string; type: string; amount: number; reason: string; balanceAfter: number }> {
+    const id = await this.resolveUserId(userId);
+
+    const amountInSen = toSen(amount);
+    const isCredit = type === WalletAdjustType.CREDIT;
     const txType = isCredit ? WalletTransactionType.ADMIN_CREDIT : WalletTransactionType.ADMIN_DEBIT;
 
     // Serial generated before the transaction to avoid Redis incr gaps on rollback.
@@ -932,7 +1014,7 @@ export class AdminUsersService {
           amount: amountInSen,
           balanceBefore,
           balanceAfter,
-          description: `Admin ${dto.type.toLowerCase()}: ${dto.reason}`,
+          description: `Admin ${type.toLowerCase()}: ${reason}`,
           completedAt: new Date(),
         },
       });
@@ -946,8 +1028,8 @@ export class AdminUsersService {
           category: getCategoryForType(notifType),
           title: isCredit ? 'Balance Credited by Admin' : 'Balance Debited by Admin',
           body: isCredit
-            ? `Rp ${dto.amount.toLocaleString('id-ID')} has been added to your wallet balance. Reason: ${dto.reason}`
-            : `Rp ${dto.amount.toLocaleString('id-ID')} has been deducted from your wallet balance. Reason: ${dto.reason}`,
+            ? `Rp ${amount.toLocaleString('id-ID')} has been added to your wallet balance. Reason: ${reason}`
+            : `Rp ${amount.toLocaleString('id-ID')} has been deducted from your wallet balance. Reason: ${reason}`,
           isRead: false,
         },
       });
@@ -956,8 +1038,8 @@ export class AdminUsersService {
 
     const notifTitle = isCredit ? 'Balance Credited by Admin' : 'Balance Debited by Admin';
     const notifBody = isCredit
-      ? `Rp ${dto.amount.toLocaleString('id-ID')} has been added to your wallet balance. Reason: ${dto.reason}`
-      : `Rp ${dto.amount.toLocaleString('id-ID')} has been deducted from your wallet balance. Reason: ${dto.reason}`;
+      ? `Rp ${amount.toLocaleString('id-ID')} has been added to your wallet balance. Reason: ${reason}`
+      : `Rp ${amount.toLocaleString('id-ID')} has been deducted from your wallet balance. Reason: ${reason}`;
     this.prisma.emitNotificationCreated({ userId: id, title: notifTitle, body: notifBody, data: { type: 'WALLET_ADJUSTED' } });
 
     const auditAction = isCredit ? AuditAction.WALLET_CREDIT : AuditAction.WALLET_DEBIT;
@@ -966,7 +1048,7 @@ export class AdminUsersService {
       action: auditAction,
       targetType: 'Wallet',
       targetId: walletId,
-      description: `Admin ${dto.type.toLowerCase()} ${dto.amount} IDR to user ${id}. Reason: ${dto.reason}`,
+      description: `Admin ${type.toLowerCase()} ${amount} IDR to user ${id}. Reason: ${reason}`,
       before: { availableBalance: balanceBefore.toString() },
       after: { availableBalance: balanceAfter.toString() },
       ipAddress,
@@ -975,7 +1057,7 @@ export class AdminUsersService {
     // AW-018: totalWalletBalance di summary dashboard berubah.
     await this.dashboard.invalidateSummaryCache();
 
-    return { txId, type: dto.type, amount: dto.amount, reason: dto.reason, balanceAfter: toIdr(balanceAfter) };
+    return { txId, type, amount, reason, balanceAfter: toIdr(balanceAfter) };
   }
 
   async getUserAuditLog(userId: string, page = 1, limit = 20, adminId?: string, ipAddress?: string): Promise<object> {

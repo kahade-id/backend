@@ -9,6 +9,7 @@ import { UploadService } from '../../../upload/upload.service';
 import { RealtimeService } from '../../../realtime/realtime.service';
 import { ChatService } from '../../../chat/chat.service';
 import { DashboardService } from '../../dashboard/dashboard.service';
+import { ApprovalsService } from '../../approvals/approvals.service';
 
 /**
  * M6 follow-up (Wave 2): order patungan yang selesai lewat verdict sengketa
@@ -121,6 +122,8 @@ describe('AdminDisputesService M6 dispute rebate (Wave 2)', () => {
         // M3 no-wallet: wallet aktif di test ini → jalur wallet lama.
         { provide: WalletModeService, useValue: { isWalletEnabled: () => true } },
         { provide: DisputeDanaSettlementService, useValue: {} },
+        // SEC-501: dual control — executor registry (mock).
+        { provide: ApprovalsService, useValue: { registerExecutor: jest.fn(), propose: jest.fn() } },
       ],
     }).compile();
     service = module.get(AdminDisputesService);
@@ -135,7 +138,7 @@ describe('AdminDisputesService M6 dispute rebate (Wave 2)', () => {
 
   it('FULL_SELLER pada order patungan overfunded: host terima bersih − rebate, buyer dapat rebate', async () => {
     await buildModule();
-    await service.resolveDispute('disp-1', 'admin-1', { decision: 'FULL_SELLER' } as never);
+    await service.resolveDispute('disp-1', 'admin-1', { decision: 'FULL_SELLER' } as never, 'internal', { viaDualControl: true });
 
     // 1. Host dikredit Rp950.000 (Rp1.000.000 − rebate Rp50.000).
     const sellerUpdates = walletUpdateFor('w-seller');
@@ -173,7 +176,7 @@ describe('AdminDisputesService M6 dispute rebate (Wave 2)', () => {
         findMany: jest.fn().mockResolvedValue([]),
       },
     });
-    await service.resolveDispute('disp-1', 'admin-1', { decision: 'FULL_SELLER' } as never);
+    await service.resolveDispute('disp-1', 'admin-1', { decision: 'FULL_SELLER' } as never, 'internal', { viaDualControl: true });
 
     const sellerUpdates = walletUpdateFor('w-seller');
     expect(sellerUpdates[0].data.availableBalance).toEqual({ increment: SEN(1_000_000) });
@@ -186,7 +189,7 @@ describe('AdminDisputesService M6 dispute rebate (Wave 2)', () => {
   it('idempoten: baris rebate sudah ada → tidak double-rebate', async () => {
     await buildModule();
     mockTx.walletTransaction.findFirst.mockResolvedValue({ id: 'wtx-rebate-lama' });
-    await service.resolveDispute('disp-1', 'admin-1', { decision: 'FULL_SELLER' } as never);
+    await service.resolveDispute('disp-1', 'admin-1', { decision: 'FULL_SELLER' } as never, 'internal', { viaDualControl: true });
 
     const sellerUpdates = walletUpdateFor('w-seller');
     expect(sellerUpdates[0].data.availableBalance).toEqual({ increment: SEN(1_000_000) });

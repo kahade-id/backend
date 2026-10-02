@@ -12,6 +12,10 @@ import { ParseIdPipe } from '../../../common/pipes/parse-id.pipe';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
 import { AdminDisbursementService } from './admin-disbursement.service';
 import { DisbursementQueryDto, DisbursementReviewDto } from './dto/disbursement.dto';
+import { AdminActionReasonDto } from '../management/dto/admin-action-reason.dto';
+import { AdminJwtPayload } from '../../../common/types/jwt-payload.types';
+import { StepUpGuard } from '../../../common/guards/step-up.guard';
+import { RequireStepUp } from '../../../common/decorators/require-step-up.decorator';
 
 /**
  * BAI-043 (P0) — antrean admin READ-ONLY untuk lifecycle EscrowDisbursement
@@ -125,5 +129,33 @@ export class AdminDisbursementController {
     @Req() req: Request,
   ): Promise<object> {
     return this.service.requeueDisbursement(id, adminId, req.ip || 'unknown');
+  }
+
+  @Post(':id/reopen')
+  @AdminRoles('SUPER_ADMIN')
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // BAD-001/503: buka ulang disbursement CANCELLED → PENDING. SELALU via dual
+  // control (DISBURSEMENT_REOPEN) — endpoint ini hanya membuat usulan PENDING;
+  // eksekusi oleh admin kedua via POST /v1/admin/approvals/:id/approve.
+  @RequireStepUp('disbursement.reopen', 'id')
+  @Idempotency()
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({
+    summary: 'Buka ulang disbursement CANCELLED (SUPER_ADMIN, dual control)',
+    description:
+      'BAD-001: satu-satunya jalan resmi CANCELLED → PENDING. Selalu via dual control — ' +
+      'endpoint ini hanya membuat usulan PENDING (mengembalikan approvalId); ' +
+      'eksekusi oleh admin kedua. Requires X-Step-Up-Token (action disbursement.reopen) + Idempotency-Key.',
+  })
+  @ApiResponse({ status: 200, description: 'Usulan reopen dibuat (status PENDING).' })
+  @ApiResponse({ status: 404, description: 'Disbursement tidak ditemukan.' })
+  @ApiResponse({ status: 409, description: 'Disbursement bukan CANCELLED.' })
+  reopenDisbursement(
+    @Param('id', ParseIdPipe) id: string,
+    @Body() dto: AdminActionReasonDto,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.requestReopen(id, admin.sub, admin.role, dto.reason, req.ip || 'unknown');
   }
 }

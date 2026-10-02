@@ -5,9 +5,10 @@ import { AdminAuthController } from './admin-auth.controller';
 import { AdminAuthService } from './admin-auth.service';
 import { TokenService } from '../../auth/token.service';
 import { AuditLogModule } from '../../../common/services/audit-log.module';
+import { StepUpModule } from './step-up.module';
 
 @Module({
-  imports: [JwtModule.register({}), ConfigModule, AuditLogModule],
+  imports: [JwtModule.register({}), ConfigModule, AuditLogModule, StepUpModule],
   controllers: [AdminAuthController],
   providers: [AdminAuthService, TokenService],
   exports: [AdminAuthService],

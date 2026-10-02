@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { OpsSettingsService } from '../ops-settings.service';
+import { ApprovalsService } from '../../admin/approvals/approvals.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { initializeCrypto } from '../../../common/utils/crypto.util';
 import { MANAGEABLE_SETTING_MAP } from '../ops-settings.registry';
@@ -64,6 +65,7 @@ describe('OpsSettingsService', () => {
       providers: [
         OpsSettingsService,
         { provide: PrismaService, useValue: mockPrisma },
+        { provide: ApprovalsService, useValue: { registerExecutor: jest.fn(), propose: jest.fn() } },
       ],
     }).compile();
     service = module.get<OpsSettingsService>(OpsSettingsService);

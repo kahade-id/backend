@@ -12,6 +12,9 @@ import { getQueueToken } from '@nestjs/bull';
 import { NotFoundException } from '@nestjs/common';
 
 import { AdminUsersService } from '../admin-users.service';
+import { WalletModeService } from '../../../wallet-mode/wallet-mode.service';
+import { AdminPasswordService } from '../../auth/admin-password.service';
+import { ApprovalsService } from '../../approvals/approvals.service';
 import { PrismaService } from '../../../../prisma/prisma.service';
 import { RedisService } from '../../../../redis/redis.service';
 import { AuditLogService } from '../../../../common/services/audit-log.service';
@@ -50,6 +53,10 @@ describe('AdminUsersService — deletion status & legal hold (GAP-A G067/G071)',
         { provide: getQueueToken(EMAIL_QUEUE), useValue: { add: jest.fn() } },
         { provide: DashboardService, useValue: {} },
         { provide: UploadService, useValue: {} },
+        // BAD-008/SEC-601: kill-switch + re-auth + dual control (mock).
+        { provide: WalletModeService, useValue: { isWalletEnabled: () => true } },
+        { provide: AdminPasswordService, useValue: { verifyAdminPassword: jest.fn() } },
+        { provide: ApprovalsService, useValue: { registerExecutor: jest.fn(), propose: jest.fn() } },
         { provide: LocalStorageService, useValue: {} },
       ],
     }).compile();

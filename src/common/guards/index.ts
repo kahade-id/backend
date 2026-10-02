@@ -6,3 +6,4 @@ export * from './email-verified.guard';
 export * from './user-throttle.guard';
 export * from './global-throttle.guard';
 export * from './csrf.guard';
+export * from './step-up.guard';

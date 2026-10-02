@@ -31,6 +31,32 @@ import type { WalletDiscrepancy } from './reconciliation.service';
  */
 export const RECONCILIATION_URGENT_THRESHOLD_IDR = 5_000_000;
 export const URGENT_INVARIANT = 'URGENT_AMOUNT_THRESHOLD';
+
+/**
+ * BAD-020: builder filter findings yang dipakai BERSAMA oleh list
+ * (listFindings) dan ekspor CSV (buildFindingsCsvExport) — ekspor WAJIB
+ * menghormati filter aktif yang sama dengan daftar yang dilihat admin.
+ */
+export function buildFindingsWhereInput(
+  query: Pick<FindingsQueryDto, 'status' | 'minDifferenceIdr' | 'maxAgeDays' | 'invariant' | 'urgentOnly'>,
+): Prisma.ReconciliationFindingWhereInput {
+  const { status, minDifferenceIdr, maxAgeDays, invariant, urgentOnly } = query;
+  const where: Prisma.ReconciliationFindingWhereInput = {};
+  if (status) where.status = status;
+  if (minDifferenceIdr !== undefined && minDifferenceIdr > 0) {
+    const bound = toSen(minDifferenceIdr);
+    where.OR = [{ difference: { gte: bound } }, { difference: { lte: -bound } }];
+  }
+  if (maxAgeDays !== undefined && maxAgeDays >= 0) {
+    where.createdAt = { gte: new Date(Date.now() - maxAgeDays * 24 * 3600 * 1000) };
+  }
+  if (invariant) {
+    where.violatedInvariants = { has: invariant };
+  } else if (urgentOnly) {
+    where.violatedInvariants = { has: URGENT_INVARIANT };
+  }
+  return where;
+}
 export const LEDGER_MISMATCH_INVARIANT = 'LEDGER_TOTAL_MISMATCH';
 export const COMPONENT_MISMATCH_INVARIANT = 'COMPONENT_SUM_MISMATCH';
 
@@ -192,24 +218,12 @@ export class ReconciliationFindingsService {
   }
 
   async listFindings(query: FindingsQueryDto): Promise<object> {
-    const { page = 1, limit = 20, status, minDifferenceIdr, maxAgeDays, invariant, urgentOnly } = query;
+    const { page = 1, limit = 20 } = query;
     const safePage = Number.isInteger(page) && page > 0 ? page : 1;
     const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 100) : 20;
 
-    const where: Prisma.ReconciliationFindingWhereInput = {};
-    if (status) where.status = status;
-    if (minDifferenceIdr !== undefined && minDifferenceIdr > 0) {
-      const bound = toSen(minDifferenceIdr);
-      where.OR = [{ difference: { gte: bound } }, { difference: { lte: -bound } }];
-    }
-    if (maxAgeDays !== undefined && maxAgeDays >= 0) {
-      where.createdAt = { gte: new Date(Date.now() - maxAgeDays * 24 * 3600 * 1000) };
-    }
-    if (invariant) {
-      where.violatedInvariants = { has: invariant };
-    } else if (urgentOnly) {
-      where.violatedInvariants = { has: URGENT_INVARIANT };
-    }
+    // BAD-020: filter yang sama dipakai ekspor CSV.
+    const where = buildFindingsWhereInput(query);
 
     const [rows, total] = await Promise.all([
       this.prisma.reconciliationFinding.findMany({

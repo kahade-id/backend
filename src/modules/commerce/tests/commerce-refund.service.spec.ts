@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { CommerceRefundService } from '../services/commerce-refund.service';
+import { ApprovalsService } from '../../admin/approvals/approvals.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { OrderStateService } from '../../orders/order-state.service';
 import { PatunganParticipantStatus, JastipParticipantStatus, OrderStatus } from '@prisma/client';
@@ -22,6 +23,7 @@ describe('CommerceRefundService (M2)', () => {
         CommerceRefundService,
         { provide: PrismaService, useValue: mockPrisma },
         { provide: OrderStateService, useValue: mockOrderState },
+        { provide: ApprovalsService, useValue: { registerExecutor: jest.fn(), propose: jest.fn() } },
       ],
     }).compile();
     service = module.get<CommerceRefundService>(CommerceRefundService);

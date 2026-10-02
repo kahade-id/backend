@@ -1,4 +1,4 @@
-import { IsString, IsEnum, IsNumber, IsInt, Min, Max, MinLength, MaxLength, IsOptional } from 'class-validator';
+import { IsString, IsEnum, IsNumber, IsInt, Min, Max, MinLength, MaxLength, IsOptional, IsNotEmpty } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { WALLET_DAILY_TOPUP_LIMIT } from '../../../../common/constants/app.constants';
 
@@ -31,4 +31,15 @@ export class WalletAdjustDto {
   @MinLength(8)
   @MaxLength(128)
   idempotencyKey?: string;
+
+  @ApiProperty({
+    description:
+      'SEC-601: password admin untuk re-auth server-side (pola AUT-013). ' +
+      'Wajib untuk setiap adjust — JWT curian saja tidak cukup.',
+    maxLength: 72,
+  })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(72)
+  reauthPassword!: string;
 }

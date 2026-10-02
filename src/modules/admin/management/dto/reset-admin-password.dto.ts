@@ -18,4 +18,11 @@ export class ResetAdminPasswordDto {
   @MinLength(12)
   @MaxLength(72)
   temporaryPassword?: string;
+
+  // BAD-028: alasan reset (opsional) — tercatat di audit trail.
+  @ApiPropertyOptional({ description: 'Alasan reset password (opsional) — tercatat di audit trail.', maxLength: 500 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  reason?: string;
 }

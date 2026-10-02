@@ -10,6 +10,7 @@ import { AuthModule } from '../../auth/auth.module';
 import { VerificationBadgeModule } from '../../users/verification-badge.module';
 import { DashboardModule } from '../dashboard/dashboard.module';
 import { UploadModule } from '../../upload/upload.module';
+import { WalletModeModule } from '../../wallet-mode/wallet-mode.module';
 import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
 
 @Module({
@@ -21,6 +22,7 @@ import { EMAIL_QUEUE } from '../../queue/processors/email.processor';
     VerificationBadgeModule,
     DashboardModule, // AW-018: invalidasi cache summary dashboard
     UploadModule, // GAP-E (G380): signed URL unduhan hasil ekspor async
+    WalletModeModule, // BAD-008: kill-switch WALLET_ENABLED untuk adjustWallet
     BullModule.registerQueue({
       name: EMAIL_QUEUE,
       settings: { stalledInterval: 30_000, maxStalledCount: 1 },

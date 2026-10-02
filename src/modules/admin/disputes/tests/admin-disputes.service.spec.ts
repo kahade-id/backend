@@ -10,6 +10,7 @@ import { UploadService } from '../../../upload/upload.service';
 import { RealtimeService } from '../../../realtime/realtime.service';
 import { ChatService } from '../../../chat/chat.service';
 import { DashboardService } from '../../dashboard/dashboard.service';
+import { ApprovalsService } from '../../approvals/approvals.service';
 
 describe('AdminDisputesService round-two boundaries', () => {
   const prisma: any = {
@@ -35,6 +36,8 @@ describe('AdminDisputesService round-two boundaries', () => {
         // M3 no-wallet: wallet aktif di test ini → jalur wallet lama.
         { provide: WalletModeService, useValue: { isWalletEnabled: () => true } },
         { provide: DisputeDanaSettlementService, useValue: {} },
+        // SEC-501: dual control — executor registry (mock).
+        { provide: ApprovalsService, useValue: { registerExecutor: jest.fn(), propose: jest.fn() } },
       ],
     }).compile();
     service = module.get(AdminDisputesService);

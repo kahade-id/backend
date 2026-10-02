@@ -24,6 +24,8 @@ import { AdminSupportModule } from './support/admin-support.module';
 import { AdminChatModule } from './chat/admin-chat.module';
 // Audit 2026-10-03 (FAL-010): moderasi komentar showcase oleh Trust & Safety.
 import { AdminShowcaseCommentsModule } from './showcase-comments/admin-showcase-comments.module';
+// Audit 2026-10-03 (SEC-501/502/601/602, BAD-001): dual control maker-checker.
+import { ApprovalsModule } from './approvals/approvals.module';
 import { AdminFeedbackModule } from './feedback/admin-feedback.module';
 // GAP-C (G196–G199): admin milestone.
 import { AdminMilestonesModule } from './milestones/admin-milestones.module';
@@ -55,6 +57,7 @@ import { AdminActionLocationsModule } from './action-locations/admin-action-loca
     AdminSupportModule,
     AdminChatModule,
     AdminShowcaseCommentsModule,
+    ApprovalsModule,
     AdminFeedbackModule,
     AdminMilestonesModule, // GAP-C (G196–G199)
     AdminActionLocationsModule,

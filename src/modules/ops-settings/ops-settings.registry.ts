@@ -18,6 +18,12 @@ export interface ManageableSettingDef {
   isSecret: boolean;
   /** true → admin panel menampilkan tombol "Test koneksi" */
   testable: boolean;
+  /**
+   * SEC-506: true → kategori FINANSIAL (fee, limit, ambang disbursement,
+   * config DANA, WALLET_ENABLED). Perubahan WAJIB via dual control
+   * (OPS_SETTING_CHANGE) — tidak bisa diubah langsung via PUT.
+   */
+  financial: boolean;
 }
 
 export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
@@ -30,6 +36,7 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
       'Berlaku untuk pengiriman berikutnya (maks ~60 detik).',
     isSecret: true,
     testable: true,
+    financial: false,
   },
   {
     key: 'FONNTE_WEBHOOK_SECRET',
@@ -43,6 +50,7 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
       'IP whitelist kosong, SEMUA webhook DITOLAK (fail-closed).',
     isSecret: true,
     testable: false,
+    financial: false,
   },
   {
     key: 'FONNTE_WEBHOOK_IPS',
@@ -55,6 +63,7 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
       'verifikasi IP (tidak disarankan).',
     isSecret: false,
     testable: false,
+    financial: false,
   },
   {
     key: 'FONNTE_API_URL',
@@ -66,6 +75,7 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
       'dinormalisasi — nilai tersimpan bisa berbeda dari yang diketik.',
     isSecret: false,
     testable: false,
+    financial: false,
   },
   {
     key: 'FONNTE_COUNTRY_CODE',
@@ -73,6 +83,7 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
     description: 'Kode negara default untuk nomor tujuan Fonnte (default: 62).',
     isSecret: false,
     testable: false,
+    financial: false,
   },
   {
     key: 'MAINTENANCE_MODE',
@@ -83,6 +94,7 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
       'Diubah via PUT /v1/admin/maintenance (toggle + pesan) atau panel ini.',
     isSecret: false,
     testable: false,
+    financial: false,
   },
   {
     key: 'MAINTENANCE_MESSAGE',
@@ -93,6 +105,7 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
       '(atau kosongkan pesan di kartu maintenance) untuk memakai pesan default.',
     isSecret: false,
     testable: false,
+    financial: false,
   },
   {
     key: 'WALLET_ENABLED',
@@ -102,9 +115,31 @@ export const MANAGEABLE_SETTINGS: ManageableSettingDef[] = [
       '(saldo, top-up, withdraw, PIN) diaktifkan kembali; kosong/"false" = ' +
       'NONAKTIF (default, fail-closed) — uang hanya numpang lewat via DANA ' +
       '(buyer → DANA → escrow → rekening bank seller). Setara dengan env ' +
-      'WALLET_ENABLED. Berlaku untuk request berikutnya (maks ~60 detik).',
+      'WALLET_ENABLED. Berlaku untuk request berikutnya (maks ~60 detik). ' +
+      'SEC-506: kategori FINANSIAL — perubahan wajib dual control.',
     isSecret: false,
     testable: false,
+    financial: true,
+  },
+  {
+    key: 'TRANSLATION_PROVIDER',
+    label: 'Translation Provider',
+    description:
+      'FAL-006: provider layanan terjemahan (mis. "google", "deepl"). ' +
+      'Dibaca dinamis oleh consumer terjemahan via OpsSettingsService.',
+    isSecret: false,
+    testable: false,
+    financial: false,
+  },
+  {
+    key: 'TRANSLATION_API_KEY',
+    label: 'Translation API Key',
+    description:
+      'FAL-006: API key provider terjemahan. Disimpan terenkripsi AES-GCM, ' +
+      'tampil ter-mask di panel.',
+    isSecret: true,
+    testable: false,
+    financial: false,
   },
 ];
 

@@ -4,8 +4,9 @@ import {
   NotFoundException,
   ConflictException,
   BadRequestException,
+  OnModuleInit,
 } from '@nestjs/common';
-import { Prisma, AuditAction, EscrowDisbursementStatus } from '@prisma/client';
+import { Prisma, AuditAction, EscrowDisbursementStatus, AdminRole } from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { DanaDisbursementService } from '../../payment/dana/dana-disbursement.service';
@@ -17,6 +18,8 @@ import {
   DisbursementQueryDto,
   DisbursementReviewDto,
 } from './dto/disbursement.dto';
+// BAD-001: reopen disbursement CANCELLED selalu via dual control.
+import { ApprovalsService } from '../approvals/approvals.service';
 
 export interface DisbursementListItem {
   id: string;
@@ -69,14 +72,29 @@ export interface DisbursementDetail extends DisbursementListItem {
  *   (inquiry bank + verifikasi nama).
  */
 @Injectable()
-export class AdminDisbursementService {
+export class AdminDisbursementService implements OnModuleInit {
   private readonly logger = new Logger(AdminDisbursementService.name);
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditLog: AuditLogService,
     private readonly danaDisbursement: DanaDisbursementService,
+    // BAD-001: modul ini mengeksekusi DISBURSEMENT_REOPEN yang disetujui
+    // (ApprovalsModule @Global — tanpa import modul).
+    private readonly approvals: ApprovalsService,
   ) {}
+
+  onModuleInit(): void {
+    this.approvals.registerExecutor('DISBURSEMENT_REOPEN', async (ctx) => {
+      if (!ctx.targetId) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'DISBURSEMENT_REOPEN membutuhkan targetId (disbursementId)',
+        });
+      }
+      return this.executeReopen(ctx.targetId, ctx.decidedBy, ctx.proposedBy, ctx.ipAddress);
+    });
+  }
 
   async listDisbursements(query: DisbursementQueryDto): Promise<object> {
     const page = Number.isInteger(query.page) && (query.page as number) > 0 ? (query.page as number) : 1;
@@ -90,12 +108,22 @@ export class AdminDisbursementService {
     if (query.scope) where.scope = query.scope;
     if (query.search) {
       const s = query.search.trim();
-      where.OR = [
+      const or: Prisma.EscrowDisbursementWhereInput[] = [
         { idempotencyKey: { contains: s, mode: 'insensitive' } },
         { danaReferenceNo: { contains: s, mode: 'insensitive' } },
         { danaPartnerReferenceNo: { contains: s, mode: 'insensitive' } },
         { sellerId: s },
       ];
+      // BAD-017: pencarian mendukung orderId publik (ORD-...) — resolve ke
+      // id internal karena EscrowDisbursement.orderId menyimpan id internal.
+      if (/^ORD-/i.test(s)) {
+        const ord = await this.prisma.order.findFirst({
+          where: { orderId: s },
+          select: { id: true },
+        });
+        if (ord) or.push({ orderId: ord.id });
+      }
+      where.OR = or;
     }
 
     const [rows, total] = await Promise.all([
@@ -191,13 +219,15 @@ export class AdminDisbursementService {
     }
     if (row.status !== EscrowDisbursementStatus.PROCESSING) {
       throw new ConflictException({
-        code: ErrorCodes.DISBURSEMENT_NOT_REQUEUABLE,
+        // BAD-022: kode copy-paste dari requeue diperbaiki — recheck butuh kode sendiri.
+        code: ErrorCodes.DISBURSEMENT_NOT_RECHECKABLE,
         message: `Hanya disbursement PROCESSING yang dapat di-recheck ke DANA (saat ini: ${row.status})`,
       });
     }
     if (!row.danaPartnerReferenceNo) {
       throw new BadRequestException({
-        code: ErrorCodes.DISBURSEMENT_NOT_REQUEUABLE,
+        // BAD-022: kode copy-paste dari requeue diperbaiki.
+        code: ErrorCodes.DISBURSEMENT_NOT_RECHECKABLE,
         message: 'Disbursement ini belum memiliki referensi DANA (belum pernah dikirim ke provider)',
       });
     }
@@ -391,6 +421,101 @@ export class AdminDisbursementService {
     });
 
     return { id: updated.id, idempotencyKey: updated.idempotencyKey, status: updated.status };
+  }
+
+  /**
+   * BAD-001: buka ulang disbursement CANCELLED → PENDING. SELALU via dual
+   * control — endpoint hanya MEMBUAT usulan PENDING (tidak mengeksekusi).
+   * Eksekusi oleh admin kedua via POST /v1/admin/approvals/:id/approve.
+   *
+   * Konteks P0: BAD-001 — releaseFunds()/settle() tidak boleh menganggap
+   * CANCELLED sebagai retryable (fix ada di escrow-disbursement.service.ts,
+   * domain Worker A). Satu-satunya jalan CANCELLED → hidup kembali adalah
+   * reopen eksplisit ini, dengan persetujuan dua admin + audit trail.
+   */
+  async requestReopen(
+    id: string,
+    adminId: string,
+    adminRole: AdminRole,
+    reason: string | undefined,
+    ipAddress: string,
+  ): Promise<object> {
+    const row = await this.prisma.escrowDisbursement.findUnique({ where: { id } });
+    if (!row) {
+      throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Disbursement tidak ditemukan' });
+    }
+    if (row.status !== EscrowDisbursementStatus.CANCELLED) {
+      throw new ConflictException({
+        code: ErrorCodes.DISBURSEMENT_NOT_REOPENABLE,
+        message: `Hanya disbursement CANCELLED yang dapat dibuka ulang (saat ini: ${row.status})`,
+      });
+    }
+    const approval = await this.approvals.propose({
+      actionType: 'DISBURSEMENT_REOPEN',
+      targetId: id,
+      payload: { reason: reason?.trim() || null },
+      amountSen: Number(row.amountSen),
+      // Idempoten per disbursement: request ulang mengembalikan approval yang ada.
+      idempotencyKey: `disbursement-reopen:${id}`,
+      proposedBy: adminId,
+      proposerRole: adminRole,
+      ipAddress,
+    });
+    return {
+      approvalId: approval.approvalId,
+      status: approval.status,
+      expiresAt: approval.expiresAt,
+      message:
+        'Usulan reopen disbursement dibuat — butuh persetujuan admin kedua ' +
+        '(POST /v1/admin/approvals/:id/approve). Eksekusi: CANCELLED → PENDING.',
+    };
+  }
+
+  /**
+   * BAD-001: eksekusi reopen — HANYA dipanggil dari executor
+   * DISBURSEMENT_REOPEN setelah approval dual control (bukan dari endpoint
+   * langsung). Transisi CANCELLED → PENDING atomik via conditional
+   * updateMany (predicate status) agar dua approval konkuren tidak
+   * double-execute. attemptCount di-reset agar cron retryDue mendapat
+   * siklus percobaan baru yang utuh.
+   */
+  async executeReopen(
+    id: string,
+    decidedBy: string,
+    proposedBy: string,
+    ipAddress: string,
+  ): Promise<object> {
+    const claimed = await this.prisma.escrowDisbursement.updateMany({
+      where: { id, status: EscrowDisbursementStatus.CANCELLED },
+      data: {
+        status: EscrowDisbursementStatus.PENDING,
+        attemptCount: 0,
+        lastError: null,
+        heldReason: null,
+      },
+    });
+    if (claimed.count === 0) {
+      const row = await this.prisma.escrowDisbursement.findUnique({ where: { id } });
+      if (!row) {
+        throw new NotFoundException({ code: ErrorCodes.NOT_FOUND, message: 'Disbursement tidak ditemukan' });
+      }
+      throw new ConflictException({
+        code: ErrorCodes.DISBURSEMENT_NOT_REOPENABLE,
+        message: `Disbursement tidak lagi CANCELLED (saat ini: ${row.status}) — reopen dibatalkan`,
+      });
+    }
+    this.auditLog.logAdminAction({
+      adminId: decidedBy,
+      action: AuditAction.DISBURSEMENT_REQUEUED,
+      targetType: 'EscrowDisbursement',
+      targetId: id,
+      description:
+        `Dual control DISBURSEMENT_REOPEN: diusulkan ${proposedBy}, disetujui+dieksekusi ${decidedBy} — ` +
+        `disbursement CANCELLED → PENDING (siklus retry baru)`,
+      after: { from: 'CANCELLED', to: 'PENDING' },
+      ipAddress,
+    });
+    return { id, status: 'PENDING' };
   }
 
   private toListItem(

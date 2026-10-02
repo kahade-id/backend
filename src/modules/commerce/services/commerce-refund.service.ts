@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException, BadRequestException, ConflictException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, BadRequestException, ConflictException, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import {
   PatunganParticipantStatus,
@@ -8,6 +8,8 @@ import {
 } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { OrderStateService } from '../../orders/order-state.service';
+// SEC-602: dual control untuk refund manual nominal besar.
+import { ApprovalsService } from '../../admin/approvals/approvals.service';
 
 export type CommerceRefundKind = 'patungan' | 'jastip';
 
@@ -47,13 +49,45 @@ export const COMMERCE_REFUND_SYSTEM_ACTOR = 'system';
  *   closed); tetap REFUND_REQUIRED + alert untuk tindak lanjut dispute.
  */
 @Injectable()
-export class CommerceRefundService {
+export class CommerceRefundService implements OnModuleInit {
   private readonly logger = new Logger(CommerceRefundService.name);
 
   constructor(
     private prisma: PrismaService,
     private orderStateService: OrderStateService,
+    // SEC-602: modul ini mengeksekusi COMMERCE_REFUND yang disetujui
+    // (ApprovalsModule @Global — tanpa import modul).
+    private readonly approvals: ApprovalsService,
   ) {}
+
+  onModuleInit(): void {
+    this.approvals.registerExecutor('COMMERCE_REFUND', async (ctx) => {
+      if (!ctx.targetId) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'COMMERCE_REFUND membutuhkan targetId (orderId)',
+        });
+      }
+      const reason =
+        typeof ctx.payload.reason === 'string' && ctx.payload.reason.trim().length > 0
+          ? (ctx.payload.reason as string)
+          : `Refund manual via dual control (approval ${ctx.approvalId})`;
+      return this.executeRefundForOrder(ctx.targetId, ctx.decidedBy, reason);
+    });
+  }
+
+  /**
+   * SEC-602: nominal refundable (orderValue, sen) untuk gate dual control di
+   * controller. Mengembalikan 0n bila order tidak ditemukan (controller tetap
+   * memanggil executeRefundForOrder yang melempar 404 yang benar).
+   */
+  async getRefundableNominalSen(orderIdParam: string): Promise<bigint> {
+    const order = await this.prisma.order.findFirst({
+      where: { OR: [{ id: orderIdParam }, { orderId: orderIdParam }], deletedAt: null },
+      select: { orderValue: true },
+    });
+    return order?.orderValue ?? 0n;
+  }
 
   /** Cari peserta REFUND_REQUIRED dari orderId publik (ORD-...) atau id internal. */
   async executeRefundForOrder(

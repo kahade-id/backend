@@ -1,9 +1,10 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { createPaginatedResponse } from '../../../common/dto/pagination.dto';
 import {
+  AdminRole,
   AuditAction,
   InsuranceClaimStatus,
   NotificationType,
@@ -16,6 +17,8 @@ import * as ErrorCodes from '../../../common/constants/error-codes';
 import { escapeLikePattern } from '../../../common/utils/search.util';
 import { generateNotifId, generateWalletTxId } from '../../../common/utils/id-generator.util';
 import { getCategoryForType } from '../../notifications/notification-category.map';
+// SEC-502: pembayaran klaim SELALU via dual control (maker-checker).
+import { ApprovalsService } from '../approvals/approvals.service';
 
 const TERMINAL_STATUSES: InsuranceClaimStatus[] = [
   InsuranceClaimStatus.PAID,
@@ -48,12 +51,30 @@ const ALLOWED_TRANSITIONS: Record<string, InsuranceClaimStatus[]> = {
  * - PATCH  /v1/admin/insurance-claims/:id {status, note?}
  */
 @Injectable()
-export class AdminInsuranceClaimsService {
+export class AdminInsuranceClaimsService implements OnModuleInit {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditLog: AuditLogService,
     private readonly walletTxSerial: WalletTxSerialService,
+    // SEC-502: modul ini mengeksekusi INSURANCE_CLAIM_PAY yang disetujui.
+    private readonly approvals: ApprovalsService,
   ) {}
+
+  onModuleInit(): void {
+    this.approvals.registerExecutor('INSURANCE_CLAIM_PAY', async (ctx) => {
+      if (!ctx.targetId) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'INSURANCE_CLAIM_PAY membutuhkan targetId (claimId)',
+        });
+      }
+      const note =
+        typeof ctx.payload.note === 'string' ? (ctx.payload.note as string) : undefined;
+      // paidBy (decidedBy) != approvedBy (proposedBy) dijamin guard SELF_APPROVAL;
+      // dicatat eksplisit di audit trail.
+      return this.payApprovedClaim(ctx.targetId, note, ctx.decidedBy, ctx.proposedBy, ctx.ipAddress);
+    });
+  }
 
   async listClaims(page: number, limit: number, status?: string, search?: string): Promise<object> {
     const safePage = Math.max(1, Number.isFinite(page) ? Math.trunc(page) : 1);
@@ -98,6 +119,7 @@ export class AdminInsuranceClaimsService {
     status: 'APPROVED' | 'REJECTED' | 'PAID',
     note: string | undefined,
     adminId: string,
+    adminRole: AdminRole,
     ipAddress: string,
   ): Promise<object> {
     const claim = await this.prisma.insuranceClaim.findUnique({ where: { id: claimId } });
@@ -126,8 +148,29 @@ export class AdminInsuranceClaimsService {
     // INS-001: PAID harus menggerakkan uang — payout atomik + idempoten.
     // Klaim yang sudah PAID/berubah status di tengah jalan ditolak agar
     // tidak terjadi double-credit.
+    // SEC-502: PAID SELALU via dual control — endpoint ini hanya MEMBUAT
+    // usulan PENDING (tidak mengeksekusi). Eksekusi terjadi saat admin KEDUA
+    // menyetujui via POST /v1/admin/approvals/:id/approve.
     if (status === 'PAID') {
-      return this.payClaim(claimId, note, adminId, ipAddress, claim);
+      const approval = await this.approvals.propose({
+        actionType: 'INSURANCE_CLAIM_PAY',
+        targetId: claimId,
+        payload: { note: note ?? null },
+        amountSen: Number(claim.amount),
+        // Idempoten per klaim: PATCH PAID ulang mengembalikan approval yang ada.
+        idempotencyKey: `insurance-pay:${claimId}`,
+        proposedBy: adminId,
+        proposerRole: adminRole,
+        ipAddress,
+      });
+      return {
+        approvalId: approval.approvalId,
+        status: approval.status,
+        expiresAt: approval.expiresAt,
+        message:
+          'Usulan pembayaran klaim dibuat — butuh persetujuan admin kedua ' +
+          '(POST /v1/admin/approvals/:id/approve). paidBy wajib berbeda dari pengusul.',
+      };
     }
 
     // CW-008/SP-018: keputusan APPROVED/REJECTED diberitahukan ke pengaju.
@@ -189,6 +232,46 @@ export class AdminInsuranceClaimsService {
       amount: toIdr(updated.amount),
       cap: toIdr(updated.cap),
     };
+  }
+
+  /**
+   * SEC-502: eksekusi pembayaran klaim HANYA dipanggil dari executor
+   * INSURANCE_CLAIM_PAY setelah approval dual control (bukan dari endpoint
+   * langsung). paidBy (decidedBy) != proposedBy dijamin guard SELF_APPROVAL
+   * di ApprovalsService dan dicatat eksplisit di audit trail.
+   */
+  async payApprovedClaim(
+    claimId: string,
+    note: string | undefined,
+    decidedBy: string,
+    proposedBy: string,
+    ipAddress: string,
+  ): Promise<object> {
+    const claim = await this.prisma.insuranceClaim.findUnique({ where: { id: claimId } });
+    if (!claim) {
+      throw new NotFoundException({
+        code: ErrorCodes.INSURANCE_CLAIM_NOT_FOUND,
+        message: 'Klaim asuransi tidak ditemukan',
+      });
+    }
+    const result = await this.payClaim(claimId, note, decidedBy, ipAddress, {
+      id: claim.id,
+      userId: claim.userId,
+      status: claim.status,
+      amount: claim.amount,
+      claimType: claim.claimType,
+    });
+    this.auditLog.logAdminAction({
+      adminId: decidedBy,
+      action: AuditAction.ADMIN_ACTION,
+      targetType: 'InsuranceClaim',
+      targetId: claimId,
+      description:
+        `Dual control INSURANCE_CLAIM_PAY: diusulkan ${proposedBy}, ` +
+        `disetujui+dibayar (paidBy) ${decidedBy}`,
+      ipAddress,
+    });
+    return result;
   }
 
   /**

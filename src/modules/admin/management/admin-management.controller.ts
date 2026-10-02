@@ -11,6 +11,7 @@ import { ChangeAdminRoleDto } from './dto/change-admin-role.dto';
 import { CreateEmergencyGrantDto } from './dto/emergency-grant.dto';
 import { CreateHandoffDto, HandoffQueryDto } from './dto/create-handoff.dto';
 import { ResetAdminPasswordDto } from './dto/reset-admin-password.dto';
+import { AdminActionReasonDto, ReactivateAdminDto } from './dto/admin-action-reason.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
 import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
@@ -19,6 +20,8 @@ import { AdminJwtPayload } from '../../../common/types/jwt-payload.types';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
 import { Request } from 'express';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
+import { StepUpGuard } from '../../../common/guards/step-up.guard';
+import { RequireStepUp } from '../../../common/decorators/require-step-up.decorator';
 import { Idempotency } from '../../../common/decorators/idempotency.decorator';
 
 @ApiTags('admin-management')
@@ -229,16 +232,17 @@ export class AdminManagementController {
   @UseGuards(UserThrottleGuard)
   @Idempotency()
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Aktifkan kembali akun admin yang di-suspend', description: 'Audit ADMIN_REACTIVATED.' })
+  @ApiOperation({ summary: 'Aktifkan kembali akun admin yang di-suspend', description: 'Audit ADMIN_REACTIVATED. BAD-029: reason wajib dari client, disimpan di audit.' })
   @ApiResponse({ status: 200, description: 'Admin reactivated.' })
   @ApiResponse({ status: 404, description: 'Admin not found.' })
   @ApiResponse({ status: 409, description: 'Admin already active.' })
   reactivateAdmin(
     @Param('id', ParseIdPipe) id: string,
+    @Body() dto: ReactivateAdminDto,
     @CurrentAdmin('sub') adminId: string,
     @Req() req: Request,
   ): Promise<object> {
-    return this.service.reactivateAdmin(id, adminId, req.ip ?? '');
+    return this.service.reactivateAdmin(id, adminId, req.ip ?? '', dto.reason);
   }
 
   @Put(':id/role')
@@ -333,18 +337,21 @@ export class AdminManagementController {
   }
 
   @Post(':id/reset-2fa')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // BAD-009/503: reset 2FA admin lain wajib step-up server-side.
+  @RequireStepUp('admin.reset2fa', 'id')
   @Idempotency()
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Reset admin 2FA' })
+  @ApiOperation({ summary: 'Reset admin 2FA', description: 'BAD-009: wajib X-Step-Up-Token (action admin.reset2fa). BAD-028: reason opsional tercatat di audit.' })
   @ApiResponse({ status: 200, description: '2FA reset successfully.' })
   @ApiResponse({ status: 404, description: 'Admin not found.' })
   resetAdmin2fa(
     @Param('id', ParseIdPipe) id: string,
+    @Body() dto: AdminActionReasonDto,
     @CurrentAdmin('sub') adminId: string,
     @Req() req: Request,
   ): Promise<{ message: string }> {
-    return this.service.resetAdmin2fa(id, adminId, req.ip ?? '');
+    return this.service.resetAdmin2fa(id, adminId, req.ip ?? '', dto.reason);
   }
 
   /**
@@ -353,7 +360,9 @@ export class AdminManagementController {
    * untuk admin — pemulihan hanya lewat endpoint ini, teraudit.
    */
   @Post(':id/reset-password')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // BAD-009/503: reset password admin lain wajib step-up server-side.
+  @RequireStepUp('admin.resetPassword', 'id')
   @Idempotency()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
@@ -362,7 +371,9 @@ export class AdminManagementController {
       'Mereset password admin target ke password sementara (dibangkitkan bila ' +
       'tidak diberikan). Target WAJIB mengganti password saat login berikutnya ' +
       '(flag mustChangePassword) dan semua sesinya dicabut. Tidak bisa dipakai ' +
-      'untuk me-reset password sendiri — gunakan /v1/admin/auth/change-password.',
+      'untuk me-reset password sendiri — gunakan /v1/admin/auth/change-password. ' +
+      'BAD-009: wajib X-Step-Up-Token (action admin.resetPassword). ' +
+      'BAD-028: reason opsional tercatat di audit.',
   })
   @ApiResponse({ status: 200, description: 'Password reset; temporary password returned (tampilkan sekali ke SUPER_ADMIN).' })
   @ApiResponse({ status: 403, description: 'Cannot reset own password.' })
@@ -373,35 +384,41 @@ export class AdminManagementController {
     @CurrentAdmin('sub') adminId: string,
     @Req() req: Request,
   ): Promise<{ message: string; temporaryPassword: string }> {
-    return this.service.resetAdminPassword(id, adminId, req.ip ?? '', dto.temporaryPassword);
+    return this.service.resetAdminPassword(id, adminId, req.ip ?? '', dto.temporaryPassword, dto.reason);
   }
 
   @Post(':id/unlock')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // BAD-009/503: unlock akun admin wajib step-up server-side.
+  @RequireStepUp('admin.unlock', 'id')
   @Idempotency()
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Unlock locked admin account' })
+  @ApiOperation({ summary: 'Unlock locked admin account', description: 'BAD-009: wajib X-Step-Up-Token (action admin.unlock). BAD-028: reason opsional tercatat di audit.' })
   @ApiResponse({ status: 200, description: 'Admin unlocked.' })
   @ApiResponse({ status: 404, description: 'Admin not found.' })
   unlockAdmin(
     @Param('id', ParseIdPipe) id: string,
+    @Body() dto: AdminActionReasonDto,
     @CurrentAdmin('sub') adminId: string,
     @Req() req: Request,
   ): Promise<{ message: string }> {
-    return this.service.unlockAdmin(id, adminId, req.ip ?? '');
+    return this.service.unlockAdmin(id, adminId, req.ip ?? '', dto.reason);
   }
 
   @Delete(':id')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  // BAD-009/503: soft-delete admin wajib step-up server-side.
+  @RequireStepUp('admin.delete', 'id')
   @Idempotency()
-  @ApiOperation({ summary: 'Soft-delete admin user' })
+  @ApiOperation({ summary: 'Soft-delete admin user', description: 'BAD-009: wajib X-Step-Up-Token (action admin.delete). BAD-028: reason opsional tercatat di audit.' })
   @ApiResponse({ status: 200, description: 'Admin deleted.' })
   @ApiResponse({ status: 404, description: 'Admin not found.' })
   deleteAdmin(
     @Param('id', ParseIdPipe) id: string,
+    @Body() dto: AdminActionReasonDto,
     @CurrentAdmin('sub') adminId: string,
     @Req() req: Request,
   ): Promise<{ message: string }> {
-    return this.service.deleteAdmin(id, adminId, req.ip ?? '');
+    return this.service.deleteAdmin(id, adminId, req.ip ?? '', dto.reason);
   }
 }

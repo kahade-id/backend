@@ -1047,6 +1047,8 @@ model User {
   showcaseSaves             ShowcaseSave[]
   highlights                UserHighlight[]
   showcaseComments          ShowcaseComment[]
+  // Audit 2026-10-03 (BFE-117/FAL-009): reaksi like/dislike komentar showcase.
+  showcaseCommentReactions  ShowcaseCommentReaction[]
   scheduledWithdrawals      ScheduledWithdrawal[]     @relation("UserScheduledWithdrawals")
   deliveryProofsSubmitted   DeliveryProof[]           @relation("DeliveryProofSubmitter")
   ratingReplies             RatingReply[]             @relation("RatingReplies")
@@ -1651,6 +1653,11 @@ model WalletTransaction {
   metadata      Json?
   failureReason String?
 
+  // SEC-203 (audit 2026-10-03): kunci idempotensi DEDIKASI sebagai kolom (bukan
+  // path JSON di metadata) — diklaim atomik via unique constraint, sehingga dua
+  // request konkuren dengan key sama tidak bisa double-debit.
+  idempotencyKey String?
+
   reversalTxId String?
   reversalTx   WalletTransaction?  @relation("ReversalTransaction", fields: [reversalTxId], references: [id], onDelete: SetNull)
   reversals    WalletTransaction[] @relation("ReversalTransaction")
@@ -1678,6 +1685,7 @@ model WalletTransaction {
   @@index([bankAccountId])
   @@index([paymentTxId])
   @@index([reversalTxId])
+  @@unique([idempotencyKey]) // SEC-203 (audit 2026-10-03): klaim idempotensi atomik
   @@index([irisPayoutId]) // performance index untuk webhook lookup
   @@map("wallet_transactions")
 }
@@ -2501,6 +2509,8 @@ model Dispute {
   // BAI-095: catatan internal kolaboratif antar admin (pengganti localStorage
   // per-perangkat di panel admin).
   internalNotes   DisputeInternalNote[]
+  // Audit 2026-10-03 (SEC-104): intent settlement durable per sengketa.
+  settlementIntent DisputeSettlementIntent?
 
   @@index([status])
   @@index([status, createdAt])
@@ -4270,6 +4280,14 @@ model ShowcaseComment {
   hiddenReason ContentHiddenReason?
   hiddenAt     DateTime?
   hiddenBy     String?              @db.VarChar(100)
+
+  // FAL-027 (audit 2026-10-03): soft-delete — hapus tidak lagi hard-delete;
+  // balasan tetap ada, parent ditandai dihapus. Audit via admin_audit_logs.
+  deletedAt    DateTime?
+  deletedBy    String?   @db.VarChar(100)
+  deleteReason String?   @db.Text
+
+  reactions ShowcaseCommentReaction[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -6591,4 +6609,84 @@ model Banner {
 
   @@index([isActive, position, sortOrder])
   @@map("banners")
+}
+
+// === AUDIT 2026-10-03: model baru ===
+
+// BFE-117 / FAL-009: like/dislike komentar showcase — persisten per user,
+// toggle idempoten. value: 1 = suka, -1 = tidak suka.
+model ShowcaseCommentReaction {
+  id        String          @id @default(cuid())
+  commentId String
+  comment   ShowcaseComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  value     Int // 1 | -1
+  createdAt DateTime @default(now())
+
+  @@unique([commentId, userId])
+  @@index([commentId])
+  @@map("showcase_comment_reactions")
+}
+
+// SEC-104: intent settlement sengketa no-wallet yang durable. Dibuat di DALAM
+// tx putusan (status PENDING), diklaim post-commit, disapu cron bila belum DONE.
+// Mencegah: sengketa RESOLVED tapi uang tidak bergerak tanpa jalur retry.
+model DisputeSettlementIntent {
+  id             String   @id @default(cuid())
+  disputeId      String   @unique
+  dispute        Dispute  @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+  status         String   @default("PENDING") @db.VarChar(20) // PENDING | CLAIMED | DONE | FAILED
+  buyerAmountSen BigInt   @default(0)
+  sellerAmountSen BigInt  @default(0)
+  attemptCount   Int      @default(0)
+  lastError      String?  @db.Text
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  claimedAt      DateTime?
+  doneAt         DateTime?
+
+  @@index([status, updatedAt])
+  @@map("dispute_settlement_intents")
+}
+
+// SEC-503: token step-up re-auth admin — single-use, TTL pendek, terikat
+// aksi+target. Disimpan hash-nya saja; yang dikirim ke admin adalah token mentah.
+// adminId disimpan sebagai String polos (tanpa FK) mengikuti konvensi repo.
+model AdminStepUpToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  adminId   String
+  action    String    @db.VarChar(120)
+  targetId  String?
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([adminId, createdAt])
+  @@map("admin_step_up_tokens")
+}
+
+// SEC-501/502/601/602 + BAD-001: dual control untuk aksi sensitif admin.
+// Aksi membuat record PENDING (proposedBy + step-up); admin KEDUA (!= proposer)
+// menyetujui dengan step-up-nya sendiri, baru dieksekusi.
+model AdminActionApproval {
+  id             String    @id @default(cuid())
+  actionType     String    @db.VarChar(120)
+  targetId       String?
+  payload        Json
+  amountSen      BigInt?
+  idempotencyKey String    @unique
+  proposedBy     String // AdminUser.id, tanpa FK
+  proposedAt     DateTime  @default(now())
+  status         String    @default("PENDING") @db.VarChar(20) // PENDING | APPROVED | EXECUTED | REJECTED | EXPIRED
+  decidedBy      String?
+  decidedAt      DateTime?
+  executedAt     DateTime?
+  expiresAt      DateTime
+  rejectReason   String?   @db.Text
+
+  @@index([status, expiresAt])
+  @@index([proposedBy, proposedAt])
+  @@map("admin_action_approvals")
 }

@@ -11,12 +11,27 @@ const danaSuccessPayment = {
   refundedAmount: BigInt(0),
 };
 
-function buildPrisma(payment: unknown, attemptStore: Record<string, any> = {}) {
+function buildPrisma(payment: any, attemptStore: Record<string, any> = {}) {
+  // State "DB" yang hidup antar panggilan dalam satu test — meniru baris
+  // paymentTransaction yang berubah oleh updateMany kondisional.
+  const state: any = { ...payment };
   return {
     paymentTransaction: {
-      findUnique: jest.fn(async () => payment),
-      findFirst: jest.fn(async () => payment),
+      findUnique: jest.fn(async () => ({ ...state })),
+      findFirst: jest.fn(async () => ({ ...state })),
       update: jest.fn(async () => ({})),
+      // SEC-103: semantik kondisional seperti Prisma asli — increment hanya
+      // bila refundedAmount masih sama dengan where; count=0 berarti kalah race.
+      updateMany: jest.fn(async (args: any) => {
+        if (args.where?.refundedAmount !== undefined && state.refundedAmount !== args.where.refundedAmount) {
+          return { count: 0 };
+        }
+        const inc: bigint = args.data?.refundedAmount?.increment ?? BigInt(0);
+        state.refundedAmount = (state.refundedAmount ?? BigInt(0)) + inc;
+        const { refundedAmount: _drop, ...rest } = args.data ?? {};
+        Object.assign(state, rest, { refundedAmount: state.refundedAmount });
+        return { count: 1 };
+      }),
     },
     danaRefundAttempt: {
       create: jest.fn(async (args: any) => {
@@ -96,10 +111,14 @@ describe('DanaDirectRefundService (refundAmount kanonis)', () => {
         reason: 'Cancel sebelum kirim',
       }),
     );
-    // payment ditandai REFUNDED + refundedAmount penuh
-    expect(prisma.paymentTransaction.update).toHaveBeenCalledWith(
+    // payment ditandai REFUNDED via klaim kondisional (increment, bukan overwrite dari snapshot basi)
+    expect(prisma.paymentTransaction.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ status: PaymentStatus.REFUNDED, refundedAmount: BigInt(1510500) }),
+        where: expect.objectContaining({ id: 'pt-1', refundedAmount: BigInt(0) }),
+        data: expect.objectContaining({
+          status: PaymentStatus.REFUNDED,
+          refundedAmount: { increment: BigInt(1510500) },
+        }),
       }),
     );
     // attempt ditandai SUCCESS
@@ -124,13 +143,14 @@ describe('DanaDirectRefundService (refundAmount kanonis)', () => {
     expect(danaPayment.refundOrder).toHaveBeenCalledWith(
       expect.objectContaining({ amountIdr: 5000 }),
     );
-    expect(prisma.paymentTransaction.update).toHaveBeenCalledWith(
+    expect(prisma.paymentTransaction.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ refundedAmount: BigInt(500000) }),
+        where: expect.objectContaining({ refundedAmount: BigInt(0) }),
+        data: expect.objectContaining({ refundedAmount: { increment: BigInt(500000) } }),
       }),
     );
     // status TIDAK jadi REFUNDED untuk parsial
-    const updateData = (prisma.paymentTransaction.update as jest.Mock).mock.calls[0][0].data;
+    const updateData = (prisma.paymentTransaction.updateMany as jest.Mock).mock.calls[0][0].data;
     expect(updateData.status).toBeUndefined();
   });
 
@@ -186,6 +206,51 @@ describe('DanaDirectRefundService (refundAmount kanonis)', () => {
     const svc = new DanaDirectRefundService(prisma as never, danaPayment as never);
     expect(await svc.refundOrderEscrow('order-db-x', 'auto-cancel')).toBe(false);
     expect(danaPayment.refundOrder).not.toHaveBeenCalled();
+  });
+
+  describe('SEC-103: refund konkuren dengan key berbeda (anti over-refund)', () => {
+    it('dua refund konkuren — total refundedAmount benar (increment), bukan overwrite penulis-terakhir', async () => {
+      const prisma = buildPrisma({ ...danaSuccessPayment });
+      danaPayment.refundOrder.mockResolvedValue({ partnerRefundNo: 'x', referenceNo: 'DANA-R', status: 'SUCCESS' });
+      const svc = new DanaDirectRefundService(prisma as never, danaPayment as never);
+
+      const [r1, r2] = await Promise.all([
+        svc.refundAmount({ paymentDbId: 'pt-1', amountSen: BigInt(500000), reason: 'retur', idempotencyKey: 'RETURN:r-1' }),
+        svc.refundAmount({ paymentDbId: 'pt-1', amountSen: BigInt(400000), reason: 'dispute', idempotencyKey: 'DISPUTE:d-1:BUYER' }),
+      ]);
+
+      expect(r1.refunded).toBe(true);
+      expect(r2.refunded).toBe(true);
+      // Semua pencatatan memakai increment kondisional — tidak ada overwrite.
+      const calls = (prisma.paymentTransaction.updateMany as jest.Mock).mock.calls;
+      expect(calls.length).toBeGreaterThanOrEqual(2);
+      for (const c of calls) {
+        expect(c[0].data.refundedAmount).toEqual({ increment: expect.any(BigInt) });
+      }
+      // Total TEPAT 900000 — pola overwrite lama akan mencatat 500000 atau 400000.
+      const finalState = await (prisma.paymentTransaction.findUnique as jest.Mock)();
+      expect(finalState.refundedAmount).toBe(BigInt(900000));
+    });
+
+    it('over-refund konkuren diblokir: total melebihi gross → OVER_REFUND_BLOCKED, DB tidak over-record', async () => {
+      const prisma = buildPrisma({ ...danaSuccessPayment, grossAmount: BigInt(1000000), refundedAmount: BigInt(0) });
+      danaPayment.refundOrder.mockResolvedValue({ partnerRefundNo: 'x', referenceNo: 'DANA-R', status: 'SUCCESS' });
+      const svc = new DanaDirectRefundService(prisma as never, danaPayment as never);
+
+      const [r1, r2] = await Promise.allSettled([
+        svc.refundAmount({ paymentDbId: 'pt-1', amountSen: BigInt(700000), reason: 'a', idempotencyKey: 'K:A' }),
+        svc.refundAmount({ paymentDbId: 'pt-1', amountSen: BigInt(700000), reason: 'b', idempotencyKey: 'K:B' }),
+      ]);
+
+      const fulfilled = [r1, r2].filter((r) => r.status === 'fulfilled');
+      const rejected = [r1, r2].filter((r) => r.status === 'rejected');
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect((rejected[0] as PromiseRejectedResult).reason.message).toMatch(/OVER_REFUND_BLOCKED/);
+      // DB mencatat hanya 700000 — tidak pernah overwrite menjadi 1400000.
+      const finalState = await (prisma.paymentTransaction.findUnique as jest.Mock)();
+      expect(finalState.refundedAmount).toBe(BigInt(700000));
+    });
   });
 
   describe('P1: partnerRefundNo deterministik (anti double-refund)', () => {

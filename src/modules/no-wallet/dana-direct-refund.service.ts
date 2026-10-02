@@ -223,20 +223,54 @@ export class DanaDirectRefundService {
         where: { id: attempt.id },
         data: { status: 'SUCCESS', danaReferenceNo: result.referenceNo || undefined },
       });
-      const newRefunded = alreadyRefunded + amountSen;
-      const fullyRefunded = newRefunded >= payment.grossAmount;
-      await this.prisma.paymentTransaction.update({
-        where: { id: payment.id },
-        data: {
-          refundedAmount: newRefunded,
-          refundRequestedAt: new Date(),
-          refundReference: partnerRefundNo,
-          refundReason: reason.slice(0, 500),
-          ...(fullyRefunded
-            ? { status: PaymentStatus.REFUNDED, danaReferenceNo: result.referenceNo || undefined }
-            : {}),
-        },
-      });
+      const fullyRefunded = alreadyRefunded + amountSen >= payment.grossAmount;
+      // SEC-103: JANGAN overwrite refundedAmount dari snapshot basi — klaim
+      // kondisional (refundedAmount masih = nilai yang kita baca). Dua refund
+      // konkuren dengan key berbeda tidak bisa saling menimpa angka.
+      const finalizePayment = (baseRefunded: bigint) =>
+        this.prisma.paymentTransaction.updateMany({
+          where: { id: payment.id, refundedAmount: baseRefunded },
+          data: {
+            refundedAmount: { increment: amountSen },
+            refundRequestedAt: new Date(),
+            refundReference: partnerRefundNo,
+            refundReason: reason.slice(0, 500),
+            ...(baseRefunded + amountSen >= payment.grossAmount
+              ? { status: PaymentStatus.REFUNDED, danaReferenceNo: result.referenceNo || undefined }
+              : {}),
+          },
+        });
+      let finalized = await finalizePayment(alreadyRefunded);
+      if (finalized.count === 0) {
+        // Race: baris berubah di tengah jalan — baca ulang, hitung ulang
+        // remaining (fail-closed). Refund DANA untuk attempt ini SUDAH jalan
+        // (uang keluar), jadi pencatatan harus mengejar nilai fresh.
+        const fresh = await this.prisma.paymentTransaction.findUnique({
+          where: { id: payment.id },
+          select: { refundedAmount: true, grossAmount: true },
+        });
+        const freshRefunded = fresh?.refundedAmount ?? BigInt(0);
+        const freshRemaining = (fresh?.grossAmount ?? payment.grossAmount) - freshRefunded;
+        if (freshRemaining < amountSen) {
+          this.logger.error(
+            `SEC-103 OVER_REFUND_BLOCKED: payment=${paymentDbId} amountSen=${amountSen} ` +
+              `freshRemaining=${freshRemaining} — total refund konkuren melebihi gross; ` +
+              `refund DANA ${partnerRefundNo} sudah dieksekusi, BUTUH rekonsiliasi manual`,
+          );
+          throw new Error(
+            'OVER_REFUND_BLOCKED: refund konkuren melebihi sisa pembayaran — diblokir, butuh rekonsiliasi manual',
+          );
+        }
+        finalized = await finalizePayment(freshRefunded);
+        if (finalized.count === 0) {
+          this.logger.error(
+            `SEC-103 OVER_REFUND_BLOCKED: payment=${paymentDbId} — gagal mencatat refund ${partnerRefundNo} setelah baca ulang; BUTUH rekonsiliasi manual`,
+          );
+          throw new Error(
+            'OVER_REFUND_BLOCKED: gagal mencatat refund setelah baca ulang — butuh rekonsiliasi manual',
+          );
+        }
+      }
       this.logger.log(
         `DANA refund sukses: payment=${paymentDbId} refundNo=${partnerRefundNo} amountSen=${amountSen} full=${fullyRefunded}`,
       );

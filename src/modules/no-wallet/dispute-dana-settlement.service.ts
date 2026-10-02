@@ -22,6 +22,17 @@ export interface DisputeNoWalletSettlementResult {
   sellerDisbursement: ReleaseResult | null;
 }
 
+export interface ClaimAndSettleIntentInput {
+  /** DB id dispute (unik di dispute_settlement_intents). */
+  disputeId: string;
+  /** DB id order. */
+  orderDbId: string;
+  decision: 'FULL_BUYER' | 'FULL_SELLER' | 'SPLIT';
+  buyerAmountSen: bigint;
+  sellerAmountSen: bigint;
+  reason: string;
+}
+
 /**
  * Eksekusi finansial putusan sengketa TANPA menyentuh wallet internal
  * (mode BI-safe, misi tanpa-wallet).
@@ -93,6 +104,14 @@ export class DisputeDanaSettlementService {
         reason: input.reason,
         idempotencyKey: `DISPUTE:${input.disputeDbId}:BUYER`,
       });
+      // SEC-104(a): porsi buyer GAGAL (mis. NOT_ELIGIBLE) → THROW, jangan
+      // lanjut diam-diam ke porsi seller — porsi buyer akan hilang tanpa jejak.
+      if (!res.refunded) {
+        throw new BadRequestException({
+          code: 'DISPUTE_BUYER_REFUND_FAILED',
+          message: `Refund porsi buyer gagal (${res.reason}) — settlement dibatalkan (fail-closed), porsi seller TIDAK dicairkan`,
+        });
+      }
       buyerRefunded = res.refunded;
       buyerRefundAlready = 'already' in res ? (res.already ?? false) : false;
       this.logger.log(
@@ -118,5 +137,60 @@ export class DisputeDanaSettlementService {
     }
 
     return { buyerRefunded, buyerRefundAlready, sellerDisbursement };
+  }
+
+  /**
+   * SEC-104: eksekusi settlement dari baris intent yang durable
+   * (`dispute_settlement_intents`, dibuat DI DALAM tx putusan).
+   *
+   * - Klaim atomik PENDING/FAILED → CLAIMED: hanya SATU eksekutor yang menang
+   *   (post-commit accept + cron sweep boleh berlomba; yang kalah skip).
+   * - Sukses → intent DONE. Gagal → intent FAILED + lastError, lalu RETHROW
+   *   (fail-closed; cron `dispute-settlement-sweep` retry sampai batas attempt).
+   * - Kalah klaim → return null (bukan error).
+   */
+  async claimAndSettleIntent(
+    input: ClaimAndSettleIntentInput,
+  ): Promise<DisputeNoWalletSettlementResult | null> {
+    const claimed = await this.prisma.disputeSettlementIntent.updateMany({
+      where: { disputeId: input.disputeId, status: { in: ['PENDING', 'FAILED'] } },
+      data: { status: 'CLAIMED', claimedAt: new Date(), attemptCount: { increment: 1 } },
+    });
+    if (claimed.count !== 1) {
+      this.logger.warn(
+        `Dispute settlement intent ${input.disputeId} sudah diklaim/done pihak lain — skip`,
+      );
+      return null;
+    }
+    try {
+      const result = await this.settleDisputeNoWallet({
+        orderDbId: input.orderDbId,
+        disputeDbId: input.disputeId,
+        decision: input.decision,
+        buyerAmountSen: input.buyerAmountSen,
+        sellerAmountSen: input.sellerAmountSen,
+        reason: input.reason,
+      });
+      await this.prisma.disputeSettlementIntent.update({
+        where: { disputeId: input.disputeId },
+        data: { status: 'DONE', doneAt: new Date(), lastError: null },
+      });
+      return result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await this.prisma.disputeSettlementIntent
+        .update({
+          where: { disputeId: input.disputeId },
+          data: { status: 'FAILED', lastError: msg.slice(0, 2000) },
+        })
+        .catch((markError: unknown) =>
+          this.logger.error(
+            `Gagal menandai settlement intent FAILED ${input.disputeId}: ${
+              markError instanceof Error ? markError.message : String(markError)
+            }`,
+          ),
+        );
+      throw err;
+    }
   }
 }

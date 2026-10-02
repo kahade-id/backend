@@ -75,6 +75,23 @@ describe('DisputeDanaSettlementService (M3 no-wallet)', () => {
     expect(escrowDisbursementService.releaseFunds).toHaveBeenCalledTimes(1);
   });
 
+  it('SEC-104(a): refund buyer GAGAL → THROW (jangan lanjut diam-diam ke porsi seller)', async () => {
+    const { svc, prisma, danaDirectRefundService, escrowDisbursementService } = build();
+    mockPreCompletion(prisma);
+    // DANA Refund API tidak berhasil (mis. NOT_ELIGIBLE) — bukan {refunded:true}.
+    danaDirectRefundService.refundAmount.mockResolvedValue({ refunded: false, already: false, reason: 'NOT_ELIGIBLE' });
+
+    let code: string | undefined;
+    try {
+      await svc.settleDisputeNoWallet(baseInput);
+    } catch (e) {
+      code = (e as { response?: { code?: string } }).response?.code;
+    }
+    expect(code).toBe('DISPUTE_BUYER_REFUND_FAILED');
+    // Porsi seller TIDAK BOLEH dicairkan diam-diam saat refund buyer gagal.
+    expect(escrowDisbursementService.releaseFunds).not.toHaveBeenCalled();
+  });
+
   it('pasca-completion → fail-closed DISPUTE_POST_COMPLETION_MANUAL_REVIEW', async () => {
     const { svc, prisma, danaDirectRefundService, escrowDisbursementService } = build();
     prisma.order.findUnique.mockResolvedValue({ id: 'order-1', sellerId: 'seller-1', completedAt: new Date() });

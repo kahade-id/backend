@@ -17,10 +17,18 @@ function escapeHtml(value: unknown): string {
     .replace(/'/g, '&#39;');
 }
 
-function appSchemeUrl(path: string): string {
+/**
+ * SYS-C-401: di-export agar bisa di-assert test kontrak — setiap path yang
+ * dihasilkan HARUS resolve ke route expo-router FE yang ada.
+ */
+export function appSchemeUrl(path: string): string {
   // FX-001 (audit Discovery 2026-09-26): scheme HARUS "kahade" — sesuai
   // yang didaftarkan di frontend/app.json ("scheme": "kahade").
   // "kahade-frontend" tidak terdaftar sehingga deep link tidak membuka aplikasi.
+  // SYS-C-401 (audit sistemik ronde 3, 2026-10-03): path HARUS rute FE penuh
+  // (user/<u>, order-link/<t>, order/<id>, notification/<id>, verify-email) —
+  // head pendek (u/, o-l/, o/, n/, email-verified) tidak punya padanan route
+  // expo-router di FE dan jatuh ke +not-found.
   return `kahade://${path.replace(/^\/+/, '')}`;
 }
 
@@ -74,7 +82,7 @@ export class DeepLinksController {
   ): Promise<void> {
     const safeUsername = String(username ?? '').trim().toLowerCase();
     if (!USERNAME_RE.test(safeUsername)) {
-      response.status(404).send(page({ title: 'Profil tidak ditemukan', description: 'Profil publik Kahade tidak tersedia.', appUrl: appSchemeUrl('u/invalid'), detail: 'Username pada tautan tidak valid.' }));
+      response.status(404).send(page({ title: 'Profil tidak ditemukan', description: 'Profil publik Kahade tidak tersedia.', appUrl: appSchemeUrl('user/invalid'), detail: 'Username pada tautan tidak valid.' }));
       return;
     }
     let detail = `Profil publik @${safeUsername}`;
@@ -98,7 +106,7 @@ export class DeepLinksController {
       // "profil private", "akun dihapus", dan "kamu diblokir" dari responsnya.
       detail = `Profil @${safeUsername} belum dapat dimuat. Buka aplikasi untuk melihat status terbaru.`;
     }
-    response.status(200).send(page({ title, description: 'Profil publik Kahade.', appUrl: appSchemeUrl(`u/${encodeURIComponent(safeUsername)}`), detail }));
+    response.status(200).send(page({ title, description: 'Profil publik Kahade.', appUrl: appSchemeUrl(`user/${encodeURIComponent(safeUsername)}`), detail }));
   }
 
   @Public()
@@ -119,7 +127,7 @@ export class DeepLinksController {
   async orderLink(@Param('token') token: string, @Res() response: Response): Promise<void> {
     const safeToken = String(token ?? '').trim();
     if (!PUBLIC_ID_RE.test(safeToken)) {
-      response.status(404).send(page({ title: 'Tautan tidak ditemukan', description: 'Tautan transaksi Kahade tidak tersedia.', appUrl: appSchemeUrl('o-l/invalid'), detail: 'Token tautan tidak valid.' }));
+      response.status(404).send(page({ title: 'Tautan tidak ditemukan', description: 'Tautan transaksi Kahade tidak tersedia.', appUrl: appSchemeUrl('order-link/invalid'), detail: 'Token tautan tidak valid.' }));
       return;
     }
     let title = 'Tautan transaksi Kahade';
@@ -132,7 +140,7 @@ export class DeepLinksController {
     } catch {
       detail = 'Tautan ini mungkin sudah kedaluwarsa, dibatalkan, atau sudah digunakan. Buka aplikasi untuk mendapatkan status terbaru.';
     }
-    response.status(200).send(page({ title, description: 'Tautan transaksi escrow Kahade.', appUrl: appSchemeUrl(`o-l/${encodeURIComponent(safeToken)}`), detail }));
+    response.status(200).send(page({ title, description: 'Tautan transaksi escrow Kahade.', appUrl: appSchemeUrl(`order-link/${encodeURIComponent(safeToken)}`), detail }));
   }
 
   // Section 3: halaman share untuk item showcase (konten sosial).
@@ -182,10 +190,10 @@ export class DeepLinksController {
   order(@Param('orderId') orderId: string, @Res() response: Response): void {
     const safeId = String(orderId ?? '').trim();
     if (!PUBLIC_ID_RE.test(safeId)) {
-      response.status(404).send(page({ title: 'Transaksi tidak ditemukan', description: 'Detail transaksi Kahade tidak tersedia.', appUrl: appSchemeUrl('o/invalid'), detail: 'ID transaksi tidak valid.' }));
+      response.status(404).send(page({ title: 'Transaksi tidak ditemukan', description: 'Detail transaksi Kahade tidak tersedia.', appUrl: appSchemeUrl('order/invalid'), detail: 'ID transaksi tidak valid.' }));
       return;
     }
-    response.status(200).send(page({ title: 'Detail transaksi Kahade', description: 'Detail transaksi hanya dapat dibuka setelah autentikasi.', appUrl: appSchemeUrl(`o/${encodeURIComponent(safeId)}`), detail: `ID transaksi: ${safeId}\nMasuk ke aplikasi untuk melihat status, pihak buyer/seller, escrow, delivery proof, dan dispute.` }));
+    response.status(200).send(page({ title: 'Detail transaksi Kahade', description: 'Detail transaksi hanya dapat dibuka setelah autentikasi.', appUrl: appSchemeUrl(`order/${encodeURIComponent(safeId)}`), detail: `ID transaksi: ${safeId}\nMasuk ke aplikasi untuk melihat status, pihak buyer/seller, escrow, delivery proof, dan dispute.` }));
   }
 
   @Public()
@@ -195,9 +203,9 @@ export class DeepLinksController {
   notification(@Param('notificationId') notificationId: string, @Res() response: Response): void {
     const safeId = String(notificationId ?? '').trim();
     if (!PUBLIC_ID_RE.test(safeId)) {
-      response.status(404).send(page({ title: 'Notifikasi tidak ditemukan', description: 'Notifikasi Kahade tidak tersedia.', appUrl: appSchemeUrl('n/invalid'), detail: 'ID notifikasi tidak valid.' }));
+      response.status(404).send(page({ title: 'Notifikasi tidak ditemukan', description: 'Notifikasi Kahade tidak tersedia.', appUrl: appSchemeUrl('notification/invalid'), detail: 'ID notifikasi tidak valid.' }));
       return;
     }
-    response.status(200).send(page({ title: 'Notifikasi Kahade', description: 'Notifikasi akan dibuka di aplikasi Kahade setelah autentikasi.', appUrl: appSchemeUrl(`n/${encodeURIComponent(safeId)}`), detail: `ID notifikasi: ${safeId}` }));
+    response.status(200).send(page({ title: 'Notifikasi Kahade', description: 'Notifikasi akan dibuka di aplikasi Kahade setelah autentikasi.', appUrl: appSchemeUrl(`notification/${encodeURIComponent(safeId)}`), detail: `ID notifikasi: ${safeId}` }));
   }
 }

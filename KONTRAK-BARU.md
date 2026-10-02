@@ -20,9 +20,12 @@ Body: { "password": "string", "action": "string", "targetId?": "string" }
 - Pemakaian: header `X-Step-Up-Token: <token>` pada endpoint yang mewajibkan.
 - Validasi gagal → `403 STEP_UP_REQUIRED | STEP_UP_INVALID | STEP_UP_EXPIRED | STEP_UP_MISMATCH`.
 - Contoh `action`: `dispute.resolve`, `insurance.review`, `insurance.pay`, `withdrawal.approve`,
-  `withdrawal.reject`, `wallet.adjust`, `commerce.refund`, `order.cancelUnshipped`, `order.forceCancel`,
-  `order.forceComplete`, `disbursement.reopen`, `admin.reset2fa`, `admin.resetPassword`,
+  `withdrawal.reject`, `wallet.adjust`, `commerce.refund`,
+  `disbursement.reopen`, `admin.reset2fa`, `admin.resetPassword`,
   `admin.delete`, `admin.unlock`, `opsSetting.update`.
+  (CATATAN: `order.cancelUnshipped`, `order.forceCancel`, `order.forceComplete`
+  TIDAK memakai step-up token — ketiganya memakai `ForceActionWithReauthDto`
+  (password di body, verifikasi server-side), lihat §8.)
 
 Endpoint yang kini WAJIB step-up (tanpa token → 403):
 dispute resolve, insurance claim review (APPROVED/REJECTED/PAID), withdrawal approve/reject,

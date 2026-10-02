@@ -10,6 +10,8 @@ import { DisputeDanaSettlementService, DisputeNoWalletSettlementResult } from '.
 import { FeeCalculatorService } from '../orders/fee-calculator.service';
 import { generateWalletTxId, generateNotifId } from '../../common/utils/id-generator.util';
 import { getCategoryForType } from '../notifications/notification-category.map';
+// SYS-C-105: copy notifikasi mengikuti bahasa preferensi penerima.
+import { renderNotificationCopy, resolveNotificationLanguage } from '../notifications/notification-copy.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
 
 const MAX_RETRIES = 3;
@@ -111,17 +113,29 @@ export class MutualResolutionService {
      * demoted to the codebase's `silent-catch` idiom — the notification is best-effort, the
      * proposal is not.
      */
-    this.runPostCommitBestEffort(() => this.prisma.notification.create({
-      data: {
-        notifId: generateNotifId(),
-        userId: counterpartId,
-        type: NotificationType.DISPUTE_SUBMITTED,
-        category: getCategoryForType(NotificationType.DISPUTE_SUBMITTED),
-        title: 'Mutual Resolution Proposed',
-        body: `${proposerLabel} proposed a mutual resolution for order "${dispute.order.title || dispute.order.orderId}": ${dto.buyerPercent}% buyer / ${dto.sellerPercent}% seller.`,
-        isRead: false,
-      },
-    }), 'PROPOSE_MUTUAL_RESOLUTION_NOTIFICATION');
+    this.runPostCommitBestEffort(async () => {
+      // SYS-C-105: copy mengikuti bahasa preferensi penerima.
+      const disputeCopy = renderNotificationCopy(
+        NotificationType.DISPUTE_SUBMITTED,
+        await resolveNotificationLanguage(this.prisma, counterpartId),
+        {
+          proposer: proposerLabel,
+          orderTitle: dispute.order.title || dispute.order.orderId,
+          detail: ` ${dto.buyerPercent}% buyer / ${dto.sellerPercent}% seller.`,
+        },
+      );
+      await this.prisma.notification.create({
+        data: {
+          notifId: generateNotifId(),
+          userId: counterpartId,
+          type: NotificationType.DISPUTE_SUBMITTED,
+          category: getCategoryForType(NotificationType.DISPUTE_SUBMITTED),
+          title: disputeCopy.title,
+          body: disputeCopy.body,
+          isRead: false,
+        },
+      });
+    }, 'PROPOSE_MUTUAL_RESOLUTION_NOTIFICATION');
     this.runRealtimeBestEffort(() => this.prisma.emitNotificationCreated({
       userId: counterpartId,
       title: 'Mutual Resolution Proposed',

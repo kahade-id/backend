@@ -58,10 +58,10 @@ export class CreateOrderLinkDto {
   @IsEnum(FeeResponsibility)
   feeResponsibility!: FeeResponsibility;
 
-  @ApiPropertyOptional({ maxLength: 50 })
+  @ApiPropertyOptional({ maxLength: 30 })
   @IsOptional()
   @IsString()
-  @MaxLength(50)
+  @MaxLength(30)
   counterpartUsername?: string;
 
   @ApiPropertyOptional({

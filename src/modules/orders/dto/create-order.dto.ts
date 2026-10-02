@@ -66,10 +66,10 @@ export class CreateOrderDto {
   @IsEnum(['BUYER', 'SELLER'], { message: 'role must be BUYER or SELLER' })
   role!: 'BUYER' | 'SELLER';
 
-  @ApiProperty({ description: 'Username of the counterpart', minLength: 3, maxLength: 50 })
+  @ApiProperty({ description: 'Username of the counterpart', minLength: 3, maxLength: 30 })
   @IsString()
   @MinLength(3)
-  @MaxLength(50)
+  @MaxLength(30)
   counterpartUsername!: string;
 
   @ApiProperty({ description: 'Order title', minLength: 3, maxLength: 100 })

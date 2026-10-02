@@ -7,6 +7,7 @@ import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial
 import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
+import { DanaPaymentService } from '../../payment/dana/dana-payment.service';
 import { ScheduledWithdrawalService } from '../../withdrawals/scheduled-withdrawal.service';
 import { ReconciliationService } from '../../admin/finance/reconciliation.service';
 import { MidtransService } from '../../payment/midtrans.service';
@@ -200,7 +201,11 @@ describe('Scheduler services smoke', () => {
   });
 
   it('ExpireUnpaidOrdersService — defined + skip', async () => {
-    const svc = await build<ExpireUnpaidOrdersService>(ExpireUnpaidOrdersService);
+    // SYS-B-305: DanaPaymentService kini di-inject (bukan @Optional) —
+    // sediakan mock di modul uji.
+    const svc = await build<ExpireUnpaidOrdersService>(ExpireUnpaidOrdersService, [
+      { provide: DanaPaymentService, useValue: { cancelOrder: jest.fn() } },
+    ]);
     expect(svc).toBeDefined();
     await expect(svc.expireUnpaidOrders()).resolves.toBeUndefined();
   });

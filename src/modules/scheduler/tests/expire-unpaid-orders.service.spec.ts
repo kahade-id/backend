@@ -25,7 +25,7 @@ describe('ExpireUnpaidOrdersService — distributed lock', () => {
     redis.setNx.mockResolvedValue(true);
     redis.releaseLock.mockResolvedValue(true);
     redis.renewLock.mockResolvedValue(true);
-    service = new ExpireUnpaidOrdersService(prisma as never, redis as never);
+    service = new ExpireUnpaidOrdersService(prisma as never, redis as never, { cancelOrder: jest.fn() } as never);
   });
 
   it('renews the lock while a batch query is still running', async () => {

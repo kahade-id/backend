@@ -20,7 +20,7 @@ describe('AdminSystemService webhook dead-letter actions', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.webhookLog.updateMany.mockResolvedValue({ count: 1 });
-    service = new AdminSystemService(prisma as never, redis as never, auditLogService as never, { enqueueMany: jest.fn() } as never);
+    service = new AdminSystemService(prisma as never, redis as never, auditLogService as never, { enqueueMany: jest.fn() } as never, { registerExecutor: jest.fn(), findPendingByActionTarget: jest.fn(), propose: jest.fn(), approve: jest.fn(), listPending: jest.fn() } as never);
   });
 
   it('requeues an unprocessed dead-letter event and resets the retry budget', async () => {

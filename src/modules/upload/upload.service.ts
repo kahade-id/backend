@@ -116,7 +116,7 @@ const CONFIRMED_KEY_TTL_SECONDS = 86_400;
 // This matters for container formats (RIFF/WEBP, ISO-BMFF) where checking only
 // the inner brand at a non-zero offset would let an attacker prepend arbitrary
 // bytes (e.g. an HTML/JS polyglot) and still be classified as an image.
-const MAGIC_BYTES: { mime: string; runs: { offset: number; bytes: number[] }[] }[] = [
+const MAGIC_BYTES: { mime: string; runs: { offset: number; bytes: number[] }[]; validate?: (header: Buffer) => boolean }[] = [
   { mime: 'image/jpeg', runs: [{ offset: 0, bytes: [0xFF, 0xD8, 0xFF] }] },
   { mime: 'image/png', runs: [{ offset: 0, bytes: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] }] },
   // B-38 (audit-fix): WEBP is a RIFF container — the 'RIFF' tag at offset 0 was
@@ -132,37 +132,84 @@ const MAGIC_BYTES: { mime: string; runs: { offset: number; bytes: number[] }[] }
   { mime: 'application/pdf', runs: [{ offset: 0, bytes: [0x25, 0x50, 0x44, 0x46] }] },
   // ISO BMFF "ftyp" container variants: HEIC, HEIF, AVIF.
   // Bytes 4..7 == 'ftyp', bytes 8..11 carry the brand.
-  { mime: 'image/heic', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63] }] }, // ftypheic
-  { mime: 'image/heic', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x78] }] }, // ftypheix
-  { mime: 'image/heif', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x69, 0x66, 0x31] }] }, // ftypmif1
-  { mime: 'image/heif', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x73, 0x66, 0x31] }] }, // ftypmsf1
-  { mime: 'image/avif', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66] }] }, // ftypavif
-  { mime: 'image/avif', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x73] }] }, // ftypavis
+  // UPFV-04 (defense-in-depth): setiap entri ftyp juga memvalidasi 4 byte
+  // pertama sebagai box-size yang waras (konsisten dengan threat model
+  // anchoring B-38 untuk WebP) — lihat `isSaneFtypBoxSize`.
+  { mime: 'image/heic', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63] }], validate: isSaneFtypBoxSize }, // ftypheic
+  { mime: 'image/heic', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x78] }], validate: isSaneFtypBoxSize }, // ftypheix
+  { mime: 'image/heif', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x69, 0x66, 0x31] }], validate: isSaneFtypBoxSize }, // ftypmif1
+  { mime: 'image/heif', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x73, 0x66, 0x31] }], validate: isSaneFtypBoxSize }, // ftypmsf1
+  { mime: 'image/avif', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66] }], validate: isSaneFtypBoxSize }, // ftypavif
+  { mime: 'image/avif', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x73] }], validate: isSaneFtypBoxSize }, // ftypavis
   // Batch 19 TIM A (item 1): magic-byte video untuk purpose SHOWCASE_VIDEO.
   // ISO-BMFF "ftyp" + brand spesifik (offset 8..11) — HARUS setelah entri
   // heic/heif/avif di atas supaya brand-brand itu tidak salah terdeteksi mp4.
-  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x6D] }] }, // ftypisom
-  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x32] }] }, // ftypiso2
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x6D] }], validate: isSaneFtypBoxSize }, // ftypisom
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x32] }], validate: isSaneFtypBoxSize }, // ftypiso2
   // UMD-006: perlebar brand ftyp MP4 yang diterima — brand MP4 valid lain
   // (iso3/iso4/iso5/iso6 dari encoder modern, "M4V " uppercase ala Apple)
   // sebelumnya ditolak MIME_TYPE_MISMATCH padahal isi benar-benar MP4.
-  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x33] }] }, // ftypiso3
-  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x34] }] }, // ftypiso4
-  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x35] }] }, // ftypiso5
-  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x36] }] }, // ftypiso6
-  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x4D, 0x34, 0x56, 0x20] }] }, // ftypM4V␣ (uppercase)
-  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x70, 0x34, 0x31] }] }, // ftypmp41
-  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x70, 0x34, 0x32] }] }, // ftypmp42
-  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x63, 0x31] }] }, // ftypavc1
-  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x34, 0x76, 0x20] }] }, // ftypm4v␣
-  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x64, 0x61, 0x73, 0x68] }] }, // ftypdash
-  { mime: 'video/quicktime', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x71, 0x74, 0x20, 0x20] }] }, // ftypqt␣␣
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x33] }], validate: isSaneFtypBoxSize }, // ftypiso3
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x34] }], validate: isSaneFtypBoxSize }, // ftypiso4
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x35] }], validate: isSaneFtypBoxSize }, // ftypiso5
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x36] }], validate: isSaneFtypBoxSize }, // ftypiso6
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x4D, 0x34, 0x56, 0x20] }], validate: isSaneFtypBoxSize }, // ftypM4V␣ (uppercase)
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x70, 0x34, 0x31] }], validate: isSaneFtypBoxSize }, // ftypmp41
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x70, 0x34, 0x32] }], validate: isSaneFtypBoxSize }, // ftypmp42
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x63, 0x31] }], validate: isSaneFtypBoxSize }, // ftypavc1
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x6D, 0x34, 0x76, 0x20] }], validate: isSaneFtypBoxSize }, // ftypm4v␣
+  { mime: 'video/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x64, 0x61, 0x73, 0x68] }], validate: isSaneFtypBoxSize }, // ftypdash
+  { mime: 'video/quicktime', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x71, 0x74, 0x20, 0x20] }], validate: isSaneFtypBoxSize }, // ftypqt␣␣
   // WebM = EBML header (0x1A45DFA3). MKV juga EBML — dibedakan tidak di sini;
   // keduanya container video aman (ekstensi hasil mapping = .webm).
   { mime: 'video/webm', runs: [{ offset: 0, bytes: [0x1A, 0x45, 0xDF, 0xA3] }] },
+  // UPFV-01 (audit-fix): signature audio — sebelumnya MAGIC_BYTES tidak punya
+  // satu pun signature audio sehingga SEMUA audio (mp3/wav/ogg/m4a) ditolak
+  // MIME_TYPE_MISMATCH walau ada di whitelist. Voice note & lampiran audio
+  // mati total.
+  // mp3: tag ID3v2 ("ID3") atau frame sync MPEG-1 Layer 3 (0xFF 0xFB).
+  { mime: 'audio/mpeg', runs: [{ offset: 0, bytes: [0x49, 0x44, 0x33] }] }, // ID3
+  { mime: 'audio/mpeg', runs: [{ offset: 0, bytes: [0xFF, 0xFB] }] }, // frame sync
+  // wav: container RIFF — anchor ganda seperti WebP (B-38): 'RIFF' di offset
+  // 0 dan 'WAVE' di offset 8.
+  {
+    mime: 'audio/wav',
+    runs: [
+      { offset: 0, bytes: [0x52, 0x49, 0x46, 0x46] }, // 'RIFF'
+      { offset: 8, bytes: [0x57, 0x41, 0x56, 0x45] }, // 'WAVE'
+    ],
+  },
+  // ogg: "OggS" di offset 0.
+  { mime: 'audio/ogg', runs: [{ offset: 0, bytes: [0x4F, 0x67, 0x67, 0x53] }] }, // OggS
+  // m4a: ISO-BMFF "ftyp" + brand "M4A " → dideteksi `audio/mp4`, konsisten
+  // dengan konvensi server `.m4a ↔ audio/mp4` (DETECTED_MIME_TO_EXTENSION).
+  // Ditempatkan SETELAH entri video/mp4 di atas (brand berbeda, tidak konflik).
+  { mime: 'audio/mp4', runs: [{ offset: 4, bytes: [0x66, 0x74, 0x79, 0x70, 0x4D, 0x34, 0x41, 0x20] }], validate: isSaneFtypBoxSize }, // ftypM4A␣
 ];
 
 const MIME_HEADER_BYTES = 32;
+
+/**
+ * UPFV-04 (defense-in-depth): validasi 4 byte pertama entri ISO-BMFF "ftyp"
+ * sebagai box-size yang waras — pasangan dari anchoring B-38 (WebP) untuk
+ * threat model yang sama (byte arbitrer yang di-prepend, mis. polyglot
+ * HTML/JS, tidak boleh tetap terklasifikasi sebagai container media).
+ *
+ * 4 byte pertama box ISO-BMFF = ukuran box (uint32 big-endian). ftyp yang
+ * valid berukuran minimal 8 (header box); box ftyp asli hanya berisi daftar
+ * brand sehingga tidak pernah besar — batas atas 4096 longgar untuk encoder
+ * eksotis tapi menyingkirkan sampah (0, 1/"largesize", 0xFFFFFFFF, atau teks
+ * arbitrer seperti `<htm…` yang ter-decode > 4096).
+ *
+ * Penilaian jujur: ini hardening, bukan penutup lubang aktif — exploitability
+ * praktis tetap rendah karena ekstensi tersimpan diturunkan dari MIME
+ * terdeteksi (SH-S-001) dan file diserve dengan `nosniff`.
+ */
+function isSaneFtypBoxSize(header: Buffer): boolean {
+  if (header.length < 4) return false;
+  const size = header.readUInt32BE(0);
+  return size >= 8 && size <= 4096;
+}
 
 function detectMimeFromBytes(header: Buffer): string | null {
   for (const sig of MAGIC_BYTES) {
@@ -173,10 +220,13 @@ function detectMimeFromBytes(header: Buffer): string | null {
       }
       return true;
     });
-    if (allRunsMatch) return sig.mime;
+    if (allRunsMatch && (!sig.validate || sig.validate(header))) return sig.mime;
   }
   return null;
 }
+
+/** Diekspor untuk test kontrak magic-byte (UPFV-01/UPFV-04). */
+export { detectMimeFromBytes };
 
 // B-37 (audit-fix): centralised filename sanitiser used by every code path
 // that builds an R2 object-key from a user-supplied filename. Rules:

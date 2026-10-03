@@ -313,6 +313,19 @@ const PURPOSE_BY_FOLDER: Record<string, UploadPurpose | undefined> = Object.from
     .map((p) => [PURPOSE_FOLDER_MAP_INTERNAL[p], p]),
 );
 
+/**
+ * UPI-02: nama folder tingkat-atas di DISK LOKAL untuk semua upload.
+ * `LocalStorageService.resolvePath` men-strip prefix `uploads/` saat simpan,
+ * jadi layout nyata adalah `<storage>/<folder>/<userId>/<file>`.
+ * Dipakai janitor orphan agar tidak menyentuh `.chunks`, `smoke-test`,
+ * `account-exports`/`admin-exports`, atau direktori non-upload lain.
+ */
+export const UPLOAD_DISK_FOLDER_NAMES: ReadonlySet<string> = new Set([
+  ...Object.values(PURPOSE_FOLDER_MAP_INTERNAL),
+  // Bukan UploadPurpose — dikelola users.service (avatar/header direct).
+  'headers',
+]);
+
 // Derived from the typed visibility map — the source of truth is PURPOSE_VISIBILITY.
 const PRIVATE_FOLDER_PREFIXES: string[] = (Object.keys(PURPOSE_VISIBILITY) as UploadPurpose[])
   .filter((p) => PURPOSE_VISIBILITY[p] === 'private')

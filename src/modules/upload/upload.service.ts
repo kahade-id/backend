@@ -53,6 +53,8 @@ export const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
   [UploadPurpose.DELIVERY_PROOF]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf'],
   // BFI-097: bukti milestone — foto/scan + PDF, privat.
   [UploadPurpose.MILESTONE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf'],
+  // Karir (Fase F2): CV pelamar — PDF SAJA (anti polyglot; ekstensi dari MIME terdeteksi).
+  [UploadPurpose.CAREER_CV]: ['application/pdf'],
 };
 
 const MIN_FILE_SIZE = 1024;
@@ -102,6 +104,8 @@ export const MAX_FILE_SIZE: Record<UploadPurpose, number> = {
   [UploadPurpose.DELIVERY_PROOF]: 10 * 1024 * 1024,
   // BFI-097: bukti milestone — 10 MiB (sama seperti bukti laporan/pengiriman).
   [UploadPurpose.MILESTONE_EVIDENCE]: 10 * 1024 * 1024,
+  // Karir (Fase F2): CV maks 5 MB.
+  [UploadPurpose.CAREER_CV]: 5 * 1024 * 1024,
 };
 
 const CONFIRMED_KEY_TTL_SECONDS = 86_400;
@@ -285,6 +289,10 @@ const PURPOSE_VISIBILITY: Record<UploadPurpose, 'private' | 'public'> = {
   [UploadPurpose.DELIVERY_PROOF]: 'private',
   // BFI-097: bukti milestone — privat (signed URL kedaluwarsa).
   [UploadPurpose.MILESTONE_EVIDENCE]: 'private',
+  // Karir (Fase F2): CV privat — nginx TIDAK serve prefix career-cvs/
+  // (deploy/nginx.conf: hanya avatars/headers/showcase-images publik;
+  // sisanya 404). Akses baca hanya via signed URL HMAC + guard SUPER_ADMIN.
+  [UploadPurpose.CAREER_CV]: 'private',
 };
 
 const PURPOSE_FOLDER_MAP_INTERNAL: Record<UploadPurpose, string> = {
@@ -302,6 +310,8 @@ const PURPOSE_FOLDER_MAP_INTERNAL: Record<UploadPurpose, string> = {
   [UploadPurpose.DELIVERY_PROOF]: 'delivery-proof',
   // BFI-097: folder privat baru untuk bukti milestone.
   [UploadPurpose.MILESTONE_EVIDENCE]: 'milestone-evidence',
+  // Karir (Fase F2): folder privat CV pelamar.
+  [UploadPurpose.CAREER_CV]: 'career-cvs',
 };
 
 // Reverse of PURPOSE_FOLDER_MAP_INTERNAL, derived rather than hand-written so a new

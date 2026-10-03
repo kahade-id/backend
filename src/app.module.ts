@@ -62,6 +62,7 @@ import { HelpCenterModule } from './modules/help-center/help-center.module';
 import { TransactionTemplatesModule } from './modules/transaction-templates/transaction-templates.module';
 import { SupportModule } from './modules/support/support.module';
 import { FeedbackModule } from './modules/feedback/feedback.module';
+import { CareersModule } from './modules/careers/careers.module';
 import { ConfigApiModule } from './modules/config/config-api.module';
 import { SearchModule } from './modules/search/search.module';
 import { PartnerModule } from './modules/partner/partner.module';
@@ -188,6 +189,7 @@ const runtimeEnvFile = getRuntimeEnvFile();
     TransactionTemplatesModule,
     SupportModule,
     FeedbackModule,
+    CareersModule, // Karir karir.kahade.id (Fase F1–F3)
     ConfigApiModule,
     SearchModule,
     PartnerModule, // GAP-F (G452-G475): public partner API & outbound webhooks

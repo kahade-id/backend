@@ -26,6 +26,9 @@ export enum UploadPurpose {
   // bukti sengketa/laporan — hanya pemilik + pihak terkait yang boleh baca
   // via signed URL.
   MILESTONE_EVIDENCE = 'MILESTONE_EVIDENCE',
+  // Karir karir.kahade.id (Fase F2, 2026-10-03): CV pelamar. PDF-only,
+  // maks 5 MB, storage privat folder `career-cvs` — tanpa akun.
+  CAREER_CV = 'CAREER_CV',
 }
 
 export class PresignedUrlDto {

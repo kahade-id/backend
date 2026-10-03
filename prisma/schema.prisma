@@ -6695,3 +6695,83 @@ model AdminActionApproval {
   @@index([proposedBy, proposedAt])
   @@map("admin_action_approvals")
 }
+
+// ── Karir karir.kahade.id (Fase F1, 2026-10-03) ─────────────────────────────
+// Konvensi tabel baru: kolom camelCase TANPA @map; nama tabel snake_case via @@map.
+// Status pipeline lamaran
+enum JobApplicationStatus {
+  BARU // baru masuk, belum dibaca
+  DIREVIEW // sedang ditinjau
+  WAWANCARA // lolos ke tahap wawancara
+  DITERIMA // diterima (terminal — arsip HR)
+  DITOLAK // ditolak (terminal — kena retensi 90 hari)
+}
+
+// Lowongan pekerjaan (dikelola admin SUPER_ADMIN)
+model JobPosting {
+  id          String    @id @default(cuid())
+  slug        String    @unique @db.VarChar(128) // "co-founder-coo" — untuk URL
+  title       String    @db.VarChar(200) // "Co-Founder / COO"
+  location    String    @db.VarChar(128) // "Remote" | "Jakarta"
+  type        String    @db.VarChar(64) // "Penuh waktu" | "Paruh waktu" | "Kontrak"
+  equity      String    @db.VarChar(128) // "15% saham" — WAJIB diisi, tampil eksplisit
+  summary     String    @db.Text // 1-2 kalimat untuk kartu
+  description String    @db.Text // markdown: tanggung jawab, kualifikasi
+  requirements Json     @default("[]") // string[]
+  isActive    Boolean   @default(true)
+  publishedAt DateTime?
+  closedAt    DateTime?
+  sortOrder   Int       @default(0)
+  createdBy   String? // admin id
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  applications JobApplication[]
+
+  @@index([isActive, sortOrder])
+  @@map("job_postings")
+}
+
+// Lamaran pelamar (PII — HANYA via endpoint admin SUPER_ADMIN).
+// SENGAJA tanpa @@unique([postingId, email]): pelamar DITOLAK boleh melamar
+// lagi posisi yang sama. Duplikat aktif dicegah di service (409 ALREADY_APPLIED
+// bila ada lamaran existing dengan status selain DITOLAK).
+model JobApplication {
+  id                String               @id @default(cuid())
+  postingId         String
+  posting           JobPosting           @relation(fields: [postingId], references: [id], onDelete: Cascade)
+  fullName          String               @db.VarChar(200)
+  email             String               @db.VarChar(255)
+  phone             String               @db.VarChar(32)
+  coverNote         String?              @db.Text
+  cvFileKey         String               @db.VarChar(512) // key privat career-cvs/
+  portfolioUrl      String?              @db.VarChar(512)
+  status            JobApplicationStatus @default(BARU)
+  internalNote      String?              @db.Text // catatan admin, TIDAK tampil ke publik
+  reviewedBy        String? // admin id terakhir
+  reviewedAt        DateTime?
+  deletionTokenHash String               @db.VarChar(128) // hash bcrypt token hapus-mandiri
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  history JobApplicationStatusHistory[]
+
+  @@index([postingId, status])
+  @@index([status, updatedAt]) // untuk cron retensi 90 hari
+  @@map("job_applications")
+}
+
+// Audit trail perubahan status lamaran
+model JobApplicationStatusHistory {
+  id            String               @id @default(cuid())
+  applicationId String
+  application   JobApplication       @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  fromStatus    JobApplicationStatus?
+  toStatus      JobApplicationStatus
+  changedBy     String? // admin id; null = sistem (cron)
+  note          String?              @db.Text
+  createdAt     DateTime             @default(now())
+
+  @@index([applicationId])
+  @@map("job_application_status_history")
+}

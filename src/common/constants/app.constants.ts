@@ -153,16 +153,16 @@ export const WALLET_MIN_TRANSFER = 1000;
 export const WALLET_MAX_TRANSFER_PER_TX = 25000000;
 export const WALLET_DAILY_TRANSFER_LIMIT = 50000000;
 
-// Standard platform fee: 2.5% of order value, clamped to [Rp 5.000, Rp 250.000].
+// Standard platform fee: 2.5% of order value, clamped to [Rp 2.500, Rp 250.000].
 // The clamp applies BEFORE any reductions (Kahade Plus subscription, voucher,
 // rank-based discount, promo). Reductions may bring the effective fee below
-// the Rp 5.000 floor (down to Rp 0).
+// the Rp 2.500 floor (down to Rp 0).
 export const KAHADE_FEE_RATE = 2.5;
 // Kahade Plus subscriber rate (applied as a reduction from the standard fee,
 // never higher than the clamped standard fee).
 export const KAHADE_PLUS_FEE_RATE = 0.5;
 // Hard limits applied to the STANDARD fee only (in sen).
-export const FEE_MIN_SEN = 500_000;     // Rp 5.000
+export const FEE_MIN_SEN = 250_000;     // Rp 2.500
 export const FEE_MAX_SEN = 25_000_000;  // Rp 250.000
 
 export const SUBSCRIPTION_MONTHLY_PRICE = 99000;

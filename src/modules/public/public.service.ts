@@ -4,6 +4,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { OpsSettingsService } from '../ops-settings/ops-settings.service';
 import { SUBSCRIPTION_PLANS_CACHE } from '../../common/constants/redis-keys';
+import { FEE_MIN_SEN, FEE_MAX_SEN } from '../../common/constants/app.constants';
 import { formatIdr } from '../../common/utils/currency.util';
 
 const SUBSCRIPTION_PLANS_TTL = 300;
@@ -160,8 +161,8 @@ export class PublicService {
     // Standard-fee clamp bounds in IDR (sen → IDR).  Mirrors FEE_MIN_SEN /
     // FEE_MAX_SEN in app.constants.ts.  Surfaced here so clients can render
     // the full fee policy without hardcoding the bounds.
-    const standardFeeMin = 5_000;
-    const standardFeeMax = 250_000;
+    const standardFeeMin = Number(FEE_MIN_SEN) / 100;
+    const standardFeeMax = Number(FEE_MAX_SEN) / 100;
 
     return {
       feeSchedule: {

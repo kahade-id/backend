@@ -291,7 +291,7 @@ export class FeeCalculatorService {
     const voucherDiscountSen = directSen ?? toSen(voucherDiscount);
 
     // ── 1. Standard fee: orderValue × standard rate (e.g. 2.5%), clamped to
-    //       [Rp 5.000, Rp 250.000].  This clamp is the contract for non-discounted
+    //       [Rp 2.500, Rp 250.000].  This clamp is the contract for non-discounted
     //       orders — it ALWAYS holds when no reduction is applied.
     const standardRateBps = this.getFeeRateBps(false, feeConfig);
     const MIN_FEE = BigInt(FEE_MIN_SEN);

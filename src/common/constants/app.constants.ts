@@ -307,6 +307,15 @@ const RESERVED_USERNAMES_EN = [
   'contact', 'home', 'search', 'notifications', 'profile',
 ];
 
+// Deeplink path segments (Instagram-style: kahade.id/:username, kahade.id/p/:id).
+// These MUST NOT be usable as usernames, otherwise the landing router cannot
+// distinguish a profile URL from a reserved route. Kept in a separate list so
+// the intent is explicit; merged into RESERVED_USERNAMES below.
+const RESERVED_USERNAMES_DEEPLINK = [
+  'p', 'v', 'r', 'faq', 'verify', 'transfer', 'download', 'static',
+  'images', 'order-link', 'explore',
+];
+
 const RESERVED_USERNAMES_ID = [
   'transaksi', 'notifikasi', 'profil', 'langganan', 'sesi', 'pengaturan',
   'lainnya', 'bantuan', 'template-transaksi', 'analitik', 'cara-kerja',
@@ -318,4 +327,5 @@ export const RESERVED_USERNAMES = [
   'kahade',
   ...RESERVED_USERNAMES_EN,
   ...RESERVED_USERNAMES_ID,
+  ...RESERVED_USERNAMES_DEEPLINK,
 ];

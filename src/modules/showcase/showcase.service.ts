@@ -2733,7 +2733,9 @@ export class ShowcaseService {
       id: row.id,
       showcaseId: row.showcaseId,
       parentId: row.parentId,
-      content: isDeleted ? null : row.content,
+      // 2026-10-03: jangan kirim null — frontend parser membutuhkan string.
+      // Komentar yang dihapus tampil sebagai placeholder.
+      content: isDeleted ? "[Komentar dihapus]" : row.content,
       isDeleted,
       isHidden: row.isHidden,
       hiddenReason: row.isHidden ? row.hiddenReason : null,

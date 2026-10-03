@@ -1,6 +1,9 @@
 import { registerDecorator, ValidationOptions } from 'class-validator';
 
 const CUID_RE = /^c[a-z0-9]{24}$/;
+// CUID2 (dari @paralleldrive/cuid2): 24 char lowercase alphanumerik,
+// tidak diawali 'c'. Lihat penjelasan di src/common/pipes/parse-id.pipe.ts.
+const CUID2_RE = /^[a-z0-9]{24}$/;
 const PREFIXED_ID_RE = /^[A-Z]{2,5}-[A-Za-z0-9_-]{3,80}$/;
 const MAX_ID_LENGTH = 100;
 
@@ -19,7 +22,7 @@ export function IsValidId(validationOptions?: ValidationOptions) {
           if (typeof value !== 'string' || value.length === 0 || value.length > MAX_ID_LENGTH) {
             return false;
           }
-          return CUID_RE.test(value) || PREFIXED_ID_RE.test(value);
+          return CUID_RE.test(value) || CUID2_RE.test(value) || PREFIXED_ID_RE.test(value);
         },
       },
     });

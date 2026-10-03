@@ -498,7 +498,7 @@ export class AutoCompleteDeliveredOrdersService {
                         });
                         if (activeSub && activeSub.feeSavingsUsed < activeSub.feeSavingsLimit) {
                           const feeConfig = await this.feeCalculator.getFeeConfig();
-                          // Canonical helper — savings respect the [Rp 5.000, Rp
+                          // Canonical helper — savings respect the [Rp 2.500, Rp
                           // 250.000] clamp on the standard fee that the buyer was
                           // actually charged under.
                           const savings = this.feeCalculator.getPlusSavingsSen(

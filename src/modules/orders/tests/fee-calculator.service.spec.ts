@@ -54,10 +54,10 @@ describe('FeeCalculatorService', () => {
       expect(result.feeAmount).toBe(BigInt(2_500_000));
     });
 
-    it('should clamp standard fee to MIN Rp 5.000 for small orders', () => {
-      // Rp 100.000 × 2.5% = Rp 2.500 → clamped UP to Rp 5.000
-      const result = service.calculateFee({ orderValue: 100_000, feeResponsibility: 'BUYER', isKahadePlus: false });
-      expect(result.feeAmount).toBe(BigInt(500_000)); // 500_000 sen = Rp 5.000
+    it('should clamp standard fee to MIN Rp 2.500 for small orders', () => {
+      // Rp 50.000 × 2.5% = Rp 1.250 → clamped UP to Rp 2.500
+      const result = service.calculateFee({ orderValue: 50_000, feeResponsibility: 'BUYER', isKahadePlus: false });
+      expect(result.feeAmount).toBe(BigInt(250_000)); // 250_000 sen = Rp 2.500
     });
 
     it('should clamp standard fee to MAX Rp 250.000 for huge orders', () => {
@@ -66,8 +66,8 @@ describe('FeeCalculatorService', () => {
       expect(result.feeAmount).toBe(BigInt(25_000_000)); // 25_000_000 sen = Rp 250.000
     });
 
-    it('should allow Kahade Plus subscription to bring fee BELOW the Rp 5.000 floor', () => {
-      // Rp 100.000 × 0.5% = Rp 500 (well below Rp 5.000 floor — allowed for Plus)
+    it('should allow Kahade Plus subscription to bring fee BELOW the Rp 2.500 floor', () => {
+      // Rp 100.000 × 0.5% = Rp 500 (well below Rp 2.500 floor — allowed for Plus)
       const result = service.calculateFee({ orderValue: 100_000, feeResponsibility: 'BUYER', isKahadePlus: true });
       expect(result.feeAmount).toBe(BigInt(50_000)); // 50_000 sen = Rp 500
     });
@@ -137,9 +137,9 @@ describe('FeeCalculatorService', () => {
       expect(result.feeAmount).toBeGreaterThan(BigInt(0));
     });
 
-    it('should clamp tiny orders (Rp 1) to MIN fee of Rp 5.000 for non-Plus', () => {
+    it('should clamp tiny orders (Rp 1) to MIN fee of Rp 2.500 for non-Plus', () => {
       const result = service.calculateFee({ orderValue: 1, feeResponsibility: 'BUYER', isKahadePlus: false });
-      expect(result.feeAmount).toBe(BigInt(500_000)); // Rp 5.000
+      expect(result.feeAmount).toBe(BigInt(250_000)); // Rp 2.500
     });
 
     it('should keep feeAmount = 0 when zero-value order regardless of responsibility', () => {

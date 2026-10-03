@@ -17,6 +17,7 @@ import * as ErrorCodes from '../../common/constants/error-codes';
 import { MAX_LIMIT, RESERVED_USERNAMES } from '../../common/constants/app.constants';
 import { ReportFlagService } from '../../common/services/report-flag.service';
 import { LocalStorageService } from '../upload/local-storage.service';
+import { stripImageMetadata } from '../upload/utils/strip-image-metadata';
 import { TOKEN_BLACKLIST, SESSION_REVOKED_KEY, TOTP_USED_CODE } from '../../common/constants/redis-keys';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { ReportUserDto } from './dto/report-user.dto';
@@ -847,8 +848,12 @@ export class UsersService {
     // di disk & URL publik IDENTIK dengan key lama — URL lama tidak rusak.
     const avatarKey = `uploads/avatars/${userId}/${nanoid(16)}.${ext}`;
 
+    // UPF-01: strip EXIF/GPS (termasuk koordinat) sebelum simpan — avatar
+    // disajikan publik via nginx. Pola sama seperti uploadDirectTx.
+    const safeBuffer = stripImageMetadata(fileBuffer, detectedType);
+
     try {
-      await this.localStorage.saveFile(avatarKey, fileBuffer);
+      await this.localStorage.saveFile(avatarKey, safeBuffer);
     } catch (err) {
       this.logger.error('Self-hosted avatar upload failed', err);
       throw new BadRequestException({
@@ -2255,9 +2260,13 @@ export class UsersService {
     // BFI-103: key kanonis BARU memakai prefix `uploads/` (lihat avatar di atas).
     const headerKey = `uploads/headers/${userId}/${nanoid(16)}.${ext}`;
 
+    // UPF-01: strip EXIF/GPS (termasuk koordinat) sebelum simpan — sampul
+    // disajikan publik via nginx. Pola sama seperti uploadDirectTx.
+    const safeBuffer = stripImageMetadata(fileBuffer, detectedType);
+
     // Self-hosted (2026-09-26, SS-007/ST-007): R2 diganti LocalStorageService.
     try {
-      await this.localStorage.saveFile(headerKey, fileBuffer);
+      await this.localStorage.saveFile(headerKey, safeBuffer);
     } catch (err) {
       this.logger.error('Self-hosted direct header upload failed', err);
       throw new BadRequestException({

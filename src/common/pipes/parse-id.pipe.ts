@@ -1,6 +1,9 @@
 import { PipeTransform, Injectable, BadRequestException } from '@nestjs/common';
 
 const CUID_RE = /^c[a-z0-9]{24}$/;
+// CUID2 (dari @paralleldrive/cuid2, dipakai mis. untuk ID pesan chat):
+// 24 char lowercase alphanumerik, TIDAK diawali 'c' (contoh: lz86en0s6kbxtgoevh7k7az7).
+const CUID2_RE = /^[a-z0-9]{24}$/;
 const PREFIXED_ID_RE = /^[A-Z]{2,5}-[A-Za-z0-9_-]{3,80}$/;
 const MAX_ID_LENGTH = 100;
 
@@ -26,6 +29,7 @@ export class ParseIdPipe implements PipeTransform<string, string> {
     }
 
     if (CUID_RE.test(value)) return value;
+    if (CUID2_RE.test(value)) return value;
 
     const dashIdx = value.indexOf('-');
     if (dashIdx > 0) {

@@ -1852,11 +1852,13 @@ export class ChatService implements OnModuleInit {
       ) {
         return;
       }
-      // CN-007: hormati preferensi chatInApp — user yang mematikan notifikasi
-      // chat tidak boleh tetap mendapat baris di inbox. Pipeline PUSH tetap
-      // harus berjalan (digate chatPush di push.service), jadi hanya
-      // `notification.create` yang dilewati, bukan `emitNotificationCreated`.
-      const inAppEnabled = await this.notificationsService.isInAppEnabled(recipientId, NotificationType.CHAT_NEW_MESSAGE);
+      // 2026-10-03 (keputusan produk): chat TIDAK masuk notifikasi in-app.
+      // Alasan: 30 pesan chat = 30 baris notifikasi (spam). User sudah melihat
+      // pesan di tab Chat (badge unread). Pipeline PUSH tetap berjalan
+      // (digate chatPush di push.service) — hanya `notification.create`
+      // yang dilewati, bukan `emitNotificationCreated`.
+      // (Sebelumnya: CN-007 menghormati preferensi chatInApp. Kini nonaktif total.)
+      const inAppEnabled = false;
       const author = await this.prisma.user.findUnique({
         where: { id: senderId },
         select: { fullName: true, username: true },

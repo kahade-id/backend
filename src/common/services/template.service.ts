@@ -57,6 +57,10 @@ export class TemplateService implements OnModuleInit {
     'kyc-revoked',
     // GAP-A: konfirmasi permintaan penghapusan akun.
     'account-deletion',
+    // KARIR (karir.kahade.id): notifikasi lamaran — template decoupled dari
+    // logika kirim; pengiriman via email queue (fase 3).
+    'career-application-received', 'career-status-review', 'career-status-interview',
+    'career-status-accepted', 'career-status-rejected',
   ]);
 
   private getOrCompile(templateName: string): Handlebars.TemplateDelegate {

@@ -28,6 +28,34 @@ export class VideoProcessingService {
   private readonly logger = new Logger(VideoProcessingService.name);
   private availability: boolean | null = null;
 
+  /**
+   * UPV-03: batasi ffmpeg/ffprobe konkuren — proses ini CPU-bound dan
+   * berjalan di dalam request handler. Tanpa batas, N upload video
+   * bersamaan menahan event loop/CPU hingga ~90 dtk per request.
+   * Semaphore sederhana: maks 2 proses ffmpeg/ffprobe jalan bersamaan per
+   * instance; sisanya antre di promise (tidak menolak — upload tetap jalan,
+   * hanya lebih lambat saat spike).
+   */
+  private static readonly MAX_CONCURRENT_FFMPEG = 2;
+  private activeFfmpeg = 0;
+  private readonly ffmpegWaiters: Array<() => void> = [];
+
+  private async acquireFfmpegSlot(): Promise<() => void> {
+    if (this.activeFfmpeg < VideoProcessingService.MAX_CONCURRENT_FFMPEG) {
+      this.activeFfmpeg += 1;
+      return () => this.releaseFfmpegSlot();
+    }
+    await new Promise<void>((resolve) => this.ffmpegWaiters.push(resolve));
+    this.activeFfmpeg += 1;
+    return () => this.releaseFfmpegSlot();
+  }
+
+  private releaseFfmpegSlot(): void {
+    this.activeFfmpeg = Math.max(0, this.activeFfmpeg - 1);
+    const next = this.ffmpegWaiters.shift();
+    if (next) next();
+  }
+
   /** true bila ffmpeg & ffprobe tersedia di PATH. Hasil di-cache per proses. */
   isAvailable(): boolean {
     if (this.availability !== null) return this.availability;
@@ -46,6 +74,15 @@ export class VideoProcessingService {
    * atau ffprobe tidak bisa membaca stream-nya (fail closed di pemanggil).
    */
   async probeVideo(filePath: string): Promise<VideoProbeResult> {
+    const release = await this.acquireFfmpegSlot();
+    try {
+      return await this.probeVideoInner(filePath);
+    } finally {
+      release();
+    }
+  }
+
+  private async probeVideoInner(filePath: string): Promise<VideoProbeResult> {
     let stdout: string;
     try {
       ({ stdout } = await execFileAsync('ffprobe', [
@@ -82,6 +119,7 @@ export class VideoProcessingService {
    * ffmpeg gagal — pemanggil menghapus file video yang sudah tersimpan.
    */
   async generateThumbnail(filePath: string, destPath: string, atSecond: number, width: number): Promise<void> {
+    const release = await this.acquireFfmpegSlot();
     try {
       await execFileAsync('ffmpeg', [
         '-y',
@@ -95,6 +133,8 @@ export class VideoProcessingService {
     } catch (err) {
       this.logger.warn(`ffmpeg thumbnail gagal untuk ${filePath}: ${(err as Error).message}`);
       throw new Error('VIDEO_THUMBNAIL_FAILED');
+    } finally {
+      release();
     }
   }
 }

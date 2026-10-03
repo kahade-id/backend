@@ -9,7 +9,7 @@
  * - keamanan: sessionId malformed → 400, user lain → 403, sesi
  *   kedaluwarsa → 410.
  */
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { randomBytes } from 'crypto';
@@ -19,21 +19,29 @@ import { UploadPurpose } from '../dto/presigned-url.dto';
 describe('ChunkedUploadService — NP-006', () => {
   let service: ChunkedUploadService;
   let storageRoot: string;
-  let mockUploadDirect: jest.Mock;
+  let mockUploadDirectFromPath: jest.Mock;
+  let capturedAssembled: Buffer | null;
 
   const CHUNK = 512 * 1024; // MIN_CHUNK_BYTES server
 
   beforeEach(() => {
     storageRoot = mkdtempSync(join(tmpdir(), 'kahade-chunks-'));
-    mockUploadDirect = jest.fn().mockImplementation(
-      async (_userId: string, _purpose: UploadPurpose, _name: string, _mime: string, buffer: Buffer) => ({
-        fileKey: 'videos/x.mp4',
-        fileUrl: 'https://cdn/x.mp4',
-        receivedBytes: buffer.length,
-      }),
+    capturedAssembled = null;
+    // UPV-03: complete() memakai uploadDirectFromPath (tanpa readFile penuh).
+    // Mock menangkap isi file rakitan SAAT dipanggil — `finally` di complete()
+    // menghapus sesi (termasuk assembled.bin) setelahnya.
+    mockUploadDirectFromPath = jest.fn().mockImplementation(
+      async (_userId: string, _purpose: UploadPurpose, _name: string, _mime: string, sourcePath: string) => {
+        capturedAssembled = readFileSync(sourcePath);
+        return {
+          fileKey: 'videos/x.mp4',
+          fileUrl: 'https://cdn/x.mp4',
+          receivedBytes: capturedAssembled.length,
+        };
+      },
     );
     const configService = { get: jest.fn().mockReturnValue(storageRoot) };
-    const uploadService = { uploadDirect: mockUploadDirect };
+    const uploadService = { uploadDirectFromPath: mockUploadDirectFromPath };
     service = new ChunkedUploadService(configService as never, uploadService as never);
   });
 
@@ -143,7 +151,7 @@ describe('ChunkedUploadService — NP-006', () => {
     });
   });
 
-  it('complete: merakit chunk terurut menjadi byte identik lalu memakai pipeline uploadDirect', async () => {
+  it('complete: merakit chunk terurut menjadi byte identik lalu memakai pipeline uploadDirectFromPath (UPV-03)', async () => {
     const totalSize = CHUNK * 2 + 123;
     const { sessionId } = await initVideo(totalSize);
     const chunks = [randomBytes(CHUNK), randomBytes(CHUNK), randomBytes(123)];
@@ -153,10 +161,12 @@ describe('ChunkedUploadService — NP-006', () => {
     await service.uploadChunk('user-1', sessionId, 1, { buffer: chunks[1], size: chunks[1].length });
     const result = await service.complete('user-1', sessionId);
     expect(result.fileKey).toBe('videos/x.mp4');
-    expect(mockUploadDirect).toHaveBeenCalledTimes(1);
-    const assembled: Buffer = mockUploadDirect.mock.calls[0][4];
-    expect(assembled.length).toBe(totalSize);
-    expect(Buffer.compare(assembled, Buffer.concat(chunks))).toBe(0);
+    expect(mockUploadDirectFromPath).toHaveBeenCalledTimes(1);
+    // UPV-03: path file rakitan (bukan buffer) yang diteruskan — byte
+    // ditangkap mock saat dipanggil (sesi sudah dihapus setelah complete).
+    expect(capturedAssembled).not.toBeNull();
+    expect((capturedAssembled as Buffer).length).toBe(totalSize);
+    expect(Buffer.compare(capturedAssembled as Buffer, Buffer.concat(chunks))).toBe(0);
   });
 
   it('keamanan: sessionId malformed → 400 (anti traversal)', async () => {

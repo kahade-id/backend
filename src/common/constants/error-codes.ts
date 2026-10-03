@@ -72,6 +72,8 @@ export const VIDEO_TOO_LONG = 'VIDEO_TOO_LONG';
 // Batas video etalase resmi (keputusan user 2026-09-28): 100MB / 180 detik.
 export const VIDEO_TOO_LARGE = 'VIDEO_TOO_LARGE';
 export const VIDEO_UNPROCESSABLE = 'VIDEO_UNPROCESSABLE';
+// UPV-04 (audit upload video 2026-10-03): resolusi melebihi batas maksimum.
+export const VIDEO_RESOLUTION_TOO_HIGH = 'VIDEO_RESOLUTION_TOO_HIGH';
 export const SHOWCASE_INVALID_MEDIA = 'SHOWCASE_INVALID_MEDIA';
 export const SHOWCASE_SPIN360_INVALID = 'SHOWCASE_SPIN360_INVALID';
 // Batch 19 TIM A (item 4): highlight etalase.

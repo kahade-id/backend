@@ -14,6 +14,7 @@ import { VideoProcessingService } from './video-processing.service';
 import {
   SHOWCASE_IMAGE_THUMBNAIL_WIDTH,
   SHOWCASE_VIDEO_MAX_BYTES,
+  SHOWCASE_VIDEO_MAX_DIMENSION_PX,
   SHOWCASE_VIDEO_MAX_DURATION_SEC,
   SHOWCASE_VIDEO_MIN_DURATION_SEC,
   SHOWCASE_VIDEO_THUMBNAIL_WIDTH,
@@ -22,6 +23,7 @@ import { encryptAES, decryptAES } from '../../common/utils/crypto.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { withSpan } from '../../common/tracing/tracing';
 import { stripImageMetadata } from './utils/strip-image-metadata';
+import { parseHttpRange } from './utils/http-range';
 
 const nanoid = customAlphabet('1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ', 10);
 
@@ -402,8 +404,31 @@ export class UploadService {
     return key;
   }
 
-  /** Stream byte file privat untuk endpoint download terautentikasi. */
-  async getPrivateFileStream(fileKey: string): Promise<{ stream: Readable; contentType: string; size: number }> {
+  /**
+   * Stream byte file privat untuk endpoint download terautentikasi.
+   *
+   * UPV-01 (audit upload video 2026-10-03): mendukung header HTTP `Range`
+   * (single-range `bytes=start-end`) sehingga video privat (chat/sengketa)
+   * bisa di-seek seperti video showcase publik yang diserve nginx (206).
+   * Auth + ownership check tetap di controller — fungsi ini tidak mengubah
+   * otorisasi apa pun.
+   *
+   * - `contentRange` non-null → caller WAJIB balas 206 + `Content-Range`.
+   * - `rangeUnsatisfiable` true → caller WAJIB balas 416 + `Content-Range: bytes *\/<size>`.
+   * - Keduanya null/false → balas 200 penuh seperti sebelumnya.
+   * - File ekspor terenkripsi (account/admin-exports): Range DIABAIKAN
+   *   (dekripsi butuh file utuh; bukan video sehingga seek tak relevan).
+   */
+  async getPrivateFileStream(
+    fileKey: string,
+    rangeHeader?: string,
+  ): Promise<{
+    stream: Readable;
+    contentType: string;
+    size: number;
+    contentRange: { start: number; end: number } | null;
+    rangeUnsatisfiable: boolean;
+  }> {
     if (!isSafeFileKey(fileKey) || !isPrivateFileKey(fileKey)) {
       throw new BadRequestException({ code: ErrorCodes.INVALID_FILE_TYPE, message: 'Invalid private file key' });
     }
@@ -411,7 +436,22 @@ export class UploadService {
     if (size === null) {
       throw new NotFoundException({ code: ErrorCodes.FILE_NOT_FOUND_OR_EXPIRED, message: 'File not found' });
     }
-    let stream: Readable = this.localStorage.createReadStream(fileKey) as Readable;
+    const isEncryptedExport =
+      fileKey.startsWith('uploads/account-exports/') || fileKey.startsWith('uploads/admin-exports/');
+    let contentRange: { start: number; end: number } | null = null;
+    let rangeUnsatisfiable = false;
+    if (rangeHeader && !isEncryptedExport) {
+      const parsed = parseHttpRange(rangeHeader, size);
+      if (parsed === 'unsatisfiable') {
+        rangeUnsatisfiable = true;
+      } else if (parsed) {
+        contentRange = parsed;
+      }
+    }
+    let stream: Readable = this.localStorage.createReadStream(
+      fileKey,
+      contentRange ?? undefined,
+    ) as Readable;
     // ST-019: export akun disimpan terenkripsi at-rest — dekripsi saat serve.
     // Fallback: file lama (sebelum enkripsi) yang sudah berupa JSON diserve
     // apa adanya agar masa transisi tidak merusak unduhan yang sedang berjalan.
@@ -436,9 +476,16 @@ export class UploadService {
       const contentType = fileKey.startsWith('uploads/admin-exports/')
         ? 'text/csv; charset=utf-8'
         : fileKey.endsWith('.zip') ? 'application/zip' : 'application/json';
-      return { stream, contentType, size: buf.length };
+      // Ekspor terenkripsi selalu diserve penuh (Range diabaikan di atas).
+      return { stream, contentType, size: buf.length, contentRange: null, rangeUnsatisfiable: false };
     }
-    return { stream, contentType: this.localStorage.getContentType(fileKey), size };
+    return {
+      stream,
+      contentType: this.localStorage.getContentType(fileKey),
+      size,
+      contentRange,
+      rangeUnsatisfiable,
+    };
   }
 
   // ── Self-hosted storage (2026-09-26): R2 diganti local disk. ──
@@ -931,6 +978,136 @@ export class UploadService {
   }
 
   /**
+   * UPV-03 (audit upload video 2026-10-03): varian `uploadDirect` untuk file
+   * yang SUDAH ada di disk (hasil rakitan chunked upload). Menghilangkan
+   * puncak RAM ~2× ukuran file di request handler:
+   * - validasi ukuran via `stat`, magic-byte via baca header saja
+   *   (32 byte, bukan `readFile` penuh);
+   * - file dipindah dengan `rename` (atomic, satu filesystem) ke lokasi
+   *   final — tanpa buffer kedua di memori.
+   * Gambar tetap lewat buffer (butuh strip EXIF) — ukurannya kecil
+   * (≤10 MiB) sehingga bukan masalah.
+   *
+   * Pemanggil bertanggung jawab atas file sumber: sukses → file sudah
+   * pindah (atau dihapus bila gambar); gagal validasi → file sumber
+   * DIBIARKAN (pemanggil yang membersihkan, mis. destroySession).
+   */
+  async uploadDirectFromPath(
+    userId: string,
+    purpose: UploadPurpose,
+    fileName: string,
+    contentType: string,
+    sourcePath: string,
+  ): Promise<DirectUploadResult> {
+    const allowedTypes = ALLOWED_CONTENT_TYPES[purpose];
+    if (!allowedTypes.includes(contentType)) {
+      throw new BadRequestException({
+        code: ErrorCodes.MIME_TYPE_MISMATCH,
+        message: `Content type ${contentType} is not allowed for ${purpose}. Allowed: ${allowedTypes.join(', ')}`,
+      });
+    }
+
+    let stat: fs.Stats;
+    try {
+      stat = await fs.promises.stat(sourcePath);
+    } catch {
+      throw new BadRequestException({
+        code: ErrorCodes.UPLOAD_FAILED,
+        message: 'Source file not found for upload',
+      });
+    }
+    if (!stat.isFile()) {
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_FILE_TYPE,
+        message: 'Source path is not a file',
+      });
+    }
+    if (stat.size < MIN_FILE_SIZE) {
+      throw new BadRequestException({
+        code: ErrorCodes.INVALID_FILE_TYPE,
+        message: `File is too small (${stat.size} bytes). Minimum size is ${MIN_FILE_SIZE} bytes`,
+      });
+    }
+    const maxSize = MAX_FILE_SIZE[purpose];
+    if (stat.size > maxSize) {
+      throw fileTooLargeException(purpose, maxSize);
+    }
+
+    // Magic-byte: cukup baca header, tanpa memuat seluruh file.
+    const header = await this.localStorage.readFileRangeByPath(sourcePath, 0, MIME_HEADER_BYTES - 1);
+    const detectedMime = detectMimeFromBytes(header);
+    if (!detectedMime) {
+      throw new BadRequestException({
+        code: ErrorCodes.MIME_TYPE_MISMATCH,
+        message: 'Unable to identify file type from content. The file may be corrupted or unsupported.',
+      });
+    }
+    if (detectedMime !== contentType) {
+      throw new BadRequestException({
+        code: ErrorCodes.MIME_TYPE_MISMATCH,
+        message: `File content (${detectedMime}) does not match declared type (${contentType})`,
+      });
+    }
+
+    const fileKey = this.buildStoredFileKey(userId, purpose, fileName, detectedMime);
+
+    let imageBuffer: Buffer | undefined;
+    if (detectedMime.startsWith('image/')) {
+      // Gambar kecil: baca buffer untuk strip EXIF (jalur sama seperti
+      // uploadDirectTx), lalu hapus file sumber.
+      const fileBuffer = await fs.promises.readFile(sourcePath);
+      const storedBuffer = stripImageMetadata(fileBuffer, detectedMime);
+      try {
+        await this.localStorage.saveFile(fileKey, storedBuffer);
+      } catch (error) {
+        this.logger.error(`Direct-from-path upload to local storage failed for key=${fileKey}`, error instanceof Error ? error.stack : error);
+        throw new BadRequestException({
+          code: ErrorCodes.UPLOAD_FAILED,
+          message: 'Failed to upload file to storage. Please try again.',
+        });
+      }
+      await fs.promises.unlink(sourcePath).catch(() => undefined);
+      imageBuffer = fileBuffer;
+    } else {
+      // Pindahkan tanpa menyalin isi file (rename atomic — staging dan
+      // storage di filesystem yang sama).
+      const destPath = this.localStorage.resolvePath(fileKey);
+      await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+      try {
+        await fs.promises.rename(sourcePath, destPath);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'EXDEV') {
+          await fs.promises.copyFile(sourcePath, destPath);
+          await fs.promises.unlink(sourcePath).catch(() => undefined);
+        } else {
+          this.logger.error(`Direct-from-path move failed for key=${fileKey}`, (err as Error).stack);
+          throw new BadRequestException({
+            code: ErrorCodes.UPLOAD_FAILED,
+            message: 'Failed to upload file to storage. Please try again.',
+          });
+        }
+      }
+    }
+
+    return withSpan(
+      'upload.direct_from_path',
+      async (span) => {
+        const result = await this.finalizeDirectUpload(userId, purpose, fileKey, detectedMime, imageBuffer);
+        span.setAttribute(
+          'fileKeyHash',
+          createHash('sha256').update(result.fileKey).digest('hex'),
+        );
+        return result;
+      },
+      {
+        size: stat.size,
+        mime: contentType,
+        purpose,
+      },
+    );
+  }
+
+  /**
    * G481: span upload.direct — HANYA { fileKeyHash, size, mime, purpose }.
    * Tanpa isi file, tanpa nama file asli, tanpa userId mentah di atribut
    * (fileKey di-hash SHA-256 sebelum masuk span).
@@ -1002,6 +1179,37 @@ export class UploadService {
       });
     }
 
+    const fileKey = this.buildStoredFileKey(userId, purpose, fileName, detectedMime);
+
+    // LOW (SEC-D): strip metadata EXIF/XMP (termasuk GPS) dari foto — lossless,
+    // tanpa re-encode. Foto dari HP membawa koordinat GPS di EXIF; tanpa ini
+    // lokasi rumah/user bisa bocor lewat foto profil/etalase/KYC.
+    const storedBuffer = stripImageMetadata(fileBuffer, detectedMime);
+
+    try {
+      await this.localStorage.saveFile(fileKey, storedBuffer);
+    } catch (error) {
+      this.logger.error(`Direct upload to local storage failed for key=${fileKey}`, error instanceof Error ? error.stack : error);
+      throw new BadRequestException({
+        code: ErrorCodes.UPLOAD_FAILED,
+        message: 'Failed to upload file to storage. Please try again.',
+      });
+    }
+
+    return this.finalizeDirectUpload(userId, purpose, fileKey, detectedMime, fileBuffer);
+  }
+
+  /**
+   * UPV-03: bangun fileKey penyimpanan yang aman — diekstrak dari
+   * `uploadDirectTx` agar dipakai ulang oleh `uploadDirectFromPath`.
+   * SH-S-001: ekstensi SELALU dari MIME terdeteksi, bukan filename user.
+   */
+  private buildStoredFileKey(
+    userId: string,
+    purpose: UploadPurpose,
+    fileName: string,
+    detectedMime: string,
+  ): string {
     const sanitizedFileName = sanitizeStoredFileName(fileName);
     // SH-S-001: buang ekstensi asli dari filename user SEPENUHNYA, ganti dengan
     // ekstensi dari MIME terdeteksi. `promo.html` ber-magic JPEG tersimpan
@@ -1020,23 +1228,22 @@ export class UploadService {
     const timestamp = Date.now();
     const randomSuffix = nanoid();
     const folder = UploadService.PURPOSE_FOLDER_MAP[purpose];
-    const fileKey = `uploads/${folder}/${userId}/${timestamp}-${randomSuffix}-${storedFileName}`;
+    return `uploads/${folder}/${userId}/${timestamp}-${randomSuffix}-${storedFileName}`;
+  }
 
-    // LOW (SEC-D): strip metadata EXIF/XMP (termasuk GPS) dari foto — lossless,
-    // tanpa re-encode. Foto dari HP membawa koordinat GPS di EXIF; tanpa ini
-    // lokasi rumah/user bisa bocor lewat foto profil/etalase/KYC.
-    const storedBuffer = stripImageMetadata(fileBuffer, detectedMime);
-
-    try {
-      await this.localStorage.saveFile(fileKey, storedBuffer);
-    } catch (error) {
-      this.logger.error(`Direct upload to local storage failed for key=${fileKey}`, error instanceof Error ? error.stack : error);
-      throw new BadRequestException({
-        code: ErrorCodes.UPLOAD_FAILED,
-        message: 'Failed to upload file to storage. Please try again.',
-      });
-    }
-
+  /**
+   * UPV-03: langkah akhir uploadDirect yang SAMA untuk kedua varian
+   * (buffer & from-path): tandai terkonfirmasi, pasca-pemrosesan
+   * video/gambar, bangun fileUrl. `imageBuffer` = buffer asli untuk
+   * `processShowcaseImage` (hanya relevan bila purpose SHOWCASE_IMAGE).
+   */
+  private async finalizeDirectUpload(
+    userId: string,
+    purpose: UploadPurpose,
+    fileKey: string,
+    detectedMime: string,
+    imageBuffer?: Buffer,
+  ): Promise<DirectUploadResult> {
     const redisKey = `confirmed_upload:${userId}:${fileKey}`;
     await this.redis.setNx(redisKey, '1', CONFIRMED_KEY_TTL_SECONDS);
 
@@ -1048,14 +1255,32 @@ export class UploadService {
       videoMeta = await this.processShowcaseVideo(userId, fileKey);
     }
 
+    // UPV-07: lampiran video privat (chat/sengketa/bukti) — thumbnail
+    // best-effort FAIL-OPEN: gagal → upload tetap sukses, thumbnailUrl kosong
+    // (FE fallback ke ikon seperti sebelumnya). Disimpan di folder privat
+    // milik user yang sama sehingga lolos validateOwnership + signed URL.
+    let chatVideoThumbMeta: Pick<DirectUploadResult, 'thumbnailFileKey' | 'thumbnailUrl'> | undefined;
+    if (
+      detectedMime.startsWith('video/') &&
+      (purpose === UploadPurpose.CHAT_ATTACHMENT ||
+        purpose === UploadPurpose.DISPUTE_EVIDENCE ||
+        purpose === UploadPurpose.DELIVERY_PROOF ||
+        purpose === UploadPurpose.MILESTONE_EVIDENCE)
+    ) {
+      chatVideoThumbMeta = await this.processChatVideoThumbnail(userId, fileKey).catch((err) => {
+        this.logger.warn(`UPV-07: thumbnail video chat gagal untuk ${fileKey}: ${(err as Error).message}`);
+        return undefined;
+      });
+    }
+
     // PERF-FIX (NP-001): SHOWCASE_IMAGE — thumbnail JPEG ~640px via sharp.
     // Sengaja FAIL-OPEN (beda dengan video): thumbnail foto adalah optimasi
     // kuota, bukan persyaratan kontrak — upload foto tidak boleh gagal hanya
     // karena pembuatan thumbnail bermasalah. Kegagalan dicatat di log dan
     // field thumbnail tetap undefined (frontend fallback ke imageUrl penuh).
     let imageThumbMeta: Pick<DirectUploadResult, 'thumbnailFileKey' | 'thumbnailUrl'> | undefined;
-    if (purpose === UploadPurpose.SHOWCASE_IMAGE) {
-      imageThumbMeta = await this.processShowcaseImage(userId, fileKey, fileBuffer);
+    if (purpose === UploadPurpose.SHOWCASE_IMAGE && imageBuffer) {
+      imageThumbMeta = await this.processShowcaseImage(userId, fileKey, imageBuffer);
     }
 
     // Batch 1A (ST-004): purpose PRIVAT (KYC/dokumen/bukti) mendapat signed URL
@@ -1065,7 +1290,7 @@ export class UploadService {
       ? this.buildSignedDownloadUrl(fileKey, 900)
       : this.localStorage.getPublicUrl(fileKey);
 
-    return { fileKey, fileUrl, ...videoMeta, ...imageThumbMeta };
+    return { fileKey, fileUrl, ...videoMeta, ...chatVideoThumbMeta, ...imageThumbMeta };
   }
 
   /**
@@ -1073,7 +1298,8 @@ export class UploadService {
    *
    * 1. Cek ffmpeg/ffprobe tersedia (prasyarat deploy di server).
    * 2. Probe durasi + dimensi via ffprobe — gagal parse = bukan video valid.
-   * 3. Tolak bila durasi di luar [MIN, MAX].
+   * 3. Tolak bila durasi di luar [MIN, MAX] (UPV-04: juga tolak bila dimensi
+   *    maksimum > SHOWCASE_VIDEO_MAX_DIMENSION_PX).
    * 4. Generate thumbnail JPEG (lebar 640px) via ffmpeg, disimpan di folder
    *    SHOWCASE_IMAGE milik user yang sama dan DITANDAI terkonfirmasi
    *    (confirmed_upload) supaya langsung bisa dipakai sebagai media showcase.
@@ -1124,6 +1350,16 @@ export class UploadService {
         message: 'Video duration is too short or the file is corrupted',
       });
     }
+    // UPV-04: tolak resolusi absurd (mis. 8K) — fail-closed seperti durasi.
+    if (
+      Math.max(probe.width, probe.height) > SHOWCASE_VIDEO_MAX_DIMENSION_PX
+    ) {
+      await discardVideo();
+      throw new BadRequestException({
+        code: ErrorCodes.VIDEO_RESOLUTION_TOO_HIGH,
+        message: `Resolusi video melebihi batas maksimal ${SHOWCASE_VIDEO_MAX_DIMENSION_PX}p.`,
+      });
+    }
 
     // Thumbnail: key mengikuti pola fileKey aman (lolos isSafeFileKey), folder
     // SHOWCASE_IMAGE milik user yang sama supaya bisa dilampirkan sebagai
@@ -1156,6 +1392,54 @@ export class UploadService {
       durationSec: Math.round(probe.durationSec),
       width: probe.width,
       height: probe.height,
+    };
+  }
+
+  /**
+   * UPV-07 (audit upload video 2026-10-03): thumbnail best-effort untuk video
+   * lampiran privat (chat/sengketa/bukti kirim/milestone).
+   *
+   * BEDA dengan `processShowcaseVideo`:
+   * - FAIL-OPEN: gagal (ffmpeg tak tersedia / file aneh) → return undefined,
+   *   upload video TETAP sukses. Pemanggil (finalizeDirectUpload) menelan
+   *   error dan mencatat warning.
+   * - TANPA validasi durasi/dimensi — chat tidak terikat aturan konten etalase.
+   * - Disimpan di folder privat `chat-attachments/{userId}/` (bukan
+   *   showcase-images) supaya `validateOwnership` di chat.service lolos dan
+   *   URL-nya berupa signed URL kedaluwarsa seperti file induknya.
+   */
+  private async processChatVideoThumbnail(
+    userId: string,
+    fileKey: string,
+  ): Promise<Pick<DirectUploadResult, 'thumbnailFileKey' | 'thumbnailUrl'> | undefined> {
+    if (!this.videoProcessing.isAvailable()) return undefined;
+    const thumbKey = `uploads/chat-attachments/${userId}/${Date.now()}-thumb-${nanoid()}.jpg`;
+    const destPath = this.localStorage.resolvePath(thumbKey);
+    await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+    try {
+      // Frame detik ke-1 (atau tengah bila video < 2 dtk — probe best-effort).
+      let atSecond = 1;
+      try {
+        const probe = await this.videoProcessing.probeVideo(this.localStorage.resolvePath(fileKey));
+        atSecond = Math.min(1, probe.durationSec / 2);
+      } catch {
+        // Probe gagal → coba thumbnail di detik 0; generateThumbnail yang
+        // menentukan fail-open final.
+      }
+      await this.videoProcessing.generateThumbnail(
+        this.localStorage.resolvePath(fileKey),
+        destPath,
+        atSecond,
+        SHOWCASE_VIDEO_THUMBNAIL_WIDTH,
+      );
+    } catch {
+      await this.localStorage.deleteFile(thumbKey).catch(() => undefined);
+      return undefined;
+    }
+    await this.redis.setNx(`confirmed_upload:${userId}:${thumbKey}`, '1', CONFIRMED_KEY_TTL_SECONDS);
+    return {
+      thumbnailFileKey: thumbKey,
+      thumbnailUrl: this.buildSignedDownloadUrl(thumbKey, 900),
     };
   }
 

@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger, Optional } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ConflictException, ForbiddenException, Logger, Optional, PayloadTooLargeException } from '@nestjs/common';
 import { ActionLocationService, type ActionLocationContext } from '../action-location/action-location.service';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -827,8 +827,11 @@ export class UsersService {
 
     const MAX_SIZE = 2 * 1024 * 1024;
     if (fileBuffer.length > MAX_SIZE) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
+      // UPI-07: file kebesaran → 413 terstruktur (konsisten dengan
+      // /v1/upload/direct via fileTooLargeException), bukan 400
+      // VALIDATION_ERROR — agar FE bisa memetakan copy error.
+      throw new PayloadTooLargeException({
+        code: ErrorCodes.FILE_TOO_LARGE,
         message: 'File exceeds maximum allowed size of 2 MB',
       });
     }
@@ -859,10 +862,22 @@ export class UsersService {
 
     const avatarUrl = this.localStorage.getPublicUrl(avatarKey);
 
-    // Hapus avatar lama dari disk (best-effort) — dulu bocor di bucket R2 (R2-F).
-    await this.deleteStoredMediaQuietly(user.avatarUrl, avatarKey);
-
     await this.prisma.user.update({ where: { id: userId }, data: { avatarUrl } });
+    // UPI-06: last-write-wins yang aman untuk upload paralel. Baca ulang
+    // pemenang race: bila URL kita masih live, avatar lama yatim → hapus;
+    // bila kalah, file KITA yang yatim → hapus (jangan sentuh file pemenang).
+    const currentAvatar = await this.prisma.user.findUnique({ where: { id: userId }, select: { avatarUrl: true } });
+    if (currentAvatar?.avatarUrl === avatarUrl) {
+      // Menang: hapus avatar lama dari disk (best-effort) — dulu bocor di bucket R2 (R2-F).
+      await this.deleteStoredMediaQuietly(user.avatarUrl, avatarKey);
+    } else {
+      // Kalah: file kita yatim — hapus best-effort agar tidak menumpuk.
+      try {
+        await this.localStorage.deleteFile(avatarKey);
+      } catch (err) {
+        this.logger.warn(`Failed to delete losing avatar upload ${avatarKey}`, err);
+      }
+    }
     this.invalidateUserOgCaches(user.username);
     // BFI-105: sertakan avatarKey (aditif) — FE memakainya untuk
     // confirmAvatar + cleanup orphan (G-04); pickString FE sudah membaca
@@ -885,6 +900,14 @@ export class UsersService {
         code: ErrorCodes.VALIDATION_ERROR,
         message: 'Invalid avatar key',
       });
+    }
+
+    // UPI-08: idempoten — uploadAvatarDirect SUDAH mem-publish avatar ke DB,
+    // sehingga confirm untuk key yang sudah live adalah no-op. Tanpa ini,
+    // retry/kegagalan transien memicu publish ulang + penghapusan file yang
+    // salah (FE lama bahkan menghapus avatar live sebagai "orphan").
+    if (user.avatarUrl === this.localStorage.getPublicUrl(normalizedKey)) {
+      return { avatarUrl: user.avatarUrl };
     }
 
     // Self-hosted (2026-09-26, SS-007/ST-007): verifikasi ke disk lokal, bukan R2.
@@ -912,7 +935,18 @@ export class UsersService {
       where: { id: userId },
       data: { avatarUrl },
     });
-    await this.deleteStoredMediaQuietly(user.avatarUrl, avatarKey);
+    // UPI-06: last-write-wins yang aman (lihat uploadAvatarDirect). Bila
+    // kalah race, file key ini yatim → hapus best-effort.
+    const currentAvatar = await this.prisma.user.findUnique({ where: { id: userId }, select: { avatarUrl: true } });
+    if (currentAvatar?.avatarUrl === avatarUrl) {
+      await this.deleteStoredMediaQuietly(user.avatarUrl, avatarKey);
+    } else {
+      try {
+        await this.localStorage.deleteFile(avatarKey);
+      } catch (err) {
+        this.logger.warn(`Failed to delete losing avatar confirm ${avatarKey}`, err);
+      }
+    }
     this.invalidateUserOgCaches(user.username);
 
     return { avatarUrl };
@@ -2202,6 +2236,12 @@ export class UsersService {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid header key' });
     }
 
+    // UPI-08: idempoten — uploadHeaderDirect SUDAH mem-publish header ke DB,
+    // sehingga confirm untuk key yang sudah live adalah no-op.
+    if (user.headerUrl === this.localStorage.getPublicUrl(normalizedKey)) {
+      return { headerUrl: user.headerUrl };
+    }
+
     // Self-hosted (2026-09-26): verifikasi ke disk lokal, bukan R2.
     try {
       const size = await this.localStorage.getFileSize(headerKey);
@@ -2218,7 +2258,18 @@ export class UsersService {
     const headerUrl = this.localStorage.getPublicUrl(headerKey);
 
     await this.prisma.user.update({ where: { id: userId }, data: { headerUrl } });
-    await this.deleteStoredMediaQuietly(user.headerUrl, headerKey);
+    // UPI-06: last-write-wins yang aman (lihat uploadAvatarDirect). Bila
+    // kalah race, file key ini yatim → hapus best-effort.
+    const currentHeader = await this.prisma.user.findUnique({ where: { id: userId }, select: { headerUrl: true } });
+    if (currentHeader?.headerUrl === headerUrl) {
+      await this.deleteStoredMediaQuietly(user.headerUrl, headerKey);
+    } else {
+      try {
+        await this.localStorage.deleteFile(headerKey);
+      } catch (err) {
+        this.logger.warn(`Failed to delete losing header confirm ${headerKey}`, err);
+      }
+    }
     this.invalidateUserOgCaches(user.username);
     return { headerUrl };
   }
@@ -2237,8 +2288,10 @@ export class UsersService {
 
     const MAX_SIZE = 5 * 1024 * 1024;
     if (fileBuffer.length > MAX_SIZE) {
-      throw new BadRequestException({
-        code: ErrorCodes.VALIDATION_ERROR,
+      // UPI-07: file kebesaran → 413 terstruktur (konsisten dengan
+      // /v1/upload/direct), bukan 400 VALIDATION_ERROR.
+      throw new PayloadTooLargeException({
+        code: ErrorCodes.FILE_TOO_LARGE,
         message: 'File exceeds maximum allowed size of 5 MB',
       });
     }
@@ -2268,10 +2321,21 @@ export class UsersService {
 
     const headerUrl = this.localStorage.getPublicUrl(headerKey);
 
-    // Hapus header lama dari disk (best-effort).
-    await this.deleteStoredMediaQuietly(user.headerUrl, headerKey);
-
     await this.prisma.user.update({ where: { id: userId }, data: { headerUrl } });
+    // UPI-06: last-write-wins yang aman untuk upload paralel (lihat
+    // uploadAvatarDirect): pemenang menghapus header lama, yang kalah
+    // menghapus file-nya sendiri.
+    const currentHeader = await this.prisma.user.findUnique({ where: { id: userId }, select: { headerUrl: true } });
+    if (currentHeader?.headerUrl === headerUrl) {
+      // Hapus header lama dari disk (best-effort).
+      await this.deleteStoredMediaQuietly(user.headerUrl, headerKey);
+    } else {
+      try {
+        await this.localStorage.deleteFile(headerKey);
+      } catch (err) {
+        this.logger.warn(`Failed to delete losing header upload ${headerKey}`, err);
+      }
+    }
     this.invalidateUserOgCaches(user.username);
     return { headerUrl };
   }

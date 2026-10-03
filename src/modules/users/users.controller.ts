@@ -51,6 +51,7 @@ import { CreateShowcaseItemDto, UpdateShowcaseItemDto } from '../showcase/dto/sh
 import { AttachShowcaseImagesDto, ReorderShowcaseImagesDto } from '../showcase/dto/showcase-image.dto';
 import { TrustDeviceDto } from './dto/trust-device.dto';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
+import { PhoneVerifiedGuard } from '../../common/guards/phone-verified.guard';
 
 @ApiTags('users')
 @ApiBearerAuth('access-token')
@@ -132,7 +133,7 @@ export class UsersController {
   }
 
   @Throttle({ default: { ttl: 60000, limit: 10 } })
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, PhoneVerifiedGuard)
   @Post('me/avatar/confirm')
   async confirmAvatar(
     @CurrentUser('sub') userId: string,
@@ -142,7 +143,7 @@ export class UsersController {
   }
 
   @Post('me/avatar/direct')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, PhoneVerifiedGuard)
   @ApiOperation({ summary: 'Upload avatar directly through the server (bypasses CORS)' })
   @ApiConsumes('multipart/form-data')
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 2 * 1024 * 1024 } }))
@@ -159,7 +160,7 @@ export class UsersController {
 
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @Delete('me/avatar')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, PhoneVerifiedGuard)
   async deleteAvatar(@CurrentUser('sub') userId: string): Promise<{ message: string }> {
     return this.usersService.deleteAvatar(userId);
   }
@@ -175,7 +176,7 @@ export class UsersController {
   }
 
   @Post('me/header/confirm')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, PhoneVerifiedGuard)
   @ApiOperation({ summary: 'Confirm header image upload' })
   async confirmHeader(
     @CurrentUser('sub') userId: string,
@@ -185,7 +186,7 @@ export class UsersController {
   }
 
   @Post('me/header/direct')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, PhoneVerifiedGuard)
   @ApiOperation({ summary: 'Upload header image directly through the server (bypasses CORS)' })
   @ApiConsumes('multipart/form-data')
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 5 * 1024 * 1024 } }))
@@ -201,7 +202,7 @@ export class UsersController {
   }
 
   @Delete('me/header')
-  @UseGuards(UserThrottleGuard)
+  @UseGuards(UserThrottleGuard, PhoneVerifiedGuard)
   @ApiOperation({ summary: 'Delete header image' })
   async deleteHeader(@CurrentUser('sub') userId: string): Promise<{ message: string }> {
     return this.usersService.deleteHeader(userId);

@@ -368,13 +368,15 @@ export class ChunkedUploadService {
           message: 'Assembled file size does not match declared totalSize',
         });
       }
-      const buffer = await fs.promises.readFile(assembledPath);
-      return await this.uploadService.uploadDirect(
+      // UPV-03: JANGAN `readFile` (puncak RAM ~2× ukuran file: buffer rakitan
+      // + buffer uploadDirect). `uploadDirectFromPath` memvalidasi dari disk
+      // (stat + header magic-byte) lalu me-`rename` atomic ke lokasi final.
+      return await this.uploadService.uploadDirectFromPath(
         userId,
         manifest.purpose,
         manifest.fileName,
         manifest.mimeType,
-        buffer,
+        assembledPath,
       );
     } finally {
       await this.destroySession(sessionId).catch(() => undefined);

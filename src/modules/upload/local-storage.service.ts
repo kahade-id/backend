@@ -76,8 +76,15 @@ export class LocalStorageService {
   }
 
   async readFileRange(fileKey: string, start: number, end: number): Promise<Buffer> {
-    const fullPath = this.resolvePath(fileKey);
-    const fd = await fs.promises.open(fullPath, 'r');
+    return this.readFileRangeByPath(this.resolvePath(fileKey), start, end);
+  }
+
+  /**
+   * UPV-03: baca rentang byte dari PATH absolut (tanpa lewat fileKey) —
+   * dipakai `uploadDirectFromPath` untuk magic-byte tanpa `readFile` penuh.
+   */
+  async readFileRangeByPath(absPath: string, start: number, end: number): Promise<Buffer> {
+    const fd = await fs.promises.open(absPath, 'r');
     try {
       const len = end - start + 1;
       const buf = Buffer.alloc(len);
@@ -89,8 +96,11 @@ export class LocalStorageService {
   }
 
   /** Stream file untuk hashing tanpa buffer penuh di memori. */
-  createReadStream(fileKey: string): fs.ReadStream {
-    return fs.createReadStream(this.resolvePath(fileKey));
+  createReadStream(fileKey: string, range?: { start: number; end: number }): fs.ReadStream {
+    // UPV-01: `end` fs inklusif — sama dengan semantik Content-Range.
+    return range
+      ? fs.createReadStream(this.resolvePath(fileKey), { start: range.start, end: range.end })
+      : fs.createReadStream(this.resolvePath(fileKey));
   }
 
   async deleteFile(fileKey: string): Promise<boolean> {

@@ -7,6 +7,7 @@ import { Throttle } from '@nestjs/throttler';
 import { ApiTags, ApiBearerAuth, ApiOperation, ApiConsumes } from '@nestjs/swagger';
 import { ChatService } from './chat.service';
 import { UploadService } from '../upload/upload.service';
+import { MulterTooLargeInterceptor } from '../upload/multer-too-large.interceptor';
 import { UploadPurpose } from '../upload/dto/presigned-url.dto';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
@@ -627,12 +628,19 @@ export class ChatController {
   @HttpCode(200)
   @ApiOperation({ summary: 'Upload a file attachment to a chat room' })
   @ApiConsumes('multipart/form-data')
-  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: CHAT_ATTACHMENT_MAX_BYTES } }))
+  // UPV-02: 413 multer mentah (LIMIT_FILE_SIZE) → `{ code: 'PAYLOAD_TOO_LARGE' }`
+  // terstruktur, sama seperti di UploadController. Urutan di SATU decorator:
+  // MulterTooLargeInterceptor HARUS outermost (index 0) agar catchError-nya
+  // membungkus FileInterceptor yang melempar 413.
+  @UseInterceptors(
+    MulterTooLargeInterceptor,
+    FileInterceptor('file', { limits: { fileSize: CHAT_ATTACHMENT_MAX_BYTES } }),
+  )
   async uploadChatFile(
     @CurrentUser('sub') userId: string,
     @Param('roomId', ParseIdPipe) roomId: string,
     @UploadedFile() file: MulterFile,
-  ): Promise<{ url: string; fileUrl: string; fileKey: string; fileName: string; mimeType: string }> {
+  ): Promise<{ url: string; fileUrl: string; fileKey: string; fileName: string; mimeType: string; thumbnailFileKey?: string; thumbnailUrl?: string }> {
     if (!file) {
       throw new BadRequestException({ code: 'VALIDATION_ERROR', message: 'File is required' });
     }
@@ -660,7 +668,17 @@ export class ChatController {
       (typeof file.originalname === 'string' && file.originalname.trim()) ||
       result.fileKey.split('/').pop() ||
       'file';
-    return { url: readableUrl, fileUrl: readableUrl, fileKey: result.fileKey, fileName, mimeType: file.mimetype };
+    // UPV-07: teruskan thumbnail video (best-effort, undefined bila gagal) —
+    // FE sudah me-render `thumbnailUrl` bila ada (fallback ikon).
+    return {
+      url: readableUrl,
+      fileUrl: readableUrl,
+      fileKey: result.fileKey,
+      fileName,
+      mimeType: file.mimetype,
+      thumbnailFileKey: result.thumbnailFileKey,
+      thumbnailUrl: result.thumbnailUrl,
+    };
   }
 
   @Get('rooms/:roomId/attachments')

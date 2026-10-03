@@ -222,8 +222,27 @@ export const SHOWCASE_VIDEO_MAX_BYTES = 100 * 1024 * 1024;
 export const SHOWCASE_VIDEO_MAX_DURATION_SEC = 180;
 /** Durasi minimum video showcase (detik) — menolak file 0-detik/korup. */
 export const SHOWCASE_VIDEO_MIN_DURATION_SEC = 1;
-/** Guard kasar multer di POST /upload/direct: sedikit di atas batas video. */
-export const UPLOAD_DIRECT_MULTER_MAX_BYTES = 105 * 1024 * 1024;
+/**
+ * UPV-04 (audit upload video 2026-10-03): dimensi maksimum video showcase
+ * (px, sisi terpanjang). 3840 = 4K UHD — video 8K/absurd ditolak fail-closed
+ * (beban decode di HP + storage/bandwidth). Ditegakkan di
+ * `processShowcaseVideo` via hasil ffprobe.
+ */
+export const SHOWCASE_VIDEO_MAX_DIMENSION_PX = 3840;
+/**
+ * Guard kasar multer di POST /upload/direct.
+ *
+ * UPV-08 (audit upload video 2026-10-03): HARUS di bawah
+ * `client_max_body_size 105M` nginx (= 105.000.000 byte) agar guard multer
+ * yang trip duluan — sehingga 413 terstruktur `{ code: 'PAYLOAD_TOO_LARGE' }`
+ * dari `MulterTooLargeInterceptor` yang sampai ke klien, bukan halaman 413
+ * HTML mentah nginx. 104 MiB = 109.051.904 byte (< 105.000.000) dan tetap di
+ * atas batas video showcase 100 MiB.
+ * Rekomendasi infra: naikkan nginx ke `client_max_body_size 115M` agar
+ * selisihnya tidak terlalu tipis (perubahan nginx = akses server, di luar
+ * lingkup commit ini).
+ */
+export const UPLOAD_DIRECT_MULTER_MAX_BYTES = 104 * 1024 * 1024;
 /** Lebar thumbnail video showcase (px); tinggi mengikuti aspek rasio. */
 export const SHOWCASE_VIDEO_THUMBNAIL_WIDTH = 640;
 /** PERF-FIX (NP-001): lebar thumbnail foto showcase (px); tinggi mengikuti

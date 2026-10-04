@@ -225,6 +225,18 @@ export class CreateServiceSlotDto {
   note?: string;
 }
 
+// ── POIN 2 (2026-10-04): booking jasa + buat order escrow ────────────────────
+
+export class BookServiceSlotDto {
+  @ApiPropertyOptional({
+    description: 'Harga jasa disepakati (IDR). Bila kosong, pakai priceMin etalase.',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  priceIdr?: number;
+}
+
 // ── Item 11: SPK ringan ──────────────────────────────────────────────────────
 
 export class CreateAgreementDto {

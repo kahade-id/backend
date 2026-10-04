@@ -1,6 +1,6 @@
 import { IsOptional, IsEnum, IsString, IsInt, Min, Max, IsDateString } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
-import { OrderStatus } from '@prisma/client';
+import { OrderStatus, OrderKind } from '@prisma/client';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 
 export class GetOrdersQueryDto {
@@ -58,4 +58,10 @@ export class GetOrdersQueryDto {
   @IsOptional()
   @IsEnum(['asc', 'desc'])
   sortOrder?: 'asc' | 'desc';
+
+  @ApiPropertyOptional({ description: 'Filter jenis transaksi escrow (POIN 2 2026-10-04)', enum: OrderKind })
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => typeof value === 'string' ? value.toUpperCase() : value)
+  @IsEnum(OrderKind, { message: 'Invalid order kind filter' })
+  kind?: OrderKind;
 }

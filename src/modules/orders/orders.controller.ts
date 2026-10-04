@@ -179,7 +179,7 @@ export class OrdersController {
     page: number;
     limit: number;
   }> {
-    return this.ordersService.getOrders(userId, query.page, query.limit, query.status as OrderStatus | undefined, query.role, query.search, query.from, query.to, query.sortBy, query.sortOrder);
+    return this.ordersService.getOrders(userId, query.page, query.limit, query.status as OrderStatus | undefined, query.role, query.search, query.from, query.to, query.sortBy, query.sortOrder, query.kind);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 30 } })

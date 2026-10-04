@@ -9,7 +9,7 @@ import { FeeCalculatorService } from '../fee-calculator.service';
 import { RealtimeService } from '../../realtime/realtime.service';
 import { NotificationQueueService } from '../../queue/notification-queue.service';
 import { SubscriptionsService } from '../../subscriptions/subscriptions.service';
-import { KycStatus, FeeResponsibility, OrderStatus, OrderType } from '@prisma/client';
+import { KycStatus, FeeResponsibility, OrderStatus, OrderType, OrderKind } from '@prisma/client';
 
 // TRX-009: pii.util di-mock agar decryptPiiSafe deterministik (ciphertext
 // "enc(x)" -> "enc(x)" apa adanya; pola sama seperti admin-users.service.spec).
@@ -907,6 +907,38 @@ describe('OrdersService', () => {
       const result = await service.getOrders('user-db-1', 1, 999) as Record<string, unknown>;
 
       expect(result.limit).toBe(100);
+    });
+
+    // POIN 2 (2026-10-04): filter jenis transaksi escrow.
+
+    it('should filter by order kind when provided', async () => {
+      mockPrisma.order.findMany.mockResolvedValue([]);
+      mockPrisma.order.count.mockResolvedValue(0);
+
+      await service.getOrders('user-db-1', 1, 10, undefined, undefined, undefined, undefined, undefined, undefined, undefined, OrderKind.JASTIP);
+
+      const findManyCall = mockPrisma.order.findMany.mock.calls[0][0];
+      expect(findManyCall.where.orderKind).toBe(OrderKind.JASTIP);
+    });
+
+    it('should include orderKind in each listed order', async () => {
+      const ordersWithRelations = [
+        { ...mockOrder, orderKind: OrderKind.PATUNGAN, buyer: { username: 'b', fullName: 'B', avatarUrl: null }, seller: { username: 's', fullName: 'S', avatarUrl: null } },
+      ];
+      mockPrisma.order.findMany.mockResolvedValue(ordersWithRelations);
+
+      const result = await service.getOrders('user-db-1', 1, 10) as {
+        orders: Array<{ orderKind: OrderKind }>;
+      };
+
+      expect(result.orders[0].orderKind).toBe(OrderKind.PATUNGAN);
+    });
+
+    it('rejects an invalid kind filter instead of returning unfiltered orders', async () => {
+      await expect(
+        service.getOrders('user-db-1', 1, 10, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'BOGUS' as OrderKind),
+      ).rejects.toThrow(BadRequestException);
+      expect(mockPrisma.order.findMany).not.toHaveBeenCalled();
     });
 
     it('should convert BigInt amounts to numbers divided by 100', async () => {

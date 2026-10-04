@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { PatunganService } from '../services/patungan.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { OrderStateService } from '../../orders/order-state.service';
+import { OrdersService } from '../../orders/orders.service';
 import { PatunganMode, PatunganStatus, PatunganParticipantStatus, OrderStatus } from '@prisma/client';
 
 const mockTx: Record<string, any> = {
@@ -22,6 +23,7 @@ const mockPrisma: Record<string, any> = {
   $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
 };
 const mockOrderState = { cancelOrder: jest.fn().mockResolvedValue({ ok: true }) };
+const mockOrdersService = { createOrder: jest.fn() };
 
 const groupDto = {
   title: 'Patungan Kue Lebaran',
@@ -43,6 +45,7 @@ describe('PatunganService', () => {
         PatunganService,
         { provide: PrismaService, useValue: mockPrisma },
         { provide: OrderStateService, useValue: mockOrderState },
+        { provide: OrdersService, useValue: mockOrdersService },
       ],
     }).compile();
     service = module.get<PatunganService>(PatunganService);

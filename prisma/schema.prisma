@@ -62,6 +62,17 @@ enum OrderType {
   OTHER
 }
 
+/// POIN 2 (2026-10-04) — unifikasi transaksi escrow: dimensi JENIS TRANSAKSI,
+/// BERBEDA dengan OrderType (dimensi jenis barang). DIRECT = order normal
+/// (perilaku lama); JASTIP/PATUNGAN/SERVICE_BOOKING = order yang dibuat dari
+/// alur commerce (participant/booking). Dipakai filter list + analitik FE/admin.
+enum OrderKind {
+  DIRECT
+  JASTIP
+  PATUNGAN
+  SERVICE_BOOKING
+}
+
 // --- BE-COMMERCE batch (2026-10-01): tipe produk & entitas commerce -----------
 /// Tipe produk untuk UserShowcase. Dipakai untuk validasi:
 /// resi/ongkir hanya FISIK (sudah ditegakkan di orders.updateShipping via
@@ -1894,6 +1905,9 @@ model Order {
   title       String    @db.VarChar(100)
   description String    @db.VarChar(500)
   orderType   OrderType
+  /// POIN 2 (2026-10-04): jenis transaksi escrow (bukan jenis barang).
+  /// DIRECT = default (order normal, perilaku lama).
+  orderKind   OrderKind @default(DIRECT)
 
   // Financial (in sen / IDR x 100)
   orderValue          BigInt
@@ -2034,6 +2048,7 @@ model Order {
   @@index([status, confirmationDeadlineAt]) // confirmation timeout scheduler
   @@index([status, processingDeadlineAt]) // processing timeout scheduler
   @@index([orderLinkId])
+  @@index([orderKind]) // POIN 2 (2026-10-04): filter list order per jenis transaksi
   @@index([showcaseId]) // SH-B-011: analitik konversi etalase → order
   @@map("orders")
 }

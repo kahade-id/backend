@@ -1,5 +1,5 @@
 import { IsOptional, IsEnum, IsString, IsBoolean, IsIn, IsDateString, IsNotEmpty, MinLength, MaxLength } from 'class-validator';
-import { OrderStatus } from '@prisma/client';
+import { OrderStatus, OrderKind } from '@prisma/client';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import { PaginationDto } from '../../../../common/dto/pagination.dto';
@@ -9,6 +9,12 @@ export class AdminOrderQueryDto extends PaginationDto {
   @IsOptional()
   @IsEnum(OrderStatus)
   status?: OrderStatus;
+
+  @ApiPropertyOptional({ enum: OrderKind, description: 'Filter by jenis transaksi escrow (POIN 2 2026-10-04)' })
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => typeof value === 'string' ? value.toUpperCase() : value)
+  @IsEnum(OrderKind)
+  kind?: OrderKind;
 
   @ApiPropertyOptional({ description: 'Start date filter' })
   @IsOptional()

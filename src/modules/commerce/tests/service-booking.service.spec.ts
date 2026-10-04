@@ -1,7 +1,10 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ServiceBookingService } from '../services/service-booking.service';
 import { PrismaService } from '../../../prisma/prisma.service';
+import { OrdersService } from '../../orders/orders.service';
 import { ProductType, SlotBookingStatus } from '@prisma/client';
+
+const mockOrdersService = { createOrder: jest.fn() };
 
 const mockTx: Record<string, any> = {
   serviceSlot: { updateMany: jest.fn(), update: jest.fn() },
@@ -27,7 +30,7 @@ describe('ServiceBookingService', () => {
     jest.resetAllMocks();
     mockPrisma.$transaction.mockImplementation((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx));
     const module: TestingModule = await Test.createTestingModule({
-      providers: [ServiceBookingService, { provide: PrismaService, useValue: mockPrisma }],
+      providers: [ServiceBookingService, { provide: PrismaService, useValue: mockPrisma }, { provide: OrdersService, useValue: mockOrdersService }],
     }).compile();
     service = module.get<ServiceBookingService>(ServiceBookingService);
   });

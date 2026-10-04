@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { JastipService } from '../services/jastip.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { OrderStateService } from '../../orders/order-state.service';
+import { OrdersService } from '../../orders/orders.service';
 import { JastipTripStatus, JastipParticipantStatus, OrderStatus } from '@prisma/client';
 
 const mockTx: Record<string, any> = {
@@ -20,6 +21,7 @@ const mockPrisma: Record<string, any> = {
   $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
 };
 const mockOrderState = { cancelOrder: jest.fn().mockResolvedValue({ ok: true }) };
+const mockOrdersService = { createOrder: jest.fn() };
 
 const futureDto = {
   title: 'Trip Jakarta',
@@ -42,6 +44,7 @@ describe('JastipService', () => {
         JastipService,
         { provide: PrismaService, useValue: mockPrisma },
         { provide: OrderStateService, useValue: mockOrderState },
+        { provide: OrdersService, useValue: mockOrdersService },
       ],
     }).compile();
     service = module.get<JastipService>(JastipService);

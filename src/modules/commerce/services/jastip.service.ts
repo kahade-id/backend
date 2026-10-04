@@ -1,10 +1,13 @@
-import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, Logger, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { JastipTripStatus, JastipParticipantStatus, OrderStatus, Prisma } from '@prisma/client';
+import { JastipTripStatus, JastipParticipantStatus, OrderStatus, OrderType, OrderKind, FeeResponsibility, Prisma } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { toSen, toIdr } from '../../../common/utils/currency.util';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { OrderStateService } from '../../orders/order-state.service';
+import { OrdersService } from '../../orders/orders.service';
+import { CommerceOrderHooks } from '../commerce-order-hooks';
+import { clampDeadlineDays } from '../commerce-order.util';
 import {
   CreateJastipTripDto,
   AddJastipItemDto,
@@ -34,13 +37,25 @@ const PREPAID_PARTICIPANT_STATUSES: JastipParticipantStatus[] = [
  * return/dispute yang sudah ada, BUKAN logika uang baru di sini).
  */
 @Injectable()
-export class JastipService {
+export class JastipService implements OnModuleInit {
   private readonly logger = new Logger(JastipService.name);
 
   constructor(
     private prisma: PrismaService,
     private orderStateService: OrderStateService,
+    // POIN 2 (2026-10-04): create-order dari peserta memanggil
+    // OrdersService.createOrder secara internal. Satu arah (commerce →
+    // orders); OrdersModule tidak mengimpor CommerceModule → tanpa
+    // circular DI.
+    private ordersService: OrdersService,
   ) {}
+
+  onModuleInit(): void {
+    // POIN 2: peserta yang order-nya dibuat via create-order (belum bayar)
+    // ditandai PAID saat pembayaran terkonfirmasi — via registry statis
+    // CommerceOrderHooks (pola ChatOrderHooks), bukan DI.
+    CommerceOrderHooks.onOrderPaid((orderPublicId) => this.markParticipantPaidByOrder(orderPublicId));
+  }
 
   private async assertHostTrip(hostId: string, tripId: string) {
     const trip = await this.prisma.jastipTrip.findFirst({
@@ -304,9 +319,165 @@ export class JastipService {
   }
 
   /**
+   * POIN 2 (2026-10-04) — unifikasi transaksi escrow: buyer membuat escrow
+   * order LANGSUNG dari peserta (menggantikan pola lama "buat order manual
+   * lalu tempel ID via link-order").
+   *
+   * - Order dibuat via `OrdersService.createOrder` (internal, bukan HTTP)
+   *   dengan `orderKind=JASTIP`; validasi/fee/voucher/notifikasi mengikuti
+   *   alur order normal.
+   * - `participant.orderId` terisi otomatis dalam SATU transaksi DB (advisory
+   *   lock per peserta + predicate status) — dua request konkuren untuk
+   *   peserta yang sama: satu menang, satu Conflict.
+   * - Order berawal BELUM dibayar (WAITING_PAYMENT); peserta tetap
+   *   PRICE_LOCKED sampai pembayaran terkonfirmasi → PAID via
+   *   CommerceOrderHooks (real-time) / syncPaidParticipants (fallback cron).
+   *
+   * Catatan transaksi: `OrdersService.createOrder` menjalankan transaksinya
+   * sendiri (retry serial orderId) sehingga tidak bisa di-nest ke tx luar
+   * Prisma. Urutan di dalam tx: kunci advisory → verifikasi ulang → buat
+   * order → tautkan. Bila createOrder gagal, tx luar rollback tanpa perubahan.
+   */
+  async createOrderFromParticipant(buyerId: string, participantId: string) {
+    const participant = await this.prisma.jastipParticipant.findFirst({
+      where: { id: participantId, buyerId },
+      include: { trip: { select: { id: true, hostId: true, status: true, title: true, orderDeadline: true } } },
+    });
+    if (!participant) {
+      throw new NotFoundException({ code: ErrorCodes.JASTIP_PARTICIPANT_NOT_FOUND, message: 'Peserta tidak ditemukan' });
+    }
+    if (participant.orderId) {
+      throw new ConflictException({ code: ErrorCodes.ORDER_ALREADY_LINKED, message: 'Order sudah dibuat untuk peserta ini' });
+    }
+    if (participant.status !== JastipParticipantStatus.PRICE_LOCKED) {
+      throw new BadRequestException({ code: ErrorCodes.JASTIP_PRICE_NOT_LOCKED, message: 'Harga belum dikunci host' });
+    }
+    if (participant.trip.status !== JastipTripStatus.OPEN) {
+      throw new BadRequestException({ code: ErrorCodes.JASTIP_TRIP_NOT_OPEN, message: 'Trip tidak sedang dibuka' });
+    }
+    if (participant.totalLocked == null || participant.totalLocked <= 0n) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Total harga terkunci tidak valid' });
+    }
+    const host = await this.prisma.user.findUnique({
+      where: { id: participant.trip.hostId },
+      select: { username: true, isActive: true, isBanned: true },
+    });
+    if (!host?.username) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Host trip tidak valid' });
+    }
+
+    const orderValueIdr = toIdr(participant.totalLocked);
+    const title = `Jastip: ${participant.trip.title}`.replace(/[<>"'&]/g, '').trim().slice(0, 100);
+    const breakdown =
+      `Rincian terkunci: barang ${toIdr(participant.goodsAmount ?? 0n)} + fee jastip ${toIdr(participant.jastipFee ?? 0n)} + ongkir ${toIdr(participant.shippingCost ?? 0n)}.`;
+    const description = `Pesanan jastip "${participant.trip.title}" — ${participant.itemSummary}. ${breakdown}`
+      .replace(/[<>"'&]/g, '')
+      .trim()
+      .slice(0, 500);
+    const deliveryDeadlineDays = clampDeadlineDays(participant.trip.orderDeadline);
+
+    return this.prisma.$transaction(async (tx) => {
+      // Serialisasi create-order konkuren untuk peserta yang sama.
+      await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `commerce_create_order:${participant.id}`);
+      const fresh = await tx.jastipParticipant.findUnique({
+        where: { id: participant.id },
+        select: { status: true, orderId: true },
+      });
+      if (!fresh) {
+        throw new NotFoundException({ code: ErrorCodes.JASTIP_PARTICIPANT_NOT_FOUND, message: 'Peserta tidak ditemukan' });
+      }
+      if (fresh.orderId) {
+        throw new ConflictException({ code: ErrorCodes.ORDER_ALREADY_LINKED, message: 'Order sudah dibuat untuk peserta ini' });
+      }
+      if (fresh.status !== JastipParticipantStatus.PRICE_LOCKED) {
+        throw new BadRequestException({ code: ErrorCodes.JASTIP_PRICE_NOT_LOCKED, message: 'Harga belum dikunci host' });
+      }
+      const created = await this.ordersService.createOrder(buyerId, {
+        role: 'BUYER',
+        counterpartUsername: host.username as string,
+        title,
+        description,
+        orderType: OrderType.PHYSICAL_GOODS,
+        orderKind: OrderKind.JASTIP,
+        orderValue: orderValueIdr,
+        deliveryDeadlineDays,
+        feeResponsibility: FeeResponsibility.BUYER,
+      });
+      const orderRow = await tx.order.findUnique({ where: { orderId: created.orderId }, select: { id: true } });
+      if (!orderRow) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Order gagal dibuat' });
+      }
+      const marked = await tx.jastipParticipant.updateMany({
+        where: { id: participant.id, status: JastipParticipantStatus.PRICE_LOCKED, orderId: null },
+        data: { orderId: orderRow.id },
+      });
+      if (marked.count === 0) {
+        throw new ConflictException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Peserta sudah dalam proses' });
+      }
+      return {
+        participantId: participant.id,
+        orderId: created.orderId,
+        orderKind: OrderKind.JASTIP,
+        status: created.status,
+        buyerPayAmount: created.feeCalculation.buyerPayAmount,
+        confirmationDeadlineAt: created.confirmationDeadlineAt,
+      };
+    });
+  }
+
+  /**
+   * Peserta PRICE_LOCKED yang order-nya (dibuat via create-order) sudah
+   * berstatus bayar → PAID. Dipanggil real-time via CommerceOrderHooks
+   * (post-commit pembayaran) dan fallback via syncPaidParticipants (cron).
+   * Idempoten: predicate status, tanpa efek bila sudah PAID/terminal.
+   */
+  async markParticipantPaidByOrder(orderPublicId: string): Promise<void> {
+    const order = await this.prisma.order.findFirst({
+      where: { orderId: orderPublicId, deletedAt: null },
+      select: { id: true, status: true },
+    });
+    if (!order || !PAID_ORDER_STATUSES.includes(order.status)) return;
+    await this.prisma.jastipParticipant.updateMany({
+      where: { orderId: order.id, status: JastipParticipantStatus.PRICE_LOCKED },
+      data: { status: JastipParticipantStatus.PAID },
+    });
+  }
+
+  /**
+   * Fallback cron (CommerceSchedulerService, tiap 5 menit): sinkronkan
+   * peserta PRICE_LOCKED + orderId yang order-nya sudah bayar → PAID.
+   * Menutup celah bila event CommerceOrderHooks terlewat (restart di tengah
+   * pembayaran, dsb.). Mengembalikan jumlah peserta yang disinkronkan.
+   */
+  async syncPaidParticipants(): Promise<number> {
+    const candidates = await this.prisma.jastipParticipant.findMany({
+      where: { status: JastipParticipantStatus.PRICE_LOCKED, orderId: { not: null } },
+      select: { orderId: true },
+      take: 500,
+    });
+    const orderIds = [...new Set(candidates.map((c) => c.orderId as string))];
+    if (orderIds.length === 0) return 0;
+    const paidOrders = await this.prisma.order.findMany({
+      where: { id: { in: orderIds }, status: { in: PAID_ORDER_STATUSES } },
+      select: { id: true },
+    });
+    if (paidOrders.length === 0) return 0;
+    const res = await this.prisma.jastipParticipant.updateMany({
+      where: { orderId: { in: paidOrders.map((o) => o.id) }, status: JastipParticipantStatus.PRICE_LOCKED },
+      data: { status: JastipParticipantStatus.PAID },
+    });
+    return res.count;
+  }
+
+  /**
    * Buyer menautkan escrow order yang SUDAH DIBAYAR (dibuat via alur order
    * normal). Validasi: order milik buyer, seller = host, nilai = total
    * terkunci, status sudah bayar.
+   *
+   * @deprecated POIN 2 (2026-10-04): pola "tempel ID manual" digantikan
+   * `POST /v1/jastip/participants/:id/create-order`
+   * (`createOrderFromParticipant`) — order dibuat internal + orderId terisi
+   * otomatis. Endpoint ini dipertahankan non-breaking untuk klien lama.
    */
   async linkOrder(buyerId: string, participantId: string, dto: LinkJastipOrderDto) {
     const participant = await this.prisma.jastipParticipant.findFirst({

@@ -5,7 +5,7 @@ import { ActionLocationService, type ActionLocationContext } from '../action-loc
 import { RedisService } from '../../redis/redis.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { FeeCalculatorService } from './fee-calculator.service';
-import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, SubscriptionStatus, NotificationType, Prisma, Voucher, VoucherApplicability, VoucherType, CampaignStatus, ChatRoomType, PaymentPurpose, PaymentStatus } from '@prisma/client';
+import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, OrderKind, SubscriptionStatus, NotificationType, Prisma, Voucher, VoucherApplicability, VoucherType, CampaignStatus, ChatRoomType, PaymentPurpose, PaymentStatus } from '@prisma/client';
 import { generateOrderId } from '../../common/utils/id-generator.util';
 import { toSen, toIdr, formatIdr, percentToBpsBigInt } from '../../common/utils/currency.util';
 import { safeBigIntToNumber } from '../../common/utils/bigint.util';
@@ -272,6 +272,9 @@ export class OrdersService {
       title: string;
       description: string;
       orderType: OrderType;
+      // POIN 2 (2026-10-04): jenis transaksi escrow — opsional, default DIRECT.
+      // Diisi JASTIP/PATUNGAN/SERVICE_BOOKING oleh endpoint create-order commerce.
+      orderKind?: OrderKind;
       orderValue: number;
       deliveryDeadlineDays: number;
       deliveryDeadlineAt?: string;
@@ -326,6 +329,8 @@ export class OrdersService {
       title: string;
       description: string;
       orderType: OrderType;
+      // POIN 2 (2026-10-04): jenis transaksi escrow — opsional, default DIRECT.
+      orderKind?: OrderKind;
       orderValue: number;
       deliveryDeadlineDays: number;
       // T3 (audit 2026-09-26): tanggal kalender eksplisit, opsional.
@@ -745,6 +750,8 @@ export class OrdersService {
               orderId, buyerId, sellerId,
               title: sanitizedTitle, description: sanitizedDescription,
               orderType: dto.orderType, orderValue: toSen(dto.orderValue),
+              // POIN 2 (2026-10-04): jenis transaksi — default DIRECT bila tidak diisi.
+              orderKind: dto.orderKind ?? OrderKind.DIRECT,
               feeAmount: txFeeCalc.feeAmount,
               feeResponsibility: dto.feeResponsibility,
               buyerFeeAmount: txFeeCalc.buyerFeeAmount,
@@ -943,7 +950,7 @@ export class OrdersService {
     OrderStatus.IN_DELIVERY,
   ];
 
-  async getOrders(userId: string, page: number, limit: number, status?: OrderStatus, role?: 'BUYER' | 'SELLER' | 'ALL', search?: string, from?: string, to?: string, sortBy?: string, sortOrder?: string): Promise<{
+  async getOrders(userId: string, page: number, limit: number, status?: OrderStatus, role?: 'BUYER' | 'SELLER' | 'ALL', search?: string, from?: string, to?: string, sortBy?: string, sortOrder?: string, kind?: OrderKind): Promise<{
     orders: {
       orderId: string;
       orderNumber: string;
@@ -951,6 +958,8 @@ export class OrdersService {
       description: string;
       status: OrderStatus;
       orderType: OrderType;
+      // POIN 2 (2026-10-04): jenis transaksi escrow — ikut di respons list/detail (dibutuhkan FE + admin).
+      orderKind: OrderKind;
       orderValue: number;
       buyerPayAmount: number;
       sellerReceiveAmount: number;
@@ -1001,6 +1010,15 @@ export class OrdersService {
       } else {
         throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid order status filter' });
       }
+    }
+
+    // POIN 2 (2026-10-04): filter jenis transaksi escrow (opsional).
+    if (kind !== undefined) {
+      const kindStr = String(kind).toUpperCase() as OrderKind;
+      if (!Object.values(OrderKind).includes(kindStr)) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid order kind filter' });
+      }
+      where.orderKind = kindStr;
     }
 
     if (search && search.trim().length > 0) {
@@ -1059,6 +1077,7 @@ export class OrdersService {
         // deskripsi full (s.d. 500 char) hanya di GET /v1/orders/:id.
         title: order.title, description: toExcerpt(order.description), status: order.status,
         orderType: order.orderType,
+        orderKind: order.orderKind,
         orderValue: toIdr(order.orderValue),
         buyerPayAmount: toIdr(order.buyerPayAmount),
         sellerReceiveAmount: toIdr(order.sellerReceiveAmount),
@@ -1155,7 +1174,7 @@ export class OrdersService {
     return {
       order: {
         orderId: order.orderId, title: order.title, description: order.description,
-        orderType: order.orderType, status: order.status,
+        orderType: order.orderType, orderKind: order.orderKind, status: order.status,
         ...(order.status === OrderStatus.CANCELLED ? {
           cancelReason: order.cancelReason ?? null,
           cancelNote: order.cancelNote ?? null,

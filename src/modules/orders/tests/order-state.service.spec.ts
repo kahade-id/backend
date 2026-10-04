@@ -12,6 +12,7 @@ import { FeeCalculatorService } from '../fee-calculator.service';
 import { RealtimeService } from '../../realtime/realtime.service';
 import { MembershipRankService } from '../membership-rank.service';
 import { NotificationQueueService } from '../../queue/notification-queue.service';
+import { EscrowDisbursementService } from '../../no-wallet/escrow-disbursement.service';
 import { OrderStatus, FeeResponsibility, OrderType, Prisma, WalletTransactionType } from '@prisma/client';
 
 const mockOrder = {
@@ -194,6 +195,8 @@ describe('OrderStateService', () => {
         // WalletModeService wajib (constructor non-optional); default mode
         // wallet-aktif agar ekspektasi existing tidak berubah.
         { provide: WalletModeService, useValue: { isWalletEnabled: () => true } },
+        // E1 no-wallet: EscrowDisbursementService wajib (non-optional) sejak M5.
+        { provide: EscrowDisbursementService, useValue: {} },
       ],
     }).compile();
 

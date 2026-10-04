@@ -36,6 +36,7 @@ import { ActionLocationService, type ActionLocationContext } from '../action-loc
 // Dipanggil via registry statis — bukan import service, agar tidak ada
 // circular DI antara modul orders dan chat.
 import { ChatOrderHooks } from '../chat/chat-order-hooks';
+import { CommerceOrderHooks } from '../commerce/commerce-order-hooks';
 
 const VALID_CANCEL_REASONS = [
   'CHANGED_MIND',
@@ -223,6 +224,10 @@ export class OrderStateService {
 
     // Batch 43 BE-CHAT: pesan sistem "bayar diterima" di room order.
     this.runPostCommitBestEffort(() => ChatOrderHooks.emit(orderId, 'ORDER_PAID'), 'CHAT_ORDER_PAID_SYSTEM_MSG');
+    // POIN 2 (2026-10-04): peserta jastip/patungan yang order-nya dibuat via
+    // create-order ditandai PAID saat pembayaran terkonfirmasi (best-effort;
+    // fallback idempoten: scheduler commerce syncPaidParticipants).
+    this.runPostCommitBestEffort(() => CommerceOrderHooks.emitOrderPaid(orderId), 'COMMERCE_ORDER_PAID_SYNC');
 
     return { orderId, status: 'PROCESSING', walletTxId };
   }

@@ -32,6 +32,7 @@ import { BannersController } from './controllers/banners.controller';
 import { AdminBannersController } from './controllers/admin-banners.controller';
 import { AdminGroupBuyingController } from './controllers/admin-group-buying.controller';
 import { AdminJastipTripsController } from './controllers/admin-jastip-trips.controller';
+import { AdminServiceBookingsController } from './controllers/admin-service-bookings.controller';
 import { AdminSellerVouchersController } from './controllers/admin-seller-vouchers.controller';
 import { AdminCommerceRefundsController } from './controllers/admin-commerce-refunds.controller';
 
@@ -78,6 +79,7 @@ import { AdminCommerceRefundsController } from './controllers/admin-commerce-ref
     AdminBannersController,
     AdminGroupBuyingController,
     AdminJastipTripsController,
+    AdminServiceBookingsController,
     AdminSellerVouchersController,
     AdminCommerceRefundsController,
   ],

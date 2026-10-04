@@ -1,10 +1,13 @@
-import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, Logger } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, Logger, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { PatunganStatus, PatunganMode, PatunganParticipantStatus, OrderStatus, DisputeStatus, Prisma } from '@prisma/client';
+import { PatunganStatus, PatunganMode, PatunganParticipantStatus, OrderStatus, DisputeStatus, OrderType, OrderKind, FeeResponsibility, Prisma } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { toSen, toIdr } from '../../../common/utils/currency.util';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { OrderStateService } from '../../orders/order-state.service';
+import { OrdersService } from '../../orders/orders.service';
+import { CommerceOrderHooks } from '../commerce-order-hooks';
+import { clampDeadlineDays } from '../commerce-order.util';
 import { CreatePatunganGroupDto, JoinPatunganDto } from '../dto/commerce.dto';
 
 /** Union penuh agar `.includes(status)` menerima semua nilai enum. */
@@ -19,7 +22,7 @@ export const PATUNGAN_CONTEST_HOURS = 24;
  *
  * TANPA LOGIKA UANG BARU. Modul ini hanya mencatat SYARAT pelepasan escrow:
  * - Setiap peserta bayar via escrow order NORMAL (existing flow), ditautkan
- *   lewat link-order (orderId).
+ *   lewat create-order/link-order (orderId).
  * - Target tercapai → host inisiasi cair → masa sanggah 24 jam (peserta bisa
  *   buka dispute via alur existing) → RELEASED = syarat pelepasan terpenuhi;
  *   pencairan dana aktual tetap lewat penyelesaian order escrow normal.
@@ -28,15 +31,37 @@ export const PATUNGAN_CONTEST_HOURS = 24;
  *   yang sudah dibayar → REFUND_REQUIRED, fail closed).
  * - Overfunding → kelebihan dihitung sebagai pengurang merata per orang
  *   (informatif di response; bukan perubahan nilai order).
+ *
+ * POIN 2 (2026-10-04) — mekanisme khusus → standar (BUKAN jalur paralel):
+ * - "Masa sanggah 24 jam" = ATURAN OTOMATIS sebagai trigger dalam alur
+ *   sengketa STANDAR: selama CONTEST, peserta yang keberatan membuka sengketa
+ *   lewat DisputesService.submitDispute (kategori SERVICE_NOT_RENDERED bila
+ *   jasa/barang tidak diberikan — sudah cukup, tanpa kategori baru);
+ *   processDeadlines MENAHAN rilis (fail closed, perpanjang 24 jam) selama
+ *   ada sengketa terbuka. Tidak ada mesin sengketa khusus patungan.
+ * - "Refund otomatis" = trigger dalam alur refund STANDAR:
+ *   OrderStateService.cancelOrder / adminCancelOrder (via CommerceRefundService
+ *   untuk REFUND_REQUIRED). Tidak ada logika pergerakan dana baru di sini.
  */
 @Injectable()
-export class PatunganService {
+export class PatunganService implements OnModuleInit {
   private readonly logger = new Logger(PatunganService.name);
 
   constructor(
     private prisma: PrismaService,
     private orderStateService: OrderStateService,
+    // POIN 2 (2026-10-04): create-order dari peserta memanggil
+    // OrdersService.createOrder secara internal. Satu arah (commerce →
+    // orders); tanpa circular DI.
+    private ordersService: OrdersService,
   ) {}
+
+  onModuleInit(): void {
+    // POIN 2: peserta yang order-nya dibuat via create-order (belum bayar)
+    // ditandai PAID saat pembayaran terkonfirmasi — via registry statis
+    // CommerceOrderHooks (pola ChatOrderHooks), bukan DI.
+    CommerceOrderHooks.onOrderPaid((orderPublicId) => this.markParticipantPaidByOrder(orderPublicId));
+  }
 
   private async assertHostGroup(hostId: string, groupId: string) {
     const group = await this.prisma.patunganGroup.findFirst({
@@ -283,8 +308,197 @@ export class PatunganService {
   }
 
   /**
+   * POIN 2 (2026-10-04) — unifikasi transaksi escrow: peserta membuat escrow
+   * order LANGSUNG (menggantikan pola lama "buat order manual lalu tempel ID
+   * via link-order").
+   *
+   * - Order dibuat via `OrdersService.createOrder` (internal) dengan
+   *   `orderKind=PATUNGAN`; fee/voucher/notifikasi mengikuti alur normal.
+   * - `participant.orderId` terisi otomatis dalam SATU transaksi DB (advisory
+   *   lock per peserta + predicate status).
+   * - Order berawal BELUM dibayar; peserta tetap PENDING sampai pembayaran
+   *   terkonfirmasi → PAID via CommerceOrderHooks / syncPaidParticipants,
+   *   lalu cek target tercapai (checkAndMarkTargetReached).
+   *
+   * Catatan transaksi: sama seperti jastip — createOrder punya tx sendiri;
+   * urutan: kunci advisory → verifikasi ulang → buat order → tautkan.
+   */
+  async createOrderFromParticipant(userId: string, participantId: string) {
+    const participant = await this.prisma.patunganParticipant.findFirst({
+      where: { id: participantId, userId },
+      include: { group: { select: { id: true, hostId: true, status: true, title: true, deadlineAt: true } } },
+    });
+    if (!participant) {
+      throw new NotFoundException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Data peserta tidak ditemukan' });
+    }
+    if (participant.orderId) {
+      throw new ConflictException({ code: ErrorCodes.ORDER_ALREADY_LINKED, message: 'Order sudah dibuat untuk peserta ini' });
+    }
+    if (participant.status !== PatunganParticipantStatus.PENDING) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Peserta sudah dalam proses / selesai' });
+    }
+    if (participant.group.status !== PatunganStatus.OPEN) {
+      throw new BadRequestException({ code: ErrorCodes.PATUNGAN_NOT_OPEN, message: 'Grup tidak sedang dibuka' });
+    }
+    if (participant.amount <= 0n) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Nominal patungan tidak valid' });
+    }
+    const host = await this.prisma.user.findUnique({
+      where: { id: participant.group.hostId },
+      select: { username: true },
+    });
+    if (!host?.username) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Host grup tidak valid' });
+    }
+
+    const orderValueIdr = toIdr(participant.amount);
+    const title = `Patungan: ${participant.group.title}`.replace(/[<>"'&]/g, '').trim().slice(0, 100);
+    const description = `Kontribusi patungan "${participant.group.title}" — nominal Rp${orderValueIdr}.`
+      .replace(/[<>"'&]/g, '')
+      .trim()
+      .slice(0, 500);
+    const deliveryDeadlineDays = clampDeadlineDays(participant.group.deadlineAt);
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `commerce_create_order:${participant.id}`);
+      const fresh = await tx.patunganParticipant.findUnique({
+        where: { id: participant.id },
+        select: { status: true, orderId: true },
+      });
+      if (!fresh) {
+        throw new NotFoundException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Data peserta tidak ditemukan' });
+      }
+      if (fresh.orderId) {
+        throw new ConflictException({ code: ErrorCodes.ORDER_ALREADY_LINKED, message: 'Order sudah dibuat untuk peserta ini' });
+      }
+      if (fresh.status !== PatunganParticipantStatus.PENDING) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Peserta sudah dalam proses / selesai' });
+      }
+      const created = await this.ordersService.createOrder(userId, {
+        role: 'BUYER',
+        counterpartUsername: host.username as string,
+        title,
+        description,
+        orderType: OrderType.PHYSICAL_GOODS,
+        orderKind: OrderKind.PATUNGAN,
+        orderValue: orderValueIdr,
+        deliveryDeadlineDays,
+        feeResponsibility: FeeResponsibility.BUYER,
+      });
+      const orderRow = await tx.order.findUnique({ where: { orderId: created.orderId }, select: { id: true } });
+      if (!orderRow) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Order gagal dibuat' });
+      }
+      const marked = await tx.patunganParticipant.updateMany({
+        where: { id: participant.id, status: PatunganParticipantStatus.PENDING, orderId: null },
+        data: { orderId: orderRow.id },
+      });
+      if (marked.count === 0) {
+        throw new ConflictException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Peserta sudah dalam proses' });
+      }
+      return {
+        participantId: participant.id,
+        orderId: created.orderId,
+        orderKind: OrderKind.PATUNGAN,
+        status: created.status,
+        buyerPayAmount: created.feeCalculation.buyerPayAmount,
+        confirmationDeadlineAt: created.confirmationDeadlineAt,
+      };
+    });
+  }
+
+  /**
+   * Peserta PENDING yang order-nya (dibuat via create-order) sudah berstatus
+   * bayar → PAID + cek target tercapai. Dipanggil real-time via
+   * CommerceOrderHooks dan fallback via syncPaidParticipants (cron).
+   * Idempoten: predicate status.
+   */
+  async markParticipantPaidByOrder(orderPublicId: string): Promise<void> {
+    const order = await this.prisma.order.findFirst({
+      where: { orderId: orderPublicId, deletedAt: null },
+      select: { id: true, status: true },
+    });
+    if (!order || !PAID_ORDER_STATUSES.includes(order.status)) return;
+    const marked = await this.prisma.patunganParticipant.updateMany({
+      where: { orderId: order.id, status: PatunganParticipantStatus.PENDING },
+      data: { status: PatunganParticipantStatus.PAID, paidAt: new Date() },
+    });
+    if (marked.count === 0) return;
+    const participant = await this.prisma.patunganParticipant.findFirst({
+      where: { orderId: order.id },
+      select: { groupId: true },
+    });
+    if (participant) await this.checkAndMarkTargetReached(participant.groupId);
+  }
+
+  /**
+   * Cek agregat PAID vs target → TARGET_REACHED (kondisional, predicate
+   * status). Dipakai alur baru (paid-flip) dan fallback cron. Balapan dengan
+   * processDeadlines (grup sudah FAILED) → return false, tanpa menimpa.
+   */
+  private async checkAndMarkTargetReached(groupId: string): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const freshGroup = await tx.patunganGroup.findUnique({
+        where: { id: groupId },
+        select: { status: true, targetAmount: true },
+      });
+      if (!freshGroup || freshGroup.status !== PatunganStatus.OPEN) return false;
+      const agg = await tx.patunganParticipant.aggregate({
+        where: { groupId, status: PatunganParticipantStatus.PAID },
+        _sum: { amount: true },
+      });
+      const totalPaid = agg._sum.amount ?? 0n;
+      if (totalPaid < freshGroup.targetAmount) return false;
+      const claimed = await tx.patunganGroup.updateMany({
+        where: { id: groupId, status: PatunganStatus.OPEN },
+        data: { status: PatunganStatus.TARGET_REACHED },
+      });
+      return claimed.count > 0;
+    });
+  }
+
+  /**
+   * Fallback cron (CommerceSchedulerService, tiap 5 menit): sinkronkan
+   * peserta PENDING + orderId yang order-nya sudah bayar → PAID + cek target.
+   * Mengembalikan jumlah peserta yang disinkronkan.
+   */
+  async syncPaidParticipants(): Promise<number> {
+    const candidates = await this.prisma.patunganParticipant.findMany({
+      where: { status: PatunganParticipantStatus.PENDING, orderId: { not: null } },
+      select: { orderId: true },
+      take: 500,
+    });
+    const orderIds = [...new Set(candidates.map((c) => c.orderId as string))];
+    if (orderIds.length === 0) return 0;
+    const paidOrders = await this.prisma.order.findMany({
+      where: { id: { in: orderIds }, status: { in: PAID_ORDER_STATUSES } },
+      select: { id: true },
+    });
+    if (paidOrders.length === 0) return 0;
+    const paidIds = paidOrders.map((o) => o.id);
+    const flipped = await this.prisma.patunganParticipant.updateMany({
+      where: { orderId: { in: paidIds }, status: PatunganParticipantStatus.PENDING },
+      data: { status: PatunganParticipantStatus.PAID, paidAt: new Date() },
+    });
+    if (flipped.count > 0) {
+      const groups = await this.prisma.patunganParticipant.findMany({
+        where: { orderId: { in: paidIds } },
+        select: { groupId: true },
+        distinct: ['groupId'],
+      });
+      for (const g of groups) await this.checkAndMarkTargetReached(g.groupId);
+    }
+    return flipped.count;
+  }
+
+  /**
    * Tautkan escrow order yang SUDAH DIBAYAR (dibuat via alur order normal).
    * Setelah ini, cek otomatis: total PAID >= target → TARGET_REACHED.
+   *
+   * @deprecated POIN 2 (2026-10-04): pola "tempel ID manual" digantikan
+   * `POST /v1/patungan/participants/:id/create-order`
+   * (`createOrderFromParticipant`) — order dibuat internal + orderId terisi
+   * otomatis. Endpoint ini dipertahankan non-breaking untuk klien lama.
    */
   async linkOrder(userId: string, participantId: string, orderId: string) {
     const participant = await this.prisma.patunganParticipant.findFirst({
@@ -427,7 +641,10 @@ export class PatunganService {
 
   /**
    * Host inisiasi pencairan → masa sanggah 24 jam (CONTEST). Selama masa
-   * sanggah, peserta yang keberatan membuka dispute via alur existing.
+   * sanggah, peserta yang keberatan membuka dispute via alur STANDAR
+   * (DisputesService — kategori SERVICE_NOT_RENDERED bila jasa/barang tak
+   * diberikan). Masa sanggah di sini HANYA trigger otomatis (deadline);
+   * bukan mekanisme sengketa paralel — lihat processDeadlines.
    */
   async initiateRelease(hostId: string, groupId: string) {
     const group = await this.assertHostGroup(hostId, groupId);

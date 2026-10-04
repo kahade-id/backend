@@ -2,7 +2,7 @@ import { Controller, Get, Post, Delete, Body, Param, Query, HttpCode } from '@ne
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { ServiceBookingService } from '../services/service-booking.service';
-import { CreateServiceSlotDto } from '../dto/commerce.dto';
+import { CreateServiceSlotDto, BookServiceSlotDto } from '../dto/commerce.dto';
 import { CurrentUser } from '../../../common/decorators/current-user.decorator';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
 import { Public } from '../../../common/decorators/public.decorator';
@@ -47,6 +47,18 @@ export class ServiceBookingController {
   @ApiOperation({ summary: 'Buyer booking slot' })
   bookSlot(@CurrentUser('sub') userId: string, @Param('id') id: string) {
     return this.service.bookSlot(userId, id);
+  }
+
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Post(':id/book-with-order')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Buyer booking slot + buat escrow order (orderKind=SERVICE_BOOKING)' })
+  bookWithOrder(
+    @CurrentUser('sub') userId: string,
+    @Param('id') id: string,
+    @Body() dto: BookServiceSlotDto,
+  ) {
+    return this.service.bookAndCreateOrder(userId, id, dto);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 60 } })

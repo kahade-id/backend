@@ -76,13 +76,21 @@ export class JastipController {
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Post('participants/:participantId/link-order')
   @HttpCode(200)
-  @ApiOperation({ summary: 'Buyer menautkan escrow order yang sudah dibayar' })
+  @ApiOperation({ summary: 'Buyer menautkan escrow order yang sudah dibayar', deprecated: true })
   linkOrder(
     @CurrentUser('sub') buyerId: string,
     @Param('participantId') participantId: string,
     @Body() dto: LinkJastipOrderDto,
   ) {
     return this.service.linkOrder(buyerId, participantId, dto);
+  }
+
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Post('participants/:participantId/create-order')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Buyer membuat escrow order dari peserta (orderKind=JASTIP, orderId terisi otomatis)' })
+  createOrder(@CurrentUser('sub') buyerId: string, @Param('participantId') participantId: string) {
+    return this.service.createOrderFromParticipant(buyerId, participantId);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 20 } })

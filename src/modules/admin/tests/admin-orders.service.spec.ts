@@ -10,6 +10,7 @@ import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
 import { RedisService } from '../../../redis/redis.service';
 import { DashboardService } from '../dashboard/dashboard.service';
+import { UnshippedOrderCancelService } from '../../orders/unshipped-order-cancel.service';
 
 function buildPrisma() {
   const buyerWallet = { id: 'wallet-buyer', availableBalance: 0n, escrowBalance: 0n, totalBalance: 0n, version: 1, isLocked: false };
@@ -48,6 +49,7 @@ describe('AdminOrdersService — forceComplete terminal cleanup', () => {
         { provide: AuditLogService, useValue: { logAdminAction: jest.fn() } },
         { provide: RedisService, useValue: { del: jest.fn().mockResolvedValue(undefined) } },
         { provide: OrderStateService, useValue: {} },
+        { provide: UnshippedOrderCancelService, useValue: {} },
         { provide: FeeCalculatorService, useValue: { getFeeConfig: jest.fn(), getPlusSavingsSen: jest.fn() } },
         { provide: WalletTxSerialService, useValue: { getNext: jest.fn().mockResolvedValue(1) } },
         { provide: ReferralService, useValue: { createReferralRewardIfEligible: jest.fn() } },
@@ -58,7 +60,11 @@ describe('AdminOrdersService — forceComplete terminal cleanup', () => {
     }).compile();
 
     const service = module.get(AdminOrdersService);
-    await expect(service.forceComplete('ORD-1', 'admin-1', { reason: 'Force completion with sufficient operational evidence' })).resolves.toEqual({ orderId: 'ORD-1', status: OrderStatus.COMPLETED });
+    // AUT-013: forceComplete kini wajib re-auth password admin — mock
+    // verifikasi privat agar spec tetap menguji inti cleanup terminal
+    // (bukan jalur re-auth yang sudah dicover spec auth tersendiri).
+    jest.spyOn(service as unknown as { verifyAdminPasswordForForceAction: () => Promise<void> }, 'verifyAdminPasswordForForceAction').mockResolvedValue(undefined);
+    await expect(service.forceComplete('ORD-1', 'admin-1', { reason: 'Force completion with sufficient operational evidence', password: 'test-password' })).resolves.toEqual({ orderId: 'ORD-1', status: OrderStatus.COMPLETED });
 
     expect(prisma.orderExtensionRequest.updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: { orderId: 'order-1', status: 'PENDING' }, data: expect.objectContaining({ status: 'REJECTED' }) }));
     expect(prisma.deliveryProof.updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: { orderId: 'order-1', status: 'SUBMITTED' }, data: expect.objectContaining({ status: 'ACCEPTED' }) }));

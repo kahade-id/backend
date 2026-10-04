@@ -47,13 +47,21 @@ export class PatunganController {
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Post('participants/:participantId/link-order')
   @HttpCode(200)
-  @ApiOperation({ summary: 'Tautkan escrow order yang sudah dibayar ke partisipasi' })
+  @ApiOperation({ summary: 'Tautkan escrow order yang sudah dibayar ke partisipasi', deprecated: true })
   linkOrder(
     @CurrentUser('sub') userId: string,
     @Param('participantId') participantId: string,
     @Body() dto: LinkPatunganOrderDto,
   ) {
     return this.service.linkOrder(userId, participantId, dto.orderId);
+  }
+
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Post('participants/:participantId/create-order')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Buat escrow order dari partisipasi (orderKind=PATUNGAN, orderId terisi otomatis)' })
+  createOrder(@CurrentUser('sub') userId: string, @Param('participantId') participantId: string) {
+    return this.service.createOrderFromParticipant(userId, participantId);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 30 } })

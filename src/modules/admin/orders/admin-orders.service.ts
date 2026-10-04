@@ -77,7 +77,7 @@ export class AdminOrdersService {
   }
 
   async listOrders(query: AdminOrderQueryDto): Promise<PaginatedResponse<Record<string, unknown>>> {
-    const { page = 1, limit = 20, status, startDate, endDate, search, hasEscrow, sortBy, sortOrder } = query;
+    const { page = 1, limit = 20, status, kind, startDate, endDate, search, hasEscrow, sortBy, sortOrder } = query;
     const safePage = Math.max(1, Math.trunc(Number.isFinite(page) ? page : 1));
     const safeLimit = Math.min(100, Math.max(1, Math.trunc(Number.isFinite(limit) ? limit : 20)));
     const skip = (safePage - 1) * safeLimit;
@@ -86,6 +86,11 @@ export class AdminOrdersService {
 
     if (status) {
       where.status = status;
+    }
+
+    // POIN 2 (2026-10-04): filter jenis transaksi escrow.
+    if (kind) {
+      where.orderKind = kind;
     }
 
     if (hasEscrow === true) {

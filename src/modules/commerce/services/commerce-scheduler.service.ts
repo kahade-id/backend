@@ -85,4 +85,23 @@ export class CommerceSchedulerService {
       }
     });
   }
+
+  /**
+   * POIN 2 (2026-10-04): fallback idempoten untuk event CommerceOrderHooks.
+   * Peserta jastip/patungan yang order-nya (dibuat via create-order) sudah
+   * berstatus bayar → PAID. Tiap 5 menit; menutup celah bila emit terlewat
+   * (restart di tengah pembayaran dsb.).
+   */
+  @Cron('*/5 * * * *', { name: 'commerce-sync-paid-participants' })
+  async syncPaidParticipants(): Promise<void> {
+    await this.withLock('cron_lock:commerce_sync_paid_participants', 300, async () => {
+      const [jastip, patungan] = await Promise.all([
+        this.jastipService.syncPaidParticipants(),
+        this.patunganService.syncPaidParticipants(),
+      ]);
+      if (jastip > 0 || patungan > 0) {
+        this.logger.log(`Commerce: sinkronisasi peserta PAID — jastip=${jastip}, patungan=${patungan}`);
+      }
+    });
+  }
 }

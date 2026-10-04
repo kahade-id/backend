@@ -34,7 +34,9 @@ const BUSINESS_DOCUMENT_FOLDER = 'business-documents';
  *  - BusinessVerification membuktikan legalitas usahanya (NPWP/akta/SIUP)
  *    -> badge BUSINESS_VERIFIED
  *
- * Hanya akun `accountType == BUSINESS` yang boleh mengajukan. Review dilakukan
+ * Akun PERSONAL boleh mengajukan; akun yang SUDAH BUSINESS tidak perlu
+ * mengajukan lagi (ditolak di gate). Saat APPROVED, accountType otomatis
+ * dinaikkan ke BUSINESS (BAI-064). Review dilakukan
  * admin lewat AdminBusinessVerificationService (pola sama seperti admin-kyc).
  */
 @Injectable()
@@ -125,10 +127,14 @@ export class BusinessVerificationService {
   }
 
   /**
-   * Gate utama: hanya akun BUSINESS. Dilempar sebagai Forbidden (bukan NotFound)
-   * karena identitasnya memang ada — yang ditolak adalah eligibility-nya.
+   * Gate utama: akun PERSONAL BOLEH mengajukan verifikasi bisnis — hasil
+   * APPROVED otomatis menaikkan accountType ke BUSINESS (BAI-064).
+   * Dilempar sebagai Forbidden (bukan NotFound) bila user tidak ada karena
+   * identitasnya memang ada — yang ditolak adalah eligibility-nya.
+   * Akun yang SUDAH BUSINESS ditolak (tidak perlu mengajukan lagi);
+   * pengajuan APPROVED/PENDING ditangani assertNoActiveSubmission.
    */
-  private async assertBusinessAccount(userId: string): Promise<void> {
+  private async assertEligibleToApply(userId: string): Promise<void> {
     const user = await this.prisma.user.findFirst({
       // Soft-delete guard
       where: { id: userId, deletedAt: null },
@@ -137,10 +143,10 @@ export class BusinessVerificationService {
     if (!user) {
       throw new ForbiddenException({ code: ErrorCodes.FORBIDDEN, message: 'User not found' });
     }
-    if (user.accountType !== UserAccountType.BUSINESS) {
-      throw new ForbiddenException({
-        code: ErrorCodes.BUSINESS_ACCOUNT_REQUIRED,
-        message: 'Business verification is only available for BUSINESS accounts. Switch your account type first.',
+    if (user.accountType === UserAccountType.BUSINESS) {
+      throw new BadRequestException({
+        code: ErrorCodes.BUSINESS_VERIFICATION_ALREADY_APPROVED,
+        message: 'Your account is already a BUSINESS account. No verification submission is needed.',
       });
     }
   }
@@ -221,7 +227,7 @@ export class BusinessVerificationService {
     ipAddress: string | undefined,
     allowRejected = false,
   ): Promise<Record<string, unknown>> {
-    await this.assertBusinessAccount(userId);
+    await this.assertEligibleToApply(userId);
     await this.assertNoActiveSubmission(userId, allowRejected);
     await this.verifyDocumentsConfirmed(userId, dto.documentFileKeys);
 

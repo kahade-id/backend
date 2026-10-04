@@ -1,6 +1,5 @@
 import { IsString, IsOptional, MaxLength, IsEnum, MinLength, IsBoolean, IsEmail, Matches, IsDateString } from 'class-validator';
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { UserAccountType } from '@prisma/client';
 
 export class UpdateProfileDto {
   @ApiPropertyOptional({ description: 'Full name', minLength: 2, maxLength: 60 })
@@ -25,11 +24,6 @@ export class UpdateProfileDto {
   @MaxLength(500, { message: 'Bio must be at most 500 characters' })
   @Matches(/^[^<>]*$/, { message: 'Bio must not contain < or > characters' })
   bio?: string;
-
-  @ApiPropertyOptional({ enum: UserAccountType, description: 'Account type' })
-  @IsOptional()
-  @IsEnum(UserAccountType, { message: 'accountType must be PERSONAL or BUSINESS' })
-  accountType?: UserAccountType;
 
   @ApiPropertyOptional({ description: 'Phone number' })
   @IsOptional()

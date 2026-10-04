@@ -3,7 +3,7 @@ import { ActionLocationService, type ActionLocationContext } from '../action-loc
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
-import { Gender, KycStatus, NotificationType, OrderStatus, Prisma, UserAccountType, UserAuditAction, WalletTransactionType, WithdrawStatus } from '@prisma/client';
+import { Gender, KycStatus, NotificationType, OrderStatus, Prisma, UserAuditAction, WalletTransactionType, WithdrawStatus } from '@prisma/client';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { toIdr } from '../../common/utils/currency.util';
 import { bcryptCompare, decryptAES, sha256 } from '../../common/utils/crypto.util';
@@ -167,7 +167,6 @@ export class UsersService {
     const updateData: Prisma.UserUpdateInput = {};
     if (dto.fullName !== undefined) updateData.fullName = dto.fullName;
     if (dto.bio !== undefined) updateData.bio = dto.bio || null;
-    if (dto.accountType !== undefined) updateData.accountType = dto.accountType as UserAccountType;
     if (dto.contactEmail !== undefined) updateData.contactEmail = dto.contactEmail || null;
     if (dto.contactPhone !== undefined) updateData.contactPhone = dto.contactPhone || null;
     if (dto.dateOfBirth !== undefined) {

@@ -29,6 +29,7 @@ const FLAGGED_AT = new Date('2026-09-12T00:00:00.000Z');
 const mockPrisma: any = {
   user: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
   userSession: { findMany: jest.fn(), updateMany: jest.fn() },
+  businessVerification: { findFirst: jest.fn() },
 };
 const mockRedis = { setex: jest.fn(), get: jest.fn(), del: jest.fn(), exists: jest.fn().mockResolvedValue(0) };
 const mockConfig = { get: jest.fn(() => '15m') };
@@ -326,6 +327,67 @@ describe('AdminUsersService — siklus hidup flaggedForReview (Section 6)', () =
       it('rejects when the tier is not revoked', async () => {
         await expect(service.restoreGrayVerified('user-1', ADMIN_ID)).rejects.toThrow(BadRequestException);
       });
+    });
+  });
+
+  describe('updateUser — accountType gate (POIN 3)', () => {
+    const personal = { id: 'user-1', userId: 'USR-1', accountType: 'PERSONAL' };
+
+    beforeEach(() => {
+      mockPrisma.user.findFirst.mockResolvedValue({ ...personal });
+      mockPrisma.businessVerification.findFirst.mockResolvedValue(null);
+    });
+
+    it('blocks manual upgrade to BUSINESS without an APPROVED BusinessVerification record', async () => {
+      await expect(
+        service.updateUser('user-1', { accountType: 'BUSINESS' as any }, ADMIN_ID, '1.2.3.4'),
+      ).rejects.toThrow(BadRequestException);
+      expect(mockPrisma.businessVerification.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { userId: 'user-1', status: 'APPROVED' } }),
+      );
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('allows manual upgrade to BUSINESS when an APPROVED record exists', async () => {
+      mockPrisma.businessVerification.findFirst.mockResolvedValue({ id: 'bv-1' });
+      const result = await service.updateUser('user-1', { accountType: 'BUSINESS' as any }, ADMIN_ID, '1.2.3.4');
+      expect(result).toMatchObject({ userId: 'USR-1', accountType: 'BUSINESS' });
+      expect(mockVerificationBadge.invalidate).toHaveBeenCalledWith('user-1');
+      expect(mockAudit.logAdminAction).toHaveBeenCalledWith(
+        expect.objectContaining({ action: expect.anything(), targetId: 'user-1' }),
+      );
+    });
+
+    it('still allows manual downgrade to PERSONAL without a verification record', async () => {
+      mockPrisma.user.findFirst.mockResolvedValue({ ...personal, accountType: 'BUSINESS' });
+      const result = await service.updateUser('user-1', { accountType: 'PERSONAL' as any }, ADMIN_ID, '1.2.3.4');
+      expect(result).toMatchObject({ userId: 'USR-1', accountType: 'PERSONAL' });
+      expect(mockPrisma.businessVerification.findFirst).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listUsers — accountType filter (POIN 3)', () => {
+    beforeEach(() => {
+      mockPrisma.user.findMany.mockResolvedValue([]);
+      mockPrisma.user.count.mockResolvedValue(0);
+    });
+
+    it('applies the accountType filter to the where clause', async () => {
+      await service.listUsers(1, 20, undefined, undefined, undefined, undefined, undefined, 'BUSINESS' as any);
+      const where = mockPrisma.user.findMany.mock.calls[0][0].where;
+      expect(where.accountType).toBe('BUSINESS');
+      expect(mockPrisma.user.count.mock.calls[0][0].where.accountType).toBe('BUSINESS');
+    });
+
+    it('exposes accountType in the list projection', async () => {
+      await service.listUsers(1, 20);
+      const select = mockPrisma.user.findMany.mock.calls[0][0].select;
+      expect(select.accountType).toBe(true);
+    });
+
+    it('does not filter when accountType is undefined', async () => {
+      await service.listUsers(1, 20);
+      expect(mockPrisma.user.findMany.mock.calls[0][0].where.accountType).toBeUndefined();
     });
   });
 });

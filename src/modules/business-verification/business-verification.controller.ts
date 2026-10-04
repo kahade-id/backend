@@ -30,13 +30,13 @@ export class BusinessVerificationController {
   @ApiOperation({
     summary: 'Submit business verification (gunakan fileKey dari /upload/confirm)',
     description:
-      'Hanya tersedia untuk akun dengan accountType=BUSINESS. Mengajukan NPWP, nama badan usaha, ' +
+      'Tersedia untuk akun PERSONAL maupun BUSINESS. Mengajukan NPWP, nama badan usaha, ' +
       'nomor akta/SIUP, dan dokumen pendukung untuk direview admin. Mengaktifkan badge ' +
-      '"Business Verified" setelah APPROVED.',
+      '"Business Verified" dan accountType BUSINESS setelah APPROVED.',
   })
   @ApiResponse({ status: 201, description: 'Pengajuan tersimpan dengan status PENDING.' })
   @ApiResponse({ status: 400, description: 'Sudah ada pengajuan PENDING/APPROVED, NPWP duplikat, atau dokumen belum dikonfirmasi.' })
-  @ApiResponse({ status: 403, description: 'Akun bukan BUSINESS, atau verifikasi sebelumnya sudah di-revoke.' })
+  @ApiResponse({ status: 403, description: 'Verifikasi sebelumnya sudah di-revoke, atau akun tidak ditemukan.' })
   async submit(
     @CurrentUser('sub') userId: string,
     @Body() dto: SubmitBusinessVerificationDto,

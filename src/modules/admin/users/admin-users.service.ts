@@ -4,7 +4,7 @@ import { Logger } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { randomUUID } from 'crypto';
-import { Prisma, AuditAction, OrderStatus, WalletTransactionType, WalletTransactionStatus, OtpType, NotificationType, DeletionRequestStatus } from '@prisma/client';
+import { Prisma, AuditAction, OrderStatus, WalletTransactionType, WalletTransactionStatus, OtpType, NotificationType, DeletionRequestStatus, BusinessVerificationStatus, UserAccountType } from '@prisma/client';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
@@ -109,10 +109,10 @@ export class AdminUsersService implements OnModuleInit {
    * melihat email/nomor HP penuh; role lain (mis. CUSTOMER_SUPPORT) mendapat
    * versi ter-mask, sesuai kebijakan `PII_UNMASKED_ROLES`.
    */
-  async listUsers(page = 1, limit = 20, search?: string, status?: string, sortBy?: string, sortOrder?: 'asc' | 'desc', adminRole?: string): Promise<object> {
+  async listUsers(page = 1, limit = 20, search?: string, status?: string, sortBy?: string, sortOrder?: 'asc' | 'desc', adminRole?: string, accountType?: UserAccountType): Promise<object> {
     const safeLimit = Math.min(limit, 100);
     const skip = (page - 1) * safeLimit;
-    const where = this.buildUserWhere(search, status);
+    const where = this.buildUserWhere(search, status, accountType);
 
     const allowedSortFields = ['createdAt', 'lastLoginAt', 'email', 'fullName'];
     const orderField = sortBy && allowedSortFields.includes(sortBy) ? sortBy : 'createdAt';
@@ -128,7 +128,7 @@ export class AdminUsersService implements OnModuleInit {
           id: true, userId: true, username: true, email: true, fullName: true,
           kycStatus: true, isBanned: true, banReason: true,
           emailVerified: true, isActive: true, isKahadePlus: true,
-          membershipRank: true, averageRating: true,
+          membershipRank: true, accountType: true, averageRating: true,
           totalOrdersAsBuyer: true, totalOrdersAsSeller: true, totalOrdersCompleted: true,
           createdAt: true, lastLoginAt: true,
           // Section 6: penanda antrean moderasi (internal admin saja).
@@ -157,7 +157,7 @@ export class AdminUsersService implements OnModuleInit {
    * GAP-E (G380): where filter pengguna bersama untuk list & ekspor CSV.
    * Diekstrak dari listUsers agar ekspor memakai semantik filter yang sama.
    */
-  private buildUserWhere(search?: string, status?: string): Prisma.UserWhereInput {
+  private buildUserWhere(search?: string, status?: string, accountType?: UserAccountType): Prisma.UserWhereInput {
     const where: Prisma.UserWhereInput = { deletedAt: null };
 
     if (search) {
@@ -191,6 +191,10 @@ export class AdminUsersService implements OnModuleInit {
     // Section 6: antrean moderasi — user yang terflag agregasi laporan
     // (>= 3 reporter berbeda dalam 24 jam). Flag ini sinyal saja, bukan sanksi.
     if (status === 'flagged') where.flaggedForReview = true;
+    // POIN 3: filter tipe akun untuk UI admin.
+    if (accountType === UserAccountType.PERSONAL || accountType === UserAccountType.BUSINESS) {
+      where.accountType = accountType;
+    }
     return where;
   }
 
@@ -364,6 +368,21 @@ export class AdminUsersService implements OnModuleInit {
     const changes: Record<string, { before: unknown; after: unknown }> = {};
     const data: Prisma.UserUpdateInput = {};
     if (dto.accountType !== undefined && dto.accountType !== user.accountType) {
+      // POIN 3: upgrade manual ke BUSINESS WAJIB didahului record BusinessVerification
+      // berstatus APPROVED — mencegah self-claim via jalur admin. Downgrade
+      // (mis. BUSINESS -> PERSONAL) tetap boleh tanpa syarat ini.
+      if (dto.accountType === UserAccountType.BUSINESS) {
+        const approved = await this.prisma.businessVerification.findFirst({
+          where: { userId: user.id, status: BusinessVerificationStatus.APPROVED },
+          select: { id: true },
+        });
+        if (!approved) {
+          throw new BadRequestException({
+            code: ErrorCodes.VALIDATION_ERROR,
+            message: 'Cannot set accountType to BUSINESS: user has no APPROVED business verification record',
+          });
+        }
+      }
       data.accountType = dto.accountType;
       changes.accountType = { before: user.accountType, after: dto.accountType };
     }

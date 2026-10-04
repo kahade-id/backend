@@ -43,7 +43,7 @@ export class AdminUsersController {
     @Query() query: UserListQueryDto,
     @CurrentAdmin() admin: AdminJwtPayload,
   ): Promise<object> {
-    return this.service.listUsers(query.page!, query.limit!, query.search, query.status, query.sortBy, query.sortOrder, admin.role);
+    return this.service.listUsers(query.page!, query.limit!, query.search, query.status, query.sortBy, query.sortOrder, admin.role, query.accountType);
   }
 
   @Get(':userId')

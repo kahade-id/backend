@@ -1449,9 +1449,11 @@ model KycReviewAssignment {
 // BUSINESS VERIFICATION (badge "Business Verified")
 // ============================================================
 //
-// Verifikasi badan usaha — BEDA domain dari KycRequest (personal/KTP). Hanya
-// boleh diajukan oleh akun dengan accountType == BUSINESS; enforcement di
-// BusinessVerificationService, bukan di DB (accountType bisa berubah).
+// Verifikasi badan usaha — BEDA domain dari KycRequest (personal/KTP). Akun
+// PERSONAL boleh mengajukan; saat APPROVED, accountType otomatis dinaikkan
+// ke BUSINESS (BAI-064). Enforcement di BusinessVerificationService, bukan
+// di DB (accountType bisa berubah). Akun yang SUDAH BUSINESS tidak perlu
+// mengajukan lagi — ditolak di gate aplikasi.
 //
 // Review lewat admin console dengan pola yang sama persis seperti admin-kyc.service.ts:
 // queue FIFO per status, approve/reject/revoke dengan guard `status = 'PENDING'`

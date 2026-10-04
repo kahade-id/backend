@@ -53,8 +53,10 @@ describe('BusinessVerificationService', () => {
     // clearAllMocks (bukan resetAllMocks) supaya implementasi mock crypto.util
     // yang dideklarasikan di jest.mock() tetap ada.
     jest.clearAllMocks();
-    // Default: akun BUSINESS yang sehat, belum pernah mengajukan, dokumen terkonfirmasi.
-    mockPrisma.user.findFirst.mockResolvedValue({ accountType: UserAccountType.BUSINESS });
+    // Default: akun PERSONAL yang sehat, belum pernah mengajukan, dokumen terkonfirmasi.
+    // POIN 3: PERSONAL boleh mengajukan — gate eligibility kini menolak akun yang
+    // SUDAH BUSINESS atau yang sudah punya pengajuan APPROVED/PENDING.
+    mockPrisma.user.findFirst.mockResolvedValue({ accountType: UserAccountType.PERSONAL });
     mockPrisma.businessVerification.findFirst.mockResolvedValue(null);
     mockPrisma.businessVerification.count.mockResolvedValue(0);
     mockPrisma.businessVerification.findMany.mockResolvedValue([]);
@@ -88,12 +90,18 @@ describe('BusinessVerificationService', () => {
   it('should be defined', () => expect(service).toBeDefined());
 
   describe('submit — eligibility', () => {
-    it('rejects a PERSONAL account with BUSINESS_ACCOUNT_REQUIRED', async () => {
-      mockPrisma.user.findFirst.mockResolvedValue({ accountType: UserAccountType.PERSONAL });
+    it('rejects an already-BUSINESS account (no need to apply)', async () => {
+      mockPrisma.user.findFirst.mockResolvedValue({ accountType: UserAccountType.BUSINESS });
       await expect(service.submit(userId, dto())).rejects.toMatchObject({
-        response: expect.objectContaining({ code: ErrorCodes.BUSINESS_ACCOUNT_REQUIRED }),
+        response: expect.objectContaining({ code: ErrorCodes.BUSINESS_VERIFICATION_ALREADY_APPROVED }),
       });
       expect(mockPrisma.businessVerification.create).not.toHaveBeenCalled();
+    });
+
+    it('allows a PERSONAL account to submit (approval raises accountType to BUSINESS)', async () => {
+      const result = await service.submit(userId, dto());
+      expect(result).toMatchObject({ status: BusinessVerificationStatus.PENDING });
+      expect(mockPrisma.businessVerification.create).toHaveBeenCalled();
     });
 
     it('rejects a soft-deleted account', async () => {

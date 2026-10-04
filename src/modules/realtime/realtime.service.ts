@@ -128,6 +128,35 @@ export class RealtimeService {
     void this.emitSignedToRoom(`chat:${roomId}`, event, data);
   }
 
+  /**
+   * POIN 5 (2026-10-04): room percakapan livechat support (`support:<id>`).
+   * Dipakai SupportChatService untuk event `support.*`.
+   */
+  emitToSupportRoom(conversationId: string, event: string, data: unknown): void {
+    if (!this.server) return;
+    void this.emitSignedToRoom(`support:${conversationId}`, event, data);
+  }
+
+  /**
+   * POIN 5: room pribadi admin (`admin:<adminId>`) — untuk event yang ditujukan
+   * ke agen tertentu (mis. pesan baru di percakapan yang ia tangani) tanpa
+   * harus join tiap room percakapan.
+   */
+  emitToAdmin(adminId: string, event: string, data: unknown): void {
+    if (!this.server) return;
+    void this.emitSignedToRoom(`admin:${adminId}`, event, data);
+  }
+
+  /**
+   * POIN 5: room bersama semua agen support (`support:agents`) — untuk
+   * perubahan antrean (percakapan dibuat/di-claim/ditutup/dieskalasi).
+   * Socket admin di-join otomatis ke room ini saat konek (lihat gateway).
+   */
+  emitToSupportAgents(event: string, data: unknown): void {
+    if (!this.server) return;
+    void this.emitSignedToRoom('support:agents', event, data);
+  }
+
   async setUserPresence(userId: string, online: boolean): Promise<void> {
     try {
       if (online) {

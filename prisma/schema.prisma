@@ -350,6 +350,11 @@ enum NotificationType {
   DISPUTE_CLAIM_SUBMITTED
   DISPUTE_ESCALATED
   CHAT_NEW_MESSAGE
+  // POIN 5 (2026-10-04): balasan agen livechat support ke user. Berbeda dengan
+  // CHAT_NEW_MESSAGE (yang sengaja tidak masuk notifikasi in-app per keputusan
+  // produk 2026-10-03): balasan agen jarang & penting, user perlu tahu walau
+  // layar chat tidak terbuka.
+  SUPPORT_AGENT_REPLY
   WALLET_TOPUP_SUCCESS
   WALLET_TOPUP_FAILED
   WALLET_WITHDRAW_SUCCESS
@@ -1051,6 +1056,9 @@ model User {
   // Section 4: upvote pertanyaan profil
   questionUpvotes           ProfileQuestionUpvote[]
   supportTickets            SupportTicket[]           @relation("UserSupportTickets")
+  // POIN 5 (2026-10-04): percakapan livechat support milik user.
+  supportConversations      SupportConversation[]     @relation("UserSupportConversations")
+  supportMessagesSent       SupportMessage[]          @relation("SupportMessageUser")
   showcaseItems             UserShowcase[]
   // Section 3: interaksi sosial pada showcase (like & komentar)
   showcaseLikes             ShowcaseLike[]
@@ -3373,6 +3381,9 @@ model AdminUser {
 
   // GAP-F G426–G450 (append-only): relasi balik moderasi Q&A.
   qaReportAssignments QaReport[]               @relation("QaReportAssignee")
+  // POIN 5 (2026-10-04): percakapan livechat support yang ditangani admin ini.
+  assignedSupportConversations SupportConversation[] @relation("SupportConversationAgent")
+  supportMessagesSent          SupportMessage[]      @relation("SupportMessageAgent")
   qaModerationEvents  QaModerationEvent[]      @relation("QaEventActor")
   qaDeleteRequests    QaDeleteRequest[]        @relation("QaDeleteRequester")
   qaDeleteApprovals   QaDeleteRequest[]        @relation("QaDeleteApprover")
@@ -3900,6 +3911,15 @@ model SupportTicket {
   // Di-set saat tiket dibuat via SubscriptionsService.isActive().
   priority         Boolean               @default(false)
 
+  // POIN 5 (2026-10-04): tiket HANYA dibuat admin (eskalasi livechat untuk
+  // masalah yang tak terselesaikan langsung). Kolom asal + transkrip:
+  sourceType       SupportTicketSource   @default(APP)
+  // Percakapan livechat asal eskalasi (null untuk tiket non-eskalasi).
+  sourceChatRoomId String?
+  sourceConversation SupportConversation? @relation("TicketSourceConversation", fields: [sourceChatRoomId], references: [id], onDelete: SetNull)
+  // Snapshot teks transkrip percakapan saat eskalasi (bukan relasi hidup).
+  transcriptText   String?               @db.Text
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -3909,6 +3929,7 @@ model SupportTicket {
   @@index([status])
   @@index([priority])
   @@index([relatedArticleId])
+  @@index([sourceChatRoomId])
   @@map("support_tickets")
 }
 
@@ -3927,6 +3948,105 @@ model SupportTicketReply {
 
   @@index([ticketId])
   @@map("support_ticket_replies")
+}
+
+// ============================================================
+// SUPPORT LIVECHAT (POIN 5, gelombang 1 — 2026-10-04)
+// ============================================================
+// Keputusan desain: model BARU, bukan reuse ChatRoom. Alasan:
+//  1. ChatRoom terikat semantik commerce (ORDER/INQUIRY, buyer/seller,
+//     grace period order, pipeline moderasi Trust & Safety, pesan ephemeral,
+//     polling/star/pin) — tidak satu pun berlaku untuk percakapan support.
+//  2. Status tidak kompatibel: ChatRoomStatus {ACTIVE, CLOSED} vs alur
+//     antrean {WAITING, ASSIGNED, OPEN, CLOSED}.
+//  3. Batas otorisasi bersih: mencampur support ke ChatRoom akan
+//     membocorkan percakapan support ke daftar chat user (dan sebaliknya)
+//     lewat API chat yang sudah ada.
+//  4. Migrasi aditif murni — tabel chat yang panas tidak disentuh.
+
+// WAITING  : dibuat user, menunggu di antrean agen.
+// ASSIGNED : agen mengambil alih, belum ada balasan agen.
+// OPEN     : percakapan aktif (agen sudah membalas).
+// CLOSED   : selesai/ditutup (oleh user atau agen).
+enum SupportConversationStatus {
+  WAITING
+  ASSIGNED
+  OPEN
+  CLOSED
+}
+
+enum SupportMessageSenderType {
+  USER
+  AGENT
+  SYSTEM
+}
+
+// Asal tiket. Sejak POIN 5 tiket HANYA dibuat admin (eskalasi livechat);
+// nilai APP/HELP_SITE untuk kompatibilitas baris lama & kanal lain.
+enum SupportTicketSource {
+  APP
+  HELP_SITE
+  CHAT_ESCALATION
+}
+
+model SupportConversation {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation("UserSupportConversations", fields: [userId], references: [id], onDelete: Cascade)
+
+  status SupportConversationStatus @default(WAITING)
+
+  // Agen yang menangani (AdminUser ber-role CUSTOMER_SUPPORT/SUPER_ADMIN).
+  assignedAgentId String?
+  assignedAgent   AdminUser? @relation("SupportConversationAgent", fields: [assignedAgentId], references: [id], onDelete: SetNull)
+  assignedAt      DateTime?
+
+  // Kanal asal percakapan: aplikasi mobile atau bantuan.kahade.id.
+  source SupportTicketSource @default(APP)
+  subject String? @db.VarChar(200)
+  // Prioritas Kahade+ — dihitung saat percakapan dibuat (seperti tiket).
+  priority Boolean @default(false)
+
+  closedAt     DateTime?
+  closedByType SupportMessageSenderType?
+  closedById   String?
+
+  // Penilaian user setelah CLOSED (1-5), seperti rating tiket.
+  rating        Int?
+  ratingComment String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages         SupportMessage[]
+  escalatedTickets SupportTicket[]  @relation("TicketSourceConversation")
+
+  @@index([userId, status])
+  // Antrean agen: WAITING diurutkan prioritas dulu, lalu FIFO.
+  @@index([status, priority, createdAt])
+  @@index([assignedAgentId, status])
+  @@map("support_conversations")
+}
+
+model SupportMessage {
+  id             String              @id @default(cuid())
+  conversationId String
+  conversation   SupportConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  senderType SupportMessageSenderType
+  // Tepat satu terisi sesuai senderType: USER → senderUser, AGENT → senderAdmin.
+  senderUserId  String?
+  senderUser    User?      @relation("SupportMessageUser", fields: [senderUserId], references: [id], onDelete: SetNull)
+  senderAdminId String?
+  senderAdmin   AdminUser? @relation("SupportMessageAgent", fields: [senderAdminId], references: [id], onDelete: SetNull)
+
+  content     String? @db.Text
+  attachments Json    @default("[]")
+
+  createdAt DateTime @default(now())
+
+  @@index([conversationId, createdAt])
+  @@map("support_messages")
 }
 
 // Feedback pengguna (G-001). Bisa dikirim guest (userId null) — auth opsional.

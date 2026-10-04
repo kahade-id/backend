@@ -12,21 +12,32 @@ import { Logger, OnModuleDestroy, Optional } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { AdminRole } from '@prisma/client';
+import type { SupportConversationStatus } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { RealtimeService } from './realtime.service';
 import { NotificationsService } from '../notifications/notifications.service';
-import { TOKEN_ISSUER, USER_TOKEN_AUDIENCE } from '../auth/token.service';
-import { TOKEN_BLACKLIST, SESSION_REVOKED_KEY } from '../../common/constants/redis-keys';
+import { TOKEN_ISSUER, USER_TOKEN_AUDIENCE, ADMIN_TOKEN_AUDIENCE } from '../auth/token.service';
+import { TOKEN_BLACKLIST, SESSION_REVOKED_KEY, ADMIN_TOKEN_BLACKLIST } from '../../common/constants/redis-keys';
 import { TYPING_HOLD_MS, TYPING_REBROADCAST_INTERVAL_MS } from '../../common/constants/app.constants';
 import { wsOnConnect, wsOnDisconnect } from '../observability/ws-metrics.service';
+import { SupportChatService } from '../support/support-chat.service';
 
 interface AuthenticatedSocket extends Socket {
   userId?: string;
+  /** POIN 5: 'admin' untuk agen support (token admin), 'user' untuk pengguna. */
+  role?: 'user' | 'admin';
+  adminId?: string;
+  adminRole?: AdminRole;
+  /** Room support.* yang di-join socket ini (untuk event leave saat disconnect). */
+  _supportRooms?: Set<string>;
   _connectionLeaseRegistered?: boolean;
   _connectionLeaseKey?: string;
   _presenceRegistered?: boolean;
   _tokenExp?: number;
+  _tokenIat?: number;
+  _isAdminToken?: boolean;
   _jti?: string;
   _sessionId?: string;
   _hmacSessionKey?: string;
@@ -117,6 +128,10 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     private prisma: PrismaService,
     private redisService: RedisService,
     private realtimeService: RealtimeService,
+    // POIN 5: handler livechat support. Disediakan SupportModule yang
+    // di-import RealtimeModule (tidak sirkular: SupportModule tidak
+    // meng-import RealtimeModule).
+    private supportChatService: SupportChatService,
     @Optional() private notificationsService?: NotificationsService,
   ) {}
 
@@ -226,11 +241,32 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
         checks.push(this.realtimeService.refreshUserPresence(client.userId));
         checks.push(this.redisService.expire(`${this.WS_CONN_PREFIX}${client.userId}`, this.WS_CONN_TTL));
       }
+      if (client.adminId) {
+        checks.push(this.realtimeService.refreshUserPresence(client.adminId));
+        checks.push(this.redisService.expire(`${this.WS_CONN_PREFIX}admin:${client.adminId}`, this.WS_CONN_TTL));
+      }
       if (client._jti) {
+        // POIN 5: token admin memakai daftar blacklist admin yang terpisah.
+        const blacklistKey = client._isAdminToken ? ADMIN_TOKEN_BLACKLIST(client._jti) : TOKEN_BLACKLIST(client._jti);
         checks.push(
-          this.redisService.get(TOKEN_BLACKLIST(client._jti), { throwOnError: true }).then(revoked => {
+          this.redisService.get(blacklistKey, { throwOnError: true }).then(revoked => {
             if (revoked) {
               client.emit('error', { message: 'Token revoked' });
+              client.disconnect(true);
+            }
+          }),
+        );
+      }
+      // POIN 5: token admin yang dicabut via admin_revoked:<id> (pola JwtAdminGuard).
+      if (client._isAdminToken && client.adminId) {
+        const adminId = client.adminId;
+        const issuedAt = client._tokenIat ?? 0;
+        checks.push(
+          this.redisService.get(`admin_revoked:${adminId}`, { throwOnError: true }).then(raw => {
+            if (!raw) return;
+            const revokedAt = Number(raw);
+            if (!Number.isFinite(revokedAt) || revokedAt <= 1 || issuedAt <= revokedAt) {
+              client.emit('error', { message: 'Admin token has been revoked' });
               client.disconnect(true);
             }
           }),
@@ -262,6 +298,19 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     return match ? match[1] : null;
   }
 
+  /**
+   * POIN 5 (2026-10-04): DUA jalur autentikasi pada SATU gateway (namespace `/`).
+   *   1. Token user (aplikasi mobile / bantuan.kahade.id) — jalur existing.
+   *   2. Token admin (agen support dari admin.kahade.id) — secret & audience
+   *      berbeda (jwt.adminSecret / kahade-admin-api); hanya role
+   *      SUPER_ADMIN & CUSTOMER_SUPPORT yang diterima.
+   *
+   * Satu gateway dipakai ulang (bukan @WebSocketGateway baru) supaya auth
+   * fail-closed, rate limit, lease koneksi, presence, dan HMAC tetap satu
+   * implementasi — menduplikasi ~400 baris auth berisiko security drift.
+   * Event livechat support memakai prefix `support.*` dan room
+   * `support:<conversationId>`.
+   */
   async handleConnection(client: AuthenticatedSocket): Promise<void> {
     try {
       const token =
@@ -276,55 +325,92 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
         return;
       }
 
-      const secret = this.configService.get<string>('jwt.secret');
-      const payload = await this.jwtService.verifyAsync(token, {
-        secret,
-        audience: USER_TOKEN_AUDIENCE,
-        issuer: TOKEN_ISSUER,
-        algorithms: ['HS256'],
-      });
-
-      if (!payload?.sub) {
-        client.emit('error', { message: 'Invalid token payload' });
-        client.disconnect(true);
-        return;
-      }
-
+      // 1) Coba token user (jalur existing).
+      let principal: { kind: 'user'; payload: any } | { kind: 'admin'; payload: any; role: AdminRole } | null = null;
       try {
-        if (payload.jti) {
-          const isBlacklisted = await this.redisService.get(TOKEN_BLACKLIST(payload.jti), { throwOnError: true });
-          if (isBlacklisted) {
-            client.emit('error', { message: 'Token has been revoked' });
-            client.disconnect(true);
-            return;
-          }
-        }
-        if (payload.sessionId) {
-          const sessionRevoked = await this.redisService.get(SESSION_REVOKED_KEY(payload.sessionId), { throwOnError: true });
-          if (sessionRevoked) {
-            client.emit('error', { message: 'Session has been revoked' });
-            client.disconnect(true);
-            return;
-          }
-        }
+        const userPayload = await this.jwtService.verifyAsync(token, {
+          secret: this.configService.get<string>('jwt.secret'),
+          audience: USER_TOKEN_AUDIENCE,
+          issuer: TOKEN_ISSUER,
+          algorithms: ['HS256'],
+        });
+        if (userPayload?.sub) principal = { kind: 'user', payload: userPayload };
       } catch {
-        this.logger.error('Redis unavailable during WS auth — rejecting connection (fail-closed)');
-        client.emit('error', { message: 'Service temporarily unavailable' });
+        // Bukan token user — lanjut ke percobaan token admin di bawah.
+      }
+
+      // 2) Fallback: token admin (agen support).
+      if (!principal) {
+        let unavailable = false;
+        let adminAuth: { payload: any; role: AdminRole } | null = null;
+        try {
+          adminAuth = await this.verifySupportAdminToken(token);
+        } catch {
+          // Redis down saat verifikasi admin — fail-closed seperti jalur user.
+          unavailable = true;
+        }
+        if (unavailable) {
+          this.logger.error('Redis unavailable during WS admin auth — rejecting connection (fail-closed)');
+          client.emit('error', { message: 'Service temporarily unavailable' });
+          client.disconnect(true);
+          return;
+        }
+        if (adminAuth) principal = { kind: 'admin', payload: adminAuth.payload, role: adminAuth.role };
+      }
+
+      if (!principal) {
+        client.emit('error', { message: 'Authentication failed' });
         client.disconnect(true);
         return;
       }
 
-      const wsUser = await this.prisma.user.findUnique({
-        where: { id: payload.sub },
-        select: { isActive: true, isBanned: true },
-      });
-      if (!wsUser || !wsUser.isActive || wsUser.isBanned) {
-        client.emit('error', { message: wsUser?.isBanned ? 'Account banned' : 'Account inactive' });
-        client.disconnect(true);
-        return;
+      const payload = principal.payload;
+      const principalId: string = payload.sub;
+
+      // Pemeriksaan khusus token user (blacklist, sesi, status akun) — sama
+      // persis seperti sebelum POIN 5. Pemeriksaan token admin sudah dilakukan
+      // di verifySupportAdminToken (pola JwtAdminGuard).
+      if (principal.kind === 'user') {
+        try {
+          if (payload.jti) {
+            const isBlacklisted = await this.redisService.get(TOKEN_BLACKLIST(payload.jti), { throwOnError: true });
+            if (isBlacklisted) {
+              client.emit('error', { message: 'Token has been revoked' });
+              client.disconnect(true);
+              return;
+            }
+          }
+          if (payload.sessionId) {
+            const sessionRevoked = await this.redisService.get(SESSION_REVOKED_KEY(payload.sessionId), { throwOnError: true });
+            if (sessionRevoked) {
+              client.emit('error', { message: 'Session has been revoked' });
+              client.disconnect(true);
+              return;
+            }
+          }
+        } catch {
+          this.logger.error('Redis unavailable during WS auth — rejecting connection (fail-closed)');
+          client.emit('error', { message: 'Service temporarily unavailable' });
+          client.disconnect(true);
+          return;
+        }
+
+        const wsUser = await this.prisma.user.findUnique({
+          where: { id: principalId },
+          select: { isActive: true, isBanned: true },
+        });
+        if (!wsUser || !wsUser.isActive || wsUser.isBanned) {
+          client.emit('error', { message: wsUser?.isBanned ? 'Account banned' : 'Account inactive' });
+          client.disconnect(true);
+          return;
+        }
       }
 
-      const connKey = `${this.WS_CONN_PREFIX}${payload.sub}`;
+      // Lease koneksi per-principal. Admin memakai namespace kunci sendiri
+      // agar tidak bertabrakan dengan user (id dari tabel berbeda).
+      const connKey = principal.kind === 'admin'
+        ? `${this.WS_CONN_PREFIX}admin:${principalId}`
+        : `${this.WS_CONN_PREFIX}${principalId}`;
       const currentCount = await this.redisService.incr(connKey);
       client._connectionLeaseRegistered = true;
       // AUDIT-19: remember the lease key so the outer catch below can release it even
@@ -351,15 +437,26 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
         return;
       }
 
-      client.userId = payload.sub;
+      if (principal.kind === 'admin') {
+        client.adminId = principalId;
+        client.role = 'admin';
+        client.adminRole = principal.role;
+        client._isAdminToken = true;
+      } else {
+        client.userId = principalId;
+        client.role = 'user';
+      }
       // G493: metrik koneksi WebSocket (tanpa userId/IP di store — hanya counter).
       wsOnConnect(
         client.id,
-        payload.sub,
+        principalId,
         (client.handshake.auth?.appVersion ?? client.handshake.query?.appVersion) as string | undefined,
       );
       if (payload.exp) {
         client._tokenExp = payload.exp;
+      }
+      if (typeof payload.iat === 'number') {
+        client._tokenIat = payload.iat;
       }
       if (payload.jti) {
         client._jti = payload.jti;
@@ -367,9 +464,6 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
       if (payload.sessionId) {
         client._sessionId = payload.sessionId;
       }
-      await client.join(`user:${payload.sub}`);
-      await this.realtimeService.setUserPresence(payload.sub, true);
-      client._presenceRegistered = true;
 
       if (this.realtimeService.isHmacEnabled()) {
         const sessionKey = this.realtimeService.generateSessionKey();
@@ -377,12 +471,32 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
         client.emit('session_hmac_token', { token: sessionKey });
       }
 
-      const userRooms = await this.getUserPresenceRooms(payload.sub);
-      for (const room of userRooms) {
-        await this.realtimeService.emitSignedToRoomExcept(room, client.id, 'user.online', { userId: payload.sub });
-      }
+      if (principal.kind === 'admin') {
+        await client.join(`admin:${principalId}`);
+        // Room bersama agen support — untuk event perubahan antrean.
+        await client.join('support:agents');
+        await this.realtimeService.setUserPresence(principalId, true);
+        client._presenceRegistered = true;
 
-      this.logger.debug(`Client connected: ${client.id} (user: ${payload.sub})`);
+        const agentRooms = await this.getAdminPresenceRooms(principalId);
+        for (const room of agentRooms) {
+          await this.realtimeService.emitSignedToRoomExcept(room, client.id, 'support.agent_presence', {
+            agentId: principalId,
+            online: true,
+          });
+        }
+        this.logger.debug(`Admin client connected: ${client.id} (admin: ${principalId}, role: ${principal.role})`);
+      } else {
+        await client.join(`user:${principalId}`);
+        await this.realtimeService.setUserPresence(principalId, true);
+        client._presenceRegistered = true;
+
+        const userRooms = await this.getUserPresenceRooms(principalId);
+        for (const room of userRooms) {
+          await this.realtimeService.emitSignedToRoomExcept(room, client.id, 'user.online', { userId: principalId });
+        }
+        this.logger.debug(`Client connected: ${client.id} (user: ${principalId})`);
+      }
     } catch {
       // AUDIT-19: release a lease that was registered before the failure; otherwise the
       // slot stays counted for the whole TTL and repeated failures permanently exhaust
@@ -398,39 +512,145 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
     }
   }
 
+  /**
+   * Verifikasi token admin untuk agen support — pola JwtAdminGuard
+   * (blacklist jti, admin_revoked, status akun, kunci) + pembatasan role
+   * support. Mengembalikan null bila BUKAN token admin yang valid;
+   * melempar bila Redis tidak tersedia (fail-closed di pemanggil).
+   */
+  private async verifySupportAdminToken(token: string): Promise<{ payload: any; role: AdminRole } | null> {
+    let payload: any;
+    try {
+      payload = await this.jwtService.verifyAsync(token, {
+        secret: this.configService.get<string>('jwt.adminSecret'),
+        audience: ADMIN_TOKEN_AUDIENCE,
+        issuer: TOKEN_ISSUER,
+        algorithms: ['HS256'],
+      });
+    } catch {
+      return null;
+    }
+    if (!payload?.sub || !payload?.jti) return null;
+
+    const isBlacklisted = await this.redisService.get(ADMIN_TOKEN_BLACKLIST(payload.jti), { throwOnError: true });
+    if (isBlacklisted) return null;
+
+    const revokedAtRaw = await this.redisService.get(`admin_revoked:${payload.sub}`, { throwOnError: true });
+    if (revokedAtRaw) {
+      const revokedAt = Number(revokedAtRaw);
+      const issuedAt = typeof payload.iat === 'number' ? payload.iat : 0;
+      if (!Number.isFinite(revokedAt) || revokedAt <= 1 || issuedAt <= revokedAt) return null;
+    }
+
+    const admin = await this.prisma.adminUser.findUnique({
+      where: { id: payload.sub },
+      select: { isActive: true, deletedAt: true, lockedUntil: true, role: true },
+    });
+    if (!admin || !admin.isActive || admin.deletedAt) return null;
+    if (admin.lockedUntil && admin.lockedUntil > new Date()) return null;
+    if (admin.role !== AdminRole.CUSTOMER_SUPPORT && admin.role !== AdminRole.SUPER_ADMIN) return null;
+    return { payload, role: admin.role };
+  }
+
   async handleDisconnect(client: AuthenticatedSocket): Promise<void> {
     // G493: metrik koneksi WebSocket.
-    wsOnDisconnect(client.id, client.userId);
-    if (client.userId) {
+    const principalId = client.userId ?? client.adminId;
+    wsOnDisconnect(client.id, principalId);
+    if (principalId) {
       // Putus koneksi tidak boleh meninggalkan indikator "sedang mengetik"
-      // yang menyala selamanya di layar lawan bicara.
-      const typingKeys = [...this.typingState.keys()].filter((key) => key.startsWith(`${client.userId}:`));
-      for (const key of typingKeys) {
-        const roomId = key.slice(`${client.userId}:`.length);
-        if (roomId) await this.clearTyping(client, roomId, key);
+      // yang menyala selamanya di layar lawan bicara (hanya jalur chat user).
+      if (client.userId) {
+        const typingKeys = [...this.typingState.keys()].filter((key) => key.startsWith(`${client.userId}:`));
+        for (const key of typingKeys) {
+          const roomId = key.slice(`${client.userId}:`.length);
+          if (roomId) await this.clearTyping(client, roomId, key);
+        }
       }
 
-      const connKey = `${this.WS_CONN_PREFIX}${client.userId}`;
+      // POIN 5: beritahu penghuni room support yang ditinggalkan.
+      if (client._supportRooms && client._supportRooms.size > 0) {
+        const isAdmin = client.role === 'admin';
+        for (const room of client._supportRooms) {
+          await this.realtimeService.emitSignedToRoomExcept(room, client.id, isAdmin ? 'support.agent_left' : 'support.user_left', {
+            conversationId: room.replace(/^support:/, ''),
+            ...(isAdmin ? { agentId: client.adminId } : { userId: client.userId }),
+          });
+        }
+        client._supportRooms.clear();
+      }
+
       if (client._connectionLeaseRegistered) {
-        const count = await this.redisService.decr(connKey).catch(() => 0);
-        if (count <= 0) await this.redisService.del(connKey).catch(() => undefined);
+        // Kunci lease disimpan saat konek (berbeda untuk admin) — jangan
+        // dihitung ulang dari userId.
+        const leaseKey = client._connectionLeaseKey ?? `${this.WS_CONN_PREFIX}${principalId}`;
+        const count = await this.redisService.decr(leaseKey).catch(() => 0);
+        if (count <= 0) await this.redisService.del(leaseKey).catch(() => undefined);
         client._connectionLeaseRegistered = false;
       }
       // The presence key itself is a connection counter. Decrement it for
       // every socket that closes; only the offline broadcast waits for zero.
       if (client._presenceRegistered) {
-        await this.realtimeService.setUserPresence(client.userId, false);
+        await this.realtimeService.setUserPresence(principalId, false);
         client._presenceRegistered = false;
       }
-      const remaining = await this.realtimeService.getConnectionCount(client.userId);
+      const remaining = await this.realtimeService.getConnectionCount(principalId);
       if (remaining <= 0) {
-        const userRooms = await this.getUserPresenceRooms(client.userId);
-        for (const room of userRooms) {
-          await this.realtimeService.emitSignedToRoomExcept(room, client.id, 'user.offline', { userId: client.userId });
+        if (client.role === 'admin' && client.adminId) {
+          // POIN 5: presence agen ke room percakapan yang ia tangani.
+          const agentRooms = await this.getAdminPresenceRooms(client.adminId);
+          for (const room of agentRooms) {
+            await this.realtimeService.emitSignedToRoomExcept(room, client.id, 'support.agent_presence', {
+              agentId: client.adminId,
+              online: false,
+            });
+          }
+        } else {
+          const userRooms = await this.getUserPresenceRooms(principalId);
+          for (const room of userRooms) {
+            await this.realtimeService.emitSignedToRoomExcept(room, client.id, 'user.offline', { userId: principalId });
+          }
         }
       }
     }
-    this.logger.debug(`Client disconnected: ${client.id} (user: ${client.userId ?? 'unknown'})`);
+    this.logger.debug(`Client disconnected: ${client.id} (principal: ${principalId ?? 'unknown'})`);
+  }
+
+  /**
+   * Room percakapan support yang ditangani agen ini dan masih terbuka —
+   * untuk broadcast presence agen.
+   */
+  private async getAdminPresenceRooms(adminId: string): Promise<string[]> {
+    try {
+      const convs = await this.prisma.supportConversation.findMany({
+        where: {
+          assignedAgentId: adminId,
+          status: { in: ['ASSIGNED', 'OPEN'] as SupportConversationStatus[] },
+        },
+        select: { id: true },
+      });
+      return convs.map((c) => `support:${c.id}`);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Room percakapan support aktif milik user — supaya event `user.online` /
+   * `user.offline` juga sampai ke agen yang sedang membuka room support.
+   */
+  private async getUserSupportRooms(userId: string): Promise<string[]> {
+    try {
+      const convs = await this.prisma.supportConversation.findMany({
+        where: {
+          userId,
+          status: { in: ['WAITING', 'ASSIGNED', 'OPEN'] as SupportConversationStatus[] },
+        },
+        select: { id: true },
+      });
+      return convs.map((c) => `support:${c.id}`);
+    } catch {
+      return [];
+    }
   }
 
   private async getUserOrderRooms(userId: string): Promise<string[]> {
@@ -472,11 +692,13 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
 
   /** Semua room tempat presence user perlu diumumkan. */
   private async getUserPresenceRooms(userId: string): Promise<string[]> {
-    const [orderRooms, chatRooms] = await Promise.all([
+    const [orderRooms, chatRooms, supportRooms] = await Promise.all([
       this.getUserOrderRooms(userId),
       this.getUserChatRooms(userId),
+      // POIN 5: agen di room support perlu tahu user online/offline.
+      this.getUserSupportRooms(userId),
     ]);
-    return [...new Set([...orderRooms, ...chatRooms])];
+    return [...new Set([...orderRooms, ...chatRooms, ...supportRooms])];
   }
 
   /**
@@ -736,4 +958,178 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
   }
 
   // SYS-C-403: scaffolding 'dispute.call_*' DIHAPUS — keputusan: fitur call dibatalkan.
+
+  // ============================================================
+  // POIN 5 (2026-10-04) — LIVECHAT SUPPORT (websocket penuh)
+  // ============================================================
+  // Event client→server: support.join, support.leave, support.message,
+  //   support.typing.
+  // Event server→client: support.message.new, support.typing,
+  //   support.agent_joined, support.agent_left, support.user_joined,
+  //   support.user_left, support.agent_presence, support.assigned,
+  //   support.escalated, support.queue.changed (room support:agents).
+  // Detail protokol wire ada di laporan tugas POIN 5.
+
+  /**
+   * Otorisasi percakapan support untuk socket ini: user harus pemilik
+   * percakapan; admin (role support, sudah diautentikasi saat konek) boleh
+   * mengakses semua percakapan.
+   */
+  private async getSupportConversationForSocket(
+    client: AuthenticatedSocket,
+    conversationId: string,
+  ): Promise<{ id: string; userId: string } | null> {
+    try {
+      const conv = await this.prisma.supportConversation.findUnique({
+        where: { id: conversationId },
+        select: { id: true, userId: true },
+      });
+      if (!conv) return null;
+      if (client.role === 'admin' && client.adminId) return conv;
+      if (client.role !== 'admin' && client.userId && conv.userId === client.userId) return conv;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  private trackSupportRoom(client: AuthenticatedSocket, room: string): void {
+    if (!client._supportRooms) client._supportRooms = new Set<string>();
+    client._supportRooms.add(room);
+  }
+
+  @SubscribeMessage('support.join')
+  async handleSupportJoin(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody() data: { conversationId: string },
+  ): Promise<{
+    success: boolean;
+    message?: string;
+    conversation?: unknown;
+    messages?: unknown[];
+    agentOnline?: boolean | null;
+    queuePosition?: number | null;
+  }> {
+    const principalId = client.userId ?? client.adminId;
+    if (!principalId) return { success: false, message: 'Not authenticated' };
+    if (!(await this.checkWsRateLimit(client))) return { success: false, message: 'Rate limit exceeded' };
+    const conversationId = data?.conversationId;
+    if (!conversationId || typeof conversationId !== 'string' || conversationId.length > 100) {
+      return { success: false, message: 'conversationId is required' };
+    }
+    const conv = await this.getSupportConversationForSocket(client, conversationId);
+    if (!conv) return { success: false, message: 'Not authorized' };
+
+    const room = `support:${conv.id}`;
+    await client.join(room);
+    this.trackSupportRoom(client, room);
+
+    const isAdmin = client.role === 'admin';
+    const viewer = isAdmin
+      ? { kind: 'admin' as const, id: client.adminId! }
+      : { kind: 'user' as const, id: client.userId! };
+    const [conversation, history] = await Promise.all([
+      isAdmin
+        ? this.supportChatService.getConversationForAdmin(conv.id)
+        : this.supportChatService.getConversationForUser(client.userId!, conv.id),
+      // 30 pesan terakhir (terlama → terbaru) untuk render langsung.
+      this.supportChatService.getMessages(conv.id, viewer, undefined, 30),
+    ]);
+
+    let agentOnline: boolean | null = null;
+    let queuePosition: number | null = null;
+    if (!isAdmin) {
+      const assignedAgentId = (conversation as { assignedAgent?: { id: string } | null } | null)?.assignedAgent?.id ?? null;
+      agentOnline = assignedAgentId ? await this.realtimeService.isUserOnline(assignedAgentId) : null;
+      queuePosition = await this.supportChatService.getQueuePosition(conv.id);
+    }
+
+    await this.realtimeService.emitSignedToRoomExcept(
+      room,
+      client.id,
+      isAdmin ? 'support.agent_joined' : 'support.user_joined',
+      isAdmin
+        ? { conversationId: conv.id, agentId: client.adminId }
+        : { conversationId: conv.id, userId: client.userId },
+    );
+
+    return { success: true, conversation, messages: history.data, agentOnline, queuePosition };
+  }
+
+  @SubscribeMessage('support.leave')
+  async handleSupportLeave(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody() data: { conversationId: string },
+  ): Promise<{ success: boolean }> {
+    const conversationId = data?.conversationId;
+    if (typeof conversationId === 'string' && conversationId.length <= 100) {
+      const room = `support:${conversationId}`;
+      await client.leave(room);
+      client._supportRooms?.delete(room);
+      const isAdmin = client.role === 'admin';
+      await this.realtimeService.emitSignedToRoomExcept(
+        room,
+        client.id,
+        isAdmin ? 'support.agent_left' : 'support.user_left',
+        {
+          conversationId,
+          ...(isAdmin ? { agentId: client.adminId } : { userId: client.userId }),
+        },
+      );
+    }
+    return { success: true };
+  }
+
+  @SubscribeMessage('support.message')
+  async handleSupportMessage(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody() data: { conversationId: string; content?: string; attachments?: string[] },
+  ): Promise<{ success: boolean; message?: string; data?: unknown }> {
+    const principalId = client.userId ?? client.adminId;
+    if (!principalId) return { success: false, message: 'Not authenticated' };
+    if (!(await this.checkWsRateLimit(client))) return { success: false, message: 'Rate limit exceeded' };
+    const conversationId = data?.conversationId;
+    if (!conversationId || typeof conversationId !== 'string' || conversationId.length > 100) {
+      return { success: false, message: 'conversationId is required' };
+    }
+    const conv = await this.getSupportConversationForSocket(client, conversationId);
+    if (!conv) return { success: false, message: 'Not authorized' };
+
+    try {
+      // Balasan pertama agen = claim otomatis (WAITING → ASSIGNED → OPEN).
+      const saved =
+        client.role === 'admin'
+          ? await this.supportChatService.sendAgentMessage(client.adminId!, conversationId, data?.content, data?.attachments)
+          : await this.supportChatService.sendUserMessage(client.userId!, conversationId, data?.content, data?.attachments);
+      return { success: true, data: saved };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to send message';
+      return { success: false, message };
+    }
+  }
+
+  @SubscribeMessage('support.typing')
+  async handleSupportTyping(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody() data: { conversationId: string; isTyping?: boolean },
+  ): Promise<void> {
+    const principalId = client.userId ?? client.adminId;
+    const conversationId = data?.conversationId;
+    if (!principalId || !conversationId || typeof conversationId !== 'string' || conversationId.length > 100) return;
+    // Rate limit typing bersifat silent (pola chat): heartbeat berlebih hanya
+    // menahan broadcast, tidak membatalkan status.
+    if (!(await this.checkTypingRateLimit(client))) return;
+    const conv = await this.getSupportConversationForSocket(client, conversationId);
+    if (!conv) return;
+    const isTyping = data.isTyping !== false;
+    // Stateless (tanpa state machine seperti chat): klien memakai expiresAt
+    // untuk mematikan indikator bila paket stop hilang.
+    await this.realtimeService.emitSignedToRoomExcept(`support:${conv.id}`, client.id, 'support.typing', {
+      conversationId: conv.id,
+      senderType: client.role === 'admin' ? 'AGENT' : 'USER',
+      senderId: principalId,
+      isTyping,
+      expiresAt: new Date(Date.now() + (isTyping ? TYPING_HOLD_MS : 0)).toISOString(),
+    });
+  }
 }

@@ -12,8 +12,10 @@ describe('SupportController mutation throttling', () => {
     return handler as (...args: never[]) => unknown;
   }
 
-  it('requires per-user throttling on ticket creation and replies', () => {
-    for (const route of ['createTicket', 'replyToTicket']) {
+  it('requires per-user throttling on ticket mutations', () => {
+    // POIN 5 (2026-10-04): rute POST /support/tickets (createTicket) DICABUT —
+    // tiket hanya dibuat admin via eskalasi livechat. replyToTicket tetap ada.
+    for (const route of ['replyToTicket']) {
       const handler = handlerOf(route);
       expect(Reflect.getMetadata(METHOD_METADATA, handler)).toBeDefined();
       expect(Reflect.getMetadata(GUARDS_METADATA, handler)).toContain(UserThrottleGuard);

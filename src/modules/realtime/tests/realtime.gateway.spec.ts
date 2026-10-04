@@ -3,6 +3,7 @@ import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { RealtimeGateway } from '../realtime.gateway';
 import { RealtimeService } from '../realtime.service';
+import { SupportChatService } from '../../support/support-chat.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { TYPING_HOLD_MS } from '../../../common/constants/app.constants';
@@ -80,6 +81,8 @@ describe('RealtimeGateway — chat room join/leave symmetry (D-02)', () => {
         { provide: RealtimeService, useValue: mockRealtimeService },
         { provide: JwtService, useValue: { verifyAsync: jest.fn() } },
         { provide: ConfigService, useValue: { get: jest.fn().mockReturnValue(null) } },
+        // POIN 5: gateway kini meng-inject SupportChatService untuk handler support.*.
+        { provide: SupportChatService, useValue: {} },
       ],
     }).compile();
     gateway = module.get<RealtimeGateway>(RealtimeGateway);
@@ -178,6 +181,8 @@ describe('RealtimeGateway — multi-connection presence', () => {
         { provide: RealtimeService, useValue: mockRealtimeService },
         { provide: JwtService, useValue: { verifyAsync: jest.fn() } },
         { provide: ConfigService, useValue: { get: jest.fn().mockReturnValue(null) } },
+        // POIN 5: gateway kini meng-inject SupportChatService untuk handler support.*.
+        { provide: SupportChatService, useValue: {} },
       ],
     }).compile();
     gateway = module.get<RealtimeGateway>(RealtimeGateway);
@@ -208,6 +213,8 @@ describe('RealtimeGateway — active connection counter lease', () => {
         { provide: RealtimeService, useValue: mockRealtimeService },
         { provide: JwtService, useValue: { verifyAsync: jest.fn() } },
         { provide: ConfigService, useValue: { get: jest.fn().mockReturnValue(null) } },
+        // POIN 5: gateway kini meng-inject SupportChatService untuk handler support.*.
+        { provide: SupportChatService, useValue: {} },
       ],
     }).compile();
     gateway = module.get<RealtimeGateway>(RealtimeGateway);
@@ -239,6 +246,8 @@ describe('RealtimeGateway — unread notification count', () => {
         { provide: RealtimeService, useValue: mockRealtimeService },
         { provide: JwtService, useValue: { verifyAsync: jest.fn() } },
         { provide: ConfigService, useValue: { get: jest.fn().mockReturnValue(null) } },
+        // POIN 5: gateway kini meng-inject SupportChatService untuk handler support.*.
+        { provide: SupportChatService, useValue: {} },
       ],
     }).compile();
     gateway = module.get<RealtimeGateway>(RealtimeGateway);
@@ -356,6 +365,8 @@ describe('RealtimeGateway — typing indicator', () => {
         { provide: RealtimeService, useValue: mockRealtimeService },
         { provide: JwtService, useValue: { verifyAsync: jest.fn() } },
         { provide: ConfigService, useValue: { get: jest.fn().mockReturnValue(null) } },
+        // POIN 5: gateway kini meng-inject SupportChatService untuk handler support.*.
+        { provide: SupportChatService, useValue: {} },
       ],
     }).compile();
     gateway = module.get<RealtimeGateway>(RealtimeGateway);

@@ -282,6 +282,19 @@ export const NOTIFICATION_COPY: Record<
       body: '{preview}',
     },
   },
+  // ------------------------------------------------------- SUPPORT LIVECHAT
+  // POIN 5 (2026-10-04): balasan agen livechat ke user. Berbeda dengan chat
+  // biasa (yang tidak masuk notifikasi in-app), balasan agen jarang & penting.
+  [NotificationType.SUPPORT_AGENT_REPLY]: {
+    id: {
+      title: 'Balasan dari {agentName}',
+      body: '{preview}',
+    },
+    en: {
+      title: 'Reply from {agentName}',
+      body: '{preview}',
+    },
+  },
   // ----------------------------------------------------------------- WALLET
   [NotificationType.WALLET_TOPUP_SUCCESS]: {
     id: {

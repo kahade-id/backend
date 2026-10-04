@@ -1,12 +1,11 @@
 import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { CreateTicketDto, ReplyTicketDto } from './dto/create-ticket.dto';
+import { ReplyTicketDto } from './dto/create-ticket.dto';
 import { UploadPurpose } from '../upload/dto/presigned-url.dto';
 import { UploadService } from '../upload/upload.service';
 import { AuditAction, SupportTicketStatus } from '@prisma/client';
 import { AuditLogService } from '../../common/services/audit-log.service';
-import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 
 const TERMINAL_TICKET_STATUSES = ['CLOSED', 'RESOLVED'] as const;
 
@@ -16,56 +15,7 @@ export class SupportService {
     private readonly prisma: PrismaService,
     private readonly uploadService: UploadService,
     private readonly auditLog: AuditLogService,
-    private readonly subscriptionsService: SubscriptionsService,
   ) {}
-
-  async createTicket(userId: string, dto: CreateTicketDto): Promise<object> {
-    const attachments = dto.attachments ?? [];
-    await this.uploadService.verifyUserFileKeys(userId, attachments, UploadPurpose.CHAT_ATTACHMENT);
-
-    // R2-C (audit): `orderId` on a ticket is shown to staff as the order context.
-    // Accepting any order id let users attach other people's orders to their ticket
-    // (no FK guarantees it); require the referenced order to be one the ticket
-    // creator participates in before linking it.
-    const linkedOrderId = dto.orderId?.trim();
-    if (linkedOrderId) {
-      const order = await this.prisma.order.findFirst({
-        where: { OR: [{ orderId: linkedOrderId }, { id: linkedOrderId }], deletedAt: null },
-        select: { buyerId: true, sellerId: true },
-      });
-      if (!order || (order.buyerId !== userId && order.sellerId !== userId)) {
-        throw new BadRequestException({
-          code: ErrorCodes.NOT_FOUND,
-          message: 'orderId does not refer to an order owned by this user',
-        });
-      }
-    }
-
-    let relatedArticleId: string | null = null;
-    if ((dto as any).relatedArticleId) {
-      const article = await this.prisma.faqItem.findUnique({ where: { id: (dto as any).relatedArticleId } });
-      if (article) relatedArticleId = article.id;
-    }
-
-    // Benefit 4 Kahade+ — bantuan prioritas: tiket dari subscriber aktif
-    // otomatis ditandai priority. Fail-safe: bila pengecekan gagal, tiket
-    // tetap dibuat sebagai non-prioritas.
-    const priority = await this.subscriptionsService.isActive(userId).catch(() => false);
-
-    return this.prisma.supportTicket.create({
-      data: {
-        userId,
-        subject: dto.subject.trim(),
-        message: dto.message.trim(),
-        category: dto.category || 'GENERAL',
-        orderId: linkedOrderId ?? null,
-        attachments,
-        status: 'OPEN',
-        priority,
-        ...(relatedArticleId ? { relatedArticleId } : {}),
-      },
-    });
-  }
 
   async getTickets(userId: string, page = 1, limit = 20): Promise<{ data: object[]; total: number; page: number; limit: number }> {
     const safeLimit = Math.min(Math.max(1, Math.floor(limit)), 50);
@@ -132,10 +82,9 @@ export class SupportService {
   }
 
   async replyToTicket(userId: string, ticketId: string, dto: ReplyTicketDto): Promise<object> {
-    // BE-IMP (item 130): lampiran balasan diverifikasi seperti lampiran tiket
-    // utama — key harus milik user, purpose CHAT_ATTACHMENT, maks 5 file.
-    // Verifikasi di luar transaksi (pola createTicket) supaya kegagalan
-    // validasi tidak membuka transaksi DB sia-sia.
+    // Lampiran balasan diverifikasi seperti lampiran tiket utama — key harus
+    // milik user, purpose CHAT_ATTACHMENT, maks 5 file. Verifikasi di luar
+    // transaksi supaya kegagalan validasi tidak membuka transaksi DB sia-sia.
     const attachments = dto.attachments ?? [];
     await this.uploadService.verifyUserFileKeys(userId, attachments, UploadPurpose.CHAT_ATTACHMENT);
     const reply = await this.prisma.$transaction(async (tx) => {

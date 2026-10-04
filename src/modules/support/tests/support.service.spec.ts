@@ -4,7 +4,6 @@ import { SupportService } from '../support.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { UploadService } from '../../upload/upload.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
-import { SubscriptionsService } from '../../subscriptions/subscriptions.service';
 
 const mockPrisma = {
   supportTicket: { create: jest.fn(), findMany: jest.fn(), count: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
@@ -15,19 +14,13 @@ const mockPrisma = {
 
 const mockUpload = { verifyUserFileKeys: jest.fn() };
 const mockAuditLog = { logAdminAction: jest.fn() };
-// Benefit 4 Kahade+: tiket subscriber otomatis priority — di-reset tiap test
-// via jest.resetAllMocks(), jadi implementasi default diset ulang di beforeEach.
-const mockSubscriptions = { isActive: jest.fn() };
 
 describe('SupportService', () => {
   let service: SupportService;
 
   beforeEach(async () => {
     jest.resetAllMocks();
-    mockSubscriptions.isActive.mockResolvedValue(false);
     mockUpload.verifyUserFileKeys.mockResolvedValue(undefined);
-    // R2-C: createTicket validates the linked order belongs to the requester.
-    mockPrisma.order.findFirst.mockResolvedValue({ buyerId: 'u1', sellerId: 'u2' });
     mockPrisma.$transaction.mockImplementation(async (callback: (tx: typeof mockPrisma) => unknown) => callback(mockPrisma));
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -35,97 +28,12 @@ describe('SupportService', () => {
         { provide: PrismaService, useValue: mockPrisma },
         { provide: UploadService, useValue: mockUpload },
         { provide: AuditLogService, useValue: mockAuditLog },
-        // Benefit 4 Kahade+: tiket subscriber otomatis priority.
-        { provide: SubscriptionsService, useValue: mockSubscriptions },
       ],
     }).compile();
     service = module.get<SupportService>(SupportService);
   });
 
   it('should be defined', () => expect(service).toBeDefined());
-
-  describe('createTicket', () => {
-    it('creates ticket with default category GENERAL', async () => {
-      const ticket = { id: 't1', userId: 'u1', subject: 'Help', message: 'msg', category: 'GENERAL', status: 'OPEN' };
-      mockPrisma.supportTicket.create.mockResolvedValue(ticket);
-      const result = await service.createTicket('u1', { subject: 'Help', message: 'msg' } as any);
-      expect(result).toEqual(ticket);
-      expect(mockPrisma.supportTicket.create).toHaveBeenCalledWith(expect.objectContaining({
-        data: expect.objectContaining({ category: 'GENERAL', status: 'OPEN' }),
-      }));
-    });
-
-    it('validates and persists attachment keys instead of silently dropping them', async () => {
-      mockPrisma.supportTicket.create.mockResolvedValue({ id: 't1', attachments: ['uploads/chat-attachments/u1/file.jpg'] });
-      const attachments = ['uploads/chat-attachments/u1/file.jpg'];
-      await service.createTicket('u1', { subject: 'S', message: 'M', attachments } as any);
-      expect(mockUpload.verifyUserFileKeys).toHaveBeenCalledWith('u1', attachments, 'CHAT_ATTACHMENT');
-      expect(mockPrisma.supportTicket.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ attachments }) }));
-    });
-
-    it('uses provided category and orderId', async () => {
-      mockPrisma.supportTicket.create.mockResolvedValue({});
-      await service.createTicket('u1', { subject: 'S', message: 'M', category: 'PAYMENT', orderId: 'ORD-1' } as any);
-      expect(mockPrisma.supportTicket.create).toHaveBeenCalledWith(expect.objectContaining({
-        data: expect.objectContaining({ category: 'PAYMENT', orderId: 'ORD-1' }),
-      }));
-    });
-
-    it('marks ticket priority=true for active Kahade+ subscribers (Benefit 4)', async () => {
-      mockSubscriptions.isActive.mockResolvedValueOnce(true);
-      mockPrisma.supportTicket.create.mockResolvedValue({ id: 't-prio' });
-      await service.createTicket('u1', { subject: 'S', message: 'M' } as any);
-      expect(mockPrisma.supportTicket.create).toHaveBeenCalledWith(expect.objectContaining({
-        data: expect.objectContaining({ priority: true }),
-      }));
-    });
-
-    it('marks ticket priority=false for non-subscribers', async () => {
-      mockPrisma.supportTicket.create.mockResolvedValue({ id: 't-normal' });
-      await service.createTicket('u1', { subject: 'S', message: 'M' } as any);
-      expect(mockPrisma.supportTicket.create).toHaveBeenCalledWith(expect.objectContaining({
-        data: expect.objectContaining({ priority: false }),
-      }));
-    });
-
-    it('rejects linking another user\'s order to the ticket', async () => {
-      mockPrisma.order.findFirst.mockResolvedValue({ buyerId: 'someone-else', sellerId: 'u9' });
-      await expect(
-        service.createTicket('u1', { subject: 'S', message: 'M', orderId: 'ORD-OTHER' } as any),
-      ).rejects.toThrow(BadRequestException);
-      expect(mockPrisma.supportTicket.create).not.toHaveBeenCalled();
-    });
-
-    it('rejects linking an order id that does not exist', async () => {
-      mockPrisma.order.findFirst.mockResolvedValue(null);
-      await expect(
-        service.createTicket('u1', { subject: 'S', message: 'M', orderId: 'ORD-MISSING' } as any),
-      ).rejects.toThrow(BadRequestException);
-      expect(mockPrisma.supportTicket.create).not.toHaveBeenCalled();
-    });
-
-    /*
-     * D-05: the ticket id was minted with `generateUserId()` — the `USR-` user-id generator — which
-     * both mislabels the row and shrinks the id space to 36^8 (~2.8e12), where a P2002 on the
-     * primary key becomes plausible at scale. The column already declares `@default(cuid())`.
-     */
-    it('does not set an explicit id, leaving the schema cuid() default to mint it', async () => {
-      mockPrisma.supportTicket.create.mockResolvedValue({});
-      await service.createTicket('u1', { subject: 'S', message: 'M' } as any);
-      const data = mockPrisma.supportTicket.create.mock.calls[0][0].data;
-      // Pre-fix this was `USR-XXXXXXXX`; `id` must now be absent so Prisma applies the default.
-      expect(data).not.toHaveProperty('id');
-    });
-
-    it('never stamps a ticket with the USR- user-id prefix', async () => {
-      mockPrisma.supportTicket.create.mockResolvedValue({});
-      await service.createTicket('u1', { subject: 'S', message: 'M' } as any);
-      const data = mockPrisma.supportTicket.create.mock.calls[0][0].data;
-      // `parse-id.pipe.ts:8` accepts `USR-…` on any `:ticketId` route, so a ticket carrying that
-      // prefix is indistinguishable from a user id at the routing layer.
-      expect(String(data.id ?? '')).not.toMatch(/^USR-/);
-    });
-  });
 
   describe('getTickets', () => {
     it('returns paginated user tickets with first-reply staff flag', async () => {

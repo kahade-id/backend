@@ -20,7 +20,6 @@ describe('ExpireUnshippedOrdersService', () => {
     findDueUnshippedOrders: jest.fn(),
     cancelUnshippedOrder: jest.fn(),
   };
-  const inventoryService: any = { safeReleaseForOrder: jest.fn() };
 
   let service: ExpireUnshippedOrdersService;
 
@@ -29,7 +28,7 @@ describe('ExpireUnshippedOrdersService', () => {
     redis.setNx.mockResolvedValue(true);
     redis.releaseLock.mockResolvedValue(true);
     unshippedCancelService.findDueUnshippedOrders.mockResolvedValue([]);
-    service = new ExpireUnshippedOrdersService(prisma, redis, unshippedCancelService, inventoryService);
+    service = new ExpireUnshippedOrdersService(prisma, redis, unshippedCancelService);
   });
 
   it('tidak jalan bila lock tidak didapat (single-flight)', async () => {
@@ -46,7 +45,7 @@ describe('ExpireUnshippedOrdersService', () => {
     expect(redis.setNx).not.toHaveBeenCalled();
   });
 
-  it('cancel + refund order due, lepas stok, lalu lepas lock', async () => {
+  it('cancel + refund order due, lalu lepas lock', async () => {
     const due = { id: 'o1', orderId: 'ORD-1', buyerPayAmount: BigInt(100000) };
     unshippedCancelService.findDueUnshippedOrders.mockResolvedValue([due]);
     unshippedCancelService.cancelUnshippedOrder.mockResolvedValue({ orderId: 'ORD-1', outcome: 'CANCELLED_REFUNDED' });
@@ -58,18 +57,16 @@ describe('ExpireUnshippedOrdersService', () => {
       'system:expire-unshipped-orders',
       expect.stringContaining('batas kirim'),
     );
-    expect(inventoryService.safeReleaseForOrder).toHaveBeenCalledWith('o1', 'ORDER_EXPIRED:TIMEOUT_PROCESSING');
     expect(redis.releaseLock).toHaveBeenCalledWith('cron_lock:expire_unshipped_orders', expect.any(String));
   });
 
-  it('tidak lepas stok untuk outcome non-cancel', async () => {
+  it('tidak ada aksi stok untuk outcome non-cancel', async () => {
     const due = { id: 'o2', orderId: 'ORD-2', buyerPayAmount: BigInt(100000) };
     unshippedCancelService.findDueUnshippedOrders.mockResolvedValue([due]);
     unshippedCancelService.cancelUnshippedOrder.mockResolvedValue({ orderId: 'ORD-2', outcome: 'SKIPPED_DISPUTED' });
 
     await service.expireUnshippedOrders();
 
-    expect(inventoryService.safeReleaseForOrder).not.toHaveBeenCalled();
     expect(redis.releaseLock).toHaveBeenCalled();
   });
 

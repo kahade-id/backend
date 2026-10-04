@@ -70,9 +70,7 @@ import {
 } from '../../common/utils/cron-runtime.registry';
 import { QueueModule } from '../queue/queue.module';
 import { RedisService } from '../../redis/redis.service';
-// GAP-D (G256): pelepasan reservasi stok saat order kedaluwarsa — @Optional()
-// di ExpireUnpaidOrdersService, best-effort, no-op untuk order tanpa order lines.
-import { InventoryModule } from '../inventory/inventory.module';
+// (katalog dihapus total 2026-10-04 — modul inventory dihapus)
 import { safeErrorMessage } from '../../common/utils/background-reliability.util';
 import { AuditLogModule } from '../../common/services/audit-log.module';
 import { AdminShowcaseReportsModule } from '../admin/showcase-reports/admin-showcase-reports.module';
@@ -91,7 +89,7 @@ import { MilestonesModule } from '../milestones/milestones.module';
 import { UsersModule } from '../users/users.module';
 
 @Module({
-  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, AdminShowcaseReportsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, NoWalletModule, WalletModeModule, AuditLogModule, UploadModule, AdminFeedbackModule, InventoryModule, MilestonesModule, forwardRef(() => UsersModule)],
+  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, AdminShowcaseReportsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, NoWalletModule, WalletModeModule, AuditLogModule, UploadModule, AdminFeedbackModule, MilestonesModule, forwardRef(() => UsersModule)],
   providers: [
     WalletDailyResetService,
     DataCleanupService,

@@ -23,14 +23,12 @@ import { AuditLogModule } from '../../common/services/audit-log.module';
 import { QueueModule } from '../queue/queue.module';
 import { PaymentModule } from '../payment/payment.module';
 import { SubscriptionsModule } from '../subscriptions/subscriptions.module';
-// GAP-D (G256/G257): hook reservasi stok katalog — @Optional() di OrderStateService,
-// aman bila modul belum ter-import; tidak mengubah perilaku order existing.
-import { InventoryModule } from '../inventory/inventory.module';
+// (katalog dihapus total 2026-10-04 — modul inventory dihapus)
 import { NoWalletModule } from '../no-wallet/no-wallet.module';
 import { WalletModeModule } from '../wallet-mode/wallet-mode.module';
 
 @Module({
-  imports: [ConfigModule, WalletModule, RedisModule, ReferralModule, forwardRef(() => DisputesModule), RealtimeModule, UploadModule, AuditLogModule, QueueModule, PaymentModule, SubscriptionsModule, InventoryModule, NoWalletModule, WalletModeModule],
+  imports: [ConfigModule, WalletModule, RedisModule, ReferralModule, forwardRef(() => DisputesModule), RealtimeModule, UploadModule, AuditLogModule, QueueModule, PaymentModule, SubscriptionsModule, NoWalletModule, WalletModeModule],
   controllers: [OrdersController],
   providers: [OrdersService, FeeCalculatorService, OrderStateService, OrderExtensionsService, OrderLinksService, DeliveryProofService, InvoiceService, ReceiptService, MembershipRankService, WalletTxSerialService, UnshippedOrderCancelService],
   exports: [OrdersService, FeeCalculatorService, OrderStateService, OrderExtensionsService, OrderLinksService, DeliveryProofService, InvoiceService, ReceiptService, MembershipRankService, UnshippedOrderCancelService],

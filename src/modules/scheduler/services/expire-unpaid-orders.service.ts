@@ -1,4 +1,4 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { OrderStatus, ActorType, NotificationType, Prisma } from '@prisma/client';
 import { randomUUID } from 'crypto';
@@ -8,9 +8,7 @@ import { RedisService } from '../../../redis/redis.service';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
 import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { rollbackOrderVoucherUsage } from '../../../common/utils/voucher-rollback.util';
-// GAP-D (G256): pelepasan reservasi stok saat order kedaluwarsa — @Optional(),
-// best-effort, no-op untuk order tanpa order lines katalog.
-import { InventoryService } from '../../inventory/inventory.service';
+// (katalog dihapus total 2026-10-04 — hook pelepasan stok inventory dibuang)
 import { DanaPaymentService } from '../../payment/dana/dana-payment.service';
 
 @Injectable()
@@ -25,7 +23,6 @@ export class ExpireUnpaidOrdersService {
     // DanaModule; bila wiring salah, lebih baik gagal saat startup daripada
     // diam-diam melewatkan pembatalan provider.
     private danaPayment: DanaPaymentService,
-    @Optional() private inventoryService?: InventoryService,
   ) {}
 
   private emitRealtimeBestEffort(
@@ -197,14 +194,6 @@ export class ExpireUnpaidOrdersService {
             );
 
             if (!didExpire) continue;
-
-            // GAP-D (G256): lepaskan reservasi stok katalog untuk order yang
-            // kedaluwarsa. Best-effort — tidak pernah throw; no-op bila tidak
-            // ada order lines katalog.
-            if (this.inventoryService) {
-              const inventory = this.inventoryService;
-              await inventory.safeReleaseForOrder(order.id, 'ORDER_EXPIRED:TIMEOUT_PAYMENT');
-            }
 
             // SYS-B-305c: batalkan ke DANA + tandai payment EXPIRED.
             // Sebelumnya order mati tetapi paymentTransaction tetap PENDING

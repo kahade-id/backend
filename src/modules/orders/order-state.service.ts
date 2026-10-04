@@ -29,10 +29,8 @@ import { withSpan } from '../../common/tracing/tracing';
 // satu tahap existing.
 import { activateMilestonesForOrderTx } from '../milestones/milestone-activation';
 import { computePatunganRebateTx, createPatunganRebateLedgerTx } from '../commerce/patungan-rebate';
-// GAP-D (G256/G257): hook reservasi stok — @Optional(), best-effort post-commit,
-// no-op untuk order tanpa order lines katalog. Tidak mengubah perilaku order existing.
+// (katalog GAP-D G256/G257 dihapus total 2026-10-04 — hook reservasi stok dibuang)
 import { Optional } from '@nestjs/common';
-import { InventoryService } from '../inventory/inventory.service';
 import { ActionLocationService, type ActionLocationContext } from '../action-location/action-location.service';
 // Batch 43 BE-CHAT: pesan sistem otomatis di room order (best-effort).
 // Dipanggil via registry statis — bukan import service, agar tidak ada
@@ -99,9 +97,7 @@ export class OrderStateService {
     private realtime: RealtimeService,
     private membershipRankService: MembershipRankService,
     private notificationQueue: NotificationQueueService,
-    // GAP-D (G256/G257): @Optional() — aman bila InventoryModule belum ter-import.
-    @Optional() private inventoryService?: InventoryService,
-    // Lokasi presisi aksi sensitif — @Optional() mengikuti pola inventory di atas.
+    // Lokasi presisi aksi sensitif — @Optional() mengikuti pola lama inventory.
     @Optional() private actionLocationService?: ActionLocationService,
     // M5 no-wallet: order bertahap DANA-direct di-cancel via refund parsial
     // per tahap (MilestonesService), bukan refundOrderEscrow penuh.
@@ -177,16 +173,8 @@ export class OrderStateService {
       await this.notificationQueue.enqueue({ userId: creatorId, type: notifType, title, body, pushData: { type: notifType, orderId } });
     }, 'CONFIRM_ACTION_NOTIFICATION');
 
-    // GAP-D (G256): cadangkan stok katalog setelah order dikonfirmasi seller.
-    // Best-effort — tidak pernah throw; no-op untuk order tanpa order lines.
-    if (action === 'ACCEPT') {
-      const inventory = this.inventoryService;
-      this.runPostCommitBestEffort(async () => {
-        const order = await this.prisma.order.findUnique({ where: { orderId }, select: { id: true } });
-        if (!order || !inventory) return;
-        await inventory.safeReserveForOrder(order.id);
-      }, 'CONFIRM_ACTION_INVENTORY_RESERVE');
-    }
+    // (katalog dihapus total 2026-10-04 — hook stok inventory dihapus;
+    // order tidak pernah punya order lines katalog)
 
     return { orderId, status: newStatus };
   }
@@ -302,15 +290,6 @@ export class OrderStateService {
       }
     }, 'COMPLETE_ORDER_NOTIFICATION');
 
-    // GAP-D (G256): kurangi stok katalog setelah order selesai.
-    // Best-effort — tidak pernah throw; no-op untuk order tanpa order lines.
-    const inventoryComplete = this.inventoryService;
-    this.runPostCommitBestEffort(async () => {
-      const order = await this.prisma.order.findUnique({ where: { orderId }, select: { id: true } });
-      if (!order || !inventoryComplete) return;
-      await inventoryComplete.safeDecrementForOrder(order.id);
-    }, 'COMPLETE_ORDER_INVENTORY_DECREMENT');
-
     // Batch 43 BE-CHAT: pesan sistem "dana dicairkan" + arsip otomatis room.
     this.runPostCommitBestEffort(() => ChatOrderHooks.emit(orderId, 'ORDER_COMPLETED'), 'CHAT_ORDER_COMPLETED_SYSTEM_MSG');
 
@@ -351,15 +330,6 @@ export class OrderStateService {
       );
       await this.notificationQueue.enqueue({ userId: recipientId, type: NotificationType.ORDER_CANCELLED, title: cancelCopy.title, body: cancelCopy.body, pushData: { type: 'ORDER_CANCELLED', orderId } });
     }, 'CANCEL_ORDER_NOTIFICATION');
-
-    // GAP-D (G256): lepaskan reservasi stok katalog setelah order dibatalkan.
-    // Best-effort — tidak pernah throw; no-op untuk order tanpa order lines.
-    const inventoryCancel = this.inventoryService;
-    this.runPostCommitBestEffort(async () => {
-      const order = await this.prisma.order.findUnique({ where: { orderId }, select: { id: true } });
-      if (!order || !inventoryCancel) return;
-      await inventoryCancel.safeReleaseForOrder(order.id, `ORDER_CANCELLED:${normalizedReason}`);
-    }, 'CANCEL_ORDER_INVENTORY_RELEASE');
 
     return { orderId, status: 'CANCELLED' };
   }

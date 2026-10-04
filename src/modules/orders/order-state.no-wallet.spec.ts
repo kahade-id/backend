@@ -104,7 +104,6 @@ function buildService(opts: { walletEnabled: boolean; danaPayment: boolean; lega
     realtime as never,
     {} as never,
     notificationQueue as never,
-    undefined as never, // inventoryService
     undefined as never, // actionLocationService
     undefined as never, // milestonesService (M5) — tidak di-mock: fallback refundOrderEscrow
   );

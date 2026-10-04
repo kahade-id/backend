@@ -1,13 +1,11 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { UnshippedOrderCancelService } from '../../orders/unshipped-order-cancel.service';
-// GAP-D (G256): pelepasan reservasi stok saat order kedaluwarsa — @Optional(),
-// best-effort, no-op untuk order tanpa order lines katalog.
-import { InventoryService } from '../../inventory/inventory.service';
+// (katalog dihapus total 2026-10-04 — hook pelepasan stok inventory dibuang)
 
 /**
  * Wave 3 P0 (2026-09-28) — sweep auto-cancel + auto-refund order yang
@@ -31,7 +29,6 @@ export class ExpireUnshippedOrdersService {
     private prisma: PrismaService,
     private redis: RedisService,
     private unshippedCancelService: UnshippedOrderCancelService,
-    @Optional() private inventoryService?: InventoryService,
   ) {}
 
   // SCH-XXX: tiap 5 menit — samakan kadens dengan commerce refund sweep.
@@ -65,12 +62,6 @@ export class ExpireUnshippedOrdersService {
           );
           if (result.outcome === 'CANCELLED_REFUNDED') {
             cancelled++;
-            // GAP-D (G256): lepaskan reservasi stok katalog. Best-effort —
-            // tidak pernah throw; no-op bila tidak ada order lines katalog.
-            if (this.inventoryService) {
-              const inventory = this.inventoryService;
-              await inventory.safeReleaseForOrder(order.id, 'ORDER_EXPIRED:TIMEOUT_PROCESSING');
-            }
           } else if (result.outcome === 'FAILED') {
             failed++;
           } else {

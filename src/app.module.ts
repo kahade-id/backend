@@ -33,7 +33,6 @@ import { OrdersModule } from './modules/orders/orders.module';
 import { MilestonesModule } from './modules/milestones/milestones.module';
 import { CourierModule } from './modules/courier/courier.module';
 import { ReturnsModule } from './modules/returns/returns.module';
-import { InventoryModule } from './modules/inventory/inventory.module';
 import { ChatModule } from './modules/chat/chat.module';
 import { DisputesModule } from './modules/disputes/disputes.module';
 import { RatingsModule } from './modules/ratings/ratings.module';
@@ -160,7 +159,6 @@ const runtimeEnvFile = getRuntimeEnvFile();
     MilestonesModule, // GAP-C (G176–G200)
     CourierModule,
     ReturnsModule,
-    InventoryModule,
     ChatModule,
     DisputesModule,
     RatingsModule,

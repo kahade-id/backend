@@ -1,4 +1,4 @@
-import { Injectable, Logger, BadRequestException, NotFoundException, ForbiddenException, ConflictException, GoneException } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException, NotFoundException, ForbiddenException, ConflictException, GoneException, InternalServerErrorException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { AuditAction, ContentHiddenReason, OrderStatus, Prisma, ShowcaseVisibility } from '@prisma/client';
 import { createHash } from 'crypto';
@@ -2687,17 +2687,24 @@ export class ShowcaseService {
     ]);
     const { counts: reactionCounts, userVotes } = await this.getCommentReactionMaps(allCommentIds, viewerId);
 
-    const data = roots.map((root) => ({
-      ...this.serializeComment(
+    // (2026-10-05: serializeComment bisa kembalikan null untuk user rusak —
+    // filter agar tidak meruntuhkan response.)
+    const data = roots.flatMap((root) => {
+      const serialized = this.serializeComment(
         root as CommentRow,
         sealTierMap,
         this.reactionSummaryFor(root.id, reactionCounts, userVotes),
-      ),
-      replyCount: replyCountByParent.get(root.id) ?? 0,
-      replies: (repliesByParent.get(root.id) ?? []).map((reply) =>
-        this.serializeComment(reply, sealTierMap, this.reactionSummaryFor(reply.id, reactionCounts, userVotes)),
-      ),
-    }));
+      );
+      if (!serialized) return [];
+      return [{
+        ...serialized,
+        replyCount: replyCountByParent.get(root.id) ?? 0,
+        replies: (repliesByParent.get(root.id) ?? []).flatMap((reply) => {
+          const s = this.serializeComment(reply, sealTierMap, this.reactionSummaryFor(reply.id, reactionCounts, userVotes));
+          return s ? [s] : [];
+        }),
+      }];
+    });
 
     const totalPages = Math.ceil(total / safeLimit);
     return {
@@ -2727,7 +2734,10 @@ export class ShowcaseService {
     row: CommentRow,
     sealTierMap?: Map<string, string | null>,
     reactions?: { likes: number; dislikes: number; userVote: number },
-  ): Record<string, unknown> {
+  ): Record<string, unknown> | null {
+    // (2026-10-05: defensif — user yang hilang/rusak tidak boleh meruntuhkan
+    // seluruh response; kembalikan null agar pemanggil bisa melewatinya.)
+    if (!row.user) return null
     const isDeleted = row.deletedAt != null;
     return {
       id: row.id,
@@ -2872,7 +2882,9 @@ export class ShowcaseService {
     })) as unknown as CommentRow;
 
     const sealTierMap = await this.verificationBadgeService.getSealTierMap([created.user.id]);
-    return this.serializeComment(created, sealTierMap);
+    const result = this.serializeComment(created, sealTierMap);
+    if (!result) throw new InternalServerErrorException('Gagal serialisasi komentar');
+    return result;
   }
 
   async updateComment(userId: string, commentId: string, dto: UpdateShowcaseCommentDto): Promise<object> {
@@ -2914,7 +2926,9 @@ export class ShowcaseService {
     })) as unknown as CommentRow;
     const sealTierMap = await this.verificationBadgeService.getSealTierMap([updated.user.id]);
     const { counts: reactionCounts, userVotes } = await this.getCommentReactionMaps([updated.id], userId);
-    return this.serializeComment(updated, sealTierMap, this.reactionSummaryFor(updated.id, reactionCounts, userVotes));
+    const result = this.serializeComment(updated, sealTierMap, this.reactionSummaryFor(updated.id, reactionCounts, userVotes));
+    if (!result) throw new InternalServerErrorException('Gagal serialisasi komentar');
+    return result;
   }
 
   /**
@@ -3043,7 +3057,9 @@ export class ShowcaseService {
 
     const sealTierMap = await this.verificationBadgeService.getSealTierMap([updated.user.id]);
     const { counts: reactionCounts, userVotes } = await this.getCommentReactionMaps([updated.id], userId);
-    return this.serializeComment(updated, sealTierMap, this.reactionSummaryFor(updated.id, reactionCounts, userVotes));
+    const result = this.serializeComment(updated, sealTierMap, this.reactionSummaryFor(updated.id, reactionCounts, userVotes));
+    if (!result) throw new InternalServerErrorException('Gagal serialisasi komentar');
+    return result;
   }
 
   /**

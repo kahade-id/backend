@@ -218,7 +218,7 @@ export class OrdersController {
     @Body() dto: PayOrderDto,
     @Req() req: Request,
   ): Promise<PayOrderResult> {
-    return this.orderStateService.handlePayOrder(orderId, userId, dto.pin, req.ip, extractLocationContext(req, dto));
+    return this.orderStateService.handlePayOrder(orderId, userId, dto.pin, req.ip, extractLocationContext(req, dto), dto.expectedBuyerPayAmountSen);
   }
 
   @UseGuards(UserThrottleGuard, WalletKillSwitchGuard)

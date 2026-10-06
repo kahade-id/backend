@@ -383,6 +383,9 @@ export class ChatController {
   }
 
   @Post('rooms/:roomId/order')
+  // P1-4 (audit integrasi 2026-10-06): idempotensi WAJIB — endpoint membuat
+  // escrow order; double-tap sebelum re-render bisa membuat dua order.
+  @Idempotency()
   @ApiOperation({ summary: 'Create an escrow order from a negotiation chat (1-by-1)' })
   async createOrderFromChat(
     @CurrentUser('sub') userId: string,

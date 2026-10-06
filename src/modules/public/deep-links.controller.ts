@@ -123,24 +123,57 @@ export class DeepLinksController {
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Get('order-link/:token')
-  @Header('Content-Type', 'text/html; charset=utf-8')
-  async orderLink(@Param('token') token: string, @Res() response: Response): Promise<void> {
+  async orderLink(
+    @Param('token') token: string,
+    @Req() request: Request,
+    @Res() response: Response,
+  ): Promise<void> {
     const safeToken = String(token ?? '').trim();
+    // P0-5 (audit integrasi 2026-10-06): content negotiation — klien API
+    // (frontend `previewOrderLink`) mengirim `Accept: application/json` dan
+    // mengharapkan JSON `{ link: {...} }`; browser/crawler tetap dapat HTML.
+    const wantsJson = String(request.headers['accept'] ?? '')
+      .split(',')
+      .some((part) => part.trim().split(';')[0].trim() === 'application/json');
     if (!PUBLIC_ID_RE.test(safeToken)) {
-      response.status(404).send(page({ title: 'Tautan tidak ditemukan', description: 'Tautan transaksi Kahade tidak tersedia.', appUrl: appSchemeUrl('order-link/invalid'), detail: 'Token tautan tidak valid.' }));
+      if (wantsJson) {
+        response
+          .status(404)
+          .type('application/json')
+          .json({ code: 'ORDER_LINK_NOT_FOUND', message: 'Token tautan tidak valid.' });
+        return;
+      }
+      response
+        .status(404)
+        .type('text/html; charset=utf-8')
+        .send(page({ title: 'Tautan tidak ditemukan', description: 'Tautan transaksi Kahade tidak tersedia.', appUrl: appSchemeUrl('order-link/invalid'), detail: 'Token tautan tidak valid.' }));
       return;
     }
     let title = 'Tautan transaksi Kahade';
     let detail = 'Tinjau detail tautan transaksi di aplikasi Kahade.';
     try {
       const link = await this.orderLinksService.getLinkByToken(safeToken);
+      if (wantsJson) {
+        // Bentuk `{ link: {...} }` — cocok dengan normalisasi FE
+        // (`normalizeOrderLink` membaca `link`/`data`/top-level secara toleran).
+        response.status(200).type('application/json').json({ link });
+        return;
+      }
       const record = link as Record<string, unknown>;
       title = String(record.title ?? title);
       detail = `${String(record.description ?? 'Tautan escrow Kahade')}\nNilai: Rp ${String(record.orderValue ?? '—')}\nPembuat: ${String((record.creator as Record<string, unknown> | undefined)?.username ?? 'Pengguna Kahade')}`;
-    } catch {
+    } catch (err) {
+      if (wantsJson) {
+        // Untuk klien JSON, biarkan exception filter memformat error
+        // (NotFound/BadRequest dengan kode ORDER_LINK_*); FE punya fallback.
+        throw err;
+      }
       detail = 'Tautan ini mungkin sudah kedaluwarsa, dibatalkan, atau sudah digunakan. Buka aplikasi untuk mendapatkan status terbaru.';
     }
-    response.status(200).send(page({ title, description: 'Tautan transaksi escrow Kahade.', appUrl: appSchemeUrl(`order-link/${encodeURIComponent(safeToken)}`), detail }));
+    response
+      .status(200)
+      .type('text/html; charset=utf-8')
+      .send(page({ title, description: 'Tautan transaksi escrow Kahade.', appUrl: appSchemeUrl(`order-link/${encodeURIComponent(safeToken)}`), detail }));
   }
 
   // Section 3: halaman share untuk item showcase (konten sosial).

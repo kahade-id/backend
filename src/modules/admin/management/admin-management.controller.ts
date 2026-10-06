@@ -59,6 +59,8 @@ export class AdminManagementController {
   @Delete('emergency-grants/:id')
   @UseGuards(UserThrottleGuard)
   @Idempotency()
+  // P1-3: step-up WAJIB (sinkron dengan AdminOpsAliasController).
+  @RequireStepUp('admin.emergency-grant.revoke', 'id')
   @ApiOperation({ summary: 'Cabut grant akses darurat (kontrak admin web)', description: 'Hanya SUPER_ADMIN. Audit EMERGENCY_ACCESS_REVOKED.' })
   @ApiResponse({ status: 200, description: 'Emergency grant revoked.' })
   @ApiResponse({ status: 404, description: 'Grant not found.' })
@@ -80,6 +82,9 @@ export class AdminManagementController {
   @Post('emergency-grants')
   @UseGuards(UserThrottleGuard)
   @Idempotency()
+  // P1-3 (audit integrasi 2026-10-06): step-up WAJIB — sinkron dengan
+  // AdminOpsAliasController (kontrak admin web).
+  @RequireStepUp('admin.emergency-grant.create')
   @ApiOperation({
     summary: 'Grant akses darurat berjangka',
     description: 'Hanya SUPER_ADMIN. Kedaluwarsa maks 120 menit. Audit EMERGENCY_ACCESS_GRANTED.',
@@ -99,6 +104,8 @@ export class AdminManagementController {
   @UseGuards(UserThrottleGuard)
   @Idempotency()
   @HttpCode(HttpStatus.OK)
+  // P1-3: step-up WAJIB (sinkron dengan AdminOpsAliasController).
+  @RequireStepUp('admin.emergency-grant.revoke', 'grantId')
   @ApiOperation({ summary: 'Cabut grant akses darurat', description: 'Hanya SUPER_ADMIN. Audit EMERGENCY_ACCESS_REVOKED.' })
   @ApiResponse({ status: 200, description: 'Emergency grant revoked.' })
   @ApiResponse({ status: 404, description: 'Grant not found.' })

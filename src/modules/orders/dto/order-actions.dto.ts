@@ -1,6 +1,6 @@
 import {
   IsString, IsOptional, IsEnum, IsArray, IsNumber, IsInt,
-  Min, Max, MinLength, MaxLength, ArrayMaxSize, IsIn, ValidateNested,
+  Min, Max, MinLength, MaxLength, ArrayMaxSize, IsIn, ValidateNested, Matches,
 } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
 import { FeeResponsibility } from '@prisma/client';
@@ -181,6 +181,19 @@ export class PayOrderDto {
   @ValidateNested()
   @Type(() => LocationDto)
   deviceLocation?: LocationDto | null;
+
+  /**
+   * P1-1 (audit integrasi 2026-10-06): nominal (dalam SEN, string digit) yang
+   * disetujui user di dialog konfirmasi terakhir. Bila diisi dan tidak sama
+   * dengan `buyerPayAmount` tersimpan, pembayaran ditolak 409
+   * (ORDER_TOTAL_CHANGED) — persetujuan user harus mengikat nominal yang
+   * didebit. Opsional agar klien lama tetap kompatibel.
+   */
+  @ApiPropertyOptional({ description: 'Nominal yang disetujui user (sen, string digit). Bila tidak cocok dengan order → 409.', required: false })
+  @IsOptional()
+  @IsString()
+  @Matches(/^\d{1,15}$/, { message: 'expectedBuyerPayAmountSen must be a digit string' })
+  expectedBuyerPayAmountSen?: string;
 }
 
 /**

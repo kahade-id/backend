@@ -12,6 +12,7 @@ import { AdminJwtPayload } from '../../../common/types/jwt-payload.types';
 import { ParseIdPipe } from '../../../common/pipes/parse-id.pipe';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
 import { Idempotency } from '../../../common/decorators/idempotency.decorator';
+import { RequireStepUp } from '../../../common/decorators/require-step-up.decorator';
 import { Request } from 'express';
 import { AdminManagementService } from './admin-management.service';
 import { CreateEmergencyGrantDto } from './dto/emergency-grant.dto';
@@ -56,6 +57,10 @@ export class AdminOpsAliasController {
   @Post('emergency-grants')
   @UseGuards(UserThrottleGuard)
   @Idempotency()
+  // P1-3 (audit integrasi 2026-10-06): step-up WAJIB — UI admin sudah mengirim
+  // X-Step-Up-Token dengan action 'admin.emergency-grant.create'; tanpa
+  // decorator ini StepUpGuard no-op dan proteksi hanya teater.
+  @RequireStepUp('admin.emergency-grant.create')
   @ApiOperation({ summary: 'Grant akses darurat berjangka (kontrak admin web)' })
   @ApiResponse({ status: 201, description: 'Emergency grant created.' })
   @ApiResponse({ status: 403, description: 'Requires SUPER_ADMIN.' })
@@ -71,6 +76,9 @@ export class AdminOpsAliasController {
   @Delete('emergency-grants/:id')
   @UseGuards(UserThrottleGuard)
   @Idempotency()
+  // P1-3: step-up WAJIB — UI memakai action 'admin.emergency-grant.revoke'
+  // dengan targetId = id grant (param route 'id' di sini).
+  @RequireStepUp('admin.emergency-grant.revoke', 'id')
   @ApiOperation({ summary: 'Cabut grant akses darurat (kontrak admin web)' })
   @ApiResponse({ status: 200, description: 'Emergency grant revoked.' })
   @ApiResponse({ status: 404, description: 'Grant not found.' })
@@ -86,6 +94,8 @@ export class AdminOpsAliasController {
   @UseGuards(UserThrottleGuard)
   @Idempotency()
   @HttpCode(HttpStatus.OK)
+  // P1-3: step-up WAJIB (lihat komentar di createEmergencyGrant).
+  @RequireStepUp('admin.emergency-grant.revoke', 'grantId')
   @ApiOperation({ summary: 'Cabut grant akses darurat' })
   @ApiResponse({ status: 200, description: 'Emergency grant revoked.' })
   @ApiResponse({ status: 404, description: 'Grant not found.' })

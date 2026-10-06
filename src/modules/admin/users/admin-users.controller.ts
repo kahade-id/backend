@@ -173,6 +173,9 @@ export class AdminUsersController {
   @Post(':userId/ban')
   @UseGuards(UserThrottleGuard)
   @AdminRoles('SUPER_ADMIN')
+  // P2-1 (audit integrasi 2026-10-06): step-up WAJIB — ban mencabut akun +
+  // sesi; setara wallet.adjust yang sudah wajib step-up.
+  @RequireStepUp('user.ban', 'userId')
   @ApiOperation({ summary: 'Ban user', description: 'Bans a user with a required reason. ADMIN and SUPER_ADMIN only.' })
   @ApiResponse({ status: 200, description: 'User banned.' })
   @ApiResponse({ status: 403, description: 'Insufficient admin role or user already banned.' })
@@ -228,6 +231,8 @@ export class AdminUsersController {
   @Post(':userId/suspend')
   @UseGuards(UserThrottleGuard)
   @AdminRoles('SUPER_ADMIN')
+  // P2-1 (audit integrasi 2026-10-06): step-up WAJIB — setara ban.
+  @RequireStepUp('user.suspend', 'userId')
   @ApiOperation({
     summary: 'Suspend sementara user',
     description:

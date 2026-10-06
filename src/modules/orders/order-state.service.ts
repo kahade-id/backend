@@ -180,7 +180,7 @@ export class OrderStateService {
     return { orderId, status: newStatus };
   }
 
-  async handlePayOrder(orderId: string, userId: string, pin?: string, ip?: string, ctx?: ActionLocationContext): Promise<PayOrderResult> {
+  async handlePayOrder(orderId: string, userId: string, pin?: string, ip?: string, ctx?: ActionLocationContext, expectedBuyerPayAmountSen?: string): Promise<PayOrderResult> {
     // Misi BI-safe (defense in depth — guard juga ada di controller):
     // bayar pakai saldo wallet dilarang saat wallet nonaktif.
     if (!this.walletMode.isWalletEnabled()) {
@@ -196,7 +196,7 @@ export class OrderStateService {
       });
     }
     await this.walletService.verifyPin(userId, pin, ip);
-    const { walletTxId } = await this.payOrder(orderId, userId);
+    const { walletTxId } = await this.payOrder(orderId, userId, expectedBuyerPayAmountSen);
     this.runRealtimeBestEffort(() => this.realtime.emitToOrder(orderId, 'order.status_changed', { orderId, status: 'PROCESSING' }), 'PAY_ORDER_STATUS');
 
     // Lokasi presisi tiap aksi sensitif — best-effort, tidak pernah throw.
@@ -442,7 +442,7 @@ export class OrderStateService {
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }), 'REJECT_ORDER_TX');
   }
 
-  async payOrder(orderId: string, buyerId: string): Promise<{ walletTxId: string }> {
+  async payOrder(orderId: string, buyerId: string, expectedBuyerPayAmountSen?: string): Promise<{ walletTxId: string }> {
     const order = await this.prisma.order.findFirst({
       where: { orderId, deletedAt: null }, // AUDIT-16
       include: { buyer: { select: { wallet: { select: { id: true } } } } },
@@ -482,6 +482,24 @@ export class OrderStateService {
       }
       if (freshOrder.buyerId !== buyerId || freshOrder.buyerPayAmount !== order.buyerPayAmount) {
         throw new ConflictException({ code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT, message: 'Order payment terms changed, please reload and retry' });
+      }
+      // P1-1 (audit integrasi 2026-10-06): nominal yang disetujui user di
+      // dialog HARUS sama dengan yang didebit. Bila klien mengirim ekspektasi
+      // dan tidak cocok → tolak 409 agar user memuat ulang, bukan mendebit
+      // nominal yang tidak disetujui.
+      if (expectedBuyerPayAmountSen !== undefined && expectedBuyerPayAmountSen !== '') {
+        let expectedSen: bigint;
+        try {
+          expectedSen = BigInt(expectedBuyerPayAmountSen);
+        } catch {
+          throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'expectedBuyerPayAmountSen must be a digit string' });
+        }
+        if (expectedSen !== freshOrder.buyerPayAmount) {
+          throw new ConflictException({
+            code: 'ORDER_TOTAL_CHANGED',
+            message: 'Total bayar berubah sejak Anda menyetujuinya. Muat ulang dan coba lagi.',
+          });
+        }
       }
 
       const wallet = await tx.wallet.findUnique({ where: { id: buyerWalletId } });

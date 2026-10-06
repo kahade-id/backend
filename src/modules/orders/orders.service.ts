@@ -299,6 +299,16 @@ export class OrdersService {
       category?: OrderCategory;
       // TX-UNIFIED-V2 (P1-3): estimasi tanggal fulfillment untuk PREORDER (ISO 8601).
       preorderEstimatedDate?: string;
+      // TX-UNIFIED-V2 (P0-A, 2026-10-06): detail kategori dari flow "Buat Transaksi".
+      scheduledDate?: string;
+      itemCondition?: string;
+      conditionDescription?: string;
+      deliveryMethod?: string;
+      warrantyDays?: number;
+      deliverables?: string;
+      serviceLocation?: string;
+      cancellationPolicy?: string;
+      slotId?: string;
       orderValue: number;
       deliveryDeadlineDays: number;
       deliveryDeadlineAt?: string;
@@ -361,6 +371,16 @@ export class OrdersService {
       category?: OrderCategory;
       // TX-UNIFIED-V2 (P1-3): estimasi tanggal fulfillment untuk PREORDER (ISO 8601).
       preorderEstimatedDate?: string;
+      // TX-UNIFIED-V2 (P0-A, 2026-10-06): detail kategori dari flow "Buat Transaksi".
+      scheduledDate?: string;
+      itemCondition?: string;
+      conditionDescription?: string;
+      deliveryMethod?: string;
+      warrantyDays?: number;
+      deliverables?: string;
+      serviceLocation?: string;
+      cancellationPolicy?: string;
+      slotId?: string;
       orderValue: number;
       deliveryDeadlineDays: number;
       // T3 (audit 2026-09-26): tanggal kalender eksplisit, opsional.
@@ -421,9 +441,15 @@ export class OrdersService {
         });
       }
       const nowMs = Date.now();
-      const minMs = nowMs + 24 * 60 * 60 * 1000; // minimal besok
-      const maxMs = nowMs + DELIVERY_DEADLINE_DAYS_MAX * 24 * 60 * 60 * 1000;
-      if (parsed.getTime() < minMs || parsed.getTime() > maxMs) {
+      // TX-AUDIT2 (P2): toleransi "besok" — frontend mengirim tanggal pilihan
+      // sebagai tengah hari lokal (12:00), sehingga syarat instant now+24h
+      // menolak "besok" yang dipilih di siang/sore hari. Validasi berbasis
+      // tanggal kalender WIB: tanggal pilihan (WIB) harus >= besok (WIB)
+      // dan <= batas maksimal (WIB).
+      const pickedWibDate = formatWIBDate(parsed);
+      const minWibDate = formatWIBDate(new Date(nowMs + 24 * 60 * 60 * 1000)); // besok
+      const maxWibDate = formatWIBDate(new Date(nowMs + DELIVERY_DEADLINE_DAYS_MAX * 24 * 60 * 60 * 1000));
+      if (pickedWibDate < minWibDate || pickedWibDate > maxWibDate) {
         throw new BadRequestException({
           code: ErrorCodes.VALIDATION_ERROR,
           message: `deliveryDeadlineAt must be between tomorrow and ${DELIVERY_DEADLINE_DAYS_MAX} days from now`,
@@ -447,9 +473,12 @@ export class OrdersService {
       }
       const nowMs = Date.now();
       // Estimasi harus di masa depan (minimal besok) dan wajar (maks 365 hari).
-      const minMs = nowMs + 24 * 60 * 60 * 1000;
-      const maxMs = nowMs + 365 * 24 * 60 * 60 * 1000;
-      if (parsed.getTime() < minMs || parsed.getTime() > maxMs) {
+      // TX-AUDIT2 (P2): bandingkan tanggal kalender WIB (toleransi "besok",
+      // selaras validasi deliveryDeadlineAt di atas).
+      const pickedWibDate = formatWIBDate(parsed);
+      const minWibDate = formatWIBDate(new Date(nowMs + 24 * 60 * 60 * 1000));
+      const maxWibDate = formatWIBDate(new Date(nowMs + 365 * 24 * 60 * 60 * 1000));
+      if (pickedWibDate < minWibDate || pickedWibDate > maxWibDate) {
         throw new BadRequestException({
           code: ErrorCodes.VALIDATION_ERROR,
           message: 'preorderEstimatedDate must be between tomorrow and 365 days from now',
@@ -458,10 +487,74 @@ export class OrdersService {
       explicitPreorderEstimatedDate = parsed;
     }
 
+    // TX-UNIFIED-V2 (P0-A, 2026-10-06): tanggal/jadwal layanan untuk JASA.
+    // Pola sama seperti preorderEstimatedDate: parse WIB, harus valid &
+    // di masa depan (minimal besok, maks 365 hari) bila diisi.
+    let explicitScheduledDate: Date | null = null;
+    if (dto.scheduledDate !== undefined && dto.scheduledDate !== null && String(dto.scheduledDate).trim() !== '') {
+      const parsed = parseDateBoundaryWIB(String(dto.scheduledDate).trim(), 'end');
+      if (!parsed) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'scheduledDate must be a valid ISO 8601 date-time or YYYY-MM-DD calendar date',
+        });
+      }
+      const nowMs = Date.now();
+      const pickedWibDate = formatWIBDate(parsed);
+      const minWibDate = formatWIBDate(new Date(nowMs + 24 * 60 * 60 * 1000)); // besok
+      const maxWibDate = formatWIBDate(new Date(nowMs + 365 * 24 * 60 * 60 * 1000));
+      if (pickedWibDate < minWibDate || pickedWibDate > maxWibDate) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'scheduledDate must be between tomorrow and 365 days from now',
+        });
+      }
+      explicitScheduledDate = parsed;
+    }
+
+    // TX-UNIFIED-V2 (P0-A): validasi nilai enum-like detail kategori.
+    if (dto.itemCondition !== undefined && dto.itemCondition !== null && dto.itemCondition !== '') {
+      if (dto.itemCondition !== 'baru' && dto.itemCondition !== 'bekas') {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'itemCondition must be "baru" or "bekas"',
+        });
+      }
+    }
+    if (dto.deliveryMethod !== undefined && dto.deliveryMethod !== null && dto.deliveryMethod !== '') {
+      if (!['file', 'kode', 'akun', 'lainnya'].includes(dto.deliveryMethod)) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'deliveryMethod must be one of "file", "kode", "akun", "lainnya"',
+        });
+      }
+    }
+
+    // TX-AUDIT2 (P1-E): participantMode=GROUP ditolak via API publik sampai
+    // semantik grup diimplementasikan (fail-closed). Jalur internal legacy
+    // (orderKind=PATUNGAN, dto tidak melewati ValidationPipe publik) tetap
+    // diizinkan karena modenya diturunkan dari orderKind, bukan diminta user.
+    if (dto.participantMode === ParticipantMode.GROUP && dto.orderKind !== OrderKind.PATUNGAN) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'participantMode GROUP belum didukung — fitur patungan segera hadir',
+      });
+    }
+
     // TX-UNIFIED-V2 (P1-3): turunkan category dari orderType bila tidak diisi eksplisit.
-    const resolvedCategory: OrderCategory = dto.category ?? orderTypeToCategory(dto.orderType);
-    const resolvedFulfillment: FulfillmentType = dto.fulfillment ?? FulfillmentType.BIASA;
-    const resolvedParticipantMode: ParticipantMode = dto.participantMode ?? ParticipantMode.SINGLE;
+    // TX-AUDIT2 (P0-B): bila orderKind legacy diisi (jalur commerce internal)
+    // dan dimensi baru tidak eksplisit, turunkan dari orderKind agar jastip
+    // tidak jatuh ke BIASA (auto-cancel 2 hari) dan patungan tidak jatuh ke SINGLE.
+    const resolvedCategory: OrderCategory =
+      dto.category ??
+      (dto.orderKind === OrderKind.SERVICE_BOOKING ? OrderCategory.JASA : undefined) ??
+      orderTypeToCategory(dto.orderType);
+    const resolvedFulfillment: FulfillmentType =
+      dto.fulfillment ??
+      (dto.orderKind === OrderKind.JASTIP ? FulfillmentType.PREORDER : FulfillmentType.BIASA);
+    const resolvedParticipantMode: ParticipantMode =
+      dto.participantMode ??
+      (dto.orderKind === OrderKind.PATUNGAN ? ParticipantMode.GROUP : ParticipantMode.SINGLE);
 
     const sanitizedTitle = (typeof dto.title === 'string' ? dto.title : '').replace(/[<>\"'&]/g, '').trim();
     const sanitizedDescription = (typeof dto.description === 'string' ? dto.description : '').replace(/[<>\"'&]/g, '').trim();
@@ -819,6 +912,16 @@ export class OrdersService {
               category: resolvedCategory,
               // TX-UNIFIED-V2 (P1-3): estimasi fulfillment preorder (null = pakai default 30 hari saat bayar).
               preorderEstimatedDate: explicitPreorderEstimatedDate,
+              // TX-UNIFIED-V2 (P0-A, 2026-10-06): detail kategori dari flow "Buat Transaksi".
+              scheduledDate: explicitScheduledDate,
+              itemCondition: dto.itemCondition?.trim() || null,
+              conditionDescription: dto.conditionDescription?.replace(/[<>\"'&]/g, '').trim() || null,
+              deliveryMethod: dto.deliveryMethod?.trim() || null,
+              warrantyDays: dto.warrantyDays ?? null,
+              deliverables: dto.deliverables?.replace(/[<>\"'&]/g, '').trim() || null,
+              serviceLocation: dto.serviceLocation?.replace(/[<>\"'&]/g, '').trim() || null,
+              cancellationPolicy: dto.cancellationPolicy?.replace(/[<>\"'&]/g, '').trim() || null,
+              slotId: dto.slotId?.trim() || null,
               feeAmount: txFeeCalc.feeAmount,
               feeResponsibility: dto.feeResponsibility,
               buyerFeeAmount: txFeeCalc.buyerFeeAmount,
@@ -1017,7 +1120,7 @@ export class OrdersService {
     OrderStatus.IN_DELIVERY,
   ];
 
-  async getOrders(userId: string, page: number, limit: number, status?: OrderStatus, role?: 'BUYER' | 'SELLER' | 'ALL', search?: string, from?: string, to?: string, sortBy?: string, sortOrder?: string, kind?: OrderKind): Promise<{
+  async getOrders(userId: string, page: number, limit: number, status?: OrderStatus, role?: 'BUYER' | 'SELLER' | 'ALL', search?: string, from?: string, to?: string, sortBy?: string, sortOrder?: string, kind?: OrderKind, fulfillment?: FulfillmentType, participantMode?: ParticipantMode, category?: OrderCategory): Promise<{
     orders: {
       orderId: string;
       orderNumber: string;
@@ -1027,6 +1130,10 @@ export class OrdersService {
       orderType: OrderType;
       // POIN 2 (2026-10-04): jenis transaksi escrow — ikut di respons list/detail (dibutuhkan FE + admin).
       orderKind: OrderKind;
+      // TX-UNIFIED-V2 (2026-10-06): 3 dimensi baru — ikut di respons list.
+      fulfillment: FulfillmentType;
+      participantMode: ParticipantMode;
+      category: OrderCategory;
       orderValue: number;
       buyerPayAmount: number;
       sellerReceiveAmount: number;
@@ -1088,6 +1195,29 @@ export class OrdersService {
       where.orderKind = kindStr;
     }
 
+    // TX-UNIFIED-V2 (2026-10-06): filter 3 dimensi (opsional).
+    if (fulfillment !== undefined) {
+      const fStr = String(fulfillment).toUpperCase() as FulfillmentType;
+      if (!Object.values(FulfillmentType).includes(fStr)) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid fulfillment filter' });
+      }
+      where.fulfillment = fStr;
+    }
+    if (participantMode !== undefined) {
+      const pmStr = String(participantMode).toUpperCase() as ParticipantMode;
+      if (!Object.values(ParticipantMode).includes(pmStr)) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid participantMode filter' });
+      }
+      where.participantMode = pmStr;
+    }
+    if (category !== undefined) {
+      const cStr = String(category).toUpperCase() as OrderCategory;
+      if (!Object.values(OrderCategory).includes(cStr)) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid category filter' });
+      }
+      where.category = cStr;
+    }
+
     if (search && search.trim().length > 0) {
       const searchTerm = escapeLikePattern(search.trim().slice(0, 100));
       where.AND = [
@@ -1145,6 +1275,10 @@ export class OrdersService {
         title: order.title, description: toExcerpt(order.description), status: order.status,
         orderType: order.orderType,
         orderKind: order.orderKind,
+        // TX-UNIFIED-V2 (2026-10-06): 3 dimensi di respons list.
+        fulfillment: order.fulfillment,
+        participantMode: order.participantMode,
+        category: order.category,
         orderValue: toIdr(order.orderValue),
         buyerPayAmount: toIdr(order.buyerPayAmount),
         sellerReceiveAmount: toIdr(order.sellerReceiveAmount),
@@ -1273,6 +1407,16 @@ export class OrdersService {
         participantMode: order.participantMode ?? 'SINGLE',
         category: order.category ?? 'FISIK',
         preorderEstimatedDate: order.preorderEstimatedDate ?? null,
+        // TX-UNIFIED-V2 (P0-A, 2026-10-06): detail kategori.
+        scheduledDate: order.scheduledDate ?? null,
+        itemCondition: order.itemCondition ?? null,
+        conditionDescription: order.conditionDescription ?? null,
+        deliveryMethod: order.deliveryMethod ?? null,
+        warrantyDays: order.warrantyDays ?? null,
+        deliverables: order.deliverables ?? null,
+        serviceLocation: order.serviceLocation ?? null,
+        cancellationPolicy: order.cancellationPolicy ?? null,
+        slotId: order.slotId ?? null,
         trackingNumber: order.trackingNumber, courierName: order.courierName,
         trackingNotes: order.trackingNotes ?? null,
         // TRX-009: alamat pengiriman snapshot (didekripsi) — penjual butuh ini

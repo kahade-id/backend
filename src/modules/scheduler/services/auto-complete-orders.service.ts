@@ -20,6 +20,7 @@ import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-generator.util';
+import { rollbackOrderVoucherUsage } from '../../../common/utils/voucher-rollback.util';
 import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback, CashbackCreditResult } from '../../../common/utils/cashback-credit.util';
 import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
 import { EscrowDisbursementService } from '../../no-wallet/escrow-disbursement.service';
@@ -193,6 +194,12 @@ export class AutoCompleteDeliveredOrdersService {
                       select: { id: true },
                     });
 
+                    // TX-AUDIT2 (P1-D): flag auto-confirm via resi — di-set di
+                    // cabang "tanpa proof sama sekali" bila seller punya
+                    // trackingNumber. Bila true, lewati logika proof/grace
+                    // dan langsung ke jalur release (cair ke seller).
+                    let autoConfirmByShipmentEvidence = false;
+
                     if (!acceptedProof) {
                       const submittedProof = await tx.deliveryProof.findFirst({
                         where: {
@@ -211,10 +218,15 @@ export class AutoCompleteDeliveredOrdersService {
 
                         if (!rejectedProof) {
                           /*
-                           * P1-2 FIX: Order IN_DELIVERY tanpa proof sama sekali.
-                           * Sebelumnya: skip permanen tiap jam selamanya → dana terkunci tanpa batas.
-                           * Sekarang: jika deadline sudah lewat 2x review window tanpa proof apapun,
-                           * perlakukan sebagai seller-abandoned → auto-cancel + auto-refund ke buyer.
+                           * TX-AUDIT2 (P1-D): keputusan produk "100% adil, jangan ada fraud".
+                           * Order IN_DELIVERY tanpa deliveryProof sama sekali:
+                           * - Seller PUNYA bukti kirim (resi/trackingNumber — wajib untuk
+                           *   fisik saat processOrder) + buyer diam 2x review window →
+                           *   auto-confirm: dana CAIR ke seller (diam = menerima).
+                           * - Seller TANPA bukti kirim sama sekali → seller-abandoned →
+                           *   auto-cancel + auto-refund ke buyer.
+                           * Tanpa cabang ini (P1-2 lama), buyer yang diam mendapat
+                           * barang + refund penuh = vektor fraud double-dip.
                            */
                           const abandonThreshold = new Date(
                             now.getTime() -
@@ -227,31 +239,52 @@ export class AutoCompleteDeliveredOrdersService {
                           );
                           const deadline = freshOrder.deliveryDeadlineAt;
                           if (deadline && deadline < abandonThreshold) {
+                            const shipmentEvidence = await tx.order.findUnique({
+                              where: { id: order.id },
+                              select: { trackingNumber: true },
+                            });
+                            if (shipmentEvidence?.trackingNumber) {
+                              this.logger.log(
+                                `AUTO-CONFIRM: Order ${order.orderId} IN_DELIVERY tanpa proof ` +
+                                  `tapi seller punya resi, buyer diam setelah ` +
+                                  `${SELLER_ABANDONED_MULTIPLIER}x review window. Dana cair ke seller.`,
+                              );
+                              autoConfirmByShipmentEvidence = true;
+                            } else {
+                              this.logger.error(
+                                `SELLER-ABANDONED: Order ${order.orderId} IN_DELIVERY tanpa proof ` +
+                                  `sama sekali dan tanpa resi, deadline ${deadline.toISOString()} sudah lewat ` +
+                                  `${SELLER_ABANDONED_MULTIPLIER}x review window. Auto-cancel + auto-refund ke buyer.`,
+                              );
+                              return await this.cancelAbandonedOrder(tx, order, now);
+                            }
+                          } else {
+                            // Belum lewat threshold — tetap skip tapi dengan alert yang jelas
+                            // (bukan warn biasa) agar terpantau di monitoring.
                             this.logger.error(
-                              `SELLER-ABANDONED: Order ${order.orderId} IN_DELIVERY tanpa proof ` +
-                                `sama sekali, deadline ${deadline.toISOString()} sudah lewat ` +
-                                `${SELLER_ABANDONED_MULTIPLIER}x review window. Auto-cancel + auto-refund ke buyer.`,
+                              `ALERT: Order ${order.orderId} IN_DELIVERY tanpa proof sama sekali ` +
+                                `(deadline: ${deadline?.toISOString() ?? 'null'}). ` +
+                                `Akan auto-confirm (bila ada resi) atau auto-refund (tanpa resi) ` +
+                                `jika buyer tetap diam hingga ${abandonThreshold.toISOString()}.`,
                             );
-                            return await this.cancelAbandonedOrder(tx, order, now);
+                            return;
                           }
-                          // Belum lewat threshold — tetap skip tapi dengan alert yang jelas
-                          // (bukan warn biasa) agar terpantau di monitoring.
-                          this.logger.error(
-                            `ALERT: Order ${order.orderId} IN_DELIVERY tanpa proof sama sekali ` +
-                              `(deadline: ${deadline?.toISOString() ?? 'null'}). ` +
-                              `Akan auto-refund jika tidak ada proof hingga ${abandonThreshold.toISOString()}.`,
-                          );
-                          return;
                         }
                       }
 
-                      if (!submittedProof) {
+                      // TX-AUDIT2 (P1-D): bila auto-confirm via resi, lewati cabang
+                      // "hanya rejected proof" — langsung ke release.
+                      if (!submittedProof && !autoConfirmByShipmentEvidence) {
                         this.logger.log(
                           `Order ${order.orderId} has only rejected/expired proofs and no accepted proof — seller must resubmit. Skipping.`,
                         );
                         return;
                       }
 
+                      // TX-AUDIT2 (P1-D): auto-confirm via resi tidak perlu grace
+                      // period tambahan — buyer sudah diam 2x review window penuh.
+                      // Langsung ke jalur release (cair ke seller) di bawah.
+                      if (!autoConfirmByShipmentEvidence) {
                       // C-02: the grace marker was read before the tx started (see above) — no Redis
                       // access inside the transaction.
                       if (alreadyExtended) {
@@ -283,6 +316,7 @@ export class AutoCompleteDeliveredOrdersService {
                         // C-02 fix: marker committed only *after* tx succeeds. Deferred to outer scope.
                         return { gracePeriodExtended: true as const };
                       }
+                      } // end TX-AUDIT2 (P1-D): skip grace period bila auto-confirm via resi
                     }
 
                     const updated = await tx.order.updateMany({
@@ -572,7 +606,10 @@ export class AutoCompleteDeliveredOrdersService {
                         toStatus: OrderStatus.COMPLETED,
                         changedBy: 'SYSTEM',
                         changedByType: ActorType.SYSTEM,
-                        reason: 'Auto-completed: delivery deadline passed without dispute',
+                        // TX-AUDIT2 (P1-D): bedakan alasan auto-confirm via resi.
+                        reason: autoConfirmByShipmentEvidence
+                          ? 'Auto-confirm: seller punya bukti kirim (resi), buyer diam 2x review window — dana cair ke seller'
+                          : 'Auto-completed: delivery deadline passed without dispute',
                       },
                     });
 
@@ -690,6 +727,17 @@ export class AutoCompleteDeliveredOrdersService {
                     data: { type: 'ORDER_CANCELLED', orderId: order.orderId },
                   }),
                 `ABANDONED_REFUND_BUYER_NOTIFICATION orderId=${order.orderId}`,
+              );
+              // TX-AUDIT2 (P1-D): seller juga dapat push realtime, bukan cuma inbox.
+              this.runRealtimeBestEffort(
+                () =>
+                  this.prisma.emitNotificationCreated({
+                    userId: order.sellerId,
+                    title: 'Order Dibatalkan Otomatis',
+                    body: `Order "${order.title}" dibatalkan otomatis karena tidak ada bukti pengiriman.`,
+                    data: { type: 'ORDER_CANCELLED', orderId: order.orderId },
+                  }),
+                `ABANDONED_REFUND_SELLER_NOTIFICATION orderId=${order.orderId}`,
               );
               // Clear failure counter — ini hasil yang diharapkan, bukan error.
               await this.redis
@@ -921,6 +969,7 @@ export class AutoCompleteDeliveredOrdersService {
       sellerId: string;
       buyerPayAmount: bigint;
       title: string;
+      voucherId: string | null;
     },
     now: Date,
   ): Promise<{ abandonedRefunded: boolean }> {
@@ -948,6 +997,12 @@ export class AutoCompleteDeliveredOrdersService {
         reason: 'Seller-abandoned: no delivery proof after 2x review window — auto-refund to buyer',
       },
     });
+
+    // TX-AUDIT2 (P2): kembalikan pemakaian voucher — buyer tidak boleh
+    // kehilangan voucher karena kesalahan seller. Idempoten (helper SP-034).
+    if (order.voucherId) {
+      await rollbackOrderVoucherUsage(tx, order.id, order.voucherId);
+    }
 
     const walletEnabled = this.walletMode?.isWalletEnabled() ?? true;
 

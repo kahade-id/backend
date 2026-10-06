@@ -9,7 +9,7 @@ const mockTx: Record<string, any> = {
   patunganParticipant: { update: jest.fn(), updateMany: jest.fn(), aggregate: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), findUnique: jest.fn(), count: jest.fn(), create: jest.fn() },
   patunganGroup: { update: jest.fn(), updateMany: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn() },
   jastipParticipant: { findFirst: jest.fn() },
-  order: { count: jest.fn() },
+  order: { count: jest.fn(), update: jest.fn().mockResolvedValue({}), findFirst: jest.fn(), findUnique: jest.fn() },
   dispute: { count: jest.fn() },
   $executeRawUnsafe: jest.fn(),
   $queryRaw: jest.fn(),

@@ -72,9 +72,25 @@ export class UnshippedOrderCancelService {
         OR: [
           {
             processingDeadlineAt: { lt: now },
-            // Guard eksplisit: PREORDER dengan estimasi di masa depan tidak
-            // boleh tersentuh walau processingDeadlineAt-nya anomali.
-            NOT: { fulfillment: 'PREORDER', preorderEstimatedDate: { gt: now } },
+            // Guard eksplisit: PREORDER tidak boleh tersentuh walau
+            // processingDeadlineAt-nya anomali —
+            // (a) estimasi di masa depan, atau
+            // (b) TX-AUDIT2 (P1-C): legacy hasil backfill migrasi
+            //     (fulfillment=PREORDER, preorderEstimatedDate=null,
+            //     processingDeadlineAt=paidAt+2hari) yang paidAt-nya masih
+            //     dalam 30 hari. Tanpa (b), NOT di (a) lolos (estimasi null
+            //     → NOT{false}=true) dan order jastip lama yang sah ikut
+            //     ter-cancel pada sweep pertama pasca-deploy.
+            NOT: {
+              OR: [
+                { fulfillment: 'PREORDER', preorderEstimatedDate: { gt: now } },
+                {
+                  fulfillment: 'PREORDER',
+                  preorderEstimatedDate: null,
+                  paidAt: { gt: preorderLegacyCutoff },
+                },
+              ],
+            },
           },
           // Backfill implisit: order lama yang processingDeadlineAt-nya NULL.
           // P1-3: bedakan cutoff — PREORDER lama pakai 30 hari, bukan 2 hari.
@@ -125,6 +141,9 @@ export class UnshippedOrderCancelService {
         paidAt: true,
         buyerId: true,
         buyerPayAmount: true,
+        // TX-AUDIT2 (P1-C): butuh dimensi untuk guard preorder legacy.
+        fulfillment: true,
+        preorderEstimatedDate: true,
       },
     });
     if (!order) {
@@ -140,7 +159,7 @@ export class UnshippedOrderCancelService {
         detail: `Status ${order.status} — bukan PROCESSING yang belum dikirim`,
       };
     }
-    if (!this.isPastShipDeadline(order.processingDeadlineAt, order.paidAt, new Date())) {
+    if (!this.isPastShipDeadline(order, new Date())) {
       return { orderId: order.orderId, outcome: 'SKIPPED_NOT_DUE', detail: 'Belum melewati batas kirim' };
     }
     const openDispute = await this.prisma.dispute.findFirst({
@@ -197,13 +216,32 @@ export class UnshippedOrderCancelService {
   }
 
   private isPastShipDeadline(
-    processingDeadlineAt: Date | null,
-    paidAt: Date | null,
+    order: {
+      processingDeadlineAt: Date | null;
+      paidAt: Date | null;
+      fulfillment: string;
+      preorderEstimatedDate: Date | null;
+    },
     now: Date,
   ): boolean {
-    if (processingDeadlineAt) return processingDeadlineAt.getTime() < now.getTime();
+    // TX-AUDIT2 (P1-C): PREORDER tidak memakai SLA 2 hari.
+    // - Estimasi di masa depan → belum lewat batas.
+    // - Estimasi null (legacy backfill) → jatah 30 hari dari paidAt.
+    if (order.fulfillment === 'PREORDER') {
+      if (order.preorderEstimatedDate) {
+        return order.preorderEstimatedDate.getTime() < now.getTime();
+      }
+      if (order.paidAt) {
+        return (
+          order.paidAt.getTime() + PREORDER_DEFAULT_DEADLINE_DAYS * 24 * 3600_000 <
+          now.getTime()
+        );
+      }
+      return false;
+    }
+    if (order.processingDeadlineAt) return order.processingDeadlineAt.getTime() < now.getTime();
     // Backfill implisit order lama: paidAt + PROCESSING_DEADLINE_DAYS.
-    if (paidAt) return paidAt.getTime() + UnshippedOrderCancelService.processingDeadlineMs() < now.getTime();
+    if (order.paidAt) return order.paidAt.getTime() + UnshippedOrderCancelService.processingDeadlineMs() < now.getTime();
     return false;
   }
 

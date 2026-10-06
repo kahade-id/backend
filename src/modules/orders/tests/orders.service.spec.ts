@@ -422,6 +422,181 @@ describe('OrdersService', () => {
       expect(mockPrisma.$transaction).not.toHaveBeenCalled();
     });
 
+    // TX-AUDIT2 (P2): toleransi "besok" — frontend mengirim tengah hari lokal.
+    it('accepts deliveryDeadlineAt "tomorrow" sent as local noon (TX-AUDIT2 P2)', async () => {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
+        mockPrisma.order.create.mockResolvedValue(mockOrder);
+        mockPrisma.chatRoom.create.mockResolvedValue({ id: 'chat-1' });
+        return fn(mockPrisma);
+      });
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+
+      // "Besok" jam 12:00 siang waktu lokal — seperti yang dikirim DateField frontend.
+      const tomorrowNoon = new Date();
+      tomorrowNoon.setDate(tomorrowNoon.getDate() + 1);
+      tomorrowNoon.setHours(12, 0, 0, 0);
+      await service.createOrder('user-db-1', { ...dto, deliveryDeadlineAt: tomorrowNoon.toISOString() });
+
+      expect(mockPrisma.$transaction).toHaveBeenCalled();
+      const createCall = mockPrisma.order.create.mock.calls[0][0].data;
+      expect(createCall.deliveryDeadlineAt).toEqual(tomorrowNoon);
+    });
+
+    // TX-AUDIT2 (P0-A): field kategori frontend tidak ditolak & tersimpan.
+    it('stores category detail fields from frontend payload (TX-AUDIT2 P0-A)', async () => {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
+        mockPrisma.order.create.mockResolvedValue(mockOrder);
+        mockPrisma.chatRoom.create.mockResolvedValue({ id: 'chat-1' });
+        return fn(mockPrisma);
+      });
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+
+      const tomorrow = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      await service.createOrder('user-db-1', {
+        ...dto,
+        category: OrderCategory.JASA,
+        fulfillment: FulfillmentType.BIASA,
+        participantMode: ParticipantMode.SINGLE,
+        scheduledDate: tomorrow,
+        deliverables: 'Desain logo + brand guideline',
+        serviceLocation: 'Jakarta Selatan',
+        cancellationPolicy: 'H-3 full refund',
+      });
+
+      const createCall = mockPrisma.order.create.mock.calls[0][0].data;
+      expect(createCall.category).toBe(OrderCategory.JASA);
+      expect(createCall.scheduledDate).toBeInstanceOf(Date);
+      expect(createCall.deliverables).toBe('Desain logo + brand guideline');
+      expect(createCall.serviceLocation).toBe('Jakarta Selatan');
+      expect(createCall.cancellationPolicy).toBe('H-3 full refund');
+    });
+
+    it('stores FISIK/condition and DIGITAL/delivery fields (TX-AUDIT2 P0-A)', async () => {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
+        mockPrisma.order.create.mockResolvedValue(mockOrder);
+        mockPrisma.chatRoom.create.mockResolvedValue({ id: 'chat-1' });
+        return fn(mockPrisma);
+      });
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+
+      await service.createOrder('user-db-1', {
+        ...dto,
+        category: OrderCategory.FISIK,
+        itemCondition: 'bekas',
+        conditionDescription: 'Lecet dikit di sudut',
+      });
+      let createCall = mockPrisma.order.create.mock.calls[0][0].data;
+      expect(createCall.itemCondition).toBe('bekas');
+      expect(createCall.conditionDescription).toBe('Lecet dikit di sudut');
+
+      await expect(
+        service.createOrder('user-db-1', { ...dto, itemCondition: 'rusak' }),
+      ).rejects.toThrow(BadRequestException);
+      await expect(
+        service.createOrder('user-db-1', { ...dto, deliveryMethod: 'pos' }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    // TX-AUDIT2 (P0-B): derivasi dimensi dari orderKind legacy.
+    it('derives dimensions from legacy orderKind when not explicit (TX-AUDIT2 P0-B)', async () => {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
+        mockPrisma.order.create.mockResolvedValue(mockOrder);
+        mockPrisma.chatRoom.create.mockResolvedValue({ id: 'chat-1' });
+        return fn(mockPrisma);
+      });
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+
+      // JASTIP tanpa fulfillment eksplisit → PREORDER (tidak kena SLA 2 hari).
+      await service.createOrder('user-db-1', { ...dto, orderKind: OrderKind.JASTIP });
+      let createCall = mockPrisma.order.create.mock.calls[0][0].data;
+      expect(createCall.orderKind).toBe(OrderKind.JASTIP);
+      expect(createCall.fulfillment).toBe(FulfillmentType.PREORDER);
+
+      // PATUNGAN tanpa participantMode eksplisit → GROUP.
+      await service.createOrder('user-db-1', { ...dto, orderKind: OrderKind.PATUNGAN });
+      createCall = mockPrisma.order.create.mock.calls[1][0].data;
+      expect(createCall.participantMode).toBe(ParticipantMode.GROUP);
+
+      // SERVICE_BOOKING tanpa category eksplisit → JASA.
+      await service.createOrder('user-db-1', {
+        ...dto,
+        orderType: OrderType.SERVICE,
+        orderKind: OrderKind.SERVICE_BOOKING,
+        shippingAddressId: undefined,
+      });
+      createCall = mockPrisma.order.create.mock.calls[2][0].data;
+      expect(createCall.category).toBe(OrderCategory.JASA);
+
+      // Dimensi eksplisit tidak ditimpa derivasi.
+      await service.createOrder('user-db-1', {
+        ...dto,
+        orderKind: OrderKind.JASTIP,
+        fulfillment: FulfillmentType.BIASA,
+      });
+      createCall = mockPrisma.order.create.mock.calls[3][0].data;
+      expect(createCall.fulfillment).toBe(FulfillmentType.BIASA);
+    });
+
+    // TX-AUDIT2 (P1-E): GROUP via API publik ditolak.
+    it('rejects participantMode GROUP via public API (TX-AUDIT2 P1-E)', async () => {
+      await expect(
+        service.createOrder('user-db-1', { ...dto, participantMode: ParticipantMode.GROUP }),
+      ).rejects.toThrow(BadRequestException);
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('allows GROUP derived from legacy PATUNGAN orderKind (TX-AUDIT2 P1-E)', async () => {
+      mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
+        if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
+        if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
+        return Promise.resolve(null);
+      });
+      mockPrisma.blockList.findFirst.mockResolvedValue(null);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => {
+        mockPrisma.order.create.mockResolvedValue(mockOrder);
+        mockPrisma.chatRoom.create.mockResolvedValue({ id: 'chat-1' });
+        return fn(mockPrisma);
+      });
+      mockPrisma.order.findFirst.mockResolvedValue(null);
+
+      // Jalur internal patungan: orderKind=PATUNGAN + participantMode=GROUP eksplisit.
+      await service.createOrder('user-db-1', {
+        ...dto,
+        orderKind: OrderKind.PATUNGAN,
+        participantMode: ParticipantMode.GROUP,
+      });
+      expect(mockPrisma.$transaction).toHaveBeenCalled();
+    });
+
     it('stores an explicit calendar deliveryDeadlineAt on the order (T3 audit 2026-09-26)', async () => {
       mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
         if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
@@ -616,6 +791,7 @@ describe('OrdersService', () => {
       mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
         if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
         if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
         return Promise.resolve(null);
       });
       mockPrisma.blockList.findFirst.mockResolvedValue(null);
@@ -631,6 +807,7 @@ describe('OrdersService', () => {
       mockPrisma.user.findUnique.mockImplementation(({ where }: { where: { id?: string; username?: string } }) => {
         if (where.username === 'seller01') return Promise.resolve(mockCounterpart);
         if (where.id === 'user-db-1') return Promise.resolve(mockUser);
+        if (where.id === 'user-db-2') return Promise.resolve(mockCounterpart);
         return Promise.resolve(null);
       });
       mockPrisma.blockList.findFirst.mockResolvedValue(null);

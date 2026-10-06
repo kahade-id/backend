@@ -11,7 +11,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
-import { FeeResponsibility, OrderType } from '@prisma/client';
+import { FeeResponsibility, OrderType, FulfillmentType, ParticipantMode, OrderCategory } from '@prisma/client';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { LocationDto } from '../../auth/dto/location.dto';
 import {
@@ -143,6 +143,27 @@ export class CreateOrderDto {
   @IsString()
   @MaxLength(100)
   inquiryRoomId?: string;
+
+  @ApiPropertyOptional({ enum: FulfillmentType, description: 'TX-UNIFIED-V2: BIASA (ready stock) atau PREORDER (fulfill nanti). Default BIASA.' })
+  @IsOptional()
+  @IsEnum(FulfillmentType, { message: 'fulfillment must be BIASA or PREORDER' })
+  fulfillment?: FulfillmentType;
+
+  @ApiPropertyOptional({ enum: ParticipantMode, description: 'TX-UNIFIED-V2: SINGLE (1-by-1) atau GROUP (1-by-N patungan). Default SINGLE.' })
+  @IsOptional()
+  @IsEnum(ParticipantMode, { message: 'participantMode must be SINGLE or GROUP' })
+  participantMode?: ParticipantMode;
+
+  @ApiPropertyOptional({ enum: OrderCategory, description: 'TX-UNIFIED-V2: FISIK, DIGITAL, atau JASA. Default diturunkan dari orderType.' })
+  @IsOptional()
+  @IsEnum(OrderCategory, { message: 'category must be FISIK, DIGITAL, or JASA' })
+  category?: OrderCategory;
+
+  @ApiPropertyOptional({ description: 'TX-UNIFIED-V2: estimasi tanggal fulfillment untuk PREORDER (ISO 8601). Wajib jika fulfillment=PREORDER.' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  preorderEstimatedDate?: string;
 
   @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)', type: () => LocationDto })
   @IsOptional()

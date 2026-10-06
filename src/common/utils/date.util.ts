@@ -93,6 +93,32 @@ export function resolveDeliveryDeadlineAt(explicit: Date | null | undefined, fal
   return addDays(now, fallbackDays);
 }
 
+/**
+ * TX-UNIFIED-V2 (P1-3, 2026-10-06): tentukan processingDeadlineAt saat pembayaran.
+ *
+ * Aturan:
+ * - BIASA (atau null/undefined): paidAt + PROCESSING_DEADLINE_DAYS (2 hari) — perilaku lama.
+ * - PREORDER dengan estimasi eksplisit yang masih di masa depan: pakai estimasi
+ *   (sweep unshipped tidak akan membatalkan sebelum estimasi lewat).
+ * - PREORDER tanpa estimasi (atau estimasi sudah basi): paidAt + PREORDER_DEFAULT_DEADLINE_DAYS
+ *   (30 hari) — JANGAN 2 hari, karena itu membatalkan preorder yang sah.
+ */
+export function resolveProcessingDeadlineAt(
+  fulfillment: string | null | undefined,
+  preorderEstimatedDate: Date | null | undefined,
+  paidAt: Date,
+  processingDeadlineDays: number,
+  preorderDefaultDeadlineDays: number,
+): Date {
+  if (fulfillment === 'PREORDER') {
+    if (preorderEstimatedDate && preorderEstimatedDate.getTime() > paidAt.getTime()) {
+      return preorderEstimatedDate;
+    }
+    return addDays(paidAt, preorderDefaultDeadlineDays);
+  }
+  return addDays(paidAt, processingDeadlineDays);
+}
+
 export function isExpired(date: Date): boolean {
   return dayjs(date).isBefore(dayjs());
 }

@@ -1,10 +1,11 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ConflictException, Logger } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { Prisma, ProductType, SlotBookingStatus, OrderType, OrderKind, FulfillmentType, ParticipantMode, OrderCategory, FeeResponsibility } from '@prisma/client';
+import { Prisma, ProductType, SlotBookingStatus, OrderType, OrderKind, FeeResponsibility, OrderStatus } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { toIdr } from '../../../common/utils/currency.util';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { OrdersService } from '../../orders/orders.service';
+import { OrderStateService } from '../../orders/order-state.service';
 import { clampDeadlineDays } from '../commerce-order.util';
 import { CreateServiceSlotDto, BookServiceSlotDto } from '../dto/commerce.dto';
 
@@ -16,12 +17,17 @@ const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
  */
 @Injectable()
 export class ServiceBookingService {
+  private readonly logger = new Logger(ServiceBookingService.name);
+
   constructor(
     private prisma: PrismaService,
     // POIN 2 (2026-10-04): bookAndCreateOrder memanggil
     // OrdersService.createOrder secara internal. Satu arah (commerce →
     // orders); tanpa circular DI.
     private ordersService: OrdersService,
+    // P2-2: cascade pembatalan order escrow saat booking dibatalkan.
+    // CommerceModule sudah mengimpor OrdersModule (pola jastip/patungan).
+    private orderStateService: OrderStateService,
   ) {}
 
   private async assertSellerShowcase(sellerId: string, showcaseId: string) {
@@ -168,6 +174,7 @@ export class ServiceBookingService {
     if (!seller?.username) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Seller slot tidak valid' });
     }
+    const sellerUsername: string = seller.username;
 
     // slotDate disimpan sebagai Date @db.Date zona WIB — tampilkan YYYY-MM-DD WIB.
     const slotDateWib = new Date(slot.slotDate.getTime() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
@@ -178,43 +185,76 @@ export class ServiceBookingService {
       .trim()
       .slice(0, 500);
 
-    // createOrder menjalankan transaksinya sendiri (lihat jastip/patungan):
-    // booking sudah diklaim di atas; predicate di bawah mencegah orderId
-    // tertimpa bila dua request balapan.
-    const created = await this.ordersService.createOrder(userId, {
-      role: 'BUYER',
-      counterpartUsername: seller.username,
-      title,
-      description,
-      orderType: OrderType.SERVICE,
-      orderKind: OrderKind.SERVICE_BOOKING,
-      // TX-UNIFIED-V2 (2026-10-06): booking jasa = JASA; dual-write dengan orderKind lama.
-      fulfillment: FulfillmentType.BIASA,
-      participantMode: ParticipantMode.SINGLE,
-      category: OrderCategory.JASA,
-      orderValue: priceIdr,
-      deliveryDeadlineDays: clampDeadlineDays(slot.slotDate),
-      feeResponsibility: FeeResponsibility.BUYER,
+    // P2-1: serialisasi create-order + attach per booking (pola yang sama
+    // dengan jastip/patungan: pg_advisory_xact_lock + re-check di dalam tx).
+    // Tanpa ini, dua request konkuren untuk booking yang sama bisa membuat
+    // DUA order — satu menjadi yatim (WAITING_CONFIRMATION, dana belum
+    // bergerak tapi order menggantung selamanya).
+    // createOrder berjalan di tx-nya sendiri (via ordersService, pola
+    // existing); attach memakai predicate orderId:null sebagai guard kedua.
+    const result = await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `commerce_create_order:booking:${bookingId}`);
+      const fresh = await tx.serviceSlotBooking.findUnique({
+        where: { id: bookingId },
+        select: { status: true, orderId: true },
+      });
+      if (!fresh || fresh.status !== SlotBookingStatus.BOOKED) {
+        throw new ConflictException({ code: ErrorCodes.BOOKING_NOT_FOUND, message: 'Booking tidak valid / sudah berubah' });
+      }
+      if (fresh.orderId) {
+        throw new ConflictException({ code: ErrorCodes.ORDER_ALREADY_LINKED, message: 'Order sudah dibuat untuk booking ini' });
+      }
+      const created = await this.ordersService.createOrder(userId, {
+        role: 'BUYER',
+        counterpartUsername: sellerUsername,
+        title,
+        description,
+        orderType: OrderType.SERVICE,
+        orderKind: OrderKind.SERVICE_BOOKING,
+        orderValue: priceIdr,
+        deliveryDeadlineDays: clampDeadlineDays(slot.slotDate),
+        feeResponsibility: FeeResponsibility.BUYER,
+      });
+      const orderRow = await tx.order.findUnique({ where: { orderId: created.orderId }, select: { id: true } });
+      if (!orderRow) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Order gagal dibuat' });
+      }
+      const marked = await tx.serviceSlotBooking.updateMany({
+        where: { id: bookingId, status: SlotBookingStatus.BOOKED, orderId: null },
+        data: { orderId: orderRow.id },
+      });
+      if (marked.count === 0) {
+        // P2-1: attach gagal setelah order ter-commit → order yatim.
+        // Best-effort cleanup: order baru berstatus WAITING_* sehingga bisa
+        // di-cancel oleh buyer pembuatnya. Jangan biarkan menggantung.
+        await this.cancelOrphanOrder(userId, created.orderId);
+        throw new ConflictException({ code: ErrorCodes.ORDER_ALREADY_LINKED, message: 'Booking sudah tertaut order' });
+      }
+      return {
+        bookingId,
+        orderId: created.orderId,
+        orderKind: OrderKind.SERVICE_BOOKING,
+        status: created.status,
+        buyerPayAmount: created.feeCalculation.buyerPayAmount,
+        confirmationDeadlineAt: created.confirmationDeadlineAt,
+      };
     });
-    const orderRow = await this.prisma.order.findUnique({ where: { orderId: created.orderId }, select: { id: true } });
-    if (!orderRow) {
-      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Order gagal dibuat' });
+    return result;
+  }
+
+  /**
+   * P2-1: best-effort cleanup order yatim — order ter-commit tetapi gagal
+   * ditautkan ke booking (race yang lolos dari advisory lock). Order yang
+   * baru dibuat berstatus WAITING_* sehingga bisa di-cancel oleh buyer
+   * pembuatnya. Tidak pernah throw — kegagalan cleanup hanya di-log
+   * (order yatim akan dibersihkan cron expire-unconfirmed).
+   */
+  private async cancelOrphanOrder(buyerId: string, orderPublicId: string): Promise<void> {
+    try {
+      await this.orderStateService.cancelOrder(orderPublicId, buyerId, 'OTHER', 'Cleanup P2-1: order yatim gagal ditautkan ke booking');
+    } catch (e) {
+      this.logger.warn(`[P2-1] Gagal cleanup order yatim ${orderPublicId}: ${(e as Error).message}`);
     }
-    const marked = await this.prisma.serviceSlotBooking.updateMany({
-      where: { id: bookingId, status: SlotBookingStatus.BOOKED, orderId: null },
-      data: { orderId: orderRow.id },
-    });
-    if (marked.count === 0) {
-      throw new ConflictException({ code: ErrorCodes.ORDER_ALREADY_LINKED, message: 'Booking sudah tertaut order' });
-    }
-    return {
-      bookingId,
-      orderId: created.orderId,
-      orderKind: OrderKind.SERVICE_BOOKING,
-      status: created.status,
-      buyerPayAmount: created.feeCalculation.buyerPayAmount,
-      confirmationDeadlineAt: created.confirmationDeadlineAt,
-    };
   }
 
   /** Slot aktif + bukan milik sendiri. Dipakai bookSlot & bookAndCreateOrder. */
@@ -250,12 +290,37 @@ export class ServiceBookingService {
     });
   }
 
+  /**
+   * P2-2: booking dengan order escrow tertaut TIDAK BOLEH dibatalkan
+   * diam-diam. Sebelumnya `select` tidak membaca `orderId` sehingga slot
+   * dibebaskan sementara dana escrow tetap terkunci di order (inkonsisten).
+   * Sekarang: cascade via alur order resmi — order yang masih cancellable
+   * dibatalkan dulu, baru slot dibebaskan. Order yang sudah tidak bisa
+   * dibatalkan (PROCESSING+) → tolak dengan pesan yang jelas (fail closed).
+   */
   async cancelBooking(userId: string, bookingId: string) {
     const booking = await this.prisma.serviceSlotBooking.findFirst({
       where: { id: bookingId, userId, status: SlotBookingStatus.BOOKED },
-      select: { id: true, slotId: true },
+      select: { id: true, slotId: true, orderId: true },
     });
     if (!booking) throw new NotFoundException({ code: ErrorCodes.BOOKING_NOT_FOUND, message: 'Booking tidak ditemukan' });
+    if (booking.orderId) {
+      const order = await this.prisma.order.findUnique({
+        where: { id: booking.orderId },
+        select: { orderId: true, status: true },
+      });
+      const terminal = order && (order.status === OrderStatus.CANCELLED || order.status === OrderStatus.COMPLETED);
+      if (!terminal) {
+        try {
+          await this.orderStateService.cancelOrder(order!.orderId, userId, 'OTHER', 'Booking jasa dibatalkan buyer — cascade ke order');
+        } catch (e) {
+          throw new BadRequestException({
+            code: ErrorCodes.INVALID_ORDER_STATUS,
+            message: 'Booking memiliki order aktif yang tidak bisa dibatalkan — selesaikan/batalkan melalui alur order atau hubungi admin',
+          });
+        }
+      }
+    }
     await this.prisma.$transaction(async (tx) => {
       await tx.serviceSlotBooking.update({ where: { id: booking.id }, data: { status: SlotBookingStatus.CANCELLED } });
       await tx.serviceSlot.update({ where: { id: booking.slotId }, data: { bookedCount: { decrement: 1 } } });

@@ -421,6 +421,19 @@ export class OrdersController {
     ): Promise<{ orderId: string; trackingNumber: string | null; courierName: string | null }> {
     return this.ordersService.updateShipping(orderId, userId, dto);
   }
+
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 900000, limit: 10 } })
+  @Put(':orderId/preorder-estimate')
+  @Idempotency()
+  @ApiOperation({ summary: 'TX-UNIFIED-V2 (P1-3): seller ubah estimasi fulfillment PREORDER (sebelum buyer bayar)' })
+  async updatePreorderEstimate(
+    @CurrentUser('sub') userId: string,
+    @Param('orderId', ParseIdPipe) orderId: string,
+    @Body() dto: { preorderEstimatedDate: string },
+  ): Promise<{ orderId: string; preorderEstimatedDate: Date | null }> {
+    return this.ordersService.updatePreorderEstimate(orderId, userId, dto);
+  }
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 900000, limit: 5 } })
   @Post(':orderId/complete')

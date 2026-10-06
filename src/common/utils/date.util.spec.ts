@@ -1,4 +1,4 @@
-import { resolveDeliveryDeadlineAt, parseDateBoundaryWIB } from './date.util';
+import { resolveDeliveryDeadlineAt, parseDateBoundaryWIB, resolveProcessingDeadlineAt } from './date.util';
 
 describe('resolveDeliveryDeadlineAt (T3 audit 2026-09-26)', () => {
   it('keeps the user-picked explicit date when it is still in the future', () => {
@@ -33,5 +33,36 @@ describe('parseDateBoundaryWIB for calendar dates', () => {
 
   it('returns undefined for an invalid date', () => {
     expect(parseDateBoundaryWIB('not-a-date', 'end')).toBeUndefined();
+  });
+});
+
+describe('resolveProcessingDeadlineAt (TX-UNIFIED-V2 P1-3)', () => {
+  const PAID = new Date('2026-10-01T00:00:00Z');
+
+  it('BIASA: paidAt + 2 hari (perilaku lama)', () => {
+    const res = resolveProcessingDeadlineAt('BIASA', null, PAID, 2, 30);
+    expect(res.toISOString()).toBe('2026-10-03T00:00:00.000Z');
+  });
+
+  it('BIASA dengan null fulfillment: default ke perilaku lama', () => {
+    const res = resolveProcessingDeadlineAt(null, null, PAID, 2, 30);
+    expect(res.toISOString()).toBe('2026-10-03T00:00:00.000Z');
+  });
+
+  it('PREORDER dengan estimasi masa depan: pakai estimasi', () => {
+    const estimate = new Date('2026-10-20T00:00:00Z');
+    const res = resolveProcessingDeadlineAt('PREORDER', estimate, PAID, 2, 30);
+    expect(res).toBe(estimate);
+  });
+
+  it('PREORDER tanpa estimasi: paidAt + 30 hari (BUKAN 2 hari)', () => {
+    const res = resolveProcessingDeadlineAt('PREORDER', null, PAID, 2, 30);
+    expect(res.toISOString()).toBe('2026-10-31T00:00:00.000Z');
+  });
+
+  it('PREORDER dengan estimasi basi: fallback 30 hari', () => {
+    const stale = new Date('2026-09-15T00:00:00Z');
+    const res = resolveProcessingDeadlineAt('PREORDER', stale, PAID, 2, 30);
+    expect(res.toISOString()).toBe('2026-10-31T00:00:00.000Z');
   });
 });

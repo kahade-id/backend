@@ -38,6 +38,13 @@ export const CONFIRMATION_DEADLINE_DAYS = 1;
  * Disimpan ke orders.processingDeadlineAt saat pembayaran sukses.
  */
 export const PROCESSING_DEADLINE_DAYS = 2;
+/**
+ * TX-UNIFIED-V2 (P1-3, 2026-10-06) — batas kirim default untuk PREORDER
+ * TANPA estimasi eksplisit. Preorder tanpa tanggal estimasi tidak boleh
+ * memakai SLA 2 hari (akan membatalkan preorder yang sah) — pakai 30 hari
+ * sebagai default yang wajar; seller didorong mengisi estimasi eksplisit.
+ */
+export const PREORDER_DEFAULT_DEADLINE_DAYS = 30;
 export const CONFIRMATION_DEADLINE_DAYS_MAP: Record<string, number> = {
   PRODUCT: 1,
   SERVICE: 2,

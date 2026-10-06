@@ -40,6 +40,8 @@ describe('PatunganService', () => {
     mockOrderState.cancelOrder.mockResolvedValue({ ok: true });
     mockPrisma.$transaction.mockImplementation((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx));
     mockTx.$executeRawUnsafe.mockResolvedValue(0);
+    // P2-5 repair sweep: default tidak ada peserta PAID yang stuck di grup FAILED.
+    mockPrisma.patunganParticipant.findMany.mockResolvedValue([]);
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         PatunganService,
@@ -72,6 +74,36 @@ describe('PatunganService', () => {
         data: expect.objectContaining({ targetAmount: 1000000_00n, mode: PatunganMode.BAGI_RATA }),
       }),
     );
+  });
+
+  it('P2-6: createGroup menolak target mustahil (perPerson × slot < target)', async () => {
+    await expect(
+      service.createGroup('h1', {
+        ...groupDto,
+        targetAmountIdr: 1000000, // Rp1jt
+        perPersonAmountIdr: 100000, // Rp100rb × 2 slot = Rp200rb < Rp1jt
+        slotTotal: 2,
+      } as never),
+    ).rejects.toThrow('tidak mungkin tercapai');
+    expect(mockPrisma.patunganGroup.create).not.toHaveBeenCalled();
+  });
+
+  it('P2-6: createGroup menolak slotTotal = 1', async () => {
+    await expect(
+      service.createGroup('h1', { ...groupDto, slotTotal: 1 } as never),
+    ).rejects.toThrow('minimal 2');
+    expect(mockPrisma.patunganGroup.create).not.toHaveBeenCalled();
+  });
+
+  it('P2-6: createGroup menerima target yang pas (perPerson × slot = target)', async () => {
+    mockPrisma.patunganGroup.create.mockResolvedValue({ id: 'g1', status: PatunganStatus.OPEN, hostId: 'h1' });
+    const res = await service.createGroup('h1', {
+      ...groupDto,
+      targetAmountIdr: 1000000,
+      perPersonAmountIdr: 500000, // 500rb × 2 = 1jt = target
+      slotTotal: 2,
+    } as never);
+    expect(res.status).toBe(PatunganStatus.OPEN);
   });
 
   it('getGroupDetail menghitung agregat + overfunding per orang', async () => {
@@ -312,9 +344,9 @@ describe('PatunganService', () => {
     expect(mockOrderState.cancelOrder).not.toHaveBeenCalled();
   });
 
-  it('M4: processDeadlines — target tak tercapai → FAILED kondisional + refund peserta', async () => {
+  it('M4: processDeadlines — target tak tercapai → FAILED kondisional + refund peserta (P2-4)', async () => {
     mockPrisma.patunganGroup.findMany
-      .mockResolvedValueOnce([{ id: 'g1', hostId: 'h1' }])
+      .mockResolvedValueOnce([{ id: 'g1' }])
       .mockResolvedValueOnce([]);
     mockTx.patunganGroup.findUnique.mockResolvedValue({ status: PatunganStatus.OPEN, targetAmount: 100000000n });
     mockTx.patunganParticipant.aggregate.mockResolvedValue({ _sum: { amount: 25000000n } });
@@ -323,7 +355,6 @@ describe('PatunganService', () => {
       { id: 'pp1', orderId: 'o1', status: PatunganParticipantStatus.PAID },
       { id: 'pp2', orderId: null, status: PatunganParticipantStatus.PENDING },
     ]);
-    mockPrisma.order.findUnique.mockResolvedValue({ orderId: 'ORD-1', status: OrderStatus.WAITING_PAYMENT });
     mockPrisma.patunganParticipant.updateMany.mockResolvedValue({ count: 1 });
     const res = await service.processDeadlines();
     expect(res.failed).toBe(1);
@@ -333,10 +364,14 @@ describe('PatunganService', () => {
         data: { status: PatunganStatus.FAILED },
       }),
     );
-    expect(mockOrderState.cancelOrder).toHaveBeenCalledWith('ORD-1', 'h1', 'OTHER', expect.any(String));
-    // Peserta PAID → REFUNDED, PENDING → REFUNDED, semua via predicate status.
+    // P2-4: tanpa dead path cancelOrder — peserta PAID langsung REFUND_REQUIRED.
+    expect(mockOrderState.cancelOrder).not.toHaveBeenCalled();
+    // Peserta PAID → REFUND_REQUIRED, PENDING → REFUNDED, semua via predicate status.
     expect(mockPrisma.patunganParticipant.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: expect.objectContaining({ status: PatunganParticipantStatus.PAID }) }),
+      expect.objectContaining({
+        where: expect.objectContaining({ status: PatunganParticipantStatus.PAID }),
+        data: expect.objectContaining({ status: PatunganParticipantStatus.REFUND_REQUIRED }),
+      }),
     );
   });
 
@@ -348,7 +383,41 @@ describe('PatunganService', () => {
     const res = await service.processDeadlines();
     expect(res).toEqual({ failed: 0, released: 0 });
     expect(mockOrderState.cancelOrder).not.toHaveBeenCalled();
-    expect(mockPrisma.patunganParticipant.findMany).not.toHaveBeenCalled();
+    // P2-5 repair sweep jalan tapi tidak menemukan peserta stuck (mock []).
+    expect(mockPrisma.patunganParticipant.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('P2-5: markParticipantPaidByOrder — bayar setelah grup FAILED → REFUND_REQUIRED (bukan PAID nyangkut)', async () => {
+    mockPrisma.order.findFirst.mockResolvedValue({ id: 'db-o1', status: OrderStatus.PROCESSING });
+    mockPrisma.patunganParticipant.updateMany.mockResolvedValue({ count: 1 }); // PENDING → PAID
+    mockPrisma.patunganParticipant.findFirst.mockResolvedValue({ id: 'pp1', groupId: 'g1' });
+    mockPrisma.patunganGroup.findUnique.mockResolvedValue({ status: PatunganStatus.FAILED });
+    await service.markParticipantPaidByOrder('ORD-P-X');
+    // Peserta yang baru PAID langsung ditandai REFUND_REQUIRED.
+    expect(mockPrisma.patunganParticipant.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'pp1', status: PatunganParticipantStatus.PAID }),
+        data: expect.objectContaining({ status: PatunganParticipantStatus.REFUND_REQUIRED }),
+      }),
+    );
+  });
+
+  it('P2-5-repair: processDeadlines menandai PAID di grup FAILED → REFUND_REQUIRED', async () => {
+    mockPrisma.patunganGroup.findMany
+      .mockResolvedValueOnce([]) // expiredOpen: tidak ada
+      .mockResolvedValueOnce([]); // contestDone: tidak ada
+    mockPrisma.patunganParticipant.findMany.mockResolvedValueOnce([
+      { id: 'pp-stuck', groupId: 'g-failed' },
+    ]);
+    mockPrisma.patunganParticipant.updateMany.mockResolvedValue({ count: 1 });
+    const res = await service.processDeadlines();
+    expect(res).toEqual({ failed: 0, released: 0 });
+    expect(mockPrisma.patunganParticipant.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'pp-stuck', status: PatunganParticipantStatus.PAID }),
+        data: expect.objectContaining({ status: PatunganParticipantStatus.REFUND_REQUIRED }),
+      }),
+    );
   });
 
   it('M4: processDeadlines — CONTEST → RELEASED kondisional; predicate gagal → lewati', async () => {

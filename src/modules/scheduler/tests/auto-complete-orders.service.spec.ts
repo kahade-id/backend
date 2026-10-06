@@ -41,6 +41,8 @@ type TxOverrides = {
   extensionCount?: number;
   graceMarker?: string | null;
   txThrowsAfterGrace?: boolean;
+  // P1-2: override deadline untuk skenario seller-abandoned
+  deliveryDeadlineAt?: Date;
 };
 
 const ORDER = {
@@ -94,7 +96,7 @@ describe('AutoCompleteDeliveredOrdersService — escrow release guards', () => {
         }),
       },
       order: {
-        findUnique: jest.fn().mockResolvedValue({ status: OrderStatus.IN_DELIVERY, deliveryDeadlineAt: ORDER.deliveryDeadlineAt, dispute: null }),
+        findUnique: jest.fn().mockResolvedValue({ status: OrderStatus.IN_DELIVERY, deliveryDeadlineAt: opts.deliveryDeadlineAt ?? ORDER.deliveryDeadlineAt, dispute: null }),
         updateMany: jest.fn(async ({ data }: any) =>
           'status' in data
             ? { count: opts.orderUpdateCount ?? 1 }
@@ -120,10 +122,13 @@ describe('AutoCompleteDeliveredOrdersService — escrow release guards', () => {
     };
 
     let served = false;
+    const batchOrder = opts.deliveryDeadlineAt
+      ? { ...ORDER, deliveryDeadlineAt: opts.deliveryDeadlineAt }
+      : ORDER;
     prisma.order.findMany.mockImplementation(async () => {
       if (served) return [];
       served = true;
-      return [ORDER];
+      return [batchOrder];
     });
 
     prisma.$transaction.mockImplementation(async (cb: any) => {
@@ -304,6 +309,68 @@ describe('AutoCompleteDeliveredOrdersService — escrow release guards', () => {
       await service.autoComplete();
 
       expect(prisma.emitNotificationCreated).not.toHaveBeenCalled();
+    });
+
+    // P1-2: seller-abandoned — deadline lewat 2x review window tanpa proof → auto-refund
+    it('P1-2: auto-cancels and refunds buyer when IN_DELIVERY has no proof and deadline passed 2x review window', async () => {
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      arrange({
+        acceptedProof: null,
+        submittedProof: null,
+        rejectedProof: null,
+        deliveryDeadlineAt: sevenDaysAgo,
+      });
+
+      await service.autoComplete();
+
+      // Order di-update ke CANCELLED (bukan COMPLETED).
+      expect(tx.order.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'CANCELLED' }),
+        }),
+      );
+
+      // Escrow di-refund ke buyer.
+      expect(tx.walletTransaction.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            type: 'ORDER_REFUND',
+            orderId: ORDER.id,
+          }),
+        }),
+      );
+
+      // Status history tercatat.
+      expect(tx.orderStatusHistory.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            fromStatus: 'IN_DELIVERY',
+            toStatus: 'CANCELLED',
+            changedBy: 'SYSTEM',
+          }),
+        }),
+      );
+    });
+
+    it('P1-2: does NOT refund when deadline only 1 day ago (not yet 2x review window)', async () => {
+      const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      arrange({
+        acceptedProof: null,
+        submittedProof: null,
+        rejectedProof: null,
+        deliveryDeadlineAt: oneDayAgo,
+      });
+
+      await service.autoComplete();
+
+      // TIDAK ada update ke CANCELLED.
+      const cancelCalls = (tx.order.updateMany as jest.Mock).mock.calls.filter(
+        (c: any) => c[0]?.data?.status === 'CANCELLED',
+      );
+      expect(cancelCalls).toHaveLength(0);
+
+      // TIDAK ada refund.
+      expect(tx.walletTransaction.create).not.toHaveBeenCalled();
     });
 
     it('sends no push when only rejected proofs exist', async () => {
@@ -495,3 +562,5 @@ describe('SEC-101: cabang no-wallet (DANA-direct) — tanpa ORDER_LOCK/ledger wa
     );
   });
 });
+
+

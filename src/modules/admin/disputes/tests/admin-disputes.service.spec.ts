@@ -117,5 +117,66 @@ describe('AdminDisputesService round-two boundaries', () => {
     }));
   });
 
+  describe('P1-1: computeDisbursementAmounts FULL_BUYER menghormati feeResponsibility', () => {
+    // Nilai dalam sen (IDR x 100). orderValue Rp100.000, fee 2,5% = Rp2.500.
+    const compute = (order: {
+      buyerPayAmount: bigint; sellerReceiveAmount: bigint; buyerFeeAmount: bigint; completedAt: Date | null;
+    }) =>
+      (service as any).computeDisbursementAmounts(order, 'FULL_BUYER', undefined, undefined);
+
+    it('feeResponsibility=BUYER: buyer refund = buyerPayAmount - buyerFeeAmount', () => {
+      const r = compute({
+        buyerPayAmount: BigInt(10_250_000),
+        sellerReceiveAmount: BigInt(10_000_000),
+        buyerFeeAmount: BigInt(250_000),
+        completedAt: null,
+      });
+      expect(r.buyerAmount).toBe(BigInt(10_000_000));
+      expect(r.sellerAmount).toBe(BigInt(0));
+      expect(r.platformRetainAmount).toBe(BigInt(250_000));
+      expect(r.totalDisbursement).toBe(r.escrowedAmount);
+    });
+
+    it('feeResponsibility=SELLER: buyer dapat refund PENUH sebesar yang dibayar', () => {
+      const r = compute({
+        buyerPayAmount: BigInt(10_000_000),
+        sellerReceiveAmount: BigInt(9_750_000),
+        buyerFeeAmount: BigInt(0),
+        completedAt: null,
+      });
+      // Sebelum fix: buyer hanya dapat 9_750_000 (sellerReceiveAmount) — kurang Rp2.500.
+      expect(r.buyerAmount).toBe(BigInt(10_000_000));
+      expect(r.sellerAmount).toBe(BigInt(0));
+      expect(r.platformRetainAmount).toBe(BigInt(0));
+      expect(r.totalDisbursement).toBe(r.escrowedAmount);
+    });
+
+    it('feeResponsibility=SPLIT: buyer refund = buyerPayAmount - porsi fee buyer', () => {
+      const r = compute({
+        buyerPayAmount: BigInt(10_125_000),
+        sellerReceiveAmount: BigInt(9_875_000),
+        buyerFeeAmount: BigInt(125_000),
+        completedAt: null,
+      });
+      expect(r.buyerAmount).toBe(BigInt(10_000_000));
+      expect(r.sellerAmount).toBe(BigInt(0));
+      expect(r.platformRetainAmount).toBe(BigInt(125_000));
+      expect(r.totalDisbursement).toBe(r.escrowedAmount);
+    });
+
+    it('pasca-completion: refund dibatasi escrowedAmount (= sellerReceiveAmount)', () => {
+      const r = compute({
+        buyerPayAmount: BigInt(10_000_000),
+        sellerReceiveAmount: BigInt(9_750_000),
+        buyerFeeAmount: BigInt(0),
+        completedAt: new Date(),
+      });
+      expect(r.escrowedAmount).toBe(BigInt(9_750_000));
+      expect(r.buyerAmount).toBe(BigInt(9_750_000));
+      expect(r.platformRetainAmount).toBe(BigInt(0));
+      expect(r.isPostCompletionDispute).toBe(true);
+    });
+  });
+
   void BadRequestException;
 });

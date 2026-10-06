@@ -18,10 +18,10 @@ import {
   Prisma,
 } from '@prisma/client';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { PROCESSING_DEADLINE_DAYS } from '../../common/constants/app.constants';
+import { PROCESSING_DEADLINE_DAYS, PREORDER_DEFAULT_DEADLINE_DAYS } from '../../common/constants/app.constants';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { toIdr, toSen } from '../../common/utils/currency.util';
-import { addDays, resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
+import { addDays, resolveDeliveryDeadlineAt, resolveProcessingDeadlineAt } from '../../common/utils/date.util';
 import { generatePaymentTxId } from '../../common/utils/id-generator.util';
 import { PrismaService } from '../../prisma/prisma.service';
 import { activateMilestonesForOrderTx, activateMilestonesForOrderNoWalletTx } from '../milestones/milestone-activation';
@@ -546,7 +546,15 @@ export class DanaDirectPaymentService {
               order.deliveryDeadlineAt,
               order.deliveryDeadlineDays ?? 3,
             ),
-            processingDeadlineAt: addDays(paidAt, PROCESSING_DEADLINE_DAYS),
+            // TX-UNIFIED-V2 (P1-3): PREORDER pakai estimasi (bukan 2 hari) agar
+            // preorder yang sah tidak terbatal otomatis oleh sweep.
+            processingDeadlineAt: resolveProcessingDeadlineAt(
+              order.fulfillment,
+              order.preorderEstimatedDate,
+              paidAt,
+              PROCESSING_DEADLINE_DAYS,
+              PREORDER_DEFAULT_DEADLINE_DAYS,
+            ),
             // Simpan referensi DANA di order (kolom aditif).
             danaPartnerReferenceNo: payment.danaPartnerReferenceNo,
             danaReferenceNo: payment.danaReferenceNo,

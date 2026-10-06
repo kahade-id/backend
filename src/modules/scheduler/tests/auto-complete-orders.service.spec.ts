@@ -43,6 +43,10 @@ type TxOverrides = {
   txThrowsAfterGrace?: boolean;
   // P1-2: override deadline untuk skenario seller-abandoned
   deliveryDeadlineAt?: Date;
+  // TX-AUDIT2 (P1-D): resi untuk skenario auto-confirm vs abandoned
+  trackingNumber?: string | null;
+  // TX-AUDIT2 (P2): voucherId untuk skenario rollback voucher
+  voucherId?: string | null;
 };
 
 const ORDER = {
@@ -96,7 +100,17 @@ describe('AutoCompleteDeliveredOrdersService — escrow release guards', () => {
         }),
       },
       order: {
-        findUnique: jest.fn().mockResolvedValue({ status: OrderStatus.IN_DELIVERY, deliveryDeadlineAt: opts.deliveryDeadlineAt ?? ORDER.deliveryDeadlineAt, dispute: null }),
+        findUnique: jest.fn(async ({ select }: any) => {
+          // TX-AUDIT2 (P1-D): panggilan kedua = cek bukti kirim (resi).
+          if (select?.trackingNumber) {
+            return { trackingNumber: opts.trackingNumber ?? null };
+          }
+          return {
+            status: OrderStatus.IN_DELIVERY,
+            deliveryDeadlineAt: opts.deliveryDeadlineAt ?? ORDER.deliveryDeadlineAt,
+            dispute: null,
+          };
+        }),
         updateMany: jest.fn(async ({ data }: any) =>
           'status' in data
             ? { count: opts.orderUpdateCount ?? 1 }
@@ -119,12 +133,19 @@ describe('AutoCompleteDeliveredOrdersService — escrow release guards', () => {
       orderStatusHistory: { create: jest.fn().mockResolvedValue({}) },
       user: { update: jest.fn().mockResolvedValue({}) },
       subscription: { findFirst: jest.fn().mockResolvedValue(null) },
+      // TX-AUDIT2 (P2): mock untuk rollbackOrderVoucherUsage.
+      voucher: { findUnique: jest.fn().mockResolvedValue({ campaignId: null }) },
+      voucherUsage: { deleteMany: jest.fn().mockResolvedValue({ count: 1 }) },
+      campaign: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
     };
 
     let served = false;
-    const batchOrder = opts.deliveryDeadlineAt
-      ? { ...ORDER, deliveryDeadlineAt: opts.deliveryDeadlineAt }
-      : ORDER;
+    const batchOrder = {
+      ...ORDER,
+      ...(opts.deliveryDeadlineAt ? { deliveryDeadlineAt: opts.deliveryDeadlineAt } : {}),
+      // TX-AUDIT2 (P2): voucherId untuk cancelAbandonedOrder.
+      ...(opts.voucherId !== undefined ? { voucherId: opts.voucherId } : {}),
+    };
     prisma.order.findMany.mockImplementation(async () => {
       if (served) return [];
       served = true;
@@ -371,6 +392,144 @@ describe('AutoCompleteDeliveredOrdersService — escrow release guards', () => {
 
       // TIDAK ada refund.
       expect(tx.walletTransaction.create).not.toHaveBeenCalled();
+    });
+
+    // TX-AUDIT2 (P1-D): "100% adil, jangan ada fraud".
+    it('P1-D: seller PUNYA resi + buyer diam 2x window → auto-confirm, dana CAIR ke seller (bukan refund)', async () => {
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      arrange({
+        acceptedProof: null,
+        submittedProof: null,
+        rejectedProof: null,
+        deliveryDeadlineAt: sevenDaysAgo,
+        trackingNumber: 'RESI123456',
+      });
+
+      await service.autoComplete();
+
+      // Order COMPLETED (bukan CANCELLED).
+      expect(tx.order.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'COMPLETED' }),
+        }),
+      );
+      const cancelCalls = (tx.order.updateMany as jest.Mock).mock.calls.filter(
+        (c: any) => c[0]?.data?.status === 'CANCELLED',
+      );
+      expect(cancelCalls).toHaveLength(0);
+
+      // Escrow RELEASE ke seller (ORDER_RELEASE), BUKAN refund ke buyer.
+      expect(tx.walletTransaction.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ type: 'ORDER_RELEASE' }),
+        }),
+      );
+      const refundCalls = (tx.walletTransaction.create as jest.Mock).mock.calls.filter(
+        (c: any) => c[0]?.data?.type === 'ORDER_REFUND',
+      );
+      expect(refundCalls).toHaveLength(0);
+
+      // Status history mencatat alasan auto-confirm.
+      expect(tx.orderStatusHistory.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            fromStatus: 'IN_DELIVERY',
+            toStatus: 'COMPLETED',
+            reason: expect.stringContaining('Auto-confirm'),
+          }),
+        }),
+      );
+    });
+
+    it('P1-D: seller TANPA resi + buyer diam 2x window → seller-abandoned, refund ke buyer', async () => {
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      arrange({
+        acceptedProof: null,
+        submittedProof: null,
+        rejectedProof: null,
+        deliveryDeadlineAt: sevenDaysAgo,
+        trackingNumber: null,
+      });
+
+      await service.autoComplete();
+
+      // Order CANCELLED + refund — perilaku P1-2 dipertahankan.
+      expect(tx.order.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'CANCELLED' }),
+        }),
+      );
+      expect(tx.walletTransaction.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ type: 'ORDER_REFUND' }),
+        }),
+      );
+    });
+
+    it('P1-D: seller punya resi tapi deadline baru 1 hari lalu → belum auto-confirm (tunggu 2x window)', async () => {
+      const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      arrange({
+        acceptedProof: null,
+        submittedProof: null,
+        rejectedProof: null,
+        deliveryDeadlineAt: oneDayAgo,
+        trackingNumber: 'RESI123456',
+      });
+
+      await service.autoComplete();
+
+      // Belum COMPLETED maupun CANCELLED.
+      const completeCalls = (tx.order.updateMany as jest.Mock).mock.calls.filter(
+        (c: any) => c[0]?.data?.status === 'COMPLETED',
+      );
+      const cancelCalls = (tx.order.updateMany as jest.Mock).mock.calls.filter(
+        (c: any) => c[0]?.data?.status === 'CANCELLED',
+      );
+      expect(completeCalls).toHaveLength(0);
+      expect(cancelCalls).toHaveLength(0);
+      expect(tx.walletTransaction.create).not.toHaveBeenCalled();
+    });
+
+    it('P1-D: abandoned-refund mengirim push realtime ke buyer DAN seller', async () => {
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      arrange({
+        acceptedProof: null,
+        submittedProof: null,
+        rejectedProof: null,
+        deliveryDeadlineAt: sevenDaysAgo,
+        trackingNumber: null,
+      });
+
+      await service.autoComplete();
+
+      // Push ke buyer (existing) + seller (baru TX-AUDIT2).
+      expect(prisma.emitNotificationCreated).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: ORDER.buyerId }),
+      );
+      expect(prisma.emitNotificationCreated).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: ORDER.sellerId }),
+      );
+    });
+
+    it('P2: abandoned-refund me-rollback pemakaian voucher buyer', async () => {
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      arrange({
+        acceptedProof: null,
+        submittedProof: null,
+        rejectedProof: null,
+        deliveryDeadlineAt: sevenDaysAgo,
+        trackingNumber: null,
+        voucherId: 'voucher-1',
+      });
+
+      await service.autoComplete();
+
+      // VoucherUsage dihapus (rollback).
+      expect(tx.voucherUsage.deleteMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ orderId: ORDER.id, voucherId: 'voucher-1' }),
+        }),
+      );
     });
 
     it('sends no push when only rejected proofs exist', async () => {

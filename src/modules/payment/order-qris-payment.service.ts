@@ -10,6 +10,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import {
   ActorType,
+  NotificationType,
   OrderStatus,
   PaymentMethod,
   PaymentProvider,
@@ -22,7 +23,7 @@ import {
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { MAX_ESCROW_BALANCE, PROCESSING_DEADLINE_DAYS, PREORDER_DEFAULT_DEADLINE_DAYS } from '../../common/constants/app.constants';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
-import { toIdr, toSen } from '../../common/utils/currency.util';
+import { toIdr, toSen, formatSen } from '../../common/utils/currency.util';
 import { addDays, resolveDeliveryDeadlineAt, resolveProcessingDeadlineAt } from '../../common/utils/date.util';
 import { generatePaymentTxId, generateWalletTxId } from '../../common/utils/id-generator.util';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -31,6 +32,8 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { activateMilestonesForOrderTx } from '../milestones/milestone-activation';
 import { MidtransService } from './midtrans.service';
 import { DanaPaymentService } from './dana/dana-payment.service';
+import { NotificationQueueService } from '../queue/notification-queue.service';
+import { renderNotificationCopy, resolveNotificationLanguage } from '../notifications/notification-copy.service';
 
 const DEFAULT_QRIS_EXPIRY_MINUTES = 30;
 
@@ -56,6 +59,7 @@ export class OrderQrisPaymentService {
     private readonly config: ConfigService,
     private readonly walletTxSerialService: WalletTxSerialService,
     private readonly danaPayment: DanaPaymentService,
+    private readonly notificationQueue: NotificationQueueService,
   ) {}
 
   private qrisFee(amount: number): number {
@@ -377,6 +381,15 @@ export class OrderQrisPaymentService {
 
     const walletTxSerial = await this.walletTxSerialService.getNext();
     let refundReason: string | null = null;
+    // TX-AUDIT2 (P1-F): info order yang berhasil di-settle — untuk notifikasi
+    // seller post-commit (satu titik: memperbaiki jalur QRIS Midtrans dan
+    // DANA-direct yang keduanya memanggil handleSettlement ini).
+    let settledOrder: {
+      sellerId: string;
+      title: string;
+      orderPublicId: string;
+      buyerPayAmount: bigint;
+    } | null = null;
 
     await this.prisma.$transaction(
       async tx => {
@@ -500,12 +513,44 @@ export class OrderQrisPaymentService {
           where: { id: freshPayment.id },
           data: { status: PaymentStatus.SUCCESS, paidAt: new Date(), settledAt: new Date() },
         });
+        // TX-AUDIT2 (P1-F): settlement sukses — catat untuk notifikasi seller post-commit.
+        settledOrder = {
+          sellerId: order.sellerId,
+          title: order.title,
+          orderPublicId: order.orderId,
+          buyerPayAmount: order.buyerPayAmount,
+        };
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
 
     if (refundReason) {
       await this.requestRefund(midtransOrderId, refundReason);
+    }
+
+    // TX-AUDIT2 (P1-F): seller WAJIB tahu escrow didanai — tanpa ini SLA kirim
+    // 2 hari berjalan tanpa ia sadari. Best-effort post-commit (tidak boleh
+    // melempar; enqueue sendiri sudah menelan error).
+    if (settledOrder && !refundReason) {
+      const { sellerId, title, orderPublicId, buyerPayAmount } = settledOrder;
+      try {
+        const payCopy = renderNotificationCopy(
+          NotificationType.ORDER_PAYMENT_RECEIVED,
+          await resolveNotificationLanguage(this.prisma, sellerId),
+          { amount: formatSen(buyerPayAmount), orderTitle: title },
+        );
+        await this.notificationQueue.enqueue({
+          userId: sellerId,
+          type: NotificationType.ORDER_PAYMENT_RECEIVED,
+          title: payCopy.title,
+          body: payCopy.body,
+          pushData: { type: 'ORDER_PAYMENT_RECEIVED', orderId: orderPublicId },
+        });
+      } catch (error) {
+        this.logger.warn(
+          `P1-F settlement seller notification failed for order ${orderPublicId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
   }
 

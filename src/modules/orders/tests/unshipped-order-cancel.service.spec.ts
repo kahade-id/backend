@@ -150,4 +150,71 @@ describe('UnshippedOrderCancelService', () => {
     expect(JSON.stringify(where.OR)).toContain('processingDeadlineAt');
     expect(JSON.stringify(where.OR)).toContain('paidAt');
   });
+
+  // TX-AUDIT2 (P1-C): guard sweep untuk PREORDER legacy hasil backfill.
+  it('P1-C: findDueUnshippedOrders mengecualikan PREORDER legacy (estimasi null, paidAt < 30 hari)', async () => {
+    prisma.order.findMany.mockResolvedValue([]);
+    const now = new Date();
+    await service.findDueUnshippedOrders(200, now);
+
+    const where = prisma.order.findMany.mock.calls[0][0].where;
+    const firstBranch = where.OR[0];
+    // Cabang processingDeadlineAt < now harus punya guard NOT untuk
+    // PREORDER legacy (estimasi null + paidAt dalam 30 hari).
+    const notClause = JSON.stringify(firstBranch.NOT);
+    expect(notClause).toContain('PREORDER');
+    expect(notClause).toContain('preorderEstimatedDate');
+    // Guard (b): estimasi null + paidAt > (now - 30 hari).
+    expect(notClause).toContain('paidAt');
+  });
+
+  it('P1-C: cancelUnshippedOrder melewatkan PREORDER legacy (estimasi null, paidAt 5 hari lalu)', async () => {
+    prisma.order.findFirst.mockResolvedValue(
+      orderRow({
+        fulfillment: 'PREORDER',
+        preorderEstimatedDate: null,
+        // processingDeadlineAt legacy = paidAt + 2 hari (sudah lewat),
+        // tapi preorder dapat jatah 30 hari.
+        processingDeadlineAt: new Date(Date.now() - 3 * 24 * 3600_000),
+        paidAt: new Date(Date.now() - 5 * 24 * 3600_000),
+      }),
+    );
+
+    const result = await service.cancelUnshippedOrder('ORD-20260928-000001-TEST', 'system:test', 'reason');
+
+    expect(result.outcome).toBe('SKIPPED_NOT_DUE');
+    expect(orderStateService.adminCancelOrder).not.toHaveBeenCalled();
+  });
+
+  it('P1-C: cancelUnshippedOrder tetap membatalkan PREORDER legacy yang paidAt > 30 hari', async () => {
+    prisma.order.findFirst.mockResolvedValue(
+      orderRow({
+        fulfillment: 'PREORDER',
+        preorderEstimatedDate: null,
+        processingDeadlineAt: new Date(Date.now() - 35 * 24 * 3600_000),
+        paidAt: new Date(Date.now() - 40 * 24 * 3600_000),
+      }),
+    );
+
+    const result = await service.cancelUnshippedOrder('ORD-20260928-000001-TEST', 'system:test', 'reason');
+
+    expect(result.outcome).toBe('CANCELLED_REFUNDED');
+    expect(orderStateService.adminCancelOrder).toHaveBeenCalled();
+  });
+
+  it('P1-C: cancelUnshippedOrder melewatkan PREORDER dengan estimasi di masa depan', async () => {
+    prisma.order.findFirst.mockResolvedValue(
+      orderRow({
+        fulfillment: 'PREORDER',
+        preorderEstimatedDate: new Date(Date.now() + 10 * 24 * 3600_000),
+        processingDeadlineAt: new Date(Date.now() - 1 * 24 * 3600_000),
+        paidAt: new Date(Date.now() - 3 * 24 * 3600_000),
+      }),
+    );
+
+    const result = await service.cancelUnshippedOrder('ORD-20260928-000001-TEST', 'system:test', 'reason');
+
+    expect(result.outcome).toBe('SKIPPED_NOT_DUE');
+    expect(orderStateService.adminCancelOrder).not.toHaveBeenCalled();
+  });
 });

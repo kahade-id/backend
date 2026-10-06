@@ -13,12 +13,14 @@ describe('OrderQrisPaymentService.cancelPendingPaymentForOrder (E3)', () => {
     };
     const midtrans = { cancelTransaction: jest.fn(async () => ({})) };
     const danaPayment = { cancelOrder: jest.fn(async () => undefined) };
+    const notificationQueue = { enqueue: jest.fn(async () => undefined) };
     const svc = new OrderQrisPaymentService(
       prisma as never,
       midtrans as never,
       {} as never,
       {} as never,
       danaPayment as never,
+      notificationQueue as never,
     );
     return { svc, prisma, midtrans, danaPayment };
   }

@@ -9,6 +9,7 @@ const mockTx: Record<string, any> = {
   jastipTrip: { updateMany: jest.fn(), update: jest.fn() },
   jastipParticipant: { create: jest.fn(), update: jest.fn(), updateMany: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn() },
   patunganParticipant: { findFirst: jest.fn() },
+  order: { update: jest.fn().mockResolvedValue({}), findFirst: jest.fn(), findUnique: jest.fn() },
   $executeRawUnsafe: jest.fn(),
 };
 

@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, BadRequestException, ConflictException, Logger } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { Prisma, ProductType, SlotBookingStatus, OrderType, OrderKind, FeeResponsibility, OrderStatus } from '@prisma/client';
+import { Prisma, ProductType, SlotBookingStatus, OrderType, OrderKind, FeeResponsibility, OrderStatus, FulfillmentType, ParticipantMode, OrderCategory } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { toIdr } from '../../../common/utils/currency.util';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
@@ -211,6 +211,12 @@ export class ServiceBookingService {
         description,
         orderType: OrderType.SERVICE,
         orderKind: OrderKind.SERVICE_BOOKING,
+        // TX-UNIFIED-V2 (2026-10-06, audit2 P0-B): booking jasa = JASA, 1-by-1,
+        // fulfillment BIASA. Eksplisit di sini (derivasi otomatis di
+        // createOrderTx tetap ada sebagai pengaman).
+        fulfillment: FulfillmentType.BIASA,
+        participantMode: ParticipantMode.SINGLE,
+        category: OrderCategory.JASA,
         orderValue: priceIdr,
         deliveryDeadlineDays: clampDeadlineDays(slot.slotDate),
         feeResponsibility: FeeResponsibility.BUYER,

@@ -165,6 +165,69 @@ export class CreateOrderDto {
   @MaxLength(40)
   preorderEstimatedDate?: string;
 
+  // TX-UNIFIED-V2 (P0-A, 2026-10-06): detail kategori dari flow "Buat Transaksi".
+  // Semua OPSIONAL di DTO agar tidak 422 — validasi semantik per kategori
+  // dilakukan di OrdersService.createOrder.
+
+  @ApiPropertyOptional({ description: 'JASA: tanggal/jadwal layanan (YYYY-MM-DD). Wajib diisi di UI untuk kategori JASA.', example: '2026-10-15' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  scheduledDate?: string;
+
+  @ApiPropertyOptional({ description: 'FISIK: kondisi barang', enum: ['baru', 'bekas'] })
+  @IsOptional()
+  @IsString()
+  @MaxLength(10)
+  itemCondition?: string;
+
+  @ApiPropertyOptional({ description: 'FISIK: deskripsi kondisi bila bekas', maxLength: 500 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  @Transform(({ value }: { value: unknown }) => sanitizeText(value))
+  conditionDescription?: string;
+
+  @ApiPropertyOptional({ description: 'DIGITAL: metode serah-terima', enum: ['file', 'kode', 'akun', 'lainnya'] })
+  @IsOptional()
+  @IsString()
+  @MaxLength(20)
+  deliveryMethod?: string;
+
+  @ApiPropertyOptional({ description: 'DIGITAL: masa garansi dalam hari (>= 0)', minimum: 0 })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Type(() => Number)
+  warrantyDays?: number;
+
+  @ApiPropertyOptional({ description: 'JASA: deliverable yang disepakati', maxLength: 1000 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  @Transform(({ value }: { value: unknown }) => sanitizeText(value))
+  deliverables?: string;
+
+  @ApiPropertyOptional({ description: 'JASA: lokasi pelaksanaan layanan', maxLength: 200 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  @Transform(({ value }: { value: unknown }) => sanitizeText(value))
+  serviceLocation?: string;
+
+  @ApiPropertyOptional({ description: 'JASA: kebijakan pembatalan', maxLength: 1000 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  @Transform(({ value }: { value: unknown }) => sanitizeText(value))
+  cancellationPolicy?: string;
+
+  @ApiPropertyOptional({ description: 'Slot jasa yang dibayar order ini (dari booking jasa)', maxLength: 100 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  slotId?: string;
+
   @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)', type: () => LocationDto })
   @IsOptional()
   @ValidateNested()

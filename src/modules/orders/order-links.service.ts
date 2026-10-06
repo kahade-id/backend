@@ -1,7 +1,7 @@
 import { Injectable, BadRequestException, NotFoundException, ForbiddenException, ConflictException, Logger, Optional } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import { ConfigService } from '@nestjs/config';
-import { KycStatus, NotificationType, Prisma, SubscriptionStatus } from '@prisma/client';
+import { KycStatus, NotificationType, Prisma, SubscriptionStatus, OrderType, FulfillmentType, ParticipantMode, OrderCategory } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { FeeCalculatorService } from './fee-calculator.service';
@@ -500,6 +500,17 @@ export class OrderLinksService {
             title: link.title,
             description: link.description,
             orderType: link.orderType,
+            // TX-UNIFIED-V2 (2026-10-06): tulis 3 dimensi baru. Kategori
+            // diturunkan dari orderType link (kanonis: orderTypeToCategory di
+            // orders.service.ts); fulfillment/participantMode default karena
+            // link adalah transaksi 1-by-1 biasa.
+            fulfillment: FulfillmentType.BIASA,
+            participantMode: ParticipantMode.SINGLE,
+            category: link.orderType === OrderType.DIGITAL_GOODS
+              ? OrderCategory.DIGITAL
+              : link.orderType === OrderType.SERVICE
+                ? OrderCategory.JASA
+                : OrderCategory.FISIK,
             orderValue: link.orderValue,
             feeAmount: feeResult.feeAmount,
             feeResponsibility: link.feeResponsibility,

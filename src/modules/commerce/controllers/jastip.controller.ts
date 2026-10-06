@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Param, Query, HttpCode } from '@nestjs/common';
+import { Controller, Get, Post, Body, Param, Query, HttpCode, GoneException } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { JastipService } from '../services/jastip.service';
@@ -76,19 +76,19 @@ export class JastipController {
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Post('participants/:participantId/link-order')
   @HttpCode(200)
-  @ApiOperation({ summary: 'Buyer menautkan escrow order yang sudah dibayar', deprecated: true })
+  @ApiOperation({ summary: 'DINONAKTIFKAN: gunakan POST /v1/jastip/participants/:id/create-order', deprecated: true })
   linkOrder(
     @CurrentUser('sub') buyerId: string,
     @Param('participantId') participantId: string,
     @Body() dto: LinkJastipOrderDto,
   ) {
-    return this.service.linkOrder(buyerId, participantId, dto);
+    throw new GoneException('Endpoint link-order dinonaktifkan. Gunakan POST /v1/jastip/participants/:id/create-order untuk membuat order otomatis.');
   }
 
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Post('participants/:participantId/create-order')
   @HttpCode(200)
-  @ApiOperation({ summary: 'Buyer membuat escrow order dari peserta (orderKind=JASTIP, orderId terisi otomatis)' })
+  @ApiOperation({ summary: 'Buyer membuat escrow order dari peserta (PREORDER+SINGLE+FISIK, orderId terisi otomatis)' })
   createOrder(@CurrentUser('sub') buyerId: string, @Param('participantId') participantId: string) {
     return this.service.createOrderFromParticipant(buyerId, participantId);
   }

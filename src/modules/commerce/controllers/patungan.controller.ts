@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Param, Query, HttpCode } from '@nestjs/common';
+import { Controller, Get, Post, Body, Param, Query, HttpCode, GoneException } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { PatunganService } from '../services/patungan.service';
@@ -47,19 +47,19 @@ export class PatunganController {
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Post('participants/:participantId/link-order')
   @HttpCode(200)
-  @ApiOperation({ summary: 'Tautkan escrow order yang sudah dibayar ke partisipasi', deprecated: true })
+  @ApiOperation({ summary: 'DINONAKTIFKAN: gunakan POST /v1/patungan/participants/:id/create-order', deprecated: true })
   linkOrder(
     @CurrentUser('sub') userId: string,
     @Param('participantId') participantId: string,
     @Body() dto: LinkPatunganOrderDto,
   ) {
-    return this.service.linkOrder(userId, participantId, dto.orderId);
+    throw new GoneException('Endpoint link-order dinonaktifkan. Gunakan POST /v1/patungan/participants/:id/create-order untuk membuat order otomatis.');
   }
 
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Post('participants/:participantId/create-order')
   @HttpCode(200)
-  @ApiOperation({ summary: 'Buat escrow order dari partisipasi (orderKind=PATUNGAN, orderId terisi otomatis)' })
+  @ApiOperation({ summary: 'Buat escrow order dari partisipasi (BIASA+GROUP+FISIK, orderId terisi otomatis)' })
   createOrder(@CurrentUser('sub') userId: string, @Param('participantId') participantId: string) {
     return this.service.createOrderFromParticipant(userId, participantId);
   }

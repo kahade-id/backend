@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, Logger, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { PatunganStatus, PatunganMode, PatunganParticipantStatus, OrderStatus, DisputeStatus, OrderType, OrderKind, FeeResponsibility, Prisma } from '@prisma/client';
+import { PatunganStatus, PatunganMode, PatunganParticipantStatus, OrderStatus, DisputeStatus, OrderType, OrderKind, FulfillmentType, ParticipantMode, OrderCategory, FeeResponsibility, Prisma } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { toSen, toIdr } from '../../../common/utils/currency.util';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
@@ -381,6 +381,10 @@ export class PatunganService implements OnModuleInit {
         description,
         orderType: OrderType.PHYSICAL_GOODS,
         orderKind: OrderKind.PATUNGAN,
+        // TX-UNIFIED-V2 (2026-10-06): patungan = GROUP; dual-write dengan orderKind lama.
+        fulfillment: FulfillmentType.BIASA,
+        participantMode: ParticipantMode.GROUP,
+        category: OrderCategory.FISIK,
         orderValue: orderValueIdr,
         deliveryDeadlineDays,
         feeResponsibility: FeeResponsibility.BUYER,
@@ -560,6 +564,17 @@ export class PatunganService implements OnModuleInit {
       if (marked.count === 0) {
         throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Peserta sudah dalam proses / selesai' });
       }
+      // TX-UNIFIED-V2 (2026-10-06) — perbaiki M2 audit: order yang ditautkan
+      // manual juga harus tercatat dengan dimensi baru yang benar.
+      await tx.order.update({
+        where: { id: order.id },
+        data: {
+          orderKind: OrderKind.PATUNGAN,
+          fulfillment: FulfillmentType.BIASA,
+          participantMode: ParticipantMode.GROUP,
+          category: OrderCategory.FISIK,
+        },
+      });
       // M4: baca ulang grup DI DALAM tx — snapshot di luar tx bisa basi
       // (balapan dengan processDeadlines).
       const freshGroup = await tx.patunganGroup.findUnique({

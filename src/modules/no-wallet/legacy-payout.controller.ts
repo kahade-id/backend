@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, Ip, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Ip, Logger, Post, Query, UseGuards } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
@@ -17,6 +17,8 @@ import { EscrowDisbursementScope } from '@prisma/client';
  */
 @Controller('legacy-payout')
 export class LegacyPayoutController {
+  private readonly logger = new Logger(LegacyPayoutController.name);
+
   constructor(
     private readonly legacyPayout: LegacyPayoutService,
     private readonly escrowDisbursement: EscrowDisbursementService,
@@ -28,12 +30,21 @@ export class LegacyPayoutController {
   @HttpCode(200)
   // SYS-B-102: payout satu arah adalah pergerakan uang — wajib Idempotency-Key
   // (UUID v4) di header; double submit tidak men-debit ganda.
+  //
+  // P3: Endpoint ini SENGAJA dipertahankan sebagai jalur keluar saldo wallet
+  // lama saat WALLET_ENABLED=false. Tidak ada pemanggil frontend aktif saat
+  // ini, tetapi menonaktifkannya akan menjebak dana user yang memiliki saldo
+  // lama. Jangan hapus tanpa migrasi saldo terlebih dahulu.
+  // @deprecated Untuk saldo baru gunakan jalur disbursement standar;
+  // endpoint ini hanya untuk migrasi saldo lama.
   @Idempotency()
   async request(
     @CurrentUser('sub') userId: string,
     @Body() dto: LegacyPayoutDto,
     @Ip() ip?: string,
   ) {
+    // P3: observability — endpoint fund-movement tanpa pemanggil aktif
+    this.logger.warn(`LEGACY_PAYOUT_REQUEST userId=${userId} amountSen=${dto.amountSen} ip=${ip ?? '-'}`);
     return this.legacyPayout.requestPayout(userId, dto, ip);
   }
 

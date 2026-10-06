@@ -15,6 +15,10 @@ import { AdminRole, PatunganStatus } from '@prisma/client';
  *   GET /v1/admin/group-buying     — daftar (query: page, limit, status, q)
  *   GET /v1/admin/group-buying/:id — detail (progres + daftar peserta)
  * Monitoring saja — TANPA aksi finansial.
+ *
+ * P3 @deprecated: Halaman admin untuk modul ini dihapus (TX-UNIFIED-V2).
+ * Tidak ada pemanggil aktif. Dipertahankan untuk kompatibilitas; jangan
+ * tambah endpoint baru di sini.
  */
 @ApiTags('admin-group-buying')
 @ApiBearerAuth('access-token')

@@ -647,6 +647,10 @@ export class AuthController {
     return this.authService.verifyEmail(dto.email, dto.otp);
   }
 
+  // P3: Endpoint ini SENGAJA dipertahankan — landing page HTML untuk user yang
+  // klik tautan verifikasi dari aplikasi email (browser → tombol deep-link
+  // kahade://verify-email → aplikasi). Bukan dead code; jangan hapus.
+  // Varian API-nya (POST /verify-email dengan OTP) dipakai aplikasi.
   @Public()
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @Get('verify-email')

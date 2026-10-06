@@ -4402,6 +4402,11 @@ export class AuthService {
     return value * (multipliers[unit] ?? 60);
   }
 
+  // P3: Sesi user memakai sliding refresh (7 hari, diperpanjang tiap dipakai)
+  // tanpa absolute TTL. Ini STANDAR aplikasi mobile (WhatsApp, Gojek, dll. —
+  // user tidak dipaksa login ulang selagi aktif). Bukan celah keamanan:
+  // rotasi refresh token + device binding + deteksi reuse tetap aktif.
+  // Jangan tambah absolute TTL tanpa keputusan produk.
   private getRefreshTokenExpiryDate(): Date {
     const ttl = this.getRefreshTokenTtlSeconds();
     return new Date(Date.now() + ttl * 1000);

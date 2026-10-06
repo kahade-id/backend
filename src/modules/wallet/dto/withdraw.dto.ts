@@ -2,12 +2,17 @@ import { IsNumber, IsInt, Min, Max, IsString, IsNotEmpty, IsOptional, Matches, L
 import { Transform, Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { LocationDto } from '../../auth/dto/location.dto';
-import { WALLET_MIN_WITHDRAW, WALLET_DAILY_WITHDRAW_LIMIT } from '../../../common/constants/app.constants';
+import { WALLET_MIN_WITHDRAW, WALLET_MAX_WITHDRAW_PER_TX } from '../../../common/constants/app.constants';
 import { formatIdr } from '../../../common/utils/currency.util';
 import { IsValidId } from '../../../common/decorators/is-valid-id.decorator';
 
 export class WithdrawDto {
-  @ApiProperty({ description: 'Withdrawal amount in IDR', minimum: WALLET_MIN_WITHDRAW, maximum: WALLET_DAILY_WITHDRAW_LIMIT })
+  // P3: DTO max diselaraskan dengan batas per-transaksi efektif yang dienforce
+  // service (WALLET_MAX_WITHDRAW_PER_TX = 25jt). Sebelumnya memakai
+  // WALLET_DAILY_WITHDRAW_LIMIT (50jt) sehingga request 25-50jt lolos DTO
+  // lalu ditolak service dengan ABOVE_MAXIMUM_WITHDRAW — membingungkan.
+  // Daily limit tetap dienforce terpisah oleh service.
+  @ApiProperty({ description: 'Withdrawal amount in IDR (per-transaction max)', minimum: WALLET_MIN_WITHDRAW, maximum: WALLET_MAX_WITHDRAW_PER_TX })
   @Transform(({ value }) => {
     if (typeof value === 'number') return value;
     if (typeof value === 'string') {
@@ -19,7 +24,7 @@ export class WithdrawDto {
   @IsNumber()
   @IsInt({ message: 'amount must be a whole number (no decimals)' })
   @Min(WALLET_MIN_WITHDRAW, { message: `Minimum withdrawal is ${formatIdr(WALLET_MIN_WITHDRAW)}` })
-  @Max(WALLET_DAILY_WITHDRAW_LIMIT, { message: `Maximum single withdrawal is ${formatIdr(WALLET_DAILY_WITHDRAW_LIMIT)}` })
+  @Max(WALLET_MAX_WITHDRAW_PER_TX, { message: `Maximum single withdrawal is ${formatIdr(WALLET_MAX_WITHDRAW_PER_TX)}` })
   amount!: number;
 
   @ApiProperty({ description: 'Bank account ID for withdrawal' })

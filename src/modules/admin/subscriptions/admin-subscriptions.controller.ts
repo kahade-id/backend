@@ -45,15 +45,9 @@ export class AdminSubscriptionsController {
     return this.service.grantSubscription(dto.userId, dto.plan, dto.durationDays, dto.reason, adminId, req.ip ?? '');
   }
 
-  @Get(':subId')
-  @ApiOperation({ summary: 'Get subscription detail + usage periode berjalan' })
-  @ApiResponse({ status: 200, description: 'Subscription detail returned.' })
-  @ApiResponse({ status: 404, description: 'Subscription not found.' })
-  getSubscriptionDetail(@Param('subId', ParseIdPipe) subId: string): Promise<object> {
-    return this.service.getSubscriptionDetail(subId);
-  }
-
   // ---------- Kode promo gratis (keputusan produk 2026-09-26) ----------
+  // NOTE: @Get('promo-codes') HARUS dideklarasikan SEBELUM @Get(':subId') —
+  // kalau tidak, request ke /promo-codes jatuh ke :subId dan gagal ParseIdPipe (400).
 
   @Post('promo-codes')
   @UseGuards(UserThrottleGuard, StepUpGuard)
@@ -110,6 +104,14 @@ export class AdminSubscriptionsController {
     @Req() req: Request,
   ): Promise<object> {
     return this.service.setPromoCodeStatus(id, true, adminId, req.ip ?? '');
+  }
+
+  @Get(':subId')
+  @ApiOperation({ summary: 'Get subscription detail + usage periode berjalan' })
+  @ApiResponse({ status: 200, description: 'Subscription detail returned.' })
+  @ApiResponse({ status: 404, description: 'Subscription not found.' })
+  getSubscriptionDetail(@Param('subId', ParseIdPipe) subId: string): Promise<object> {
+    return this.service.getSubscriptionDetail(subId);
   }
 
   @Post(':subId/cancel')

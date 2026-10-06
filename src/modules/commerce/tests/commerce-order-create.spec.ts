@@ -226,6 +226,7 @@ describe('PatunganService.createOrderFromParticipant', () => {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         findFirst: jest.fn().mockResolvedValue({ groupId: 'g1' }),
       },
+      patunganGroup: { findUnique: jest.fn().mockResolvedValue({ status: PatunganStatus.OPEN }) },
       $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => fn(tx2)),
     };
     const module: TestingModule = await Test.createTestingModule({
@@ -253,7 +254,9 @@ describe('ServiceBookingService.bookAndCreateOrder', () => {
   let service: ServiceBookingService;
   const mockTx: Record<string, any> = {
     serviceSlot: { updateMany: jest.fn() },
-    serviceSlotBooking: { upsert: jest.fn() },
+    serviceSlotBooking: { upsert: jest.fn(), findUnique: jest.fn(), updateMany: jest.fn() },
+    order: { findUnique: jest.fn() },
+    $executeRawUnsafe: jest.fn(),
   };
   const mockPrisma: Record<string, any> = {
     serviceSlot: { findFirst: jest.fn() },
@@ -279,6 +282,7 @@ describe('ServiceBookingService.bookAndCreateOrder', () => {
         ServiceBookingService,
         { provide: PrismaService, useValue: mockPrisma },
         { provide: OrdersService, useValue: mockOrdersService },
+        { provide: OrderStateService, useValue: {} },
       ],
     }).compile();
     service = module.get<ServiceBookingService>(ServiceBookingService);
@@ -291,9 +295,10 @@ describe('ServiceBookingService.bookAndCreateOrder', () => {
     mockTx.serviceSlotBooking.upsert.mockResolvedValue({ id: 'b1', slotId: 'slot-1', status: SlotBookingStatus.BOOKED });
     mockPrisma.userShowcase.findUnique.mockResolvedValue({ title: 'Cuci AC', priceMin: 5_000_000n });
     mockPrisma.user.findUnique.mockResolvedValue({ username: 'seller01' });
+    mockTx.serviceSlotBooking.findUnique.mockResolvedValue({ status: SlotBookingStatus.BOOKED, orderId: null });
     mockOrdersService.createOrder.mockResolvedValue(createdOrderResult('ORD-SB-1'));
-    mockPrisma.order.findUnique.mockResolvedValue({ id: 'db-order-3' });
-    mockPrisma.serviceSlotBooking.updateMany.mockResolvedValue({ count: 1 });
+    mockTx.order.findUnique.mockResolvedValue({ id: 'db-order-3' });
+    mockTx.serviceSlotBooking.updateMany.mockResolvedValue({ count: 1 });
 
     const res = await service.bookAndCreateOrder('buyer-1', 'slot-1', {});
 
@@ -307,7 +312,7 @@ describe('ServiceBookingService.bookAndCreateOrder', () => {
         orderValue: 50000,
       }),
     );
-    expect(mockPrisma.serviceSlotBooking.updateMany).toHaveBeenCalledWith(
+    expect(mockTx.serviceSlotBooking.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({ id: 'b1', status: SlotBookingStatus.BOOKED, orderId: null }),
         data: { orderId: 'db-order-3' },
@@ -323,9 +328,10 @@ describe('ServiceBookingService.bookAndCreateOrder', () => {
     mockTx.serviceSlotBooking.upsert.mockResolvedValue({ id: 'b1', slotId: 'slot-1', status: SlotBookingStatus.BOOKED });
     mockPrisma.userShowcase.findUnique.mockResolvedValue({ title: 'Cuci AC', priceMin: 5_000_000n });
     mockPrisma.user.findUnique.mockResolvedValue({ username: 'seller01' });
+    mockTx.serviceSlotBooking.findUnique.mockResolvedValue({ status: SlotBookingStatus.BOOKED, orderId: null });
     mockOrdersService.createOrder.mockResolvedValue(createdOrderResult('ORD-SB-2'));
-    mockPrisma.order.findUnique.mockResolvedValue({ id: 'db-order-4' });
-    mockPrisma.serviceSlotBooking.updateMany.mockResolvedValue({ count: 1 });
+    mockTx.order.findUnique.mockResolvedValue({ id: 'db-order-4' });
+    mockTx.serviceSlotBooking.updateMany.mockResolvedValue({ count: 1 });
 
     await service.bookAndCreateOrder('buyer-1', 'slot-1', { priceIdr: 75000 });
 
@@ -333,6 +339,32 @@ describe('ServiceBookingService.bookAndCreateOrder', () => {
       'buyer-1',
       expect.objectContaining({ orderValue: 75000, orderKind: OrderKind.SERVICE_BOOKING }),
     );
+  });
+
+  it('P2-1: attach gagal setelah order ter-commit → order yatim di-cancel (best-effort)', async () => {
+    const mockOrderState2 = { cancelOrder: jest.fn().mockResolvedValue(undefined) };
+    mockPrisma.serviceSlot.findFirst.mockResolvedValue(slot);
+    mockPrisma.serviceSlotBooking.findUnique.mockResolvedValue(null);
+    mockTx.serviceSlot.updateMany.mockResolvedValue({ count: 1 });
+    mockTx.serviceSlotBooking.upsert.mockResolvedValue({ id: 'b1', slotId: 'slot-1', status: SlotBookingStatus.BOOKED });
+    mockPrisma.userShowcase.findUnique.mockResolvedValue({ title: 'Cuci AC', priceMin: 5_000_000n });
+    mockPrisma.user.findUnique.mockResolvedValue({ username: 'seller01' });
+    mockTx.serviceSlotBooking.findUnique.mockResolvedValue({ status: SlotBookingStatus.BOOKED, orderId: null });
+    mockOrdersService.createOrder.mockResolvedValue(createdOrderResult('ORD-SB-9'));
+    mockTx.order.findUnique.mockResolvedValue({ id: 'db-order-9' });
+    mockTx.serviceSlotBooking.updateMany.mockResolvedValue({ count: 0 }); // predicate gagal → race
+    const module2: TestingModule = await Test.createTestingModule({
+      providers: [
+        ServiceBookingService,
+        { provide: PrismaService, useValue: mockPrisma },
+        { provide: OrdersService, useValue: mockOrdersService },
+        { provide: OrderStateService, useValue: mockOrderState2 },
+      ],
+    }).compile();
+    const svc2 = module2.get<ServiceBookingService>(ServiceBookingService);
+    await expect(svc2.bookAndCreateOrder('buyer-1', 'slot-1', {})).rejects.toBeInstanceOf(ConflictException);
+    // Order yatim dibersihkan via cancelOrder (best-effort).
+    expect(mockOrderState2.cancelOrder).toHaveBeenCalledWith('ORD-SB-9', 'buyer-1', 'OTHER', expect.any(String));
   });
 
   it('menolak bila booking sudah punya order (conflict)', async () => {
@@ -396,6 +428,7 @@ describe('ServiceBookingService.listAdminBookings', () => {
         ServiceBookingService,
         { provide: PrismaService, useValue: mockPrisma },
         { provide: OrdersService, useValue: { createOrder: jest.fn() } },
+        { provide: OrderStateService, useValue: {} },
       ],
     }).compile();
     service = module.get<ServiceBookingService>(ServiceBookingService);

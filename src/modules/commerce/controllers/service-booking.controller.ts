@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Delete, Body, Param, Query, HttpCode } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Body, Param, Query, HttpCode, GoneException } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { ServiceBookingService } from '../services/service-booking.service';
@@ -44,9 +44,9 @@ export class ServiceBookingController {
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Post(':id/book')
   @HttpCode(200)
-  @ApiOperation({ summary: 'Buyer booking slot' })
+  @ApiOperation({ summary: 'DINONAKTIFKAN: gunakan POST /v1/commerce/service-slots/:id/book-with-order', deprecated: true })
   bookSlot(@CurrentUser('sub') userId: string, @Param('id') id: string) {
-    return this.service.bookSlot(userId, id);
+    throw new GoneException('Endpoint book tanpa order dinonaktifkan. Gunakan POST /v1/commerce/service-slots/:id/book-with-order agar booking masuk alur transaksi.');
   }
 
   @Throttle({ default: { ttl: 60000, limit: 30 } })

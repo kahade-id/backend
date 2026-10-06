@@ -40,6 +40,8 @@ describe('PatunganService', () => {
     mockOrderState.cancelOrder.mockResolvedValue({ ok: true });
     mockPrisma.$transaction.mockImplementation((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx));
     mockTx.$executeRawUnsafe.mockResolvedValue(0);
+    // P2-5 repair sweep: default tidak ada peserta PAID yang stuck di grup FAILED.
+    mockPrisma.patunganParticipant.findMany.mockResolvedValue([]);
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         PatunganService,
@@ -312,9 +314,9 @@ describe('PatunganService', () => {
     expect(mockOrderState.cancelOrder).not.toHaveBeenCalled();
   });
 
-  it('M4: processDeadlines — target tak tercapai → FAILED kondisional + refund peserta', async () => {
+  it('M4: processDeadlines — target tak tercapai → FAILED kondisional + refund peserta (P2-4)', async () => {
     mockPrisma.patunganGroup.findMany
-      .mockResolvedValueOnce([{ id: 'g1', hostId: 'h1' }])
+      .mockResolvedValueOnce([{ id: 'g1' }])
       .mockResolvedValueOnce([]);
     mockTx.patunganGroup.findUnique.mockResolvedValue({ status: PatunganStatus.OPEN, targetAmount: 100000000n });
     mockTx.patunganParticipant.aggregate.mockResolvedValue({ _sum: { amount: 25000000n } });
@@ -323,7 +325,6 @@ describe('PatunganService', () => {
       { id: 'pp1', orderId: 'o1', status: PatunganParticipantStatus.PAID },
       { id: 'pp2', orderId: null, status: PatunganParticipantStatus.PENDING },
     ]);
-    mockPrisma.order.findUnique.mockResolvedValue({ orderId: 'ORD-1', status: OrderStatus.WAITING_PAYMENT });
     mockPrisma.patunganParticipant.updateMany.mockResolvedValue({ count: 1 });
     const res = await service.processDeadlines();
     expect(res.failed).toBe(1);
@@ -333,10 +334,14 @@ describe('PatunganService', () => {
         data: { status: PatunganStatus.FAILED },
       }),
     );
-    expect(mockOrderState.cancelOrder).toHaveBeenCalledWith('ORD-1', 'h1', 'OTHER', expect.any(String));
-    // Peserta PAID → REFUNDED, PENDING → REFUNDED, semua via predicate status.
+    // P2-4: tanpa dead path cancelOrder — peserta PAID langsung REFUND_REQUIRED.
+    expect(mockOrderState.cancelOrder).not.toHaveBeenCalled();
+    // Peserta PAID → REFUND_REQUIRED, PENDING → REFUNDED, semua via predicate status.
     expect(mockPrisma.patunganParticipant.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: expect.objectContaining({ status: PatunganParticipantStatus.PAID }) }),
+      expect.objectContaining({
+        where: expect.objectContaining({ status: PatunganParticipantStatus.PAID }),
+        data: expect.objectContaining({ status: PatunganParticipantStatus.REFUND_REQUIRED }),
+      }),
     );
   });
 

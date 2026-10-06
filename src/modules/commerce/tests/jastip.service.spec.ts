@@ -195,7 +195,7 @@ describe('JastipService', () => {
     );
   });
 
-  it('failTrip: order masih cancellable → di-cancel via OrderStateService', async () => {
+  it('failTrip: peserta PAID langsung REFUND_REQUIRED (P2-4, tanpa dead path cancelOrder)', async () => {
     mockPrisma.jastipTrip.findFirst.mockResolvedValue({
       id: 't1', hostId: 'host-1', status: JastipTripStatus.OPEN,
       participants: [{ id: 'p1', status: JastipParticipantStatus.PAID, orderId: 'oid1' }],
@@ -204,11 +204,10 @@ describe('JastipService', () => {
     mockPrisma.jastipParticipant.findMany.mockResolvedValue([
       { id: 'p1', status: JastipParticipantStatus.PAID, orderId: 'oid1' },
     ]);
-    mockPrisma.order.findUnique.mockResolvedValue({ orderId: 'ORD-1', status: OrderStatus.WAITING_PAYMENT });
     mockPrisma.jastipParticipant.updateMany.mockResolvedValue({ count: 1 });
     const res = await service.failTrip('host-1', 't1', 'barang habis');
-    expect(mockOrderState.cancelOrder).toHaveBeenCalled();
-    expect(res.results[0].outcome).toBe('REFUNDED');
+    expect(mockOrderState.cancelOrder).not.toHaveBeenCalled();
+    expect(res.results[0].outcome).toBe('REFUND_REQUIRED');
   });
 
   it('M3: retry setelah crash (trip sudah CANCELLED) → TIDAK ditolak, sisa peserta diproses', async () => {
@@ -239,7 +238,7 @@ describe('JastipService', () => {
     expect(mockPrisma.jastipTrip.updateMany).not.toHaveBeenCalled();
   });
 
-  it('M3: cancelOrder balapan (order ter-cancel jalur lain) → peserta REFUNDED bukan REFUND_REQUIRED', async () => {
+  it('M3: failTrip idempoten — peserta PAID selalu REFUND_REQUIRED (P2-4)', async () => {
     mockPrisma.jastipTrip.findFirst.mockResolvedValue({
       id: 't1', hostId: 'host-1', status: JastipTripStatus.OPEN, participants: [],
     });
@@ -247,13 +246,10 @@ describe('JastipService', () => {
     mockPrisma.jastipParticipant.findMany.mockResolvedValue([
       { id: 'p1', status: JastipParticipantStatus.PAID, orderId: 'oid1' },
     ]);
-    mockPrisma.order.findUnique
-      .mockResolvedValueOnce({ orderId: 'ORD-1', status: OrderStatus.WAITING_PAYMENT })
-      .mockResolvedValueOnce({ status: OrderStatus.CANCELLED }); // baca ulang pasca-gagal
-    mockOrderState.cancelOrder.mockRejectedValueOnce(new Error('Order status has already changed'));
     mockPrisma.jastipParticipant.updateMany.mockResolvedValue({ count: 1 });
     const res = await service.failTrip('host-1', 't1');
-    expect(res.results[0].outcome).toBe('REFUNDED');
+    expect(res.results[0].outcome).toBe('REFUND_REQUIRED');
+    expect(mockOrderState.cancelOrder).not.toHaveBeenCalled();
   });
 
   it('M3: closeExpiredTrips tidak menimpa trip yang sudah CANCELLED via failTrip', async () => {

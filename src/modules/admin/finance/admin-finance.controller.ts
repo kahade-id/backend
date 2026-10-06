@@ -24,6 +24,7 @@ import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { WalletKillSwitchGuard } from '../../../modules/wallet-mode/wallet-kill-switch.guard';
 import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
+import { AdminJwtPayload } from '../../../common/types/jwt-payload.types';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
 import { StepUpGuard } from '../../../common/guards/step-up.guard';
@@ -47,8 +48,8 @@ export class AdminFinanceController {
   @Get('transactions')
   @ApiOperation({ summary: 'List all wallet transactions', description: 'Paginated list of all wallet transactions with optional filters.' })
   @ApiResponse({ status: 200, description: 'Transactions list returned.' })
-  listTransactions(@Query() query: FinanceTransactionQueryDto): Promise<object> {
-    return this.service.listTransactions(query);
+  listTransactions(@Query() query: FinanceTransactionQueryDto, @CurrentAdmin() admin: AdminJwtPayload): Promise<object> {
+    return this.service.listTransactions(query, admin.role);
   }
 
   // AW-002 (perf-fix): agregat server-side untuk halaman Keuangan — DIDAFTARKAN
@@ -67,8 +68,8 @@ export class AdminFinanceController {
   @ApiOperation({ summary: 'Get transaction detail', description: 'Returns full transaction detail including wallet owner and related entities.' })
   @ApiResponse({ status: 200, description: 'Transaction detail returned.' })
   @ApiResponse({ status: 404, description: 'Transaction not found.' })
-  getTransactionDetail(@Param('txId', ParseIdPipe) txId: string, @CurrentAdmin('sub') adminId: string, @Req() req: Request): Promise<object> {
-    return this.service.getTransactionDetail(txId, adminId, req.ip || 'unknown');
+  getTransactionDetail(@Param('txId', ParseIdPipe) txId: string, @CurrentAdmin() admin: AdminJwtPayload, @Req() req: Request): Promise<object> {
+    return this.service.getTransactionDetail(txId, admin.sub, req.ip || 'unknown', admin.role);
   }
 
   @Get('transactions/:txId/timeline')
@@ -89,8 +90,8 @@ export class AdminFinanceController {
   @Get('withdrawals/pending')
   @ApiOperation({ summary: 'List pending withdrawals', description: 'Paginated list of all withdrawals with pending status.' })
   @ApiResponse({ status: 200, description: 'Pending withdrawals list returned.' })
-  listPendingWithdrawals(@Query() query: PaginationDto, @CurrentAdmin('sub') adminId: string, @Req() req: Request): Promise<object> {
-    return this.service.listPendingWithdrawals(query.page, query.limit, adminId, req.ip || 'unknown');
+  listPendingWithdrawals(@Query() query: PaginationDto, @CurrentAdmin() admin: AdminJwtPayload, @Req() req: Request): Promise<object> {
+    return this.service.listPendingWithdrawals(query.page, query.limit, admin.sub, req.ip || 'unknown', admin.role);
   }
 
   // BAI-041 (P0): jalur payout legacy DI-SUNSET. Service melempar 410 GONE

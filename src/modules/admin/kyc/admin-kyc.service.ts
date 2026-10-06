@@ -13,6 +13,8 @@ import { Queue } from 'bull';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
+// P2: samarkan email user untuk role non-SUPER_ADMIN.
+import { applyUserMask } from '../../../common/maskPiiByRole';
 import { UploadService } from '../../upload/upload.service';
 import { VerificationBadgeService } from '../../users/verification-badge.service';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
@@ -85,6 +87,7 @@ export class AdminKycService {
    */
   async getKycQueue(
     query: KycQueueQueryDto,
+    adminRole?: string,
   ): Promise<PaginatedResponse<Record<string, unknown>>> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
@@ -200,6 +203,8 @@ export class AdminKycService {
       const reviewerMap = await this.getAdminNameMap(reviewerIds);
       const rows = pageRows.map(r => ({
         ...r,
+        // P2: samarkan email user untuk role non-SUPER_ADMIN.
+        user: r.user ? { ...(r.user as Record<string, unknown>), ...applyUserMask(adminRole, { email: (r.user as Record<string, unknown>).email as string | null, phoneNumber: null }) } : r.user,
         sla: this.buildSlaView(r, slaNow, slaConfig),
         assignedReviewer: r.assignedReviewerId
           ? (reviewerMap.get(r.assignedReviewerId) ?? { adminId: r.assignedReviewerId, fullName: null })
@@ -243,6 +248,8 @@ export class AdminKycService {
 
     const rows = requests.map(r => ({
       ...r,
+      // P2: samarkan email user untuk role non-SUPER_ADMIN.
+      user: r.user ? { ...(r.user as Record<string, unknown>), ...applyUserMask(adminRole, { email: (r.user as Record<string, unknown>).email as string | null, phoneNumber: null }) } : r.user,
       sla: this.buildSlaView(r, now, config),
       assignedReviewer: r.assignedReviewerId
         ? (reviewerMap.get(r.assignedReviewerId) ?? { adminId: r.assignedReviewerId, fullName: null })
@@ -644,6 +651,7 @@ export class AdminKycService {
     kycId: string,
     adminId?: string,
     ipAddress?: string,
+    adminRole?: string,
   ): Promise<Record<string, unknown>> {
     const request = await this.prisma.kycRequest.findFirst({
       where: { OR: [{ id: kycId }, { kycId }] },
@@ -735,6 +743,10 @@ export class AdminKycService {
 
     return {
       ...request,
+      // P2: samarkan email user untuk role non-SUPER_ADMIN.
+      user: (request as Record<string, unknown>).user
+        ? { ...((request as Record<string, unknown>).user as Record<string, unknown>), ...applyUserMask(adminRole, { email: (((request as Record<string, unknown>).user) as Record<string, unknown>).email as string | null, phoneNumber: null }) }
+        : (request as Record<string, unknown>).user,
       sla: this.buildSlaView(request, now, config),
       assignedReviewer: request.assignedReviewerId
         ? (assignmentNameMap.get(request.assignedReviewerId) ?? {

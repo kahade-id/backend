@@ -19,6 +19,8 @@ import { UnshippedOrderCancelService } from '../../orders/unshipped-order-cancel
 import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
+// P2: samarkan email buyer/seller untuk role non-SUPER_ADMIN.
+import { applyUserMask } from '../../../common/maskPiiByRole';
 import { AdminOrderQueryDto, ForceActionDto, ForceActionWithReauthDto } from './dto/admin-order-query.dto';
 import { toIdr, formatSen } from '../../../common/utils/currency.util';
 import { decryptPiiSafe } from '../../../common/utils/pii.util';
@@ -27,9 +29,14 @@ import * as ErrorCodes from '../../../common/constants/error-codes';
 import { escapeLikePattern } from '../../../common/utils/search.util';
 import { DashboardService } from '../dashboard/dashboard.service';
 
-function serializeOrder(order: Record<string, unknown>): Record<string, unknown> {
+function serializeOrder(order: Record<string, unknown>, adminRole?: string): Record<string, unknown> {
+  // P2: samarkan email buyer/seller untuk role non-SUPER_ADMIN.
+  const buyer = order.buyer as Record<string, unknown> | null | undefined;
+  const seller = order.seller as Record<string, unknown> | null | undefined;
   return {
     ...order,
+    buyer: buyer ? { ...buyer, ...applyUserMask(adminRole, { email: buyer.email as string | null, phoneNumber: null }) } : buyer,
+    seller: seller ? { ...seller, ...applyUserMask(adminRole, { email: seller.email as string | null, phoneNumber: null }) } : seller,
     orderValue: toIdr(order.orderValue as bigint),
     feeAmount: toIdr(order.feeAmount as bigint),
     buyerFeeAmount: toIdr(order.buyerFeeAmount as bigint),
@@ -76,7 +83,7 @@ export class AdminOrdersService {
     throw new Error(`${label}: unreachable`);
   }
 
-  async listOrders(query: AdminOrderQueryDto): Promise<PaginatedResponse<Record<string, unknown>>> {
+  async listOrders(query: AdminOrderQueryDto, adminRole?: string): Promise<PaginatedResponse<Record<string, unknown>>> {
     const { page = 1, limit = 20, status, kind, fulfillment, participantMode, category, startDate, endDate, search, hasEscrow, sortBy, sortOrder } = query;
     const safePage = Math.max(1, Math.trunc(Number.isFinite(page) ? page : 1));
     const safeLimit = Math.min(100, Math.max(1, Math.trunc(Number.isFinite(limit) ? limit : 20)));
@@ -153,10 +160,10 @@ export class AdminOrdersService {
       this.prisma.order.count({ where }),
     ]);
 
-    return createPaginatedResponse(orders.map(o => serializeOrder(o as unknown as Record<string, unknown>)), total, safePage, safeLimit);
+    return createPaginatedResponse(orders.map(o => serializeOrder(o as unknown as Record<string, unknown>, adminRole)), total, safePage, safeLimit);
   }
 
-  async getOrderDetail(orderId: string): Promise<Record<string, unknown>> {
+  async getOrderDetail(orderId: string, adminRole?: string): Promise<Record<string, unknown>> {
     const order = await this.prisma.order.findFirst({
       where: { OR: [{ id: orderId }, { orderId }] },
       include: {
@@ -220,7 +227,7 @@ export class AdminOrdersService {
       },
     });
 
-    const result = serializeOrder(order as unknown as Record<string, unknown>);
+    const result = serializeOrder(order as unknown as Record<string, unknown>, adminRole);
 
     // MFE-012/MFE-013: mapping ter-serialisasi untuk admin FE —
     // danaPayments berisi snapshot DANA-direct per order (BigInt→IDR).

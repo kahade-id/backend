@@ -46,7 +46,7 @@ export class AdminDisputesController {
   @ApiResponse({ status: 200, description: 'Dispute detail returned.' })
   @ApiResponse({ status: 404, description: 'Dispute not found.' })
   getDetail(@Param('disputeId', ParseIdPipe) disputeId: string, @CurrentAdmin() admin: AdminJwtPayload, @Req() req: Request): Promise<object> {
-    return this.service.getDisputeDetail(disputeId, admin.sub, req.ip || 'unknown');
+    return this.service.getDisputeDetail(disputeId, admin.sub, req.ip || 'unknown', admin.role);
   }
 
   @Get(':disputeId/messages')

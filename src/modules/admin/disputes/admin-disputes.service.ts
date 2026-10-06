@@ -13,6 +13,8 @@ import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback } from 
 import { EscrowDisbursementService } from '../../no-wallet/escrow-disbursement.service';
 import { computePatunganRebateTx, createPatunganRebateLedgerTx } from '../../commerce/patungan-rebate';
 import { DisputeDecisionDto, validateSplitPercents } from './dispute-decision.dto';
+// P2: samarkan email initiator untuk role non-SUPER_ADMIN.
+import { applyUserMask } from '../../../common/maskPiiByRole';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { toIdr } from '../../../common/utils/currency.util';
 import * as ErrorCodes from '../../../common/constants/error-codes';
@@ -186,7 +188,7 @@ export class AdminDisputesService implements OnModuleInit {
     return createPaginatedResponse(serialized, total, safePage, safeLimit);
   }
 
-  async getDisputeDetail(disputeId: string, adminId?: string, ipAddress?: string): Promise<object> {
+  async getDisputeDetail(disputeId: string, adminId?: string, ipAddress?: string, adminRole?: string): Promise<object> {
     const dispute = await this.prisma.dispute.findFirst({
       where: { OR: [{ id: disputeId }, { disputeId }] },
       include: {
@@ -236,6 +238,10 @@ export class AdminDisputesService implements OnModuleInit {
 
     return {
       ...dispute,
+      // P2: samarkan email initiator untuk role non-SUPER_ADMIN.
+      initiator: dispute.initiator
+        ? { ...dispute.initiator, ...applyUserMask(adminRole, { email: dispute.initiator.email, phoneNumber: null }) }
+        : dispute.initiator,
       evidences: evidenceWithDownloads,
       calls: dispute.calls,
       mutualProposals: dispute.mutualProposals.map((proposal) => ({

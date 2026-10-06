@@ -16,6 +16,8 @@ import { FinanceTransactionQueryDto } from './dto/finance-query.dto';
 import { WithdrawalApproveDto, WithdrawalRejectDto } from './dto/withdrawal-action.dto';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { AuditLogService } from '../../../common/services/audit-log.service';
+// P2: samarkan email user untuk role non-SUPER_ADMIN.
+import { applyUserMask } from '../../../common/maskPiiByRole';
 import { MidtransService } from '../../../modules/payment/midtrans.service';
 import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
 import { decryptAES } from '../../../common/utils/crypto.util';
@@ -282,7 +284,7 @@ export class AdminFinanceService {
     return { where, start, end };
   }
 
-  async listTransactions(query: FinanceTransactionQueryDto): Promise<object> {
+  async listTransactions(query: FinanceTransactionQueryDto, adminRole?: string): Promise<object> {
     const { page = 1, limit = 20 } = query;
     const safePage = Number.isInteger(page) && page > 0 ? page : 1;
     const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 100) : 20;
@@ -311,6 +313,13 @@ export class AdminFinanceService {
 
     const serialized = transactions.map(tx => ({
       ...tx,
+      // P2: samarkan email user untuk role non-SUPER_ADMIN.
+      wallet: tx.wallet ? {
+        ...(tx.wallet as Record<string, unknown>),
+        user: (tx.wallet as Record<string, unknown>).user
+          ? { ...((tx.wallet as Record<string, unknown>).user as Record<string, unknown>), ...applyUserMask(adminRole, { email: (((tx.wallet as Record<string, unknown>).user) as Record<string, unknown>).email as string | null, phoneNumber: null }) }
+          : (tx.wallet as Record<string, unknown>).user,
+      } : tx.wallet,
       // Convert BigInt sen amounts to IDR numbers for frontend display.
       amount: toIdr(tx.amount),
       balanceBefore: toIdr(tx.balanceBefore),
@@ -367,8 +376,9 @@ export class AdminFinanceService {
     txId: string,
     adminId: string,
     ipAddress: string = 'unknown',
+    adminRole?: string,
   ): Promise<object> {
-    const detail = await this.buildTransactionDetail(txId, adminId, ipAddress);
+    const detail = await this.buildTransactionDetail(txId, adminId, ipAddress, adminRole);
 
     this.auditLog.logAdminAction({
       adminId,
@@ -386,6 +396,7 @@ export class AdminFinanceService {
     txId: string,
     adminId: string,
     ipAddress: string = 'unknown',
+    adminRole?: string,
   ): Promise<object> {
     // B-22 (audit-fix): lookup by public txId only.
     // E3 (G326-G350): audit kebocoran secret — metadata & payload webhook
@@ -541,7 +552,10 @@ export class AdminFinanceService {
 
     return {
       ...result,
-      owner: tx.wallet?.user ?? null,
+      // P2: samarkan email owner untuk role non-SUPER_ADMIN.
+      owner: tx.wallet?.user
+        ? { ...(tx.wallet.user as Record<string, unknown>), ...applyUserMask(adminRole, { email: (tx.wallet.user as Record<string, unknown>).email as string | null, phoneNumber: null }) }
+        : null,
       order,
       reversalTx,
       reversals,
@@ -907,6 +921,7 @@ export class AdminFinanceService {
     limit: number = 20,
     adminId: string,
     ipAddress: string = 'unknown',
+    adminRole?: string,
   ): Promise<object> {
     const safeLimit = Math.min(limit, 100);
     const where: Prisma.WalletTransactionWhereInput = {
@@ -998,6 +1013,13 @@ export class AdminFinanceService {
           balanceBefore: toIdr(tx.balanceBefore),
           balanceAfter: toIdr(tx.balanceAfter),
           approvalInfo,
+          // P2: samarkan email user untuk role non-SUPER_ADMIN.
+          wallet: tx.wallet ? {
+            ...(tx.wallet as Record<string, unknown>),
+            user: (tx.wallet as Record<string, unknown>).user
+              ? { ...(((tx.wallet as Record<string, unknown>).user) as Record<string, unknown>), ...applyUserMask(adminRole, { email: ((((tx.wallet as Record<string, unknown>).user) as Record<string, unknown>)).email as string | null, phoneNumber: null }) }
+              : (tx.wallet as Record<string, unknown>).user,
+          } : tx.wallet,
           bankAccount: tx.bankAccount
             ? {
                 ...tx.bankAccount,

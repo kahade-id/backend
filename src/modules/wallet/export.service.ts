@@ -436,12 +436,9 @@ export class WalletExportService {
       select: { fullName: true, userId: true },
     });
 
-    const formatCurrency = (amount: number) =>
-      new Intl.NumberFormat('id-ID', {
-        style: 'currency',
-        currency: 'IDR',
-        minimumFractionDigits: 0,
-      }).format(amount);
+    // P2-F1: format kanonis "Rp1.500.000" tanpa spasi (currency.util),
+    // bukan Intl currency style yang menghasilkan "Rp 1.500.000".
+    const formatCurrency = (amount: number) => formatIdr(amount);
 
     const INCOME_TYPES = [
       'TOP_UP',

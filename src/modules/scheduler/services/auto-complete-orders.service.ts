@@ -15,6 +15,9 @@ import { randomUUID, randomInt } from 'crypto';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
+// P2-R1: kirim pesan sistem "order selesai" ke ruang chat transaksi saat
+// auto-complete — sama seperti alur manual (order-state.service.ts:299).
+import { ChatOrderHooks } from '../../chat/chat-order-hooks';
 import { WalletTxSerialService } from '../../../common/services/wallet-tx-serial.service';
 import { ReferralService } from '../../referral/referral.service';
 import { MembershipRankService } from '../../orders/membership-rank.service';
@@ -888,6 +891,12 @@ export class AutoCompleteDeliveredOrdersService {
                   data: { type: 'WALLET_FUNDS_RELEASED', orderId: order.orderId },
                 }),
               `AUTO_COMPLETE_SELLER_NOTIFICATION orderId=${order.orderId}`,
+            );
+            // P2-R1: pesan sistem "dana dicairkan" ke ruang chat transaksi —
+            // pola yang sama dengan alur manual (ORDER_COMPLETED).
+            this.runRealtimeBestEffort(
+              () => ChatOrderHooks.emit(order.id, 'ORDER_COMPLETED'),
+              `AUTO_COMPLETE_CHAT_SYSTEM_MSG orderId=${order.orderId}`,
             );
             // Success: clear any previous failure counter
             await this.redis

@@ -38,8 +38,8 @@ export class AdminKycController {
   @Get()
   @ApiOperation({ summary: 'Get KYC queue', description: 'Paginated KYC request queue ordered FIFO, filterable by status, SLA breach, age range, and assigned reviewer. Each row carries a live SLA view.' })
   @ApiResponse({ status: 200, description: 'KYC queue returned.' })
-  getQueue(@Query() query: KycQueueQueryDto): Promise<object> {
-    return this.service.getKycQueue(query);
+  getQueue(@Query() query: KycQueueQueryDto, @CurrentAdmin() admin: AdminJwtPayload): Promise<object> {
+    return this.service.getKycQueue(query, admin.role);
   }
 
   @Get('sla-config')
@@ -122,7 +122,7 @@ export class AdminKycController {
     @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<Record<string, unknown>> {
-    return this.service.getKycDetail(kycId, admin.sub, req.ip || 'unknown');
+    return this.service.getKycDetail(kycId, admin.sub, req.ip || 'unknown', admin.role);
   }
 
   @Post(':kycId/document-urls')

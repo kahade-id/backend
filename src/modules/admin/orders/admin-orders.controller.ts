@@ -26,16 +26,16 @@ export class AdminOrdersController {
   @Get()
   @ApiOperation({ summary: 'List all orders', description: 'Paginated list of all orders with optional status and date range filters.' })
   @ApiResponse({ status: 200, description: 'Orders list returned.' })
-  listOrders(@Query() query: AdminOrderQueryDto): Promise<PaginatedResponse<Record<string, unknown>>> {
-    return this.service.listOrders(query);
+  listOrders(@Query() query: AdminOrderQueryDto, @CurrentAdmin() admin: AdminJwtPayload): Promise<PaginatedResponse<Record<string, unknown>>> {
+    return this.service.listOrders(query, admin.role);
   }
 
   @Get(':orderId')
   @ApiOperation({ summary: 'Get order detail', description: 'Returns full order detail including participants, wallet transactions, and status history.' })
   @ApiResponse({ status: 200, description: 'Order detail returned.' })
   @ApiResponse({ status: 404, description: 'Order not found.' })
-  getOrderDetail(@Param('orderId', ParseIdPipe) orderId: string): Promise<Record<string, unknown>> {
-    return this.service.getOrderDetail(orderId);
+  getOrderDetail(@Param('orderId', ParseIdPipe) orderId: string, @CurrentAdmin() admin: AdminJwtPayload): Promise<Record<string, unknown>> {
+    return this.service.getOrderDetail(orderId, admin.role);
   }
 
   @Post(':orderId/force-cancel')

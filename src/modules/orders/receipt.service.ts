@@ -1,7 +1,7 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { toIdr } from '../../common/utils/currency.util';
+import { toIdr, formatIdr } from '../../common/utils/currency.util';
 
 function escapeHtml(str: string | null | undefined): string {
   if (!str) return '';
@@ -37,8 +37,9 @@ export class ReceiptService {
       throw new BadRequestException({ code: 'RECEIPT_NOT_AVAILABLE', message: 'Receipt only available for completed or disputed orders' });
     }
 
-    const formatCurrency = (amount: number) =>
-      new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(amount);
+    // P2-F1: format kanonis "Rp1.500.000" tanpa spasi (currency.util),
+    // bukan Intl currency style yang menghasilkan "Rp 1.500.000".
+    const formatCurrency = (amount: number) => formatIdr(amount);
 
     const statusLabel: Record<string, string> = {
       WAITING_CONFIRMATION: 'Waiting for Confirmation',

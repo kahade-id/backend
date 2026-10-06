@@ -8,6 +8,8 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { CommerceRefundService } from '../services/commerce-refund.service';
 import { PaginationDto } from '../../../common/dto/pagination.dto';
 import { JwtAdminGuard } from '../../../common/guards/jwt-admin.guard';
+// P2: idempotensi untuk eksekusi refund manual (retry aman).
+import { Idempotency } from '../../../common/decorators/idempotency.decorator';
 import { AdminRolesGuard } from '../../../common/guards/admin-roles.guard';
 import { AdminRoles } from '../../../common/decorators/admin-roles.decorator';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
@@ -70,6 +72,8 @@ export class AdminCommerceRefundsController {
   @Post(':orderId/execute')
   @HttpCode(200)
   @UseGuards(StepUpGuard)
+  // P2: idempotensi — retry tak-pasti dapat replay respons asli.
+  @Idempotency()
   // SEC-602/503: eksekusi refund manual wajib step-up server-side (+ reauthPassword
   // di body, diverifikasi pola AUT-013). Nominal > Rp1jt → dual control
   // (COMMERCE_REFUND). Jalur scheduler otomatis (executeRefund) TIDAK digate.

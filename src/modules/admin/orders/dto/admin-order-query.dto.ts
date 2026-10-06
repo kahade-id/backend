@@ -1,5 +1,5 @@
 import { IsOptional, IsEnum, IsString, IsBoolean, IsIn, IsDateString, IsNotEmpty, MinLength, MaxLength } from 'class-validator';
-import { OrderStatus, OrderKind } from '@prisma/client';
+import { OrderStatus, OrderKind, FulfillmentType, ParticipantMode, OrderCategory } from '@prisma/client';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import { PaginationDto } from '../../../../common/dto/pagination.dto';
@@ -10,11 +10,29 @@ export class AdminOrderQueryDto extends PaginationDto {
   @IsEnum(OrderStatus)
   status?: OrderStatus;
 
-  @ApiPropertyOptional({ enum: OrderKind, description: 'Filter by jenis transaksi escrow (POIN 2 2026-10-04)' })
+  @ApiPropertyOptional({ enum: OrderKind, description: 'Filter by jenis transaksi escrow (POIN 2 2026-10-04). DEPRECATED: pakai fulfillment/participantMode/category.' })
   @IsOptional()
   @Transform(({ value }: { value: unknown }) => typeof value === 'string' ? value.toUpperCase() : value)
   @IsEnum(OrderKind)
   kind?: OrderKind;
+
+  @ApiPropertyOptional({ enum: FulfillmentType, description: 'Filter by waktu pemenuhan (TX-UNIFIED-V2)' })
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => typeof value === 'string' ? value.toUpperCase() : value)
+  @IsEnum(FulfillmentType)
+  fulfillment?: FulfillmentType;
+
+  @ApiPropertyOptional({ enum: ParticipantMode, description: 'Filter by mode peserta (TX-UNIFIED-V2)' })
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => typeof value === 'string' ? value.toUpperCase() : value)
+  @IsEnum(ParticipantMode)
+  participantMode?: ParticipantMode;
+
+  @ApiPropertyOptional({ enum: OrderCategory, description: 'Filter by kategori (TX-UNIFIED-V2)' })
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => typeof value === 'string' ? value.toUpperCase() : value)
+  @IsEnum(OrderCategory)
+  category?: OrderCategory;
 
   @ApiPropertyOptional({ description: 'Start date filter' })
   @IsOptional()

@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, Logger, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { JastipTripStatus, JastipParticipantStatus, OrderStatus, OrderType, OrderKind, FeeResponsibility, Prisma } from '@prisma/client';
+import { JastipTripStatus, JastipParticipantStatus, OrderStatus, OrderType, OrderKind, FulfillmentType, ParticipantMode, OrderCategory, FeeResponsibility, Prisma } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { toSen, toIdr } from '../../../common/utils/currency.util';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
@@ -399,6 +399,10 @@ export class JastipService implements OnModuleInit {
         description,
         orderType: OrderType.PHYSICAL_GOODS,
         orderKind: OrderKind.JASTIP,
+        // TX-UNIFIED-V2 (2026-10-06): jastip = preorder; dual-write dengan orderKind lama.
+        fulfillment: FulfillmentType.PREORDER,
+        participantMode: ParticipantMode.SINGLE,
+        category: OrderCategory.FISIK,
         orderValue: orderValueIdr,
         deliveryDeadlineDays,
         feeResponsibility: FeeResponsibility.BUYER,
@@ -540,6 +544,18 @@ export class JastipService implements OnModuleInit {
             message: 'Peserta sudah dalam proses / selesai',
           });
         }
+        // TX-UNIFIED-V2 (2026-10-06) — perbaiki M2 audit: order yang ditautkan
+        // manual juga harus tercatat dengan dimensi baru yang benar
+        // (sebelumnya hanya orderId yang ditulis, orderKind tetap DIRECT).
+        await tx.order.update({
+          where: { id: order.id },
+          data: {
+            orderKind: OrderKind.JASTIP,
+            fulfillment: FulfillmentType.PREORDER,
+            participantMode: ParticipantMode.SINGLE,
+            category: OrderCategory.FISIK,
+          },
+        });
         return tx.jastipParticipant.findUnique({ where: { id: participant.id } });
       });
     } catch (e) {

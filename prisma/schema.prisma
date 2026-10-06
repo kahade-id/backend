@@ -66,11 +66,40 @@ enum OrderType {
 /// BERBEDA dengan OrderType (dimensi jenis barang). DIRECT = order normal
 /// (perilaku lama); JASTIP/PATUNGAN/SERVICE_BOOKING = order yang dibuat dari
 /// alur commerce (participant/booking). Dipakai filter list + analitik FE/admin.
+///
+/// DEPRECATED (2026-10-06, TX-UNIFIED-V2): digantikan 3 dimensi independen
+/// (FulfillmentType × ParticipantMode × OrderCategory). Kolom dipertahankan
+/// untuk backward compat selama transisi; tulis dua arah (dual-write).
 enum OrderKind {
   DIRECT
   JASTIP
   PATUNGAN
   SERVICE_BOOKING
+}
+
+/// TX-UNIFIED-V2 (2026-10-06) — dimensi WAKTU PEMENUHAN, independen dari
+/// kategori & peserta. PREORDER = barang/jasa dipenuhi kemudian (estimasi
+/// tanggal wajib); BIASA = ready. Jasa tidak memakai label ini (pakai
+/// tanggal jadwal langsung).
+enum FulfillmentType {
+  BIASA
+  PREORDER
+}
+
+/// TX-UNIFIED-V2 (2026-10-06) — dimensi PESERTA. SINGLE = 1-by-1;
+/// GROUP = 1-by-N patungan/split-bill (2-100 peserta, tiap peserta order sendiri).
+enum ParticipantMode {
+  SINGLE
+  GROUP
+}
+
+/// TX-UNIFIED-V2 (2026-10-06) — dimensi KATEGORI BARANG/JASA.
+/// Selaras dengan OrderType: FISIK←PHYSICAL_GOODS, DIGITAL←DIGITAL_GOODS,
+/// JASA←SERVICE. TIDAK ada "LAINNYA" (keputusan produk 2026-10-05).
+enum OrderCategory {
+  FISIK
+  DIGITAL
+  JASA
 }
 
 // --- BE-COMMERCE batch (2026-10-01): tipe produk & entitas commerce -----------
@@ -1915,7 +1944,16 @@ model Order {
   orderType   OrderType
   /// POIN 2 (2026-10-04): jenis transaksi escrow (bukan jenis barang).
   /// DIRECT = default (order normal, perilaku lama).
+  /// DEPRECATED (2026-10-06, TX-UNIFIED-V2): digantikan fulfillment +
+  /// participantMode + category. Dipertahankan untuk backward compat.
   orderKind   OrderKind @default(DIRECT)
+  /// TX-UNIFIED-V2 (2026-10-06): 3 dimensi independen pengganti orderKind.
+  /// Ditulis bersama orderKind (dual-write) selama masa transisi.
+  fulfillment     FulfillmentType @default(BIASA)
+  participantMode ParticipantMode @default(SINGLE)
+  /// Diturunkan dari orderType bila tidak diisi eksplisit:
+  /// PHYSICAL_GOODS→FISIK, DIGITAL_GOODS→DIGITAL, SERVICE→JASA, OTHER→FISIK.
+  category        OrderCategory   @default(FISIK)
 
   // Financial (in sen / IDR x 100)
   orderValue          BigInt

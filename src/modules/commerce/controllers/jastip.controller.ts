@@ -88,7 +88,7 @@ export class JastipController {
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Post('participants/:participantId/create-order')
   @HttpCode(200)
-  @ApiOperation({ summary: 'Buyer membuat escrow order dari peserta (orderKind=JASTIP, orderId terisi otomatis)' })
+  @ApiOperation({ summary: 'Buyer membuat escrow order dari peserta (PREORDER+SINGLE+FISIK, orderId terisi otomatis)' })
   createOrder(@CurrentUser('sub') buyerId: string, @Param('participantId') participantId: string) {
     return this.service.createOrderFromParticipant(buyerId, participantId);
   }

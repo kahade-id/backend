@@ -165,6 +165,10 @@ export class OrdersController {
       description: string;
       status: string;
       orderType: string;
+      // TX-UNIFIED-V2 (2026-10-06): 3 dimensi baru.
+      fulfillment: string;
+      participantMode: string;
+      category: string;
       orderValue: number;
       buyerPayAmount: number;
       sellerReceiveAmount: number;
@@ -179,7 +183,7 @@ export class OrdersController {
     page: number;
     limit: number;
   }> {
-    return this.ordersService.getOrders(userId, query.page, query.limit, query.status as OrderStatus | undefined, query.role, query.search, query.from, query.to, query.sortBy, query.sortOrder, query.kind);
+    return this.ordersService.getOrders(userId, query.page, query.limit, query.status as OrderStatus | undefined, query.role, query.search, query.from, query.to, query.sortBy, query.sortOrder, query.kind, query.fulfillment, query.participantMode, query.category);
   }
 
   @Throttle({ default: { ttl: 60000, limit: 30 } })

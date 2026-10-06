@@ -5,7 +5,7 @@ import { ActionLocationService, type ActionLocationContext } from '../action-loc
 import { RedisService } from '../../redis/redis.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { FeeCalculatorService } from './fee-calculator.service';
-import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, OrderKind, SubscriptionStatus, NotificationType, Prisma, Voucher, VoucherApplicability, VoucherType, CampaignStatus, ChatRoomType, PaymentPurpose, PaymentStatus } from '@prisma/client';
+import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, OrderKind, FulfillmentType, ParticipantMode, OrderCategory, SubscriptionStatus, NotificationType, Prisma, Voucher, VoucherApplicability, VoucherType, CampaignStatus, ChatRoomType, PaymentPurpose, PaymentStatus } from '@prisma/client';
 import { generateOrderId } from '../../common/utils/id-generator.util';
 import { toSen, toIdr, formatIdr, percentToBpsBigInt } from '../../common/utils/currency.util';
 import { safeBigIntToNumber } from '../../common/utils/bigint.util';
@@ -42,6 +42,22 @@ function toExcerpt(description: string | null | undefined): string {
 
 function getConfirmationDeadlineDays(orderType: OrderType): number {
   return CONFIRMATION_DEADLINE_DAYS_MAP[orderType] ?? CONFIRMATION_DEADLINE_DAYS;
+}
+
+/**
+ * TX-UNIFIED-V2 (2026-10-06): turunkan OrderCategory dari OrderType bila
+ * pemanggil tidak mengisi eksplisit. Selaras dengan backfill migrasi:
+ * PHYSICAL_GOODS→FISIK, DIGITAL_GOODS→DIGITAL, SERVICE→JASA, OTHER→FISIK
+ * (tidak ada kategori LAINNYA di model baru — keputusan produk 2026-10-05).
+ */
+export function orderTypeToCategory(orderType: OrderType): OrderCategory {
+  switch (orderType) {
+    case OrderType.DIGITAL_GOODS: return OrderCategory.DIGITAL;
+    case OrderType.SERVICE: return OrderCategory.JASA;
+    case OrderType.PHYSICAL_GOODS:
+    case OrderType.OTHER:
+    default: return OrderCategory.FISIK;
+  }
 }
 
 const ORDER_CREATE_MAX_RETRIES = 3;
@@ -274,7 +290,14 @@ export class OrdersService {
       orderType: OrderType;
       // POIN 2 (2026-10-04): jenis transaksi escrow — opsional, default DIRECT.
       // Diisi JASTIP/PATUNGAN/SERVICE_BOOKING oleh endpoint create-order commerce.
+      // DEPRECATED (2026-10-06, TX-UNIFIED-V2): digantikan 3 dimensi di bawah;
+      // tetap ditulis (dual-write) untuk backward compat.
       orderKind?: OrderKind;
+      // TX-UNIFIED-V2 (2026-10-06): 3 dimensi independen. Bila tidak diisi:
+      // fulfillment→BIASA, participantMode→SINGLE, category→diturunkan dari orderType.
+      fulfillment?: FulfillmentType;
+      participantMode?: ParticipantMode;
+      category?: OrderCategory;
       orderValue: number;
       deliveryDeadlineDays: number;
       deliveryDeadlineAt?: string;
@@ -330,7 +353,14 @@ export class OrdersService {
       description: string;
       orderType: OrderType;
       // POIN 2 (2026-10-04): jenis transaksi escrow — opsional, default DIRECT.
+      // DEPRECATED (2026-10-06, TX-UNIFIED-V2): digantikan 3 dimensi di bawah;
+      // tetap ditulis (dual-write) untuk backward compat.
       orderKind?: OrderKind;
+      // TX-UNIFIED-V2 (2026-10-06): 3 dimensi independen. Bila tidak diisi:
+      // fulfillment→BIASA, participantMode→SINGLE, category→diturunkan dari orderType.
+      fulfillment?: FulfillmentType;
+      participantMode?: ParticipantMode;
+      category?: OrderCategory;
       orderValue: number;
       deliveryDeadlineDays: number;
       // T3 (audit 2026-09-26): tanggal kalender eksplisit, opsional.
@@ -751,7 +781,12 @@ export class OrdersService {
               title: sanitizedTitle, description: sanitizedDescription,
               orderType: dto.orderType, orderValue: toSen(dto.orderValue),
               // POIN 2 (2026-10-04): jenis transaksi — default DIRECT bila tidak diisi.
+              // DEPRECATED (2026-10-06, TX-UNIFIED-V2): dual-write dengan 3 dimensi baru.
               orderKind: dto.orderKind ?? OrderKind.DIRECT,
+              // TX-UNIFIED-V2 (2026-10-06): tulis 3 dimensi independen.
+              fulfillment: dto.fulfillment ?? FulfillmentType.BIASA,
+              participantMode: dto.participantMode ?? ParticipantMode.SINGLE,
+              category: dto.category ?? orderTypeToCategory(dto.orderType),
               feeAmount: txFeeCalc.feeAmount,
               feeResponsibility: dto.feeResponsibility,
               buyerFeeAmount: txFeeCalc.buyerFeeAmount,
@@ -950,7 +985,7 @@ export class OrdersService {
     OrderStatus.IN_DELIVERY,
   ];
 
-  async getOrders(userId: string, page: number, limit: number, status?: OrderStatus, role?: 'BUYER' | 'SELLER' | 'ALL', search?: string, from?: string, to?: string, sortBy?: string, sortOrder?: string, kind?: OrderKind): Promise<{
+  async getOrders(userId: string, page: number, limit: number, status?: OrderStatus, role?: 'BUYER' | 'SELLER' | 'ALL', search?: string, from?: string, to?: string, sortBy?: string, sortOrder?: string, kind?: OrderKind, fulfillment?: FulfillmentType, participantMode?: ParticipantMode, category?: OrderCategory): Promise<{
     orders: {
       orderId: string;
       orderNumber: string;
@@ -958,6 +993,10 @@ export class OrdersService {
       description: string;
       status: OrderStatus;
       orderType: OrderType;
+      // TX-UNIFIED-V2 (2026-10-06): 3 dimensi baru di respons (orderKind lama tetap ada).
+      fulfillment: FulfillmentType;
+      participantMode: ParticipantMode;
+      category: OrderCategory;
       // POIN 2 (2026-10-04): jenis transaksi escrow — ikut di respons list/detail (dibutuhkan FE + admin).
       orderKind: OrderKind;
       orderValue: number;
@@ -1013,12 +1052,36 @@ export class OrdersService {
     }
 
     // POIN 2 (2026-10-04): filter jenis transaksi escrow (opsional).
+    // DEPRECATED (2026-10-06, TX-UNIFIED-V2): tetap didukung via kolom lama (dual-write).
     if (kind !== undefined) {
       const kindStr = String(kind).toUpperCase() as OrderKind;
       if (!Object.values(OrderKind).includes(kindStr)) {
         throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid order kind filter' });
       }
       where.orderKind = kindStr;
+    }
+
+    // TX-UNIFIED-V2 (2026-10-06): filter 3 dimensi independen (opsional).
+    if (fulfillment !== undefined) {
+      const fStr = String(fulfillment).toUpperCase() as FulfillmentType;
+      if (!Object.values(FulfillmentType).includes(fStr)) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid fulfillment filter' });
+      }
+      where.fulfillment = fStr;
+    }
+    if (participantMode !== undefined) {
+      const pmStr = String(participantMode).toUpperCase() as ParticipantMode;
+      if (!Object.values(ParticipantMode).includes(pmStr)) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid participantMode filter' });
+      }
+      where.participantMode = pmStr;
+    }
+    if (category !== undefined) {
+      const cStr = String(category).toUpperCase() as OrderCategory;
+      if (!Object.values(OrderCategory).includes(cStr)) {
+        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Invalid category filter' });
+      }
+      where.category = cStr;
     }
 
     if (search && search.trim().length > 0) {
@@ -1078,6 +1141,10 @@ export class OrdersService {
         title: order.title, description: toExcerpt(order.description), status: order.status,
         orderType: order.orderType,
         orderKind: order.orderKind,
+        // TX-UNIFIED-V2 (2026-10-06): 3 dimensi baru.
+        fulfillment: order.fulfillment,
+        participantMode: order.participantMode,
+        category: order.category,
         orderValue: toIdr(order.orderValue),
         buyerPayAmount: toIdr(order.buyerPayAmount),
         sellerReceiveAmount: toIdr(order.sellerReceiveAmount),
@@ -1175,6 +1242,9 @@ export class OrdersService {
       order: {
         orderId: order.orderId, title: order.title, description: order.description,
         orderType: order.orderType, orderKind: order.orderKind, status: order.status,
+        // TX-UNIFIED-V2 (2026-10-06): 3 dimensi baru.
+        fulfillment: order.fulfillment, participantMode: order.participantMode,
+        category: order.category,
         ...(order.status === OrderStatus.CANCELLED ? {
           cancelReason: order.cancelReason ?? null,
           cancelNote: order.cancelNote ?? null,

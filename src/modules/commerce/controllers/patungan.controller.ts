@@ -59,7 +59,7 @@ export class PatunganController {
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Post('participants/:participantId/create-order')
   @HttpCode(200)
-  @ApiOperation({ summary: 'Buat escrow order dari partisipasi (orderKind=PATUNGAN, orderId terisi otomatis)' })
+  @ApiOperation({ summary: 'Buat escrow order dari partisipasi (BIASA+GROUP+FISIK, orderId terisi otomatis)' })
   createOrder(@CurrentUser('sub') userId: string, @Param('participantId') participantId: string) {
     return this.service.createOrderFromParticipant(userId, participantId);
   }

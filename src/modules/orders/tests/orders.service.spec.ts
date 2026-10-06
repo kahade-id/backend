@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { OrdersService } from '../orders.service';
+import { orderTypeToCategory } from '../orders.service';
 import { CreateOrderDto } from '../dto/create-order.dto';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
@@ -9,7 +10,7 @@ import { FeeCalculatorService } from '../fee-calculator.service';
 import { RealtimeService } from '../../realtime/realtime.service';
 import { NotificationQueueService } from '../../queue/notification-queue.service';
 import { SubscriptionsService } from '../../subscriptions/subscriptions.service';
-import { KycStatus, FeeResponsibility, OrderStatus, OrderType, OrderKind } from '@prisma/client';
+import { KycStatus, FeeResponsibility, OrderStatus, OrderType, OrderKind, FulfillmentType, ParticipantMode, OrderCategory } from '@prisma/client';
 
 // TRX-009: pii.util di-mock agar decryptPiiSafe deterministik (ciphertext
 // "enc(x)" -> "enc(x)" apa adanya; pola sama seperti admin-users.service.spec).
@@ -190,6 +191,22 @@ const mockNotificationQueue = { enqueue: jest.fn() };
  * are fully covered by order-state.service.spec.ts in this same directory.
  */
 describe('OrdersService', () => {
+  // TX-UNIFIED-V2 (2026-10-06): orderTypeToCategory mapping.
+  describe('orderTypeToCategory', () => {
+    it('maps PHYSICAL_GOODS to FISIK', () => {
+      expect(orderTypeToCategory(OrderType.PHYSICAL_GOODS)).toBe(OrderCategory.FISIK);
+    });
+    it('maps DIGITAL_GOODS to DIGITAL', () => {
+      expect(orderTypeToCategory(OrderType.DIGITAL_GOODS)).toBe(OrderCategory.DIGITAL);
+    });
+    it('maps SERVICE to JASA', () => {
+      expect(orderTypeToCategory(OrderType.SERVICE)).toBe(OrderCategory.JASA);
+    });
+    it('maps OTHER to FISIK (safe default, no LAINNYA category)', () => {
+      expect(orderTypeToCategory(OrderType.OTHER)).toBe(OrderCategory.FISIK);
+    });
+  });
+
   let service: OrdersService;
   let subscriptionsMock: {
     waiveFeeIfEligible: jest.Mock;
@@ -937,6 +954,66 @@ describe('OrdersService', () => {
     it('rejects an invalid kind filter instead of returning unfiltered orders', async () => {
       await expect(
         service.getOrders('user-db-1', 1, 10, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'BOGUS' as OrderKind),
+      ).rejects.toThrow(BadRequestException);
+      expect(mockPrisma.order.findMany).not.toHaveBeenCalled();
+    });
+
+    // TX-UNIFIED-V2 (2026-10-06): filter 3 dimensi independen.
+
+    it('should filter by fulfillment when provided', async () => {
+      mockPrisma.order.findMany.mockResolvedValue([]);
+      mockPrisma.order.count.mockResolvedValue(0);
+
+      await service.getOrders('user-db-1', 1, 10, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, FulfillmentType.PREORDER);
+
+      const findManyCall = mockPrisma.order.findMany.mock.calls[0][0];
+      expect(findManyCall.where.fulfillment).toBe(FulfillmentType.PREORDER);
+    });
+
+    it('should filter by participantMode when provided', async () => {
+      mockPrisma.order.findMany.mockResolvedValue([]);
+      mockPrisma.order.count.mockResolvedValue(0);
+
+      await service.getOrders('user-db-1', 1, 10, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, ParticipantMode.GROUP);
+
+      const findManyCall = mockPrisma.order.findMany.mock.calls[0][0];
+      expect(findManyCall.where.participantMode).toBe(ParticipantMode.GROUP);
+    });
+
+    it('should filter by category when provided', async () => {
+      mockPrisma.order.findMany.mockResolvedValue([]);
+      mockPrisma.order.count.mockResolvedValue(0);
+
+      await service.getOrders('user-db-1', 1, 10, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, OrderCategory.JASA);
+
+      const findManyCall = mockPrisma.order.findMany.mock.calls[0][0];
+      expect(findManyCall.where.category).toBe(OrderCategory.JASA);
+    });
+
+    it('should include new dimensions in each listed order', async () => {
+      const ordersWithRelations = [
+        { ...mockOrder, fulfillment: FulfillmentType.PREORDER, participantMode: ParticipantMode.GROUP, category: OrderCategory.FISIK, buyer: { username: 'b', fullName: 'B', avatarUrl: null }, seller: { username: 's', fullName: 'S', avatarUrl: null } },
+      ];
+      mockPrisma.order.findMany.mockResolvedValue(ordersWithRelations);
+
+      const result = await service.getOrders('user-db-1', 1, 10) as {
+        orders: Array<{ fulfillment: FulfillmentType; participantMode: ParticipantMode; category: OrderCategory }>;
+      };
+
+      expect(result.orders[0].fulfillment).toBe(FulfillmentType.PREORDER);
+      expect(result.orders[0].participantMode).toBe(ParticipantMode.GROUP);
+      expect(result.orders[0].category).toBe(OrderCategory.FISIK);
+    });
+
+    it('rejects invalid new dimension filters', async () => {
+      await expect(
+        service.getOrders('user-db-1', 1, 10, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'BOGUS' as FulfillmentType),
+      ).rejects.toThrow(BadRequestException);
+      await expect(
+        service.getOrders('user-db-1', 1, 10, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'BOGUS' as ParticipantMode),
+      ).rejects.toThrow(BadRequestException);
+      await expect(
+        service.getOrders('user-db-1', 1, 10, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'BOGUS' as OrderCategory),
       ).rejects.toThrow(BadRequestException);
       expect(mockPrisma.order.findMany).not.toHaveBeenCalled();
     });

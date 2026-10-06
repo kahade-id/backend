@@ -1,6 +1,6 @@
 import { IsOptional, IsEnum, IsString, IsInt, Min, Max, IsDateString } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
-import { OrderStatus, OrderKind } from '@prisma/client';
+import { OrderStatus, OrderKind, FulfillmentType, ParticipantMode, OrderCategory } from '@prisma/client';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 
 export class GetOrdersQueryDto {
@@ -59,9 +59,27 @@ export class GetOrdersQueryDto {
   @IsEnum(['asc', 'desc'])
   sortOrder?: 'asc' | 'desc';
 
-  @ApiPropertyOptional({ description: 'Filter jenis transaksi escrow (POIN 2 2026-10-04)', enum: OrderKind })
+  @ApiPropertyOptional({ description: 'Filter jenis transaksi escrow (POIN 2 2026-10-04). DEPRECATED: pakai fulfillment/participantMode/category.', enum: OrderKind })
   @IsOptional()
   @Transform(({ value }: { value: unknown }) => typeof value === 'string' ? value.toUpperCase() : value)
   @IsEnum(OrderKind, { message: 'Invalid order kind filter' })
   kind?: OrderKind;
+
+  @ApiPropertyOptional({ description: 'Filter waktu pemenuhan (TX-UNIFIED-V2)', enum: FulfillmentType })
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => typeof value === 'string' ? value.toUpperCase() : value)
+  @IsEnum(FulfillmentType, { message: 'Invalid fulfillment filter' })
+  fulfillment?: FulfillmentType;
+
+  @ApiPropertyOptional({ description: 'Filter mode peserta (TX-UNIFIED-V2)', enum: ParticipantMode })
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => typeof value === 'string' ? value.toUpperCase() : value)
+  @IsEnum(ParticipantMode, { message: 'Invalid participantMode filter' })
+  participantMode?: ParticipantMode;
+
+  @ApiPropertyOptional({ description: 'Filter kategori (TX-UNIFIED-V2)', enum: OrderCategory })
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => typeof value === 'string' ? value.toUpperCase() : value)
+  @IsEnum(OrderCategory, { message: 'Invalid category filter' })
+  category?: OrderCategory;
 }

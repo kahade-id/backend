@@ -25,6 +25,9 @@ import {
   PatunganParticipantStatus,
   OrderStatus,
   OrderKind,
+  FulfillmentType,
+  ParticipantMode,
+  OrderCategory,
   OrderType,
   SlotBookingStatus,
 } from '@prisma/client';
@@ -97,6 +100,9 @@ describe('JastipService.createOrderFromParticipant', () => {
         counterpartUsername: 'host01',
         orderType: OrderType.PHYSICAL_GOODS,
         orderKind: OrderKind.JASTIP,
+        fulfillment: FulfillmentType.PREORDER,
+        participantMode: ParticipantMode.SINGLE,
+        category: OrderCategory.FISIK,
         orderValue: 125000,
       }),
     );
@@ -195,7 +201,7 @@ describe('PatunganService.createOrderFromParticipant', () => {
 
     expect(mockOrdersService.createOrder).toHaveBeenCalledWith(
       'user-1',
-      expect.objectContaining({ orderKind: OrderKind.PATUNGAN, orderValue: 50000, role: 'BUYER', counterpartUsername: 'host01' }),
+      expect.objectContaining({ orderKind: OrderKind.PATUNGAN, fulfillment: FulfillmentType.BIASA, participantMode: ParticipantMode.GROUP, category: OrderCategory.FISIK, orderValue: 50000, role: 'BUYER', counterpartUsername: 'host01' }),
     );
     expect(mockTx.patunganParticipant.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({ data: { orderId: 'db-order-2' } }),
@@ -304,6 +310,9 @@ describe('ServiceBookingService.bookAndCreateOrder', () => {
         counterpartUsername: 'seller01',
         orderType: OrderType.SERVICE,
         orderKind: OrderKind.SERVICE_BOOKING,
+        fulfillment: FulfillmentType.BIASA,
+        participantMode: ParticipantMode.SINGLE,
+        category: OrderCategory.JASA,
         orderValue: 50000,
       }),
     );

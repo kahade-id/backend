@@ -77,7 +77,7 @@ export class AdminOrdersService {
   }
 
   async listOrders(query: AdminOrderQueryDto): Promise<PaginatedResponse<Record<string, unknown>>> {
-    const { page = 1, limit = 20, status, kind, startDate, endDate, search, hasEscrow, sortBy, sortOrder } = query;
+    const { page = 1, limit = 20, status, kind, fulfillment, participantMode, category, startDate, endDate, search, hasEscrow, sortBy, sortOrder } = query;
     const safePage = Math.max(1, Math.trunc(Number.isFinite(page) ? page : 1));
     const safeLimit = Math.min(100, Math.max(1, Math.trunc(Number.isFinite(limit) ? limit : 20)));
     const skip = (safePage - 1) * safeLimit;
@@ -89,8 +89,20 @@ export class AdminOrdersService {
     }
 
     // POIN 2 (2026-10-04): filter jenis transaksi escrow.
+    // DEPRECATED (2026-10-06, TX-UNIFIED-V2): tetap didukung via kolom lama (dual-write).
     if (kind) {
       where.orderKind = kind;
+    }
+
+    // TX-UNIFIED-V2 (2026-10-06): filter 3 dimensi independen.
+    if (fulfillment) {
+      where.fulfillment = fulfillment;
+    }
+    if (participantMode) {
+      where.participantMode = participantMode;
+    }
+    if (category) {
+      where.category = category;
     }
 
     if (hasEscrow === true) {

@@ -52,7 +52,7 @@ export class ServiceBookingController {
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Post(':id/book-with-order')
   @HttpCode(200)
-  @ApiOperation({ summary: 'Buyer booking slot + buat escrow order (orderKind=SERVICE_BOOKING)' })
+  @ApiOperation({ summary: 'Buyer booking slot + buat escrow order (BIASA+SINGLE+JASA)' })
   bookWithOrder(
     @CurrentUser('sub') userId: string,
     @Param('id') id: string,

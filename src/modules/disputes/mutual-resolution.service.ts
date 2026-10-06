@@ -171,6 +171,8 @@ export class MutualResolutionService {
             sellerId: true,
             buyerPayAmount: true,
             sellerReceiveAmount: true,
+            buyerFeeAmount: true,
+            sellerFeeAmount: true,
             feeAmount: true,
             orderValue: true,
             isKahadePlus: true,
@@ -267,12 +269,29 @@ export class MutualResolutionService {
 
     const isPostCompletionDispute = dispute.order.completedAt !== null;
     const sellerReceiveAmount = dispute.order.sellerReceiveAmount;
-    const platformFee = isPostCompletionDispute
-      ? BigInt(0)
-      : dispute.order.buyerPayAmount - sellerReceiveAmount;
 
-    const buyerAmount = (sellerReceiveAmount * BigInt(proposal.buyerPercent)) / BigInt(100);
-    const sellerAmount = sellerReceiveAmount - buyerAmount;
+    // P1-1 (lanjutan): basis pembagian = dana aktual di escrow.
+    // Pra-completion: buyerPayAmount; masing-masing pihak menanggung beban
+    // fee-nya sendiri (buyerFeeAmount/sellerFeeAmount sesuai feeResponsibility),
+    // dikurangkan dari porsi kesepakatan mereka. Pasca-completion: fee sudah
+    // diambil platform saat disbursement, yang dibagi hanya sellerReceiveAmount.
+    let buyerAmount: bigint;
+    let sellerAmount: bigint;
+    let platformFee: bigint;
+    if (isPostCompletionDispute) {
+      platformFee = BigInt(0);
+      buyerAmount = (sellerReceiveAmount * BigInt(proposal.buyerPercent)) / BigInt(100);
+      sellerAmount = sellerReceiveAmount - buyerAmount;
+    } else {
+      const buyerPayAmount = dispute.order.buyerPayAmount;
+      buyerAmount =
+        (buyerPayAmount * BigInt(proposal.buyerPercent)) / BigInt(100) - dispute.order.buyerFeeAmount;
+      sellerAmount =
+        (buyerPayAmount * BigInt(proposal.sellerPercent)) / BigInt(100) - dispute.order.sellerFeeAmount;
+      if (buyerAmount < BigInt(0)) buyerAmount = BigInt(0);
+      if (sellerAmount < BigInt(0)) sellerAmount = BigInt(0);
+      platformFee = buyerPayAmount - buyerAmount - sellerAmount;
+    }
 
     // M3 (no-wallet): order dibayar via DANA-direct — accept mutual resolution
     // dieksekusi TANPA wallet: refund DANA ke buyer + disbursement ke bank seller.

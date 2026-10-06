@@ -269,7 +269,7 @@ export class AdminDisputesService implements OnModuleInit {
    * Perilaku keuangan TIDAK berubah: logika disalin verbatim dari resolve.
    */
   private computeDisbursementAmounts(
-    order: { buyerPayAmount: bigint; sellerReceiveAmount: bigint; completedAt: Date | null },
+    order: { buyerPayAmount: bigint; sellerReceiveAmount: bigint; buyerFeeAmount: bigint; completedAt: Date | null },
     decision: 'FULL_BUYER' | 'FULL_SELLER' | 'SPLIT',
     buyerPercent: number | undefined,
     sellerPercent: number | undefined,
@@ -302,22 +302,29 @@ export class AdminDisputesService implements OnModuleInit {
 
     // Kebijakan platform fee saat putusan FULL_BUYER (lihat
     // DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE di app.constants.ts):
-    // - false (default, perilaku saat ini): platform menahan fee — pembeli
-    //   menerima sellerReceiveAmount (nilai order), fee tidak ikut refund.
+    // - false (default, perilaku saat ini): platform menahan porsi fee yang
+    //   menjadi beban buyer (buyerFeeAmount) — pembeli menerima
+    //   buyerPayAmount - buyerFeeAmount. P1-1 fix: sebelumnya memakai
+    //   sellerReceiveAmount yang hanya benar bila feeResponsibility=BUYER;
+    //   bila fee dibayar seller/split, buyer menerima KURANG dari yang dibayar.
     // - true (rekomendasi, perlu keputusan produk): fee ikut refund — pembeli
     //   menerima buyerPayAmount penuh (escrowedAmount) saat transaksi batal
     //   total; platform tidak menahan fee untuk order ini.
     // Catatan: untuk sengketa pasca-completion, platformFee selalu 0 sehingga
-    // kedua cabang identik.
+    // kedua cabang identik (buyerAmount dibatasi escrowedAmount).
     if (decision === 'FULL_BUYER') {
       if (DISPUTE_FULL_BUYER_REFUNDS_PLATFORM_FEE) {
         buyerAmount = escrowedAmount;
         sellerAmount = BigInt(0);
         platformRetainAmount = BigInt(0);
       } else {
-        buyerAmount = sellerReceiveAmount;
+        // Refund = yang dibayar buyer dikurangi porsi fee yang memang beban
+        // buyer (0 bila feeResponsibility=SELLER). Dibatasi escrowedAmount
+        // untuk sengketa pasca-completion (dana sudah cair sebagian).
+        const fullRefund = order.buyerPayAmount - order.buyerFeeAmount;
+        buyerAmount = fullRefund > escrowedAmount ? escrowedAmount : fullRefund;
         sellerAmount = BigInt(0);
-        platformRetainAmount = platformFee;
+        platformRetainAmount = escrowedAmount - buyerAmount;
       }
     } else if (decision === 'FULL_SELLER') {
       buyerAmount = BigInt(0);

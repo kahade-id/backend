@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { encryptPii, decryptPiiSafe } from '../../common/utils/pii.util';
 // BAD-004: validasi IP whitelist Fonnte.
@@ -81,7 +81,7 @@ export class OpsSettingsService implements OnModuleInit, OnModuleDestroy {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly approvals: ApprovalsService,
+    @Optional() private readonly approvals: ApprovalsService | null,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -95,7 +95,9 @@ export class OpsSettingsService implements OnModuleInit, OnModuleDestroy {
     // keamanan yang cacat harus menggagalkan boot, bukan berjalan diam-diam.
     this.validateStartupConfig();
     // SEC-506: executor untuk OPS_SETTING_CHANGE yang disetujui dual control.
-    this.approvals.registerExecutor('OPS_SETTING_CHANGE', async (ctx) => {
+    // @Optional: tidak ada di graph smoke read-only (tidak butuh approvals di sana).
+    if (this.approvals) {
+      this.approvals.registerExecutor('OPS_SETTING_CHANGE', async (ctx) => {
       if (!ctx.targetId) {
         throw new Error('OPS_SETTING_CHANGE membutuhkan targetId (key setting)');
       }
@@ -107,7 +109,8 @@ export class OpsSettingsService implements OnModuleInit, OnModuleDestroy {
         throw new Error('OPS_SETTING_CHANGE membutuhkan payload.value (string)');
       }
       return this.set(ctx.targetId, payload.value, ctx.decidedBy);
-    });
+      });
+    }
   }
 
   /**

@@ -5,7 +5,7 @@ import { ActionLocationService, type ActionLocationContext } from '../action-loc
 import { RedisService } from '../../redis/redis.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { FeeCalculatorService } from './fee-calculator.service';
-import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, OrderKind, SubscriptionStatus, NotificationType, Prisma, Voucher, VoucherApplicability, VoucherType, CampaignStatus, ChatRoomType, PaymentPurpose, PaymentStatus } from '@prisma/client';
+import { OrderStatus, KycStatus, FeeResponsibility, DeadlineExtensionStatus, ActorType, OrderType, OrderKind, FulfillmentType, ParticipantMode, OrderCategory, SubscriptionStatus, NotificationType, Prisma, Voucher, VoucherApplicability, VoucherType, CampaignStatus, ChatRoomType, PaymentPurpose, PaymentStatus } from '@prisma/client';
 import { generateOrderId } from '../../common/utils/id-generator.util';
 import { toSen, toIdr, formatIdr, percentToBpsBigInt } from '../../common/utils/currency.util';
 import { safeBigIntToNumber } from '../../common/utils/bigint.util';
@@ -42,6 +42,24 @@ function toExcerpt(description: string | null | undefined): string {
 
 function getConfirmationDeadlineDays(orderType: OrderType): number {
   return CONFIRMATION_DEADLINE_DAYS_MAP[orderType] ?? CONFIRMATION_DEADLINE_DAYS;
+}
+
+/**
+ * TX-UNIFIED-V2 (P1-3): turunkan OrderCategory dari OrderType bila klien
+ * tidak mengisi category eksplisit. OTHER -> FISIK (tidak ada kategori
+ * LAINNYA di model baru; keputusan produk 2026-10-05).
+ */
+export function orderTypeToCategory(orderType: OrderType): OrderCategory {
+  switch (orderType) {
+    case OrderType.DIGITAL_GOODS:
+      return OrderCategory.DIGITAL;
+    case OrderType.SERVICE:
+      return OrderCategory.JASA;
+    case OrderType.PHYSICAL_GOODS:
+    case OrderType.OTHER:
+    default:
+      return OrderCategory.FISIK;
+  }
 }
 
 const ORDER_CREATE_MAX_RETRIES = 3;
@@ -275,6 +293,12 @@ export class OrdersService {
       // POIN 2 (2026-10-04): jenis transaksi escrow — opsional, default DIRECT.
       // Diisi JASTIP/PATUNGAN/SERVICE_BOOKING oleh endpoint create-order commerce.
       orderKind?: OrderKind;
+      // TX-UNIFIED-V2 (P1-3): 3 dimensi independen. Opsional — ada default.
+      fulfillment?: FulfillmentType;
+      participantMode?: ParticipantMode;
+      category?: OrderCategory;
+      // TX-UNIFIED-V2 (P1-3): estimasi tanggal fulfillment untuk PREORDER (ISO 8601).
+      preorderEstimatedDate?: string;
       orderValue: number;
       deliveryDeadlineDays: number;
       deliveryDeadlineAt?: string;
@@ -331,6 +355,12 @@ export class OrdersService {
       orderType: OrderType;
       // POIN 2 (2026-10-04): jenis transaksi escrow — opsional, default DIRECT.
       orderKind?: OrderKind;
+      // TX-UNIFIED-V2 (P1-3): 3 dimensi independen. Opsional — ada default.
+      fulfillment?: FulfillmentType;
+      participantMode?: ParticipantMode;
+      category?: OrderCategory;
+      // TX-UNIFIED-V2 (P1-3): estimasi tanggal fulfillment untuk PREORDER (ISO 8601).
+      preorderEstimatedDate?: string;
       orderValue: number;
       deliveryDeadlineDays: number;
       // T3 (audit 2026-09-26): tanggal kalender eksplisit, opsional.
@@ -401,6 +431,37 @@ export class OrdersService {
       }
       explicitDeliveryDeadlineAt = parsed;
     }
+
+    // TX-UNIFIED-V2 (P1-3): estimasi tanggal fulfillment untuk PREORDER.
+    // Pola sama seperti T3: parse WIB, harus valid & di masa depan.
+    // Tidak wajib diisi (default 30 hari dipakai saat pembayaran), tapi bila
+    // diisi harus valid agar tidak menyimpan tanggal basi/ngawur.
+    let explicitPreorderEstimatedDate: Date | null = null;
+    if (dto.preorderEstimatedDate !== undefined && dto.preorderEstimatedDate !== null && String(dto.preorderEstimatedDate).trim() !== '') {
+      const parsed = parseDateBoundaryWIB(String(dto.preorderEstimatedDate).trim(), 'end');
+      if (!parsed) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'preorderEstimatedDate must be a valid ISO 8601 date-time or YYYY-MM-DD calendar date',
+        });
+      }
+      const nowMs = Date.now();
+      // Estimasi harus di masa depan (minimal besok) dan wajar (maks 365 hari).
+      const minMs = nowMs + 24 * 60 * 60 * 1000;
+      const maxMs = nowMs + 365 * 24 * 60 * 60 * 1000;
+      if (parsed.getTime() < minMs || parsed.getTime() > maxMs) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'preorderEstimatedDate must be between tomorrow and 365 days from now',
+        });
+      }
+      explicitPreorderEstimatedDate = parsed;
+    }
+
+    // TX-UNIFIED-V2 (P1-3): turunkan category dari orderType bila tidak diisi eksplisit.
+    const resolvedCategory: OrderCategory = dto.category ?? orderTypeToCategory(dto.orderType);
+    const resolvedFulfillment: FulfillmentType = dto.fulfillment ?? FulfillmentType.BIASA;
+    const resolvedParticipantMode: ParticipantMode = dto.participantMode ?? ParticipantMode.SINGLE;
 
     const sanitizedTitle = (typeof dto.title === 'string' ? dto.title : '').replace(/[<>\"'&]/g, '').trim();
     const sanitizedDescription = (typeof dto.description === 'string' ? dto.description : '').replace(/[<>\"'&]/g, '').trim();
@@ -752,6 +813,12 @@ export class OrdersService {
               orderType: dto.orderType, orderValue: toSen(dto.orderValue),
               // POIN 2 (2026-10-04): jenis transaksi — default DIRECT bila tidak diisi.
               orderKind: dto.orderKind ?? OrderKind.DIRECT,
+              // TX-UNIFIED-V2 (P1-3): 3 dimensi independen (dual-write dengan orderKind).
+              fulfillment: resolvedFulfillment,
+              participantMode: resolvedParticipantMode,
+              category: resolvedCategory,
+              // TX-UNIFIED-V2 (P1-3): estimasi fulfillment preorder (null = pakai default 30 hari saat bayar).
+              preorderEstimatedDate: explicitPreorderEstimatedDate,
               feeAmount: txFeeCalc.feeAmount,
               feeResponsibility: dto.feeResponsibility,
               buyerFeeAmount: txFeeCalc.buyerFeeAmount,
@@ -1201,6 +1268,11 @@ export class OrdersService {
         paymentDeadlineAt: order.paymentDeadlineAt,
         confirmationDeadlineAt: order.confirmationDeadlineAt ?? null,
         processingDeadlineAt: order.processingDeadlineAt ?? null,
+        // TX-UNIFIED-V2 (P1-3): 3 dimensi + estimasi preorder.
+        fulfillment: order.fulfillment ?? 'BIASA',
+        participantMode: order.participantMode ?? 'SINGLE',
+        category: order.category ?? 'FISIK',
+        preorderEstimatedDate: order.preorderEstimatedDate ?? null,
         trackingNumber: order.trackingNumber, courierName: order.courierName,
         trackingNotes: order.trackingNotes ?? null,
         // TRX-009: alamat pengiriman snapshot (didekripsi) — penjual butuh ini
@@ -1760,6 +1832,93 @@ export class OrdersService {
         trackingNumber: result.trackingNumber,
       });
     } catch { /* never block shipping update */ }
+
+    return { orderId, ...result };
+  }
+
+  /**
+   * TX-UNIFIED-V2 (P1-3): seller mengubah estimasi tanggal fulfillment untuk
+   * order PREORDER — HANYA sebelum buyer membayar (WAITING_CONFIRMATION /
+   * WAITING_PAYMENT). Setelah dibayar, estimasi terkunci (pakai mekanisme
+   * OrderExtensionRequest untuk perubahan).
+   *
+   * Tercatat di OrderStatusHistory (timeline) dengan reason
+   * PREORDER_ESTIMATE_UPDATED + metadata old/new.
+   */
+  async updatePreorderEstimate(
+    orderId: string,
+    sellerId: string,
+    dto: { preorderEstimatedDate: string },
+  ): Promise<{ orderId: string; preorderEstimatedDate: Date | null }> {
+    const validStatuses: OrderStatus[] = [OrderStatus.WAITING_CONFIRMATION, OrderStatus.WAITING_PAYMENT];
+
+    // Validasi tanggal: harus valid & di masa depan (minimal besok, maks 365 hari).
+    const parsed = parseDateBoundaryWIB(String(dto.preorderEstimatedDate ?? '').trim(), 'end');
+    if (!parsed) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'preorderEstimatedDate must be a valid ISO 8601 date-time or YYYY-MM-DD calendar date',
+      });
+    }
+    const nowMs = Date.now();
+    const minMs = nowMs + 24 * 60 * 60 * 1000;
+    const maxMs = nowMs + 365 * 24 * 60 * 60 * 1000;
+    if (parsed.getTime() < minMs || parsed.getTime() > maxMs) {
+      throw new BadRequestException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'preorderEstimatedDate must be between tomorrow and 365 days from now',
+      });
+    }
+
+    const result = await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const order = await tx.order.findFirst({ where: { orderId, deletedAt: null } });
+      if (!order) throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order not found' });
+      if (order.sellerId !== sellerId) throw new ForbiddenException({ code: ErrorCodes.NOT_ORDER_PARTICIPANT, message: 'Only the seller can update the preorder estimate' });
+
+      if (!validStatuses.includes(order.status)) {
+        throw new BadRequestException({
+          code: ErrorCodes.INVALID_ORDER_STATUS,
+          message: 'Preorder estimate can only be updated before the buyer pays',
+        });
+      }
+      if (order.fulfillment !== FulfillmentType.PREORDER) {
+        throw new BadRequestException({
+          code: ErrorCodes.INVALID_ORDER_STATUS,
+          message: 'Preorder estimate is only applicable to PREORDER orders',
+        });
+      }
+
+      await tx.$queryRaw`SELECT id FROM orders WHERE id = ${order.id} FOR UPDATE`;
+      const freshOrder = await tx.order.findUnique({ where: { id: order.id } });
+      if (!freshOrder || !validStatuses.includes(freshOrder.status) || freshOrder.sellerId !== sellerId) {
+        throw new BadRequestException({ code: ErrorCodes.INVALID_ORDER_STATUS, message: 'Order is no longer available for estimate update' });
+      }
+
+      const oldEstimatedDate = freshOrder.preorderEstimatedDate;
+      const updated = await tx.order.updateMany({
+        where: { id: order.id, status: freshOrder.status },
+        data: { preorderEstimatedDate: parsed },
+      });
+      if (updated.count === 0) {
+        throw new ConflictException({ code: ErrorCodes.OPTIMISTIC_LOCK_CONFLICT, message: 'Order status has already changed' });
+      }
+
+      await tx.orderStatusHistory.create({
+        data: {
+          orderId: order.id,
+          fromStatus: freshOrder.status,
+          toStatus: freshOrder.status,
+          changedBy: sellerId,
+          changedByType: ActorType.SELLER,
+          reason: 'PREORDER_ESTIMATE_UPDATED',
+          metadata: {
+            oldEstimatedDate: oldEstimatedDate ? oldEstimatedDate.toISOString() : null,
+            newEstimatedDate: parsed.toISOString(),
+          },
+        },
+      });
+      return { preorderEstimatedDate: parsed };
+    }), 'UPDATE_PREORDER_ESTIMATE_TX');
 
     return { orderId, ...result };
   }

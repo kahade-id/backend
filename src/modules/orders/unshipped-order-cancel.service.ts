@@ -2,7 +2,7 @@ import { Injectable, Logger, NotFoundException, BadRequestException, ConflictExc
 import { OrderStatus, OrderCancelReason, DisputeStatus } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { OrderStateService } from './order-state.service';
-import { PROCESSING_DEADLINE_DAYS } from '../../common/constants/app.constants';
+import { PROCESSING_DEADLINE_DAYS, PREORDER_DEFAULT_DEADLINE_DAYS } from '../../common/constants/app.constants';
 import * as ErrorCodes from '../../common/constants/error-codes';
 
 /**
@@ -55,18 +55,36 @@ export class UnshippedOrderCancelService {
   /**
    * Kandidat sweep: PROCESSING + belum ada shipment (shippedAt NULL) +
    * melewati batas kirim + tanpa dispute berjalan.
+   *
+   * TX-UNIFIED-V2 (P1-3): PREORDER dikecualikan dari SLA 2 hari. Untuk order
+   * baru, processingDeadlineAt sudah = estimasi (atau paidAt+30 hari), jadi
+   * cabang utama bekerja otomatis. Cabang backfill legacy dibuat sadar
+   * fulfillment agar preorder lama tidak terbatal prematur.
    */
   async findDueUnshippedOrders(limit = 200, now: Date = new Date()) {
     const legacyCutoff = new Date(now.getTime() - UnshippedOrderCancelService.processingDeadlineMs());
+    const preorderLegacyCutoff = new Date(now.getTime() - PREORDER_DEFAULT_DEADLINE_DAYS * 24 * 3600_000);
     return this.prisma.order.findMany({
       where: {
         status: OrderStatus.PROCESSING,
         deletedAt: null,
         shippedAt: null,
         OR: [
-          { processingDeadlineAt: { lt: now } },
+          {
+            processingDeadlineAt: { lt: now },
+            // Guard eksplisit: PREORDER dengan estimasi di masa depan tidak
+            // boleh tersentuh walau processingDeadlineAt-nya anomali.
+            NOT: { fulfillment: 'PREORDER', preorderEstimatedDate: { gt: now } },
+          },
           // Backfill implisit: order lama yang processingDeadlineAt-nya NULL.
-          { processingDeadlineAt: null, paidAt: { lt: legacyCutoff } },
+          // P1-3: bedakan cutoff — PREORDER lama pakai 30 hari, bukan 2 hari.
+          {
+            processingDeadlineAt: null,
+            OR: [
+              { fulfillment: { not: 'PREORDER' }, paidAt: { lt: legacyCutoff } },
+              { fulfillment: 'PREORDER', paidAt: { lt: preorderLegacyCutoff } },
+            ],
+          },
         ],
         // Satu order maksimal satu dispute (orderId unique di Dispute).
         dispute: { isNot: { status: { in: OPEN_DISPUTE_STATUSES } } },
@@ -78,6 +96,8 @@ export class UnshippedOrderCancelService {
         buyerPayAmount: true,
         processingDeadlineAt: true,
         paidAt: true,
+        fulfillment: true,
+        preorderEstimatedDate: true,
       },
       orderBy: [{ processingDeadlineAt: 'asc' }, { paidAt: 'asc' }],
       take: limit,

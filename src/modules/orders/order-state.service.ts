@@ -8,7 +8,7 @@ import { ReferralService } from '../referral/referral.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { MembershipRankService } from './membership-rank.service';
 import { OrderStatus, OrderCancelReason, ActorType, WalletTransactionType, WalletTransactionStatus, SubscriptionStatus, NotificationType, Prisma, VoucherType, EscrowDisbursementScope, EscrowDisbursementStatus } from '@prisma/client';
-import { addDays, resolveDeliveryDeadlineAt } from '../../common/utils/date.util';
+import { addDays, resolveDeliveryDeadlineAt, resolveProcessingDeadlineAt } from '../../common/utils/date.util';
 import { rollbackOrderVoucherUsage } from '../../common/utils/voucher-rollback.util';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
 import { formatSen } from '../../common/utils/currency.util';
@@ -23,7 +23,7 @@ import { FeeCalculatorService } from './fee-calculator.service';
 import { NotificationQueueService } from '../queue/notification-queue.service';
 import { OrderQrisPaymentService } from '../payment/order-qris-payment.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
-import { PAYMENT_DEADLINE_DAYS, PROCESSING_DEADLINE_DAYS, MAX_ESCROW_BALANCE } from '../../common/constants/app.constants';
+import { PAYMENT_DEADLINE_DAYS, PROCESSING_DEADLINE_DAYS, PREORDER_DEFAULT_DEADLINE_DAYS, MAX_ESCROW_BALANCE } from '../../common/constants/app.constants';
 import { withSpan } from '../../common/tracing/tracing';
 // GAP-C (G176): aktivasi milestone setelah escrow lock — no-op untuk order
 // satu tahap existing.
@@ -531,7 +531,15 @@ export class OrderStateService {
           // T3: hormati tanggal eksplisit pilihan user bila masih di masa depan.
           deliveryDeadlineAt: resolveDeliveryDeadlineAt(order.deliveryDeadlineAt, order.deliveryDeadlineDays ?? 3),
           // Wave 3 P0: batas kirim penjual — dipakai sweep expire-unshipped-orders.
-          processingDeadlineAt: addDays(paidAt, PROCESSING_DEADLINE_DAYS),
+          // TX-UNIFIED-V2 (P1-3): PREORDER pakai estimasi (bukan 2 hari) agar
+          // preorder yang sah tidak terbatal otomatis oleh sweep.
+          processingDeadlineAt: resolveProcessingDeadlineAt(
+            order.fulfillment,
+            order.preorderEstimatedDate,
+            paidAt,
+            PROCESSING_DEADLINE_DAYS,
+            PREORDER_DEFAULT_DEADLINE_DAYS,
+          ),
         },
       });
       if (orderUpdated.count === 0) {

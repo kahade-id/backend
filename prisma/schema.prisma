@@ -73,6 +73,26 @@ enum OrderKind {
   SERVICE_BOOKING
 }
 
+/// TX-UNIFIED-V2 (P1-3, 2026-10-06) — 3 dimensi independen pengganti
+/// OrderKind flat. fulfillment = kapan dipenuhi (BIASA: ready stock,
+/// PREORDER: fulfill nanti, mis. jastip); participantMode = 1-by-1 atau
+/// 1-by-N (patungan); category = jenis barang/jasa.
+enum FulfillmentType {
+  BIASA
+  PREORDER
+}
+
+enum ParticipantMode {
+  SINGLE
+  GROUP
+}
+
+enum OrderCategory {
+  FISIK
+  DIGITAL
+  JASA
+}
+
 // --- BE-COMMERCE batch (2026-10-01): tipe produk & entitas commerce -----------
 /// Tipe produk untuk UserShowcase. Dipakai untuk validasi:
 /// resi/ongkir hanya FISIK (sudah ditegakkan di orders.updateShipping via
@@ -1916,6 +1936,15 @@ model Order {
   /// POIN 2 (2026-10-04): jenis transaksi escrow (bukan jenis barang).
   /// DIRECT = default (order normal, perilaku lama).
   orderKind   OrderKind @default(DIRECT)
+  /// TX-UNIFIED-V2 (P1-3, 2026-10-06): 3 dimensi independen. Dual-write
+  /// dengan orderKind selama transisi; orderKind dihapus di fase terpisah.
+  fulfillment     FulfillmentType @default(BIASA)
+  participantMode ParticipantMode @default(SINGLE)
+  category        OrderCategory   @default(FISIK)
+  /// TX-UNIFIED-V2 (P1-3): estimasi tanggal fulfillment untuk PREORDER
+  /// (mis. tanggal trip jastip). Dipakai sebagai processingDeadlineAt
+  /// agar sweep unshipped tidak membatalkan preorder yang sah.
+  preorderEstimatedDate DateTime?
 
   // Financial (in sen / IDR x 100)
   orderValue          BigInt
@@ -2049,6 +2078,7 @@ model Order {
   @@index([sellerId, status])
   @@index([buyerId, createdAt])
   @@index([sellerId, createdAt])
+  @@index([fulfillment]) // TX-UNIFIED-V2 (P1-3): filter fulfillment + sweep preorder
   @@index([voucherId]) // FK tanpa index = full table scan
   @@index([trackingNumber]) // admin lookup order via tracking number kurir
   @@index([status, deliveryDeadlineAt]) // auto-complete scheduler: WHERE status=IN_DELIVERY AND deliveryDeadlineAt < NOW()

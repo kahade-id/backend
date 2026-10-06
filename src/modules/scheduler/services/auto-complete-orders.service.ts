@@ -23,9 +23,10 @@ import { generateWalletTxId, generateNotifId } from '../../../common/utils/id-ge
 import { creditCashbackIfEligible, planDanaCashback, executeDanaCashback, CashbackCreditResult } from '../../../common/utils/cashback-credit.util';
 import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
 import { EscrowDisbursementService } from '../../no-wallet/escrow-disbursement.service';
+import { deriveDanaRefundNo } from '../../no-wallet/dana-direct-refund.service';
 import { alertMoneyCronSkippedRedisDown, ensureRedisAvailable } from '../../../common/utils/redis-health.util';
 import { toIdr, formatSen } from '../../../common/utils/currency.util';
-import { AUTO_COMPLETE_GRACE_PERIOD_HOURS } from '../../../common/constants/app.constants';
+import { AUTO_COMPLETE_GRACE_PERIOD_HOURS, DELIVERY_REVIEW_WINDOW_DAYS } from '../../../common/constants/app.constants';
 
 /*
  * Thrown inside the tx to roll it back while telling the caller this order was deferred
@@ -33,6 +34,14 @@ import { AUTO_COMPLETE_GRACE_PERIOD_HOURS } from '../../../common/constants/app.
  * counter and raise a false CRITICAL alert. Same idiom as ScheduledWithdrawalService.
  */
 const DEFER_PREFIX = 'DEFER_AUTO_COMPLETE:';
+
+/*
+ * P1-2 FIX: Batas waktu seller-abandoned. Order IN_DELIVERY tanpa proof sama
+ * sekali yang deadline-nya sudah lewat lebih dari 2x review window dianggap
+ * ditinggalkan seller → auto-cancel + auto-refund ke buyer agar dana tidak
+ * terkunci selamanya.
+ */
+const SELLER_ABANDONED_MULTIPLIER = 2;
 
 @Injectable()
 export class AutoCompleteDeliveredOrdersService {
@@ -201,8 +210,36 @@ export class AutoCompleteDeliveredOrdersService {
                         });
 
                         if (!rejectedProof) {
-                          this.logger.warn(
-                            `Skipping auto-complete for order ${order.orderId}: no delivery proof at all`,
+                          /*
+                           * P1-2 FIX: Order IN_DELIVERY tanpa proof sama sekali.
+                           * Sebelumnya: skip permanen tiap jam selamanya → dana terkunci tanpa batas.
+                           * Sekarang: jika deadline sudah lewat 2x review window tanpa proof apapun,
+                           * perlakukan sebagai seller-abandoned → auto-cancel + auto-refund ke buyer.
+                           */
+                          const abandonThreshold = new Date(
+                            now.getTime() -
+                              SELLER_ABANDONED_MULTIPLIER *
+                                DELIVERY_REVIEW_WINDOW_DAYS *
+                                24 *
+                                60 *
+                                60 *
+                                1000,
+                          );
+                          const deadline = freshOrder.deliveryDeadlineAt;
+                          if (deadline && deadline < abandonThreshold) {
+                            this.logger.error(
+                              `SELLER-ABANDONED: Order ${order.orderId} IN_DELIVERY tanpa proof ` +
+                                `sama sekali, deadline ${deadline.toISOString()} sudah lewat ` +
+                                `${SELLER_ABANDONED_MULTIPLIER}x review window. Auto-cancel + auto-refund ke buyer.`,
+                            );
+                            return await this.cancelAbandonedOrder(tx, order, now);
+                          }
+                          // Belum lewat threshold — tetap skip tapi dengan alert yang jelas
+                          // (bukan warn biasa) agar terpantau di monitoring.
+                          this.logger.error(
+                            `ALERT: Order ${order.orderId} IN_DELIVERY tanpa proof sama sekali ` +
+                              `(deadline: ${deadline?.toISOString() ?? 'null'}). ` +
+                              `Akan auto-refund jika tidak ada proof hingga ${abandonThreshold.toISOString()}.`,
                           );
                           return;
                         }
@@ -607,6 +644,64 @@ export class AutoCompleteDeliveredOrdersService {
               continue;
             }
 
+            if (outcome && 'abandonedRefunded' in outcome) {
+              // P1-2: notifikasi untuk seller-abandoned auto-refund.
+              const refundAmountIdr = formatSen(order.buyerPayAmount);
+              this.prisma.notification
+                .create({
+                  data: {
+                    notifId: generateNotifId(),
+                    userId: order.buyerId,
+                    type: NotificationType.ORDER_CANCELLED,
+                    category: getCategoryForType(NotificationType.ORDER_CANCELLED),
+                    title: 'Dana Dikembalikan',
+                    body: `Order "${order.title}" dibatalkan otomatis karena penjual tidak mengirim bukti pengiriman. ${refundAmountIdr} telah dikembalikan ke saldo Anda.`,
+                    isRead: false,
+                  },
+                })
+                .catch((notificationError: unknown) =>
+                  this.logger.warn(
+                    `silent-catch: abandoned-refund buyer notification failed: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`,
+                  ),
+                );
+              this.prisma.notification
+                .create({
+                  data: {
+                    notifId: generateNotifId(),
+                    userId: order.sellerId,
+                    type: NotificationType.ORDER_CANCELLED,
+                    category: getCategoryForType(NotificationType.ORDER_CANCELLED),
+                    title: 'Order Dibatalkan Otomatis',
+                    body: `Order "${order.title}" dibatalkan otomatis karena Anda tidak mengirim bukti pengiriman dalam batas waktu.`,
+                    isRead: false,
+                  },
+                })
+                .catch((notificationError: unknown) =>
+                  this.logger.warn(
+                    `silent-catch: abandoned-refund seller notification failed: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`,
+                  ),
+                );
+              this.runRealtimeBestEffort(
+                () =>
+                  this.prisma.emitNotificationCreated({
+                    userId: order.buyerId,
+                    title: 'Dana Dikembalikan',
+                    body: `Order "${order.title}" dibatalkan otomatis — ${refundAmountIdr} dikembalikan.`,
+                    data: { type: 'ORDER_CANCELLED', orderId: order.orderId },
+                  }),
+                `ABANDONED_REFUND_BUYER_NOTIFICATION orderId=${order.orderId}`,
+              );
+              // Clear failure counter — ini hasil yang diharapkan, bukan error.
+              await this.redis
+                .del(`auto_complete_failures:${order.id}`)
+                .catch(err =>
+                  this.logger.warn(
+                    `silent-catch: ${err instanceof Error ? err.message : String(err)}`,
+                  ),
+                );
+              continue;
+            }
+
             if (!outcome?.completed) continue;
 
             // SEC-101: eksekusi release escrow DANA post-commit untuk order
@@ -808,6 +903,150 @@ export class AutoCompleteDeliveredOrdersService {
           this.logger.warn(`silent-catch: ${err instanceof Error ? err.message : String(err)}`),
         );
     }
+  }
+
+  /*
+   * P1-2 FIX: Batalkan order yang ditinggalkan seller (IN_DELIVERY tanpa proof
+   * sama sekali setelah 2x review window) + refund escrow ke buyer.
+   *
+   * Dipanggil dari dalam transaksi serializable auto-complete. Mengembalikan
+   * marker agar outer scope bisa kirim notifikasi.
+   */
+  private async cancelAbandonedOrder(
+    tx: any,
+    order: {
+      id: string;
+      orderId: string;
+      buyerId: string;
+      sellerId: string;
+      buyerPayAmount: bigint;
+      title: string;
+    },
+    now: Date,
+  ): Promise<{ abandonedRefunded: boolean }> {
+    // Update status dengan guard optimistik — hanya dari IN_DELIVERY.
+    const updated = await tx.order.updateMany({
+      where: { id: order.id, status: OrderStatus.IN_DELIVERY, deletedAt: null },
+      data: {
+        status: OrderStatus.CANCELLED,
+        cancelledAt: now,
+        cancelReason: 'SELLER_ABANDONED',
+        cancelNote:
+          'Auto-cancel sistem: seller tidak mengirim bukti pengiriman sama sekali ' +
+          `setelah ${SELLER_ABANDONED_MULTIPLIER}x review window dari deadline. Dana dikembalikan ke buyer.`,
+      },
+    });
+    if (updated.count === 0) return { abandonedRefunded: true };
+
+    await tx.orderStatusHistory.create({
+      data: {
+        orderId: order.id,
+        fromStatus: OrderStatus.IN_DELIVERY,
+        toStatus: OrderStatus.CANCELLED,
+        changedBy: 'SYSTEM',
+        changedByType: ActorType.SYSTEM,
+        reason: 'Seller-abandoned: no delivery proof after 2x review window — auto-refund to buyer',
+      },
+    });
+
+    const walletEnabled = this.walletMode?.isWalletEnabled() ?? true;
+
+    if (walletEnabled) {
+      // Verifikasi escrow lock — pola yang sama dengan auto-complete release.
+      const escrowLock = await tx.walletTransaction.findFirst({
+        where: {
+          orderId: order.id,
+          type: WalletTransactionType.ORDER_LOCK,
+          status: WalletTransactionStatus.SUCCESS,
+        },
+        select: { amount: true },
+      });
+      if (!escrowLock || escrowLock.amount !== order.buyerPayAmount) {
+        throw new Error(
+          `ESCROW_LOCK_MISSING: abandoned-refund blocked for order ${order.orderId}`,
+        );
+      }
+
+      const walletLookup = await tx.wallet.findUnique({
+        where: { userId: order.buyerId },
+        select: { id: true },
+      });
+      if (!walletLookup) {
+        throw new Error(`Buyer wallet not found for abandoned refund: ${order.buyerId}`);
+      }
+
+      // Row lock sebelum baca saldo — pola C-05 dari adminCancelOrder.
+      await tx.$queryRaw`SELECT id FROM wallets WHERE id = ${walletLookup.id} FOR UPDATE`;
+
+      const buyerWallet = await tx.wallet.findUnique({ where: { id: walletLookup.id } });
+      if (!buyerWallet) {
+        throw new Error(`Buyer wallet not found after lock: ${order.buyerId}`);
+      }
+
+      const refundTxSerial = await this.walletTxSerialService.getNext();
+
+      const refunded = await tx.wallet.updateMany({
+        where: {
+          id: buyerWallet.id,
+          version: buyerWallet.version,
+          escrowBalance: { gte: order.buyerPayAmount },
+        },
+        data: {
+          escrowBalance: { decrement: order.buyerPayAmount },
+          availableBalance: { increment: order.buyerPayAmount },
+          version: { increment: 1 },
+        },
+      });
+      if (refunded.count === 0) {
+        throw new Error(`OCC conflict on buyer wallet for abandoned refund ${order.orderId}`);
+      }
+
+      const refundTxId = generateWalletTxId(refundTxSerial);
+      await tx.walletTransaction.create({
+        data: {
+          txId: refundTxId,
+          walletId: buyerWallet.id,
+          type: WalletTransactionType.ORDER_REFUND,
+          status: WalletTransactionStatus.SUCCESS,
+          amount: order.buyerPayAmount,
+          balanceBefore: buyerWallet.availableBalance,
+          balanceAfter: buyerWallet.availableBalance + order.buyerPayAmount,
+          orderId: order.id,
+          description: `Auto-refund for seller-abandoned order ${order.orderId} (no delivery proof)`,
+        },
+      });
+    } else {
+      // No-wallet mode: buat baris durable untuk DANA refund — pola SYS-B-205
+      // dari adminCancelOrder. Sweep dana-refund-retry akan mengeksekusi.
+      const danaPayment = await tx.paymentTransaction.findFirst({
+        where: { orderId: order.id, provider: 'DANA', status: 'SUCCESS' },
+        select: { id: true },
+      });
+      if (danaPayment) {
+        const attemptKey = `ORDER:${order.id}:ABANDONED`;
+        await tx.danaRefundAttempt.create({
+          data: {
+            idempotencyKey: attemptKey,
+            paymentTransactionId: danaPayment.id,
+            amountSen: order.buyerPayAmount,
+            partnerRefundNo: deriveDanaRefundNo(attemptKey),
+            reason: 'Seller-abandoned: no delivery proof after 2x review window',
+            status: 'PENDING',
+          },
+        });
+      }
+      // Jika tidak ada DANA payment record, order tetap CANCELLED;
+      // tidak ada dana yang perlu di-refund via DANA (edge case tercatat di log).
+      this.logger.warn(
+        `Abandoned order ${order.orderId} cancelled in no-wallet mode` +
+          (danaPayment ? ' — DANA refund queued.' : ' — no DANA payment found, nothing to refund via DANA.'),
+      );
+    }
+
+    this.logger.log(
+      `Seller-abandoned order ${order.orderId} auto-cancelled + refunded to buyer`,
+    );
+    return { abandonedRefunded: true };
   }
 
   private async withSerializableRetry<T>(operation: () => Promise<T>, label: string): Promise<T> {

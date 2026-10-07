@@ -186,26 +186,63 @@ export class ChunkedUploadService {
     return out.sort((a, b) => a - b);
   }
 
-  /** Sapu sesi kedaluwarsa — oportunistik & murah (satu readdir). */
+  /**
+   * Sapu sesi kedaluwarsa — oportunistik & murah (satu readdir).
+   *
+   * Bug #2 (disk penuh): sebelumnya sesi yang `manifest.json`-nya HILANG atau
+   * RUSAK dilewati selamanya (`catch {}`), padahal tanpa manifest sesi itu
+   * tidak mungkin di-resume klien (init/status/complete semuanya membaca
+   * manifest) — chunk-nya hanya menumpuk di disk sampai storage penuh, dan
+   * storage penuh itulah yang membuat upload berikutnya gagal/menggantung.
+   * Sekarang sesi tanpa manifest valid disapu memakai umur direktori (mtime)
+   * dengan TTL yang sama: setiap chunk yang masuk menulis ke direktori sesi,
+   * jadi sesi yang SEDANG diunggah selalu ber-mtime segar dan aman.
+   */
   private async sweepExpired(): Promise<void> {
     try {
       const entries = await fs.promises.readdir(this.stagingRoot(), { withFileTypes: true });
       const now = Date.now();
+      let swept = 0;
+      let leaked = 0;
       await Promise.all(
         entries
           .filter((e) => e.isDirectory() && SESSION_ID_RE.test(e.name))
           .map(async (e) => {
+            const dir = path.join(this.stagingRoot(), e.name);
+            let expired = false;
+            let hasValidManifest = false;
             try {
-              const raw = await fs.promises.readFile(path.join(this.stagingRoot(), e.name, 'manifest.json'), 'utf8');
+              const raw = await fs.promises.readFile(path.join(dir, 'manifest.json'), 'utf8');
               const manifest = JSON.parse(raw) as Partial<ChunkSessionManifest>;
-              if (manifest.expiresAt && now > new Date(manifest.expiresAt).getTime()) {
-                await this.destroySession(e.name);
+              const expiresMs = manifest.expiresAt ? new Date(manifest.expiresAt).getTime() : NaN;
+              if (Number.isFinite(expiresMs)) {
+                hasValidManifest = true;
+                expired = now > expiresMs;
               }
             } catch {
-              /* manifest rusak → biarkan; bukan sesi valid */
+              /* manifest hilang/rusak → jatuh ke umur direktori di bawah */
             }
+            if (!hasValidManifest) {
+              try {
+                const stat = await fs.promises.stat(dir);
+                if (now - stat.mtimeMs < CHUNK_SESSION_TTL_MS) return; // sesi masih hidup
+                expired = true;
+              } catch {
+                return; // direktori hilang — tidak ada yang perlu disapu
+              }
+            }
+            if (!expired) return;
+            await this.destroySession(e.name);
+            swept++;
+            if (!hasValidManifest) leaked++;
           }),
       );
+      if (swept > 0) {
+        this.logger.log(
+          `Chunk sweep: ${swept} sesi kedaluwarsa dihapus` +
+            (leaked > 0 ? ` (${leaked} tanpa manifest valid — potensi kebocoran disk)` : ''),
+        );
+      }
     } catch (e) {
       if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') {
         this.logger.warn(`Chunk sweep gagal: ${(e as Error).message}`);

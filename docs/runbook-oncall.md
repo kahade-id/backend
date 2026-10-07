@@ -111,6 +111,7 @@ Cari prefix log berikut (satu request = satu `requestId`):
 | `[chunked] complete mulai/rakit selesai/selesai/gagal` | jalur upload besar: pisahkan durasi rakit vs pemrosesan ffmpeg. |
 | `[storage] ... errno=ENOSPC capacity=true` atau respons `503 UPLOAD_STORAGE_UNAVAILABLE` | **disk/kuota penuh atau FS read-only** → SEV2: bebaskan ruang pada volume `STORAGE_PATH`, cek `df -h`; retry aman setelah ruang tersedia. |
 | `[chunked] tulis chunk gagal ... errno=` | kegagalan menulis staging (`<STORAGE_PATH>/.chunks`); `.part` sudah dibersihkan otomatis. |
+| `Chunk sweep: N sesi kedaluwarsa dihapus (M tanpa manifest valid)` | sapu oportunistik staging chunked (dipicu tiap `POST /v1/upload/chunked/init`). `M > 0` = sesi yatim yang dulu bocor permanen sampai disk penuh (upload "menggantung") — pantau pertumbuhannya, cek `df -h <STORAGE_PATH>` dan `du -sh <STORAGE_PATH>/.chunks`. |
 | `GET /v1/upload/s` mengembalikan `application/json` | regresi Bug #1 (payload biner ter-bungkus envelope). Bukan masalah data — periksa `ResponseTransformInterceptor`. |
 
 Catatan infra: Nginx harus memakai `client_max_body_size 115m` +

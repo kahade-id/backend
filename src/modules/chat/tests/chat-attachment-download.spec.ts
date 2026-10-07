@@ -266,6 +266,7 @@ describe('Bug #1 — lampiran chat bisa diunduh (upload → send → read → GE
   let app: INestApplication;
   let storageRoot: string;
   let fake: ReturnType<typeof makeFakePrisma>;
+  let realtime: Record<string, jest.Mock>;
   let jpeg: Buffer;
   let pdf: Buffer;
 
@@ -300,6 +301,18 @@ describe('Bug #1 — lampiran chat bisa diunduh (upload → send → read → GE
       'jwt.secret': SIGNING_SECRET.repeat(2),
     };
 
+    realtime = {
+      emitToChatRoom: jest.fn(),
+      emitToOrder: jest.fn(),
+      emitToUser: jest.fn(),
+      broadcastToRoom: jest.fn(),
+      notifyUser: jest.fn(),
+      areUsersOnline: jest.fn(async () => ({})),
+      isUserOnline: jest.fn(async () => false),
+      getLastSeen: jest.fn(async () => null),
+      getLastSeenMany: jest.fn(async () => ({})),
+    };
+
     const moduleRef = await Test.createTestingModule({
       controllers: [ChatController, UploadController],
       providers: [
@@ -310,12 +323,7 @@ describe('Bug #1 — lampiran chat bisa diunduh (upload → send → read → GE
         ChunkedUploadService,
         { provide: PrismaService, useValue: fake.prisma },
         { provide: RedisService, useValue: redis },
-        { provide: RealtimeService, useValue: {
-          emitToChatRoom: jest.fn(), emitToOrder: jest.fn(), emitToUser: jest.fn(),
-          broadcastToRoom: jest.fn(), notifyUser: jest.fn(), areUsersOnline: jest.fn(async () => ({})),
-          isUserOnline: jest.fn(async () => false), getLastSeen: jest.fn(async () => null),
-          getLastSeenMany: jest.fn(async () => ({})),
-        } },
+        { provide: RealtimeService, useValue: realtime },
         { provide: NotificationsService, useValue: { create: jest.fn(), isInAppEnabled: jest.fn(async () => true) } },
         { provide: VerificationBadgeService, useValue: { getSealTierMap: jest.fn(async () => new Map()) } },
         { provide: OrdersService, useValue: {} },
@@ -348,6 +356,12 @@ describe('Bug #1 — lampiran chat bisa diunduh (upload → send → read → GE
   afterAll(async () => {
     await app?.close();
     fs.rmSync(storageRoot, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    // Payload socket di-assert per test — bersihkan agar tidak tertukar
+    // dengan emit dari test sebelumnya.
+    for (const fn of Object.values(realtime)) fn.mockClear();
   });
 
   function dataOf<T>(body: unknown): T {
@@ -466,6 +480,107 @@ describe('Bug #1 — lampiran chat bisa diunduh (upload → send → read → GE
     expect(persisted).toBeDefined();
     expect(persisted!.fileUrl).toBe(uploaded.fileKey);
     expect(String(persisted!.fileUrl)).not.toContain('sig=');
+  });
+
+  it('jalur LIVE: respons kirim + payload socket berisi signed URL yang benar-benar bisa diunduh', async () => {
+    const upload = await request(app.getHttpServer())
+      .post(`/v1/chat/rooms/${ROOM_ID}/upload`)
+      .set(authHeader)
+      .attach('file', jpeg, { filename: 'live.jpg', contentType: 'image/jpeg' })
+      .expect(200);
+    const uploaded = dataOf<{ fileUrl: string }>(upload.body).fileUrl;
+
+    const send = await request(app.getHttpServer())
+      .post(`/v1/chat/rooms/${ROOM_ID}/messages`)
+      .set(authHeader)
+      .send({
+        messageType: 'IMAGE',
+        content: 'foto live',
+        attachments: [{ fileUrl: uploaded, fileName: 'live.jpg', fileSize: jpeg.length, mimeType: 'image/jpeg' }],
+      })
+      .expect(200);
+
+    // 1. Respons kirim: fileUrl harus signed URL absolut (bukan fileKey mentah).
+    const sentAttachment = dataOf<{ attachments: { fileUrl: string; urlExpiresAt: string | null }[] }>(send.body)
+      .attachments[0];
+    expect(sentAttachment.fileUrl.startsWith('uploads/')).toBe(false);
+    const sentUrl = assertSignedUrl(sentAttachment.fileUrl);
+    expect(sentUrl.searchParams.get('key')).toMatch(new RegExp(`^uploads/chat-attachments/${BUYER}/`));
+    expect(typeof sentAttachment.urlExpiresAt).toBe('string');
+
+    // 2. Payload socket ke penerima (chat.new_message) juga signed URL — inilah
+    //    yang dirender penerima SEBELUM membuka ulang daftar pesan.
+    const emitted = realtime.emitToUser.mock.calls.find(
+      ([userId, event]) => userId === SELLER && event === 'chat.new_message',
+    );
+    expect(emitted).toBeDefined();
+    const recipientPayload = emitted![2] as { attachments: { fileUrl: string; urlExpiresAt: string | null }[] };
+    const socketUrl = assertSignedUrl(recipientPayload.attachments[0].fileUrl);
+    expect(socketUrl.searchParams.get('key')).toBe(sentUrl.searchParams.get('key'));
+    expect(typeof recipientPayload.attachments[0].urlExpiresAt).toBe('string');
+
+    // 3. Broadcast netral ke room juga signed.
+    const broadcast = realtime.emitToChatRoom.mock.calls.find(([, event]) => event === 'chat.new_message');
+    expect(broadcast).toBeDefined();
+    const neutralPayload = broadcast![2] as { attachments: { fileUrl: string }[] };
+    assertSignedUrl(neutralPayload.attachments[0].fileUrl);
+
+    // 4. Dan URL dari payload LIVE benar-benar mengunduh byte yang sama.
+    const download = await request(app.getHttpServer())
+      .get(`/v1/upload/s?key=${encodeURIComponent(socketUrl.searchParams.get('key')!)}&exp=${socketUrl.searchParams.get('exp')}&sig=${socketUrl.searchParams.get('sig')}`)
+      .expect(200)
+      .buffer(true);
+    expect(download.headers['content-type']).toContain('image/jpeg');
+    expect(Buffer.isBuffer(download.body)).toBe(true);
+    expect(download.body.equals(jpeg)).toBe(true);
+  });
+
+  it('pesan yang di-EDIT/di-PIN/di-SEARCH juga mengembalikan signed URL (bukan fileKey mentah)', async () => {
+    const upload = await request(app.getHttpServer())
+      .post(`/v1/chat/rooms/${ROOM_ID}/upload`)
+      .set(authHeader)
+      .attach('file', jpeg, { filename: 'multi.jpg', contentType: 'image/jpeg' })
+      .expect(200);
+    const uploaded = dataOf<{ fileUrl: string }>(upload.body).fileUrl;
+
+    const send = await request(app.getHttpServer())
+      .post(`/v1/chat/rooms/${ROOM_ID}/messages`)
+      .set(authHeader)
+      .send({
+        messageType: 'IMAGE',
+        content: 'akan di-pin',
+        attachments: [{ fileUrl: uploaded, fileName: 'multi.jpg', fileSize: jpeg.length, mimeType: 'image/jpeg' }],
+      })
+      .expect(200);
+    const messageId = dataOf<{ id: string }>(send.body).id;
+
+    // Pin pesan → respons tidak boleh membocorkan fileKey mentah.
+    await request(app.getHttpServer())
+      .post(`/v1/chat/rooms/${ROOM_ID}/messages/${messageId}/pin`)
+      .set(authHeader)
+      .expect((res) => expect([200, 201]).toContain(res.status));
+
+    const pinned = await request(app.getHttpServer())
+      .get(`/v1/chat/rooms/${ROOM_ID}/pins`)
+      .set(authHeader)
+      .expect(200);
+    const pinnedMessages = dataOf<{ messages: { attachments: { fileUrl: string }[] }[] }>(pinned.body).messages;
+    expect(pinnedMessages.length).toBeGreaterThan(0);
+    for (const msg of pinnedMessages) {
+      for (const att of msg.attachments ?? []) {
+        expect(att.fileUrl.startsWith('uploads/')).toBe(false);
+        assertSignedUrl(att.fileUrl);
+      }
+    }
+
+    // Pencarian pesan → idem.
+    const search = await request(app.getHttpServer())
+      .get(`/v1/chat/rooms/${ROOM_ID}/search?q=akan`)
+      .set(authHeader)
+      .expect(200);
+    const found = dataOf<{ messages: { attachments: { fileUrl: string }[] }[] }>(search.body).messages;
+    expect(found.length).toBeGreaterThan(0);
+    assertSignedUrl(found[0].attachments[0].fileUrl);
   });
 
   it('GET messages mengembalikan signed URL segar yang benar-benar bisa diunduh', async () => {

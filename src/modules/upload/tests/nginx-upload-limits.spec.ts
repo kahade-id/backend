@@ -15,67 +15,20 @@
  *   - guard multer SELALU < batas nginx (413 terstruktur dari aplikasi, bukan
  *     halaman HTML nginx).
  */
-import * as fs from 'fs';
-import * as path from 'path';
+import {
+  loadNginxConfigs,
+  parseSizeToBytes,
+  parseTimeToSeconds,
+  findLocationBlock,
+  directiveValue,
+} from './nginx-config-test.utils';
 import {
   CHAT_ATTACHMENT_MAX_BYTES,
   SHOWCASE_VIDEO_MAX_BYTES,
   UPLOAD_DIRECT_MULTER_MAX_BYTES,
 } from '../../../common/constants/app.constants';
 
-const REPO_ROOT = path.resolve(__dirname, '../../../..');
-const CONFIGS = ['nginx/nginx.conf', 'deploy/nginx.conf'].map((rel) => ({
-  rel,
-  content: fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8'),
-}));
-
-/** "115m" / "115M" → byte; "1m" → 1 MiB (nginx: m/k/g = MiB/KiB/GiB). */
-function parseSizeToBytes(raw: string): number {
-  const match = /^(\d+)\s*([kmg]?)$/i.exec(raw.trim());
-  if (!match) throw new Error(`Unrecognized nginx size: ${raw}`);
-  const value = Number(match[1]);
-  const unit = match[2].toLowerCase();
-  const factor = unit === 'k' ? 1024 : unit === 'm' ? 1024 * 1024 : unit === 'g' ? 1024 ** 3 : 1;
-  return value * factor;
-}
-
-function parseTimeToSeconds(raw: string): number {
-  const match = /^(\d+)\s*(ms|s|m|h)?$/i.exec(raw.trim());
-  if (!match) throw new Error(`Unrecognized nginx time: ${raw}`);
-  const value = Number(match[1]);
-  const unit = (match[2] ?? 's').toLowerCase();
-  if (unit === 'ms') return value / 1000;
-  if (unit === 's') return value;
-  if (unit === 'm') return value * 60;
-  return value * 3600;
-}
-
-/**
- * Cari blok `location <pattern> { ... }` dan kembalikan isinya (brace-aware,
- * mendukung blok bersarang seperti `location ~ \.(php)$ { return 403; }`).
- */
-function findLocationBlock(content: string, pattern: RegExp): string | null {
-  const lines = content.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    if (!pattern.test(lines[i])) continue;
-    let depth = 0;
-    const collected: string[] = [];
-    for (let j = i; j < lines.length; j++) {
-      const opens = (lines[j].match(/{/g) ?? []).length;
-      const closes = (lines[j].match(/}/g) ?? []).length;
-      collected.push(lines[j]);
-      depth += opens - closes;
-      if (depth === 0 && j > i) break;
-    }
-    return collected.join('\n');
-  }
-  return null;
-}
-
-function directiveValue(block: string, directive: string): string | null {
-  const match = new RegExp(`^\\s*${directive}\\s+([^;]+);`, 'm').exec(block);
-  return match ? match[1].trim() : null;
-}
+const CONFIGS = loadNginxConfigs();
 
 describe.each(CONFIGS)('Bug #2 — batas upload nginx ($rel)', ({ content }) => {
   it('route /v1/upload/ menerima video 100 MiB + margin dan men-stream ke upstream', () => {

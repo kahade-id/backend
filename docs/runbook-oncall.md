@@ -119,6 +119,24 @@ Catatan infra: Nginx harus memakai `client_max_body_size 115m` +
 lampiran chat) dengan `proxy_read_timeout ≥300s`, kalau tidak upload besar
 ditolak 413/504 sebelum sampai aplikasi (lihat `nginx/nginx.conf`).
 
+Catatan infra (Bug #2, asset publik): nginx hanya boleh menyerve prefix
+**publik** — daftar tunggalnya `PUBLIC_FOLDER_PREFIXES` di
+`src/modules/upload/upload.service.ts` (`avatars/`, `headers/`,
+`showcase-images/`, `showcase-videos/`). Kalau ada prefix publik yang lupa
+ditambahkan ke `nginx/nginx.conf`/`deploy/nginx.conf`, URL yang dikembalikan API
+jatuh ke catch-all `location ^~ /uploads/ { return 404; }` → **404 padahal upload
+sukses** (gejala: "video/foto gagal dimuat"). Prefix privat TIDAK boleh punya
+alias statis — berkasnya hanya lewat signed URL `GET /v1/upload/s?key=&exp=&sig=`.
+Invarian ini dijaga `src/modules/upload/tests/public-storage-serving.spec.ts`
+(termasuk path mount volume `storage_data` di `docker-compose.yml`, yang WAJIB
+ada karena service `api` berjalan `read_only` — tanpa volume itu semua upload
+gagal `EROFS`/`503 UPLOAD_STORAGE_UNAVAILABLE`).
+
+Saat mengubah lokasi berkas statis di nginx, jalankan
+`nginx -t` di server sebelum reload, dan verifikasi `curl -I` URL publik
+(`/uploads/showcase-videos/...`) mengembalikan `200` + `video/mp4` serta `206`
+untuk `Range: bytes=0-1023`.
+
 ## Triase cepat (15 menit)
 
 1. Buka `/v1/status` — status keseluruhan & komponen.

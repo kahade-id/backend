@@ -90,7 +90,7 @@ describe('storage publik: nginx ↔ compose ↔ aplikasi', () => {
     expect(STORAGE_ROOT).toBe('/var/www/kahade-storage');
   });
 
-  describe.each(loadNginxConfigs())('$rel', ({ content }) => {
+  describe.each(loadNginxConfigs())('$rel', ({ rel, content }) => {
     it('menyerve SETIAP prefix publik aplikasi, tidak kurang dan tidak lebih', () => {
       const served = uploadsPrefixLocations(content);
       expect([...served.keys()].sort()).toEqual([...PUBLIC_FOLDERS].sort());
@@ -135,6 +135,37 @@ describe('storage publik: nginx ↔ compose ↔ aplikasi', () => {
       for (const line of aliases) {
         expect(line.trim()).toMatch(/\/;$/);
       }
+    });
+
+    it('direktif storage/serve ditulis lengkap dengan ";" (proksi untuk nginx -t)', () => {
+      // Sandbox CI tidak punya biner nginx, jadi ini pengganti terdekat untuk
+      // error sintaks paling umum (direktif tanpa ";" → reload nginx gagal).
+      // Dibatasi ke direktif yang dipakai blok storage agar tidak salah
+      // menandai direktif multi-baris (mis. `log_format` yang dipecah kutip).
+      const mustTerminate = [
+        'alias',
+        'sendfile',
+        'tcp_nopush',
+        'expires',
+        'add_header',
+        'client_max_body_size',
+        'proxy_request_buffering',
+        'proxy_read_timeout',
+        'proxy_send_timeout',
+        'proxy_pass',
+        'return',
+      ];
+      const offenders: string[] = [];
+      content.split('\n').forEach((line, index) => {
+        const code = line.replace(/#.*$/, '').trim();
+        if (!code || code.endsWith(';') || code.endsWith('{') || code.endsWith('}')) return;
+        for (const directive of mustTerminate) {
+          if (new RegExp(`^${directive}\\b`).test(code)) {
+            offenders.push(`${rel}:${index + 1} → ${code}`);
+          }
+        }
+      });
+      expect(offenders).toEqual([]);
     });
   });
 

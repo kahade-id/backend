@@ -1,9 +1,31 @@
-import { Injectable, NestInterceptor, ExecutionContext, CallHandler } from '@nestjs/common';
+import { Injectable, NestInterceptor, ExecutionContext, CallHandler, StreamableFile } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { Observable } from 'rxjs';
 import { map } from 'rxjs/operators';
 import { Decimal } from '@prisma/client/runtime/library';
 import { ALLOW_RESPONSE_FIELDS_KEY } from '../decorators/allow-response-fields.decorator';
+
+/**
+ * Bug #1 (lampiran chat tidak bisa dilihat): payload BINER tidak boleh
+ * melewati serialisasi envelope JSON.
+ *
+ * `StreamableFile` menyimpan objeknya sebagai properti instance biasa
+ * (`options`, `stream`, `logger`, …) — `serializeBigInt()` yang menelusuri
+ * `for (const key in data)` mengubahnya menjadi POJO, sehingga Nest tidak lagi
+ * mengenalinya sebagai file dan mengirim `{"success":true,"data":{}}` dengan
+ * `Content-Type: application/json`.
+ *
+ * Gejala di produksi (GET /v1/upload/s untuk lampiran chat privat):
+ * - foto tampil kotak hitam/rusak (respons JSON, bukan byte gambar),
+ * - video "gagal dimuat" (bukan video),
+ * - PDF terbuka sebagai JSON,
+ * - `Content-Range`/`Accept-Ranges` ikut hilang karena body tidak pernah dialirkan.
+ */
+export function isBinaryResponsePayload(data: unknown): boolean {
+  if (data instanceof StreamableFile) return true;
+  if (Buffer.isBuffer(data) || data instanceof Uint8Array) return true;
+  return false;
+}
 
 /**
  * Standard API response envelope.
@@ -76,6 +98,13 @@ export class ResponseTransformInterceptor<T> implements NestInterceptor<T, ApiRe
 
     return next.handle().pipe(
       map((data): ApiResponse<T> => {
+        // Bug #1: file/biner (StreamableFile, Buffer) diteruskan APA ADANYA —
+        // Nest yang mengalirkan stream + Content-Type-nya. Membungkusnya ke
+        // envelope JSON merusak unduhan (lihat `isBinaryResponsePayload`).
+        if (isBinaryResponsePayload(data)) {
+          return data as unknown as ApiResponse<T>;
+        }
+
         const serializedData = this.serializeBigInt(data, allowSet);
 
         if (serializedData && typeof serializedData === 'object' && 'success' in serializedData) {

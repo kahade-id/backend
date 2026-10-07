@@ -132,6 +132,15 @@ Invarian ini dijaga `src/modules/upload/tests/public-storage-serving.spec.ts`
 ada karena service `api` berjalan `read_only` — tanpa volume itu semua upload
 gagal `EROFS`/`503 UPLOAD_STORAGE_UNAVAILABLE`).
 
+Catatan volume: `storage_data` adalah named volume — untuk deployment yang
+berkasnya harus terlihat oleh nginx HOST (`deploy/nginx.conf` memakai
+`/var/www/kahade-storage`), ganti mount di service `api`/`nginx` menjadi bind
+mount (`- /var/www/kahade-storage:/var/www/kahade-storage[:ro]`) dan pastikan UID
+container `api` (`app`, **uid 1001** sesuai `Dockerfile`) punya izin tulis di
+direktori host itu, mis. `chown -R 1001:1001 /var/www/kahade-storage`. Mengganti `STORAGE_PATH` berarti
+memperbarui KETIGA tempat: mount `api`, mount `nginx`, dan alias di
+`nginx/nginx.conf`.
+
 Saat mengubah lokasi berkas statis di nginx, jalankan
 `nginx -t` di server sebelum reload, dan verifikasi `curl -I` URL publik
 (`/uploads/showcase-videos/...`) mengembalikan `200` + `video/mp4` serta `206`

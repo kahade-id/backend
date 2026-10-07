@@ -1,4 +1,4 @@
-import { IsOptional, IsInt, Min, Max } from 'class-validator';
+import { IsOptional, IsInt, IsString, MaxLength, Min, Max } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -17,6 +17,20 @@ export class PaginationDto {
   @Min(1)
   @Max(100)
   limit?: number = 20;
+}
+
+/**
+ * 2026-10-07: Pagination + keyset cursor (NP-008).
+ * Bug fix: endpoint yang memakai `@Query() PaginationDto` + `@Query('cursor')`
+ * terpisah ditolak 422 "property cursor should not exist" karena
+ * forbidNonWhitelisted. DTO ini menggabungkan keduanya.
+ */
+export class CursorPaginationDto extends PaginationDto {
+  @ApiPropertyOptional({ description: 'Keyset cursor dari nextCursor respons sebelumnya' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  cursor?: string;
 }
 
 export interface PaginatedResponse<T> {

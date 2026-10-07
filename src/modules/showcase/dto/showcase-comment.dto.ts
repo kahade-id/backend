@@ -53,3 +53,24 @@ export class DeleteCommentDto {
   @MaxLength(500)
   reason?: string;
 }
+
+/**
+ * 2026-10-07: DTO untuk GET /v1/showcase/:showcaseId/comments.
+ * Bug: endpoint memakai `@Query() pagination: PaginationDto` + `@Query('sort')`
+ * terpisah. Karena global ValidationPipe `forbidNonWhitelisted: true`,
+ * query `?sort=newest` ditolak 422 "property sort should not exist"
+ * (PaginationDto tidak punya field sort). DTO ini menggabungkan semuanya.
+ */
+import { PaginationDto } from '../../../common/dto/pagination.dto';
+export class ListShowcaseCommentsDto extends PaginationDto {
+  @ApiPropertyOptional({ description: 'Urutan komentar root: newest (default) atau oldest', enum: ['newest', 'oldest'] })
+  @IsOptional()
+  @IsIn(['newest', 'oldest'])
+  sort?: 'newest' | 'oldest';
+
+  @ApiPropertyOptional({ description: 'Keyset cursor dari nextCursor (NP-008)' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  cursor?: string;
+}

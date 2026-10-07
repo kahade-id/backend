@@ -12,10 +12,9 @@ import { Public } from '../../common/decorators/public.decorator';
 import { Idempotency } from '../../common/decorators/idempotency.decorator';
 import { UserThrottleGuard } from '../../common/guards/user-throttle.guard';
 import { ParseIdPipe } from '../../common/pipes/parse-id.pipe';
-import { ParseQueryStringPipe } from '../../common/pipes/parse-query-string.pipe';
-import { PaginationDto } from '../../common/dto/pagination.dto';
+import { CursorPaginationDto, PaginationDto } from '../../common/dto/pagination.dto';
 import { ShowcaseFeedQueryDto } from './dto/showcase-feed-query.dto';
-import { CreateShowcaseCommentDto, DeleteCommentDto, ToggleCommentLikeDto, UpdateShowcaseCommentDto } from './dto/showcase-comment.dto';
+import { CreateShowcaseCommentDto, DeleteCommentDto, ListShowcaseCommentsDto, ToggleCommentLikeDto, UpdateShowcaseCommentDto } from './dto/showcase-comment.dto';
 import { ReportShowcaseDto } from './dto/report-showcase.dto';
 
 class SetCommentHiddenDto {
@@ -111,14 +110,13 @@ export class ShowcaseController {
   })
   async listSavedShowcases(
     @CurrentUser('sub') userId: string,
-    @Query() pagination: PaginationDto,
-    @Query('cursor', new ParseQueryStringPipe('cursor', 200)) cursor?: string,
+    @Query() query: CursorPaginationDto,
   ): Promise<object> {
     return this.showcaseService.listSavedShowcases(
       userId,
-      pagination.page ?? 1,
-      pagination.limit ?? 20,
-      cursor,
+      query.page ?? 1,
+      query.limit ?? 20,
+      query.cursor,
     );
   }
 
@@ -298,20 +296,18 @@ export class ShowcaseController {
   async listComments(
     @Param('showcaseId', ParseIdPipe) showcaseId: string,
     @CurrentUser('sub') viewerId: string | null,
-    @Query() pagination: PaginationDto,
-    @Query('sort', new ParseQueryStringPipe('sort', 10)) sort?: string,
-    @Query('cursor', new ParseQueryStringPipe('cursor', 200)) cursor?: string,
+    @Query() query: ListShowcaseCommentsDto,
   ): Promise<object> {
-    // Batch 139 BE-API1 (item 103): `sort=newest|oldest` (default `newest`).
-    // Nilai tak dikenal → `newest` (toleran, kontrak lama tak berubah).
-    const commentSort = sort === 'oldest' ? 'oldest' : 'newest';
+    // 2026-10-07: sort/cursor kini bagian dari DTO (bukan @Query terpisah)
+    // agar tidak ditolak 422 oleh forbidNonWhitelisted.
+    const commentSort = query.sort === 'oldest' ? 'oldest' : 'newest';
     return this.showcaseService.listComments(
       showcaseId,
       viewerId ?? undefined,
-      pagination.page ?? 1,
-      pagination.limit ?? 20,
+      query.page ?? 1,
+      query.limit ?? 20,
       commentSort,
-      cursor,
+      query.cursor,
     );
   }
 
@@ -399,15 +395,14 @@ export class ShowcaseController {
   async listLikers(
     @Param('showcaseId', ParseIdPipe) showcaseId: string,
     @CurrentUser('sub') viewerId: string | null,
-    @Query() pagination: PaginationDto,
-    @Query('cursor', new ParseQueryStringPipe('cursor', 200)) cursor?: string,
+    @Query() query: CursorPaginationDto,
   ): Promise<object> {
     return this.showcaseService.listLikers(
       showcaseId,
       viewerId ?? undefined,
-      pagination.page ?? 1,
-      pagination.limit ?? 20,
-      cursor,
+      query.page ?? 1,
+      query.limit ?? 20,
+      query.cursor,
     );
   }
 
@@ -424,15 +419,14 @@ export class ShowcaseController {
   async listSavers(
     @CurrentUser('sub') userId: string,
     @Param('showcaseId', ParseIdPipe) showcaseId: string,
-    @Query() pagination: PaginationDto,
-    @Query('cursor', new ParseQueryStringPipe('cursor', 200)) cursor?: string,
+    @Query() query: CursorPaginationDto,
   ): Promise<object> {
     return this.showcaseService.listSavers(
       userId,
       showcaseId,
-      pagination.page ?? 1,
-      pagination.limit ?? 20,
-      cursor,
+      query.page ?? 1,
+      query.limit ?? 20,
+      query.cursor,
     );
   }
 

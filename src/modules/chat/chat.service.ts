@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException, Logger, Optional, Inject, forwardRef, OnModuleInit, HttpException, HttpStatus } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { UploadService } from '../upload/upload.service';
+import { UploadService, isSafeFileKey } from '../upload/upload.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { SendMessageDto, UserChatMessageType } from './dto/send-message.dto';
@@ -1762,6 +1762,14 @@ export class ChatService implements OnModuleInit {
     }
 
     const validateStorageUrl = (rawUrl: string, label: string) => {
+      // 2026-10-07: terima fileKey mentah (uploads/...) untuk file private —
+      // normalizeAttachmentUrl kini menyimpan fileKey, bukan public URL.
+      if (typeof rawUrl === 'string' && rawUrl.startsWith('uploads/')) {
+        if (!isSafeFileKey(rawUrl)) {
+          throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `${label} must reference the platform storage` });
+        }
+        return;
+      }
       try {
         const parsed = new URL(rawUrl);
         if (parsed.protocol !== 'https:') throw new Error('not https');
@@ -1784,8 +1792,14 @@ export class ChatService implements OnModuleInit {
 
     const validateOwnership = (rawUrl: string, label: string) => {
       try {
-        const parsed = new URL(rawUrl);
-        const decodedPath = decodeURIComponent(parsed.pathname);
+        // 2026-10-07: dukung fileKey mentah (uploads/...) untuk file private.
+        let decodedPath: string;
+        if (typeof rawUrl === 'string' && rawUrl.startsWith('uploads/')) {
+          decodedPath = `/${rawUrl}`;
+        } else {
+          const parsed = new URL(rawUrl);
+          decodedPath = decodeURIComponent(parsed.pathname);
+        }
         if (/\.\./.test(decodedPath) || /\/\.\//.test(decodedPath)) {
           throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `${label} contains invalid path segments` });
         }

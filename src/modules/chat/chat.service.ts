@@ -1723,8 +1723,13 @@ export class ChatService implements OnModuleInit {
         if (segments.length !== 4 || segments[1] !== 'chat-attachments' || segments[2] !== userId) {
           throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `${label} does not belong to this user` });
         }
-        const storagePublicUrl = (this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads').replace(/\/+$/, '');
-        return `${storagePublicUrl}/${fileKey.slice('uploads/'.length)}`;
+        // 2026-10-07: JANGAN ubah private file jadi public URL!
+        // `https://api.kahade.id/uploads/chat-attachments/...` tidak bisa diakses
+        // (nginx hanya serve folder publik). Simpan fileKey mentah
+        // (`uploads/chat-attachments/...`) — `extractChatFileKey` sudah mendukung
+        // format ini, dan `toReadableAttachment` akan generate signed URL segar
+        // saat dibaca.
+        return fileKey;
       }
     } catch (e) {
       if (e instanceof BadRequestException) throw e;

@@ -1318,7 +1318,14 @@ export class UploadService {
     imageBuffer?: Buffer,
   ): Promise<DirectUploadResult> {
     const redisKey = `confirmed_upload:${userId}:${fileKey}`;
-    await this.redis.setNx(redisKey, '1', CONFIRMED_KEY_TTL_SECONDS);
+    // 2026-10-07: fail-open bila Redis down — confirmed flag hanya optimasi
+    // untuk janitor orphan-cleanup, bukan syarat kebenaran upload. Tanpa ini,
+    // Redis down = file sudah tersimpan tapi user dapat 500 + file yatim.
+    try {
+      await this.redis.setNx(redisKey, '1', CONFIRMED_KEY_TTL_SECONDS);
+    } catch (err) {
+      this.logger.warn(`Redis setNx failed for ${redisKey} — continuing upload (fail-open): ${err instanceof Error ? err.message : String(err)}`);
+    }
 
     // Batch 19 TIM A (item 1): SHOWCASE_VIDEO — validasi durasi + thumbnail.
     // Fail closed: video yang tidak lolos dihapus dari storage dan upload

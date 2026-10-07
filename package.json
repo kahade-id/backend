@@ -31,7 +31,6 @@
     "postprisma:migrate": "sh scripts/run-constraints.sh"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.600.0",
     "@nest-lab/throttler-storage-redis": "^1.1.0",
     "@nestjs/bull": "^11.0.4",
     "@nestjs/common": "^11.1.17",

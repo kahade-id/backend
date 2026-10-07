@@ -1673,6 +1673,16 @@ export class ChatService implements OnModuleInit {
   // Batch 1A (ST-004): ekstrak fileKey dari stable storage URL
   // (https://api.kahade.id/uploads/chat-attachments/<userId>/<file>)
   // atau dari raw key. Dipakai untuk normalisasi persist + signing saat baca.
+  //
+  // Bug #1 (residu, 2026-10-07): pesan LAMA (dipersist sebelum `0f3caee`)
+  // menyimpan **signed URL** hasil upload (`/v1/upload/s?key=&exp=&sig=`,
+  // kedaluwarsa 900s). Bentuk ini dulu jatuh ke cabang terakhir dan
+  // menghasilkan key palsu `uploads/v1/upload/s` → `generateDownloadUrl`
+  // melempar INVALID_FILE_TYPE → `toReadableAttachment` mengembalikan URL KOSONG
+  // sehingga foto/video/PDF lama tetap rusak meski endpoint unduh sudah
+  // diperbaiki. Di sini `key` diambil dari query (nilai DB milik server, bukan
+  // input klien) dan tetap divalidasi `isSafeFileKey`; otorisasi tetap dari
+  // `validateRoomAccess` di level controller.
   private extractChatFileKey(rawUrl: string): string | null {
     if (!rawUrl || typeof rawUrl !== 'string') return null;
     if (rawUrl.startsWith('uploads/')) return rawUrl;
@@ -1681,13 +1691,18 @@ export class ChatService implements OnModuleInit {
       const storagePublicUrl = this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads';
       const base = new URL(storagePublicUrl);
       if (parsed.hostname !== base.hostname) return null;
+      // Signed URL lampiran (legacy): ambil fileKey dari query.
+      if (parsed.pathname === '/v1/upload/s') {
+        const key = parsed.searchParams.get('key');
+        return key && isSafeFileKey(key) ? key : null;
+      }
       // pathname: /uploads/chat-attachments/<userId>/<file>
       const prefix = base.pathname.replace(/\/+$/, '');
       let rel = decodeURIComponent(parsed.pathname);
       if (prefix && rel.startsWith(prefix)) rel = rel.slice(prefix.length);
       rel = rel.replace(/^\/+/, '');
       if (!rel.startsWith('uploads/')) rel = `uploads/${rel}`;
-      return rel;
+      return isSafeFileKey(rel) ? rel : null;
     } catch {
       return null;
     }
@@ -1711,11 +1726,20 @@ export class ChatService implements OnModuleInit {
           throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `${label} cannot be verified (storage unavailable)` });
         }
         const params = parsed.searchParams;
-        const fileKey = this.uploadService.verifySignedDownload(
+        const verifiedKey = this.uploadService.verifySignedDownload(
           params.get('key') || '',
           params.get('exp') || '',
           params.get('sig') || '',
         );
+        // Bug #1 (residu): upload besar bisa memakan waktu > TTL signed URL
+        // (900s) di jaringan seluler, sehingga klien mengirim balik signed URL
+        // yang SUDAH kedaluwarsa — dulu ditolak 400 dan pesan gagal terkirim.
+        // Fallback: pakai `key` dari query dengan tingkat kepercayaan yang SAMA
+        // seperti klien mengirim raw fileKey (jalur yang sudah didukung DTO):
+        // `validateStorageUrl` + `validateOwnership` di bawah tetap mewajibkan
+        // folder chat-attachments milik user pengirim.
+        const fileKey = verifiedKey
+          || (isSafeFileKey(params.get('key') || '') ? (params.get('key') as string) : null);
         if (!fileKey) {
           throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `${label} has an invalid or expired signature` });
         }

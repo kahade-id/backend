@@ -19,6 +19,7 @@ import * as os from 'os';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
+import { resolveStorageDir } from '../../common/utils/storage-error.util';
 
 export type CheckStatus = 'ok' | 'down';
 
@@ -147,12 +148,13 @@ export class SyntheticService {
 /**
  * Direktori storage untuk probe sintetis — HARUS sama dengan yang dipakai
  * aplikasi (`STORAGE_PATH`), karena itu volume tempat upload nyata ditulis.
+ * Implementasi dibagi dengan indikator disk `/v1/health` (lihat
+ * `common/utils/storage-error.util`).
  */
-export function resolveStorageDirForProbe(): string {
-  return process.env.STORAGE_PATH || process.env.UPLOAD_DIR || '/var/www/kahade-storage';
-}
+export const resolveStorageDirForProbe = resolveStorageDir;
 
 /** Direktori storage temp default bila env tidak diset (untuk smoke test). */
 export function defaultStorageDir(): string {
   return process.env.STORAGE_PATH || process.env.UPLOAD_DIR || path.join(os.tmpdir(), 'kahade-storage');
 }
+

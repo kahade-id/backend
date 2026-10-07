@@ -42,3 +42,21 @@ export function describeStorageError(error: unknown): StorageErrorInfo {
 /** Pesan user-facing untuk kegagalan penyimpanan server-side (Indonesia). */
 export const STORAGE_UNAVAILABLE_MESSAGE =
   'Penyimpanan server sedang bermasalah atau penuh. File Anda tidak tersimpan — silakan coba lagi beberapa saat lagi.';
+
+/** Direktori storage default bila env tidak diset. */
+export const DEFAULT_STORAGE_DIR = '/var/www/kahade-storage';
+
+/**
+ * Direktori penyimpanan upload yang SEDANG dipakai aplikasi
+ * (`src/config/app.config.ts`: `STORAGE_PATH || '/var/www/kahade-storage'`).
+ *
+ * Bug #2: dipakai bersama oleh probe sintetis (`/v1/health/synthetic`) dan
+ * indikator disk `/v1/health` supaya KEDUANYA memeriksa volume yang sama
+ * dengan tempat upload ditulis — bukan `/` atau `UPLOAD_DIR` yang bisa
+ * menunjuk filesystem berbeda (disk penuh di volume storage dulu tidak
+ * terdeteksi sama sekali). `UPLOAD_DIR` dihormati sebagai override
+ * operasional.
+ */
+export function resolveStorageDir(): string {
+  return process.env.STORAGE_PATH || process.env.UPLOAD_DIR || DEFAULT_STORAGE_DIR;
+}

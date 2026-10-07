@@ -105,7 +105,15 @@ export class SyntheticService {
 
   private async checkStorage(): Promise<SyntheticCheck> {
     const started = Date.now();
-    const dir = process.env.UPLOAD_DIR || '/var/www/kahade-storage';
+    // Bug #2 (2026-10-07): aplikasi menulis upload ke `STORAGE_PATH`
+    // (app.config: `process.env.STORAGE_PATH || '/var/www/kahade-storage'`),
+    // tetapi probe ini dulu memakai `UPLOAD_DIR`. Bila deploy memindahkan
+    // storage ke volume lain (mis. /mnt/data), probe memeriksa direktori yang
+    // SALAH dan bisa melaporkan "storage ok" padahal upload nyata gagal
+    // (disk penuh/FS read-only di volume yang benar). Urutan prioritas kini
+    // sama dengan aplikasi; `UPLOAD_DIR` tetap dihormati sebagai override
+    // operasional.
+    const dir = resolveStorageDirForProbe();
     const fileName = `synthetic-${randomUUID()}.tmp`;
     const filePath = path.join(dir, fileName);
     const payload = `synthetic-check ${new Date().toISOString()}`;
@@ -121,9 +129,14 @@ export class SyntheticService {
       );
       return { name: 'storage', status: 'ok', latencyMs: Date.now() - started, detail: `dir=${dir}` };
     } catch (err) {
+      const errno = (err as NodeJS.ErrnoException)?.code;
       return {
-        name: 'storage', status: 'down', latencyMs: Date.now() - started,
-        detail: err instanceof Error ? err.name : 'unknown',
+        name: 'storage',
+        status: 'down',
+        latencyMs: Date.now() - started,
+        // errno penting untuk insiden disk penuh (ENOSPC/EDQUOT) — nama error
+        // saja ("Error") tidak memberi sinyal apa pun.
+        detail: `${err instanceof Error ? err.name : 'unknown'}${errno ? ` (${errno})` : ''} dir=${dir}`,
       };
     } finally {
       await fs.promises.unlink(filePath).catch(() => undefined);
@@ -131,7 +144,15 @@ export class SyntheticService {
   }
 }
 
+/**
+ * Direktori storage untuk probe sintetis — HARUS sama dengan yang dipakai
+ * aplikasi (`STORAGE_PATH`), karena itu volume tempat upload nyata ditulis.
+ */
+export function resolveStorageDirForProbe(): string {
+  return process.env.STORAGE_PATH || process.env.UPLOAD_DIR || '/var/www/kahade-storage';
+}
+
 /** Direktori storage temp default bila env tidak diset (untuk smoke test). */
 export function defaultStorageDir(): string {
-  return process.env.UPLOAD_DIR || path.join(os.tmpdir(), 'kahade-storage');
+  return process.env.STORAGE_PATH || process.env.UPLOAD_DIR || path.join(os.tmpdir(), 'kahade-storage');
 }

@@ -6,15 +6,21 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { pipeline } from 'stream/promises';
 import { UploadPurpose } from './dto/presigned-url.dto';
 import { InitChunkedUploadDto } from './dto/chunked-upload.dto';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { ALLOWED_CONTENT_TYPES, DirectUploadResult, MAX_FILE_SIZE, UploadService, fileTooLargeException } from './upload.service';
+import {
+  STORAGE_UNAVAILABLE_MESSAGE,
+  describeStorageError,
+} from '../../common/utils/storage-error.util';
 
 /**
  * NP-006 (perf-fix, 2026-09-29): upload chunked/resumable SEJATI untuk file
@@ -96,6 +102,15 @@ export class ChunkedUploadService {
   ) {
     this.storageRoot =
       this.configService.get<string>('app.storagePath') || '/var/www/kahade-storage';
+  }
+
+  /**
+   * Seam test: pembuatan write-stream rakitan. Test menimpanya untuk
+   * mensimulasikan disk penuh (ENOSPC) saat merakit file — `fs.createWriteStream`
+   * tidak bisa di-spy langsung di Node 22 (properti modul non-configurable).
+   */
+  protected createWriteStream(targetPath: string): fs.WriteStream {
+    return fs.createWriteStream(targetPath);
   }
 
   private stagingRoot(): string {
@@ -304,8 +319,26 @@ export class ChunkedUploadService {
     // Tulis atomik: .part lalu rename — pembaca `status`/`complete` tidak
     // pernah melihat chunk setengah tertulis.
     const tmp = `${dest}.part`;
-    await fs.promises.writeFile(tmp, chunk.buffer);
-    await fs.promises.rename(tmp, dest);
+    try {
+      await fs.promises.writeFile(tmp, chunk.buffer);
+      await fs.promises.rename(tmp, dest);
+    } catch (err) {
+      // Bug #2: disk/staging penuh (atau FS read-only) harus terlihat sebagai
+      // insiden SERVER di log + respons (503 + kode sendiri), bukan 500 tanpa
+      // jejak atau error mentah. Sisa `.part` dibersihkan agar tidak menumpuk.
+      const info = describeStorageError(err);
+      await fs.promises.unlink(tmp).catch(() => undefined);
+      this.logger.error(
+        `[chunked] tulis chunk gagal session=${sessionId} index=${chunkIndex} errno=${info.errno ?? 'n/a'} capacity=${info.capacity} — ${(err as Error).message}`,
+      );
+      if (info.unavailable) {
+        throw new ServiceUnavailableException({
+          code: ErrorCodes.UPLOAD_STORAGE_UNAVAILABLE,
+          message: STORAGE_UNAVAILABLE_MESSAGE,
+        });
+      }
+      throw err;
+    }
     return this.status(userId, sessionId);
   }
 
@@ -354,21 +387,24 @@ export class ChunkedUploadService {
     );
     const assembledPath = path.join(this.sessionDir(sessionId), 'assembled.bin');
     try {
-      const out = fs.createWriteStream(assembledPath);
-      for (let i = 0; i < manifest.totalChunks; i++) {
-        const chunkFile = this.chunkPath(sessionId, i);
+      // Bug #2: pakai `pipeline` (bukan `input.pipe(out)` manual) — SEMUA stream
+      // selalu punya listener 'error', sehingga kegagalan tulis di tengah rakitan
+      // (mis. ENOSPC / disk penuh pada file ~100 MiB) menjadi rejection yang
+      // tertangani. Sebelumnya `out` tidak punya listener 'error' selama loop
+      // piping → unhandled 'error' event (proses Node bisa mati), dan upload
+      // tampak menggantung di "Memproses video...".
+      const out = this.createWriteStream(assembledPath);
+      try {
+        for (let i = 0; i < manifest.totalChunks; i++) {
+          await pipeline(fs.createReadStream(this.chunkPath(sessionId, i)), out, { end: false });
+        }
         await new Promise<void>((resolve, reject) => {
-          const input = fs.createReadStream(chunkFile);
-          input.on('error', reject);
-          input.on('end', resolve);
-          input.pipe(out, { end: false });
+          out.end((err?: Error | null) => (err ? reject(err) : resolve()));
         });
+      } catch (err) {
+        out.destroy();
+        throw err;
       }
-      await new Promise<void>((resolve, reject) => {
-        out.on('finish', resolve);
-        out.on('error', reject);
-        out.end();
-      });
       const stat = await fs.promises.stat(assembledPath);
       if (stat.size !== manifest.totalSize) {
         throw new BadRequestException({
@@ -395,10 +431,19 @@ export class ChunkedUploadService {
       );
       return result;
     } catch (err) {
+      const info = describeStorageError(err);
       this.logger.warn(
         `[chunked] complete gagal session=${sessionId} elapsed=${Date.now() - startedAt}ms ` +
-          `error=${(err as Error).message} — direktori sesi dibersihkan`,
+          `errno=${info.errno ?? 'n/a'} capacity=${info.capacity} error=${(err as Error).message} — direktori sesi dibersihkan`,
       );
+      // Disk penuh / FS read-only di tengah rakitan: insiden server, bukan input
+      // user → 503 dengan kode sendiri agar alerting & copy FE tepat.
+      if (info.unavailable) {
+        throw new ServiceUnavailableException({
+          code: ErrorCodes.UPLOAD_STORAGE_UNAVAILABLE,
+          message: STORAGE_UNAVAILABLE_MESSAGE,
+        });
+      }
       throw err;
     } finally {
       await this.destroySession(sessionId).catch(() => undefined);

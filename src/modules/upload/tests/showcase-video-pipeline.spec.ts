@@ -18,8 +18,10 @@ import { BadRequestException, InternalServerErrorException, Logger } from '@nest
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { createHash } from 'crypto';
 
 import { UploadService } from '../upload.service';
+import { ChunkedUploadService } from '../chunked-upload.service';
 import { LocalStorageService } from '../local-storage.service';
 import { VideoProcessingService } from '../video-processing.service';
 import { UploadPurpose } from '../dto/presigned-url.dto';
@@ -227,6 +229,112 @@ describe('Bug #2 — pipeline video showcase', () => {
       else process.env.FFPROBE_PATH = origProbe;
       harness.installEnv();
     }
+  });
+
+  it('video BESAR via chunked (3×4 MiB) → rakitan byte-identik, metadata+thumbnail, sesi bersih', async () => {
+    // "Test dengan video besar" (Bug #2): jalur produksi untuk video besar
+    // adalah chunked (init → chunk* → complete), bukan /upload/direct.
+    const CHUNK = 4 * 1024 * 1024;
+    const totalSize = 3 * CHUNK;
+    const video = Buffer.alloc(totalSize);
+    // Magic-byte mp4 valid + isi unik supaya hash perbandingan bermakna.
+    Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]).copy(video, 0);
+    for (let i = 12; i < totalSize; i += 4096) video[i] = (i / 4096) % 256;
+
+    const uploadService = makeService();
+    const chunked = new ChunkedUploadService(
+      { get: (key: string) => (key === 'app.storagePath' ? storageRoot : undefined) } as never,
+      uploadService,
+    );
+
+    const session = await chunked.initiate(USER_ID, {
+      purpose: UploadPurpose.SHOWCASE_VIDEO,
+      fileName: 'video-besar.mp4',
+      mimeType: 'video/mp4',
+      totalSize,
+      chunkSize: CHUNK,
+    });
+    expect(session.totalChunks).toBe(3);
+
+    for (let i = 0; i < session.totalChunks; i++) {
+      await chunked.uploadChunk(USER_ID, session.sessionId, i, {
+        buffer: video.subarray(i * CHUNK, (i + 1) * CHUNK),
+        size: CHUNK,
+      });
+    }
+
+    const status = await chunked.status(USER_ID, session.sessionId);
+    expect(status.received).toEqual([0, 1, 2]);
+
+    const result = await chunked.complete(USER_ID, session.sessionId);
+
+    // 1. Rakitan byte-identik dengan sumber (hash), tersimpan di folder showcase-videos.
+    const stored = fs.readFileSync(localStorage.resolvePath(result.fileKey));
+    expect(stored.length).toBe(totalSize);
+    expect(createHash('sha256').update(stored).digest('hex')).toBe(
+      createHash('sha256').update(video).digest('hex'),
+    );
+    // 2. Pipeline video tetap berjalan (metadata + thumbnail).
+    expect(result.durationSec).toBe(13);
+    expect(result.width).toBe(1280);
+    expect(result.thumbnailFileKey).toBeDefined();
+    // 3. Sesi chunk dibersihkan total: tidak ada chunk/rakitan/.part tersisa.
+    const chunksRoot = path.join(storageRoot, '.chunks');
+    const leftovers = fs.existsSync(chunksRoot)
+      ? fs
+          .readdirSync(chunksRoot)
+          .flatMap((d) => {
+            const dir = path.join(chunksRoot, d);
+            return fs.statSync(dir).isDirectory() ? fs.readdirSync(dir).map((f) => `${d}/${f}`) : [d];
+          })
+      : [];
+    expect(leftovers).toEqual([]);
+    // 4. Log tahap: rakit selesai (dengan byte + elapsed) lalu pipeline video selesai.
+    expect(logs.some((l) => l.includes('[chunked] complete mulai'))).toBe(true);
+    expect(logs.some((l) => l.includes('[chunked] complete rakit selesai') && l.includes(`bytes=${totalSize}`))).toBe(true);
+    expect(logs.some((l) => l.includes('[chunked] complete selesai') && l.includes('elapsed='))).toBe(true);
+    expect(logs.some((l) => l.includes('[showcase-video] selesai'))).toBe(true);
+  });
+
+  it('video KORUP via chunked → 400 VIDEO_UNPROCESSABLE, sesi & file dibersihkan', async () => {
+    harness.setMode('garbage'); // ffprobe mengembalikan sampah → bukan video
+    const CHUNK = 1024 * 1024;
+    const totalSize = 512 * 1024 + CHUNK; // 2 chunk (chunk terakhir parsial)
+    const corrupt = Buffer.alloc(totalSize, 0x42);
+    Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]).copy(corrupt, 0);
+
+    const uploadService = makeService();
+    const chunked = new ChunkedUploadService(
+      { get: (key: string) => (key === 'app.storagePath' ? storageRoot : undefined) } as never,
+      uploadService,
+    );
+    const session = await chunked.initiate(USER_ID, {
+      purpose: UploadPurpose.SHOWCASE_VIDEO,
+      fileName: 'korup.mp4',
+      mimeType: 'video/mp4',
+      totalSize,
+      chunkSize: CHUNK,
+    });
+    await chunked.uploadChunk(USER_ID, session.sessionId, 0, { buffer: corrupt.subarray(0, CHUNK), size: CHUNK });
+    await chunked.uploadChunk(USER_ID, session.sessionId, 1, {
+      buffer: corrupt.subarray(CHUNK),
+      size: totalSize - CHUNK,
+    });
+
+    const before = listVideoFiles();
+    let caught: unknown;
+    try {
+      await chunked.complete(USER_ID, session.sessionId);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(BadRequestException);
+    expect(errorCodeOf(caught)).toBe('VIDEO_UNPROCESSABLE');
+    // Fail-closed: tidak ada file yatim & sesi chunk dibersihkan.
+    expect(listVideoFiles()).toEqual(before);
+    const chunksRoot = path.join(storageRoot, '.chunks');
+    expect(fs.existsSync(chunksRoot) ? fs.readdirSync(chunksRoot) : []).toEqual([]);
+    expect(warns.some((l) => l.includes('[chunked] complete gagal'))).toBe(true);
   });
 
   it('Redis down saat setNx confirmed_upload → upload TETAP sukses (fail-open)', async () => {

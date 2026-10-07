@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, NotFoundException, Logger, ConflictException, InternalServerErrorException, PayloadTooLargeException } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, Logger, ConflictException, InternalServerErrorException, PayloadTooLargeException, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHash, createHmac, timingSafeEqual } from 'crypto';
 import { Readable } from 'stream';
@@ -24,6 +24,7 @@ import * as ErrorCodes from '../../common/constants/error-codes';
 import { withSpan } from '../../common/tracing/tracing';
 import { stripImageMetadata } from './utils/strip-image-metadata';
 import { parseHttpRange } from './utils/http-range';
+import { STORAGE_UNAVAILABLE_MESSAGE, describeStorageError } from '../../common/utils/storage-error.util';
 
 const nanoid = customAlphabet('1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ', 10);
 
@@ -1133,11 +1134,8 @@ export class UploadService {
       try {
         await this.localStorage.saveFile(fileKey, storedBuffer);
       } catch (error) {
-        this.logger.error(`Direct-from-path upload to local storage failed for key=${fileKey}`, error instanceof Error ? error.stack : error);
-        throw new BadRequestException({
-          code: ErrorCodes.UPLOAD_FAILED,
-          message: 'Failed to upload file to storage. Please try again.',
-        });
+        this.logUploadStorageFailure('direct-from-path', fileKey, error);
+        throw this.storageFailureException(error);
       }
       await fs.promises.unlink(sourcePath).catch(() => undefined);
       imageBuffer = fileBuffer;
@@ -1153,11 +1151,8 @@ export class UploadService {
           await fs.promises.copyFile(sourcePath, destPath);
           await fs.promises.unlink(sourcePath).catch(() => undefined);
         } else {
-          this.logger.error(`Direct-from-path move failed for key=${fileKey}`, (err as Error).stack);
-          throw new BadRequestException({
-            code: ErrorCodes.UPLOAD_FAILED,
-            message: 'Failed to upload file to storage. Please try again.',
-          });
+          this.logUploadStorageFailure('move', fileKey, err);
+          throw this.storageFailureException(err);
         }
       }
     }
@@ -1262,14 +1257,44 @@ export class UploadService {
     try {
       await this.localStorage.saveFile(fileKey, storedBuffer);
     } catch (error) {
-      this.logger.error(`Direct upload to local storage failed for key=${fileKey}`, error instanceof Error ? error.stack : error);
-      throw new BadRequestException({
-        code: ErrorCodes.UPLOAD_FAILED,
-        message: 'Failed to upload file to storage. Please try again.',
-      });
+      this.logUploadStorageFailure('direct', fileKey, error);
+      throw this.storageFailureException(error);
     }
 
     return this.finalizeDirectUpload(userId, purpose, fileKey, detectedMime, fileBuffer);
+  }
+
+  /**
+   * Bug #2 (2026-10-07): log kegagalan penyimpanan dengan errno + sinyal
+   * kapasitas supaya insiden disk penuh / FS read-only di
+   * /var/www/kahade-storage bisa didiagnosis & di-alert dari log produksi.
+   */
+  private logUploadStorageFailure(stage: string, fileKey: string, error: unknown): void {
+    const info = describeStorageError(error);
+    this.logger.error(
+      `[storage] ${stage} gagal fileKey=${fileKey} errno=${info.errno ?? 'n/a'} ` +
+        `capacity=${info.capacity} unavailable=${info.unavailable} — ${(error as Error).message}`,
+      error instanceof Error ? error.stack : undefined,
+    );
+  }
+
+  /**
+   * Kegagalan penyimpanan sisi server (disk penuh/kuota/FS read-only) → 503
+   * `UPLOAD_STORAGE_UNAVAILABLE` (retryable, memicu alert 5xx). Kegagalan lain
+   * (mis. bug kode) tetap 400 `UPLOAD_FAILED` seperti sebelumnya.
+   */
+  private storageFailureException(error: unknown): BadRequestException | ServiceUnavailableException {
+    const info = describeStorageError(error);
+    if (info.unavailable) {
+      return new ServiceUnavailableException({
+        code: ErrorCodes.UPLOAD_STORAGE_UNAVAILABLE,
+        message: STORAGE_UNAVAILABLE_MESSAGE,
+      });
+    }
+    return new BadRequestException({
+      code: ErrorCodes.UPLOAD_FAILED,
+      message: 'Failed to upload file to storage. Please try again.',
+    });
   }
 
   /**

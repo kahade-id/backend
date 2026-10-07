@@ -344,6 +344,14 @@ export class ChunkedUploadService {
         message: `Missing chunks: ${missing.slice(0, 10).join(',')}${missing.length > 10 ? '…' : ''}`,
       });
     }
+    // Bug #2 (video showcase "Memproses video..." menggantung): pisahkan durasi
+    // TAHAP RAKIT vs TAHAP PEMROSESAN (ffmpeg) di log supaya bottleneck terlihat
+    // — sebelumnya tidak ada satu pun log sampai pipeline selesai/gagal.
+    const startedAt = Date.now();
+    this.logger.log(
+      `[chunked] complete mulai session=${sessionId} purpose=${manifest.purpose} ` +
+        `size=${manifest.totalSize}B chunks=${manifest.totalChunks} user=${userId}`,
+    );
     const assembledPath = path.join(this.sessionDir(sessionId), 'assembled.bin');
     try {
       const out = fs.createWriteStream(assembledPath);
@@ -368,16 +376,30 @@ export class ChunkedUploadService {
           message: 'Assembled file size does not match declared totalSize',
         });
       }
+      this.logger.log(
+        `[chunked] complete rakit selesai session=${sessionId} bytes=${stat.size} elapsed=${Date.now() - startedAt}ms — mulai pipeline uploadDirectFromPath`,
+      );
       // UPV-03: JANGAN `readFile` (puncak RAM ~2× ukuran file: buffer rakitan
       // + buffer uploadDirect). `uploadDirectFromPath` memvalidasi dari disk
       // (stat + header magic-byte) lalu me-`rename` atomic ke lokasi final.
-      return await this.uploadService.uploadDirectFromPath(
+      const result = await this.uploadService.uploadDirectFromPath(
         userId,
         manifest.purpose,
         manifest.fileName,
         manifest.mimeType,
         assembledPath,
       );
+      this.logger.log(
+        `[chunked] complete selesai session=${sessionId} fileKey=${result.fileKey} ` +
+          `elapsed=${Date.now() - startedAt}ms (pemrosesan video termasuk di dalamnya)`,
+      );
+      return result;
+    } catch (err) {
+      this.logger.warn(
+        `[chunked] complete gagal session=${sessionId} elapsed=${Date.now() - startedAt}ms ` +
+          `error=${(err as Error).message} — direktori sesi dibersihkan`,
+      );
+      throw err;
     } finally {
       await this.destroySession(sessionId).catch(() => undefined);
     }

@@ -1347,6 +1347,7 @@ export class UploadService {
         purpose === UploadPurpose.DELIVERY_PROOF ||
         purpose === UploadPurpose.MILESTONE_EVIDENCE)
     ) {
+      this.logger.log(`[finalize] thumbnail video privat (best-effort) fileKey=${fileKey}`);
       chatVideoThumbMeta = await this.processChatVideoThumbnail(userId, fileKey).catch((err) => {
         this.logger.warn(`UPV-07: thumbnail video chat gagal untuk ${fileKey}: ${(err as Error).message}`);
         return undefined;
@@ -1391,12 +1392,33 @@ export class UploadService {
     userId: string,
     fileKey: string,
   ): Promise<Pick<DirectUploadResult, 'thumbnailFileKey' | 'thumbnailUrl' | 'durationSec' | 'width' | 'height'>> {
+    const startedAt = Date.now();
     const discardVideo = async (): Promise<void> => {
       await this.localStorage.deleteFile(fileKey).catch(() => undefined);
     };
 
+    /**
+     * Bug #2 (video showcase "Memproses video..." menggantung): logging
+     * berjenjang per tahap supaya status pipeline bisa dibaca dari log
+     * produksi tanpa mereproduksi upload — termasuk durasi tiap tahap
+     * (probe vs thumbnail) agar bottleneck terlihat.
+     */
+    const stage = (name: string, detail: string): void => {
+      this.logger.log(
+        `[showcase-video] ${name} fileKey=${fileKey} user=${userId} elapsed=${Date.now() - startedAt}ms ${detail}`,
+      );
+    };
+    let videoBytes: number | null = null;
+    try {
+      videoBytes = (await fs.promises.stat(this.localStorage.resolvePath(fileKey))).size;
+    } catch {
+      videoBytes = null;
+    }
+    stage('mulai', `size=${videoBytes ?? '?'}B`);
+
     if (!this.videoProcessing.isAvailable()) {
       await discardVideo();
+      stage('gagal', 'ffmpeg/ffprobe tidak tersedia — file dihapus (fail-closed)');
       // 500: kesalahan konfigurasi server (ffmpeg belum diinstal) — bukan
       // kesalahan input user. Prasyarat deploy tercatat di laporan batch.
       throw new InternalServerErrorException({
@@ -1408,16 +1430,22 @@ export class UploadService {
     let probe: { durationSec: number; width: number; height: number };
     try {
       probe = await this.videoProcessing.probeVideo(this.localStorage.resolvePath(fileKey));
-    } catch {
+    } catch (err) {
       await discardVideo();
+      stage('gagal', `probe ffprobe gagal (${(err as Error).message}) — file dihapus`);
       throw new BadRequestException({
         code: ErrorCodes.VIDEO_UNPROCESSABLE,
         message: 'File is not a valid video or its duration cannot be determined',
       });
     }
+    stage(
+      'probe-ok',
+      `duration=${probe.durationSec.toFixed(3)}s dim=${probe.width}x${probe.height}`,
+    );
 
     if (probe.durationSec > SHOWCASE_VIDEO_MAX_DURATION_SEC) {
       await discardVideo();
+      stage('gagal', `durasi ${probe.durationSec.toFixed(1)}s > ${SHOWCASE_VIDEO_MAX_DURATION_SEC}s — file dihapus`);
       throw new BadRequestException({
         code: ErrorCodes.VIDEO_TOO_LONG,
         message: `Durasi video melebihi batas maksimal ${SHOWCASE_VIDEO_MAX_DURATION_SEC} detik. Maksimal 100 MB / 180 detik.`,
@@ -1425,6 +1453,7 @@ export class UploadService {
     }
     if (probe.durationSec < SHOWCASE_VIDEO_MIN_DURATION_SEC) {
       await discardVideo();
+      stage('gagal', `durasi ${probe.durationSec.toFixed(1)}s < ${SHOWCASE_VIDEO_MIN_DURATION_SEC}s — file dihapus`);
       throw new BadRequestException({
         code: ErrorCodes.VIDEO_UNPROCESSABLE,
         message: 'Video duration is too short or the file is corrupted',
@@ -1435,6 +1464,10 @@ export class UploadService {
       Math.max(probe.width, probe.height) > SHOWCASE_VIDEO_MAX_DIMENSION_PX
     ) {
       await discardVideo();
+      stage(
+        'gagal',
+        `dimensi ${probe.width}x${probe.height} > ${SHOWCASE_VIDEO_MAX_DIMENSION_PX}px — file dihapus`,
+      );
       throw new BadRequestException({
         code: ErrorCodes.VIDEO_RESOLUTION_TOO_HIGH,
         message: `Resolusi video melebihi batas maksimal ${SHOWCASE_VIDEO_MAX_DIMENSION_PX}p.`,
@@ -1448,15 +1481,17 @@ export class UploadService {
     try {
       const destPath = this.localStorage.resolvePath(thumbKey);
       await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+      stage('thumbnail-mulai', `dest=${path.basename(thumbKey)}`);
       await this.videoProcessing.generateThumbnail(
         this.localStorage.resolvePath(fileKey),
         destPath,
         Math.min(1, probe.durationSec / 2),
         SHOWCASE_VIDEO_THUMBNAIL_WIDTH,
       );
-    } catch {
+    } catch (err) {
       await discardVideo();
       await this.localStorage.deleteFile(thumbKey).catch(() => undefined);
+      stage('gagal', `thumbnail ffmpeg gagal (${(err as Error).message}) — video & thumbnail dihapus`);
       throw new InternalServerErrorException({
         code: ErrorCodes.UPLOAD_FAILED,
         message: 'Failed to generate video thumbnail',
@@ -1464,7 +1499,18 @@ export class UploadService {
     }
 
     // Tandai thumbnail sebagai confirmed (dibuat server-side, bukan oleh user).
-    await this.redis.setNx(`confirmed_upload:${userId}:${thumbKey}`, '1', CONFIRMED_KEY_TTL_SECONDS);
+    // Bug #2: fail-open seperti finalizeDirectUpload — Redis down tidak boleh
+    // membatalkan upload yang videonya SUDAH diproses & tersimpan (dulu throw
+    // di sini = 500 tanpa jejak yang jelas setelah semua kerja ffmpeg selesai).
+    try {
+      await this.redis.setNx(`confirmed_upload:${userId}:${thumbKey}`, '1', CONFIRMED_KEY_TTL_SECONDS);
+    } catch (err) {
+      this.logger.warn(
+        `[showcase-video] setNx confirmed_upload gagal untuk ${thumbKey} — lanjut (fail-open): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    stage('selesai', `thumbnail=${path.basename(thumbKey)}`);
 
     return {
       thumbnailFileKey: thumbKey,
@@ -1493,6 +1539,7 @@ export class UploadService {
     fileKey: string,
   ): Promise<Pick<DirectUploadResult, 'thumbnailFileKey' | 'thumbnailUrl'> | undefined> {
     if (!this.videoProcessing.isAvailable()) return undefined;
+    const startedAt = Date.now();
     const thumbKey = `uploads/chat-attachments/${userId}/${Date.now()}-thumb-${nanoid()}.jpg`;
     const destPath = this.localStorage.resolvePath(thumbKey);
     await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
@@ -1512,11 +1559,23 @@ export class UploadService {
         atSecond,
         SHOWCASE_VIDEO_THUMBNAIL_WIDTH,
       );
-    } catch {
+    } catch (err) {
       await this.localStorage.deleteFile(thumbKey).catch(() => undefined);
+      this.logger.warn(
+        `[chat-video-thumb] gagal (fail-open) fileKey=${fileKey} elapsed=${Date.now() - startedAt}ms error=${(err as Error).message}`,
+      );
       return undefined;
     }
-    await this.redis.setNx(`confirmed_upload:${userId}:${thumbKey}`, '1', CONFIRMED_KEY_TTL_SECONDS);
+    try {
+      await this.redis.setNx(`confirmed_upload:${userId}:${thumbKey}`, '1', CONFIRMED_KEY_TTL_SECONDS);
+    } catch (err) {
+      this.logger.warn(
+        `[chat-video-thumb] setNx gagal untuk ${thumbKey} — lanjut (fail-open): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    this.logger.log(
+      `[chat-video-thumb] selesai fileKey=${fileKey} thumb=${path.basename(thumbKey)} elapsed=${Date.now() - startedAt}ms`,
+    );
     return {
       thumbnailFileKey: thumbKey,
       thumbnailUrl: this.buildSignedDownloadUrl(thumbKey, 900),

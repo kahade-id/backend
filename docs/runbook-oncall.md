@@ -91,8 +91,32 @@ di `AdminAuditLog` `[SYSTEM ALERT]`, di log error, dan (opsional) ke
 ### `disk_usage` (warning ≥80%, critical ≥90%) / `table_growth` (>5 GB tabel log)
 1. `disk_usage`: hapus file temp `synthetic-*` yatim, audit direktori upload;
    bila > 90%: SEV2, siapkan ekspansi volume.
+   Indikator ini memeriksa **volume storage** (`STORAGE_PATH`, default
+   `/var/www/kahade-storage`) DAN `/` — ambil yang paling penuh; detail respons
+   memuat `path`, `usedPercent`, `freeMb`, `storageUsedPercent`,
+   `rootUsedPercent`.
 2. `table_growth`: jadwalkan archival/purge `webhook_log`, `audit_log`,
    `admin_audit_log`, `notification_log` (lihat `docs/backup-restore-drill.md`).
+
+### Upload video/file bermasalah ("Memproses video..." menggantung, foto/PDF rusak)
+Cari prefix log berikut (satu request = satu `requestId`):
+
+| Log | Arti / tindakan |
+|---|---|
+| `[ffmpeg-check] ... TIDAK tersedia` | ffmpeg/ffprobe tidak ada di PATH server → instal (atau set `FFPROBE_PATH`/`FFMPEG_PATH`). Upload video ditolak fail-closed (500). |
+| `[ffmpeg-slot] ... menunggu slot` / `menunggu Nms` | >2 proses ffmpeg bersamaan (semaphore). Bila antrean menumpuk lama: cek proses ffprobe/ffmpeg yang nyangkut (`ps`), lihat baris berikutnya. |
+| `[VIDEO_PROBE]/[VIDEO_THUMBNAIL] ... watchdog anti-hang` | proses biner tidak berhenti setelah timeout → SIGKILL paksa. Cek storage/file yang diproses (I/O tak terputus, file korup). |
+| `[video-probe] gagal` / `[video-thumbnail] gagal` + `elapsed` | tahap gagal + durasinya; `VIDEO_UNPROCESSABLE` = bukan video valid. |
+| `[showcase-video] mulai/probe-ok/thumbnail-mulai/selesai/gagal` | progres pipeline video (size, duration, dim, elapsed). `gagal` memuat alasan + file dihapus. |
+| `[chunked] complete mulai/rakit selesai/selesai/gagal` | jalur upload besar: pisahkan durasi rakit vs pemrosesan ffmpeg. |
+| `[storage] ... errno=ENOSPC capacity=true` atau respons `503 UPLOAD_STORAGE_UNAVAILABLE` | **disk/kuota penuh atau FS read-only** → SEV2: bebaskan ruang pada volume `STORAGE_PATH`, cek `df -h`; retry aman setelah ruang tersedia. |
+| `[chunked] tulis chunk gagal ... errno=` | kegagalan menulis staging (`<STORAGE_PATH>/.chunks`); `.part` sudah dibersihkan otomatis. |
+| `GET /v1/upload/s` mengembalikan `application/json` | regresi Bug #1 (payload biner ter-bungkus envelope). Bukan masalah data — periksa `ResponseTransformInterceptor`. |
+
+Catatan infra: Nginx harus memakai `client_max_body_size 115m` +
+`proxy_request_buffering off` untuk `/v1/upload/` (dan `55m` untuk unggah
+lampiran chat) dengan `proxy_read_timeout ≥300s`, kalau tidak upload besar
+ditolak 413/504 sebelum sampai aplikasi (lihat `nginx/nginx.conf`).
 
 ## Triase cepat (15 menit)
 

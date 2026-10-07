@@ -32,11 +32,16 @@ import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import * as fs from 'fs';
 import { PrismaService } from '../../prisma/prisma.service';
-import { AuditAction } from '@prisma/client';
+import { AuditAction, AlertSeverity as PrismaAlertSeverity } from '@prisma/client';
 import { ErrorSpikeTracker } from './metrics.service';
 import { DEAD_LETTER_QUEUE } from '../queue/queue.constants';
 
 export type AlertSeverity = 'warning' | 'critical';
+
+/** Petakan severity lokal (lowercase) ke enum Prisma (UPPERCASE). */
+function toPrismaSeverity(s: AlertSeverity): PrismaAlertSeverity {
+  return s === 'critical' ? PrismaAlertSeverity.CRITICAL : PrismaAlertSeverity.WARNING;
+}
 
 export interface AlertRuleResult {
   key: string;
@@ -247,7 +252,7 @@ export class AlertsService {
       }).alertEvent.upsert({
         where: { key: hit.key },
         update: {
-          severity: hit.severity,
+          severity: toPrismaSeverity(hit.severity),
           message: hit.message,
           context: hit.context as unknown as Record<string, unknown>,
           status: 'RAISED',
@@ -256,7 +261,7 @@ export class AlertsService {
         },
         create: {
           key: hit.key,
-          severity: hit.severity,
+          severity: toPrismaSeverity(hit.severity),
           message: hit.message,
           context: hit.context as unknown as Record<string, unknown>,
           status: 'RAISED',

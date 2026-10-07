@@ -1,6 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
-import { appConfig, cryptoConfig, databaseConfig, fcmConfig, jwtConfig, midtransConfig, r2Config, redisConfig, smtpConfig } from '../config';
+import { appConfig, cryptoConfig, databaseConfig, fcmConfig, jwtConfig, midtransConfig, redisConfig, smtpConfig } from '../config';
 import { validateEnv } from '../config/env.validation';
 import { PrismaModule } from '../prisma/prisma.module';
 import { RedisModule } from '../redis/redis.module';
@@ -24,7 +24,7 @@ const smokeEnvFile = getSmokeEnvFile();
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: smokeEnvFile,
-      load: [appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, r2Config, smtpConfig, fcmConfig],
+      load: [appConfig, databaseConfig, jwtConfig, cryptoConfig, redisConfig, midtransConfig, smtpConfig, fcmConfig],
       validate: validateEnv,
     }),
     PrismaModule,

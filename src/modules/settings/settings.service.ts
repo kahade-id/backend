@@ -263,30 +263,17 @@ export class SettingsService {
     }
 
     if (dto.evidenceUrls?.length) {
-      const trustedHostnames: string[] = [];
-      const r2Endpoint = this.configService.get<string>('r2.endpointUrl');
-      if (r2Endpoint) {
-        try { trustedHostnames.push(new URL(r2Endpoint).hostname); } catch {}
-      }
-      const r2PublicUrl = this.configService.get<string>('r2.publicUrl');
-      if (r2PublicUrl) {
-        try { trustedHostnames.push(new URL(r2PublicUrl).hostname); } catch {}
-      }
-      if (trustedHostnames.length === 0) {
-        throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Storage not configured' });
-      }
+      // Self-hosted only (2026-10-07): R2/Cloudflare dibuang — evidence harus
+      // menunjuk ke storage platform (api.kahade.id/uploads).
+      const trustedHostnames: string[] = ['api.kahade.id', 'kahade.id', 'cdn.kahade.id'];
       for (const rawUrl of dto.evidenceUrls) {
         try {
           const parsed = new URL(rawUrl);
           if (parsed.protocol !== 'https:') throw new Error('not https');
-          // The two `endsWith` fallbacks below used to accept ANY `*.r2.dev` or
-          // `*.r2.cloudflarestorage.com` host — i.e. any Cloudflare R2 bucket on
-          // any account, including one the reporter controls. Admins reviewing a
-          // report would then be fetching attacker-hosted content from a URL that
-          // looked like platform storage. `trustedHostnames` is already derived
-          // from r2.endpointUrl + r2.publicUrl (which are the account-specific
-          // hosts) and we bail out above when it is empty, so the wildcards were
-          // pure over-permission.
+          // Hanya host platform yang diizinkan — menolak R2/Cloudflare
+          // (*.r2.dev, *.r2.cloudflarestorage.com) dan host eksternal lain
+          // untuk mencegah admin mengambil konten dari URL attacker-hosted
+          // yang terlihat seperti platform storage.
           const isTrusted = trustedHostnames.some(h => parsed.hostname === h || parsed.hostname.endsWith(`.${h}`));
           if (!isTrusted) throw new Error('not allowed host');
         } catch {

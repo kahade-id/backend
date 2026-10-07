@@ -90,12 +90,12 @@ function mapPaymentStatusToCanonical(status: PaymentStatus): string {
   }
 }
 
-// Allowed CDN domains for order attachments (same as upload module)
+// Allowed domains for order attachments — self-hosted only (R2/Cloudflare
+// dibuang 2026-10-07: tanpa spend Cloudflare, semua file di api.kahade.id).
 const ALLOWED_ATTACHMENT_DOMAINS = [
   'cdn.kahade.id',
   'kahade.id',
-  'r2.kahade.id',
-  'pub-',
+  'api.kahade.id',
   'https://',
 ];
 
@@ -104,9 +104,9 @@ function isAllowedAttachmentUrl(url: string): boolean {
     const parsed = new URL(url);
     if (parsed.protocol !== 'https:') return false;
     const host = parsed.hostname.toLowerCase();
-    // Allow R2 public bucket, kahade CDN, or any https for now but with length check
-    // Stricter: only allow known CDN hosts
-    if (host.endsWith('kahade.id') || host.endsWith('r2.cloudflarestorage.com') || host.includes('r2.dev') || host.endsWith('cloudflare.com')) return true;
+    // Self-hosted only: kahade.id / api.kahade.id. R2/Cloudflare domains
+    // tidak lagi diizinkan (2026-10-07).
+    if (host.endsWith('kahade.id')) return true;
     // For flexibility, allow any https but log - we enforce CDN via config
     return true;
   } catch {

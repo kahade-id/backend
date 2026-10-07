@@ -1735,14 +1735,6 @@ export class ChatService implements OnModuleInit {
 
   private validateAttachments(userId: string, attachments: NonNullable<SendMessageDto['attachments']>, skipOwnershipCheck = false): void {
     const trustedHostnames: string[] = [];
-    const r2Endpoint = this.configService.get<string>('r2.endpointUrl');
-    if (r2Endpoint) {
-      try { trustedHostnames.push(new URL(r2Endpoint).hostname); } catch {}
-    }
-    const r2PublicUrl = this.configService.get<string>('r2.publicUrl');
-    if (r2PublicUrl) {
-      try { trustedHostnames.push(new URL(r2PublicUrl).hostname); } catch {}
-    }
     // Batch 1A (ST-008): storage self-hosted — lampiran berupa URL
     // https://api.kahade.id/uploads/... atau signed URL /v1/upload/s.
     // Sebelumnya hanya hostname R2 yang dipercaya → lampiran self-hosted
@@ -3969,10 +3961,6 @@ export class ChatService implements OnModuleInit {
     const trustedHostnames: string[] = [];
     const storagePublicUrl = this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads';
     try { trustedHostnames.push(new URL(storagePublicUrl).hostname); } catch { /* abaikan */ }
-    const r2Endpoint = this.configService.get<string>('r2.endpointUrl');
-    if (r2Endpoint) { try { trustedHostnames.push(new URL(r2Endpoint).hostname); } catch { /* abaikan */ } }
-    const r2PublicUrl = this.configService.get<string>('r2.publicUrl');
-    if (r2PublicUrl) { try { trustedHostnames.push(new URL(r2PublicUrl).hostname); } catch { /* abaikan */ } }
     if (trustedHostnames.length === 0) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Storage is not configured' });
     }

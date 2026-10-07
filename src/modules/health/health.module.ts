@@ -174,81 +174,6 @@ class MidtransHealthIndicator extends HealthIndicator {
   }
 }
 
-@Injectable()
-class R2HealthIndicator extends HealthIndicator {
-  private readonly logger = new Logger(R2HealthIndicator.name);
-
-  constructor(private config: ConfigService) {
-    super();
-  }
-
-  async isHealthy(key: string): Promise<HealthIndicatorResult> {
-    const accountId = this.config.get<string>('r2.accountId');
-    const accessKeyId = this.config.get<string>('r2.accessKeyId');
-    const secretAccessKey = this.config.get<string>('r2.secretAccessKey');
-    const bucketPublic = this.config.get<string>('r2.bucketPublic');
-
-    if (!accountId || !accessKeyId || !secretAccessKey) {
-      return this.getStatus(key, false, { message: 'R2 credentials not configured' });
-    }
-
-    if (!bucketPublic) {
-      return this.getStatus(key, false, { message: 'R2 bucket not configured' });
-    }
-
-    const endpointUrl = `https://${accountId}.r2.cloudflarestorage.com`;
-    const abortController = new AbortController();
-    const timeout = setTimeout(() => abortController.abort(), 5000);
-
-    try {
-      const url = `${endpointUrl}/${bucketPublic}?list-type=2&max-keys=1`;
-      const now = new Date();
-      const dateStr = now.toISOString().replace(/[:-]/g, '').replace(/\.\d{3}/, '');
-      const dateShort = dateStr.slice(0, 8);
-      const region = 'auto';
-      const service = 's3';
-
-      const { createHmac, createHash } = await import('crypto');
-
-      const canonicalHeaders = `host:${accountId}.r2.cloudflarestorage.com\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:${dateStr}\n`;
-      const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
-      const canonicalRequest = `GET\n/${bucketPublic}\nlist-type=2&max-keys=1\n${canonicalHeaders}\n${signedHeaders}\nUNSIGNED-PAYLOAD`;
-      const scope = `${dateShort}/${region}/${service}/aws4_request`;
-      const stringToSign = `AWS4-HMAC-SHA256\n${dateStr}\n${scope}\n${createHash('sha256').update(canonicalRequest).digest('hex')}`;
-
-      const kDate = createHmac('sha256', `AWS4${secretAccessKey}`).update(dateShort).digest();
-      const kRegion = createHmac('sha256', kDate).update(region).digest();
-      const kService = createHmac('sha256', kRegion).update(service).digest();
-      const kSigning = createHmac('sha256', kService).update('aws4_request').digest();
-      const signature = createHmac('sha256', kSigning).update(stringToSign).digest('hex');
-
-      const authHeader = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
-
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          Authorization: authHeader,
-          'x-amz-date': dateStr,
-          'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
-          Host: `${accountId}.r2.cloudflarestorage.com`,
-        },
-        signal: abortController.signal,
-      });
-      clearTimeout(timeout);
-      const ok = response.status === 200;
-      // Do NOT echo `bucket: bucketPublic` — /health is @Public() and
-      // unauthenticated, so that leaked the internal R2 bucket name to anyone
-      // who curled it. Keep it in the log stream for on-call instead.
-      if (!ok) {
-        this.logger.warn(`R2 healthcheck non-200 for bucket=${bucketPublic}: status=${response.status}`);
-      }
-      return this.getStatus(key, ok, { statusCode: response.status });
-    } catch {
-      clearTimeout(timeout);
-      return this.getStatus(key, false, { message: 'R2 storage unreachable' });
-    }
-  }
-}
 
 @Injectable()
 class SmtpHealthIndicator extends HealthIndicator {
@@ -415,7 +340,6 @@ export class HealthController {
     private diskIndicator: DiskHealthIndicator,
     private cronIndicator: CronHealthIndicator,
     private midtransIndicator: MidtransHealthIndicator,
-    private r2Indicator: R2HealthIndicator,
     private smtpIndicator: SmtpHealthIndicator,
     private webhookInboxIndicator: WebhookInboxHealthIndicator,
     private opsAlertsIndicator: OpsAlertsHealthIndicator,
@@ -467,7 +391,6 @@ export class HealthController {
       (): Promise<HealthIndicatorResult> => this.redisIndicator.isHealthy('redis'),
       (): Promise<HealthIndicatorResult> => this.diskIndicator.isHealthy('disk'),
       (): Promise<HealthIndicatorResult> => this.midtransIndicator.isHealthy('midtrans'),
-      (): Promise<HealthIndicatorResult> => this.r2Indicator.isHealthy('r2_storage'),
       (): Promise<HealthIndicatorResult> => this.smtpIndicator.isHealthy('smtp'),
       (): Promise<HealthIndicatorResult> => this.queueIndicator('queues'),
     ]);
@@ -481,7 +404,7 @@ export class HealthController {
 
   /**
    * A release gate for the process that owns the private API listener. Unlike
-   * `/health`, this endpoint does not fan out to SMTP, R2, or payment providers
+   * `/health`, this endpoint does not fan out to SMTP or payment providers
    * and it is never exposed through the reverse proxy: forwarded requests and
    * all non-loopback peers receive a generic 404.
    */
@@ -598,7 +521,6 @@ export class HealthController {
     DiskHealthIndicator,
     CronHealthIndicator,
     MidtransHealthIndicator,
-    R2HealthIndicator,
     SmtpHealthIndicator,
     WebhookInboxHealthIndicator,
     OpsAlertsHealthIndicator,

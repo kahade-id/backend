@@ -984,8 +984,8 @@ export class UsersService {
 
   /**
    * Ekstrak fileKey dari URL avatar/header.
-   * Mendukung: (1) URL self-hosted baru https://api.kahade.id/uploads/...,
-   * (2) URL R2 legacy (r2.publicUrl), (3) path relatif /uploads/....
+   * Mendukung: (1) URL self-hosted https://api.kahade.id/uploads/...,
+   * (2) path relatif /uploads/.... R2 legacy dibuang 2026-10-07.
    */
   private extractKeyFromUrl(url: string): string | null {
     try {
@@ -994,11 +994,6 @@ export class UsersService {
       const storagePublicUrl = this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads';
       if (url.startsWith(storagePublicUrl)) {
         return url.slice(storagePublicUrl.length + 1);
-      }
-      // URL R2 legacy.
-      const publicUrl = this.configService.get<string>('r2.publicUrl');
-      if (publicUrl && url.startsWith(publicUrl)) {
-        return url.slice(publicUrl.length + 1);
       }
       const parsed = new URL(url);
       return parsed.pathname.startsWith('/') ? parsed.pathname.slice(1) : parsed.pathname;
@@ -2012,21 +2007,13 @@ export class UsersService {
 
 
     if (dto.evidenceUrls?.length) {
-      // Self-hosted (2026-09-26, ST-007): storage utama adalah disk server.
-      // Bukti yang diunggah via POST /v1/upload/direct menghasilkan URL
-      // https://api.kahade.id/uploads/... — hostname inilah yang dipercaya.
-      // Hostname R2 legacy tetap diterima selama config R2 masih ada.
+      // Self-hosted (2026-09-26, ST-007; R2 dibuang 2026-10-07): storage
+      // utama adalah disk server. Bukti yang diunggah via POST
+      // /v1/upload/direct menghasilkan URL https://api.kahade.id/uploads/...
+      // — hostname inilah yang dipercaya.
       const trustedHostnames: string[] = [];
       const storagePublicUrl = this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads';
       try { trustedHostnames.push(new URL(storagePublicUrl).hostname); } catch {}
-      const endpointUrl = this.configService.get<string>('r2.endpointUrl');
-      if (endpointUrl) {
-        try { trustedHostnames.push(new URL(endpointUrl).hostname); } catch {}
-      }
-      const publicUrl = this.configService.get<string>('r2.publicUrl');
-      if (publicUrl) {
-        try { trustedHostnames.push(new URL(publicUrl).hostname); } catch {}
-      }
       if (trustedHostnames.length === 0) {
         throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Storage is not configured' });
       }

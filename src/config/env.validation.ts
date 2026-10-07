@@ -224,17 +224,6 @@ export function validateEnv(env: Env): Env {
     })
   }
 
-  // ── CLOUDFLARE R2 / STORAGE ─────────────────────────────────────────────────
-  // Batch 1A (ST-010): R2 adalah legacy — storage self-hosted adalah jalur utama
-  // (keputusan produk: tanpa spend Cloudflare). Var R2 opsional; hanya warning
-  // di prod-like bila tidak diset.
-  optionalUrl(env, 'R2_PUBLIC_URL', errors)
-  for (const key of ['R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_ACCOUNT_ID', 'R2_BUCKET_PUBLIC', 'R2_BUCKET_PRIVATE'] as const) {
-    if (isProdLike && !env[key]) {
-      errors.push({ key, message: `${key} is not set — R2 storage unavailable (self-hosted storage will be used). Set it only if legacy R2 reads are still needed.` })
-    }
-  }
-
   // ── SMTP ─────────────────────────────────────────────────────────────────────
   required(env, 'SMTP_HOST', errors)
   optionalInt(env, 'SMTP_PORT', 587, 1, 65535, errors)

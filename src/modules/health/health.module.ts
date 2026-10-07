@@ -16,6 +16,7 @@ import type { Request } from 'express';
 import { isLoopbackInternalProbe } from './internal-readiness.util';
 import { withTimeout } from '../../common/utils/background-reliability.util';
 import { getCronRuntimeSnapshots } from '../../common/utils/cron-runtime.registry';
+import { resolveStorageDir } from '../../common/utils/storage-error.util';
 import { SyntheticService } from '../observability/synthetic.service';
 import { DependenciesService } from '../observability/dependencies.service';
 import { ObservabilityModule } from '../observability/observability.module';
@@ -43,21 +44,52 @@ class RedisHealthIndicator extends HealthIndicator {
 }
 
 @Injectable()
-class DiskHealthIndicator extends HealthIndicator {
+export class DiskHealthIndicator extends HealthIndicator {
+  /**
+   * Bug #2 (2026-10-07): sebelumnya indikator ini HANYA memeriksa `/`.
+   * Upload ditulis ke `STORAGE_PATH` (`/var/www/kahade-storage`) yang di
+   * produksi sering merupakan **volume terpisah** — jadi volume storage bisa
+   * 100% penuh (semua upload gagal ENOSPC) sementara `/` masih 40% dan health
+   * tetap "ok" (container tidak pernah dianggap tidak sehat, alert tidak
+   * berbunyi). Kini keduanya diperiksa dan yang PALING penuh menentukan status,
+   * dengan path dilaporkan di detail untuk diagnosis.
+   */
   async isHealthy(key: string): Promise<HealthIndicatorResult> {
     try {
-      const stats = fs.statfsSync('/');
-      const totalBytes = stats.bsize * stats.blocks;
-      const freeBytes = stats.bsize * stats.bavail;
-      const usedPercent = Math.round(((totalBytes - freeBytes) / totalBytes) * 100);
-      const freeMb = Math.round(freeBytes / 1024 / 1024);
-      const isHealthy = usedPercent < 90;
-      return this.getStatus(key, isHealthy, { usedPercent, freeMb });
+      const storagePath = resolveStorageDir();
+      const storage = this.diskUsage(storagePath);
+      const root = this.diskUsage('/');
+      const worst = storage.usedPercent >= root.usedPercent ? storage : root;
+      const isHealthy = worst.usedPercent < 90;
+      return this.getStatus(key, isHealthy, {
+        path: worst.path,
+        usedPercent: worst.usedPercent,
+        freeMb: worst.freeMb,
+        storagePath,
+        storageUsedPercent: storage.usedPercent,
+        rootUsedPercent: root.usedPercent,
+      });
     } catch {
       // An unavailable disk probe is not evidence of a healthy disk. Returning
       // true here made a broken host appear ready to receive traffic/jobs.
       return this.getStatus(key, false, { message: 'disk check unavailable' });
     }
+  }
+
+  /**
+   * Seam test: pembacaan pemakaian disk. `fs.statfsSync` tidak bisa di-spy di
+   * Node 22 (properti modul non-configurable), sehingga test menimpa method ini
+   * untuk mensimulasikan volume storage penuh sementara `/` longgar.
+   */
+  protected diskUsage(dirPath: string): { path: string; usedPercent: number; freeMb: number } {
+    const stats = fs.statfsSync(dirPath);
+    const totalBytes = stats.bsize * stats.blocks;
+    const freeBytes = stats.bsize * stats.bavail;
+    return {
+      path: dirPath,
+      usedPercent: Math.round(((totalBytes - freeBytes) / totalBytes) * 100),
+      freeMb: Math.round(freeBytes / 1024 / 1024),
+    };
   }
 }
 

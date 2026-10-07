@@ -1346,26 +1346,14 @@ export class ChatService implements OnModuleInit {
     }
 
     // BD-006: satu cache signing per request — lampiran yang sama di pesan
-    // berbeda tidak di-signing ulang.
+    // berbeda tidak di-signing ulang. Batch 139 BE-API2 (item 122): urlExpiresAt —
+    // kapan signed URL lampiran ini kedaluwarsa (ISO absolut).
     const signCache = new Map<string, { url: string; urlExpiresAt: string | null }>();
-    const responseMessages = await Promise.all(messages.map(async (message) => ({
-      ...message,
-      attachments: await Promise.all(message.attachments.map(async (attachment) => {
-        // Batch 139 BE-API2 (item 122): urlExpiresAt — kapan signed URL
-        // lampiran ini kedaluwarsa (ISO absolut).
-        const file = await this.toReadableAttachment(attachment.fileUrl, signCache);
-        const thumb = attachment.thumbnailUrl ? await this.toReadableAttachment(attachment.thumbnailUrl, signCache) : null;
-        return {
-          ...attachment,
-          fileUrl: file.url,
-          urlExpiresAt: file.urlExpiresAt,
-          thumbnailUrl: thumb ? thumb.url : null,
-        };
-      })),
-    })));
 
     return {
-      messages: responseMessages.map((m) => serializeMessage(m, { viewerId: userId, hiddenReaders })),
+      messages: await Promise.all(
+        messages.map((message) => this.serializeForViewer(message, { viewerId: userId, hiddenReaders }, signCache)),
+      ),
       // D1-004: mode delta bukan halaman — tidak ada nextCursor/hasMore.
       nextCursor: deltaMode ? null : nextCursor,
       hasMore: deltaMode ? false : hasMore,
@@ -1623,11 +1611,16 @@ export class ChatService implements OnModuleInit {
     // CN-004: serialisasi per penerima — fromUser & reactedByMe dihitung dari
     // sudut pandang masing-masing viewer. Payload tunggal bersudut-pandang
     // pengirim membuat penerima me-render pesan masuk sebagai pesan keluar.
-    const senderView = serializeMessage(message, { viewerId: userId });
-    const recipientView = recipientId ? serializeMessage(message, { viewerId: recipientId }) : null;
+    // Bug #1: lampiran ditandatangani di SEMUA payload (respons kirim + socket)
+    // supaya penerima bisa langsung merender tanpa menunggu refresh daftar.
+    const signCache = new Map<string, { url: string; urlExpiresAt: string | null }>();
+    const senderView = await this.serializeForViewer(message, { viewerId: userId }, signCache);
+    const recipientView = recipientId
+      ? await this.serializeForViewer(message, { viewerId: recipientId }, signCache)
+      : null;
     // Room broadcast memakai payload netral (tanpa viewerId) agar tidak
     // menyesatkan; klien menentukan sudut pandang dari senderId.
-    const neutralView = serializeMessage(message, {});
+    const neutralView = await this.serializeForViewer(message, {}, signCache);
 
     this.emitChatEvent(room, 'chat.new_message', neutralView);
     // Sinkron multi-perangkat pengirim.
@@ -1673,6 +1666,16 @@ export class ChatService implements OnModuleInit {
   // Batch 1A (ST-004): ekstrak fileKey dari stable storage URL
   // (https://api.kahade.id/uploads/chat-attachments/<userId>/<file>)
   // atau dari raw key. Dipakai untuk normalisasi persist + signing saat baca.
+  //
+  // Bug #1 (residu, 2026-10-07): pesan LAMA (dipersist sebelum `0f3caee`)
+  // menyimpan **signed URL** hasil upload (`/v1/upload/s?key=&exp=&sig=`,
+  // kedaluwarsa 900s). Bentuk ini dulu jatuh ke cabang terakhir dan
+  // menghasilkan key palsu `uploads/v1/upload/s` → `generateDownloadUrl`
+  // melempar INVALID_FILE_TYPE → `toReadableAttachment` mengembalikan URL KOSONG
+  // sehingga foto/video/PDF lama tetap rusak meski endpoint unduh sudah
+  // diperbaiki. Di sini `key` diambil dari query (nilai DB milik server, bukan
+  // input klien) dan tetap divalidasi `isSafeFileKey`; otorisasi tetap dari
+  // `validateRoomAccess` di level controller.
   private extractChatFileKey(rawUrl: string): string | null {
     if (!rawUrl || typeof rawUrl !== 'string') return null;
     if (rawUrl.startsWith('uploads/')) return rawUrl;
@@ -1681,13 +1684,18 @@ export class ChatService implements OnModuleInit {
       const storagePublicUrl = this.configService.get<string>('app.storagePublicUrl') || 'https://api.kahade.id/uploads';
       const base = new URL(storagePublicUrl);
       if (parsed.hostname !== base.hostname) return null;
+      // Signed URL lampiran (legacy): ambil fileKey dari query.
+      if (parsed.pathname === '/v1/upload/s') {
+        const key = parsed.searchParams.get('key');
+        return key && isSafeFileKey(key) ? key : null;
+      }
       // pathname: /uploads/chat-attachments/<userId>/<file>
       const prefix = base.pathname.replace(/\/+$/, '');
       let rel = decodeURIComponent(parsed.pathname);
       if (prefix && rel.startsWith(prefix)) rel = rel.slice(prefix.length);
       rel = rel.replace(/^\/+/, '');
       if (!rel.startsWith('uploads/')) rel = `uploads/${rel}`;
-      return rel;
+      return isSafeFileKey(rel) ? rel : null;
     } catch {
       return null;
     }
@@ -1711,11 +1719,20 @@ export class ChatService implements OnModuleInit {
           throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `${label} cannot be verified (storage unavailable)` });
         }
         const params = parsed.searchParams;
-        const fileKey = this.uploadService.verifySignedDownload(
+        const verifiedKey = this.uploadService.verifySignedDownload(
           params.get('key') || '',
           params.get('exp') || '',
           params.get('sig') || '',
         );
+        // Bug #1 (residu): upload besar bisa memakan waktu > TTL signed URL
+        // (900s) di jaringan seluler, sehingga klien mengirim balik signed URL
+        // yang SUDAH kedaluwarsa — dulu ditolak 400 dan pesan gagal terkirim.
+        // Fallback: pakai `key` dari query dengan tingkat kepercayaan yang SAMA
+        // seperti klien mengirim raw fileKey (jalur yang sudah didukung DTO):
+        // `validateStorageUrl` + `validateOwnership` di bawah tetap mewajibkan
+        // folder chat-attachments milik user pengirim.
+        const fileKey = verifiedKey
+          || (isSafeFileKey(params.get('key') || '') ? (params.get('key') as string) : null);
         if (!fileKey) {
           throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: `${label} has an invalid or expired signature` });
         }
@@ -1980,7 +1997,7 @@ export class ChatService implements OnModuleInit {
         where: { id: messageId, roomId },
         select: MESSAGE_SELECT,
       }) as unknown as RawMessage;
-      return serializeMessage(unchanged, { viewerId: userId });
+      return this.serializeForViewer(unchanged, { viewerId: userId });
     }
 
     // Riwayat revisi disimpan DULU: kalau proses terputus di tengah, yang
@@ -2011,7 +2028,7 @@ export class ChatService implements OnModuleInit {
       where: { id: message.id, roomId },
       select: MESSAGE_SELECT,
     }) as unknown as RawMessage;
-    const serialized = serializeMessage(updated, { viewerId: userId });
+    const serialized = await this.serializeForViewer(updated, { viewerId: userId });
 
     this.emitChatEvent(room, 'chat.message_updated', serialized);
     return serialized;
@@ -2288,7 +2305,7 @@ export class ChatService implements OnModuleInit {
     }) as unknown as RawMessage[];
     return {
       roomId,
-      messages: messages.map((m) => serializeMessage(m, { viewerId: userId })),
+      messages: await Promise.all(messages.map((m) => this.serializeForViewer(m, { viewerId: userId }))),
     };
   }
 
@@ -2419,7 +2436,7 @@ export class ChatService implements OnModuleInit {
 
     return {
       query: term,
-      messages: messages.map((m) => serializeMessage(m, { viewerId: userId })),
+      messages: await Promise.all(messages.map((m) => this.serializeForViewer(m, { viewerId: userId }))),
       nextCursor,
       hasMore,
     };
@@ -2475,17 +2492,19 @@ export class ChatService implements OnModuleInit {
 
     return {
       query: term,
-      results: messages.map((message) => ({
-        ...serializeMessage(message, { viewerId: userId }),
-        room: {
-          id: message.room.id,
-          type: message.room.type,
-          subject: message.room.subject,
-          orderId: message.room.order?.orderId ?? null,
-          orderTitle: message.room.order?.title ?? null,
-          orderStatus: message.room.order?.status ?? null,
-        },
-      })),
+      results: await Promise.all(
+        messages.map(async (message) => ({
+          ...(await this.serializeForViewer(message, { viewerId: userId })),
+          room: {
+            id: message.room.id,
+            type: message.room.type,
+            subject: message.room.subject,
+            orderId: message.room.order?.orderId ?? null,
+            orderTitle: message.room.order?.title ?? null,
+            orderStatus: message.room.order?.status ?? null,
+          },
+        })),
+      ),
     };
   }
 
@@ -2681,6 +2700,51 @@ export class ChatService implements OnModuleInit {
     }
   }
 
+  /**
+   * Bug #1 (residu jalur LIVE, 2026-10-07): `serializeMessage` mengembalikan
+   * `attachments` APA ADANYA — yaitu fileKey mentah (`uploads/chat-attachments/…`)
+   * setelah `0f3caee`. Akibatnya respons kirim pesan dan payload socket
+   * (`chat.new_message`, `chat.message_updated`, hasil pencarian, pesan di-pin,
+   * pesan berbintang, tampilan admin) membawa nilai yang TIDAK bisa diunduh klien:
+   * nginx hanya melayani prefix publik, dan penerima bukan pemilik berkas
+   * sehingga `/v1/upload/my-file` tidak berlaku. Foto/video tampil rusak sampai
+   * room dibuka ulang (jalur `getMessages`, satu-satunya tempat yang menandatangani).
+   *
+   * Helper ini menandatangani `fileUrl`/`thumbnailUrl` + menambahkan
+   * `urlExpiresAt` — bentuk yang SAMA dengan `getMessages`, sehingga klien
+   * memakai satu jalur render untuk pesan lama maupun pesan live.
+   * `uploadService` tidak tersedia (mis. test) → URL lama diteruskan apa adanya.
+   */
+  private async serializeForViewer(
+    rawMessage: RawMessage,
+    options: SerializeMessageOptions = {},
+    cache?: Map<string, { url: string; urlExpiresAt: string | null }>,
+  ): Promise<Record<string, unknown>> {
+    const view = serializeMessage(rawMessage, options) as unknown as Record<string, unknown>;
+    const attachments = Array.isArray(view.attachments)
+      ? (view.attachments as Array<Record<string, unknown>>)
+      : [];
+    if (attachments.length === 0) return view;
+
+    const signedAttachments = await Promise.all(
+      attachments.map(async (attachment) => {
+        const rawFileUrl = typeof attachment.fileUrl === 'string' ? attachment.fileUrl : '';
+        const rawThumbUrl = typeof attachment.thumbnailUrl === 'string' && attachment.thumbnailUrl
+          ? attachment.thumbnailUrl
+          : null;
+        const file = await this.toReadableAttachment(rawFileUrl, cache);
+        const thumb = rawThumbUrl ? await this.toReadableAttachment(rawThumbUrl, cache) : null;
+        return {
+          ...attachment,
+          fileUrl: file.url,
+          urlExpiresAt: file.urlExpiresAt,
+          thumbnailUrl: thumb ? thumb.url : null,
+        };
+      }),
+    );
+    return { ...view, attachments: signedAttachments };
+  }
+
   async getRoomAttachments(userId: string, roomId: string, page: number, limit: number): Promise<object> {
     await this.validateRoomAccess(userId, roomId);
 
@@ -2787,7 +2851,9 @@ export class ChatService implements OnModuleInit {
     const nextCursor = hasMore && messages.length > 0 ? messages[messages.length - 1].id : null;
 
     return {
-      messages: messages.reverse().map((m) => serializeMessage(m, { includeDeletedContent: true })),
+      messages: await Promise.all(
+        messages.reverse().map((m) => this.serializeForViewer(m, { includeDeletedContent: true })),
+      ),
       nextCursor,
       hasMore,
     };
@@ -3263,10 +3329,13 @@ export class ChatService implements OnModuleInit {
     );
     return {
       roomId,
-      messages: stars.map((s) => ({
+      messages: await Promise.all(stars.map(async (s) => ({
         starredAt: s.createdAt,
-        message: serializeMessage(s.message as unknown as RawMessage, { viewerId: userId, hiddenReaders }),
-      })),
+        message: await this.serializeForViewer(
+          s.message as unknown as RawMessage,
+          { viewerId: userId, hiddenReaders },
+        ),
+      }))),
     };
   }
 

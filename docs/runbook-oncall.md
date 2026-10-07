@@ -91,8 +91,60 @@ di `AdminAuditLog` `[SYSTEM ALERT]`, di log error, dan (opsional) ke
 ### `disk_usage` (warning ≥80%, critical ≥90%) / `table_growth` (>5 GB tabel log)
 1. `disk_usage`: hapus file temp `synthetic-*` yatim, audit direktori upload;
    bila > 90%: SEV2, siapkan ekspansi volume.
+   Indikator ini memeriksa **volume storage** (`STORAGE_PATH`, default
+   `/var/www/kahade-storage`) DAN `/` — ambil yang paling penuh; detail respons
+   memuat `path`, `usedPercent`, `freeMb`, `storageUsedPercent`,
+   `rootUsedPercent`.
 2. `table_growth`: jadwalkan archival/purge `webhook_log`, `audit_log`,
    `admin_audit_log`, `notification_log` (lihat `docs/backup-restore-drill.md`).
+
+### Upload video/file bermasalah ("Memproses video..." menggantung, foto/PDF rusak)
+Cari prefix log berikut (satu request = satu `requestId`):
+
+| Log | Arti / tindakan |
+|---|---|
+| `[ffmpeg-check] ... TIDAK tersedia` | ffmpeg/ffprobe tidak ada di PATH server → instal (atau set `FFPROBE_PATH`/`FFMPEG_PATH`). Upload video ditolak fail-closed (500). |
+| `[ffmpeg-slot] ... menunggu slot` / `menunggu Nms` | >2 proses ffmpeg bersamaan (semaphore). Bila antrean menumpuk lama: cek proses ffprobe/ffmpeg yang nyangkut (`ps`), lihat baris berikutnya. |
+| `[VIDEO_PROBE]/[VIDEO_THUMBNAIL] ... watchdog anti-hang` | proses biner tidak berhenti setelah timeout → SIGKILL paksa. Cek storage/file yang diproses (I/O tak terputus, file korup). |
+| `[video-probe] gagal` / `[video-thumbnail] gagal` + `elapsed` | tahap gagal + durasinya; `VIDEO_UNPROCESSABLE` = bukan video valid. |
+| `[showcase-video] mulai/probe-ok/thumbnail-mulai/selesai/gagal` | progres pipeline video (size, duration, dim, elapsed). `gagal` memuat alasan + file dihapus. |
+| `[chunked] complete mulai/rakit selesai/selesai/gagal` | jalur upload besar: pisahkan durasi rakit vs pemrosesan ffmpeg. |
+| `[storage] ... errno=ENOSPC capacity=true` atau respons `503 UPLOAD_STORAGE_UNAVAILABLE` | **disk/kuota penuh atau FS read-only** → SEV2: bebaskan ruang pada volume `STORAGE_PATH`, cek `df -h`; retry aman setelah ruang tersedia. |
+| `[chunked] tulis chunk gagal ... errno=` | kegagalan menulis staging (`<STORAGE_PATH>/.chunks`); `.part` sudah dibersihkan otomatis. |
+| `Chunk sweep: N sesi kedaluwarsa dihapus (M tanpa manifest valid)` | sapu oportunistik staging chunked (dipicu tiap `POST /v1/upload/chunked/init`). `M > 0` = sesi yatim yang dulu bocor permanen sampai disk penuh (upload "menggantung") — pantau pertumbuhannya, cek `df -h <STORAGE_PATH>` dan `du -sh <STORAGE_PATH>/.chunks`. |
+| `GET /v1/upload/s` mengembalikan `application/json` | regresi Bug #1 (payload biner ter-bungkus envelope). Bukan masalah data — periksa `ResponseTransformInterceptor`. |
+
+Catatan infra: Nginx harus memakai `client_max_body_size 115m` +
+`proxy_request_buffering off` untuk `/v1/upload/` (dan `55m` untuk unggah
+lampiran chat) dengan `proxy_read_timeout ≥300s`, kalau tidak upload besar
+ditolak 413/504 sebelum sampai aplikasi (lihat `nginx/nginx.conf`).
+
+Catatan infra (Bug #2, asset publik): nginx hanya boleh menyerve prefix
+**publik** — daftar tunggalnya `PUBLIC_FOLDER_PREFIXES` di
+`src/modules/upload/upload.service.ts` (`avatars/`, `headers/`,
+`showcase-images/`, `showcase-videos/`). Kalau ada prefix publik yang lupa
+ditambahkan ke `nginx/nginx.conf`/`deploy/nginx.conf`, URL yang dikembalikan API
+jatuh ke catch-all `location ^~ /uploads/ { return 404; }` → **404 padahal upload
+sukses** (gejala: "video/foto gagal dimuat"). Prefix privat TIDAK boleh punya
+alias statis — berkasnya hanya lewat signed URL `GET /v1/upload/s?key=&exp=&sig=`.
+Invarian ini dijaga `src/modules/upload/tests/public-storage-serving.spec.ts`
+(termasuk path mount volume `storage_data` di `docker-compose.yml`, yang WAJIB
+ada karena service `api` berjalan `read_only` — tanpa volume itu semua upload
+gagal `EROFS`/`503 UPLOAD_STORAGE_UNAVAILABLE`).
+
+Catatan volume: `storage_data` adalah named volume — untuk deployment yang
+berkasnya harus terlihat oleh nginx HOST (`deploy/nginx.conf` memakai
+`/var/www/kahade-storage`), ganti mount di service `api`/`nginx` menjadi bind
+mount (`- /var/www/kahade-storage:/var/www/kahade-storage[:ro]`) dan pastikan UID
+container `api` (`app`, **uid 1001** sesuai `Dockerfile`) punya izin tulis di
+direktori host itu, mis. `chown -R 1001:1001 /var/www/kahade-storage`. Mengganti `STORAGE_PATH` berarti
+memperbarui KETIGA tempat: mount `api`, mount `nginx`, dan alias di
+`nginx/nginx.conf`.
+
+Saat mengubah lokasi berkas statis di nginx, jalankan
+`nginx -t` di server sebelum reload, dan verifikasi `curl -I` URL publik
+(`/uploads/showcase-videos/...`) mengembalikan `200` + `video/mp4` serta `206`
+untuk `Range: bytes=0-1023`.
 
 ## Triase cepat (15 menit)
 

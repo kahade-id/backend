@@ -240,14 +240,18 @@ export const SHOWCASE_VIDEO_MAX_DIMENSION_PX = 3840;
  * Guard kasar multer di POST /upload/direct.
  *
  * UPV-08 (audit upload video 2026-10-03): HARUS di bawah
- * `client_max_body_size 105M` nginx (= 105.000.000 byte) agar guard multer
- * yang trip duluan — sehingga 413 terstruktur `{ code: 'PAYLOAD_TOO_LARGE' }`
- * dari `MulterTooLargeInterceptor` yang sampai ke klien, bukan halaman 413
- * HTML mentah nginx. 104 MiB = 109.051.904 byte (< 105.000.000) dan tetap di
- * atas batas video showcase 100 MiB.
- * Rekomendasi infra: naikkan nginx ke `client_max_body_size 115M` agar
- * selisihnya tidak terlalu tipis (perubahan nginx = akses server, di luar
- * lingkup commit ini).
+ * `client_max_body_size` nginx untuk jalur upload agar guard multer yang trip
+ * duluan — sehingga 413 terstruktur `{ code: 'PAYLOAD_TOO_LARGE' }` dari
+ * `MulterTooLargeInterceptor` yang sampai ke klien, bukan halaman 413 HTML
+ * mentah nginx.
+ *
+ * Bug #2 (2026-10-07): nilai lama ("105M", 105.000.000 byte) SALAH HITUNG —
+ * 104 MiB = 109.051.904 byte LEBIH BESAR dari 105.000.000, jadi nginx-lah yang
+ * menolak lebih dulu. Config nginx (`deploy/nginx.conf` + `nginx/nginx.conf`)
+ * kini memakai `client_max_body_size 115M` (120.795.136 byte) khusus jalur
+ * `/v1/upload/` — selisih ~11 MiB di atas guard multer, tetap di atas batas
+ * video showcase 100 MiB, dan route JSON lain tetap dibatasi 1m seperti
+ * sebelumnya.
  */
 export const UPLOAD_DIRECT_MULTER_MAX_BYTES = 104 * 1024 * 1024;
 /** Lebar thumbnail video showcase (px); tinggi mengikuti aspek rasio. */

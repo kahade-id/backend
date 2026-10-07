@@ -28,6 +28,8 @@ services:
       - "127.0.0.1:${NGINX_PORT:-80}:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # Hanya BACA: nginx menyajikan prefix publik; penulisnya tetap service api.
+      - storage_data:/var/www/kahade-storage:ro
     depends_on:
       api:
         condition: service_healthy
@@ -61,12 +63,23 @@ services:
     tmpfs:
       - /tmp
       - /app/.cache
+    # Bug #2: rootfs read_only — TANPA volume writable, setiap upload gagal
+    # EROFS (`503 UPLOAD_STORAGE_UNAVAILABLE`) dan ffmpeg tidak bisa menulis
+    # thumbnail. Volume ini juga di-mount oleh nginx (read-only) agar berkas
+    # publik (avatars/, headers/, showcase-*) bisa diserve langsung.
+    # PENTING: mengubah path ini berarti harus mengubah juga mount nginx dan
+    # alias di nginx/nginx.conf — dijaga test public-storage-serving.spec.ts.
+    volumes:
+      - storage_data:/var/www/kahade-storage
     ports:
       - "127.0.0.1:${PORT:-3000}:3000"
     env_file:
       - .env
     environment:
       NODE_ENV: ${NODE_ENV:-development}
+      # Disamakan dengan mount point di atas supaya `.env` (atau default
+      # aplikasi) tidak bisa menunjuk path lain yang tidak writable.
+      STORAGE_PATH: /var/www/kahade-storage
       DATABASE_URL: postgresql://${POSTGRES_USER:-kahade}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-kahade_db}?connection_limit=20&pool_timeout=10
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       BULL_REDIS_URL: redis://:${REDIS_PASSWORD}@bull-redis:6380
@@ -195,6 +208,9 @@ services:
       - kahade-network
 
 volumes:
+  # Bug #2: storage self-hosted bersama api (rw) & nginx (ro).
+  storage_data:
+    driver: local
   postgres_data:
     driver: local
   redis_data:

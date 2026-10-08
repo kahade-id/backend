@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, NotFoundException, Logger, ConflictException, InternalServerErrorException, PayloadTooLargeException, ServiceUnavailableException } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, Logger, ConflictException, InternalServerErrorException, PayloadTooLargeException, ServiceUnavailableException, UnsupportedMediaTypeException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHash, createHmac, timingSafeEqual } from 'crypto';
 import { Readable } from 'stream';
@@ -47,6 +47,8 @@ export const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
   // Batch 19 TIM A (item 1): video showcase — mp4/mov/webm, magic-byte
   // terverifikasi di MAGIC_BYTES (ftyp brand spesifik / EBML).
   [UploadPurpose.SHOWCASE_VIDEO]: ['video/mp4', 'video/quicktime', 'video/webm'],
+  [UploadPurpose.STORY_MEDIA]: ['image/jpeg', 'image/png', 'image/webp'],
+  [UploadPurpose.STORY_HIGHLIGHT]: ['image/jpeg', 'image/png', 'image/webp'],
   [UploadPurpose.AVATAR]: ['image/jpeg', 'image/png', 'image/webp'],
   [UploadPurpose.CHAT_ATTACHMENT]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm', 'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/mp4'],
   [UploadPurpose.DISPUTE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm'],
@@ -94,6 +96,8 @@ export const MAX_FILE_SIZE: Record<UploadPurpose, number> = {
   [UploadPurpose.SHOWCASE_IMAGE]: 5 * 1024 * 1024,
   // Batch 19 TIM A (item 1): 100 MiB (lihat SHOWCASE_VIDEO_MAX_BYTES).
   [UploadPurpose.SHOWCASE_VIDEO]: SHOWCASE_VIDEO_MAX_BYTES,
+  [UploadPurpose.STORY_MEDIA]: 10 * 1024 * 1024,
+  [UploadPurpose.STORY_HIGHLIGHT]: 10 * 1024 * 1024,
   [UploadPurpose.AVATAR]: 2 * 1024 * 1024,
   [UploadPurpose.CHAT_ATTACHMENT]: 50 * 1024 * 1024,
   // SYS-C-303 (audit sistemik ronde 3, 2026-10-03): DISPUTE_EVIDENCE disamakan
@@ -283,6 +287,8 @@ const PURPOSE_VISIBILITY: Record<UploadPurpose, 'private' | 'public'> = {
   // Batch 19 TIM A (item 1): video showcase tampil publik di feed — diserve
   // nginx dengan HTTP Range (seek). Thumbnail-nya masuk SHOWCASE_IMAGE.
   [UploadPurpose.SHOWCASE_VIDEO]: 'public',
+  [UploadPurpose.STORY_MEDIA]: 'private',
+  [UploadPurpose.STORY_HIGHLIGHT]: 'private',
   [UploadPurpose.AVATAR]: 'public',
   [UploadPurpose.CHAT_ATTACHMENT]: 'private',
   [UploadPurpose.DISPUTE_EVIDENCE]: 'private',
@@ -304,6 +310,8 @@ const PURPOSE_FOLDER_MAP_INTERNAL: Record<UploadPurpose, string> = {
   [UploadPurpose.BUSINESS_DOCUMENT]: 'business-documents',
   [UploadPurpose.SHOWCASE_IMAGE]: 'showcase-images',
   [UploadPurpose.SHOWCASE_VIDEO]: 'showcase-videos',
+  [UploadPurpose.STORY_MEDIA]: 'story-media',
+  [UploadPurpose.STORY_HIGHLIGHT]: 'story-highlights',
   [UploadPurpose.AVATAR]: 'avatars',
   [UploadPurpose.CHAT_ATTACHMENT]: 'chat-attachments',
   [UploadPurpose.DISPUTE_EVIDENCE]: 'dispute-evidence',
@@ -397,6 +405,12 @@ export interface DirectUploadResult {
  * memetakan copy per kode (lihat VIDEO_UPLOAD_ERROR_COPY).
  */
 export function fileTooLargeException(purpose: UploadPurpose | undefined, maxSize: number): PayloadTooLargeException {
+  if (purpose === UploadPurpose.STORY_MEDIA) {
+    return new PayloadTooLargeException({
+      code: 'STORY_MEDIA_TOO_LARGE',
+      message: 'Ukuran foto story maksimal 10 MB.',
+    });
+  }
   if (purpose === UploadPurpose.SHOWCASE_VIDEO) {
     return new PayloadTooLargeException({
       code: ErrorCodes.VIDEO_TOO_LARGE,
@@ -625,7 +639,6 @@ export class UploadService {
 
     const exists = await this.localStorage.fileExists(decodedKey);
 
-    let contentLength: number | undefined;
     let storedContentType: string | undefined;
     if (!exists) {
       await this.redis.del(redisKey);
@@ -635,7 +648,7 @@ export class UploadService {
         message: 'File not found in storage. It may not have been uploaded or has expired.',
       });
     }
-    contentLength = await this.localStorage.getFileSize(decodedKey) ?? undefined;
+    const contentLength = await this.localStorage.getFileSize(decodedKey) ?? undefined;
     // storedContentType tidak tersedia di local storage — deteksi dari bytes di bawah (lebih kuat).
 
     if (detectedPurpose) {
@@ -1214,13 +1227,19 @@ export class UploadService {
   ): Promise<DirectUploadResult> {
     const allowedTypes = ALLOWED_CONTENT_TYPES[purpose];
     if (!allowedTypes.includes(contentType)) {
+      if (purpose === UploadPurpose.STORY_MEDIA) {
+        throw new UnsupportedMediaTypeException({
+          code: 'STORY_MEDIA_TYPE',
+          message: 'Format foto story harus JPEG, PNG, atau WEBP.',
+        });
+      }
       throw new BadRequestException({
         code: ErrorCodes.MIME_TYPE_MISMATCH,
         message: `Content type ${contentType} is not allowed for ${purpose}. Allowed: ${allowedTypes.join(', ')}`,
       });
     }
 
-    if (fileBuffer.length < MIN_FILE_SIZE) {
+    if (fileBuffer.length < (purpose === UploadPurpose.STORY_MEDIA ? 1 : MIN_FILE_SIZE)) {
       throw new BadRequestException({
         code: ErrorCodes.INVALID_FILE_TYPE,
         message: `File is too small (${fileBuffer.length} bytes). Minimum size is ${MIN_FILE_SIZE} bytes`,
@@ -1235,24 +1254,54 @@ export class UploadService {
     const header = fileBuffer.subarray(0, MIME_HEADER_BYTES);
     const detectedMime = detectMimeFromBytes(header);
     if (!detectedMime) {
+      if (purpose === UploadPurpose.STORY_MEDIA) {
+        throw new UnsupportedMediaTypeException({
+          code: 'STORY_MEDIA_TYPE',
+          message: 'Foto story tidak valid.',
+        });
+      }
       throw new BadRequestException({
         code: ErrorCodes.MIME_TYPE_MISMATCH,
         message: 'Unable to identify file type from content. The file may be corrupted or unsupported.',
       });
     }
     if (detectedMime !== contentType) {
+      if (purpose === UploadPurpose.STORY_MEDIA) {
+        throw new UnsupportedMediaTypeException({
+          code: 'STORY_MEDIA_TYPE',
+          message: 'Isi file tidak sesuai dengan format foto yang dikirim.',
+        });
+      }
       throw new BadRequestException({
         code: ErrorCodes.MIME_TYPE_MISMATCH,
         message: `File content (${detectedMime}) does not match declared type (${contentType})`,
       });
     }
 
-    const fileKey = this.buildStoredFileKey(userId, purpose, fileName, detectedMime);
-
-    // LOW (SEC-D): strip metadata EXIF/XMP (termasuk GPS) dari foto — lossless,
-    // tanpa re-encode. Foto dari HP membawa koordinat GPS di EXIF; tanpa ini
-    // lokasi rumah/user bisa bocor lewat foto profil/etalase/KYC.
-    const storedBuffer = stripImageMetadata(fileBuffer, detectedMime);
+    // Story photos are re-encoded to metadata-free JPEG and resized server-side
+    // to a 1600px longest edge. Other upload purposes keep their existing
+    // lossless EXIF-stripping pipeline.
+    let storedMime = detectedMime;
+    let storedBuffer: Buffer;
+    if (purpose === UploadPurpose.STORY_MEDIA) {
+      try {
+        storedMime = 'image/jpeg';
+        storedBuffer = await sharp(fileBuffer)
+          .rotate()
+          .resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 86, mozjpeg: true })
+          .toBuffer();
+      } catch {
+        throw new UnsupportedMediaTypeException({
+          code: 'STORY_MEDIA_TYPE',
+          message: 'Foto story tidak dapat diproses. Gunakan JPEG, PNG, atau WEBP yang valid.',
+        });
+      }
+    } else {
+      // LOW (SEC-D): strip metadata EXIF/XMP (termasuk GPS) tanpa re-encode.
+      storedBuffer = stripImageMetadata(fileBuffer, detectedMime);
+    }
+    const fileKey = this.buildStoredFileKey(userId, purpose, fileName, storedMime);
 
     try {
       await this.localStorage.saveFile(fileKey, storedBuffer);
@@ -1261,7 +1310,13 @@ export class UploadService {
       throw this.storageFailureException(error);
     }
 
-    return this.finalizeDirectUpload(userId, purpose, fileKey, detectedMime, fileBuffer);
+    return this.finalizeDirectUpload(
+      userId,
+      purpose,
+      fileKey,
+      storedMime,
+      purpose === UploadPurpose.SHOWCASE_IMAGE ? fileBuffer : undefined,
+    );
   }
 
   /**
@@ -1680,7 +1735,13 @@ export class UploadService {
       }
 
       try {
-        await this.localStorage.deleteFile(fileKey);
+        const deletedFromStorage = await this.localStorage.deleteFile(fileKey);
+        if (!deletedFromStorage) {
+          this.logger.warn(`Storage declined deletion for file key=${fileKey}`);
+          errors.push({ fileKey, reason: 'storage deletion failed' });
+          continue;
+        }
+
         const redisKey = `confirmed_upload:${userId}:${fileKey}`;
         await this.redis.del(redisKey);
         deleted++;

@@ -640,7 +640,7 @@ describe('ChatService', () => {
     beforeEach(() => {
       mockPrisma.user.findUnique.mockResolvedValue({ isActive: true, isBanned: false });
       mockPrisma.chatRoom.findFirst.mockResolvedValue(null);
-      mockPrisma.chatRoom.create.mockResolvedValue({ id: 'room-new' });
+      mockPrisma.chatRoom.create.mockResolvedValue({ id: 'room-new', status: 'ACTIVE' });
       mockPrisma.chatRoom.findUnique.mockResolvedValue({
         id: 'room-new',
         type: 'INQUIRY',
@@ -683,7 +683,7 @@ describe('ChatService', () => {
     });
 
     it('REUSES an existing inquiry room for the same pair', async () => {
-      mockPrisma.chatRoom.findFirst.mockResolvedValue({ id: 'room-existing' });
+      mockPrisma.chatRoom.findFirst.mockResolvedValue({ id: 'room-existing', status: 'ACTIVE' });
       mockPrisma.chatRoom.findUnique.mockResolvedValue({
         id: 'room-existing',
         type: 'INQUIRY',
@@ -696,6 +696,16 @@ describe('ChatService', () => {
       await service.createInquiry('buyer', { counterpartId: 'seller', message: 'Halo lagi' });
       expect(mockPrisma.chatRoom.create).not.toHaveBeenCalled();
       expect(mockPrisma.chatMessage.create).toHaveBeenCalled();
+    });
+
+    it('does not send Story replies to a previously closed inquiry room', async () => {
+      mockPrisma.chatRoom.findFirst.mockResolvedValue({ id: 'room-closed', status: 'CLOSED' });
+
+      await expect(service.createInquiry('buyer', { counterpartId: 'seller', message: 'Halo', }, 'story-1')).rejects.toMatchObject({
+        response: { code: 'CHAT_ROOM_CLOSED' },
+      });
+      expect(mockPrisma.chatMessage.create).not.toHaveBeenCalled();
+      expect(mockPrisma.chatRoom.create).not.toHaveBeenCalled();
     });
 
     it('REJECTS opening a conversation with yourself', async () => {

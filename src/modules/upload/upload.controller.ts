@@ -153,6 +153,18 @@ export class UploadController {
         message: `Invalid purpose. Must be one of: ${Object.values(UploadPurpose).join(', ')}`,
       });
     }
+    if (purpose === UploadPurpose.STORY_HIGHLIGHT) {
+      throw new BadRequestException({
+        code: 'INVALID_FILE_TYPE',
+        message: 'Story highlight media is created only by archiving an existing Story',
+      });
+    }
+    if (purpose === UploadPurpose.STORY_MEDIA) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: 'Upload story media through POST /v1/stories/media so it receives a single-use mediaId.',
+      });
+    }
     return this.uploadService.uploadDirect(
       userId,
       purpose as UploadPurpose,

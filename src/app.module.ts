@@ -34,6 +34,7 @@ import { MilestonesModule } from './modules/milestones/milestones.module';
 import { CourierModule } from './modules/courier/courier.module';
 import { ReturnsModule } from './modules/returns/returns.module';
 import { ChatModule } from './modules/chat/chat.module';
+import { StoriesModule } from './modules/stories/stories.module';
 import { DisputesModule } from './modules/disputes/disputes.module';
 import { RatingsModule } from './modules/ratings/ratings.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
@@ -160,6 +161,7 @@ const runtimeEnvFile = getRuntimeEnvFile();
     CourierModule,
     ReturnsModule,
     ChatModule,
+    StoriesModule,
     DisputesModule,
     RatingsModule,
     NotificationsModule,

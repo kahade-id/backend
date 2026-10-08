@@ -3940,8 +3940,9 @@
           },
           {
             "name": "cursor",
-            "required": true,
+            "required": false,
             "in": "query",
+            "description": "Keyset cursor dari nextCursor respons sebelumnya",
             "schema": {
               "type": "string"
             }
@@ -4253,16 +4254,22 @@
           },
           {
             "name": "sort",
-            "required": true,
+            "required": false,
             "in": "query",
+            "description": "Urutan komentar root: newest (default) atau oldest",
             "schema": {
-              "type": "string"
+              "type": "string",
+              "enum": [
+                "newest",
+                "oldest"
+              ]
             }
           },
           {
             "name": "cursor",
-            "required": true,
+            "required": false,
             "in": "query",
+            "description": "Keyset cursor dari nextCursor (NP-008)",
             "schema": {
               "type": "string"
             }
@@ -4443,8 +4450,9 @@
           },
           {
             "name": "cursor",
-            "required": true,
+            "required": false,
             "in": "query",
+            "description": "Keyset cursor dari nextCursor respons sebelumnya",
             "schema": {
               "type": "string"
             }
@@ -4499,8 +4507,9 @@
           },
           {
             "name": "cursor",
-            "required": true,
+            "required": false,
             "in": "query",
+            "description": "Keyset cursor dari nextCursor respons sebelumnya",
             "schema": {
               "type": "string"
             }
@@ -4810,12 +4819,15 @@
                       "BUSINESS_DOCUMENT",
                       "SHOWCASE_IMAGE",
                       "SHOWCASE_VIDEO",
+                      "STORY_MEDIA",
+                      "STORY_HIGHLIGHT",
                       "AVATAR",
                       "CHAT_ATTACHMENT",
                       "DISPUTE_EVIDENCE",
                       "REPORT_EVIDENCE",
                       "DELIVERY_PROOF",
-                      "MILESTONE_EVIDENCE"
+                      "MILESTONE_EVIDENCE",
+                      "CAREER_CV"
                     ]
                   }
                 }
@@ -7381,7 +7393,7 @@
     },
     "/v1/business-verification/submit": {
       "post": {
-        "description": "Hanya tersedia untuk akun dengan accountType=BUSINESS. Mengajukan NPWP, nama badan usaha, nomor akta/SIUP, dan dokumen pendukung untuk direview admin. Mengaktifkan badge \"Business Verified\" setelah APPROVED.",
+        "description": "Tersedia untuk akun PERSONAL maupun BUSINESS. Mengajukan NPWP, nama badan usaha, nomor akta/SIUP, dan dokumen pendukung untuk direview admin. Mengaktifkan badge \"Business Verified\" dan accountType BUSINESS setelah APPROVED.",
         "operationId": "BusinessVerificationController_submit",
         "parameters": [],
         "requestBody": {
@@ -7402,7 +7414,7 @@
             "description": "Sudah ada pengajuan PENDING/APPROVED, NPWP duplikat, atau dokumen belum dikonfirmasi."
           },
           "403": {
-            "description": "Akun bukan BUSINESS, atau verifikasi sebelumnya sudah di-revoke."
+            "description": "Verifikasi sebelumnya sudah di-revoke, atau akun tidak ditemukan."
           }
         },
         "security": [
@@ -7896,6 +7908,61 @@
                 "desc"
               ]
             }
+          },
+          {
+            "name": "kind",
+            "required": false,
+            "in": "query",
+            "description": "Filter jenis transaksi escrow (POIN 2 2026-10-04). DEPRECATED: pakai fulfillment/participantMode/category.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "DIRECT",
+                "JASTIP",
+                "PATUNGAN",
+                "SERVICE_BOOKING"
+              ]
+            }
+          },
+          {
+            "name": "fulfillment",
+            "required": false,
+            "in": "query",
+            "description": "Filter waktu pemenuhan (TX-UNIFIED-V2)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "BIASA",
+                "PREORDER"
+              ]
+            }
+          },
+          {
+            "name": "participantMode",
+            "required": false,
+            "in": "query",
+            "description": "Filter mode peserta (TX-UNIFIED-V2)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "SINGLE",
+                "GROUP"
+              ]
+            }
+          },
+          {
+            "name": "category",
+            "required": false,
+            "in": "query",
+            "description": "Filter kategori (TX-UNIFIED-V2)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "FISIK",
+                "DIGITAL",
+                "JASA"
+              ]
+            }
           }
         ],
         "responses": {
@@ -8337,6 +8404,35 @@
             "access-token": []
           }
         ],
+        "tags": [
+          "orders"
+        ]
+      }
+    },
+    "/v1/orders/{orderId}/preorder-estimate": {
+      "put": {
+        "operationId": "OrdersController_updatePreorderEstimate",
+        "parameters": [
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "TX-UNIFIED-V2 (P1-3): seller ubah estimasi fulfillment PREORDER (sebelum buyer bayar)",
         "tags": [
           "orders"
         ]
@@ -10501,10 +10597,27 @@
         ]
       }
     },
-    "/v1/products": {
+    "/v1/support/tickets": {
       "get": {
-        "operationId": "ProductsController_catalog",
-        "parameters": [],
+        "operationId": "SupportController_getTickets",
+        "parameters": [
+          {
+            "name": "page",
+            "required": true,
+            "in": "query",
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "limit",
+            "required": true,
+            "in": "query",
+            "schema": {
+              "type": "number"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": ""
@@ -10515,20 +10628,90 @@
             "access-token": []
           }
         ],
-        "summary": "Katalog produk publik + filter kategori/harga/ketersediaan (G260)",
+        "summary": "List my support tickets",
         "tags": [
-          "products"
+          "support"
         ]
-      },
+      }
+    },
+    "/v1/support/tickets/{ticketId}/fingerprint": {
+      "get": {
+        "description": "D1-010: fingerprint ringan untuk poll — status + updatedAt + jumlah balasan. Klien me-refresh bundle penuh hanya bila fingerprint berubah.",
+        "operationId": "SupportController_getTicketFingerprint",
+        "parameters": [
+          {
+            "name": "ticketId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Get ticket fingerprint (lightweight)",
+        "tags": [
+          "support"
+        ]
+      }
+    },
+    "/v1/support/tickets/{ticketId}": {
+      "get": {
+        "operationId": "SupportController_getTicketDetail",
+        "parameters": [
+          {
+            "name": "ticketId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Get ticket detail",
+        "tags": [
+          "support"
+        ]
+      }
+    },
+    "/v1/support/tickets/{ticketId}/reply": {
       "post": {
-        "operationId": "ProductsController_create",
-        "parameters": [],
+        "operationId": "SupportController_replyToTicket",
+        "parameters": [
+          {
+            "name": "ticketId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/CreateProductDto"
+                "$ref": "#/components/schemas/ReplyTicketDto"
               }
             }
           }
@@ -10543,26 +10726,191 @@
             "access-token": []
           }
         ],
-        "summary": "Seller membuat produk (G262)",
+        "summary": "Reply to a ticket",
         "tags": [
-          "products"
+          "support"
         ]
       }
     },
-    "/v1/products/seller/mine": {
-      "get": {
-        "operationId": "ProductsController_myProducts",
+    "/v1/support/tickets/{ticketId}/close": {
+      "post": {
+        "operationId": "SupportController_closeTicket",
         "parameters": [
           {
-            "name": "search",
+            "name": "ticketId",
             "required": true,
-            "in": "query",
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Close own ticket (14.1)",
+        "tags": [
+          "support"
+        ]
+      }
+    },
+    "/v1/support/tickets/{ticketId}/reopen": {
+      "post": {
+        "operationId": "SupportController_reopenTicket",
+        "parameters": [
+          {
+            "name": "ticketId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Reopen own closed ticket",
+        "tags": [
+          "support"
+        ]
+      }
+    },
+    "/v1/support/tickets/{ticketId}/rate": {
+      "post": {
+        "operationId": "SupportController_rateTicket",
+        "parameters": [
+          {
+            "name": "ticketId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Rate resolved ticket (14.1)",
+        "tags": [
+          "support"
+        ]
+      }
+    },
+    "/v1/support/chat/conversations": {
+      "get": {
+        "operationId": "SupportController_listConversations",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "List my support conversations",
+        "tags": [
+          "support"
+        ]
+      },
+      "post": {
+        "description": "Idempoten: satu user hanya punya satu percakapan aktif (WAITING/ASSIGNED/OPEN).",
+        "operationId": "SupportController_getOrCreateConversation",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateConversationDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Get or create my active support conversation",
+        "tags": [
+          "support"
+        ]
+      }
+    },
+    "/v1/support/chat/conversations/{conversationId}": {
+      "get": {
+        "operationId": "SupportController_getConversation",
+        "parameters": [
+          {
+            "name": "conversationId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Get my support conversation detail",
+        "tags": [
+          "support"
+        ]
+      }
+    },
+    "/v1/support/chat/conversations/{conversationId}/messages": {
+      "get": {
+        "operationId": "SupportController_getConversationMessages",
+        "parameters": [
+          {
+            "name": "conversationId",
+            "required": true,
+            "in": "path",
             "schema": {
               "type": "string"
             }
           },
           {
-            "name": "page",
+            "name": "cursor",
             "required": true,
             "in": "query",
             "schema": {
@@ -10574,7 +10922,7 @@
             "required": true,
             "in": "query",
             "schema": {
-              "type": "string"
+              "type": "number"
             }
           }
         ],
@@ -10588,84 +10936,18 @@
             "access-token": []
           }
         ],
-        "summary": "Daftar produk milik seller + pencarian SKU/varian (G270)",
+        "summary": "Paginated message history (cursor = ISO timestamp)",
         "tags": [
-          "products"
+          "support"
         ]
       }
     },
-    "/v1/products/{id}": {
-      "get": {
-        "operationId": "ProductsController_detail",
-        "parameters": [
-          {
-            "name": "id",
-            "required": true,
-            "in": "path",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Detail produk + tautan profil bisnis (G269)",
-        "tags": [
-          "products"
-        ]
-      },
-      "patch": {
-        "operationId": "ProductsController_update",
-        "parameters": [
-          {
-            "name": "id",
-            "required": true,
-            "in": "path",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdateProductDto"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Seller mengedit produk (G262)",
-        "tags": [
-          "products"
-        ]
-      }
-    },
-    "/v1/products/{id}/status": {
+    "/v1/support/chat/conversations/{conversationId}/close": {
       "post": {
-        "operationId": "ProductsController_setStatus",
+        "operationId": "SupportController_closeConversation",
         "parameters": [
           {
-            "name": "id",
+            "name": "conversationId",
             "required": true,
             "in": "path",
             "schema": {
@@ -10673,18 +10955,8 @@
             }
           }
         ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdateProductStatusDto"
-              }
-            }
-          }
-        },
         "responses": {
-          "200": {
+          "201": {
             "description": ""
           }
         },
@@ -10693,18 +10965,18 @@
             "access-token": []
           }
         ],
-        "summary": "Ubah status listing DRAFT/ACTIVE/OUT_OF_STOCK/ARCHIVED (G261)",
+        "summary": "Close my support conversation",
         "tags": [
-          "products"
+          "support"
         ]
       }
     },
-    "/v1/products/{id}/variants": {
+    "/v1/support/chat/conversations/{conversationId}/rate": {
       "post": {
-        "operationId": "ProductsController_createVariant",
+        "operationId": "SupportController_rateConversation",
         "parameters": [
           {
-            "name": "id",
+            "name": "conversationId",
             "required": true,
             "in": "path",
             "schema": {
@@ -10717,7 +10989,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/CreateVariantDto"
+                "$ref": "#/components/schemas/RateConversationDto"
               }
             }
           }
@@ -10732,429 +11004,9 @@
             "access-token": []
           }
         ],
-        "summary": "Tambah varian (ukuran/warna) dengan kombinasi tervalidasi (G253)",
+        "summary": "Rate a closed support conversation (1-5)",
         "tags": [
-          "products"
-        ]
-      }
-    },
-    "/v1/products/variants/{variantId}": {
-      "patch": {
-        "operationId": "ProductsController_updateVariant",
-        "parameters": [
-          {
-            "name": "variantId",
-            "required": true,
-            "in": "path",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdateVariantDto"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Edit varian (harga/ambang/berat)",
-        "tags": [
-          "products"
-        ]
-      }
-    },
-    "/v1/inventory/pre-checkout": {
-      "post": {
-        "operationId": "InventoryController_preCheckout",
-        "parameters": [],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PreCheckoutDto"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Validasi server harga & stok terkini + kebijakan sebelum checkout (G274)",
-        "tags": [
-          "inventory"
-        ]
-      }
-    },
-    "/v1/inventory/order-lines": {
-      "post": {
-        "operationId": "InventoryController_attachOrderLines",
-        "parameters": [],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AttachOrderLinesDto"
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Lampirkan order lines (snapshot qty + harga satuan) ke order (G259)",
-        "tags": [
-          "inventory"
-        ]
-      }
-    },
-    "/v1/inventory/adjust": {
-      "post": {
-        "operationId": "InventoryController_adjust",
-        "parameters": [],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AdjustStockDto"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Penyesuaian stok manual — alasan wajib, hanya pemilik (G267)",
-        "tags": [
-          "inventory"
-        ]
-      }
-    },
-    "/v1/inventory/movements": {
-      "get": {
-        "operationId": "InventoryController_movements",
-        "parameters": [],
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Riwayat mutasi stok beraudit milik seller (G266)",
-        "tags": [
-          "inventory"
-        ]
-      }
-    },
-    "/v1/inventory/low-stock": {
-      "get": {
-        "operationId": "InventoryController_lowStock",
-        "parameters": [],
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Peringatan stok menipis per SKU (G264)",
-        "tags": [
-          "inventory"
-        ]
-      }
-    },
-    "/v1/inventory/bulk-update": {
-      "post": {
-        "operationId": "InventoryController_bulkUpdate",
-        "parameters": [],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/BulkUpdateDto"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Bulk update harga/stok dengan pratinjau dry-run (G265)",
-        "tags": [
-          "inventory"
-        ]
-      }
-    },
-    "/v1/inventory/import": {
-      "post": {
-        "operationId": "InventoryController_importCsv",
-        "parameters": [],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ImportCsvDto"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Impor CSV stok dengan validasi per baris + laporan error (G263)",
-        "tags": [
-          "inventory"
-        ]
-      }
-    },
-    "/v1/inventory/export": {
-      "get": {
-        "operationId": "InventoryController_exportCsv",
-        "parameters": [],
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Ekspor CSV stok produk milik seller (G263)",
-        "tags": [
-          "inventory"
-        ]
-      }
-    },
-    "/v1/admin/inventory/products": {
-      "get": {
-        "operationId": "InventoryAdminController_listProducts",
-        "parameters": [
-          {
-            "name": "moderationStatus",
-            "required": true,
-            "in": "query",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "search",
-            "required": true,
-            "in": "query",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "page",
-            "required": true,
-            "in": "query",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "limit",
-            "required": true,
-            "in": "query",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Daftar produk untuk moderasi (G272)",
-        "tags": [
-          "admin-inventory"
-        ]
-      }
-    },
-    "/v1/admin/inventory/products/{id}/moderate": {
-      "post": {
-        "operationId": "InventoryAdminController_moderate",
-        "parameters": [
-          {
-            "name": "id",
-            "required": true,
-            "in": "path",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ModerateProductDto"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Moderasi produk: APPROVED/REJECTED/FLAGGED (G272)",
-        "tags": [
-          "admin-inventory"
-        ]
-      }
-    },
-    "/v1/admin/inventory/products/{id}/moderation-events": {
-      "get": {
-        "operationId": "InventoryAdminController_moderationEvents",
-        "parameters": [
-          {
-            "name": "id",
-            "required": true,
-            "in": "path",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Jejak audit moderasi produk (G272)",
-        "tags": [
-          "admin-inventory"
-        ]
-      }
-    },
-    "/v1/admin/inventory/movements": {
-      "get": {
-        "operationId": "InventoryAdminController_movements",
-        "parameters": [],
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Riwayat mutasi stok lintas seller (G266)",
-        "tags": [
-          "admin-inventory"
-        ]
-      }
-    },
-    "/v1/admin/inventory/adjust": {
-      "post": {
-        "operationId": "InventoryAdminController_adminAdjust",
-        "parameters": [],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AdjustStockDto"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Penyesuaian stok oleh admin — alasan wajib (G267)",
-        "tags": [
-          "admin-inventory"
+          "support"
         ]
       }
     },
@@ -14769,6 +14621,682 @@
         ]
       }
     },
+    "/v1/stories/tray": {
+      "get": {
+        "operationId": "StoriesController_getTray",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Story tray untuk pemilik dan profil yang disimpan viewer",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/users/{userId}": {
+      "get": {
+        "operationId": "StoriesController_getUserStories",
+        "parameters": [
+          {
+            "name": "userId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Story aktif milik satu user yang dapat dilihat viewer",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/me": {
+      "get": {
+        "operationId": "StoriesController_getMyStories",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Story aktif milik viewer",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/media": {
+      "post": {
+        "operationId": "StoriesController_uploadMedia",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "file"
+                ],
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "mediaId",
+                    "url"
+                  ],
+                  "properties": {
+                    "mediaId": {
+                      "type": "string"
+                    },
+                    "url": {
+                      "type": "string",
+                      "format": "uri"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Unggah foto story ke penyimpanan disk privat",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories": {
+      "post": {
+        "operationId": "StoriesController_createStory",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateStoryDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Buat story foto atau teks dengan privasi per-story",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/{storyId}": {
+      "delete": {
+        "operationId": "StoriesController_deleteStory",
+        "parameters": [
+          {
+            "name": "storyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Hapus lunak story milik sendiri",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/{storyId}/views": {
+      "post": {
+        "operationId": "StoriesController_markViewed",
+        "parameters": [
+          {
+            "name": "storyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Catat view story secara idempoten",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/{storyId}/viewers": {
+      "get": {
+        "operationId": "StoriesController_getViewers",
+        "parameters": [
+          {
+            "name": "storyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "default": 1,
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Object"
+                }
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 30,
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Object"
+                }
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Daftar viewer untuk pemilik story",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/{storyId}/reaction": {
+      "put": {
+        "operationId": "StoriesController_setReaction",
+        "parameters": [
+          {
+            "name": "storyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetStoryReactionDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Tambah atau ganti reaksi story",
+        "tags": [
+          "stories"
+        ]
+      },
+      "delete": {
+        "operationId": "StoriesController_removeReaction",
+        "parameters": [
+          {
+            "name": "storyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Hapus reaksi viewer dari story",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/{storyId}/replies": {
+      "post": {
+        "operationId": "StoriesController_replyToStory",
+        "parameters": [
+          {
+            "name": "storyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplyToStoryDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "roomId"
+                  ],
+                  "properties": {
+                    "roomId": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Balas story melalui pipeline moderasi chat",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/{storyId}/report": {
+      "post": {
+        "operationId": "StoriesController_reportStory",
+        "parameters": [
+          {
+            "name": "storyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReportStoryDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "reported",
+                    "reportId"
+                  ],
+                  "properties": {
+                    "reported": {
+                      "type": "boolean",
+                      "enum": [
+                        true
+                      ]
+                    },
+                    "reportId": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Laporkan story yang dapat dilihat viewer",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/mutes": {
+      "get": {
+        "operationId": "StoriesController_getMutes",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Daftar penulis story yang dibisukan viewer",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/mutes/{userId}": {
+      "put": {
+        "operationId": "StoriesController_muteAuthor",
+        "parameters": [
+          {
+            "name": "userId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Bisukan story seorang penulis",
+        "tags": [
+          "stories"
+        ]
+      },
+      "delete": {
+        "operationId": "StoriesController_unmuteAuthor",
+        "parameters": [
+          {
+            "name": "userId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Bunyikan kembali story seorang penulis",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/audience/candidates": {
+      "get": {
+        "operationId": "StoriesController_getAudienceCandidates",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Daftar maksimal 500 profil yang disimpan untuk editor privasi",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/highlights/users/{userId}": {
+      "get": {
+        "operationId": "StoriesController_getUserHighlights",
+        "parameters": [
+          {
+            "name": "userId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Highlight publik pada profil user",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/highlights": {
+      "post": {
+        "operationId": "StoriesController_createHighlight",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateStoryHighlightDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Buat highlight dengan menyalin media story",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
+    "/v1/stories/highlights/{highlightId}": {
+      "patch": {
+        "operationId": "StoriesController_updateHighlight",
+        "parameters": [
+          {
+            "name": "highlightId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateStoryHighlightDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Perbarui judul atau susunan highlight milik sendiri",
+        "tags": [
+          "stories"
+        ]
+      },
+      "delete": {
+        "operationId": "StoriesController_deleteHighlight",
+        "parameters": [
+          {
+            "name": "highlightId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Hapus highlight dan salinan media arsipnya",
+        "tags": [
+          "stories"
+        ]
+      }
+    },
     "/v1/ratings": {
       "post": {
         "operationId": "RatingsController_createRating",
@@ -16908,6 +17436,7 @@
     },
     "/v1/commerce/service-slots/{id}/book": {
       "post": {
+        "deprecated": true,
         "operationId": "ServiceBookingController_bookSlot",
         "parameters": [
           {
@@ -16929,7 +17458,46 @@
             "access-token": []
           }
         ],
-        "summary": "Buyer booking slot",
+        "summary": "DINONAKTIFKAN: gunakan POST /v1/commerce/service-slots/:id/book-with-order",
+        "tags": [
+          "commerce-service-slots"
+        ]
+      }
+    },
+    "/v1/commerce/service-slots/{id}/book-with-order": {
+      "post": {
+        "operationId": "ServiceBookingController_bookWithOrder",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BookServiceSlotDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Buyer booking slot + buat escrow order (BIASA+SINGLE+JASA)",
         "tags": [
           "commerce-service-slots"
         ]
@@ -17516,6 +18084,7 @@
     },
     "/v1/jastip/participants/{participantId}/link-order": {
       "post": {
+        "deprecated": true,
         "operationId": "JastipController_linkOrder",
         "parameters": [
           {
@@ -17547,7 +18116,36 @@
             "access-token": []
           }
         ],
-        "summary": "Buyer menautkan escrow order yang sudah dibayar",
+        "summary": "DINONAKTIFKAN: gunakan POST /v1/jastip/participants/:id/create-order",
+        "tags": [
+          "jastip"
+        ]
+      }
+    },
+    "/v1/jastip/participants/{participantId}/create-order": {
+      "post": {
+        "operationId": "JastipController_createOrder",
+        "parameters": [
+          {
+            "name": "participantId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Buyer membuat escrow order dari peserta (PREORDER+SINGLE+FISIK, orderId terisi otomatis)",
         "tags": [
           "jastip"
         ]
@@ -17724,6 +18322,7 @@
     },
     "/v1/patungan/participants/{participantId}/link-order": {
       "post": {
+        "deprecated": true,
         "operationId": "PatunganController_linkOrder",
         "parameters": [
           {
@@ -17755,7 +18354,36 @@
             "access-token": []
           }
         ],
-        "summary": "Tautkan escrow order yang sudah dibayar ke partisipasi",
+        "summary": "DINONAKTIFKAN: gunakan POST /v1/patungan/participants/:id/create-order",
+        "tags": [
+          "patungan"
+        ]
+      }
+    },
+    "/v1/patungan/participants/{participantId}/create-order": {
+      "post": {
+        "operationId": "PatunganController_createOrder",
+        "parameters": [
+          {
+            "name": "participantId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Buat escrow order dari partisipasi (BIASA+GROUP+FISIK, orderId terisi otomatis)",
         "tags": [
           "patungan"
         ]
@@ -18169,6 +18797,50 @@
         "summary": "Detail trip jastip (admin)",
         "tags": [
           "admin-jastip-trips"
+        ]
+      }
+    },
+    "/v1/admin/service-bookings": {
+      "get": {
+        "operationId": "AdminServiceBookingsController_list",
+        "parameters": [
+          {
+            "name": "page",
+            "required": false,
+            "in": "query",
+            "description": "Page number",
+            "schema": {
+              "minimum": 1,
+              "default": 1,
+              "type": "number"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "description": "Items per page",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Daftar booking jasa (admin, read-only)",
+        "tags": [
+          "admin-service-bookings"
         ]
       }
     },
@@ -21288,256 +21960,6 @@
         ]
       }
     },
-    "/v1/support/tickets": {
-      "get": {
-        "operationId": "SupportController_getTickets",
-        "parameters": [
-          {
-            "name": "page",
-            "required": true,
-            "in": "query",
-            "schema": {
-              "type": "number"
-            }
-          },
-          {
-            "name": "limit",
-            "required": true,
-            "in": "query",
-            "schema": {
-              "type": "number"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "List my support tickets",
-        "tags": [
-          "support"
-        ]
-      },
-      "post": {
-        "operationId": "SupportController_createTicket",
-        "parameters": [],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateTicketDto"
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Create a support ticket",
-        "tags": [
-          "support"
-        ]
-      }
-    },
-    "/v1/support/tickets/{ticketId}/fingerprint": {
-      "get": {
-        "description": "D1-010: fingerprint ringan untuk poll — status + updatedAt + jumlah balasan. Klien me-refresh bundle penuh hanya bila fingerprint berubah.",
-        "operationId": "SupportController_getTicketFingerprint",
-        "parameters": [
-          {
-            "name": "ticketId",
-            "required": true,
-            "in": "path",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Get ticket fingerprint (lightweight)",
-        "tags": [
-          "support"
-        ]
-      }
-    },
-    "/v1/support/tickets/{ticketId}": {
-      "get": {
-        "operationId": "SupportController_getTicketDetail",
-        "parameters": [
-          {
-            "name": "ticketId",
-            "required": true,
-            "in": "path",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Get ticket detail",
-        "tags": [
-          "support"
-        ]
-      }
-    },
-    "/v1/support/tickets/{ticketId}/reply": {
-      "post": {
-        "operationId": "SupportController_replyToTicket",
-        "parameters": [
-          {
-            "name": "ticketId",
-            "required": true,
-            "in": "path",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ReplyTicketDto"
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Reply to a ticket",
-        "tags": [
-          "support"
-        ]
-      }
-    },
-    "/v1/support/tickets/{ticketId}/close": {
-      "post": {
-        "operationId": "SupportController_closeTicket",
-        "parameters": [
-          {
-            "name": "ticketId",
-            "required": true,
-            "in": "path",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "201": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Close own ticket (14.1)",
-        "tags": [
-          "support"
-        ]
-      }
-    },
-    "/v1/support/tickets/{ticketId}/reopen": {
-      "post": {
-        "operationId": "SupportController_reopenTicket",
-        "parameters": [
-          {
-            "name": "ticketId",
-            "required": true,
-            "in": "path",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "201": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Reopen own closed ticket",
-        "tags": [
-          "support"
-        ]
-      }
-    },
-    "/v1/support/tickets/{ticketId}/rate": {
-      "post": {
-        "operationId": "SupportController_rateTicket",
-        "parameters": [
-          {
-            "name": "ticketId",
-            "required": true,
-            "in": "path",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "201": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Rate resolved ticket (14.1)",
-        "tags": [
-          "support"
-        ]
-      }
-    },
     "/v1/feedback": {
       "post": {
         "operationId": "FeedbackController_create",
@@ -21560,6 +21982,462 @@
         "summary": "Kirim feedback (auth opsional, guest didukung)",
         "tags": [
           "feedback"
+        ]
+      }
+    },
+    "/v1/careers/postings": {
+      "get": {
+        "operationId": "CareersController_listPostings",
+        "parameters": [
+          {
+            "name": "active",
+            "required": true,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "summary": "Daftar lowongan aktif (ringkas, tanpa deskripsi penuh)",
+        "tags": [
+          "careers"
+        ]
+      }
+    },
+    "/v1/careers/postings/{slug}": {
+      "get": {
+        "operationId": "CareersController_getPosting",
+        "parameters": [
+          {
+            "name": "slug",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "summary": "Detail lowongan by slug",
+        "tags": [
+          "careers"
+        ]
+      }
+    },
+    "/v1/careers/captcha": {
+      "get": {
+        "operationId": "CareersController_getCaptcha",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "summary": "Minta soal captcha self-hosted (single-use, TTL 5 menit)",
+        "tags": [
+          "careers"
+        ]
+      }
+    },
+    "/v1/careers/upload-cv": {
+      "post": {
+        "operationId": "CareersController_uploadCv",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "file"
+                ],
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "PDF, maks 5 MB"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "summary": "Upload CV (PDF ≤5 MB, one-time consume, kedaluwarsa 1 jam)",
+        "tags": [
+          "careers"
+        ]
+      }
+    },
+    "/v1/careers/applications": {
+      "post": {
+        "operationId": "CareersController_submitApplication",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitApplicationDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "summary": "Kirim lamaran (captcha + honeypot + throttle 5/jam/IP)",
+        "tags": [
+          "careers"
+        ]
+      }
+    },
+    "/v1/careers/applications/{id}": {
+      "delete": {
+        "operationId": "CareersController_deleteApplication",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-deletion-token",
+            "required": true,
+            "in": "header",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "summary": "Hapus lamaran sendiri via header x-deletion-token (UU PDP)",
+        "tags": [
+          "careers"
+        ]
+      }
+    },
+    "/v1/admin/careers/postings": {
+      "get": {
+        "operationId": "AdminCareersController_listPostings",
+        "parameters": [
+          {
+            "name": "page",
+            "required": false,
+            "in": "query",
+            "description": "Page number",
+            "schema": {
+              "minimum": 1,
+              "default": 1,
+              "type": "number"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "description": "Items per page",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20,
+              "type": "number"
+            }
+          },
+          {
+            "name": "active",
+            "required": true,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Daftar semua lowongan + jumlah pelamar",
+        "tags": [
+          "admin-careers"
+        ]
+      },
+      "post": {
+        "operationId": "AdminCareersController_createPosting",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateJobPostingDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Buat lowongan baru (slug otomatis dari judul bila kosong)",
+        "tags": [
+          "admin-careers"
+        ]
+      }
+    },
+    "/v1/admin/careers/postings/{id}": {
+      "patch": {
+        "operationId": "AdminCareersController_updatePosting",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateJobPostingDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Ubah lowongan (termasuk toggle isActive tutup/buka)",
+        "tags": [
+          "admin-careers"
+        ]
+      },
+      "delete": {
+        "operationId": "AdminCareersController_deletePosting",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Hapus lowongan — 409 bila masih ada lamaran",
+        "tags": [
+          "admin-careers"
+        ]
+      }
+    },
+    "/v1/admin/careers/applications": {
+      "get": {
+        "operationId": "AdminCareersController_listApplications",
+        "parameters": [
+          {
+            "name": "page",
+            "required": false,
+            "in": "query",
+            "description": "Page number",
+            "schema": {
+              "minimum": 1,
+              "default": 1,
+              "type": "number"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "description": "Items per page",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20,
+              "type": "number"
+            }
+          },
+          {
+            "name": "postingId",
+            "required": true,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "q",
+            "required": true,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Daftar lamaran (filter postingId/status/q, PII penuh — admin only)",
+        "tags": [
+          "admin-careers"
+        ]
+      }
+    },
+    "/v1/admin/careers/applications/{id}": {
+      "get": {
+        "operationId": "AdminCareersController_getApplication",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Detail lamaran + cvDownloadUrl (signed URL 15 menit) + riwayat status",
+        "tags": [
+          "admin-careers"
+        ]
+      },
+      "delete": {
+        "operationId": "AdminCareersController_deleteApplication",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Hapus lamaran manual (UU PDP) — hard delete + hapus file CV",
+        "tags": [
+          "admin-careers"
+        ]
+      }
+    },
+    "/v1/admin/careers/applications/{id}/status": {
+      "patch": {
+        "operationId": "AdminCareersController_updateStatus",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateApplicationStatusDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Ubah status lamaran (validasi transisi + audit trail + email pelamar)",
+        "tags": [
+          "admin-careers"
         ]
       }
     },
@@ -22937,6 +23815,19 @@
             }
           },
           {
+            "name": "accountType",
+            "required": false,
+            "in": "query",
+            "description": "Filter by account type (PERSONAL/BUSINESS)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "PERSONAL",
+                "BUSINESS"
+              ]
+            }
+          },
+          {
             "name": "sortBy",
             "required": false,
             "in": "query",
@@ -24213,6 +25104,61 @@
                 "COMPLETED",
                 "DISPUTED",
                 "CANCELLED"
+              ]
+            }
+          },
+          {
+            "name": "kind",
+            "required": false,
+            "in": "query",
+            "description": "Filter by jenis transaksi escrow (POIN 2 2026-10-04). DEPRECATED: pakai fulfillment/participantMode/category.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "DIRECT",
+                "JASTIP",
+                "PATUNGAN",
+                "SERVICE_BOOKING"
+              ]
+            }
+          },
+          {
+            "name": "fulfillment",
+            "required": false,
+            "in": "query",
+            "description": "Filter by waktu pemenuhan (TX-UNIFIED-V2)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "BIASA",
+                "PREORDER"
+              ]
+            }
+          },
+          {
+            "name": "participantMode",
+            "required": false,
+            "in": "query",
+            "description": "Filter by mode peserta (TX-UNIFIED-V2)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "SINGLE",
+                "GROUP"
+              ]
+            }
+          },
+          {
+            "name": "category",
+            "required": false,
+            "in": "query",
+            "description": "Filter by kategori (TX-UNIFIED-V2)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "FISIK",
+                "DIGITAL",
+                "JASA"
               ]
             }
           },
@@ -28454,38 +29400,6 @@
         ]
       }
     },
-    "/v1/admin/subscriptions/{subId}": {
-      "get": {
-        "operationId": "AdminSubscriptionsController_getSubscriptionDetail",
-        "parameters": [
-          {
-            "name": "subId",
-            "required": true,
-            "in": "path",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Subscription detail returned."
-          },
-          "404": {
-            "description": "Subscription not found."
-          }
-        },
-        "security": [
-          {
-            "access-token": []
-          }
-        ],
-        "summary": "Get subscription detail + usage periode berjalan",
-        "tags": [
-          "admin-subscriptions"
-        ]
-      }
-    },
     "/v1/admin/subscriptions/promo-codes": {
       "post": {
         "description": "SYS-B-402: requires X-Step-Up-Token (action subscription.promoCode.create). Nilai di atas Rp1.000.000 wajib dual control (actionType MONEY_VALUE_GRANT).",
@@ -28607,6 +29521,38 @@
           }
         ],
         "summary": "Aktifkan kembali kode promo",
+        "tags": [
+          "admin-subscriptions"
+        ]
+      }
+    },
+    "/v1/admin/subscriptions/{subId}": {
+      "get": {
+        "operationId": "AdminSubscriptionsController_getSubscriptionDetail",
+        "parameters": [
+          {
+            "name": "subId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Subscription detail returned."
+          },
+          "404": {
+            "description": "Subscription not found."
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Get subscription detail + usage periode berjalan",
         "tags": [
           "admin-subscriptions"
         ]
@@ -31121,6 +32067,279 @@
         ]
       }
     },
+    "/v1/admin/support/chat/conversations": {
+      "get": {
+        "description": "WAITING diprioritaskan (Kahade+ dulu, lalu FIFO).",
+        "operationId": "AdminSupportChatController_getQueue",
+        "parameters": [
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Filter status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "WAITING",
+                "ASSIGNED",
+                "OPEN",
+                "CLOSED"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Conversation queue returned."
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "List support conversations (queue)",
+        "tags": [
+          "admin-support-chat"
+        ]
+      }
+    },
+    "/v1/admin/support/chat/conversations/{conversationId}": {
+      "get": {
+        "operationId": "AdminSupportChatController_getDetail",
+        "parameters": [
+          {
+            "name": "conversationId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Conversation detail returned."
+          },
+          "404": {
+            "description": "Conversation not found."
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Get conversation detail (admin view)",
+        "tags": [
+          "admin-support-chat"
+        ]
+      }
+    },
+    "/v1/admin/support/chat/conversations/{conversationId}/messages": {
+      "get": {
+        "operationId": "AdminSupportChatController_getMessages",
+        "parameters": [
+          {
+            "name": "conversationId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": true,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": true,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Paginated message history (admin view, cursor = ISO timestamp)",
+        "tags": [
+          "admin-support-chat"
+        ]
+      }
+    },
+    "/v1/admin/support/chat/conversations/{conversationId}/claim": {
+      "post": {
+        "description": "Agen biasa hanya bisa claim untuk diri sendiri; SUPER_ADMIN boleh menugaskan ke agen lain via body.agentId.",
+        "operationId": "AdminSupportChatController_claim",
+        "parameters": [
+          {
+            "name": "conversationId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClaimConversationDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Conversation claimed."
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Claim a conversation (WAITING/ASSIGNED → ASSIGNED)",
+        "tags": [
+          "admin-support-chat"
+        ]
+      }
+    },
+    "/v1/admin/support/chat/conversations/{conversationId}/close": {
+      "post": {
+        "operationId": "AdminSupportChatController_close",
+        "parameters": [
+          {
+            "name": "conversationId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Conversation closed."
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Close a conversation as agent",
+        "tags": [
+          "admin-support-chat"
+        ]
+      }
+    },
+    "/v1/admin/support/chat/conversations/{conversationId}/escalate": {
+      "post": {
+        "description": "POIN 5: SATU-SATUNYA jalur pembuatan tiket. Membuat SupportTicket (sourceType=CHAT_ESCALATION) beserta transkrip.",
+        "operationId": "AdminSupportChatController_escalate",
+        "parameters": [
+          {
+            "name": "conversationId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EscalateConversationDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Ticket created from conversation."
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Escalate conversation → support ticket (with transcript)",
+        "tags": [
+          "admin-support-chat"
+        ]
+      }
+    },
+    "/v1/admin/support/chat/agents": {
+      "get": {
+        "operationId": "AdminSupportChatController_agents",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "List support agents with online + availability status",
+        "tags": [
+          "admin-support-chat"
+        ]
+      }
+    },
+    "/v1/admin/support/chat/agents/availability": {
+      "post": {
+        "operationId": "AdminSupportChatController_availability",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAgentAvailabilityDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Toggle my availability for new support conversations",
+        "tags": [
+          "admin-support-chat"
+        ]
+      }
+    },
     "/v1/admin/chat/moderation-events/stats": {
       "get": {
         "description": "Counts of pending events, events in the last 24h, and breakdowns by severity and action.",
@@ -31938,6 +33157,467 @@
         "summary": "List action location logs",
         "tags": [
           "admin-action-locations"
+        ]
+      }
+    },
+    "/v1/admin/stories": {
+      "get": {
+        "operationId": "AdminStoriesController_listStories",
+        "parameters": [
+          {
+            "name": "page",
+            "required": false,
+            "in": "query",
+            "description": "Page number",
+            "schema": {
+              "minimum": 1,
+              "default": 1,
+              "type": "number"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "description": "Items per page",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Daftar Story aktif/kedaluwarsa beserta metrik moderasi",
+        "tags": [
+          "admin-stories"
+        ]
+      }
+    },
+    "/v1/admin/stories/metrics": {
+      "get": {
+        "operationId": "AdminStoriesController_getMetrics",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Metrik Story dan laporan moderasi",
+        "tags": [
+          "admin-stories"
+        ]
+      }
+    },
+    "/v1/admin/stories/reports": {
+      "get": {
+        "operationId": "AdminStoriesController_listReports",
+        "parameters": [
+          {
+            "name": "page",
+            "required": false,
+            "in": "query",
+            "description": "Page number",
+            "schema": {
+              "minimum": 1,
+              "default": 1,
+              "type": "number"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "description": "Items per page",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Antrean laporan Story dengan paginasi dan filter status",
+        "tags": [
+          "admin-stories"
+        ]
+      }
+    },
+    "/v1/admin/stories/reports/{reportId}": {
+      "get": {
+        "operationId": "AdminStoriesController_getReport",
+        "parameters": [
+          {
+            "name": "reportId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Detail laporan Story dan snapshot saat dilaporkan",
+        "tags": [
+          "admin-stories"
+        ]
+      },
+      "patch": {
+        "operationId": "AdminStoriesController_reviewReport",
+        "parameters": [
+          {
+            "name": "reportId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewStoryReportDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Tinjau/tindaklanjuti laporan Story",
+        "tags": [
+          "admin-stories"
+        ]
+      }
+    },
+    "/v1/admin/stories/users/{userId}/ban": {
+      "post": {
+        "operationId": "AdminStoriesController_banStoryFeature",
+        "parameters": [
+          {
+            "name": "userId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BanStoryFeatureDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Ban fitur Story untuk user, sementara atau permanen",
+        "tags": [
+          "admin-stories"
+        ]
+      },
+      "delete": {
+        "operationId": "AdminStoriesController_unbanStoryFeature",
+        "parameters": [
+          {
+            "name": "userId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Cabut ban fitur Story",
+        "tags": [
+          "admin-stories"
+        ]
+      }
+    },
+    "/v1/admin/stories/{storyId}/viewers": {
+      "get": {
+        "operationId": "AdminStoriesController_getStoryViewers",
+        "parameters": [
+          {
+            "name": "storyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "default": 1,
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Object"
+                }
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 30,
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Object"
+                }
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Daftar viewer dan reaksi (akses dicatat di audit log)",
+        "tags": [
+          "admin-stories"
+        ]
+      }
+    },
+    "/v1/admin/stories/{storyId}/replies": {
+      "get": {
+        "operationId": "AdminStoriesController_getStoryReplies",
+        "parameters": [
+          {
+            "name": "storyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Riwayat chat balasan; hanya bila Story memiliki laporan terbuka",
+        "tags": [
+          "admin-stories"
+        ]
+      }
+    },
+    "/v1/admin/stories/{storyId}": {
+      "get": {
+        "operationId": "AdminStoriesController_getStoryDetail",
+        "parameters": [
+          {
+            "name": "storyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Preview konten Story dan audience (akses dicatat di audit log)",
+        "tags": [
+          "admin-stories"
+        ]
+      },
+      "delete": {
+        "operationId": "AdminStoriesController_deleteStory",
+        "parameters": [
+          {
+            "name": "storyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminStoryReasonDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Hapus permanen Story dan media (alasan wajib)",
+        "tags": [
+          "admin-stories"
+        ]
+      }
+    },
+    "/v1/admin/stories/{storyId}/hide": {
+      "post": {
+        "operationId": "AdminStoriesController_hideStory",
+        "parameters": [
+          {
+            "name": "storyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HideStoryDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Sembunyikan Story sementara untuk peninjauan",
+        "tags": [
+          "admin-stories"
+        ]
+      }
+    },
+    "/v1/admin/stories/{storyId}/restore": {
+      "post": {
+        "operationId": "AdminStoriesController_restoreStory",
+        "parameters": [
+          {
+            "name": "storyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Pulihkan Story yang disembunyikan dalam tujuh hari terakhir",
+        "tags": [
+          "admin-stories"
         ]
       }
     },
@@ -33893,14 +35573,6 @@
             "minLength": 0,
             "maxLength": 500
           },
-          "accountType": {
-            "type": "string",
-            "enum": [
-              "PERSONAL",
-              "BUSINESS"
-            ],
-            "description": "Account type"
-          },
           "phoneNumber": {
             "type": "string",
             "description": "Phone number"
@@ -34588,12 +36260,15 @@
               "BUSINESS_DOCUMENT",
               "SHOWCASE_IMAGE",
               "SHOWCASE_VIDEO",
+              "STORY_MEDIA",
+              "STORY_HIGHLIGHT",
               "AVATAR",
               "CHAT_ATTACHMENT",
               "DISPUTE_EVIDENCE",
               "REPORT_EVIDENCE",
               "DELIVERY_PROOF",
-              "MILESTONE_EVIDENCE"
+              "MILESTONE_EVIDENCE",
+              "CAREER_CV"
             ],
             "description": "Upload purpose determines allowed content types, max file size, and URL expiry duration"
           },
@@ -34652,12 +36327,15 @@
               "BUSINESS_DOCUMENT",
               "SHOWCASE_IMAGE",
               "SHOWCASE_VIDEO",
+              "STORY_MEDIA",
+              "STORY_HIGHLIGHT",
               "AVATAR",
               "CHAT_ATTACHMENT",
               "DISPUTE_EVIDENCE",
               "REPORT_EVIDENCE",
               "DELIVERY_PROOF",
-              "MILESTONE_EVIDENCE"
+              "MILESTONE_EVIDENCE",
+              "CAREER_CV"
             ],
             "description": "Tujuan upload — menentukan batas ukuran & MIME yang diizinkan."
           },
@@ -34879,9 +36557,9 @@
         "properties": {
           "amount": {
             "type": "number",
-            "description": "Withdrawal amount in IDR",
+            "description": "Withdrawal amount in IDR (per-transaction max)",
             "minimum": 50000,
-            "maximum": 50000000
+            "maximum": 25000000
           },
           "bankAccountId": {
             "type": "string",
@@ -35644,6 +37322,88 @@
             "type": "string",
             "description": "Source inquiry room ID if order originates from an INQUIRY chat (links negotiation context)"
           },
+          "fulfillment": {
+            "type": "string",
+            "enum": [
+              "BIASA",
+              "PREORDER"
+            ],
+            "description": "TX-UNIFIED-V2: BIASA (ready stock) atau PREORDER (fulfill nanti). Default BIASA."
+          },
+          "participantMode": {
+            "type": "string",
+            "enum": [
+              "SINGLE",
+              "GROUP"
+            ],
+            "description": "TX-UNIFIED-V2: SINGLE (1-by-1) atau GROUP (1-by-N patungan). Default SINGLE."
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "FISIK",
+              "DIGITAL",
+              "JASA"
+            ],
+            "description": "TX-UNIFIED-V2: FISIK, DIGITAL, atau JASA. Default diturunkan dari orderType."
+          },
+          "preorderEstimatedDate": {
+            "type": "string",
+            "description": "TX-UNIFIED-V2: estimasi tanggal fulfillment untuk PREORDER (ISO 8601). Wajib jika fulfillment=PREORDER."
+          },
+          "scheduledDate": {
+            "type": "string",
+            "description": "JASA: tanggal/jadwal layanan (YYYY-MM-DD). Wajib diisi di UI untuk kategori JASA.",
+            "example": "2026-10-15"
+          },
+          "itemCondition": {
+            "type": "string",
+            "description": "FISIK: kondisi barang",
+            "enum": [
+              "baru",
+              "bekas"
+            ]
+          },
+          "conditionDescription": {
+            "type": "string",
+            "description": "FISIK: deskripsi kondisi bila bekas",
+            "maxLength": 500
+          },
+          "deliveryMethod": {
+            "type": "string",
+            "description": "DIGITAL: metode serah-terima",
+            "enum": [
+              "file",
+              "kode",
+              "akun",
+              "lainnya"
+            ]
+          },
+          "warrantyDays": {
+            "type": "number",
+            "description": "DIGITAL: masa garansi dalam hari (>= 0)",
+            "minimum": 0
+          },
+          "deliverables": {
+            "type": "string",
+            "description": "JASA: deliverable yang disepakati",
+            "maxLength": 1000
+          },
+          "serviceLocation": {
+            "type": "string",
+            "description": "JASA: lokasi pelaksanaan layanan",
+            "maxLength": 200
+          },
+          "cancellationPolicy": {
+            "type": "string",
+            "description": "JASA: kebijakan pembatalan",
+            "maxLength": 1000
+          },
+          "slotId": {
+            "type": "string",
+            "description": "Slot jasa yang dibayar order ini (dari booking jasa)",
+            "maxLength": 100
+          },
           "deviceLocation": {
             "description": "Lokasi presisi perangkat (opsional — null/absent bila user menolak izin GPS)",
             "allOf": [
@@ -35707,6 +37467,10 @@
                 "$ref": "#/components/schemas/LocationDto"
               }
             ]
+          },
+          "expectedBuyerPayAmountSen": {
+            "type": "string",
+            "description": "Nominal yang disetujui user (sen, string digit). Bila tidak cocok dengan order → 409."
           }
         },
         "required": [
@@ -36299,49 +38063,44 @@
           "token"
         ]
       },
-      "CreateProductDto": {
+      "ReplyTicketDto": {
         "type": "object",
-        "properties": {}
+        "properties": {
+          "attachments": {
+            "description": "Attachment file keys (max 5)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
       },
-      "UpdateProductDto": {
+      "CreateConversationDto": {
         "type": "object",
-        "properties": {}
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "Kanal asal percakapan",
+            "enum": [
+              "APP",
+              "HELP_SITE"
+            ],
+            "default": "APP"
+          },
+          "subject": {
+            "type": "string",
+            "description": "Subjek/topik awal percakapan (maks 200 karakter)"
+          }
+        }
       },
-      "UpdateProductStatusDto": {
+      "RateConversationDto": {
         "type": "object",
-        "properties": {}
-      },
-      "CreateVariantDto": {
-        "type": "object",
-        "properties": {}
-      },
-      "UpdateVariantDto": {
-        "type": "object",
-        "properties": {}
-      },
-      "PreCheckoutDto": {
-        "type": "object",
-        "properties": {}
-      },
-      "AttachOrderLinesDto": {
-        "type": "object",
-        "properties": {}
-      },
-      "AdjustStockDto": {
-        "type": "object",
-        "properties": {}
-      },
-      "BulkUpdateDto": {
-        "type": "object",
-        "properties": {}
-      },
-      "ImportCsvDto": {
-        "type": "object",
-        "properties": {}
-      },
-      "ModerateProductDto": {
-        "type": "object",
-        "properties": {}
+        "properties": {
+          "comment": {
+            "type": "string",
+            "description": "Komentar penilaian (maks 1000 karakter)"
+          }
+        }
       },
       "CreateMilestonesDto": {
         "type": "object",
@@ -36896,6 +38655,230 @@
             "description": "Mute duration in hours. Omit to mute indefinitely.",
             "minimum": 1,
             "maximum": 720
+          }
+        }
+      },
+      "StoryProductTagInputDto": {
+        "type": "object",
+        "properties": {
+          "productId": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "x": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "y": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": [
+          "productId",
+          "x",
+          "y"
+        ]
+      },
+      "StoryPriceStickerDto": {
+        "type": "object",
+        "properties": {
+          "amount": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 999999999
+          }
+        },
+        "required": [
+          "amount"
+        ]
+      },
+      "StoryAskStockDto": {
+        "type": "object",
+        "properties": {
+          "productId": {
+            "type": "object",
+            "nullable": true,
+            "maxLength": 100
+          }
+        }
+      },
+      "StoryAudienceDto": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "all_savers",
+              "savers_except"
+            ]
+          },
+          "excludedUserIds": {
+            "maxItems": 500,
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      "CreateStoryDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "image",
+              "text"
+            ]
+          },
+          "mediaId": {
+            "type": "string",
+            "maxLength": 100,
+            "description": "Single-use mediaId returned by POST /stories/media."
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "Story text/caption."
+          },
+          "backgroundColor": {
+            "type": "string",
+            "example": "#1F2937",
+            "pattern": "^#[0-9A-Fa-f]{6}$"
+          },
+          "productTags": {
+            "maxItems": 5,
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StoryProductTagInputDto"
+            }
+          },
+          "priceSticker": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StoryPriceStickerDto"
+              }
+            ]
+          },
+          "askStock": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StoryAskStockDto"
+              }
+            ]
+          },
+          "audience": {
+            "$ref": "#/components/schemas/StoryAudienceDto"
+          }
+        },
+        "required": [
+          "kind",
+          "productTags",
+          "audience"
+        ]
+      },
+      "Object": {
+        "type": "object",
+        "properties": {}
+      },
+      "SetStoryReactionDto": {
+        "type": "object",
+        "properties": {
+          "emoji": {
+            "type": "string",
+            "enum": [
+              "❤️",
+              "😂",
+              "😮",
+              "😢",
+              "👏",
+              "🔥"
+            ]
+          }
+        },
+        "required": [
+          "emoji"
+        ]
+      },
+      "ReplyToStoryDto": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 200
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "ReportStoryDto": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": [
+              "spam",
+              "harassment",
+              "offensive",
+              "irrelevant",
+              "other"
+            ]
+          },
+          "note": {
+            "type": "string",
+            "maxLength": 500
+          }
+        },
+        "required": [
+          "category"
+        ]
+      },
+      "CreateStoryHighlightDto": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 24
+          },
+          "storyIds": {
+            "minItems": 1,
+            "maxItems": 30,
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "title",
+          "storyIds"
+        ]
+      },
+      "UpdateStoryHighlightDto": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 24
+          },
+          "storyIds": {
+            "minItems": 1,
+            "maxItems": 30,
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
@@ -37481,6 +39464,15 @@
           "startTime",
           "endTime"
         ]
+      },
+      "BookServiceSlotDto": {
+        "type": "object",
+        "properties": {
+          "priceIdr": {
+            "type": "number",
+            "description": "Harga jasa disepakati (IDR). Bila kosong, pakai priceMin etalase."
+          }
+        }
       },
       "CreateAgreementDto": {
         "type": "object",
@@ -38200,34 +40192,6 @@
         "type": "object",
         "properties": {}
       },
-      "CreateTicketDto": {
-        "type": "object",
-        "properties": {
-          "relatedArticleId": {
-            "type": "string",
-            "description": "Related help center article ID if user came from FAQ (14.2)"
-          },
-          "attachments": {
-            "description": "Attachment file keys (max 5)",
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          }
-        }
-      },
-      "ReplyTicketDto": {
-        "type": "object",
-        "properties": {
-          "attachments": {
-            "description": "Attachment file keys (max 5)",
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          }
-        }
-      },
       "CreateFeedbackDto": {
         "type": "object",
         "properties": {
@@ -38269,6 +40233,202 @@
         "required": [
           "category",
           "message"
+        ]
+      },
+      "SubmitApplicationDto": {
+        "type": "object",
+        "properties": {
+          "postingId": {
+            "type": "string",
+            "description": "ID lowongan yang dilamar"
+          },
+          "fullName": {
+            "type": "string",
+            "example": "Budi Santoso"
+          },
+          "email": {
+            "type": "string",
+            "example": "budi@example.com"
+          },
+          "phone": {
+            "type": "string",
+            "example": "081234567890"
+          },
+          "coverNote": {
+            "type": "string",
+            "description": "Surat pengantar singkat"
+          },
+          "portfolioUrl": {
+            "type": "string",
+            "example": "https://portfolio.example.com"
+          },
+          "cvFileKey": {
+            "type": "string",
+            "description": "fileKey dari POST /v1/careers/upload-cv (one-time, kedaluwarsa 1 jam)"
+          },
+          "website": {
+            "type": "string",
+            "description": "HONEYPOT anti-bot — harus dikosongkan. Bila terisi → 400 BOT_DETECTED."
+          },
+          "captchaId": {
+            "type": "string",
+            "description": "challengeId dari GET /v1/careers/captcha"
+          },
+          "captchaAnswer": {
+            "type": "number",
+            "description": "Jawaban soal captcha (angka)"
+          }
+        },
+        "required": [
+          "postingId",
+          "fullName",
+          "email",
+          "phone",
+          "cvFileKey",
+          "captchaId",
+          "captchaAnswer"
+        ]
+      },
+      "CreateJobPostingDto": {
+        "type": "object",
+        "properties": {
+          "slug": {
+            "type": "string",
+            "description": "Slug URL; otomatis dibuat dari judul bila kosong",
+            "example": "co-founder-coo"
+          },
+          "title": {
+            "type": "string",
+            "example": "Co-Founder / COO"
+          },
+          "location": {
+            "type": "string",
+            "example": "Remote"
+          },
+          "type": {
+            "type": "string",
+            "example": "Penuh waktu"
+          },
+          "equity": {
+            "type": "string",
+            "description": "Skema kompensasi — WAJIB diisi dan tampil eksplisit (tanpa gaji + saham)",
+            "example": "15% saham (tanpa gaji, skema vesting)"
+          },
+          "summary": {
+            "type": "string",
+            "description": "1-2 kalimat untuk kartu lowongan"
+          },
+          "description": {
+            "type": "string",
+            "description": "Deskripsi lengkap (markdown): tanggung jawab, kualifikasi"
+          },
+          "requirements": {
+            "example": [
+              "Berpengalaman 5+ tahun",
+              "Bisa kerja remote"
+            ],
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "isActive": {
+            "type": "boolean",
+            "default": true
+          },
+          "sortOrder": {
+            "type": "number",
+            "default": 0
+          }
+        },
+        "required": [
+          "title",
+          "location",
+          "type",
+          "equity",
+          "summary",
+          "description",
+          "requirements"
+        ]
+      },
+      "UpdateJobPostingDto": {
+        "type": "object",
+        "properties": {
+          "slug": {
+            "type": "string",
+            "description": "Slug URL; otomatis dibuat dari judul bila kosong",
+            "example": "co-founder-coo"
+          },
+          "title": {
+            "type": "string",
+            "example": "Co-Founder / COO"
+          },
+          "location": {
+            "type": "string",
+            "example": "Remote"
+          },
+          "type": {
+            "type": "string",
+            "example": "Penuh waktu"
+          },
+          "equity": {
+            "type": "string",
+            "description": "Skema kompensasi — WAJIB diisi dan tampil eksplisit (tanpa gaji + saham)",
+            "example": "15% saham (tanpa gaji, skema vesting)"
+          },
+          "summary": {
+            "type": "string",
+            "description": "1-2 kalimat untuk kartu lowongan"
+          },
+          "description": {
+            "type": "string",
+            "description": "Deskripsi lengkap (markdown): tanggung jawab, kualifikasi"
+          },
+          "requirements": {
+            "example": [
+              "Berpengalaman 5+ tahun",
+              "Bisa kerja remote"
+            ],
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "isActive": {
+            "type": "boolean",
+            "default": true
+          },
+          "sortOrder": {
+            "type": "number",
+            "default": 0
+          }
+        }
+      },
+      "UpdateApplicationStatusDto": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "BARU",
+              "DIREVIEW",
+              "WAWANCARA",
+              "DITERIMA",
+              "DITOLAK"
+            ],
+            "example": "DIREVIEW"
+          },
+          "note": {
+            "type": "string",
+            "description": "Catatan perubahan status (masuk audit trail). WAJIB diisi bila membuka ulang lamaran terminal (DITERIMA/DITOLAK → DIREVIEW)."
+          },
+          "internalNote": {
+            "type": "string",
+            "description": "Catatan internal admin (tidak tampil ke pelamar)"
+          }
+        },
+        "required": [
+          "status"
         ]
       },
       "VerifyChallengeDto": {
@@ -40115,6 +42275,33 @@
           "status"
         ]
       },
+      "ClaimConversationDto": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string",
+            "description": "ID agen tujuan (hanya SUPER_ADMIN; kosong = claim untuk diri sendiri)"
+          }
+        }
+      },
+      "EscalateConversationDto": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "description": "Kategori tiket",
+            "default": "GENERAL"
+          },
+          "message": {
+            "type": "string",
+            "description": "Ringkasan admin untuk tiket (maks 5000 karakter)"
+          }
+        }
+      },
+      "SetAgentAvailabilityDto": {
+        "type": "object",
+        "properties": {}
+      },
       "ReviewModerationEventDto": {
         "type": "object",
         "properties": {
@@ -40208,6 +42395,22 @@
             "maxLength": 1000
           }
         }
+      },
+      "ReviewStoryReportDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "BanStoryFeatureDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "AdminStoryReasonDto": {
+        "type": "object",
+        "properties": {}
+      },
+      "HideStoryDto": {
+        "type": "object",
+        "properties": {}
       }
     }
   }

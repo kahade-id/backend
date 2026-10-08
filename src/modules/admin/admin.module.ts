@@ -30,6 +30,7 @@ import { AdminFeedbackModule } from './feedback/admin-feedback.module';
 // GAP-C (G196–G199): admin milestone.
 import { AdminMilestonesModule } from './milestones/admin-milestones.module';
 import { AdminActionLocationsModule } from './action-locations/admin-action-locations.module';
+import { AdminStoriesModule } from './stories/admin-stories.module';
 
 @Module({
   imports: [
@@ -61,6 +62,7 @@ import { AdminActionLocationsModule } from './action-locations/admin-action-loca
     AdminFeedbackModule,
     AdminMilestonesModule, // GAP-C (G196–G199)
     AdminActionLocationsModule,
+    AdminStoriesModule,
   ],
 })
 export class AdminModule {}

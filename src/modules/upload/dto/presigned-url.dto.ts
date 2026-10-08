@@ -16,6 +16,12 @@ export enum UploadPurpose {
   // diserve nginx dengan HTTP Range; thumbnail JPEG dibuat server-side
   // (ffmpeg) dan disimpan di folder SHOWCASE_IMAGE.
   SHOWCASE_VIDEO = 'SHOWCASE_VIDEO',
+  // Story photos use the existing /upload/direct disk pipeline, but remain
+  // private and are resized/re-encoded by the server before being stored.
+  STORY_MEDIA = 'STORY_MEDIA',
+  // Internal-only archive copies created by StoryService; never accepted by
+  // the public upload controller.
+  STORY_HIGHLIGHT = 'STORY_HIGHLIGHT',
   AVATAR = 'AVATAR',
   CHAT_ATTACHMENT = 'CHAT_ATTACHMENT',
   DISPUTE_EVIDENCE = 'DISPUTE_EVIDENCE',

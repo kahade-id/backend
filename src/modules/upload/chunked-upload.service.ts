@@ -259,6 +259,12 @@ export class ChunkedUploadService {
   }
 
   async initiate(userId: string, dto: InitChunkedUploadDto): Promise<ChunkedInitResult> {
+    if (dto.purpose === UploadPurpose.STORY_HIGHLIGHT) {
+      throw new BadRequestException({ code: 'INVALID_FILE_TYPE', message: 'Story highlight media is created only by archiving an existing Story' });
+    }
+    if (dto.purpose === UploadPurpose.STORY_MEDIA) {
+      throw new BadRequestException({ code: 'VALIDATION_ERROR', message: 'Upload story media through POST /v1/stories/media so it receives a single-use mediaId.' });
+    }
     const maxBytes = MAX_FILE_SIZE[dto.purpose];
     if (!maxBytes) {
       throw new BadRequestException({ code: 'VALIDATION_ERROR', message: 'Unsupported upload purpose' });

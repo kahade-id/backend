@@ -12,7 +12,7 @@ jest.mock('@aws-sdk/client-s3', () => ({
   HeadObjectCommand: jest.fn(),
   HeadObjectCommandOutput: jest.fn(),
   GetObjectCommand: jest.fn(),
-}));
+}), { virtual: true });
 
 // SYS-D-006 (2026-10-03): mock @aws-sdk/s3-request-presigner dihapus —
 // paketnya di-uninstall (R2 dibuang 2026-09-26) dan tidak ada kode yang
@@ -87,7 +87,7 @@ describe('UploadService — confirmUpload', () => {
 
     service = module.get<UploadService>(UploadService);
 
-    const { S3Client } = await import('@aws-sdk/client-s3');
+    const { S3Client } = jest.requireMock('@aws-sdk/client-s3') as { S3Client: jest.Mock };
     s3Send = jest.fn();
     (S3Client as jest.Mock).mockImplementation(() => ({ send: s3Send }));
     (service as unknown as { _s3Client: null })._s3Client = null;
@@ -257,6 +257,27 @@ describe('UploadService — confirmUpload', () => {
     mockLocalStorage.getFileSize.mockResolvedValueOnce(null);
     await expect(service.verifyUserFileKeys(userId, [chatKey], 'CHAT_ATTACHMENT' as any)).rejects.toMatchObject({ response: { code: 'FILE_TOO_LARGE' } });
     expect(mockRedis.consumeOnce).not.toHaveBeenCalled();
+  });
+
+  it('keeps the confirmation marker when storage reports that file deletion failed', async () => {
+    mockLocalStorage.deleteFile.mockResolvedValueOnce(false);
+
+    const result = await service.cleanupFileKeys(userId, [ktpFileKey]);
+
+    expect(result).toEqual({
+      deleted: 0,
+      errors: [{ fileKey: ktpFileKey, reason: 'storage deletion failed' }],
+    });
+    expect(mockRedis.del).not.toHaveBeenCalled();
+  });
+
+  it('deletes the confirmation marker only after the file was deleted', async () => {
+    mockLocalStorage.deleteFile.mockResolvedValueOnce(true);
+
+    const result = await service.cleanupFileKeys(userId, [ktpFileKey]);
+
+    expect(result).toEqual({ deleted: 1, errors: [] });
+    expect(mockRedis.del).toHaveBeenCalledWith(`confirmed_upload:${userId}:${ktpFileKey}`);
   });
 
   it('rejects unsafe keys before signing a download URL', async () => {

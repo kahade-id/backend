@@ -50,6 +50,14 @@ export class LocalStorageService {
     await fs.promises.writeFile(fullPath, buffer);
   }
 
+  /** Copy a server-owned object to a new private archive key. */
+  async copyFile(sourceKey: string, destinationKey: string): Promise<void> {
+    const sourcePath = this.resolvePath(sourceKey);
+    const destinationPath = this.resolvePath(destinationKey);
+    await fs.promises.mkdir(path.dirname(destinationPath), { recursive: true });
+    await fs.promises.copyFile(sourcePath, destinationPath);
+  }
+
   async fileExists(fileKey: string): Promise<boolean> {
     try {
       const stat = await fs.promises.stat(this.resolvePath(fileKey));
@@ -107,7 +115,10 @@ export class LocalStorageService {
     try {
       await fs.promises.unlink(this.resolvePath(fileKey));
       return true;
-    } catch {
+    } catch (error) {
+      // Deletion is idempotent: an already-missing file is in the desired
+      // state and callers may safely release its Redis confirmation marker.
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return true;
       return false;
     }
   }

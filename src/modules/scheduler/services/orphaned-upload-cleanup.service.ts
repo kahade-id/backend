@@ -130,6 +130,11 @@ export class OrphanedUploadCleanupService {
       const userId = parts[1];
       const fileName = parts[2];
 
+      // Story media is retained by Story/StoryHighlight references and pruned
+      // by the story-retention job; the generic Redis-key orphan janitor must
+      // never delete it after confirmed_upload expires.
+      if (folder === 'story-media' || folder === 'story-highlights') continue;
+
       if (folder === 'avatars' || folder === 'headers') {
         profileMedia.push({ full, folder, userId, fileName });
         continue;

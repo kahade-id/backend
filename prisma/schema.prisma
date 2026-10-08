@@ -829,6 +829,8 @@ enum UserAuditAction {
   SOCIAL_LOGIN
   // GAP-F G404 (append-only): pemilik item mengajukan banding.
   SHOWCASE_APPEAL_FILED
+  // Story moderation/report flow.
+  STORY_REPORTED
 }
 
 // ============================================================
@@ -1061,6 +1063,16 @@ model User {
   // Follow system
   followers                 Follow[]                  @relation("FollowingUser")
   following                 Follow[]                  @relation("FollowerUser")
+  // Story (24-hour social content) relations are deliberately independent of follows.
+  storiesAuthored           Story[]                   @relation("StoryAuthor")
+  storyViews                StoryView[]               @relation("StoryViewViewer")
+  storyReactions            StoryReaction[]           @relation("StoryReactionViewer")
+  storyMutesGiven           StoryMute[]               @relation("StoryMuteViewer")
+  storyMutesReceived        StoryMute[]               @relation("StoryMuteAuthor")
+  storyReportsSubmitted     StoryReport[]             @relation("StoryReportReporter")
+  storyHighlights           Highlight[]               @relation("StoryHighlightOwner")
+  storyMediaUploads         StoryMediaUpload[]        @relation("StoryMediaOwner")
+  storyFeatureBan           StoryFeatureBan?
   // Favorites system
   favoritesGiven            UserFavorite[]            @relation("FavoriteOwner")
   favoritesReceived         UserFavorite[]            @relation("FavoriteTarget")
@@ -2285,6 +2297,10 @@ model ChatMessage {
   pollId String?
   poll   ChatPoll? @relation("ChatPollMessages", fields: [pollId], references: [id], onDelete: SetNull)
 
+  /// Optional story reference for a story reply. Intentionally no FK so the
+  /// chat record remains auditable after the Story itself is hard-deleted.
+  storyId String? @db.VarChar(100)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -2302,6 +2318,7 @@ model ChatMessage {
   @@index([roomId, createdAt]) // cursor-based pagination (ORDER BY createdAt DESC)
   @@index([roomId, isPinned])
   @@index([senderId])
+  @@index([storyId, createdAt])
   @@index([createdAt])
   @@index([isDeleted])
   @@map("chat_messages")
@@ -3414,6 +3431,7 @@ model AdminUser {
 
   // Relations
   auditLogs                       AdminAuditLog[]
+  storyFeatureBans                StoryFeatureBan[]      @relation("StoryFeatureBanAdmin")
   kycReviews                      KycRequest[]           @relation("KycReviewer")
   // Review verifikasi badan usaha — relasi terpisah dari kycReviews karena
   // BusinessVerification adalah domain verifikasi yang berbeda.
@@ -4356,6 +4374,183 @@ model ShowcaseReport {
   @@index([showcaseId])
   @@index([reporterId])
   @@map("showcase_reports")
+}
+
+/// Story: image or text content with a fixed 24-hour lifetime.
+enum StoryKind {
+  IMAGE
+  TEXT
+}
+
+enum StoryReportCategory {
+  SPAM
+  HARASSMENT
+  OFFENSIVE
+  IRRELEVANT
+  OTHER
+}
+
+enum StoryReportStatus {
+  OPEN
+  IN_REVIEW
+  RESOLVED_ACTION
+  RESOLVED_DISMISSED
+}
+
+/// Story media is uploaded through the existing direct-upload pipeline. This
+/// row is a single-use, 30-minute upload ticket; the Story owns the file after
+/// the ticket is consumed.
+model StoryMediaUpload {
+  id        String   @id @default(cuid())
+  authorId  String
+  author    User     @relation("StoryMediaOwner", fields: [authorId], references: [id], onDelete: Cascade)
+  fileKey   String   @unique @db.VarChar(512)
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+
+  @@index([authorId, expiresAt])
+  @@index([expiresAt])
+  @@map("story_media_uploads")
+}
+
+model Story {
+  id              String    @id @default(cuid())
+  authorId        String
+  author          User      @relation("StoryAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  kind            StoryKind
+  mediaUrl        String?   @db.VarChar(512)
+  /// Private local-storage object key. Never exposed in API responses.
+  mediaKey        String?   @db.VarChar(512)
+  textContent     String?   @db.VarChar(200)
+  backgroundColor String?   @db.VarChar(7)
+  audience        Json
+  /// Stored as [{ productId, x, y }]; current product visibility is rechecked on read.
+  productTags     Json
+  priceSticker    Json?
+  askStock        Json?
+  createdAt       DateTime  @default(now())
+  expiresAt       DateTime
+  /// Set once by the retention worker to make story.expired realtime delivery idempotent.
+  expiryNotifiedAt DateTime?
+  /// User deletion is a soft-hide; expiry cleanup physically removes the row after seven days.
+  deletedAt       DateTime?
+  /// Moderation hide; null hiddenUntil means hide until a moderator restores it.
+  hiddenAt        DateTime?
+  hiddenUntil     DateTime?
+  hiddenReason    String?   @db.VarChar(500)
+  hiddenByAdminId String?   @db.VarChar(100)
+
+  views     StoryView[]
+  reactions StoryReaction[]
+
+  @@index([authorId, expiresAt, createdAt])
+  @@index([expiresAt])
+  @@index([deletedAt])
+  @@index([hiddenAt, hiddenUntil])
+  @@map("stories")
+}
+
+model StoryView {
+  id       String   @id @default(cuid())
+  storyId  String
+  story    Story    @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  viewerId String
+  viewer   User     @relation("StoryViewViewer", fields: [viewerId], references: [id], onDelete: Cascade)
+  viewedAt DateTime @default(now())
+
+  @@unique([storyId, viewerId])
+  @@index([storyId, viewedAt, viewerId])
+  @@index([viewerId, viewedAt])
+  @@map("story_views")
+}
+
+model StoryReaction {
+  id        String   @id @default(cuid())
+  storyId   String
+  story     Story    @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  viewerId  String
+  viewer    User     @relation("StoryReactionViewer", fields: [viewerId], references: [id], onDelete: Cascade)
+  emoji     String   @db.VarChar(16)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([storyId, viewerId])
+  @@index([storyId, createdAt])
+  @@index([viewerId])
+  @@map("story_reactions")
+}
+
+model StoryMute {
+  id        String   @id @default(cuid())
+  viewerId  String
+  viewer    User     @relation("StoryMuteViewer", fields: [viewerId], references: [id], onDelete: Cascade)
+  authorId  String
+  author    User     @relation("StoryMuteAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([viewerId, authorId])
+  @@index([viewerId, createdAt])
+  @@map("story_mutes")
+}
+
+/// Reports are retained independently from Story rows so the moderation queue
+/// and resolution audit survive the seven-day Story/media purge.
+model StoryReport {
+  id                String              @id @default(cuid())
+  storyId           String              @db.VarChar(100)
+  authorId          String              @db.VarChar(100)
+  reporterId        String
+  reporter          User                @relation("StoryReportReporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  category          StoryReportCategory
+  note              String?             @db.VarChar(500)
+  storySnapshot     Json
+  status            StoryReportStatus   @default(OPEN)
+  internalNote      String?             @db.VarChar(1000)
+  reviewedByAdminId String?             @db.VarChar(100)
+  reviewedAt        DateTime?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  @@unique([storyId, reporterId])
+  @@index([status, createdAt])
+  @@index([storyId, createdAt])
+  @@index([authorId, createdAt])
+  @@index([reporterId, createdAt])
+  @@map("story_reports")
+}
+
+/// Permanent profile archive. `stories` contains independent snapshots and
+/// `storyIds` records their original Story IDs for editor ordering/updates.
+model Highlight {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation("StoryHighlightOwner", fields: [userId], references: [id], onDelete: Cascade)
+  title        String   @db.VarChar(24)
+  coverStoryId String?  @db.VarChar(100)
+  storyIds     String[] @default([])
+  stories      Json
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([userId, createdAt])
+  @@map("story_highlights")
+}
+
+/// Story-feature ban, separate from a platform-wide account ban.
+model StoryFeatureBan {
+  id              String    @id @default(cuid())
+  userId          String    @unique
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bannedUntil     DateTime?
+  reason          String    @db.VarChar(500)
+  isActive        Boolean   @default(true)
+  bannedByAdminId String?
+  bannedBy        AdminUser? @relation("StoryFeatureBanAdmin", fields: [bannedByAdminId], references: [id], onDelete: SetNull)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([isActive, bannedUntil])
+  @@map("story_feature_bans")
 }
 
 /// Visibilitas item showcase di feed discover / profil publik.

@@ -87,6 +87,7 @@ const MESSAGE_SELECT = {
   pinnedAt: true,
   durationSeconds: true,
   forwardedFromId: true,
+  storyId: true,
   readAt: true,
   // Batch 43 BE-CHAT: pesan sementara/sekali-lihat, lokasi, kartu.
   ephemeralTtlSeconds: true,
@@ -201,6 +202,7 @@ type RawMessage = {
   pinnedAt: Date | null;
   durationSeconds: number | null;
   forwardedFromId: string | null;
+  storyId: string | null;
   readAt: unknown;
   // Batch 43 BE-CHAT.
   ephemeralTtlSeconds: number | null;
@@ -377,6 +379,7 @@ export function serializeMessage(msg: RawMessage, options: SerializeMessageOptio
     pinnedAt: msg.pinnedAt ?? null,
     durationSeconds: msg.durationSeconds ?? null,
     forwardedFromId: msg.forwardedFromId ?? null,
+    ...(msg.storyId ? { storyId: msg.storyId } : {}),
     forwardedFrom,
     readAt: filterReadAtForViewer(msg.readAt, options.viewerId, options.hiddenReaders),
     // Batch 43 BE-CHAT: pesan sementara/sekali-lihat, lokasi, kartu.
@@ -1068,7 +1071,7 @@ export class ChatService implements OnModuleInit {
    * Chat pra-transaksi: buyer calon bisa bertanya/nego SEBELUM membuat order
    * dan mengunci dana di escrow. Sebelumnya chat hanya eksis setelah order ada.
    */
-  async createInquiry(userId: string, dto: CreateInquiryDto): Promise<object> {
+  async createInquiry(userId: string, dto: CreateInquiryDto, storyId?: string): Promise<object> {
     if (dto.counterpartId === userId) {
       throw new BadRequestException({
         code: ErrorCodes.CHAT_INQUIRY_SELF,
@@ -1089,31 +1092,30 @@ export class ChatService implements OnModuleInit {
 
     await this.assertNotBlocked(userId, dto.counterpartId);
 
-    const activeCount = await this.prisma.chatRoom.count({
-      where: {
-        type: 'INQUIRY',
-        deletedAt: null,
-        status: 'ACTIVE',
-        OR: [{ initiatorId: userId }, { counterpartId: userId }],
-      },
-    });
-    if (activeCount >= CHAT_INQUIRY_MAX_ACTIVE_PER_USER) {
-      throw new BadRequestException({
-        code: ErrorCodes.CHAT_INQUIRY_LIMIT_REACHED,
-        message: `You cannot open more than ${CHAT_INQUIRY_MAX_ACTIVE_PER_USER} active conversations`,
-      });
-    }
-
     // Pasangan disimpan dalam urutan kanonik agar partial unique index
     // (`chat_rooms_inquiry_pair_key`) benar-benar mencegah room ganda.
     const [initiatorId, counterpartId] = [userId, dto.counterpartId].sort();
 
     let room = await this.prisma.chatRoom.findFirst({
       where: { type: 'INQUIRY', initiatorId, counterpartId, deletedAt: null },
-      select: { id: true },
+      select: { id: true, status: true },
     });
 
     if (!room) {
+      const activeCount = await this.prisma.chatRoom.count({
+        where: {
+          type: 'INQUIRY',
+          deletedAt: null,
+          status: 'ACTIVE',
+          OR: [{ initiatorId: userId }, { counterpartId: userId }],
+        },
+      });
+      if (activeCount >= CHAT_INQUIRY_MAX_ACTIVE_PER_USER) {
+        throw new BadRequestException({
+          code: ErrorCodes.CHAT_INQUIRY_LIMIT_REACHED,
+          message: `You cannot open more than ${CHAT_INQUIRY_MAX_ACTIVE_PER_USER} active conversations`,
+        });
+      }
       // Batch 43 BE-CHAT: tegakkan kebijakan DM pemilik lawan bicara — hanya
       // saat room BARU dibuat (percakapan lama tidak diputus).
       await this.assertDmAllowed(userId, dto.counterpartId);
@@ -1131,7 +1133,14 @@ export class ChatService implements OnModuleInit {
             ],
           },
         },
-        select: { id: true },
+        select: { id: true, status: true },
+      });
+    }
+
+    if (room.status !== 'ACTIVE') {
+      throw new BadRequestException({
+        code: ErrorCodes.CHAT_ROOM_CLOSED,
+        message: 'This conversation has been closed',
       });
     }
 
@@ -1139,6 +1148,7 @@ export class ChatService implements OnModuleInit {
     const message = await this.createMessage(context, userId, {
       messageType: UserChatMessageType.TEXT,
       content: dto.message,
+      storyId,
     });
 
     return {
@@ -1386,6 +1396,8 @@ export class ChatService implements OnModuleInit {
       replyToId?: string;
       durationSeconds?: number;
       forwardedFromId?: string;
+      /** Internal-only backlink set by the Story reply endpoint. */
+      storyId?: string;
       // Batch 43 BE-CHAT: pesan lokasi / kartu / sementara / sekali lihat.
       location?: SendMessageDto['location'];
       showcaseId?: string;
@@ -1563,6 +1575,7 @@ export class ChatService implements OnModuleInit {
         durationSeconds: userMessageType === UserChatMessageType.VOICE ? (dto.durationSeconds ?? null) : null,
         replyToId: dto.replyToId || undefined,
         forwardedFromId: dto.forwardedFromId || undefined,
+        storyId: dto.storyId || undefined,
         moderationAction: verdict && verdict.matches.length > 0 ? this.highestAction(verdict) : null,
         moderationSeverity: verdict?.maxSeverity ?? null,
         moderationKind: verdict?.kinds?.[0] ?? null,

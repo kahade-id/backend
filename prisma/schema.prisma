@@ -1087,6 +1087,8 @@ model User {
   questionComments          ProfileQuestionComment[]  @relation("CommentAuthor")
   // Section 4: upvote pertanyaan profil
   questionUpvotes           ProfileQuestionUpvote[]
+  // RK-P01: upvote (tepuk tangan) komentar Q&A profil
+  questionCommentUpvotes    ProfileQuestionCommentUpvote[]
   supportTickets            SupportTicket[]           @relation("UserSupportTickets")
   // POIN 5 (2026-10-04): percakapan livechat support milik user.
   supportConversations      SupportConversation[]     @relation("UserSupportConversations")
@@ -3778,6 +3780,11 @@ model ProfileQuestionComment {
   hiddenAt     DateTime?
   hiddenBy     String?              @db.VarChar(100)
 
+  /// RK-P01: jumlah tepuk tangan (upvote) komentar. Denormalisasi + atomic
+  /// increment (pola sama seperti ProfileQuestion.upvoteCount) supaya urutan
+  /// "Teratas" tidak perlu COUNT(*) per baris.
+  upvoteCount    Int       @default(0)
+
   // GAP-F G428/G429/G434/G446 (append-only): kolom moderasi platform.
   hiddenByType    QaHiddenByType? @map("hidden_by_type")
   hiddenByAdminId String?         @map("hidden_by_admin_id")
@@ -3790,11 +3797,33 @@ model ProfileQuestionComment {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  upvotes ProfileQuestionCommentUpvote[]
+
   @@index([questionId])
   @@index([authorId])
   @@index([hiddenByType, isHidden])
   @@index([parentId])
+  // RK-P02: urutan "Teratas" di komentar.
+  @@index([questionId, isHidden, upvoteCount])
   @@map("profile_question_comments")
+}
+
+/// RK-P01 — upvote (tepuk tangan) komentar Q&A profil. Unique (userId,
+/// commentId) ditegakkan di DB agar dua request balapan tidak menghasilkan
+/// upvote ganda / counter melenceng. Pola sama seperti ProfileQuestionUpvote.
+model ProfileQuestionCommentUpvote {
+  id        String                 @id @default(cuid())
+  commentId String
+  comment   ProfileQuestionComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, commentId])
+  @@index([commentId, createdAt, id])
+  @@index([userId])
+  @@map("profile_question_comment_upvotes")
 }
 
 // ============================================================

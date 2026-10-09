@@ -36,7 +36,11 @@ function isSpam(text: string): boolean {
 interface QuestionCreatedResponse { id: string; question: string; createdAt: Date }
 interface AnswerResponse { id: string; answer: string; answeredAt: Date }
 interface UserSummary { username: string | null; fullName: string | null; avatarUrl: string | null }
-interface CommentResponse { id: string; content: string; parentId: string | null; author: UserSummary; createdAt: Date }
+interface CommentResponse {
+  id: string; content: string; parentId: string | null; author: UserSummary; createdAt: Date;
+  // RK-P01: jumlah tepuk tangan + status upvote viewer
+  upvoteCount: number; isUpvotedByViewer?: boolean;
+}
 interface PaginatedQuestions {
   questions: Array<{
     id: string; content: string; answer: string | null; answeredAt: Date | null;
@@ -48,7 +52,7 @@ interface PaginatedQuestions {
   }>;
   total: number; page: number; limit: number; totalPages: number; sort?: QuestionSort;
 }
-interface PaginatedComments { data: CommentResponse[]; total: number; page: number; limit: number; totalPages: number }
+interface PaginatedComments { data: CommentResponse[]; total: number; page: number; limit: number; totalPages: number; sort?: 'top' | 'newest' }
 
 @Injectable()
 export class ProfileQAService {
@@ -179,6 +183,8 @@ export class ProfileQAService {
     content: true,
     parentId: true,
     createdAt: true,
+    // RK-P01: jumlah tepuk tangan (parentId sudah dikirim — RK-P03 terpenuhi)
+    upvoteCount: true,
     author: { select: { username: true, fullName: true, avatarUrl: true } },
   } as const;
 
@@ -470,6 +476,114 @@ export class ProfileQAService {
     return { upvoted: false, upvoteCount: current?.upvoteCount ?? 0 };
   }
 
+  // ==================================================================
+  // RK-P01 — Upvote (tepuk tangan) komentar Q&A profil
+  // ==================================================================
+
+  /** Upvote milik viewer untuk sekumpulan komentar — satu query, bukan N+1. */
+  private async getUpvotedCommentIds(viewerId: string | undefined, commentIds: string[]): Promise<Set<string>> {
+    if (!viewerId || commentIds.length === 0) return new Set<string>();
+    const rows = await this.prisma.profileQuestionCommentUpvote.findMany({
+      where: { userId: viewerId, commentId: { in: commentIds } },
+      select: { commentId: true },
+    });
+    return new Set(rows.map(row => row.commentId));
+  }
+
+  /**
+   * Komentar yang boleh di-upvote: tidak disembunyikan, pertanyaannya publik
+   * & terlihat, dan pemilik profilnya sehat (pola sama seperti
+   * findUpvotableQuestion).
+   */
+  private async findUpvotableComment(commentId: string) {
+    const comment = await this.prisma.profileQuestionComment.findFirst({
+      where: {
+        id: commentId,
+        isHidden: false,
+        author: { isActive: true, isBanned: false, deletedAt: null, profileVisible: true },
+        question: {
+          isPublic: true,
+          isHidden: false,
+          answeredAt: { not: null },
+          receiver: { isActive: true, isBanned: false, deletedAt: null, profileVisible: true },
+        },
+      },
+      select: {
+        id: true,
+        upvoteCount: true,
+        authorId: true,
+        question: { select: { receiverId: true } },
+      },
+    });
+    if (!comment) {
+      throw new NotFoundException({ code: ErrorCodes.COMMENT_NOT_FOUND, message: 'Comment not found' });
+    }
+    return comment;
+  }
+
+  async upvoteComment(userId: string, commentId: string): Promise<{ upvoted: boolean; upvoteCount: number }> {
+    const comment = await this.findUpvotableComment(commentId);
+    if (comment.authorId === userId) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Cannot upvote your own comment' });
+    }
+    // Konvensi lama service ini: relasi block -> 404, bukan 403.
+    const block = await this.prisma.blockList.findFirst({
+      where: {
+        OR: [
+          { blockerId: userId, blockedId: comment.question.receiverId },
+          { blockerId: comment.question.receiverId, blockedId: userId },
+        ],
+      },
+      select: { id: true },
+    });
+    if (block) {
+      throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    }
+
+    try {
+      // Baris upvote + counter bergerak dalam satu transaksi (pola upvoteQuestion).
+      const updated = await this.prisma.$transaction(async tx => {
+        await tx.profileQuestionCommentUpvote.create({ data: { userId, commentId } });
+        return tx.profileQuestionComment.update({
+          where: { id: commentId },
+          data: { upvoteCount: { increment: 1 } },
+          select: { upvoteCount: true },
+        });
+      });
+      return { upvoted: true, upvoteCount: updated.upvoteCount };
+    } catch (err) {
+      if (this.isUniqueViolation(err)) {
+        const current = await this.prisma.profileQuestionComment.findUnique({ where: { id: commentId }, select: { upvoteCount: true } });
+        throw new ConflictException({
+          code: ErrorCodes.COMMENT_ALREADY_UPVOTED,
+          message: 'You already upvoted this comment',
+          upvoteCount: current?.upvoteCount ?? null,
+        });
+      }
+      throw err;
+    }
+  }
+
+  async removeCommentUpvote(userId: string, commentId: string): Promise<{ upvoted: boolean; upvoteCount: number }> {
+    const comment = await this.findUpvotableComment(commentId);
+    void comment;
+
+    await this.prisma.$transaction(async tx => {
+      const deleted = await tx.profileQuestionCommentUpvote.deleteMany({ where: { userId, commentId } });
+      if (deleted.count === 0) {
+        throw new NotFoundException({ code: ErrorCodes.COMMENT_NOT_UPVOTED, message: 'You have not upvoted this comment' });
+      }
+      // Guard gt:0 — counter tidak boleh pernah negatif.
+      await tx.profileQuestionComment.updateMany({
+        where: { id: commentId, upvoteCount: { gt: 0 } },
+        data: { upvoteCount: { decrement: 1 } },
+      });
+    });
+
+    const current = await this.prisma.profileQuestionComment.findUnique({ where: { id: commentId }, select: { upvoteCount: true } });
+    return { upvoted: false, upvoteCount: current?.upvoteCount ?? 0 };
+  }
+
   private isUniqueViolation(err: unknown): boolean {
     return typeof err === 'object' && err !== null && (err as { code?: string }).code === 'P2002';
   }
@@ -620,10 +734,23 @@ export class ProfileQAService {
       parentId: comment.parentId,
       author: comment.author,
       createdAt: comment.createdAt,
+      upvoteCount: 0,
+      isUpvotedByViewer: false,
     };
   }
 
-  async getComments(questionId: string, page: number, limit: number): Promise<PaginatedComments> {
+  /**
+   * RK-P01/RK-P02: daftar komentar dengan jumlah tepuk tangan +
+   * status upvote viewer, dan param sort ('top' | 'newest').
+   * `parentId` selalu dikirim (null untuk akar) — RK-P03.
+   */
+  async getComments(
+    questionId: string,
+    page: number,
+    limit: number,
+    sort: 'top' | 'newest' = 'newest',
+    viewerId?: string | null,
+  ): Promise<PaginatedComments> {
     const q = await this.prisma.profileQuestion.findUnique({
       where: { id: questionId },
       select: {
@@ -639,15 +766,20 @@ export class ProfileQAService {
       throw new ForbiddenException({ code: ErrorCodes.FORBIDDEN, message: 'Question is not publicly visible' });
     }
 
+    const safeSort: 'top' | 'newest' = sort === 'top' ? 'top' : 'newest';
     const safePage = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1;
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 50) : 20;
     const skip = (safePage - 1) * safeLimit;
     const visibleCommentWhere = { questionId, isHidden: false, author: { isActive: true, isBanned: false, deletedAt: null, profileVisible: true } };
 
+    const orderBy = safeSort === 'top'
+      ? [{ upvoteCount: 'desc' as const }, { createdAt: 'asc' as const }, { id: 'asc' as const }]
+      : [{ createdAt: 'asc' as const }, { id: 'asc' as const }];
+
     const [comments, total] = await Promise.all([
       this.prisma.profileQuestionComment.findMany({
         where: visibleCommentWhere,
-        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        orderBy,
         skip,
         take: safeLimit,
         select: this.commentSelect,
@@ -655,7 +787,19 @@ export class ProfileQAService {
       this.prisma.profileQuestionComment.count({ where: visibleCommentWhere }),
     ]);
 
-    return { data: comments, total, page: safePage, limit: safeLimit, totalPages: Math.ceil(total / safeLimit) };
+    const upvotedIds = await this.getUpvotedCommentIds(viewerId ?? undefined, comments.map(c => c.id));
+
+    return {
+      data: comments.map(c => ({
+        ...c,
+        isUpvotedByViewer: viewerId ? upvotedIds.has(c.id) : undefined,
+      })),
+      total,
+      page: safePage,
+      limit: safeLimit,
+      totalPages: Math.ceil(total / safeLimit),
+      sort: safeSort,
+    };
   }
 
   async deleteComment(userId: string, commentId: string): Promise<{ message: string }> {

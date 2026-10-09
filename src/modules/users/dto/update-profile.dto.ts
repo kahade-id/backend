@@ -18,10 +18,12 @@ export class UpdateProfileDto {
   @Matches(/^[a-zA-Z0-9._]+$/, { message: 'Username may only contain letters, numbers, dots, and underscores' })
   username?: string;
 
-  @ApiPropertyOptional({ description: 'User bio', minLength: 0, maxLength: 500 })
+  // RK-P10: batas 160 karakter disepakati dengan UI (frontend memotong
+  // tampilan 2 baris; validasi form memakai angka yang sama).
+  @ApiPropertyOptional({ description: 'User bio (max 160 characters)', minLength: 0, maxLength: 160 })
   @IsOptional()
   @IsString()
-  @MaxLength(500, { message: 'Bio must be at most 500 characters' })
+  @MaxLength(160, { message: 'Bio must be at most 160 characters' })
   @Matches(/^[^<>]*$/, { message: 'Bio must not contain < or > characters' })
   bio?: string;
 

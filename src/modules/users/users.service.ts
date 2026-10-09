@@ -436,10 +436,16 @@ export class UsersService {
     // Kontak publik: hormati toggle, dan paksa null bila ada relasi block.
     // (Gate di atas sudah 403 untuk block, guard ini menjaga bila kelak ada
     // jalur lain yang memanggil method ini dengan viewer terblokir.)
+    // RK-P05: flag showContactEmail/showContactPhone SELALU dikirim boolean;
+    // nilai kontak HANYA dikirim bila flag true (fail closed, anti-bocor).
     const contactAllowed = !viewerId || isOwnProfile;
+    const showContactEmail = contactAllowed && user.showContactEmail === true;
+    const showContactPhone = contactAllowed && user.showContactPhone === true;
     const publicContact = {
-      email: contactAllowed && user.showContactEmail ? user.contactEmail : null,
-      phone: contactAllowed && user.showContactPhone ? user.contactPhone : null,
+      showContactEmail,
+      showContactPhone,
+      email: showContactEmail ? user.contactEmail : null,
+      phone: showContactPhone ? user.contactPhone : null,
     };
 
     // "Tentang": tanggal akun dibuat + tanggal tiap badge didapat.
@@ -546,6 +552,11 @@ export class UsersService {
         isOwnProfile,
         isAuthenticated: Boolean(viewerId),
       },
+
+      // RK-P04: penanda "milik saya" eksplisit dari server (alias dari
+      // viewer.isOwnProfile; keamanan tetap di backend, field ini hanya
+      // memperjelas UI).
+      isSelf: isOwnProfile,
 
       // ------------------------------------------------------------------
       // DEPRECATED flat aliases — dipertahankan agar client lama tidak putus.
@@ -1588,10 +1599,12 @@ export class UsersService {
     // Batch 139 BE-API2 (item 119): sort=highest → bintang tertinggi dulu.
     // Default (dan sort=latest) tetap createdAt desc + tiebreak id desc —
     // perilaku lama tidak berubah.
+    // RK-P07: alias 'top' (=highest) dan 'newest' (=latest) untuk konsistensi
+    // dengan endpoint komentar Q&A.
     let orderBy: Prisma.RatingOrderByWithRelationInput[];
-    if (sort === 'highest') {
+    if (sort === 'highest' || sort === 'top') {
       orderBy = [{ stars: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }];
-    } else if (sort === undefined || sort === null || sort === '' || sort === 'latest') {
+    } else if (sort === undefined || sort === null || sort === '' || sort === 'latest' || sort === 'newest') {
       orderBy = [{ createdAt: 'desc' }, { id: 'desc' }];
     } else {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Unsupported rating sort' });

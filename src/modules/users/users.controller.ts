@@ -987,8 +987,38 @@ export class UsersController {
     @Param('questionId', ParseIdPipe) questionId: string,
     @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
     @Query('limit', new DefaultValuePipe(20), ParseIntPipe, new ClampLimitPipe()) limit: number,
+    @Query('sort') sort: 'top' | 'newest' | undefined,
+    @CurrentUser('sub') viewerId: string | null,
   ): Promise<object> {
-    return this.profileQAService.getComments(questionId, page, limit);
+    return this.profileQAService.getComments(questionId, page, limit, sort ?? 'newest', viewerId);
+  }
+
+  // RK-P01: upvote (tepuk tangan) komentar Q&A. Toggle idempotent via POST
+  // (buat) + DELETE (hapus), pola sama seperti upvote pertanyaan.
+  @Post('questions/comments/:commentId/upvote')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Idempotency()
+  @ApiOperation({ summary: 'Upvote a Q&A comment' })
+  async upvoteComment(
+    @CurrentUser('sub') userId: string,
+    @Param('commentId', ParseIdPipe) commentId: string,
+  ): Promise<object> {
+    const result = await this.profileQAService.upvoteComment(userId, commentId);
+    return { upvoteCount: result.upvoteCount, isUpvotedByViewer: result.upvoted };
+  }
+
+  @Delete('questions/comments/:commentId/upvote')
+  @UseGuards(UserThrottleGuard)
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Idempotency()
+  @ApiOperation({ summary: 'Remove your upvote from a Q&A comment' })
+  async removeCommentUpvote(
+    @CurrentUser('sub') userId: string,
+    @Param('commentId', ParseIdPipe) commentId: string,
+  ): Promise<object> {
+    const result = await this.profileQAService.removeCommentUpvote(userId, commentId);
+    return { upvoteCount: result.upvoteCount, isUpvotedByViewer: result.upvoted };
   }
 
   @Delete('comments/:commentId')

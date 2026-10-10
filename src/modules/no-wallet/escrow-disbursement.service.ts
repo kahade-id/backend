@@ -298,7 +298,27 @@ export class EscrowDisbursementService {
       return this.fail(row, `DECRYPT_FAILED: ${(e as Error).message}`);
     }
 
-    const amountIdr = Number(row.amountSen) / 100;
+    // K5 (audit 2026-10-10): baris yang lahir SEBELUM pembulatan fee ke rupiah
+    // (fee-calculator) bisa membawa sen pecahan rupiah → sebelumnya FAILED
+    // permanen (INVALID_AMOUNT_SEN) dan seller SELLER/SPLIT tidak pernah
+    // dibayar. Transfer bank DANA = rupiah utuh → bulatkan KE BAWAH; residu
+    // (<Rp1) tetap di akun merchant. amountSen baris diperbarui ke nominal
+    // yang benar-benar ditransfer agar jejak ledger jujur.
+    let transferSen = row.amountSen;
+    if (transferSen % BigInt(100) !== BigInt(0)) {
+      const floored = (transferSen / BigInt(100)) * BigInt(100);
+      this.logger.warn(
+        `Disbursement key=${row.idempotencyKey}: amountSen ${row.amountSen} bukan rupiah utuh → ` +
+          `ditransfer ${floored} sen (residu ${transferSen - floored} sen tetap di merchant)`,
+      );
+      await this.prisma.escrowDisbursement.update({
+        where: { id: row.id },
+        data: { amountSen: floored },
+      });
+      transferSen = floored;
+      row = { ...row, amountSen: floored };
+    }
+    const amountIdr = Number(transferSen) / 100;
     if (!Number.isInteger(amountIdr) || amountIdr <= 0) {
       return this.fail(row, `INVALID_AMOUNT_SEN: ${row.amountSen}`);
     }

@@ -57,7 +57,16 @@ export async function loadPrivacySetting(
   prisma: { privacySetting: { findUnique: (args: { where: { userId: string } }) => Promise<Partial<PrivacySettingLike> | null> } },
   userId: string,
 ): Promise<PrivacySettingLike> {
-  const row = await prisma.privacySetting.findUnique({ where: { userId } }).catch(() => null);
+  // Audit 2026-10-10: try/catch, bukan hanya `.catch` — bila client tidak
+  // punya model `privacySetting` (mis. mock di unit test lama), akses
+  // `prisma.privacySetting.findUnique` melempar TypeError SINKRON yang tak
+  // tertangkap `.catch`, dan seluruh profil publik ikut 500.
+  let row: Partial<PrivacySettingLike> | null = null;
+  try {
+    row = await prisma.privacySetting.findUnique({ where: { userId } });
+  } catch {
+    row = null;
+  }
   if (!row) return { ...DEFAULT_PRIVACY_SETTING };
   return {
     showEmail: row.showEmail ?? DEFAULT_PRIVACY_SETTING.showEmail,
@@ -141,23 +150,42 @@ export function applyPrivacyToPublicProfile<T extends Record<string, unknown>>(
     followingCount: canSeeFollowing ? social.followingCount : null,
     followers: canSeeFollowers ? social.followers : [],
     following: canSeeFollowing ? social.following : [],
+    // Audit 2026-10-10: `isFollowedBy` = keanggotaan viewer di daftar
+    // mengikuti pemilik — bila daftar itu disembunyikan, flag ini pun tidak
+    // boleh membocorkannya.
+    ...(canSeeFollowing ? {} : { isFollowedBy: null }),
   };
   // Alias deprecated diselaraskan agar tidak membocorkan lewat jalur lama.
   if (!canSeeFollowers) next.followersCount = null;
   if (!canSeeFollowing) next.followingCount = null;
 
   // G081: ulasan/rating.
+  const hidden = new Set((privacy.hiddenStats ?? []).filter((k): k is string => KNOWN_HIDDEN_STAT_KEYS.includes(k as (typeof KNOWN_HIDDEN_STAT_KEYS)[number])));
   if (!privacy.showReviews) {
     next.ratings = { averageRating: null, totalRatingCount: null, recent: [], hidden: true };
     next.recentRatings = [];
+    // Audit 2026-10-10: angka rating juga hidup di `stats` — tanpa ini
+    // "sembunyikan ulasan" masih membocorkan rata-rata & jumlah rating.
+    hidden.add('avgRating');
+    hidden.add('ratingCount');
   }
 
-  // G082: statistik tersembunyi.
-  const hidden = new Set((privacy.hiddenStats ?? []).filter((k): k is string => KNOWN_HIDDEN_STAT_KEYS.includes(k as (typeof KNOWN_HIDDEN_STAT_KEYS)[number])));
+  // G082: statistik tersembunyi — di `stats` DAN salinan nilainya di bagian
+  // lain payload (`ratings.*`, `about.memberSince`); dulu hanya `stats`
+  // sehingga klien tinggal membaca dari bagian sebelah.
   if (hidden.size > 0) {
     const stats = { ...((next.stats ?? {}) as Record<string, unknown>) };
     for (const key of hidden) stats[key] = null;
     next.stats = stats;
+    if (hidden.has('avgRating') || hidden.has('ratingCount')) {
+      const ratings = { ...((next.ratings ?? {}) as Record<string, unknown>) };
+      if (hidden.has('avgRating')) ratings.averageRating = null;
+      if (hidden.has('ratingCount')) ratings.totalRatingCount = null;
+      next.ratings = ratings;
+    }
+    if (hidden.has('memberSince')) {
+      next.about = { ...((next.about ?? {}) as Record<string, unknown>), memberSince: null };
+    }
   }
 
   // G083 + info Q&A untuk klien (mis. render meta noindex / badge kebijakan).

@@ -36,10 +36,16 @@ export class OgMetadataService {
         kycStatus: true,
         isVip: true,
         profileVisible: true,
+        isActive: true,
+        isBanned: true,
+        deletedAt: true,
       },
     });
 
-    if (!user || !user.profileVisible) {
+    // Audit 2026-10-10: gate visibilitas SAMA dengan getPublicProfile — OG
+    // (publik, tanpa auth) dulu masih menyajikan nama/bio/avatar akun yang
+    // banned, nonaktif, atau sudah dihapus selama profileVisible=true.
+    if (!user || !user.profileVisible || user.isActive === false || user.isBanned === true || user.deletedAt != null) {
       throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
     }
 

@@ -88,3 +88,40 @@ describe('detectMimeFromBytes — anchor box-size ftyp (UPFV-04)', () => {
     expect(detectMimeFromBytes(box(28, 'heic'))).toBe('image/heic');
   });
 });
+
+/**
+ * Audit Pesan 2026-10-10 (bug #4): rekaman voice note Android.
+ *
+ * MediaRecorder Android (OutputFormat.MPEG_4 + AAC — preset HIGH_QUALITY
+ * expo-audio) menulis brand ftyp `mp42`/`isom` untuk berkas audio-only, bukan
+ * `M4A `. Deteksi magic-byte menyebutnya `video/mp4`, klien mendeklarasikan
+ * `audio/mp4`, dan pembandingan ketat menolak SEMUA voice note Android.
+ * `resolveStoredMime` melonggarkan tepat satu pasangan itu dan menyimpan
+ * sebagai audio (ekstensi `.m4a`).
+ */
+describe('resolveStoredMime — voice note Android (bug #4, 2026-10-10)', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { resolveStoredMime } = require('../upload.service') as {
+    resolveStoredMime: (declared: string, detected: string) => string | null;
+  };
+
+  it('brand mp42 (Android MediaRecorder) terdeteksi video/mp4', () => {
+    expect(detectMimeFromBytes(box(24, 'mp42'))).toBe('video/mp4');
+  });
+
+  it('deklarasi audio/mp4 + deteksi video/mp4 → disimpan sebagai audio/mp4', () => {
+    expect(resolveStoredMime('audio/mp4', 'video/mp4')).toBe('audio/mp4');
+  });
+
+  it('deklarasi yang sama dengan deteksi → deteksi', () => {
+    expect(resolveStoredMime('audio/mp4', 'audio/mp4')).toBe('audio/mp4');
+    expect(resolveStoredMime('image/jpeg', 'image/jpeg')).toBe('image/jpeg');
+  });
+
+  it('arah sebaliknya dan pasangan lain tetap ditolak', () => {
+    expect(resolveStoredMime('video/mp4', 'audio/mp4')).toBeNull();
+    expect(resolveStoredMime('image/png', 'image/jpeg')).toBeNull();
+    expect(resolveStoredMime('audio/mpeg', 'video/mp4')).toBeNull();
+    expect(resolveStoredMime('application/pdf', 'video/mp4')).toBeNull();
+  });
+});

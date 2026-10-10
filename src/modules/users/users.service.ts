@@ -106,6 +106,10 @@ export class UsersService {
       usernameChangedAt: user.usernameChangedAt,
       passwordChangedAt: user.passwordChangedAt,
       isMfaEnabled: user.twoFactorAuth?.isEnabled ?? false,
+      // Audit profil 2026-10-10 (E-01/E-08): klien perlu tahu apakah akun punya
+      // kata sandi — akun OTP/sosial tidak bisa re-auth password (hapus akun →
+      // otpCode WhatsApp; ganti username → arahkan buat kata sandi dulu).
+      hasPassword: Boolean(user.password),
       wallet: user.wallet ? {
         availableBalance: toIdr(user.wallet.availableBalance),
         escrowBalance: toIdr(user.wallet.escrowBalance),

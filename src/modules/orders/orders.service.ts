@@ -664,7 +664,11 @@ export class OrdersService {
       province: string | null;
       postalCode: string;
     } | null = null;
-    if (dto.orderType === OrderType.PHYSICAL_GOODS) {
+    // Audit alamat & kurir B01 (2026-10-10): alamat tujuan adalah milik
+    // PEMBELI. Bila pembuat order berperan SELLER, alamatnya bukan tujuan
+    // kirim — jangan diminta (dulu alamat penjual sendiri tersnapshot sebagai
+    // tujuan). Pembeli mengisi alamatnya saat Terima pesanan (confirm, B02).
+    if (dto.orderType === OrderType.PHYSICAL_GOODS && dto.role === 'BUYER') {
       const shippingAddressId =
         typeof dto.shippingAddressId === 'string' ? dto.shippingAddressId.trim() : '';
       if (!shippingAddressId) {

@@ -168,12 +168,13 @@ export class UpdateAdminProviderFlagDto {
 /**
  * Wave 2 integritas-139: body POST
  * /v1/admin/courier/shipments/:id/refunds/approve.
- * amountSen dalam rupiah-penuh (bukan sen pecahan) konsisten dengan
- * RequestRefundDto (BigInt Math.round di service).
+ * A07 (audit alamat & kurir 2026-10-10): `amount` dalam RUPIAH utuh —
+ * konsisten dengan RequestRefundDto dan kolom BigInt rupiah di Shipment.
+ * Nama lama `amountSen` menyesatkan (admin mengira sen → salah 100×).
  */
 export class ApproveShippingRefundDto {
   @IsInt() @Min(1)
-  amountSen!: number;
+  amount!: number;
 
   @IsString() @IsNotEmpty() @MinLength(5) @MaxLength(500)
   reason!: string;

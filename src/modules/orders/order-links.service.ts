@@ -412,13 +412,29 @@ export class OrderLinksService {
             : 'Link ini tidak memiliki alamat pengiriman yang valid. Minta pembuat link membuat ulang tautannya.',
         });
       }
-      const address = await this.prisma.address.findFirst({
+      let address = await this.prisma.address.findFirst({
         where: { id: rawAddressId, userId: buyerId, deletedAt: null },
       });
+      // Audit alamat & kurir B03 (2026-10-10): link buatan PEMBELI yang
+      // alamatnya sudah dihapus dari buku alamat — penerima (penjual) tidak
+      // bisa memperbaikinya. Jatuhkan ke alamat utama pembeli saat ini; bila
+      // itu pun tidak ada, baru tolak (fail-closed). Pembeli yang menerima
+      // link (buyerIsAcceptor) tetap harus memilih alamat yang valid.
+      if (!address && !buyerIsAcceptor) {
+        address = await this.prisma.address.findFirst({
+          where: { userId: buyerId, deletedAt: null },
+          orderBy: [{ isDefault: 'desc' }, { updatedAt: 'desc' }],
+        });
+        if (address) {
+          this.logger.warn(`acceptLink: alamat link ${rawAddressId} sudah tidak ada — memakai alamat utama pembeli ${address.id}`);
+        }
+      }
       if (!address) {
         throw new BadRequestException({
           code: ErrorCodes.SHIPPING_ADDRESS_REQUIRED,
-          message: 'Alamat pengiriman tidak ditemukan di buku alamat pembeli.',
+          message: buyerIsAcceptor
+            ? 'Alamat pengiriman tidak ditemukan di buku alamat Anda.'
+            : 'Alamat pengiriman pembeli sudah dihapus dan tidak ada alamat lain. Minta pembeli menambah alamat lalu membuat ulang tautannya.',
         });
       }
       shippingSnapshot = {

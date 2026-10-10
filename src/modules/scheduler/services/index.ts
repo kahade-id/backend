@@ -44,3 +44,5 @@ export { DanaPaymentReconcileService, isTerminalReconcileOutcome } from './dana-
 export type { DanaPaymentReconcileOutcome } from './dana-payment-reconcile.service';
 export { DisbursementAttentionSweepService } from './disbursement-attention-sweep.service';
 export { MilestoneAutoReleaseService } from './milestone-auto-release.service';
+// Audit alamat & kurir A03/A04 (2026-10-10): pull tracking + alert macet.
+export { CourierTrackingSweepService } from './courier-tracking-sweep.service';

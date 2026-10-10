@@ -4405,10 +4405,11 @@ model ShowcaseReport {
   @@map("showcase_reports")
 }
 
-/// Story: image or text content with a fixed 24-hour lifetime.
+/// Story: image, text, or short video content with a fixed 24-hour lifetime.
 enum StoryKind {
   IMAGE
   TEXT
+  VIDEO
 }
 
 enum StoryReportCategory {
@@ -4434,6 +4435,14 @@ model StoryMediaUpload {
   authorId  String
   author    User     @relation("StoryMediaOwner", fields: [authorId], references: [id], onDelete: Cascade)
   fileKey   String   @unique @db.VarChar(512)
+  /// IMAGE or VIDEO — the Story created from this ticket must request the same kind.
+  kind      StoryKind @default(IMAGE)
+  /// VIDEO only: server-generated JPEG poster (private key, same folder as fileKey).
+  thumbnailKey String? @db.VarChar(512)
+  /// VIDEO only: ffprobe duration in milliseconds (validated ≤ STORY_VIDEO_MAX_DURATION_SEC).
+  durationMs   Int?
+  width        Int?
+  height       Int?
   createdAt DateTime @default(now())
   expiresAt DateTime
 
@@ -4450,6 +4459,10 @@ model Story {
   mediaUrl        String?   @db.VarChar(512)
   /// Private local-storage object key. Never exposed in API responses.
   mediaKey        String?   @db.VarChar(512)
+  /// VIDEO only: private key of the server-generated poster JPEG (exposed as signed `thumbnailUrl`).
+  thumbnailKey    String?   @db.VarChar(512)
+  /// VIDEO only: playback length in milliseconds — drives the viewer progress bar.
+  durationMs      Int?
   textContent     String?   @db.VarChar(200)
   backgroundColor String?   @db.VarChar(7)
   audience        Json

@@ -256,6 +256,19 @@ export const SHOWCASE_VIDEO_MAX_DIMENSION_PX = 3840;
 export const UPLOAD_DIRECT_MULTER_MAX_BYTES = 104 * 1024 * 1024;
 /** Lebar thumbnail video showcase (px); tinggi mengikuti aspek rasio. */
 export const SHOWCASE_VIDEO_THUMBNAIL_WIDTH = 640;
+
+// ---------------------------------------------------------------------------
+// Story (2026-10-10): foto + video pendek ala WhatsApp Status.
+// ---------------------------------------------------------------------------
+/** Foto story maks 10 MB (server re-encode JPEG 1600 px). */
+export const STORY_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
+/** Video story maks 50 MB — cukup untuk 60 dtk 1080p dari kamera HP. */
+export const STORY_VIDEO_MAX_BYTES = 50 * 1024 * 1024;
+/** Durasi video story maks 60 detik (Instagram Stories), min 1 detik. */
+export const STORY_VIDEO_MAX_DURATION_SEC = 60;
+export const STORY_VIDEO_MIN_DURATION_SEC = 1;
+/** Lebar poster JPEG video story (ffmpeg) — dipakai tray/viewer/admin. */
+export const STORY_VIDEO_THUMBNAIL_WIDTH = 640;
 /** PERF-FIX (NP-001): lebar thumbnail foto showcase (px); tinggi mengikuti
  * aspek rasio. Dihasilkan server-side saat upload SHOWCASE_IMAGE via sharp —
  * feed memuat varian kecil ini, bukan file full-res. */

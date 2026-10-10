@@ -17,7 +17,7 @@ import {
 import { Transform, Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
-const STORY_KINDS = ['image', 'text'] as const;
+const STORY_KINDS = ['image', 'video', 'text'] as const;
 
 export class StoryProductTagInputDto {
   @ApiProperty({ maxLength: 100 })
@@ -75,11 +75,11 @@ export class StoryAskStockDto {
 export class CreateStoryDto {
   @ApiProperty({ enum: STORY_KINDS })
   @IsIn(STORY_KINDS)
-  kind!: 'image' | 'text';
+  kind!: 'image' | 'video' | 'text';
 
   @ApiPropertyOptional({
     maxLength: 100,
-    description: 'Single-use mediaId returned by POST /stories/media.',
+    description: 'Single-use mediaId returned by POST /stories/media (image or video ticket).',
   })
   @IsOptional()
   @IsString()

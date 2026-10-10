@@ -1,3 +1,4 @@
+import * as os from 'os';
 import { ForbiddenException } from '@nestjs/common';
 import { StoriesService } from './stories.service';
 
@@ -45,7 +46,17 @@ describe('StoriesService saved-profile visibility and per-story privacy', () => 
   let row: ReturnType<typeof storyRow>;
   let realtime: { emitToUser: jest.Mock };
   let chat: { createInquiry: jest.Mock };
-  let upload: { generateDownloadUrl: jest.Mock; cleanupFileKeys: jest.Mock };
+  let upload: {
+    generateDownloadUrl: jest.Mock;
+    cleanupFileKeys: jest.Mock;
+    uploadDirect: jest.Mock;
+  };
+  let videoProcessing: {
+    isAvailable: jest.Mock;
+    probeVideo: jest.Mock;
+    generateThumbnail: jest.Mock;
+  };
+  let localStorage: { resolvePath: jest.Mock; deleteFile: jest.Mock };
 
   beforeEach(() => {
     row = storyRow({ mode: 'all_savers' });
@@ -75,7 +86,10 @@ describe('StoriesService saved-profile visibility and per-story privacy', () => 
         findUnique: jest.fn().mockResolvedValue({ id: 'saved-profile-row' }),
       },
       blockList: { findFirst: jest.fn().mockResolvedValue(null) },
-      storyFeatureBan: { findMany: jest.fn().mockResolvedValue([]) },
+      storyFeatureBan: {
+        findMany: jest.fn().mockResolvedValue([]),
+        findUnique: jest.fn().mockResolvedValue(null),
+      },
       story: {
         findFirst: jest.fn(),
         findMany: jest.fn().mockImplementation(async () => [row]),
@@ -84,6 +98,7 @@ describe('StoriesService saved-profile visibility and per-story privacy', () => 
       storyMediaUpload: {
         findMany: jest.fn().mockResolvedValue([]),
         deleteMany: jest.fn().mockResolvedValue({ count: 1 }),
+        create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => data),
       },
       userShowcase: { findMany: jest.fn().mockResolvedValue([]) },
       storyView: { findMany: jest.fn().mockResolvedValue([]) },
@@ -95,17 +110,45 @@ describe('StoriesService saved-profile visibility and per-story privacy', () => 
     upload = {
       generateDownloadUrl: jest.fn().mockResolvedValue('https://storage.example/story.jpg'),
       cleanupFileKeys: jest.fn().mockResolvedValue({ deleted: 1, errors: [] }),
+      uploadDirect: jest.fn(async (_u: string, _p: string, name: string) => ({
+        fileKey: `uploads/story-media/${AUTHOR_ID}/${name}`,
+      })),
+    };
+    videoProcessing = {
+      isAvailable: jest.fn(() => true),
+      probeVideo: jest.fn().mockResolvedValue({ durationSec: 12.4, width: 1080, height: 1920 }),
+      generateThumbnail: jest.fn().mockResolvedValue(undefined),
+    };
+    localStorage = {
+      resolvePath: jest.fn((key: string) => `${os.tmpdir()}/kahade-story-spec/${key}`),
+      deleteFile: jest.fn().mockResolvedValue(true),
     };
     service = new StoriesService(
       prisma as never,
       upload as never,
-      {} as never,
+      localStorage as never,
       realtime as never,
       {} as never,
       chat as never,
       { logUserAction: jest.fn() } as never,
+      videoProcessing as never,
     );
   });
+
+  function allowStoryFeature(): void {
+    prisma.user.findUnique.mockImplementation(
+      async ({ where }: { where: Record<string, string> }) =>
+        where.id === AUTHOR_ID
+          ? {
+              id: AUTHOR_ID,
+              userId: AUTHOR_PUBLIC_ID,
+              isActive: true,
+              isBanned: false,
+              deletedAt: null,
+            }
+          : null,
+    );
+  }
 
   it('requires a saved-profile relationship; a follow does not grant Story access', async () => {
     prisma.userSavedProfile.findUnique.mockResolvedValue(null);
@@ -189,7 +232,12 @@ describe('StoriesService saved-profile visibility and per-story privacy', () => 
     ]);
     upload.cleanupFileKeys.mockResolvedValue({
       deleted: 0,
-      errors: [{ fileKey: `uploads/story-media/${AUTHOR_ID}/story.jpg`, reason: 'storage deletion failed' }],
+      errors: [
+        {
+          fileKey: `uploads/story-media/${AUTHOR_ID}/story.jpg`,
+          reason: 'storage deletion failed',
+        },
+      ],
     });
 
     const result = await service.cleanupExpiredAndRetained(new Date());
@@ -199,23 +247,119 @@ describe('StoriesService saved-profile visibility and per-story privacy', () => 
   });
 
   it('keeps a retained Story row until its media has been deleted', async () => {
-    prisma.story.findMany
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([
-        {
-          id: STORY_ID,
-          authorId: AUTHOR_ID,
-          mediaKey: `uploads/story-media/${AUTHOR_ID}/story.jpg`,
-        },
-      ]);
+    prisma.story.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+      {
+        id: STORY_ID,
+        authorId: AUTHOR_ID,
+        mediaKey: `uploads/story-media/${AUTHOR_ID}/story.jpg`,
+      },
+    ]);
     upload.cleanupFileKeys.mockResolvedValue({
       deleted: 0,
-      errors: [{ fileKey: `uploads/story-media/${AUTHOR_ID}/story.jpg`, reason: 'storage deletion failed' }],
+      errors: [
+        {
+          fileKey: `uploads/story-media/${AUTHOR_ID}/story.jpg`,
+          reason: 'storage deletion failed',
+        },
+      ],
     });
 
     const result = await service.cleanupExpiredAndRetained(new Date());
 
     expect(result.deleted).toBe(0);
     expect(prisma.story.deleteMany).not.toHaveBeenCalled();
+  });
+
+  describe('video story upload (2026-10-10)', () => {
+    it('stores a VIDEO ticket with poster + duration from ffprobe', async () => {
+      allowStoryFeature();
+      const result = await service.uploadStoryMedia(
+        AUTHOR_ID,
+        'clip.mp4',
+        'video/mp4',
+        Buffer.alloc(2048, 1),
+      );
+      expect(upload.uploadDirect).toHaveBeenCalledWith(
+        AUTHOR_ID,
+        'STORY_MEDIA',
+        'clip.mp4',
+        'video/mp4',
+        expect.any(Buffer),
+      );
+      expect(videoProcessing.generateThumbnail).toHaveBeenCalledWith(
+        expect.stringContaining('clip.mp4'),
+        expect.stringContaining('-thumb-'),
+        1,
+        640,
+      );
+      expect(prisma.storyMediaUpload.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          kind: 'VIDEO',
+          durationMs: 12400,
+          width: 1080,
+          height: 1920,
+          thumbnailKey: expect.stringMatching(/^uploads\/story-media\/.+-thumb-.+\.jpg$/),
+        }),
+      });
+      expect(result).toMatchObject({ kind: 'video', durationMs: 12400 });
+      expect(result.thumbnailUrl).toBe('https://storage.example/story.jpg');
+    });
+
+    it('rejects a video over 60 seconds and discards the stored file (fail-closed)', async () => {
+      allowStoryFeature();
+      videoProcessing.probeVideo.mockResolvedValue({ durationSec: 61, width: 720, height: 1280 });
+      await expect(
+        service.uploadStoryMedia(AUTHOR_ID, 'long.mp4', 'video/mp4', Buffer.alloc(2048, 1)),
+      ).rejects.toMatchObject({ response: { code: 'VIDEO_TOO_LONG' } });
+      expect(upload.cleanupFileKeys).toHaveBeenCalledWith(AUTHOR_ID, [
+        `uploads/story-media/${AUTHOR_ID}/long.mp4`,
+      ]);
+      expect(prisma.storyMediaUpload.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a video over 50 MB before touching storage', async () => {
+      allowStoryFeature();
+      await expect(
+        service.uploadStoryMedia(
+          AUTHOR_ID,
+          'big.mp4',
+          'video/mp4',
+          Buffer.alloc(50 * 1024 * 1024 + 1),
+        ),
+      ).rejects.toMatchObject({ response: { code: 'STORY_MEDIA_TOO_LARGE' } });
+      expect(upload.uploadDirect).not.toHaveBeenCalled();
+    });
+
+    it('keeps the image path unchanged: no probe, IMAGE ticket', async () => {
+      allowStoryFeature();
+      const result = await service.uploadStoryMedia(
+        AUTHOR_ID,
+        'foto.jpg',
+        'image/jpeg',
+        Buffer.alloc(2048, 1),
+      );
+      expect(videoProcessing.probeVideo).not.toHaveBeenCalled();
+      expect(prisma.storyMediaUpload.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ kind: 'IMAGE', thumbnailKey: null, durationMs: null }),
+      });
+      expect(result).toMatchObject({ kind: 'image', thumbnailUrl: null, durationMs: null });
+    });
+
+    it('retention removes the poster together with the expired video ticket', async () => {
+      prisma.story.findMany.mockResolvedValue([]);
+      prisma.storyMediaUpload.findMany.mockResolvedValue([
+        {
+          id: 'media-ticket',
+          authorId: AUTHOR_ID,
+          fileKey: `uploads/story-media/${AUTHOR_ID}/clip.mp4`,
+          thumbnailKey: `uploads/story-media/${AUTHOR_ID}/clip-thumb.jpg`,
+        },
+      ]);
+      await service.cleanupExpiredAndRetained(new Date());
+      expect(upload.cleanupFileKeys).toHaveBeenCalledWith(AUTHOR_ID, [
+        `uploads/story-media/${AUTHOR_ID}/clip.mp4`,
+        `uploads/story-media/${AUTHOR_ID}/clip-thumb.jpg`,
+      ]);
+    });
   });
 });

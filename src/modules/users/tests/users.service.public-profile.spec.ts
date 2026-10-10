@@ -10,6 +10,7 @@ import { VerificationBadgeService } from '../verification-badge.service';
 import { UserAnalyticsService } from '../user-analytics.service';
 import { LocalStorageService } from '../../upload/local-storage.service';
 import { ReportFlagService } from '../../../common/services/report-flag.service';
+import { AccountDeletionService } from '../account-deletion.service';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 
 jest.mock('../../../common/utils/pii.util', () => ({
@@ -103,6 +104,9 @@ describe('UsersService.getPublicProfile (Section 2 — Profile Core)', () => {
         { provide: LocalStorageService, useValue: {} },
         // Section 6: agregasi laporan -> flag moderasi internal.
         { provide: ReportFlagService, useValue: { evaluateTarget: jest.fn(async () => ({ flaggedForReview: false, distinctReporters: 0 })) } },
+        // Konstruktor UsersService kini menginjeksi AccountDeletionService — tanpa
+        // provider ini seluruh spec gagal di compile() (baseline sejak origin/main).
+        { provide: AccountDeletionService, useValue: {} },
       ],
     }).compile();
     service = module.get<UsersService>(UsersService);
@@ -132,19 +136,19 @@ describe('UsersService.getPublicProfile (Section 2 — Profile Core)', () => {
   describe('contact privacy', () => {
     it('is null when both show-contact toggles are off even though values exist', async () => {
       const { contact } = (await service.getPublicProfile('seller')) as any;
-      expect(contact).toEqual({ email: null, phone: null });
+      expect(contact).toEqual({ email: null, phone: null, showContactEmail: false, showContactPhone: false });
     });
 
     it('exposes only the channel whose toggle is on', async () => {
       mockPrisma.user.findUnique.mockResolvedValue({ ...visibleOwner, showContactEmail: true });
       const { contact } = (await service.getPublicProfile('seller')) as any;
-      expect(contact).toEqual({ email: 'hello@seller.id', phone: null });
+      expect(contact).toEqual({ email: 'hello@seller.id', phone: null, showContactEmail: true, showContactPhone: false });
     });
 
     it('is mirrored inside the about section', async () => {
       mockPrisma.user.findUnique.mockResolvedValue({ ...visibleOwner, showContactPhone: true });
       const { about } = (await service.getPublicProfile('seller')) as any;
-      expect(about.contact).toEqual({ email: null, phone: '+6281200000000' });
+      expect(about.contact).toEqual({ email: null, phone: '+6281200000000', showContactEmail: false, showContactPhone: true });
     });
   });
 

@@ -345,11 +345,19 @@ export class UsersService {
     });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
 
-    if (!user.profileVisible || user.isActive === false || user.isBanned === true || user.deletedAt != null) {
+    const isOwnProfile = Boolean(viewerId && viewerId === user.id);
+
+    // Audit profil 2026-10-10: pemilik SELALU boleh membuka profilnya sendiri
+    // walau `profileVisible=false` (sebelumnya 404 → tab Profil pemilik
+    // "Profil tidak ditemukan" begitu ia mematikan "Profil terlihat publik").
+    // Endpoint followers/following/ratings sudah memakai pengecualian yang
+    // sama (`profileVisible === false && viewerId !== user.id`).
+    if (user.isActive === false || user.isBanned === true || user.deletedAt != null) {
       throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
     }
-
-    const isOwnProfile = Boolean(viewerId && viewerId === user.id);
+    if (!user.profileVisible && !isOwnProfile) {
+      throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    }
 
     // Block-list enforcement: relasi block dua arah menutup seluruh endpoint.
     if (viewerId && !isOwnProfile) {
@@ -380,7 +388,7 @@ export class UsersService {
       ...(excludedIds.length > 0 ? { id: { notIn: excludedIds } } : {}),
     };
 
-    const [followRow, followedByRow, favoriteRow, followerPreview, followingPreview, favorites, verificationBadges, followersCount, followingCount] =
+    const [followRow, followedByRow, favoriteRow, followerPreview, followingPreview, favorites, verificationBadges, followersCount, followingCount, favoritesTotal, privacy] =
       await Promise.all([
         viewerId && !isOwnProfile
           ? this.prisma.follow.findUnique({
@@ -427,20 +435,23 @@ export class UsersService {
         // untuk viewer yang sama (termasuk eksklusi block khusus viewer).
         this.prisma.follow.count({ where: { followingId: user.id, follower: visibleUserFilter } }),
         this.prisma.follow.count({ where: { followerId: user.id, following: visibleUserFilter } }),
+        // Audit 2026-10-10: dua query ini dulu menunggu SETELAH Promise.all
+        // (dua round-trip DB tambahan berurutan per kunjungan profil).
+        this.prisma.userFavorite.count({
+          where: { userId: user.id, favoriteUser: visibleUserFilter },
+        }),
+        loadPrivacySetting(this.prisma, user.id),
       ]);
 
-    const favoritesTotal = await this.prisma.userFavorite.count({
-      where: { userId: user.id, favoriteUser: visibleUserFilter },
-    });
-
-    // Kontak publik: hormati toggle, dan paksa null bila ada relasi block.
-    // (Gate di atas sudah 403 untuk block, guard ini menjaga bila kelak ada
-    // jalur lain yang memanggil method ini dengan viewer terblokir.)
+    // Kontak publik: hormati toggle pemilik. Relasi block sudah ditolak 403
+    // di atas, jadi tidak ada pembeda per-viewer di sini.
     // RK-P05: flag showContactEmail/showContactPhone SELALU dikirim boolean;
     // nilai kontak HANYA dikirim bila flag true (fail closed, anti-bocor).
-    const contactAllowed = !viewerId || isOwnProfile;
-    const showContactEmail = contactAllowed && user.showContactEmail === true;
-    const showContactPhone = contactAllowed && user.showContactPhone === true;
+    // Audit 2026-10-10: versi lama `contactAllowed = !viewerId || isOwnProfile`
+    // — pengunjung ANONIM melihat kontak publik, pengunjung yang LOGIN tidak
+    // pernah (kebalikan dari maksud toggle "tampilkan di profil").
+    const showContactEmail = user.showContactEmail === true;
+    const showContactPhone = user.showContactPhone === true;
     const publicContact = {
       showContactEmail,
       showContactPhone,
@@ -469,8 +480,8 @@ export class UsersService {
       createdAt: user.createdAt,
     });
 
-    // G076–G083: muat pengaturan privasi pemilik & terapkan untuk viewer != owner.
-    const privacy = await loadPrivacySetting(this.prisma, user.id);
+    // G076–G083: pengaturan privasi pemilik (dimuat paralel di atas) diterapkan
+    // untuk viewer != owner.
     const accountContact: AccountContactInfo = {
       email: user.email,
       phone: await decryptPiiSafe(user.phoneNumber),
@@ -1583,6 +1594,27 @@ export class UsersService {
 
     const { page: safePage, limit: safeLimit, skip } = this.normalizePagination(page, limit);
 
+    // G081 (audit 2026-10-10): hormati "Tampilkan ulasan" pemilik — profil
+    // sudah menyembunyikannya (privacy-profile.util), tetapi endpoint daftar
+    // ini dulu tetap mengirim seluruh ulasan + distribusi ke siapa pun.
+    if (viewerId !== user.id) {
+      const privacy = await loadPrivacySetting(this.prisma, user.id);
+      if (!privacy.showReviews) {
+        return {
+          ratings: [],
+          total: 0,
+          averageRating: null,
+          totalRatingCount: null,
+          distribution: { '1': 0, '2': 0, '3': 0, '4': 0, '5': 0 },
+          hidden: true,
+          filter: filter || null,
+          sort: sort || null,
+          page: safePage,
+          limit: safeLimit,
+        };
+      }
+    }
+
     const where: Prisma.RatingWhereInput = {
       receiverId: user.id,
       isHidden: false,
@@ -1714,8 +1746,23 @@ export class UsersService {
   }
 
   async followUser(followerId: string, username: string): Promise<{ message: string }> {
-    const target = await this.prisma.user.findUnique({ where: { username: username.toLowerCase() }, select: { id: true } });
-    if (!target) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    const target = await this.prisma.user.findUnique({
+      where: { username: username.toLowerCase() },
+      select: { id: true, isActive: true, isBanned: true, deletedAt: true, profileVisible: true },
+    });
+    // Audit 2026-10-10: akun banned/nonaktif/terhapus/privat tidak bisa diikuti
+    // (dulu hanya cek keberadaan baris) — konsisten dengan favorit & simpan
+    // profil (`isPubliclyAvailableSocialTarget`). 404, bukan 403, agar tidak
+    // membocorkan status akun.
+    if (
+      !target ||
+      target.isActive === false ||
+      target.isBanned === true ||
+      target.deletedAt != null ||
+      target.profileVisible === false
+    ) {
+      throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    }
 
     if (target.id === followerId) {
       throw new BadRequestException({ code: ErrorCodes.CANNOT_FOLLOW_SELF, message: 'Cannot follow yourself' });
@@ -1874,7 +1921,7 @@ export class UsersService {
     };
   }
 
-  async getFollowing(username: string, page: number, limit: number, viewerId?: string | null): Promise<object> {
+  async getFollowing(username: string, page: number, limit: number, viewerId?: string | null, search?: string): Promise<object> {
     const user = await this.prisma.user.findUnique({ where: { username: username.toLowerCase() }, select: { id: true, profileVisible: true, isActive: true, isBanned: true, deletedAt: true } });
     if (!user) throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
     if (user.profileVisible === false && viewerId !== user.id) {
@@ -1911,9 +1958,21 @@ export class UsersService {
       profileVisible: true,
       ...(excludedIds.length > 0 ? { id: { notIn: excludedIds } } : {}),
     };
+    // Audit 2026-10-10: `?search=` untuk daftar mengikuti — paritas dengan
+    // GET followers (frontend dulu terpaksa menyaring di klien atas halaman
+    // yang sudah dimuat, sehingga akun di halaman berikutnya tak ditemukan).
+    const followingSearch = search?.trim();
     const followingWhere: Prisma.FollowWhereInput = {
       followerId: user.id,
-      following: visibleFollowing,
+      following: followingSearch
+        ? {
+            ...visibleFollowing,
+            OR: [
+              { fullName: { contains: escapeLikePattern(followingSearch), mode: 'insensitive' as const } },
+              { username: { contains: escapeLikePattern(followingSearch), mode: 'insensitive' as const } },
+            ],
+          }
+        : visibleFollowing,
     };
 
     const [following, total] = await Promise.all([
@@ -2162,7 +2221,9 @@ export class UsersService {
       }
     }
 
-    await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    // Audit 2026-10-10: transaksi Serializable TANPA retry → tap "Simpan"
+    // ganda / dua tab = P2034 → 500. Retry yang sama dengan follow/unfollow.
+    await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const existingLinks = await tx.userLink.findMany({ where: { userId }, select: { id: true, platform: true } });
       const existingMap = new Map(existingLinks.map(l => [l.platform, l.id]));
       const incomingPlatforms = new Set(normalizedLinks.map(l => l.platform));
@@ -2192,11 +2253,12 @@ export class UsersService {
           });
         }
       }
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }));
 
     const links = await this.prisma.userLink.findMany({
       where: { userId },
-      orderBy: { displayOrder: 'asc' },
+      // Tiebreak id — urutan stabil, sama dengan bagian `links` profil publik.
+      orderBy: [{ displayOrder: 'asc' }, { id: 'asc' }],
       select: { id: true, platform: true, url: true, label: true, displayOrder: true },
     });
 
@@ -2206,7 +2268,7 @@ export class UsersService {
   async getMyLinks(userId: string): Promise<object> {
     const links = await this.prisma.userLink.findMany({
       where: { userId },
-      orderBy: { displayOrder: 'asc' },
+      orderBy: [{ displayOrder: 'asc' }, { id: 'asc' }],
       select: { id: true, platform: true, url: true, label: true, displayOrder: true },
     });
     return { links };

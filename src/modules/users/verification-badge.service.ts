@@ -537,7 +537,12 @@ export class VerificationBadgeService {
       where: { username: username.toLowerCase() },
       select: { id: true, username: true, profileVisible: true, isActive: true, isBanned: true, deletedAt: true },
     });
-    if (!owner || !owner.profileVisible || !owner.isActive || owner.isBanned || owner.deletedAt != null) {
+    if (!owner || !owner.isActive || owner.isBanned || owner.deletedAt != null) {
+      throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+    }
+    // Audit 2026-10-10: pemilik tetap melihat lencananya sendiri saat profil
+    // privat (selaras getPublicProfile/followers/ratings).
+    if (!owner.profileVisible && viewerId !== owner.id) {
       throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
     }
 

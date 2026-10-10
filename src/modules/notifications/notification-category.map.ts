@@ -32,6 +32,9 @@ const TRANSAKSI_TYPES: ReadonlySet<NotificationType> = new Set([
   NotificationType.WALLET_REFUND_RECEIVED,
   NotificationType.WALLET_TRANSFER_SENT,
   NotificationType.WALLET_TRANSFER_RECEIVED,
+  // Audit 2026-10-10 (BE-20): dana menunggu rekening = urusan dana (TRANSAKSI),
+  // bukan INFORMASI — tab Transaksi adalah tempat user mencarinya.
+  NotificationType.ESCROW_HELD_NO_BANK,
   // GAP-C (G193): notifikasi tahap milestone escrow.
   NotificationType.MILESTONE_SUBMITTED,
   NotificationType.MILESTONE_REVISION_REQUESTED,

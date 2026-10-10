@@ -98,7 +98,7 @@ export class NotificationsController {
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @Put('preferences')
-  async updatePreferences(@CurrentUser('sub') userId: string, @Body() dto: UpdatePreferencesDto): Promise<NotificationPreference> {
+  async updatePreferences(@CurrentUser('sub') userId: string, @Body() dto: UpdatePreferencesDto): Promise<NotificationPreferencesResponse> {
     return this.notificationsService.updatePreferences(userId, dto);
   }
 

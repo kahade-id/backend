@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, ForbiddenException, BadRequestException, Optional } from '@nestjs/common';
 import { Prisma, Notification, NotificationPreference, NotificationCategory, NotificationType } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { createHasNextPaginatedResponse, PaginatedResponse, sliceLimitPlusOne } from '../../common/dto/pagination.dto';
@@ -7,22 +7,19 @@ import { UpdatePreferencesDto } from './dto/update-preferences.dto';
 import { customAlphabet } from 'nanoid';
 import { getMinutesInTimezone, isMinutesInRange } from '../../common/utils/timezone.util';
 import { resolveNotificationLanguage } from './notification-copy.service';
+import { inAppPreferenceFieldForType, pushPreferenceFieldForType } from './notification-preference.map';
+import { RealtimeService } from '../realtime/realtime.service';
 
 const generateDeviceId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 16);
 const NOTIFICATION_DEDUP_WINDOW_MS = 60_000;
 const MAX_NOTIFICATION_PAGE = 10_000;
 
-const IN_APP_PREFERENCE_TYPES: ReadonlyArray<[keyof Pick<NotificationPreference, 'orderInApp' | 'walletInApp' | 'chatInApp' | 'disputeInApp' | 'rankingInApp' | 'marketingInApp'>, readonly NotificationType[]]> = [
-  ['orderInApp', [NotificationType.ORDER_NEW, NotificationType.ORDER_ACCEPTED, NotificationType.ORDER_REJECTED, NotificationType.ORDER_CANCELLED_TIMEOUT, NotificationType.ORDER_CANCELLED, NotificationType.ORDER_PAYMENT_RECEIVED, NotificationType.ORDER_SHIPPED, NotificationType.ORDER_DEADLINE_REMINDER, NotificationType.ORDER_EXTENSION_REQUESTED, NotificationType.ORDER_EXTENSION_APPROVED, NotificationType.ORDER_EXTENSION_REJECTED, NotificationType.ORDER_COMPLETED, NotificationType.ORDER_AUTOCOMPLETED, NotificationType.ORDER_DELIVERED]],
-  ['walletInApp', [NotificationType.WALLET_TOPUP_SUCCESS, NotificationType.WALLET_TOPUP_FAILED, NotificationType.WALLET_WITHDRAW_SUCCESS, NotificationType.WALLET_WITHDRAW_FAILED, NotificationType.WALLET_FUNDS_RELEASED, NotificationType.WALLET_TRANSFER_SENT, NotificationType.WALLET_TRANSFER_RECEIVED, NotificationType.WALLET_REFUND_RECEIVED]],
-  ['chatInApp', [NotificationType.CHAT_NEW_MESSAGE]],
-  // CN-006: daftar dispute dilengkapi — sebelumnya DISPUTE_MESSAGE_RECEIVED,
-  // DISPUTE_ESCALATION_SLA_WARNING/BREACHED tidak tertekan walau toggle mati
-  // (push memakai prefix-match sehingga konsisten, in-app tidak).
-  ['disputeInApp', [NotificationType.DISPUTE_SUBMITTED, NotificationType.DISPUTE_ADMIN_JOINED, NotificationType.DISPUTE_DECISION, NotificationType.DISPUTE_EVIDENCE_SUBMITTED, NotificationType.DISPUTE_CLAIM_SUBMITTED, NotificationType.DISPUTE_ESCALATED, NotificationType.DISPUTE_MESSAGE_RECEIVED, NotificationType.DISPUTE_ESCALATION_SLA_WARNING, NotificationType.DISPUTE_ESCALATION_SLA_BREACHED]],
-  ['rankingInApp', [NotificationType.RATING_NEW, NotificationType.BADGE_AWARDED, NotificationType.RANK_UPGRADED, NotificationType.SUBSCRIPTION_ACTIVATED, NotificationType.SUBSCRIPTION_EXPIRY_REMINDER, NotificationType.SUBSCRIPTION_EXPIRED, NotificationType.SUBSCRIPTION_RENEWED, NotificationType.REFERRAL_REWARD_RECEIVED]],
-  ['marketingInApp', [NotificationType.VOUCHER_ISSUED, NotificationType.CAMPAIGN_CASHBACK_CREDITED, NotificationType.TOPUP_BONUS_CREDITED]],
-];
+/**
+ * Audit 2026-10-10 (BE-06): semua anggota enum dievaluasi lewat peta bersama
+ * `notification-preference.map` (sama dengan gate push) — daftar manual lama
+ * tertinggal untuk MILESTONE_*, ESCROW_HELD_NO_BANK, QUESTION_UNANSWERED_REMINDER.
+ */
+const ALL_NOTIFICATION_TYPES = Object.values(NotificationType) as NotificationType[];
 
 function criticalSecurityType(type: NotificationType): boolean {
   return type.startsWith('SECURITY_');
@@ -103,7 +100,26 @@ export class NotificationsService {
 
   constructor(
     private prisma: PrismaService,
+    // Audit 2026-10-10 (BE-23): RealtimeModule @Global; opsional agar unit test
+    // tanpa gateway tetap jalan.
+    @Optional() private readonly realtime?: RealtimeService,
   ) {}
+
+  /**
+   * Audit 2026-10-10 (BE-23): setiap mutasi status baca/hapus (dan perubahan
+   * preferensi in-app) memancarkan `notification.unread_count` ke semua
+   * perangkat user. Dulu event ini hanya dipancarkan saat notifikasi baru
+   * dibuat → badge perangkat lain basi sampai poll 60 dtk. Best-effort.
+   */
+  private async emitUnreadCount(userId: string): Promise<void> {
+    if (!this.realtime) return;
+    try {
+      const { unreadCount } = await this.getUnreadCount(userId);
+      this.realtime.emitToUser(userId, 'notification.unread_count', { unreadCount });
+    } catch (err) {
+      this.logger.warn(`Failed to emit unread count for user ${userId}: ${(err as Error).message}`);
+    }
+  }
 
   async isDuplicate(userId: string, type: NotificationType, body: string): Promise<boolean> {
     const since = new Date(Date.now() - NOTIFICATION_DEDUP_WINDOW_MS);
@@ -138,10 +154,11 @@ export class NotificationsService {
   private async disabledInAppTypes(userId: string): Promise<NotificationType[]> {
     const prefs = await this.prisma.notificationPreference.findUnique({ where: { userId } });
     if (!prefs) return [];
-    return IN_APP_PREFERENCE_TYPES
-      .filter(([field]) => prefs[field] === false)
-      .flatMap(([, types]) => types)
-      .filter((type) => !criticalSecurityType(type));
+    return ALL_NOTIFICATION_TYPES.filter((type) => {
+      if (criticalSecurityType(type)) return false;
+      const field = inAppPreferenceFieldForType(type);
+      return field !== null && prefs[field] === false;
+    });
   }
 
   /**
@@ -258,11 +275,15 @@ export class NotificationsService {
       throw new ForbiddenException({ code: ErrorCodes.NOTIFICATION_NOT_OWNED, message: 'Notification does not belong to you' });
     }
 
+    // Audit 2026-10-10 (BE-16): idempoten — klien memanggil dua kali (daftar +
+    // detail); panggilan ulang tidak boleh menimpa `readAt` yang asli.
+    const alreadyRead = notification.isRead === true;
     const updated = await this.prisma.notification.update({
       where: { notifId },
-      data: { isRead: true, readAt: new Date() },
+      data: alreadyRead ? {} : { isRead: true, readAt: new Date() },
       select: PUBLIC_NOTIFICATION_SELECT,
     });
+    if (!alreadyRead) await this.emitUnreadCount(userId);
 
     return withImageUrl(updated);
   }
@@ -278,6 +299,7 @@ export class NotificationsService {
       },
       data: { isRead: true, readAt: new Date() },
     });
+    if (result.count > 0) await this.emitUnreadCount(userId);
     return { markedCount: result.count };
   }
 
@@ -290,6 +312,8 @@ export class NotificationsService {
       },
       data: { deletedAt: new Date() },
     });
+    // Baris yang dihapus bisa saja belum dibaca → badge perlu dihitung ulang.
+    if (result.count > 0) await this.emitUnreadCount(userId);
     return { deletedCount: result.count };
   }
 
@@ -324,6 +348,7 @@ export class NotificationsService {
       }
     } while (batchCount === 1000);
 
+    if (totalMarked > 0) await this.emitUnreadCount(userId);
     return { markedCount: totalMarked };
   }
 
@@ -340,7 +365,7 @@ export class NotificationsService {
     return { ...prefs, quietHoursActive: this.computeQuietHoursActive(prefs) };
   }
 
-  async updatePreferences(userId: string, dto: UpdatePreferencesDto): Promise<NotificationPreference> {
+  async updatePreferences(userId: string, dto: UpdatePreferencesDto): Promise<NotificationPreferencesResponse> {
     // Security alerts are safety-critical. The UI may render a unified toggle,
     // but no client can turn off the durable security channel by crafting a PUT.
     const updateData = { ...dto, securityInApp: true, securityPush: true, securityEmail: true };
@@ -349,9 +374,13 @@ export class NotificationsService {
       where: { userId },
       create: { userId, ...updateData },
       update: updateData,
-    } as any);
+    } as any) as NotificationPreference;
 
-    return prefs;
+    // Toggle in-app mengubah tipe yang terlihat → jumlah unread ikut berubah.
+    await this.emitUnreadCount(userId);
+    // Audit 2026-10-10 (BE-19): PUT mengembalikan bentuk yang sama dengan GET
+    // (termasuk `quietHoursActive`) agar klien tidak perlu refetch.
+    return { ...prefs, quietHoursActive: this.computeQuietHoursActive(prefs) };
   }
 
   /**
@@ -398,19 +427,10 @@ export class NotificationsService {
         // During quiet hours, only critical types pass
         return criticalSecurityType(type);
       }
-      // Check per-category push toggles
-      const pushMap: Record<string, NotificationType[]> = {
-        orderPush: [NotificationType.ORDER_NEW, NotificationType.ORDER_ACCEPTED, NotificationType.ORDER_REJECTED, NotificationType.ORDER_CANCELLED_TIMEOUT, NotificationType.ORDER_CANCELLED, NotificationType.ORDER_PAYMENT_RECEIVED, NotificationType.ORDER_SHIPPED, NotificationType.ORDER_DEADLINE_REMINDER, NotificationType.ORDER_EXTENSION_REQUESTED, NotificationType.ORDER_EXTENSION_APPROVED, NotificationType.ORDER_EXTENSION_REJECTED, NotificationType.ORDER_COMPLETED, NotificationType.ORDER_AUTOCOMPLETED, NotificationType.ORDER_DELIVERED],
-        walletPush: [NotificationType.WALLET_TOPUP_SUCCESS, NotificationType.WALLET_TOPUP_FAILED, NotificationType.WALLET_WITHDRAW_SUCCESS, NotificationType.WALLET_WITHDRAW_FAILED, NotificationType.WALLET_FUNDS_RELEASED, NotificationType.WALLET_TRANSFER_SENT, NotificationType.WALLET_TRANSFER_RECEIVED],
-        chatPush: [NotificationType.CHAT_NEW_MESSAGE],
-        disputePush: [NotificationType.DISPUTE_SUBMITTED, NotificationType.DISPUTE_ADMIN_JOINED, NotificationType.DISPUTE_DECISION, NotificationType.DISPUTE_EVIDENCE_SUBMITTED, NotificationType.DISPUTE_CLAIM_SUBMITTED, NotificationType.DISPUTE_ESCALATED],
-        rankingPush: [NotificationType.RATING_NEW, NotificationType.BADGE_AWARDED, NotificationType.RANK_UPGRADED, NotificationType.SUBSCRIPTION_ACTIVATED, NotificationType.SUBSCRIPTION_EXPIRY_REMINDER, NotificationType.SUBSCRIPTION_EXPIRED, NotificationType.SUBSCRIPTION_RENEWED, NotificationType.REFERRAL_REWARD_RECEIVED],
-        marketingPush: [NotificationType.VOUCHER_ISSUED, NotificationType.CAMPAIGN_CASHBACK_CREDITED, NotificationType.TOPUP_BONUS_CREDITED],
-      };
-      for (const [field, types] of Object.entries(pushMap)) {
-        if ((types as NotificationType[]).includes(type) && prefs[field] === false) return false;
-      }
-      return true;
+      // Audit 2026-10-10 (BE-07): peta bersama dengan push.service — tidak ada
+      // lagi daftar manual yang menyimpang.
+      const field = pushPreferenceFieldForType(type);
+      return !(field && prefs[field] === false);
     } catch {
       return true;
     }
@@ -442,6 +462,7 @@ export class NotificationsService {
       where: { notifId },
       data: { deletedAt: new Date() },
     });
+    if (!notification.isRead) await this.emitUnreadCount(userId);
     return { message: 'Notification deleted successfully' };
   }
 
@@ -481,13 +502,12 @@ export class NotificationsService {
           deviceType: platform ?? 'mobile',
           ipAddress: ipAddress || 'unknown',
         },
-        update: {
-          pushToken: token,
-          lastLoginAt: new Date(),
-          ipAddress: ipAddress || 'unknown',
-          deviceName: platform ?? 'push',
-          ...(platform ? { deviceType: platform } : {}),
-        },
+        // Audit 2026-10-10 (BE-17): klien memakai fingerprint yang SAMA untuk
+        // login dan push, jadi baris ini adalah baris perangkat login. Hanya
+        // token yang boleh diperbarui — dulu deviceName/deviceType/ipAddress/
+        // lastLoginAt ikut ditimpa ('push', 'android', IP registrasi) sehingga
+        // daftar perangkat di Keamanan & ekspor data menampilkan data palsu.
+        update: { pushToken: token },
       });
       return { message: 'Device registered successfully', deviceId: device.id };
     }

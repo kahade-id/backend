@@ -676,6 +676,9 @@ export class SupportChatService {
         notificationId: notification.notifId,
         conversationId,
         messageId,
+        // Audit 2026-10-10 (BE-24): sama dengan actionUrl baris notifikasi —
+        // tanpa ini tap push mendarat di detail notifikasi, bukan livechat.
+        actionUrl: `/support/chat/${encodeURIComponent(conversationId)}`,
       },
     });
   }

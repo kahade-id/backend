@@ -147,7 +147,9 @@ export class AdminSystemController {
     @Body() dto: BroadcastDto,
     @CurrentAdmin('sub') adminId: string,
     @Req() req: Request,
-  ): Promise<{ recipientCount: number }> {
+  ): Promise<{ recipientCount: number; queuedCount: number; pushRequested: boolean }> {
+    // Audit 2026-10-10 (BE-14): `queuedCount`/`pushRequested` ikut ke admin —
+    // dulu tipe respons hanya recipientCount sehingga kegagalan enqueue tak terlihat.
     return this.service.sendBroadcast(dto, adminId, req.ip ?? '');
   }
 }

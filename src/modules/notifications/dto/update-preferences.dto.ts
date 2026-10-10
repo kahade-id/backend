@@ -1,4 +1,4 @@
-import { IsOptional, IsBoolean, IsString, IsIn, Matches } from 'class-validator';
+import { IsOptional, IsBoolean, IsString, IsIn, Matches, IsTimeZone } from 'class-validator';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 
 export class UpdatePreferencesDto {
@@ -114,9 +114,12 @@ export class UpdatePreferencesDto {
   @Matches(/^([01]\d|2[0-3]):([0-5]\d)$/, { message: 'quietHoursEnd must be HH:mm' })
   quietHoursEnd?: string;
 
-  @ApiPropertyOptional({ description: 'IANA timezone for quiet hours (e.g. Asia/Jakarta)', example: 'Asia/Jakarta' })
+  // Audit 2026-10-10 (BE-18): zona waktu divalidasi — dulu string apa pun
+  // tersimpan dan perhitungan quiet hours diam-diam jatuh ke Asia/Jakarta.
+  @ApiPropertyOptional({ description: 'IANA timezone for quiet hours (e.g. Asia/Jakarta). Must be a valid IANA zone.', example: 'Asia/Jakarta' })
   @IsOptional()
   @IsString()
+  @IsTimeZone({ message: 'quietHoursTimezone must be a valid IANA timezone' })
   quietHoursTimezone?: string;
 
   @ApiPropertyOptional({ description: 'Preferred language', enum: ['id', 'en'] })

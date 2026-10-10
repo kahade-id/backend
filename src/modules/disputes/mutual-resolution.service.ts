@@ -678,7 +678,9 @@ export class MutualResolutionService {
     buyerAmount: bigint,
     sellerAmount: bigint,
   ): Promise<object> {
-    if (dispute.order.completedAt !== null) {
+    // K2 (audit 2026-10-10): pasca-completion hanya fail-closed bila ada porsi
+    // buyer (dana sudah di seller). 0% buyer tidak menggerakkan uang.
+    if (dispute.order.completedAt !== null && buyerAmount > BigInt(0)) {
       throw new BadRequestException({
         code: 'DISPUTE_POST_COMPLETION_MANUAL_REVIEW',
         message: 'Post-completion mutual resolution in no-wallet mode requires manual review — funds already disbursed to seller',
@@ -706,7 +708,7 @@ export class MutualResolutionService {
       if (!freshOrder || freshOrder.status !== OrderStatus.DISPUTED) {
         throw new ConflictException({ code: 'ORDER_STATE_CHANGED', message: 'Order state changed during processing' });
       }
-      if (freshOrder.completedAt !== null) {
+      if (freshOrder.completedAt !== null && buyerAmount > BigInt(0)) {
         throw new BadRequestException({
           code: 'DISPUTE_POST_COMPLETION_MANUAL_REVIEW',
           message: 'Order completed during processing — manual review required (funds already disbursed)',

@@ -11,6 +11,8 @@ function build() {
   const prisma = {
     order: { findUnique: jest.fn() },
     paymentTransaction: { findFirst: jest.fn() },
+    // K2: bukti "dana sudah cair ke seller" = baris ORDER_ESCROW; default tidak ada.
+    escrowDisbursement: { findFirst: jest.fn().mockResolvedValue(null) },
   };
   const danaDirectRefundService = { refundAmount: jest.fn() };
   const escrowDisbursementService = { releaseFunds: jest.fn() };
@@ -92,9 +94,55 @@ describe('DisputeDanaSettlementService (M3 no-wallet)', () => {
     expect(escrowDisbursementService.releaseFunds).not.toHaveBeenCalled();
   });
 
-  it('pasca-completion → fail-closed DISPUTE_POST_COMPLETION_MANUAL_REVIEW', async () => {
+  it('K2: completedAt terisi oleh tx putusan (FULL_SELLER) TANPA pencairan ORDER_ESCROW → tetap settle', async () => {
+    const { svc, prisma, danaDirectRefundService, escrowDisbursementService } = build();
+    // Tx putusan FULL_SELLER/SPLIT & mutual resolution menulis completedAt
+    // SEBELUM settlement — sebelumnya ini dibaca sebagai "pasca-completion"
+    // sehingga uang tidak pernah bergerak.
+    prisma.order.findUnique.mockResolvedValue({ id: 'order-1', sellerId: 'seller-1', completedAt: new Date() });
+    prisma.paymentTransaction.findFirst.mockResolvedValue({ id: 'pay-1' });
+    prisma.escrowDisbursement.findFirst.mockResolvedValue(null);
+    escrowDisbursementService.releaseFunds.mockResolvedValue({ outcome: 'RELEASED', disbursementId: 'd1', danaReferenceNo: 'ref-1' });
+
+    const res = await svc.settleDisputeNoWallet({ ...baseInput, decision: 'FULL_SELLER', buyerAmountSen: BigInt(0) });
+
+    expect(danaDirectRefundService.refundAmount).not.toHaveBeenCalled();
+    expect(escrowDisbursementService.releaseFunds).toHaveBeenCalledTimes(1);
+    expect(res.sellerDisbursement?.outcome).toBe('RELEASED');
+    expect(res.sellerAlreadyPaid).toBe(false);
+  });
+
+  it('K2: SPLIT dengan completedAt terisi oleh tx putusan → refund buyer + disbursement seller', async () => {
     const { svc, prisma, danaDirectRefundService, escrowDisbursementService } = build();
     prisma.order.findUnique.mockResolvedValue({ id: 'order-1', sellerId: 'seller-1', completedAt: new Date() });
+    prisma.paymentTransaction.findFirst.mockResolvedValue({ id: 'pay-1' });
+    prisma.escrowDisbursement.findFirst.mockResolvedValue(null);
+    danaDirectRefundService.refundAmount.mockResolvedValue({ refunded: true, already: false, amountSen: baseInput.buyerAmountSen });
+    escrowDisbursementService.releaseFunds.mockResolvedValue({ outcome: 'RELEASED', disbursementId: 'd1', danaReferenceNo: 'ref-1' });
+
+    const res = await svc.settleDisputeNoWallet(baseInput);
+
+    expect(res.buyerRefunded).toBe(true);
+    expect(res.sellerDisbursement?.outcome).toBe('RELEASED');
+  });
+
+  it('K2: pasca-completion sungguhan (ada ORDER_ESCROW) + FULL_SELLER → tidak ada pergerakan dana, sellerAlreadyPaid', async () => {
+    const { svc, prisma, danaDirectRefundService, escrowDisbursementService } = build();
+    prisma.order.findUnique.mockResolvedValue({ id: 'order-1', sellerId: 'seller-1', completedAt: new Date() });
+    prisma.escrowDisbursement.findFirst.mockResolvedValue({ id: 'disb-order', status: 'SUCCESS' });
+
+    const res = await svc.settleDisputeNoWallet({ ...baseInput, decision: 'FULL_SELLER', buyerAmountSen: BigInt(0) });
+
+    expect(res.sellerAlreadyPaid).toBe(true);
+    expect(res.sellerDisbursement).toBeNull();
+    expect(danaDirectRefundService.refundAmount).not.toHaveBeenCalled();
+    expect(escrowDisbursementService.releaseFunds).not.toHaveBeenCalled();
+  });
+
+  it('pasca-completion (ada pencairan ORDER_ESCROW) + porsi buyer → fail-closed DISPUTE_POST_COMPLETION_MANUAL_REVIEW', async () => {
+    const { svc, prisma, danaDirectRefundService, escrowDisbursementService } = build();
+    prisma.order.findUnique.mockResolvedValue({ id: 'order-1', sellerId: 'seller-1', completedAt: new Date() });
+    prisma.escrowDisbursement.findFirst.mockResolvedValue({ id: 'disb-order', status: 'PENDING' });
 
     let code: string | undefined;
     try {

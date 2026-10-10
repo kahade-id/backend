@@ -874,7 +874,10 @@ export class AdminDisputesService implements OnModuleInit {
   ): Promise<object> {
     const { buyerAmount, sellerAmount, totalDisbursement } = amounts;
 
-    if (amounts.isPostCompletionDispute) {
+    // K2 (audit 2026-10-10): pasca-completion hanya fail-closed bila ada porsi
+    // buyer (dana sudah di seller, refund = talangan platform). FULL_SELLER
+    // pasca-completion tidak menggerakkan uang → boleh diputus.
+    if (amounts.isPostCompletionDispute && buyerAmount > BigInt(0)) {
       throw new BadRequestException({
         code: 'DISPUTE_POST_COMPLETION_MANUAL_REVIEW',
         message: 'Post-completion dispute in no-wallet mode requires manual review — funds already disbursed to seller',
@@ -903,13 +906,16 @@ export class AdminDisputesService implements OnModuleInit {
         throw new ConflictException({ code: ErrorCodes.INVALID_STATUS, message: 'Order is no longer DISPUTED; dispute resolution was not applied' });
       }
       // Klasifikasi pra/pasca-completion tidak boleh berubah di tengah jalan.
-      if (order.completedAt !== null) {
+      if ((order.completedAt !== null) !== amounts.isPostCompletionDispute) {
+        throw new ConflictException({ code: ErrorCodes.INVALID_STATUS, message: 'Dispute settlement classification changed; please retry.' });
+      }
+      if (order.completedAt !== null && buyerAmount > BigInt(0)) {
         throw new BadRequestException({
           code: 'DISPUTE_POST_COMPLETION_MANUAL_REVIEW',
           message: 'Order completed during review — manual review required (funds already disbursed)',
         });
       }
-      const freshEscrowedAmount = order.buyerPayAmount;
+      const freshEscrowedAmount = order.completedAt !== null ? order.sellerReceiveAmount : order.buyerPayAmount;
       if (freshEscrowedAmount < totalDisbursement) {
         throw new ConflictException({ code: ErrorCodes.DISPUTE_AMOUNT_EXCEEDS_ESCROW, message: 'Fresh order escrow is lower than the proposed settlement' });
       }
@@ -968,14 +974,16 @@ export class AdminDisputesService implements OnModuleInit {
       });
 
       // DP-014: FULL_BUYER pra-completion = transaksi batal total → CANCELLED.
-      // FULL_SELLER & SPLIT → COMPLETED.
-      const isFullBuyerPreCompletion = dto.decision === 'FULL_BUYER';
+      // FULL_SELLER & SPLIT → COMPLETED. K2: completedAt boleh ditulis di sini
+      // karena DisputeDanaSettlementService tidak lagi memakainya sebagai
+      // penanda "dana sudah cair" (lihat priorRelease di sana).
+      const isFullBuyerPreCompletion = dto.decision === 'FULL_BUYER' && order.completedAt === null;
       const resolvedOrderStatus = isFullBuyerPreCompletion ? OrderStatus.CANCELLED : OrderStatus.COMPLETED;
       await tx.order.update({
         where: { id: order.id },
         data: {
           status: resolvedOrderStatus,
-          ...(isFullBuyerPreCompletion ? { cancelledAt: new Date() } : { completedAt: new Date() }),
+          ...(isFullBuyerPreCompletion ? { cancelledAt: new Date() } : order.completedAt ? {} : { completedAt: new Date() }),
         },
       });
       await tx.orderStatusHistory.create({

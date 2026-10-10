@@ -6,12 +6,13 @@ import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.se
 import { UploadService } from '../upload/upload.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { createPaginatedResponse, PaginatedResponse } from '../../common/dto/pagination.dto';
-import { UserAuditAction, AuditAction, OrderStatus, DisputeStatus, DisputeInitiator, ActorType, NotificationType, WalletTransactionType, WalletTransactionStatus, DisputeEvidence, DisputeCategory, Prisma } from '@prisma/client';
+import { UserAuditAction, AuditAction, OrderStatus, DisputeStatus, DisputeInitiator, ActorType, NotificationType, WalletTransactionType, WalletTransactionStatus, DisputeEvidence, DisputeCategory, PaymentProvider, PaymentPurpose, PaymentStatus, Prisma } from '@prisma/client';
 import { generateDisputeId, generateNotifId, generateWalletTxId } from '../../common/utils/id-generator.util';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import { toIdr } from '../../common/utils/currency.util';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { DISPUTE_SLA_HOURS, DISPUTE_ESCALATION_SLA_HOURS, POST_COMPLETION_DISPUTE_WINDOW_HOURS } from '../../common/constants/app.constants';
+import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { SubmitEvidenceDto } from './dto/submit-evidence.dto';
 import { SubmitClaimDto } from './dto/submit-claim.dto';
 
@@ -59,6 +60,9 @@ export class DisputesService {
     // Lokasi presisi aksi sensitif — @Optional() agar unit test lama yang
     // tidak menyediakan provider tetap lolos.
     @Optional() private actionLocationService?: ActionLocationService,
+    // K1 (audit transaksi 2026-10-10): mode no-wallet (default produksi) —
+    // escrow dibuktikan lewat payment DANA-direct, bukan ledger ORDER_LOCK.
+    @Optional() private walletMode?: WalletModeService,
   ) {}
 
   // C-18: same predicate as `mutual-resolution.service.ts:521` and `order-state.service.ts:582`.
@@ -1002,19 +1006,55 @@ export class DisputesService {
       });
 
       if (!freshIsPostCompletion) {
+        // K1 (audit 2026-10-10): sengketa pra-completion wajib punya bukti
+        // dana escrow. Dua bentuk bukti yang sah, salah satu cukup:
+        //   (a) ledger wallet ORDER_LOCK SUCCESS senilai buyerPayAmount
+        //       (order lama/mode wallet), ATAU
+        //   (b) PaymentTransaction DANA-direct ORDER_ESCROW SUCCESS senilai
+        //       buyerPayAmount (mode no-wallet — produksi saat ini).
+        // Sebelumnya hanya (a) yang diterima sehingga SEMUA sengketa
+        // no-wallet ditolak 409 ESCROW_LOCK_MISSING.
         const activeEscrowLock = await tx.walletTransaction.findFirst({
           where: { orderId: freshOrder.id, type: WalletTransactionType.ORDER_LOCK, status: WalletTransactionStatus.SUCCESS },
           select: { id: true, amount: true },
         });
-        if (!activeEscrowLock || activeEscrowLock.amount !== freshOrder.buyerPayAmount) {
+        const walletLockOk = !!activeEscrowLock && activeEscrowLock.amount === freshOrder.buyerPayAmount;
+        let danaEscrowOk = false;
+        if (!walletLockOk) {
+          const danaPayment = await tx.paymentTransaction.findFirst({
+            where: {
+              orderId: freshOrder.id,
+              purpose: PaymentPurpose.ORDER_ESCROW,
+              provider: PaymentProvider.DANA,
+              status: PaymentStatus.SUCCESS,
+              danaPayKind: { not: null },
+            },
+            select: { id: true, amount: true },
+            orderBy: { createdAt: 'desc' },
+          });
+          danaEscrowOk = !!danaPayment && danaPayment.amount === freshOrder.buyerPayAmount;
+        }
+        if (!walletLockOk && !danaEscrowOk) {
           throw new ConflictException({
             code: 'ESCROW_LOCK_MISSING',
-            message: 'This order has no matching escrow lock. The dispute was not opened; manual reconciliation is required.',
+            message: 'This order has no matching escrow funding (wallet lock or DANA payment). The dispute was not opened; manual reconciliation is required.',
           });
         }
       }
 
-      if (freshIsPostCompletion) {
+      // K1 (audit 2026-10-10): pasca-completion di mode no-wallet — dana sudah
+      // dicairkan ke rekening bank seller, tidak ada wallet yang bisa
+      // dibekukan. Sengketa tetap boleh dibuka (mediasi + jejak), eksekusi
+      // uang ditangani fail-closed di DisputeDanaSettlementService
+      // (porsi buyer > 0 → review manual; FULL_SELLER → selesai tanpa gerak dana).
+      const walletEnabled = this.walletMode?.isWalletEnabled() ?? true;
+      if (freshIsPostCompletion && !walletEnabled) {
+        this.logger.warn(
+          `POST_COMPLETION_DISPUTE_NO_WALLET order=${freshOrder.orderId}: freeze dilewati (wallet nonaktif) — settlement buyer>0 butuh review manual`,
+        );
+      }
+
+      if (freshIsPostCompletion && walletEnabled) {
         const freezeAmount = freshOrder.sellerReceiveAmount;
         const sellerWalletLookup = await tx.wallet.findUnique({
           where: { userId: freshOrder.sellerId },

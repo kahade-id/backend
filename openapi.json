@@ -3043,6 +3043,14 @@
             "schema": {
               "type": "number"
             }
+          },
+          {
+            "name": "search",
+            "required": true,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -12821,6 +12829,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "x-step-up-token",
+            "required": true,
+            "in": "header",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -12843,7 +12859,7 @@
             "access-token": []
           }
         ],
-        "summary": "Aksi admin: approve / reject / escalate / force-resolve",
+        "summary": "Aksi admin: approve / reject / escalate / force-resolve (aksi uang wajib X-Step-Up-Token)",
         "tags": [
           "admin-returns"
         ]
@@ -14779,7 +14795,8 @@
                   "type": "object",
                   "required": [
                     "mediaId",
-                    "url"
+                    "url",
+                    "kind"
                   ],
                   "properties": {
                     "mediaId": {
@@ -14788,6 +14805,22 @@
                     "url": {
                       "type": "string",
                       "format": "uri"
+                    },
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "image",
+                        "video"
+                      ]
+                    },
+                    "thumbnailUrl": {
+                      "type": "string",
+                      "format": "uri",
+                      "nullable": true
+                    },
+                    "durationMs": {
+                      "type": "integer",
+                      "nullable": true
                     }
                   }
                 }
@@ -14800,7 +14833,7 @@
             "access-token": []
           }
         ],
-        "summary": "Unggah foto story ke penyimpanan disk privat",
+        "summary": "Unggah foto/video story ke penyimpanan disk privat",
         "tags": [
           "stories"
         ]
@@ -14830,7 +14863,7 @@
             "access-token": []
           }
         ],
-        "summary": "Buat story foto atau teks dengan privasi per-story",
+        "summary": "Buat story foto, video, atau teks dengan privasi per-story",
         "tags": [
           "stories"
         ]
@@ -27096,6 +27129,39 @@
         ]
       }
     },
+    "/v1/admin/disputes/{disputeId}/settlement/retry": {
+      "post": {
+        "description": "Re-runs the DANA refund/disbursement for a resolved dispute whose settlement intent is FAILED or ESCALATED. Idempotent per dispute. SUPER_ADMIN + step-up.",
+        "operationId": "AdminDisputesController_retrySettlement",
+        "parameters": [
+          {
+            "name": "disputeId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Retry executed; see intent status."
+          },
+          "409": {
+            "description": "Settlement already DONE or currently CLAIMED."
+          }
+        },
+        "security": [
+          {
+            "access-token": []
+          }
+        ],
+        "summary": "Retry no-wallet dispute settlement",
+        "tags": [
+          "admin-disputes"
+        ]
+      }
+    },
     "/v1/admin/disputes/{disputeId}/evidence/upload": {
       "post": {
         "description": "Uploads a file as admin for later evidence submit. Uses UploadService.uploadDirect with DISPUTE_EVIDENCE purpose (admin-scoped prefix).",
@@ -34933,7 +34999,8 @@
           },
           "deviceId": {
             "type": "string",
-            "description": "Device ID for session tracking"
+            "description": "Device ID for session tracking",
+            "maxLength": 255
           },
           "deviceInfo": {
             "type": "string",
@@ -34958,7 +35025,8 @@
         },
         "required": [
           "provider",
-          "idToken"
+          "idToken",
+          "deviceId"
         ]
       },
       "LinkSocialProviderDto": {
@@ -35023,7 +35091,8 @@
           },
           "deviceId": {
             "type": "string",
-            "description": "Device ID untuk pelacakan sesi"
+            "description": "Device ID untuk pelacakan sesi",
+            "maxLength": 255
           },
           "deviceInfo": {
             "type": "string",
@@ -35031,7 +35100,8 @@
           }
         },
         "required": [
-          "linkToken"
+          "linkToken",
+          "deviceId"
         ]
       },
       "UnlinkSocialProviderDto": {
@@ -35320,7 +35390,8 @@
           },
           "deviceId": {
             "type": "string",
-            "description": "Device ID — wajib cocok dengan deviceId saat OTP diverifikasi (binding perangkat)"
+            "description": "Device ID — wajib cocok dengan deviceId saat OTP diverifikasi (binding perangkat)",
+            "maxLength": 255
           },
           "newPassword": {
             "type": "string",
@@ -35531,7 +35602,7 @@
         "properties": {
           "username": {
             "type": "string",
-            "description": "Username/email/nomor HP (opsional; bila diisi allowCredentials dibatasi ke akun itu)"
+            "description": "Username/email/nomor HP (opsional; mengikat tantangan ke akun itu, respons tetap seragam)"
           }
         }
       },
@@ -35548,7 +35619,8 @@
           },
           "deviceId": {
             "type": "string",
-            "description": "ID perangkat (diisi otomatis dari session klien bila tersedia)"
+            "description": "ID perangkat (diisi otomatis dari session klien bila tersedia)",
+            "maxLength": 255
           },
           "deviceInfo": {
             "type": "string",
@@ -35634,7 +35706,8 @@
           },
           "deviceId": {
             "type": "string",
-            "description": "ID perangkat pemohon (untuk deteksi perangkat baru)"
+            "description": "ID perangkat pemohon (untuk deteksi perangkat baru)",
+            "maxLength": 255
           }
         },
         "required": [
@@ -37538,6 +37611,11 @@
             "type": "string",
             "description": "Reason for rejection",
             "maxLength": 500
+          },
+          "shippingAddressId": {
+            "type": "string",
+            "description": "ID alamat buku alamat pembeli — wajib bila pembeli menerima order fisik buatan penjual",
+            "maxLength": 100
           }
         },
         "required": [
@@ -38105,7 +38183,7 @@
           },
           "quietHoursTimezone": {
             "type": "string",
-            "description": "IANA timezone for quiet hours (e.g. Asia/Jakarta)",
+            "description": "IANA timezone for quiet hours (e.g. Asia/Jakarta). Must be a valid IANA zone.",
             "example": "Asia/Jakarta"
           },
           "language": {
@@ -38825,13 +38903,14 @@
             "type": "string",
             "enum": [
               "image",
+              "video",
               "text"
             ]
           },
           "mediaId": {
             "type": "string",
             "maxLength": 100,
-            "description": "Single-use mediaId returned by POST /stories/media."
+            "description": "Single-use mediaId returned by POST /stories/media (image or video ticket)."
           },
           "text": {
             "type": "string",
@@ -41466,13 +41545,14 @@
           },
           "targetAudience": {
             "type": "string",
-            "description": "Target audience filter",
+            "description": "Target audience filter. all = semua akun aktif (tidak dihapus); active = login dalam 30 hari terakhir; kahade_plus = langganan Plus aktif; verified = KYC disetujui.",
             "enum": [
               "all",
               "active",
               "kahade_plus",
               "verified"
-            ]
+            ],
+            "default": "all"
           }
         },
         "required": [

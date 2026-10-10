@@ -598,7 +598,7 @@ export class AdminShowcaseReportsService {
         await this.prisma.$transaction([
           this.prisma.userShowcase.updateMany({
             where: { id: report.showcaseId, isActive: true },
-            data: { isActive: false },
+            data: { isActive: false, scheduledAt: null },
           }),
           this.prisma.showcaseReport.updateMany({
             where: { id: reportId, status: { in: OPEN_STATUSES } },
@@ -743,7 +743,7 @@ export class AdminShowcaseReportsService {
     >(
       Prisma.sql`SELECT a.id, a."fullName" AS full_name, a.role::text AS role,
                         COUNT(ra.id)::bigint AS open_assignments
-                 FROM "AdminUser" a
+                 FROM admin_users a
                  LEFT JOIN report_assignments ra
                    ON ra."assigneeAdminId" = a.id AND ra."unassignedAt" IS NULL
                  WHERE a.role::text IN ('SUPER_ADMIN', 'CUSTOMER_SUPPORT')
@@ -1156,7 +1156,7 @@ export class AdminShowcaseReportsService {
     await this.prisma.$transaction([
       this.prisma.userShowcase.updateMany({
         where: { id: report.showcaseId, isActive: true },
-        data: { isActive: false },
+        data: { isActive: false, scheduledAt: null },
       }),
       this.prisma.showcaseReport.updateMany({
         where: { id: reportId, status: { in: OPEN_STATUSES } },
@@ -1422,15 +1422,17 @@ export class AdminShowcaseReportsService {
       this.prisma.$queryRaw<Array<{ action: string; count: bigint }>>(
         Prisma.sql`SELECT action::text AS action, COUNT(*)::bigint AS count
                    FROM report_moderation_events
-                   WHERE created_at >= NOW() - INTERVAL '30 days'
+                   WHERE "createdAt" >= NOW() - INTERVAL '30 days'
                      AND action::text IN ('TAKEDOWN', 'RESTRICTED', 'REOPENED', 'DISMISSED')
                    GROUP BY action`,
       ),
       this.prisma.$queryRaw<Array<{ avg_seconds: number | null; resolved_count: bigint }>>(
-        Prisma.sql`SELECT AVG(EXTRACT(EPOCH FROM (reviewed_at - created_at))) AS avg_seconds,
+        // ADM-01 (audit 2026-10-10): kolom Prisma camelCase ber-kutip —
+        // created_at/reviewed_at tidak ada → metrics selalu 500.
+        Prisma.sql`SELECT AVG(EXTRACT(EPOCH FROM ("reviewedAt" - "createdAt"))) AS avg_seconds,
                           COUNT(*)::bigint AS resolved_count
                    FROM showcase_reports
-                   WHERE reviewed_at IS NOT NULL AND reviewed_at >= NOW() - INTERVAL '30 days'`,
+                   WHERE "reviewedAt" IS NOT NULL AND "reviewedAt" >= NOW() - INTERVAL '30 days'`,
       ),
       this.prisma.$queryRaw<Array<{ reason: string; count: bigint }>>(
         Prisma.sql`SELECT reason, COUNT(*)::bigint AS count

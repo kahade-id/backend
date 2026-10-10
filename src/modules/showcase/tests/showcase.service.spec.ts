@@ -256,6 +256,30 @@ describe('ShowcaseService — owner CRUD, images, public read, view counter', ()
       await service.getMyShowcase(OWNER_ID);
       expect(mockPrisma.userShowcase.findMany.mock.calls[0][0].orderBy).toEqual([{ sortOrder: 'asc' }, { id: 'asc' }]);
     });
+
+    it('BE-1 (audit etalase 2026-10-10): exposes owner commerce fields with IDR strike price', async () => {
+      const scheduledAt = new Date('2026-12-01T03:00:00.000Z');
+      mockPrisma.userShowcase.findMany.mockResolvedValue([
+        showcaseRow({
+          productType: 'JASA',
+          originalPrice: 25000000n, // SEN = Rp250.000
+          serviceDeadlineDays: 7,
+          digitalDeliveryInfo: 'Dikirim lewat email',
+          scheduledAt,
+        }),
+      ]);
+      const item = ((await service.getMyShowcase(OWNER_ID)) as any).items[0];
+      expect(item).toMatchObject({
+        productType: 'JASA',
+        originalPriceIdr: 250000,
+        serviceDeadlineDays: 7,
+        digitalDeliveryInfo: 'Dikirim lewat email',
+        scheduledAt,
+        visibility: ShowcaseVisibility.PUBLIC,
+      });
+      // Harga coret Rp250.000 > harga jual Rp150.000 → valid (dibandingkan dalam sen).
+      expect(item.originalPriceValid).toBe(true);
+    });
   });
 
   // ------------------------------------------------------------------

@@ -1,9 +1,10 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { OrderStatus, ProductType } from '@prisma/client';
+import { OrderStatus, ProductType, ShowcaseVisibility } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { toIdr, toSen } from '../../../common/utils/currency.util';
 import { UpdateProductCommerceDto } from '../dto/commerce.dto';
+import { moderationDb } from '../../admin/showcase-reports/moderation-prisma.types';
 
 /** Ambang badge TERLARIS: order selesai dalam 90 hari terakhir. */
 export const BEST_SELLER_MIN_COMPLETED = 10;
@@ -61,9 +62,18 @@ export class ProductCommerceService {
       }
     }
 
-    let originalPriceSen: bigint | undefined;
-    if (dto.originalPriceIdr !== undefined) {
-      const saleSen = row.priceMin ?? row.priceMax ?? null;
+    let originalPriceSen: bigint | null | undefined;
+    if (dto.originalPriceIdr === null) {
+      // Kontrak DTO: null = hapus harga coret. Dulu jatuh ke toSen(null) →
+      // RangeError 500 (audit etalase 2026-10-10).
+      originalPriceSen = null;
+    } else if (dto.originalPriceIdr !== undefined) {
+      // UserShowcase.priceMin/priceMax disimpan dalam IDR (BigInt), sedangkan
+      // originalPrice dalam SEN — bandingkan dalam satuan yang sama. Dulu
+      // dibandingkan mentah (sen vs IDR) sehingga harga coret Rp2.000 pada
+      // barang Rp150.000 lolos validasi (audit etalase 2026-10-10).
+      const saleIdr = row.priceMin ?? row.priceMax ?? null;
+      const saleSen = saleIdr === null ? null : toSen(Number(saleIdr));
       originalPriceSen = toSen(dto.originalPriceIdr);
       if (saleSen !== null && originalPriceSen <= saleSen) {
         throw new BadRequestException({
@@ -94,6 +104,14 @@ export class ProductCommerceService {
         scheduledAt = d;
       }
     }
+    // BEC-02 (audit etalase 2026-10-10): item yang dinonaktifkan MODERASI tidak
+    // boleh dijadwalkan ulang — cron publish akan menghidupkan takedown.
+    if (scheduledAt instanceof Date && (await this.hasActiveModerationEnforcement(row.id))) {
+      throw new ForbiddenException({
+        code: ErrorCodes.SHOWCASE_MODERATED,
+        message: 'Etalase ini dinonaktifkan oleh moderasi Kahade dan tidak bisa dijadwalkan.',
+      });
+    }
 
     return this.prisma.userShowcase.update({
       where: { id: row.id },
@@ -102,7 +120,9 @@ export class ProductCommerceService {
         ...(dto.serviceDeadlineDays !== undefined ? { serviceDeadlineDays: dto.serviceDeadlineDays } : {}),
         ...(dto.digitalDeliveryInfo !== undefined ? { digitalDeliveryInfo: dto.digitalDeliveryInfo || null } : {}),
         ...(originalPriceSen !== undefined ? { originalPrice: originalPriceSen } : {}),
-        ...(scheduledAt !== undefined ? { scheduledAt } : {}),
+        // BEC-03: jadwal masa depan = item DISEMBUNYIKAN sampai cron publish
+        // (dulu tetap tayang walau "terjadwal"). null = batal jadwal saja.
+        ...(scheduledAt instanceof Date ? { scheduledAt, isActive: false } : scheduledAt === null ? { scheduledAt: null } : {}),
       },
       select: {
         id: true,
@@ -119,10 +139,27 @@ export class ProductCommerceService {
   /** POST /v1/commerce/products/:id/click — hit klik (atomik, publik). */
   async recordClick(showcaseId: string): Promise<{ ok: true }> {
     await this.prisma.userShowcase.updateMany({
-      where: { id: showcaseId, deletedAt: null },
+      // BES-13 (audit etalase 2026-10-10): hanya item yang memang tayang publik
+      // — endpoint publik tanpa auth tidak boleh menjadi probe/penggelembung
+      // klik item privat/nonaktif/takedown.
+      where: { id: showcaseId, deletedAt: null, isActive: true, visibility: ShowcaseVisibility.PUBLIC },
       data: { clickCount: { increment: 1 } },
     });
     return { ok: true };
+  }
+
+  /** BEC-02: ada event TAKEDOWN/RESTRICTED yang belum disusul RESTORED (best-effort). */
+  private async hasActiveModerationEnforcement(showcaseId: string): Promise<boolean> {
+    try {
+      const ev = (await moderationDb(this.prisma).reportModerationEvent.findFirst({
+        where: { action: { in: ['TAKEDOWN', 'RESTRICTED', 'RESTORED'] }, report: { showcaseId } },
+        orderBy: { createdAt: 'desc' },
+        select: { action: true },
+      })) as unknown as { action?: string } | null;
+      return ev?.action === 'TAKEDOWN' || ev?.action === 'RESTRICTED';
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -173,9 +210,15 @@ export class ProductCommerceService {
   async getProductBadges(showcaseId: string) {
     const exists = await this.prisma.userShowcase.findFirst({
       where: { id: showcaseId, deletedAt: null },
-      select: { id: true, originalPrice: true },
+      select: { id: true, originalPrice: true, isActive: true, visibility: true },
     });
     if (!exists) throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Etalase tidak ditemukan' });
+    // BES-13: item privat/nonaktif/takedown tidak membocorkan sinyal apa pun
+    // lewat endpoint publik — badge kosong (bukan 404, agar pratinjau pemilik
+    // yang memanggil endpoint yang sama tetap aman).
+    if (!exists.isActive || exists.visibility !== ShowcaseVisibility.PUBLIC) {
+      return { showcaseId, badges: [] as string[], completedOrders90d: 0 };
+    }
     const since = new Date(Date.now() - BEST_SELLER_WINDOW_DAYS * 24 * 60 * 60 * 1000);
     const completed = await this.prisma.order.count({
       where: { showcaseId, status: OrderStatus.COMPLETED, deletedAt: null, completedAt: { gte: since } },

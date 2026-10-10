@@ -26,6 +26,7 @@ import { CreateShowcaseItemDto } from '../dto/showcase-item.dto';
 import { UploadController } from '../../upload/upload.controller';
 import { UploadService } from '../../upload/upload.service';
 import { LocalStorageService } from '../../upload/local-storage.service';
+import { VideoProcessingService } from '../../upload/video-processing.service';
 import { RedisService } from '../../../redis/redis.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
@@ -130,6 +131,7 @@ function buildMocks() {
       deleteMany: jest.fn(),
     },
     showcaseLike: { findMany: jest.fn(), create: jest.fn(), deleteMany: jest.fn() },
+    showcaseSave: { findMany: jest.fn().mockResolvedValue([]), create: jest.fn(), deleteMany: jest.fn(), count: jest.fn() },
     showcaseComment: { findMany: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn(), count: jest.fn(), create: jest.fn(), update: jest.fn(), delete: jest.fn() },
     $transaction: jest.fn(),
     $executeRaw: jest.fn(),
@@ -587,6 +589,7 @@ describe('Audit fixes — SH-S-001 stored-XSS via extension (UploadService)', ()
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         UploadService,
+        { provide: VideoProcessingService, useValue: {} },
         { provide: RedisService, useValue: mockRedis },
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
         { provide: LocalStorageService, useValue: mockLocalStorage },
@@ -634,14 +637,14 @@ describe('Audit fixes — SH-S-004 downloadOwnFile validates key shape first', (
 
   it('rejects a traversal key with controlled 400 (VALIDATION_ERROR), not a crash', async () => {
     await expect(
-      controller.downloadOwnFile('user-1', '../../etc/passwd'),
+      controller.downloadOwnFile('user-1', '../../etc/passwd', undefined, {} as never),
     ).rejects.toMatchObject({ response: expect.objectContaining({ code: 'VALIDATION_ERROR' }) });
     expect(mockUploadService.getPrivateFileStream).not.toHaveBeenCalled();
   });
 
   it('rejects a key with an unexpected segment count', async () => {
     await expect(
-      controller.downloadOwnFile('user-1', 'uploads/a/b/c/d/e.jpg'),
+      controller.downloadOwnFile('user-1', 'uploads/a/b/c/d/e.jpg', undefined, {} as never),
     ).rejects.toThrow(BadRequestException);
     expect(mockUploadService.getPrivateFileStream).not.toHaveBeenCalled();
   });

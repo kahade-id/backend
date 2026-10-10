@@ -53,6 +53,8 @@ export const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
   [UploadPurpose.STORY_MEDIA]: ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/quicktime', 'video/webm'],
   [UploadPurpose.STORY_HIGHLIGHT]: ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/quicktime', 'video/webm'],
   [UploadPurpose.AVATAR]: ['image/jpeg', 'image/png', 'image/webp'],
+  // BE-5: aset digital — PDF, gambar, video mp4 (tipe yang magic-byte-nya dikenal).
+  [UploadPurpose.DIGITAL_ASSET]: ['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'video/mp4'],
   [UploadPurpose.CHAT_ATTACHMENT]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm', 'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/mp4'],
   [UploadPurpose.DISPUTE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm'],
   [UploadPurpose.REPORT_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf'],
@@ -102,6 +104,7 @@ export const MAX_FILE_SIZE: Record<UploadPurpose, number> = {
   [UploadPurpose.STORY_MEDIA]: 10 * 1024 * 1024,
   [UploadPurpose.STORY_HIGHLIGHT]: 10 * 1024 * 1024,
   [UploadPurpose.AVATAR]: 2 * 1024 * 1024,
+  [UploadPurpose.DIGITAL_ASSET]: 50 * 1024 * 1024,
   [UploadPurpose.CHAT_ATTACHMENT]: 50 * 1024 * 1024,
   // SYS-C-303 (audit sistemik ronde 3, 2026-10-03): DISPUTE_EVIDENCE disamakan
   // dengan batas consumer (dispute-message.service.ts & disputes.service.ts:
@@ -323,6 +326,8 @@ const PURPOSE_VISIBILITY: Record<UploadPurpose, 'private' | 'public'> = {
   [UploadPurpose.STORY_MEDIA]: 'private',
   [UploadPurpose.STORY_HIGHLIGHT]: 'private',
   [UploadPurpose.AVATAR]: 'public',
+  // BE-5: aset digital privat — hanya pemilik & pembeli berbayar (signed URL).
+  [UploadPurpose.DIGITAL_ASSET]: 'private',
   [UploadPurpose.CHAT_ATTACHMENT]: 'private',
   [UploadPurpose.DISPUTE_EVIDENCE]: 'private',
   [UploadPurpose.REPORT_EVIDENCE]: 'private',
@@ -346,6 +351,7 @@ const PURPOSE_FOLDER_MAP_INTERNAL: Record<UploadPurpose, string> = {
   [UploadPurpose.STORY_MEDIA]: 'story-media',
   [UploadPurpose.STORY_HIGHLIGHT]: 'story-highlights',
   [UploadPurpose.AVATAR]: 'avatars',
+  [UploadPurpose.DIGITAL_ASSET]: 'digital-assets',
   [UploadPurpose.CHAT_ATTACHMENT]: 'chat-attachments',
   [UploadPurpose.DISPUTE_EVIDENCE]: 'dispute-evidence',
   [UploadPurpose.REPORT_EVIDENCE]: 'report-evidence',

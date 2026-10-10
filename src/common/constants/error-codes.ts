@@ -89,6 +89,9 @@ export const SHOWCASE_ALREADY_INACTIVE = 'SHOWCASE_ALREADY_INACTIVE';
 // (mis. dinonaktifkan sendiri oleh owner) — cegah "pengaktifan" item yang salah.
 export const SHOWCASE_NOT_TAKEN_DOWN = 'SHOWCASE_NOT_TAKEN_DOWN';
 export const SHOWCASE_ALREADY_ACTIVE = 'SHOWCASE_ALREADY_ACTIVE';
+// BEC-01 (audit etalase 2026-10-10): item dinonaktifkan MODERASI (takedown/restrict)
+// tidak bisa diaktifkan/dijadwalkan ulang oleh pemilik — jalurnya banding.
+export const SHOWCASE_MODERATED = 'SHOWCASE_MODERATED';
 export const INVALID_CURSOR = 'INVALID_CURSOR';
 export const INVALID_SORT_OPTION = 'INVALID_SORT_OPTION';
 

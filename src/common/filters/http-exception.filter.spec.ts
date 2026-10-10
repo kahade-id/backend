@@ -65,3 +65,28 @@ describe('HttpExceptionFilter — fields passthrough (batch 139 BE-API2, item 12
     expect(jsonSpy.mock.calls[0][0].errors.fields).toBeUndefined();
   });
 });
+
+describe('HttpExceptionFilter — errors.data passthrough (audit etalase 2026-10-10, BES-01/RK-01)', () => {
+  it('meneruskan state akhir primitif sebagai errors.data (409 like ganda)', () => {
+    const filter = new HttpExceptionFilter();
+    const { host, jsonSpy, statusSpy } = makeHost();
+    const ex = new HttpException(
+      { code: 'SHOWCASE_ALREADY_LIKED', message: 'already', likeCount: 9, data: { liked: true, likeCount: 9 } },
+      HttpStatus.CONFLICT,
+    );
+    filter.catch(ex, host);
+    expect(statusSpy).toHaveBeenCalledWith(409);
+    expect(jsonSpy.mock.calls[0][0].errors.data).toEqual({ liked: true, likeCount: 9 });
+  });
+
+  it('membuang nilai non-primitif / kunci aneh dan tidak mengirim data kosong', () => {
+    const filter = new HttpExceptionFilter();
+    const { host, jsonSpy } = makeHost();
+    const ex = new HttpException(
+      { code: 'X', message: 'x', data: { nested: { a: 1 }, 'bad key': 1, list: [1] } },
+      HttpStatus.CONFLICT,
+    );
+    filter.catch(ex, host);
+    expect(jsonSpy.mock.calls[0][0].errors.data).toBeUndefined();
+  });
+});

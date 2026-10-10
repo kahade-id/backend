@@ -481,6 +481,9 @@ export class UsersController {
   @Post('me/showcase')
   @UseGuards(UserThrottleGuard)
   @Throttle({ default: { ttl: 60000, limit: 10 } })
+  // BE-6 (audit etalase 2026-10-10): Idempotency-Key wajib — klien memakai
+  // kunci yang sama saat mencoba ulang setelah timeout agar karya tidak dobel.
+  @Idempotency()
   @ApiOperation({ summary: 'Add a showcase item' })
   async createShowcaseItem(
     @CurrentUser('sub') userId: string,
@@ -564,7 +567,7 @@ export class UsersController {
   async restoreShowcaseItem(
     @CurrentUser('sub') userId: string,
     @Param('id', ParseIdPipe) itemId: string,
-  ): Promise<{ message: string }> {
+  ): Promise<{ message: string; alreadyRestored?: boolean }> {
     return this.showcaseService.restoreShowcaseItem(userId, itemId);
   }
 

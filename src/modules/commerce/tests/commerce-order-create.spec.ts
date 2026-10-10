@@ -260,14 +260,16 @@ describe('ServiceBookingService.bookAndCreateOrder', () => {
   let service: ServiceBookingService;
   const mockTx: Record<string, any> = {
     serviceSlot: { updateMany: jest.fn() },
-    serviceSlotBooking: { upsert: jest.fn(), findUnique: jest.fn(), updateMany: jest.fn() },
+    // BES-06 (audit etalase 2026-10-10): klaim baris booking dulu (findUnique/create), baru kapasitas.
+    serviceSlotBooking: { findUnique: jest.fn(), updateMany: jest.fn(), create: jest.fn() },
     order: { findUnique: jest.fn() },
     $executeRawUnsafe: jest.fn(),
   };
   const mockPrisma: Record<string, any> = {
     serviceSlot: { findFirst: jest.fn() },
     serviceSlotBooking: { findUnique: jest.fn(), updateMany: jest.fn() },
-    userShowcase: { findUnique: jest.fn() },
+    // BES-10: loadBookableSlot memeriksa etalase jasa masih tayang (findFirst).
+    userShowcase: { findUnique: jest.fn(), findFirst: jest.fn() },
     user: { findUnique: jest.fn() },
     order: { findUnique: jest.fn() },
     $transaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
@@ -280,9 +282,25 @@ describe('ServiceBookingService.bookAndCreateOrder', () => {
     startTime: '09:00', endTime: '10:00', note: null,
   };
 
+  /**
+   * tx.serviceSlotBooking.findUnique dipanggil dua tahap: klaim (where
+   * slotId_userId → belum ada baris → create) dan attach (where id → baris
+   * segar untuk predicate BOOKED + orderId null).
+   */
+  function mockTxBookingLookup(fresh: { status: SlotBookingStatus; orderId: string | null } | null) {
+    mockTx.serviceSlotBooking.findUnique.mockImplementation(async (args: any) =>
+      args?.where?.slotId_userId ? null : fresh,
+    );
+  }
+
   beforeEach(async () => {
     jest.resetAllMocks();
     mockPrisma.$transaction.mockImplementation((fn: (tx: unknown) => Promise<unknown>) => fn(mockTx));
+    mockPrisma.userShowcase.findFirst.mockResolvedValue({ id: 's1' });
+    mockTx.serviceSlotBooking.findUnique.mockResolvedValue(null);
+    mockTx.serviceSlotBooking.create.mockImplementation(async (args: any) => ({
+      id: 'b1', slotId: args.data.slotId, status: SlotBookingStatus.BOOKED, createdAt: new Date(),
+    }));
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         ServiceBookingService,
@@ -298,10 +316,9 @@ describe('ServiceBookingService.bookAndCreateOrder', () => {
     mockPrisma.serviceSlot.findFirst.mockResolvedValue(slot);
     mockPrisma.serviceSlotBooking.findUnique.mockResolvedValue(null);
     mockTx.serviceSlot.updateMany.mockResolvedValue({ count: 1 });
-    mockTx.serviceSlotBooking.upsert.mockResolvedValue({ id: 'b1', slotId: 'slot-1', status: SlotBookingStatus.BOOKED });
     mockPrisma.userShowcase.findUnique.mockResolvedValue({ title: 'Cuci AC', priceMin: 5_000_000n });
     mockPrisma.user.findUnique.mockResolvedValue({ username: 'seller01' });
-    mockTx.serviceSlotBooking.findUnique.mockResolvedValue({ status: SlotBookingStatus.BOOKED, orderId: null });
+    mockTxBookingLookup({ status: SlotBookingStatus.BOOKED, orderId: null });
     mockOrdersService.createOrder.mockResolvedValue(createdOrderResult('ORD-SB-1'));
     mockTx.order.findUnique.mockResolvedValue({ id: 'db-order-3' });
     mockTx.serviceSlotBooking.updateMany.mockResolvedValue({ count: 1 });
@@ -334,10 +351,9 @@ describe('ServiceBookingService.bookAndCreateOrder', () => {
     mockPrisma.serviceSlot.findFirst.mockResolvedValue(slot);
     mockPrisma.serviceSlotBooking.findUnique.mockResolvedValue(null);
     mockTx.serviceSlot.updateMany.mockResolvedValue({ count: 1 });
-    mockTx.serviceSlotBooking.upsert.mockResolvedValue({ id: 'b1', slotId: 'slot-1', status: SlotBookingStatus.BOOKED });
     mockPrisma.userShowcase.findUnique.mockResolvedValue({ title: 'Cuci AC', priceMin: 5_000_000n });
     mockPrisma.user.findUnique.mockResolvedValue({ username: 'seller01' });
-    mockTx.serviceSlotBooking.findUnique.mockResolvedValue({ status: SlotBookingStatus.BOOKED, orderId: null });
+    mockTxBookingLookup({ status: SlotBookingStatus.BOOKED, orderId: null });
     mockOrdersService.createOrder.mockResolvedValue(createdOrderResult('ORD-SB-2'));
     mockTx.order.findUnique.mockResolvedValue({ id: 'db-order-4' });
     mockTx.serviceSlotBooking.updateMany.mockResolvedValue({ count: 1 });
@@ -355,10 +371,9 @@ describe('ServiceBookingService.bookAndCreateOrder', () => {
     mockPrisma.serviceSlot.findFirst.mockResolvedValue(slot);
     mockPrisma.serviceSlotBooking.findUnique.mockResolvedValue(null);
     mockTx.serviceSlot.updateMany.mockResolvedValue({ count: 1 });
-    mockTx.serviceSlotBooking.upsert.mockResolvedValue({ id: 'b1', slotId: 'slot-1', status: SlotBookingStatus.BOOKED });
     mockPrisma.userShowcase.findUnique.mockResolvedValue({ title: 'Cuci AC', priceMin: 5_000_000n });
     mockPrisma.user.findUnique.mockResolvedValue({ username: 'seller01' });
-    mockTx.serviceSlotBooking.findUnique.mockResolvedValue({ status: SlotBookingStatus.BOOKED, orderId: null });
+    mockTxBookingLookup({ status: SlotBookingStatus.BOOKED, orderId: null });
     mockOrdersService.createOrder.mockResolvedValue(createdOrderResult('ORD-SB-9'));
     mockTx.order.findUnique.mockResolvedValue({ id: 'db-order-9' });
     mockTx.serviceSlotBooking.updateMany.mockResolvedValue({ count: 0 }); // predicate gagal → race
@@ -387,7 +402,6 @@ describe('ServiceBookingService.bookAndCreateOrder', () => {
     mockPrisma.serviceSlot.findFirst.mockResolvedValue(slot);
     mockPrisma.serviceSlotBooking.findUnique.mockResolvedValue(null);
     mockTx.serviceSlot.updateMany.mockResolvedValue({ count: 1 });
-    mockTx.serviceSlotBooking.upsert.mockResolvedValue({ id: 'b1', slotId: 'slot-1', status: SlotBookingStatus.BOOKED });
     mockPrisma.userShowcase.findUnique.mockResolvedValue({ title: 'Cuci AC', priceMin: null });
     await expect(service.bookAndCreateOrder('buyer-1', 'slot-1', {})).rejects.toBeInstanceOf(BadRequestException);
     expect(mockOrdersService.createOrder).not.toHaveBeenCalled();

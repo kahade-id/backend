@@ -12,6 +12,10 @@ export class SearchTrendsController {
   constructor(private readonly service: SearchTrendsService) {}
 
   @Throttle({ default: { ttl: 60000, limit: 120 } })
+  // BES-12 (audit etalase 2026-10-10): klien memanggil tanpa sesi (tamu ikut
+  // mencari) — tanpa @Public endpoint selalu 401 dan GET /trends kosong.
+  // Payload sudah disanitasi (tanpa PII) + throttle per IP.
+  @Public()
   @Post('record')
   @HttpCode(200)
   @ApiOperation({ summary: 'Catat kata kunci pencarian (disanitasi, tanpa PII)' })

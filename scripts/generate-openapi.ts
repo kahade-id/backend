@@ -62,7 +62,10 @@ async function main(): Promise<void> {
   const app = await NestFactory.create(AppModule, {
     logger: ['warn', 'error'],
   });
-  await app.init();
+  // BE-10 (audit etalase 2026-10-10): JANGAN app.init() — hook onModuleInit
+  // (Bull processor, ping Redis) membutuhkan Redis hidup dan membuat
+  // generasi offline gagal acak (MaxRetriesPerRequestError). Swagger hanya
+  // memindai container modul yang sudah terisi oleh NestFactory.create().
 
   // Match the global prefix used by src/main.ts so generated paths match what
   // a real client hits at runtime (e.g. /v1/auth/login, not /auth/login).

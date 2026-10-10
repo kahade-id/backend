@@ -44,4 +44,11 @@ export class DigitalDeliveryController {
   listBuyer(@CurrentUser('sub') userId: string, @Param('showcaseId') showcaseId: string) {
     return this.service.listBuyerAssets(userId, showcaseId);
   }
+
+  @Throttle({ default: { ttl: 60000, limit: 30 } })
+  @Get(':id/download')
+  @ApiOperation({ summary: 'Signed URL unduhan aset FILE (pemilik atau pembeli berbayar; 15 menit)' })
+  download(@CurrentUser('sub') userId: string, @Param('id') id: string) {
+    return this.service.downloadAsset(userId, id);
+  }
 }

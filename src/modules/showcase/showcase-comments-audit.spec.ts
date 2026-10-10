@@ -20,11 +20,31 @@ describe('ShowcaseService — comment like & soft-delete (audit 2026-10-03)', ()
       delete: jest.fn(),
       deleteMany: jest.fn(),
     };
-    const userShowcase = { findUnique: jest.fn(), updateMany: jest.fn() };
+    // BES-04 (audit etalase 2026-10-10): toggleCommentLike kini memverifikasi
+    // item terlihat (findVisibleShowcase → blockList.findMany + userShowcase.findFirst)
+    // dan tidak ada relasi blokir (blockList.findFirst).
+    const userShowcase = {
+      findUnique: jest.fn(),
+      updateMany: jest.fn(),
+      findFirst: jest.fn().mockResolvedValue({
+        id: 's1',
+        userId: 'owner-1',
+        isActive: true,
+        visibility: 'PUBLIC',
+        deletedAt: null,
+        user: { id: 'owner-1', username: 'owner', fullName: 'Owner', avatarUrl: null },
+        images: [],
+      }),
+    };
+    const blockList = {
+      findMany: jest.fn().mockResolvedValue([]),
+      findFirst: jest.fn().mockResolvedValue(null),
+    };
     const prisma: any = {
       showcaseComment,
       showcaseCommentReaction: reaction,
       userShowcase,
+      blockList,
       $transaction: jest.fn(async (cb: any) => cb({ showcaseComment, userShowcase })),
     };
     const svc = new ShowcaseService(
@@ -37,10 +57,10 @@ describe('ShowcaseService — comment like & soft-delete (audit 2026-10-03)', ()
       undefined as any,
       undefined as any,
     );
-    return { svc, prisma, reaction, showcaseComment, userShowcase };
+    return { svc, prisma, reaction, showcaseComment, userShowcase, blockList };
   }
 
-  const visibleComment = { id: 'c1', isHidden: false, deletedAt: null };
+  const visibleComment = { id: 'c1', isHidden: false, deletedAt: null, showcaseId: 's1' };
 
   function mockCounts(reaction: any, likes: number, dislikes: number, vote: number) {
     reaction.groupBy.mockResolvedValue([

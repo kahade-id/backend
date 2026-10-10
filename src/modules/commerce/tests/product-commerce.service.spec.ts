@@ -29,7 +29,9 @@ describe('ProductCommerceService', () => {
     const baseRow = {
       id: 's1',
       userId: 'u1',
-      priceMin: 10000000n, // Rp100.000 dalam sen
+      // UserShowcase.priceMin disimpan dalam IDR (BigInt), BUKAN sen —
+      // lihat ShowcaseService.createShowcaseItem (BigInt(dto.priceMin)).
+      priceMin: 100000n, // Rp100.000
       priceMax: null,
       productType: null,
       serviceDeadlineDays: null,
@@ -67,6 +69,23 @@ describe('ProductCommerceService', () => {
       await service.updateCommerceFields('u1', 's1', { originalPriceIdr: 150000 });
       expect(mockPrisma.userShowcase.update).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ originalPrice: 15000000n }) }),
+      );
+    });
+
+    it('satuan: harga coret Rp2.000 pada barang Rp100.000 DITOLAK (dulu lolos karena sen vs IDR)', async () => {
+      mockPrisma.userShowcase.findFirst.mockResolvedValue(baseRow);
+      await expect(
+        service.updateCommerceFields('u1', 's1', { originalPriceIdr: 2000 }),
+      ).rejects.toThrow('lebih besar dari harga jual');
+      expect(mockPrisma.userShowcase.update).not.toHaveBeenCalled();
+    });
+
+    it('null menghapus harga coret (bukan RangeError 500)', async () => {
+      mockPrisma.userShowcase.findFirst.mockResolvedValue({ ...baseRow, originalPrice: 15000000n });
+      mockPrisma.userShowcase.update.mockResolvedValue({ id: 's1', originalPrice: null });
+      await service.updateCommerceFields('u1', 's1', { originalPriceIdr: null } as any);
+      expect(mockPrisma.userShowcase.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ originalPrice: null }) }),
       );
     });
 
@@ -113,17 +132,82 @@ describe('ProductCommerceService', () => {
 
   describe('getProductBadges', () => {
     it('TERLARIS bila >= 10 order selesai 90 hari', async () => {
-      mockPrisma.userShowcase.findFirst.mockResolvedValue({ id: 's1', originalPrice: null });
+      mockPrisma.userShowcase.findFirst.mockResolvedValue({ id: 's1', originalPrice: null, isActive: true, visibility: 'PUBLIC' });
       mockPrisma.order.count.mockResolvedValue(12);
       const res = await service.getProductBadges('s1');
       expect(res.badges).toContain('TERLARIS');
     });
 
     it('tanpa badge bila di bawah ambang', async () => {
-      mockPrisma.userShowcase.findFirst.mockResolvedValue({ id: 's1', originalPrice: null });
+      mockPrisma.userShowcase.findFirst.mockResolvedValue({ id: 's1', originalPrice: null, isActive: true, visibility: 'PUBLIC' });
       mockPrisma.order.count.mockResolvedValue(3);
       const res = await service.getProductBadges('s1');
       expect(res.badges).toEqual([]);
     });
+  });
+});
+
+describe('ProductCommerceService — audit etalase 2026-10-10 (BEC-02/03, BES-13)', () => {
+  let service: ProductCommerceService;
+  const prisma: any = mockPrisma;
+  const baseRow = { id: 's1', userId: 'u1', priceMin: 100000n, priceMax: null, productType: null, serviceDeadlineDays: null, originalPrice: null };
+
+  beforeEach(async () => {
+    jest.resetAllMocks();
+    prisma.reportModerationEvent = { findFirst: jest.fn().mockResolvedValue(null) };
+    prisma.userShowcase.update.mockResolvedValue({});
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [ProductCommerceService, { provide: PrismaService, useValue: prisma }],
+    }).compile();
+    service = module.get<ProductCommerceService>(ProductCommerceService);
+  });
+
+  it('BEC-03: jadwal masa depan menyembunyikan item (isActive:false) dalam update yang sama', async () => {
+    prisma.userShowcase.findFirst.mockResolvedValue(baseRow);
+    const future = new Date(Date.now() + 86_400_000).toISOString();
+    await service.updateCommerceFields('u1', 's1', { scheduledAt: future } as never);
+    expect(prisma.userShowcase.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ isActive: false, scheduledAt: expect.any(Date) }) }),
+    );
+  });
+
+  it('BEC-03: scheduledAt null hanya membatalkan jadwal (tidak menyentuh isActive)', async () => {
+    prisma.userShowcase.findFirst.mockResolvedValue(baseRow);
+    await service.updateCommerceFields('u1', 's1', { scheduledAt: null } as never);
+    const data = prisma.userShowcase.update.mock.calls[0][0].data;
+    expect(data).toMatchObject({ scheduledAt: null });
+    expect(data).not.toHaveProperty('isActive');
+  });
+
+  it('BEC-02: item yang di-takedown moderasi tidak bisa dijadwalkan ulang → 403 SHOWCASE_MODERATED', async () => {
+    prisma.userShowcase.findFirst.mockResolvedValue(baseRow);
+    prisma.reportModerationEvent.findFirst.mockResolvedValue({ action: 'TAKEDOWN' });
+    const future = new Date(Date.now() + 86_400_000).toISOString();
+    await expect(service.updateCommerceFields('u1', 's1', { scheduledAt: future } as never)).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'SHOWCASE_MODERATED' }),
+    });
+    expect(prisma.userShowcase.update).not.toHaveBeenCalled();
+  });
+
+  it('BEC-02: event RESTORED terakhir = tidak ada enforcement → jadwal diizinkan', async () => {
+    prisma.userShowcase.findFirst.mockResolvedValue(baseRow);
+    prisma.reportModerationEvent.findFirst.mockResolvedValue({ action: 'RESTORED' });
+    const future = new Date(Date.now() + 86_400_000).toISOString();
+    await expect(service.updateCommerceFields('u1', 's1', { scheduledAt: future } as never)).resolves.toBeDefined();
+  });
+
+  it('BES-13: klik hanya dihitung untuk item publik yang tayang', async () => {
+    prisma.userShowcase.updateMany.mockResolvedValue({ count: 0 });
+    await service.recordClick('s1');
+    expect(prisma.userShowcase.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ isActive: true, visibility: 'PUBLIC', deletedAt: null }) }),
+    );
+  });
+
+  it('BES-13: badge item privat/nonaktif → kosong (bukan bocor / bukan 404)', async () => {
+    prisma.userShowcase.findFirst.mockResolvedValue({ id: 's1', originalPrice: 100n, isActive: false, visibility: 'PUBLIC' });
+    const out = await service.getProductBadges('s1');
+    expect(out.badges).toEqual([]);
+    expect(prisma.order.count).not.toHaveBeenCalled();
   });
 });

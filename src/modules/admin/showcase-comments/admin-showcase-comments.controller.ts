@@ -21,6 +21,7 @@ import { AdminRole } from '@prisma/client';
 import { CurrentAdmin } from '../../../common/decorators/current-admin.decorator';
 import { AdminJwtPayload } from '../../../common/types/jwt-payload.types';
 import { UserThrottleGuard } from '../../../common/guards/user-throttle.guard';
+import { AdminStepUpService } from '../auth/step-up.service';
 import {
   CommentModerationListQueryDto,
   ModerateCommentDto,
@@ -38,7 +39,10 @@ import {
 @AdminRoute()
 @Controller('admin/showcase/comments')
 export class AdminShowcaseCommentsController {
-  constructor(private readonly showcaseService: ShowcaseService) {}
+  constructor(
+    private readonly showcaseService: ShowcaseService,
+    private readonly stepUp: AdminStepUpService,
+  ) {}
 
   @Get()
   @ApiOperation({
@@ -66,13 +70,31 @@ export class AdminShowcaseCommentsController {
       'hide/unhide memakai field isHidden/hiddenReason/hiddenAt/hiddenBy; delete = soft-delete (FAL-027). Setiap aksi dicatat di audit log admin.',
   })
   @ApiResponse({ status: 200, description: 'Comment moderated.' })
+  @ApiResponse({
+    status: 403,
+    description: 'action=delete tanpa/with invalid X-Step-Up-Token (STEP_UP_REQUIRED | STEP_UP_INVALID | STEP_UP_EXPIRED | STEP_UP_MISMATCH).',
+  })
   @ApiResponse({ status: 404, description: 'Comment not found.' })
-  moderate(
+  async moderate(
     @Param('id', ParseIdPipe) id: string,
     @Body() dto: ModerateCommentDto,
     @CurrentAdmin() admin: AdminJwtPayload,
     @Req() req: Request,
   ): Promise<object> {
+    // ADM-09 (audit etalase 2026-10-10): delete = destruktif → step-up WAJIB
+    // (admin web sudah meminta token aksi `showcase-comment.delete` dengan
+    // targetId = id komentar, tetapi server tidak pernah memverifikasinya).
+    // Hanya action delete yang dicek; hide/unhide reversibel. Token single-use
+    // (dihanguskan di sini); kegagalan → 403 sebelum ada perubahan data.
+    if (dto.action === 'delete') {
+      const raw = req.headers['x-step-up-token'];
+      const token = Array.isArray(raw) ? raw[0] : raw;
+      await this.stepUp.consumeStepUpToken(typeof token === 'string' ? token : undefined, {
+        adminId: admin.sub,
+        action: 'showcase-comment.delete',
+        targetId: id,
+      });
+    }
     return this.showcaseService.adminModerateComment(
       admin.sub,
       id,

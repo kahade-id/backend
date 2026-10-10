@@ -15,6 +15,7 @@ import {
   ConflictException,
   ForbiddenException,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { ActorType, AuditAction, DisputeStatus, OrderStatus, UserAuditAction, WalletTransactionStatus, WalletTransactionType } from '@prisma/client';
 import * as ErrorCodes from '../../common/constants/error-codes';
@@ -22,6 +23,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
+import { AdminStepUpService } from '../admin/auth/step-up.service';
 import { UploadService } from '../upload/upload.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { generateDisputeId, generateWalletTxId } from '../../common/utils/id-generator.util';
@@ -105,7 +107,14 @@ export class ReturnsService {
     private refundService: ReturnsRefundService,
     private walletMode: WalletModeService,
     private danaDirectRefundService: DanaDirectRefundService,
+    // Audit 2026-10-10: step-up untuk aksi uang admin (StepUpModule @Global).
+    // @Optional agar unit test lama tetap bisa mengonstruksi; fail-closed
+    // bila absen saat aksi uang dipanggil.
+    @Optional() private stepUp?: AdminStepUpService,
   ) {}
+
+  /** Nama aksi step-up untuk SEMUA aksi uang retur (target = id DB retur). */
+  static readonly MONEY_ACTION_STEP_UP = 'return.money-action';
 
   private db() {
     return getReturnsDb(this.prisma);
@@ -903,6 +912,8 @@ export class ReturnsService {
     const limit = Math.min(query.limit ?? 20, 100);
     const where: Record<string, unknown> = {};
     if (query.status && query.status !== 'ALL') where.status = query.status;
+    // Audit 2026-10-10: filter tipe transaksi server-side (relasi order).
+    if (query.kind) where.order = { orderKind: query.kind };
     if (query.minAgeHours !== undefined || query.maxAgeHours !== undefined) {
       const now = Date.now();
       const createdAt: Record<string, Date> = {};
@@ -926,12 +937,17 @@ export class ReturnsService {
     ]);
     // BAI-049 (P1): status refund DANA untuk tiap retur — batch agar tidak N+1.
     const refundMap = await this.refundDanaMap(items.map((r) => r.id));
+    // Audit 2026-10-10: ringkasan order (tipe transaksi, judul, nominal) —
+    // admin memakai `orderKind` untuk badge/filter; sebelumnya tidak dikirim.
+    const orderMap = await this.orderSummaryMap(items.map((r) => r.orderId));
     const now = Date.now();
     return {
       items: items.map((r) => ({
         ...this.toListItem(r),
         ageHours: Math.floor((now - r.createdAt.getTime()) / 3_600_000),
         refundDana: refundMap.get(r.id) ?? null,
+        orderKind: orderMap.get(r.orderId)?.orderKind ?? null,
+        order: orderMap.get(r.orderId) ?? null,
       })),
       page, limit, total, totalPages: Math.ceil(total / limit),
     };
@@ -965,6 +981,29 @@ export class ReturnsService {
     return map;
   }
 
+  /** Audit 2026-10-10: ringkasan order per retur (batch, tanpa N+1). */
+  private async orderSummaryMap(orderDbIds: string[]): Promise<
+    Map<string, { id: string; orderId: string; title: string | null; orderKind: string; buyerPayAmount: string }>
+  > {
+    const map = new Map<string, { id: string; orderId: string; title: string | null; orderKind: string; buyerPayAmount: string }>();
+    const ids = Array.from(new Set(orderDbIds.filter((id): id is string => typeof id === 'string' && id.length > 0)));
+    if (ids.length === 0) return map;
+    const orders = (await this.prisma.order.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, orderId: true, title: true, orderKind: true, buyerPayAmount: true },
+    })) ?? [];
+    for (const o of orders) {
+      map.set(o.id, {
+        id: o.id,
+        orderId: o.orderId,
+        title: o.title ?? null,
+        orderKind: String(o.orderKind),
+        buyerPayAmount: o.buyerPayAmount.toString(),
+      });
+    }
+    return map;
+  }
+
   /** BAI-049: versi single-item untuk detail/aksi admin. */
   private async refundDanaFor(returnDbId: string): Promise<RefundDanaInfo> {
     const attempt = await this.prisma.danaRefundAttempt.findUnique({
@@ -987,6 +1026,7 @@ export class ReturnsService {
     returnDbId: string,
     adminId: string,
     dto: AdminReturnActionDto,
+    stepUpToken?: string,
   ): Promise<ReturnRequestRow & { refundDana: RefundDanaInfo; notificationDelivered?: boolean; needsManualConversion?: boolean }> {
     const ret = await this.mustFind(returnDbId);
     // BAI-083: guard method-level kini mencakup CUSTOMER_SUPPORT agar
@@ -1001,6 +1041,20 @@ export class ReturnsService {
           message: 'Aksi ini (keuangan) hanya boleh dilakukan SUPER_ADMIN / DISPUTE_ADMIN.',
         });
       }
+      // Audit 2026-10-10: aksi uang wajib step-up server-side (SEC-503) —
+      // token sekali pakai terikat aksi + id retur. Fail-closed bila layanan
+      // step-up tidak tersedia.
+      if (!this.stepUp) {
+        throw new ForbiddenException({
+          code: ErrorCodes.STEP_UP_REQUIRED,
+          message: 'Verifikasi ulang (step-up) wajib untuk aksi keuangan retur, tetapi layanan step-up tidak tersedia.',
+        });
+      }
+      await this.stepUp.consumeStepUpToken(stepUpToken, {
+        adminId,
+        action: ReturnsService.MONEY_ACTION_STEP_UP,
+        targetId: returnDbId,
+      });
     }
     let result: ReturnRequestRow;
     let notificationDelivered: boolean | undefined;

@@ -91,6 +91,7 @@ describe('ReturnsService (GAP-D retur)', () => {
   let refundService: ReturnsRefundService;
   let walletMode: { isWalletEnabled: MockFn };
   let danaDirectRefundService: { refundAmount: MockFn };
+  let stepUp: { consumeStepUpToken: MockFn };
   let service: ReturnsService;
 
   beforeEach(() => {
@@ -137,6 +138,7 @@ describe('ReturnsService (GAP-D retur)', () => {
     // Default wallet ENABLED agar test jalur ledger wallet lama tetap valid.
     walletMode = { isWalletEnabled: jest.fn().mockReturnValue(true) };
     danaDirectRefundService = { refundAmount: jest.fn() };
+    stepUp = { consumeStepUpToken: jest.fn().mockResolvedValue(undefined) };
     service = new ReturnsService(
       prisma as unknown as PrismaService,
       serial as unknown as WalletTxSerialService,
@@ -146,8 +148,11 @@ describe('ReturnsService (GAP-D retur)', () => {
       refundService,
       walletMode as unknown as WalletModeService,
       danaDirectRefundService as unknown as DanaDirectRefundService,
+      // Audit 2026-10-10: aksi uang admin wajib step-up — mock menerima token apa pun.
+      stepUp as never,
     );
     jest.clearAllMocks();
+    stepUp.consumeStepUpToken.mockResolvedValue(undefined);
     // jest.clearAllMocks menghapus implementasi mockResolvedValue di atas —
     // setel ulang default yang dibutuhkan semua test.
     serial.getNextForPrefix.mockResolvedValue(7);
@@ -437,6 +442,29 @@ describe('ReturnsService (GAP-D retur)', () => {
         expect.any(String), expect.any(String), expect.any(String), expect.any(String),
         'ret-db-1', 'RTN-20260926-0001',
       );
+    });
+
+    it('audit 2026-10-10: aksi uang mengonsumsi step-up token terikat return.money-action + id retur', async () => {
+      await service.adminAct('ret-db-1', 'admin-1', { action: 'EXTEND_DEADLINE' }, 'tok-123');
+      expect(stepUp.consumeStepUpToken).toHaveBeenCalledWith('tok-123', {
+        adminId: 'admin-1',
+        action: 'return.money-action',
+        targetId: 'ret-db-1',
+      });
+    });
+
+    it('audit 2026-10-10: step-up ditolak → aksi uang tidak dieksekusi (fail-closed)', async () => {
+      stepUp.consumeStepUpToken.mockRejectedValueOnce(new Error('STEP_UP_REQUIRED'));
+      await expect(service.adminAct('ret-db-1', 'admin-1', { action: 'EXTEND_DEADLINE' })).rejects.toThrow('STEP_UP_REQUIRED');
+      expect(delegates.returnRequest.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('audit 2026-10-10: aksi non-uang (REJECT/ESCALATE) tidak butuh step-up', async () => {
+      delegates.returnRequest.findUnique.mockResolvedValue(baseReturn({ status: 'REQUESTED' }));
+      (prisma.dispute as Delegate).findFirst.mockResolvedValue(null);
+      delegates.returnRequest.updateMany.mockResolvedValue({ count: 1 });
+      await service.adminAct('ret-db-1', 'admin-1', { action: 'ESCALATE' }).catch(() => undefined);
+      expect(stepUp.consumeStepUpToken).not.toHaveBeenCalled();
     });
 
     it('menolak bila status terminal (INVALID_STATUS) — fail closed', async () => {

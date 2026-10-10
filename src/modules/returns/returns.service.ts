@@ -16,7 +16,7 @@ import {
   ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
-import { AuditAction, DisputeStatus, OrderStatus, UserAuditAction } from '@prisma/client';
+import { ActorType, AuditAction, DisputeStatus, OrderStatus, UserAuditAction, WalletTransactionStatus, WalletTransactionType } from '@prisma/client';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { PrismaService } from '../../prisma/prisma.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
@@ -24,7 +24,7 @@ import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
 import { UploadService } from '../upload/upload.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
-import { generateDisputeId } from '../../common/utils/id-generator.util';
+import { generateDisputeId, generateWalletTxId } from '../../common/utils/id-generator.util';
 import { DISPUTE_SLA_HOURS } from '../../common/constants/app.constants';
 import { getReturnsDb } from './returns.db';
 import { assertLegalReturnTransition, ACTIVE_RETURN_STATUSES } from './returns-state';
@@ -743,8 +743,13 @@ export class ReturnsService {
    * - bila ternyata sudah ada sengketa untuk order ini, tautkan saja
    *   (idempoten — tidak membuat duplikat; `Dispute.orderId` unik);
    * - sengketa baru lahir OPEN agar masuk antrean assign normal mediator;
-   * - TIDAK menyentuh status order / wallet — alur uang tetap milik retur;
-   *   sengketa ini memberi kasus yang bisa di-assign ke mediator.
+   * - K4 (audit 2026-10-10): order WAJIB ikut pindah ke DISPUTED di tx yang
+   *   sama (+ orderStatusHistory). Sebelumnya status order dibiarkan
+   *   COMPLETED sehingga resolve admin selalu 409 "Order is no longer
+   *   DISPUTED" — sengketa hasil konversi buntu selamanya. Retur selalu
+   *   pasca-completion: di mode wallet, dana seller dibekukan (pola
+   *   submitDispute) agar putusan bisa dieksekusi; di mode no-wallet tidak
+   *   ada wallet — eksekusi uang mengikuti aturan fail-closed settlement.
    */
   async convertReturnToDispute(
     returnDbId: string,
@@ -776,20 +781,96 @@ export class ReturnsService {
 
     const serial = await this.serial.getNextForPrefix('dispute_serial');
     const now = new Date();
-    const dispute = await this.prisma.dispute.create({
-      data: {
-        disputeId: generateDisputeId(serial),
-        orderId: ret.orderId,
-        // Retur selalu diajukan pembeli — inisiator konversi dicatat sebagai buyer.
-        initiatedBy: 'BUYER',
-        initiatorUserId: ret.buyerId,
-        buyerClaim: `Dikonversi dari retur ${ret.returnId} oleh admin. Alasan retur: ${ret.reasonCode}${ret.reasonDetail ? ` — ${ret.reasonDetail}` : ''}`.slice(0, 2000),
-        buyerClaimedAt: now,
-        status: 'OPEN',
-        slaHours: DISPUTE_SLA_HOURS,
-        slaDeadlineAt: new Date(now.getTime() + DISPUTE_SLA_HOURS * 3_600_000),
-      },
-      select: { id: true, disputeId: true },
+    const walletEnabled = this.walletMode.isWalletEnabled();
+    // Serial ledger Redis tidak ikut rollback — alokasikan sebelum tx.
+    const freezeTxSerial = walletEnabled ? await this.serial.getNext() : null;
+    const dispute = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM orders WHERE id = ${ret.orderId} FOR UPDATE`;
+      const order = await tx.order.findFirst({
+        where: { id: ret.orderId, deletedAt: null },
+        select: { id: true, orderId: true, status: true, sellerId: true, sellerReceiveAmount: true },
+      });
+      if (!order) {
+        throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order retur tidak ditemukan.' });
+      }
+      // Dispute.orderId unik — bila balapan dengan konversi/sengketa lain, tautkan saja.
+      const raced = await tx.dispute.findUnique({ where: { orderId: ret.orderId }, select: { id: true, disputeId: true } });
+      if (raced) return raced;
+
+      const created = await tx.dispute.create({
+        data: {
+          disputeId: generateDisputeId(serial),
+          orderId: ret.orderId,
+          // Retur selalu diajukan pembeli — inisiator konversi dicatat sebagai buyer.
+          initiatedBy: 'BUYER',
+          initiatorUserId: ret.buyerId,
+          buyerClaim: `Dikonversi dari retur ${ret.returnId} oleh admin. Alasan retur: ${ret.reasonCode}${ret.reasonDetail ? ` — ${ret.reasonDetail}` : ''}`.slice(0, 2000),
+          buyerClaimedAt: now,
+          status: 'OPEN',
+          slaHours: DISPUTE_SLA_HOURS,
+          slaDeadlineAt: new Date(now.getTime() + DISPUTE_SLA_HOURS * 3_600_000),
+        },
+        select: { id: true, disputeId: true },
+      });
+
+      // K4: order → DISPUTED (dari COMPLETED; retur hanya bisa diajukan untuk
+      // order selesai). Predikat status = guard balapan.
+      const orderUpdated = await tx.order.updateMany({
+        where: { id: order.id, status: { in: [OrderStatus.COMPLETED, OrderStatus.IN_DELIVERY, OrderStatus.PROCESSING] } },
+        data: { status: OrderStatus.DISPUTED, disputedAt: now },
+      });
+      if (orderUpdated.count === 0) {
+        throw new BadRequestException({
+          code: ErrorCodes.INVALID_ORDER_STATUS,
+          message: `Order ${order.orderId} berstatus ${order.status} — tidak dapat dikonversi menjadi sengketa.`,
+        });
+      }
+      await tx.orderStatusHistory.create({
+        data: {
+          orderId: order.id,
+          fromStatus: order.status,
+          toStatus: OrderStatus.DISPUTED,
+          changedBy: adminId,
+          changedByType: ActorType.ADMIN,
+          reason: `Retur ${ret.returnId} dikonversi menjadi sengketa ${created.disputeId}`,
+        },
+      });
+
+      // Mode wallet + pasca-completion: bekukan dana seller (pola submitDispute)
+      // agar resolveDispute pasca-completion bisa mengeksekusi putusan.
+      if (walletEnabled && order.status === OrderStatus.COMPLETED && freezeTxSerial !== null) {
+        const freezeAmount = order.sellerReceiveAmount;
+        const sellerWalletLookup = await tx.wallet.findUnique({ where: { userId: order.sellerId }, select: { id: true } });
+        if (!sellerWalletLookup) {
+          throw new ConflictException({ code: 'POST_COMPLETION_FREEZE_FAILED', message: 'Wallet seller tidak tersedia; sengketa tidak dibuat.' });
+        }
+        await tx.$queryRaw`SELECT id FROM wallets WHERE id = ${sellerWalletLookup.id} FOR UPDATE`;
+        const sellerWallet = await tx.wallet.findUnique({ where: { id: sellerWalletLookup.id } });
+        if (!sellerWallet || sellerWallet.isLocked || sellerWallet.availableBalance < freezeAmount) {
+          throw new ConflictException({ code: 'POST_COMPLETION_FREEZE_FAILED', message: 'Dana seller tidak dapat diamankan untuk sengketa ini; sengketa tidak dibuat.' });
+        }
+        const frozen = await tx.wallet.updateMany({
+          where: { id: sellerWallet.id, version: sellerWallet.version, availableBalance: { gte: freezeAmount }, isLocked: false },
+          data: { availableBalance: { decrement: freezeAmount }, escrowBalance: { increment: freezeAmount }, version: { increment: 1 } },
+        });
+        if (frozen.count === 0) {
+          throw new ConflictException({ code: 'POST_COMPLETION_FREEZE_FAILED', message: 'Dana seller berubah bersamaan; coba lagi.' });
+        }
+        await tx.walletTransaction.create({
+          data: {
+            txId: generateWalletTxId(freezeTxSerial),
+            walletId: sellerWallet.id,
+            type: WalletTransactionType.ORDER_LOCK,
+            status: WalletTransactionStatus.SUCCESS,
+            amount: freezeAmount,
+            balanceBefore: sellerWallet.availableBalance,
+            balanceAfter: sellerWallet.availableBalance - freezeAmount,
+            orderId: order.id,
+            description: `Post-completion dispute freeze (konversi retur ${ret.returnId}) for order ${order.orderId}`,
+          },
+        });
+      }
+      return created;
     });
     await this.db().returnRequest.update({ where: { id: ret.id }, data: { disputeId: dispute.id } });
     await this.logTimeline(ret.id, 'RETURN_CONVERTED_TO_DISPUTE', {

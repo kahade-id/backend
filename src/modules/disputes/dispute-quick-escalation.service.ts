@@ -30,7 +30,11 @@ export class DisputeQuickEscalationService {
 
   constructor(private prisma: PrismaService) {}
 
+  /** @param adminId DB id AdminUser (`sub` dari JWT) — ditulis ke FK assignedAdminId. */
   async quickEscalate(adminId: string, disputeId: string, note?: string) {
+    if (!adminId) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Identitas admin tidak ditemukan pada sesi' });
+    }
     const dispute = await this.prisma.dispute.findFirst({
       where: { OR: [{ id: disputeId }, { disputeId }] },
       include: { order: { select: { buyerId: true, sellerId: true } } },

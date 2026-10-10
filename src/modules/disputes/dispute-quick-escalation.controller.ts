@@ -34,7 +34,10 @@ export class DisputeQuickEscalationController {
   @Post(':id/quick-escalate')
   @HttpCode(200)
   @ApiOperation({ summary: 'Eskalasi dispute 1 ketuk (admin)' })
-  quickEscalate(@CurrentAdmin('adminId') adminId: string, @Param('id') id: string, @Body() dto: QuickEscalateDto) {
-    return this.service.quickEscalate(adminId ?? 'unknown', id, dto?.note);
+  // K7 (audit 2026-10-10): `sub` = DB id AdminUser. Sebelumnya memakai
+  // `adminId` (ID publik ADM-…) yang ditulis ke dispute.assignedAdminId (FK ke
+  // admin_users.id) → pelanggaran FK → 500 pada setiap quick-escalate.
+  quickEscalate(@CurrentAdmin('sub') adminDbId: string, @Param('id') id: string, @Body() dto: QuickEscalateDto) {
+    return this.service.quickEscalate(adminDbId, id, dto?.note);
   }
 }

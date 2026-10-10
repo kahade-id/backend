@@ -5,6 +5,8 @@ import { NotificationType } from '@prisma/client';
 import * as admin from 'firebase-admin';
 import { getMinutesInTimezone, isMinutesInRange } from '../../common/utils/timezone.util';
 import { recordDeliveryMetric } from '../observability/delivery-metrics.service';
+import { pushPreferenceFieldForType } from '../notifications/notification-preference.map';
+import { derivePushActionUrl } from '../notifications/push-action-url';
 
 const EXPO_PUSH_API_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_PUSH_BATCH_SIZE = 100;
@@ -18,6 +20,12 @@ const SAFE_PUSH_DATA_KEYS = new Set([
   'ticketId', 'promoCode', 'code', 'scheduleId', 'entityId', 'entityType', 'broadcastId',
   'milestoneId', // NCC-004: data push milestone (notifyMilestone)
   'questionId', // NCC-014: data push pengingat pertanyaan (question-reminder)
+  // Audit 2026-10-10 (BE-05): kunci yang dibaca `lib/notification-routing.ts`
+  // klien (routeForPushData) tetapi dulu dibuang di sini — tap push retur/
+  // pelacakan/komentar/support jatuh ke tab Notifikasi.
+  'refType', 'refId', 'shipmentId', 'courierStatus', 'returnId', 'returnDbId',
+  'commentId', 'showcaseId', 'storyId', 'reportId', 'appealId',
+  'conversationId', 'messageId',
 ]);
 
 /**
@@ -77,16 +85,23 @@ export class PushService implements OnModuleInit {
     const createdAfter = new Date(Date.now() - 60_000);
     const derivedActionUrl = this.deriveActionUrl(data);
     const notificationType = this.asNotificationType(data?.notificationType ?? data?.type);
-    const notification = await this.prisma.notification.findFirst({
-      where: {
-        userId,
-        deletedAt: null,
-        createdAt: { gte: createdAfter },
-        OR: [{ title, body }, ...(notificationType ? [{ type: notificationType }] : [])],
-      },
+    // Audit 2026-10-10 (BE-21): cocokkan judul+isi (+tipe bila diketahui) DULU;
+    // fallback tipe-saja hanya bila tidak ada baris yang cocok. Dulu `OR` —
+    // dua notifikasi bertipe sama dalam 60 dtk → push membawa notifId yang salah.
+    const notificationSelect = { id: true, notifId: true, actionUrl: true, type: true, category: true } as const;
+    const baseWhere = { userId, deletedAt: null, createdAt: { gte: createdAfter } };
+    let notification = await this.prisma.notification.findFirst({
+      where: { ...baseWhere, title, body, ...(notificationType ? { type: notificationType } : {}) },
       orderBy: { createdAt: 'desc' },
-      select: { id: true, notifId: true, actionUrl: true, type: true, category: true },
+      select: notificationSelect,
     }).catch(() => null);
+    if (!notification && notificationType) {
+      notification = await this.prisma.notification.findFirst({
+        where: { ...baseWhere, type: notificationType },
+        orderBy: { createdAt: 'desc' },
+        select: notificationSelect,
+      }).catch(() => null);
+    }
     if (notification && derivedActionUrl && !notification.actionUrl) {
       await this.prisma.notification.update({ where: { id: notification.id }, data: { actionUrl: derivedActionUrl } }).catch((error) => {
         this.logger.warn(`Could not backfill notification action URL for ${notification.notifId}: ${(error as Error).message}`);
@@ -119,18 +134,9 @@ export class PushService implements OnModuleInit {
     return (Object.values(NotificationType) as string[]).includes(normalized) ? normalized as NotificationType : undefined;
   }
 
+  /** Audit 2026-10-10 (BE-09): helper bersama dengan notification.processor. */
   private deriveActionUrl(data?: Record<string, string>): string | undefined {
-    if (data?.actionUrl) return data.actionUrl;
-    if (data?.orderId) return `/order/${encodeURIComponent(data.orderId)}`;
-    if (data?.roomId ?? data?.chatRoomId) return `/chat/${encodeURIComponent(data.roomId ?? data.chatRoomId ?? '')}`;
-    // NCC-003: cabang disputeId (selaras notification.processor) — tap push
-    // sengketa (DISPUTE_DECISION, DISPUTE_SUBMITTED, …) membuka detail sengketa.
-    if (data?.disputeId) return `/dispute/${encodeURIComponent(data.disputeId)}`;
-    // NCC-004: cabang milestoneId — tap push milestone membuka detail milestone.
-    if (data?.milestoneId) return `/milestones/${encodeURIComponent(data.milestoneId)}`;
-    if (data?.transactionId ?? data?.txId) return `/wallet/transaction?id=${encodeURIComponent(data.transactionId ?? data.txId ?? '')}`;
-    if (data?.notificationId) return `/notifications?notificationId=${encodeURIComponent(data.notificationId)}`;
-    return undefined;
+    return derivePushActionUrl(data, { notificationFallback: true });
   }
 
   private sanitizePushData(data?: Record<string, string>): Record<string, string> {
@@ -148,39 +154,23 @@ export class PushService implements OnModuleInit {
     return safe;
   }
 
+  /**
+   * Audit 2026-10-10 (BE-07): peta bersama `notification-preference.map`
+   * (NCC-013 dipertahankan: RATING_ dan MILESTONE_ = orderPush; marketing
+   * default opt-in false tetap menggate voucher/cashback/bonus/nudge).
+   */
   private getPushPrefFieldForType(notificationType?: string): string | null {
-    if (!notificationType) return null;
-    if (notificationType.startsWith('ORDER_')) return 'orderPush';
-    if (notificationType.startsWith('WALLET_')) return 'walletPush';
-    if (notificationType.startsWith('SECURITY_')) return 'securityPush';
-    if (notificationType.startsWith('CHAT_')) return 'chatPush';
-    if (notificationType.startsWith('DISPUTE_')) return 'disputePush';
-    // NCC-013: RATING_* dan MILESTONE_* digate toggle `orderPush`, selaras
-    // toggle lokal FE ("transaction"). Sebelumnya RATING_* digate `rankingPush`
-    // dan MILESTONE_* tak terpetakan (preferensi server diabaikan).
-    if (notificationType.startsWith('RATING_')) return 'orderPush';
-    if (notificationType.startsWith('MILESTONE_')) return 'orderPush';
-    if (notificationType === 'RANK_UPGRADED') return 'rankingPush';
-    if (notificationType.startsWith('SUBSCRIPTION_')) return 'rankingPush';
-    if (notificationType === 'REFERRAL_REWARD_RECEIVED') return 'rankingPush';
-    if (notificationType.startsWith('KYC_')) return 'securityPush';
-    if (notificationType.startsWith('SYSTEM_')) return 'securityPush';
-    // Marketing (default opt-in false): voucher, cashback, bonus topup.
-    // Tanpa pemetaan ini push promo terkirim walau user tidak pernah opt-in.
-    if (notificationType === 'VOUCHER_ISSUED') return 'marketingPush';
-    if (notificationType === 'CAMPAIGN_CASHBACK_CREDITED') return 'marketingPush';
-    if (notificationType === 'TOPUP_BONUS_CREDITED') return 'marketingPush';
-    // Nudge non-kritis: boleh dimatikan user via preferensi marketing.
-    if (notificationType === 'QUESTION_UNANSWERED_REMINDER') return 'marketingPush';
-    return null;
+    return pushPreferenceFieldForType(notificationType);
   }
 
   private getAndroidChannelId(notificationType?: string): string {
     if (!notificationType) return 'default';
     if (notificationType.startsWith('SECURITY_') || notificationType.startsWith('KYC_') || notificationType.startsWith('SYSTEM_')) return 'security';
-    if (notificationType.startsWith('ORDER_')) return 'orders';
-    if (notificationType.startsWith('WALLET_')) return 'wallet';
-    if (notificationType.startsWith('CHAT_') || notificationType.startsWith('DISPUTE_')) return 'chat';
+    // Audit 2026-10-10 (BE-08): MILESTONE_* = status order (kanal "orders"),
+    // balasan agen support = kanal "chat" — dulu keduanya jatuh ke "default".
+    if (notificationType.startsWith('ORDER_') || notificationType.startsWith('MILESTONE_')) return 'orders';
+    if (notificationType.startsWith('WALLET_') || notificationType === 'ESCROW_HELD_NO_BANK') return 'wallet';
+    if (notificationType.startsWith('CHAT_') || notificationType.startsWith('DISPUTE_') || notificationType === 'SUPPORT_AGENT_REPLY') return 'chat';
     return 'default';
   }
 

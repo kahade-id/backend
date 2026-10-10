@@ -93,11 +93,11 @@ export const NOTIFICATION_COPY: Record<
   [NotificationType.ORDER_PAYMENT_RECEIVED]: {
     id: {
       title: 'Pembayaran diterima',
-      body: 'Pembayaran {amount} untuk pesanan "{orderTitle}" telah diterima dan ditahan di escrow Kahade.',
+      body: 'Pembayaran {amount} untuk pesanan "{orderTitle}" telah diterima. Dana disimpan aman oleh Kahade sampai pesanan selesai.',
     },
     en: {
       title: 'Payment received',
-      body: 'Payment of {amount} for order "{orderTitle}" has been received and is held in Kahade escrow.',
+      body: 'Payment of {amount} for order "{orderTitle}" has been received. Kahade keeps the funds safe until the order is completed.',
     },
   },
   [NotificationType.ORDER_SHIPPED]: {
@@ -378,12 +378,12 @@ export const NOTIFICATION_COPY: Record<
   },
   [NotificationType.ESCROW_HELD_NO_BANK]: {
     id: {
-      title: 'Dana escrow menunggu rekening bank',
-      body: 'Dana {amount} dari pesanan "{orderTitle}" ditahan di escrow karena Anda belum menghubungkan rekening bank. Hubungkan rekening untuk mencairkan dana.',
+      title: 'Dana menunggu rekening bank',
+      body: 'Dana {amount} dari pesanan "{orderTitle}" aman di Kahade dan menunggu rekening bank Anda. Hubungkan rekening untuk mencairkan dana.',
     },
     en: {
-      title: 'Escrow funds awaiting bank account',
-      body: '{amount} from order "{orderTitle}" is held in escrow because you have not linked a bank account yet. Link a bank account to release the funds.',
+      title: 'Funds awaiting bank account',
+      body: '{amount} from order "{orderTitle}" is safe with Kahade and waiting for your bank account. Link a bank account to withdraw the funds.',
     },
   },
   // -------------------------------------------------------------------- KYC

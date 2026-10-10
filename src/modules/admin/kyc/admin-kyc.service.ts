@@ -367,7 +367,7 @@ export class AdminKycService {
           type: NotificationType.KYC_APPROVED,
           category: getCategoryForType(NotificationType.KYC_APPROVED),
           title: 'KYC Verification Approved',
-          body: 'Congratulations! Your identity has been successfully verified. You can now perform escrow transactions.',
+          body: 'Congratulations! Your identity has been successfully verified. You can now transact with full limits on Kahade.',
           isRead: false,
         },
       })
@@ -380,7 +380,7 @@ export class AdminKycService {
     this.prisma.emitNotificationCreated({
       userId: request.userId,
       title: 'KYC Verification Approved',
-      body: 'Congratulations! Your identity has been successfully verified. You can now perform escrow transactions.',
+      body: 'Congratulations! Your identity has been successfully verified. You can now transact with full limits on Kahade.',
       data: { type: 'KYC_APPROVED' },
     });
 

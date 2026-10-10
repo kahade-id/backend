@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, ForbiddenException, ConflictException, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ForbiddenException, ConflictException, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { randomBytes, createHash } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
@@ -9,7 +9,7 @@ import { UpdateConfigDto } from './dto/update-config.dto';
 import { BroadcastDto } from './dto/broadcast.dto';
 import { AuditLogQueryDto, WebhookLogQueryDto } from './dto/audit-log-query.dto';
 import { AuditAction, NotificationCategory, NotificationChannel, NotificationType, Prisma, KycStatus, AdminRole } from '@prisma/client';
-import { escapeHtml } from '../../../common/utils/sanitize.util';
+import { RealtimeService } from '../../realtime/realtime.service';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { ADMIN_SYSTEM_CONFIGS, FEE_CONFIG_CACHE, SUBSCRIPTION_PLANS_CACHE } from '../../../common/constants/redis-keys';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
@@ -20,6 +20,20 @@ import { escapeLikePattern } from '../../../common/utils/search.util';
 // paralel + deteksi substring FINANCIAL_CONFIG_KEYS).
 import { classifySystemConfig } from './system-config.registry';
 import { ApprovalsService } from '../approvals/approvals.service';
+
+/**
+ * Audit 2026-10-10 (BE-11): judul/isi broadcast adalah TEKS POLOS yang dirender
+ * `<Text>` di aplikasi & React di admin — keduanya tidak menafsirkan HTML.
+ * `escapeHtml` lama membuat `Promo 'Plus' & lainnya` tampil sebagai
+ * `Promo &#39;Plus&#39; &amp; lainnya` di inbox pengguna. Cukup buang karakter
+ * kontrol dan rapikan spasi.
+ */
+function sanitizeBroadcastText(input: string): string {
+  return input
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .trim();
+}
 
 const SYSTEM_CONFIG_TTL = 300;
 const SYSTEM_CONFIG_LOCK_TTL = 10;
@@ -37,6 +51,10 @@ export class AdminSystemService implements OnModuleInit {
     // SYS-B-405: modul ini mengeksekusi SYSTEM_CONFIG_CHANGE yang disetujui
     // (ApprovalsModule @Global — tanpa import modul).
     private readonly approvals: ApprovalsService,
+    // Audit 2026-10-10 (BE-12): broadcast in-app saja memancarkan `notification.new`
+    // agar inbox/badge perangkat yang online langsung bergerak. RealtimeModule
+    // @Global; opsional agar unit test tanpa gateway tetap jalan.
+    @Optional() private readonly realtime?: RealtimeService,
   ) {}
 
   onModuleInit(): void {
@@ -617,8 +635,8 @@ export class AdminSystemService implements OnModuleInit {
         await new Promise<void>((resolve) => setTimeout(resolve, STAGE_DELAY_MS));
       }
 
-      const safeTitle = escapeHtml(dto.title ?? '');
-      const safeBody = escapeHtml(dto.body ?? '');
+      const safeTitle = sanitizeBroadcastText(dto.title ?? '');
+      const safeBody = sanitizeBroadcastText(dto.body ?? '');
       if (pushRequested) {
         const QUEUE_BATCH = 500;
         const jobs = batch.map((user) => ({
@@ -626,7 +644,10 @@ export class AdminSystemService implements OnModuleInit {
           type: NotificationType.SYSTEM_ANNOUNCEMENT,
           title: safeTitle,
           body: safeBody,
-          channel: NotificationChannel.PUSH_NOTIFICATION,
+          // Audit 2026-10-10 (BE-13): bila admin juga meminta in-app, baris inbox
+          // dicatat IN_APP (push tetap dikirim oleh worker) — dulu selalu
+          // PUSH_NOTIFICATION sehingga laporan kanal salah.
+          channel: inAppRequested ? NotificationChannel.IN_APP : NotificationChannel.PUSH_NOTIFICATION,
           actionUrl: '/notifications',
           pushData: {
             notificationType: NotificationType.SYSTEM_ANNOUNCEMENT,
@@ -638,8 +659,17 @@ export class AdminSystemService implements OnModuleInit {
           queuedCount += await this.notificationQueue.enqueueMany(jobs.slice(i, i + QUEUE_BATCH));
         }
       } else if (inAppRequested) {
+        const notifIds = new Map<string, string>();
+        const notifIdFor = (userId: string): string => {
+          let id = notifIds.get(userId);
+          if (!id) {
+            id = generateNotifId();
+            notifIds.set(userId, id);
+          }
+          return id;
+        };
         const notifications = batch.map((user) => ({
-          notifId: generateNotifId(),
+          notifId: notifIdFor(user.id),
           userId: user.id,
           type: NotificationType.SYSTEM_ANNOUNCEMENT,
           category: NotificationCategory.INFORMASI,
@@ -647,12 +677,32 @@ export class AdminSystemService implements OnModuleInit {
           body: safeBody,
           channel: NotificationChannel.IN_APP,
           isRead: false,
+          // BE-12: tap item → detail notifikasi (format yang dikenal
+          // `lib/notification-routing.ts`: `/notifications?notificationId=`).
+          actionUrl: `/notifications?notificationId=${encodeURIComponent(notifIdFor(user.id))}`,
         }));
         const INSERT_BATCH = 500;
         for (let i = 0; i < notifications.length; i += INSERT_BATCH) {
           await this.prisma.notification.createMany({
             data: notifications.slice(i, i + INSERT_BATCH),
           });
+        }
+        // BE-12: beri tahu perangkat yang online (dulu hanya createMany → inbox
+        // & badge diam sampai poll). Tidak lewat `emitNotificationCreated` agar
+        // PushService tidak ikut mengirim push untuk broadcast in-app saja.
+        if (this.realtime) {
+          for (const n of notifications) {
+            this.realtime.emitToUser(n.userId, 'notification.new', {
+              notifId: n.notifId,
+              type: n.type,
+              title: n.title,
+              body: n.body,
+              notificationType: n.type,
+              notificationCategory: n.category,
+              actionUrl: n.actionUrl,
+              broadcastId,
+            });
+          }
         }
       }
 
@@ -671,8 +721,10 @@ export class AdminSystemService implements OnModuleInit {
       action: AuditAction.BROADCAST_SENT,
       targetType: 'Broadcast',
       targetId: broadcastId,
-      description: `Broadcast sent to ${totalRecipients} users (audience: ${dto.targetAudience ?? 'all'})`,
-      after: { title: dto.title, channels: dto.channels, targetAudience: dto.targetAudience, recipientCount: totalRecipients },
+      // Audit 2026-10-10 (BE-14): jumlah job terantri ikut dicatat — selisih
+      // dengan recipientCount = enqueue gagal, dulu tidak terlihat di mana pun.
+      description: `Broadcast sent to ${totalRecipients} users (audience: ${dto.targetAudience ?? 'all'}, queued: ${pushRequested ? queuedCount : 'n/a'})`,
+      after: { title: dto.title, channels: dto.channels, targetAudience: dto.targetAudience, recipientCount: totalRecipients, queuedCount, pushRequested },
       ipAddress,
     });
 

@@ -161,8 +161,16 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
               : null;
         if (notifId === null) {
           try {
+            // Audit 2026-10-10 (BE-10): batasi ke baris hidup & baru (60 dtk) —
+            // tanpa ini judul/isi yang sama bisa menunjuk notifikasi lama/terhapus.
             const row = await this.prisma.notification.findFirst({
-              where: { userId: data.userId, title: data.title, body: data.body },
+              where: {
+                userId: data.userId,
+                title: data.title,
+                body: data.body,
+                deletedAt: null,
+                createdAt: { gte: new Date(Date.now() - 60_000) },
+              },
               orderBy: { createdAt: 'desc' },
               select: { notifId: true, type: true },
             });

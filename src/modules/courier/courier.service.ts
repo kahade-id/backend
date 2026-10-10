@@ -104,6 +104,47 @@ const STATUS_RANK: Record<ShipmentStatus, number> = {
 
 const TERMINAL_STATUSES: Set<ShipmentStatus> = new Set([ShipmentStatus.DELIVERED, ShipmentStatus.RETURNED]);
 
+/**
+ * Audit alamat & kurir A01 (2026-10-10): aturan transisi status.
+ *
+ * - Terminal (DELIVERED/RETURNED) tidak pernah berubah.
+ * - EXCEPTION boleh diterapkan dari status non-terminal MANA PUN — sebelumnya
+ *   rank EXCEPTION (2) < IN_TRANSIT (3) sehingga kendala setelah paket
+ *   berangkat tidak pernah terlihat di status.
+ * - Dari UNKNOWN/EXCEPTION boleh ke mana saja (pemulihan).
+ * - Selain itu status tidak boleh turun (rank).
+ */
+export function canApplyStatus(from: ShipmentStatus, to: ShipmentStatus): boolean {
+  if (TERMINAL_STATUSES.has(from)) return false;
+  if (to === ShipmentStatus.UNKNOWN) return from === ShipmentStatus.UNKNOWN;
+  if (to === ShipmentStatus.EXCEPTION) return true;
+  if (from === ShipmentStatus.UNKNOWN || from === ShipmentStatus.EXCEPTION) return true;
+  return STATUS_RANK[to] >= STATUS_RANK[from];
+}
+
+/**
+ * A02: putar ulang riwayat event (urut waktu) memakai aturan transisi yang
+ * sama → status yang seharusnya. Dipakai memulihkan shipment yang tersangkut
+ * UNKNOWN setelah timeout provider padahal event-nya sudah lengkap.
+ */
+export function replayShipmentStatus(statuses: readonly ShipmentStatus[]): ShipmentStatus {
+  let current: ShipmentStatus = ShipmentStatus.UNKNOWN;
+  for (const next of statuses) {
+    if (next === ShipmentStatus.UNKNOWN) continue;
+    if (canApplyStatus(current, next)) current = next;
+  }
+  return current;
+}
+
+/** A09: tanggal event dari webhook — tanggal tak valid jatuh ke "sekarang", bukan Invalid Date → 500. */
+export function parseOccurredAt(raw: unknown): Date {
+  if (typeof raw === 'string' || typeof raw === 'number') {
+    const parsed = new Date(raw);
+    if (Number.isFinite(parsed.getTime())) return parsed;
+  }
+  return new Date();
+}
+
 export function normalizeRawStatus(raw: string): { status: ShipmentStatus; known: boolean } {
   const cleaned = (raw ?? '').trim();
   for (const { test, status } of RAW_STATUS_MAP) {
@@ -134,6 +175,7 @@ const STALE_EVENT_THRESHOLD_HOURS = 48; // tracking dianggap macet (G247)
 
 export interface MaskedShipment {
   id: string;
+  /** orderId PUBLIK (`ORD-…`) — A05: dulu cuid internal `orders.id` bocor ke klien. */
   orderId: string;
   providerCode: string;
   serviceCode: string | null;
@@ -234,12 +276,27 @@ export class CourierService {
       .filter((c) => this.registry.has(c));
 
     const quotes: ShippingQuote[] = [];
+    // A11: katalog layanan aktif diambil SEKALI (dulu satu query per provider).
+    const enabledServices = codes.length > 0
+      ? await this.prisma.courierService.findMany({
+          where: { providerCode: { in: codes }, enabled: true },
+          select: { providerCode: true, serviceCode: true },
+        })
+      : [];
+    const enabledByProvider = new Map<string, Set<string>>();
+    for (const s of enabledServices) {
+      if (!enabledByProvider.has(s.providerCode)) enabledByProvider.set(s.providerCode, new Set());
+      enabledByProvider.get(s.providerCode)!.add(s.serviceCode);
+    }
     for (const code of codes) {
+      const enabledSet = enabledByProvider.get(code);
+      if (!enabledSet || enabledSet.size === 0) continue;
       if (!(await this.isProviderAvailable(code, dto.destinationPostalCode))) continue;
       const p = this.registry.get(code);
       if (!p) continue;
       try {
-        // Validasi format kode pos SEBELUM meminta tarif (G229).
+        // Validasi format kode pos SEBELUM meminta tarif (G229) — A11: hasilnya
+        // dipakai (dulu dibuang), provider yang menolak tujuan dilewati.
         const validated = await p.validateAddress({
           name: 'Validasi',
           phone: '+6280000000000',
@@ -247,7 +304,10 @@ export class CourierService {
           city: dto.destinationCity ?? 'Kota',
           postalCode: dto.destinationPostalCode,
         });
-        void validated;
+        if (!validated.valid) {
+          this.logger.warn(`Quote ${code} dilewati: tujuan tidak valid (${validated.errors.join('; ')})`);
+          continue;
+        }
         const qs = await p.getQuote({
           originPostalCode: dto.originPostalCode,
           destinationPostalCode: dto.destinationPostalCode,
@@ -256,11 +316,6 @@ export class CourierService {
           weightGrams: dto.weightGrams,
         });
         // Hanya layanan yang masih enabled di katalog.
-        const enabledServices = await this.prisma.courierService.findMany({
-          where: { providerCode: code, enabled: true },
-          select: { serviceCode: true },
-        });
-        const enabledSet = new Set(enabledServices.map((s) => s.serviceCode));
         quotes.push(...qs.filter((q) => enabledSet.has(q.serviceCode)));
       } catch (error) {
         // Satu provider gagal → jangan gagalkan seluruh perbandingan (G240).
@@ -293,6 +348,33 @@ export class CourierService {
     return order;
   }
 
+  /**
+   * A05: `Shipment.orderId` adalah cuid internal `orders.id`. Semua yang keluar
+   * ke klien/notifikasi memakai orderId PUBLIK (`ORD-…`). Best-effort: bila
+   * lookup gagal, kembalikan nilai internal agar notifikasi tidak ikut gagal.
+   */
+  private async publicOrderId(internalId: string): Promise<string> {
+    try {
+      const order = await this.prisma.order.findUnique({ where: { id: internalId }, select: { orderId: true } });
+      return order?.orderId ?? internalId;
+    } catch (error) {
+      this.logger.warn(`Gagal resolve orderId publik untuk ${internalId}: ${(error as Error).message}`);
+      return internalId;
+    }
+  }
+
+  private async publicOrderIds(internalIds: string[]): Promise<Map<string, string>> {
+    const unique = [...new Set(internalIds)];
+    if (unique.length === 0) return new Map();
+    try {
+      const rows = await this.prisma.order.findMany({ where: { id: { in: unique } }, select: { id: true, orderId: true } });
+      return new Map(rows.map((r) => [r.id, r.orderId]));
+    } catch (error) {
+      this.logger.warn(`Gagal resolve orderId publik batch: ${(error as Error).message}`);
+      return new Map();
+    }
+  }
+
   private toMaskedShipment(s: {
     id: string; orderId: string; providerCode: string; serviceCode: string | null;
     mode: ShipmentMode; bookingState: ShipmentBookingState; status: ShipmentStatus;
@@ -301,10 +383,10 @@ export class CourierService {
     slaDueAt: Date | null; isManual: boolean; manualCourierName: string | null;
     originCity: string | null; originPostalCode: string | null; destCity: string | null;
     destPostalCode: string | null; lastEventAt: Date | null; createdAt: Date;
-  }, serviceName?: string | null): MaskedShipment {
+  }, serviceName?: string | null, publicOrderId?: string | null): MaskedShipment {
     return {
       id: s.id,
-      orderId: s.orderId,
+      orderId: publicOrderId ?? s.orderId,
       providerCode: s.providerCode,
       serviceCode: s.serviceCode,
       serviceName: serviceName ?? null,
@@ -396,7 +478,7 @@ export class CourierService {
       },
     });
     this.logger.log(`Shipment draft dibuat: ${created.id} order=${order.orderId} provider=${providerCode}`);
-    return this.toMaskedShipment(created, catalogEntry?.serviceName ?? null);
+    return this.toMaskedShipment(created, catalogEntry?.serviceName ?? null, order.orderId);
   }
 
   /** Booking pickup + label dari layar order (G232). */
@@ -477,9 +559,10 @@ export class CourierService {
       data: { trackingNumber: result.trackingNumber, courierName: provider.displayName },
     }).catch((e) => this.logger.warn(`Gagal mirror resi ke order: ${(e as Error).message}`));
 
-    await this.notifyParties(updated, ShipmentStatus.CREATED, 'Label pengiriman dibuat', `Resi ${result.trackingNumber} (${provider.displayName}). Estimasi tiba ${result.etaMinDays}–${result.etaMaxDays} hari.`);
+    const publicOrderId = await this.publicOrderId(updated.orderId);
+    await this.notifyParties({ ...updated, orderId: publicOrderId }, ShipmentStatus.CREATED, 'Label pengiriman dibuat', `Resi ${result.trackingNumber} (${provider.displayName}). Estimasi tiba ${result.etaMinDays}–${result.etaMaxDays} hari.`);
 
-    return this.toMaskedShipment(updated, catalogEntry?.serviceName ?? null);
+    return this.toMaskedShipment(updated, catalogEntry?.serviceName ?? null, publicOrderId);
   }
 
   // -------------------------------------------------------------------------
@@ -503,7 +586,7 @@ export class CourierService {
           select: { serviceName: true },
         })
       : null;
-    return this.toMaskedShipment(shipment, catalogEntry?.serviceName ?? null);
+    return this.toMaskedShipment(shipment, catalogEntry?.serviceName ?? null, await this.publicOrderId(shipment.orderId));
   }
 
   async getShipmentByOrder(userId: string, orderId: string): Promise<MaskedShipment | null> {
@@ -524,7 +607,8 @@ export class CourierService {
     await this.assertParticipant(userId, shipmentId);
     const events = await this.prisma.shipmentEvent.findMany({
       where: { shipmentId },
-      orderBy: { createdAt: 'asc' },
+      // A08: provider boleh mengirim out-of-order — urutkan berdasar waktu kejadian.
+      orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
       select: { id: true, rawStatus: true, status: true, locationMasked: true, description: true, occurredAt: true, createdAt: true },
     });
     return events;
@@ -552,11 +636,48 @@ export class CourierService {
     return this.refreshTrackingForShipment(shipment, 'admin');
   }
 
+  /**
+   * A03: dipanggil sweep terjadwal (CourierTrackingSweepService) — tanpa cek
+   * partisipan; logika provider IDENTIK dengan jalur user/admin.
+   */
+  async refreshTrackingSystem(
+    shipment: { id: string; trackingNumber: string | null; isManual: boolean; providerCode: string; status: ShipmentStatus },
+  ): Promise<{ status: ShipmentStatus; events: number; timeout: boolean }> {
+    return this.refreshTrackingForShipment(shipment, 'system');
+  }
+
+  /**
+   * A04 (G247): alert "tracking macet" sekali per shipment — `staleAlertSentAt`
+   * sebagai kunci idempoten (updateMany bersyarat; dua instance sweep tidak
+   * mengirim ganda). Mengembalikan true bila alert benar-benar dikirim.
+   */
+  async notifyStaleTracking(shipment: {
+    id: string; orderId: string; buyerId: string; sellerId: string; trackingNumber: string | null;
+  }): Promise<boolean> {
+    const claimed = await this.prisma.shipment.updateMany({
+      where: { id: shipment.id, staleAlertSentAt: null },
+      data: { staleAlertSentAt: new Date() },
+    });
+    if (claimed.count === 0) return false;
+    const publicOrderId = await this.publicOrderId(shipment.orderId);
+    await this.notifyParties(
+      { ...shipment, orderId: publicOrderId },
+      ShipmentStatus.EXCEPTION,
+      'Tracking paket belum diperbarui',
+      `Belum ada pembaruan tracking untuk order ${publicOrderId} selama lebih dari ${STALE_EVENT_THRESHOLD_HOURS} jam. Resi: ${shipment.trackingNumber ?? '-'}. Cek ke kurir atau hubungi lawan transaksi.`,
+    );
+    return true;
+  }
+
   private async refreshTrackingForShipment(
     shipment: { id: string; trackingNumber: string | null; isManual: boolean; providerCode: string; status: ShipmentStatus },
-    _actor: 'user' | 'admin',
+    _actor: 'user' | 'admin' | 'system',
   ): Promise<{ status: ShipmentStatus; events: number; timeout: boolean }> {
-    if (!shipment.trackingNumber || shipment.isManual) {
+    if (shipment.isManual) {
+      // A12: resi manual tidak terhubung ke provider — pesan harus jujur.
+      throw new BadRequestException({ code: ErrorCodes.COURIER_TRACKING_UNAVAILABLE, message: 'Resi manual tidak bisa dilacak otomatis — cek langsung di situs kurir' });
+    }
+    if (!shipment.trackingNumber) {
       throw new BadRequestException({ code: ErrorCodes.COURIER_TRACKING_UNAVAILABLE, message: 'Belum ada nomor resi provider' });
     }
     const provider = this.registry.get(shipment.providerCode);
@@ -586,8 +707,27 @@ export class CourierService {
       const ok = await this.applyProviderEvent(shipment.id, shipment.providerCode, e);
       if (ok) applied++;
     }
-    const fresh = await this.prisma.shipment.findUnique({ where: { id: shipment.id }, select: { status: true } });
-    return { status: fresh?.status ?? shipment.status, events: applied, timeout: false };
+    let status = (await this.prisma.shipment.findUnique({ where: { id: shipment.id }, select: { status: true } }))?.status ?? shipment.status;
+    // A02: provider sudah merespons lagi tetapi status masih UNKNOWN (sisa
+    // timeout) dan semua event ternyata duplikat → pulihkan dari riwayat.
+    if (status === ShipmentStatus.UNKNOWN) {
+      status = (await this.recoverStatusFromEvents(shipment.id)) ?? status;
+    }
+    return { status, events: applied, timeout: false };
+  }
+
+  /** A02: putar ulang event tersimpan → status; null bila tidak ada event bermakna. */
+  private async recoverStatusFromEvents(shipmentId: string): Promise<ShipmentStatus | null> {
+    const rows = await this.prisma.shipmentEvent.findMany({
+      where: { shipmentId, status: { not: ShipmentStatus.UNKNOWN } },
+      orderBy: [{ occurredAt: 'asc' }, { createdAt: 'asc' }],
+      select: { status: true },
+    });
+    const replayed = replayShipmentStatus(rows.map((r) => r.status));
+    if (replayed === ShipmentStatus.UNKNOWN) return null;
+    await this.prisma.shipment.update({ where: { id: shipmentId }, data: { status: replayed } });
+    this.logger.log(`Status shipment=${shipmentId} dipulihkan dari UNKNOWN → ${replayed} (replay event)`);
+    return replayed;
   }
 
   // -------------------------------------------------------------------------
@@ -669,7 +809,7 @@ export class CourierService {
       }
     }
 
-    const trackingNumber = String(payload.trackingNumber ?? payload.awb ?? '');
+    const trackingNumber = String(payload.trackingNumber ?? payload.awb ?? '').trim();
     if (!trackingNumber) {
       await this.logWebhook(code, null, idempotencyKey, true, payloadHash, 'REJECTED', 'Payload tanpa trackingNumber');
       return { outcome: 'ignored' };
@@ -686,7 +826,7 @@ export class CourierService {
       rawStatus,
       location: typeof payload.location === 'string' ? payload.location : undefined,
       description: typeof payload.description === 'string' ? payload.description : undefined,
-      occurredAt: payload.occurredAt ? new Date(String(payload.occurredAt)) : new Date(),
+      occurredAt: parseOccurredAt(payload.occurredAt),
     };
 
     const applied = await this.applyProviderEvent(shipment.id, code, event);
@@ -741,12 +881,14 @@ export class CourierService {
 
     const shipment = await this.prisma.shipment.findUnique({ where: { id: shipmentId } });
     if (shipment && !TERMINAL_STATUSES.has(shipment.status)) {
-      if (STATUS_RANK[status] >= STATUS_RANK[shipment.status]) {
+      if (canApplyStatus(shipment.status, status)) {
         await this.prisma.shipment.update({
           where: { id: shipmentId },
           data: { status, lastEventAt: new Date(), lastEventRaw: event.rawStatus },
         });
-        await this.notifyParties(shipment, status, this.notificationTitleFor(status), this.notificationBodyFor(shipment, status, event));
+        // A05/A13: teks & pushData notifikasi memakai orderId publik.
+        const forNotif = { ...shipment, orderId: await this.publicOrderId(shipment.orderId) };
+        await this.notifyParties(forNotif, status, this.notificationTitleFor(status), this.notificationBodyFor(forNotif, status, event));
       } else {
         await this.prisma.shipment.update({
           where: { id: shipmentId },
@@ -916,8 +1058,9 @@ export class CourierService {
     });
     // Riwayat: catat sebagai event di timeline pengiriman order ini.
     await this.recordEvent(shipment.id, shipment.providerCode, `local-void-${Date.now()}`, 'VOIDED_BY_SELLER', ShipmentStatus.UNKNOWN, undefined, `Label dibatalkan penjual. Alasan: ${dto.reason}`);
-    await this.notifyParties(updated, ShipmentStatus.UNKNOWN, 'Label pengiriman dibatalkan', `Label untuk order ${updated.orderId} dibatalkan penjual.`);
-    return this.toMaskedShipment(updated);
+    const publicOrderId = await this.publicOrderId(updated.orderId);
+    await this.notifyParties({ ...updated, orderId: publicOrderId }, ShipmentStatus.UNKNOWN, 'Label pengiriman dibatalkan', `Label untuk order ${publicOrderId} dibatalkan penjual.`);
+    return this.toMaskedShipment(updated, undefined, publicOrderId);
   }
 
   /** Fallback resi manual bila provider nonaktif/tidak tersedia (G241). */
@@ -948,8 +1091,9 @@ export class CourierService {
       where: { id: shipment.orderId },
       data: { trackingNumber: dto.trackingNumber, courierName: dto.courierName },
     }).catch((e) => this.logger.warn(`Gagal mirror resi manual ke order: ${(e as Error).message}`));
-    await this.notifyParties(updated, ShipmentStatus.PICKED_UP, 'Penjual mengisi resi pengiriman', `Resi ${dto.courierName} ${dto.trackingNumber} untuk order ${updated.orderId}.`);
-    return this.toMaskedShipment(updated);
+    const publicOrderId = await this.publicOrderId(updated.orderId);
+    await this.notifyParties({ ...updated, orderId: publicOrderId }, ShipmentStatus.PICKED_UP, 'Penjual mengisi resi pengiriman', `Resi ${dto.courierName} ${dto.trackingNumber} untuk order ${publicOrderId}.`);
+    return this.toMaskedShipment(updated, undefined, publicOrderId);
   }
 
   // -------------------------------------------------------------------------
@@ -1079,10 +1223,17 @@ export class CourierService {
     }
     const search = query.search?.trim();
     if (search) {
+      // A05: admin mencari dengan orderId PUBLIK (ORD-…) — petakan ke id internal.
+      const matchedOrders = await this.prisma.order.findMany({
+        where: { orderId: { contains: search, mode: 'insensitive' } },
+        select: { id: true },
+        take: 50,
+      });
       andClauses.push({
         OR: [
           { trackingNumber: { contains: search, mode: 'insensitive' } },
           { orderId: { contains: search, mode: 'insensitive' } },
+          ...(matchedOrders.length > 0 ? [{ orderId: { in: matchedOrders.map((o) => o.id) } }] : []),
         ],
       });
     }
@@ -1092,8 +1243,9 @@ export class CourierService {
       this.prisma.shipment.findMany({ where, orderBy: { updatedAt: 'desc' }, skip: (page - 1) * limit, take: limit }),
     ]);
     const totalPages = Math.max(1, Math.ceil(total / limit));
+    const publicIds = await this.publicOrderIds(rows.map((r) => r.orderId));
     return {
-      data: rows.map((r) => this.toMaskedShipment(r)),
+      data: rows.map((r) => this.toMaskedShipment(r, undefined, publicIds.get(r.orderId) ?? null)),
       total, page, limit, totalPages,
       hasNext: page < totalPages,
       hasPrev: page > 1,
@@ -1202,11 +1354,15 @@ export class CourierService {
 
   /**
    * Rekonsiliasi estimasi vs aktual per shipment (halaman admin).
-   * diffSen = actualCost − estimatedCost, dihitung di SQL agar bisa difilter
+   * diff = actualCost − estimatedCost, dihitung di SQL agar bisa difilter
    * (onlyMismatch) dan dipaginasi di DB tanpa full-scan ke aplikasi.
+   *
+   * A06 (audit 2026-10-10): SEMUA nilai dalam RUPIAH utuh (kolom BigInt
+   * rupiah, konsisten dengan `estimatedCost`/`actualCost` di MaskedShipment).
+   * Nama lama `*Sen` membuat admin membagi 100 → ongkir tampil 100× lebih kecil.
    */
   async getShippingReconciliation(query: { page?: number; limit?: number; onlyMismatch?: boolean }): Promise<{
-    data: Array<{ shipmentId: string; orderId: string; providerCode: string; estimatedCostSen: string; actualCostSen: string; diffSen: string }>;
+    data: Array<{ shipmentId: string; orderId: string; providerCode: string; estimatedCost: string; actualCost: string; diff: string }>;
     total: number; page: number; limit: number; totalPages: number; hasNext: boolean; hasPrev: boolean;
   }> {
     const page = Math.max(1, Math.floor(query.page ?? 1));
@@ -1214,22 +1370,23 @@ export class CourierService {
     const mismatchOnly = query.onlyMismatch === true;
     // Kolom DB mengikuti nama field Prisma (tanpa @map): "orderId",
     // "providerCode", "estimatedCost", "actualCost", "updatedAt".
-    const baseWhere = Prisma.sql`FROM "shipments" WHERE "actualCost" IS NOT NULL`;
-    const mismatchWhere = mismatchOnly ? Prisma.sql` AND ("actualCost" - "estimatedCost") <> 0` : Prisma.sql``;
+    // A05: join ke orders untuk orderId PUBLIK (bukan cuid internal).
+    const baseWhere = Prisma.sql`FROM "shipments" s LEFT JOIN "orders" o ON o."id" = s."orderId" WHERE s."actualCost" IS NOT NULL`;
+    const mismatchWhere = mismatchOnly ? Prisma.sql` AND (s."actualCost" - s."estimatedCost") <> 0` : Prisma.sql``;
     const [countRows, rows] = await Promise.all([
       this.prisma.$queryRaw<Array<{ count: bigint }>>(
         Prisma.sql`SELECT COUNT(*)::bigint AS count ${baseWhere} ${mismatchWhere}`,
       ),
       this.prisma.$queryRaw<Array<{
         shipmentId: string; orderId: string; providerCode: string;
-        estimatedCostSen: string; actualCostSen: string; diffSen: string;
+        estimatedCost: string; actualCost: string; diff: string;
       }>>(
-        Prisma.sql`SELECT "id" AS "shipmentId", "orderId", "providerCode",
-          "estimatedCost"::text AS "estimatedCostSen",
-          "actualCost"::text AS "actualCostSen",
-          ("actualCost" - "estimatedCost")::text AS "diffSen"
+        Prisma.sql`SELECT s."id" AS "shipmentId", COALESCE(o."orderId", s."orderId") AS "orderId", s."providerCode",
+          s."estimatedCost"::text AS "estimatedCost",
+          s."actualCost"::text AS "actualCost",
+          (s."actualCost" - s."estimatedCost")::text AS "diff"
           ${baseWhere} ${mismatchWhere}
-          ORDER BY "updatedAt" DESC
+          ORDER BY s."updatedAt" DESC
           LIMIT ${limit} OFFSET ${(page - 1) * limit}`,
       ),
     ]);
@@ -1249,7 +1406,7 @@ export class CourierService {
     if (!shipment) {
       throw new NotFoundException({ code: ErrorCodes.SHIPMENT_NOT_FOUND, message: 'Pengiriman tidak ditemukan' });
     }
-    const amount = BigInt(dto.amountSen);
+    const amount = BigInt(dto.amount);
     // SYS-B-501: validasi terpusat — cap = costBase − refundedAmount.
     validateShippingRefundAmount(
       { costBase: shipment.actualCost ?? shipment.estimatedCost, refundedAmount: shipment.refundedAmount },

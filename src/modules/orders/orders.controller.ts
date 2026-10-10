@@ -205,7 +205,7 @@ export class OrdersController {
     @Param('orderId', ParseIdPipe) orderId: string,
     @Body() dto: ConfirmOrderDto,
   ): Promise<ConfirmOrderResult> {
-    return this.orderStateService.handleConfirmAction(orderId, userId, dto.action, dto.reason);
+    return this.orderStateService.handleConfirmAction(orderId, userId, dto.action, dto.reason, dto.shippingAddressId);
   }
 
   @UseGuards(UserThrottleGuard, WalletKillSwitchGuard)

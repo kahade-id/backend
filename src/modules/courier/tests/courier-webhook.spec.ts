@@ -47,6 +47,8 @@ describe('CourierService — webhook (G235/G237/G250)', () => {
       shipment: { findFirst: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
       shipmentEvent: { create: jest.fn() },
       courierWebhookLog: { create: jest.fn(), findFirst: jest.fn() },
+      // A05: resolusi orderId publik untuk notifikasi.
+      order: { findUnique: jest.fn().mockResolvedValue({ orderId: 'ORD-20261010-001' }) },
     };
     courierConfig = {
       getProviderConfig: jest.fn().mockReturnValue({ code: 'mock', hmacSecretRef: 'MOCK_HMAC' }),

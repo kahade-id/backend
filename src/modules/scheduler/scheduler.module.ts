@@ -50,6 +50,7 @@ import {
   DanaPaymentReconcileService,
   DisbursementAttentionSweepService,
   MilestoneAutoReleaseService,
+  CourierTrackingSweepService,
 } from './services';
 import { AdminFinanceModule } from '../admin/finance/admin-finance.module';
 import { WithdrawalsModule } from '../withdrawals/withdrawals.module';
@@ -87,9 +88,11 @@ import { MilestonesModule } from '../milestones/milestones.module';
 // eligibilitas di dalam transaksi purge. forwardRef mengikuti pola
 // AuthModule (hindari siklus UsersModule <-> SchedulerModule).
 import { UsersModule } from '../users/users.module';
+// Audit alamat & kurir A03 (2026-10-10): sweep tracking butuh CourierService.
+import { CourierModule } from '../courier/courier.module';
 
 @Module({
-  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, AdminShowcaseReportsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, NoWalletModule, WalletModeModule, AuditLogModule, UploadModule, AdminFeedbackModule, MilestonesModule, forwardRef(() => UsersModule)],
+  imports: [PrismaModule, RedisModule, ReferralModule, ConfigModule, AdminFinanceModule, OrdersModule, WithdrawalsModule, AdminShowcaseReportsModule, QueueModule, PaymentModule, WalletModule, VerificationBadgeModule, NoWalletModule, WalletModeModule, AuditLogModule, UploadModule, AdminFeedbackModule, MilestonesModule, forwardRef(() => UsersModule), CourierModule],
   providers: [
     WalletDailyResetService,
     DataCleanupService,
@@ -132,6 +135,7 @@ import { UsersModule } from '../users/users.module';
     DanaPaymentReconcileService, // SYS-B-305b: reconcile payment DANA PENDING via getPaymentDetail
     DisbursementAttentionSweepService, // SYS-B-306: alert HELD_NO_BANK/NEEDS_REVIEW
     MilestoneAutoReleaseService, // SYS-B-307: auto-release tahap ACCEPTED >7 hari
+    CourierTrackingSweepService, // Audit alamat & kurir A03/A04: pull tracking + alert macet
     FeedbackGuestContactRedactionService,
     MilestoneReminderService, // GAP-C (G182)
     ModerationSlaService, // GAP-F (G419/G423): terdaftar sebagai provider agar cron SLA moderasi berjalan

@@ -604,7 +604,11 @@ export class OrderLinksService {
       title: 'Order Link Accepted',
       body: `Your order link "${link.title}" has been accepted. A new order has been created.`,
       pushData: { type: 'ORDER_NEW', orderId: result.order.orderId },
-      actionUrl: `/o/${result.order.orderId}`,
+      // K10 (audit 2026-10-10): `/o/<x>` = deeplink TOKEN tautan order
+      // (kahade.id/o/<token>, FE app/o/[token].tsx) — bukan detail order.
+      // Notifikasi ini merujuk order yang sudah lahir → pakai `/order/<orderId>`
+      // (konvensi push.service deriveActionUrl).
+      actionUrl: `/order/${result.order.orderId}`,
     }).catch((error: unknown) => this.logger.warn(`ACCEPT_LINK notification failed: ${error instanceof Error ? error.message : String(error)}`));
 
     return {

@@ -129,6 +129,9 @@ export const CHAT_EXPORT_MAX_MESSAGES = 5000;
 export const CHAT_POLL_MIN_OPTIONS = 2;
 export const CHAT_POLL_MAX_OPTIONS = 10;
 export const CHAT_POLL_QUESTION_MAX_LENGTH = 300;
+// Perf 2026-10-10: safety cap daftar polling per room — listPolls mengambil
+// seluruh baris + serialize per item; tanpa cap satu room bisa membludak.
+export const CHAT_LIST_POLLS_MAX = 100;
 // Batch 43 BE-CHAT: template balasan "/" — maks 50 template per user.
 export const CHAT_MAX_REPLY_TEMPLATES_PER_USER = 50;
 // Audit 2026-10-03 (BFE-002): satu angka batas ukuran lampiran chat — dipakai

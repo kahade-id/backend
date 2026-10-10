@@ -30,6 +30,7 @@ import {
   CHAT_POLL_MIN_OPTIONS,
   CHAT_POLL_MAX_OPTIONS,
   CHAT_POLL_QUESTION_MAX_LENGTH,
+  CHAT_LIST_POLLS_MAX,
   CHAT_MAX_REPLY_TEMPLATES_PER_USER,
   CHAT_INQUIRY_MAX_ACTIVE_PER_USER,
   CHAT_MAX_PINNED_PER_ROOM,
@@ -3618,12 +3619,17 @@ export class ChatService implements OnModuleInit {
 
   async listPolls(userId: string, roomId: string): Promise<object> {
     await this.validateRoomAccess(userId, roomId);
+    // Perf 2026-10-10: SATU query dengan POLL_MESSAGE_SELECT lalu serialize
+    // langsung via serializePollView — sebelumnya N+1 (findUnique per poll
+    // lewat serializePoll). Bentuk payload identik dengan sebelumnya; take =
+    // safety cap agar room dengan polling tak terbatas tidak membludak.
     const polls = await this.prisma.chatPoll.findMany({
       where: { roomId },
-      orderBy: { createdAt: 'desc' },
-      select: { id: true },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: CHAT_LIST_POLLS_MAX,
+      select: POLL_MESSAGE_SELECT,
     });
-    const items = await Promise.all(polls.map((p) => this.serializePoll(p.id, userId)));
+    const items = polls.map((p) => serializePollView(p as unknown as RawPoll, userId));
     return { roomId, polls: items };
   }
 

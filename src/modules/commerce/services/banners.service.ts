@@ -1,9 +1,15 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
+import { RedisService } from '../../../redis/redis.service';
 import { Prisma } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { CreateBannerDto, UpdateBannerDto } from '../dto/commerce.dto';
+
+// Perf 2026-10-10: TTL cache daftar banner aktif publik (lihat getActiveBanners).
+const ACTIVE_BANNERS_CACHE_TTL_SECONDS = 300; // 5 menit
+const activeBannersCacheKey = (position?: string) =>
+  `banners:active:${(position ?? 'all').trim().toLowerCase() || 'all'}`;
 
 /**
  * BE-COMMERCE (2026-10-01) — item 15: banner/carousel promo.
@@ -11,11 +17,24 @@ import { CreateBannerDto, UpdateBannerDto } from '../dto/commerce.dto';
  */
 @Injectable()
 export class BannersService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private redis: RedisService,
+  ) {}
+
+  private async invalidateActiveBannersCache(): Promise<void> {
+    // Posisi banner bebas (string admin) — hapus semua varian key sekaligus.
+    try {
+      await this.redis.delPattern('banners:active:*');
+    } catch {
+      // Kegagalan invalidasi cache tidak boleh menggagalkan mutasi admin;
+      // TTL 5 menit tetap membatasi staleness.
+    }
+  }
 
   async createBanner(adminId: string, dto: CreateBannerDto) {
     this.validateRange(dto.startsAt, dto.endsAt);
-    return this.prisma.banner.create({
+    const created = await this.prisma.banner.create({
       data: {
         title: dto.title.trim(),
         imageUrl: dto.imageUrl,
@@ -31,6 +50,8 @@ export class BannersService {
         createdBy: adminId,
       },
     });
+    await this.invalidateActiveBannersCache();
+    return created;
   }
 
   async listAdminBanners(
@@ -62,7 +83,7 @@ export class BannersService {
     const startsAt = dto.startsAt !== undefined ? (dto.startsAt ? new Date(dto.startsAt) : null) : existing.startsAt;
     const endsAt = dto.endsAt !== undefined ? (dto.endsAt ? new Date(dto.endsAt) : null) : existing.endsAt;
     this.validateRange(startsAt?.toISOString(), endsAt?.toISOString());
-    return this.prisma.banner.update({
+    const updated = await this.prisma.banner.update({
       where: { id },
       data: {
         ...(dto.title !== undefined ? { title: dto.title.trim() } : {}),
@@ -75,17 +96,37 @@ export class BannersService {
         endsAt,
       },
     });
+    await this.invalidateActiveBannersCache();
+    return updated;
   }
 
   async deleteBanner(id: string) {
     const existing = await this.prisma.banner.findUnique({ where: { id }, select: { id: true } });
     if (!existing) throw new NotFoundException({ code: ErrorCodes.BANNER_NOT_FOUND, message: 'Banner tidak ditemukan' });
     await this.prisma.banner.delete({ where: { id } });
+    await this.invalidateActiveBannersCache();
     return { id };
   }
 
   /** GET /v1/banners/active — publik: banner aktif dalam rentang tayang. */
   async getActiveBanners(position?: string) {
+    // Perf 2026-10-10: di-cache 5 menit di Redis (pola public.service.ts —
+    // Redis gagal = fall through ke DB). Banner diubah admin sesekali;
+    // mutasi CRUD meng-invalidate via delPattern di atas.
+    const cacheKey = activeBannersCacheKey(position);
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) {
+        try {
+          return JSON.parse(cached) as Array<Record<string, unknown>>;
+        } catch {
+          // Cache korup — hitung ulang dari DB.
+        }
+      }
+    } catch {
+      // Redis hanya optimisasi untuk path baca publik ini; lanjut ke DB.
+    }
+
     const now = new Date();
     const where: Prisma.BannerWhereInput = {
       isActive: true,
@@ -95,11 +136,18 @@ export class BannersService {
       ],
       ...(position ? { position } : {}),
     };
-    return this.prisma.banner.findMany({
+    const rows = await this.prisma.banner.findMany({
       where,
       orderBy: [{ sortOrder: 'asc' }, { createdAt: 'desc' }],
       select: { id: true, title: true, imageUrl: true, linkUrl: true, position: true, sortOrder: true },
     });
+
+    try {
+      await this.redis.setex(cacheKey, ACTIVE_BANNERS_CACHE_TTL_SECONDS, JSON.stringify(rows));
+    } catch {
+      // Kegagalan tulis cache tidak boleh mengubah response publik yang sukses.
+    }
+    return rows;
   }
 
   private validateRange(startsAt?: string | null, endsAt?: string | null): void {

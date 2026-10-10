@@ -2,10 +2,19 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { NotFoundException } from '@nestjs/common';
 import { HelpCenterService } from '../help-center.service';
 import { PrismaService } from '../../../prisma/prisma.service';
+import { RedisService } from '../../../redis/redis.service';
 
 const mockPrisma = {
   faqCategory: { findMany: jest.fn(), findFirst: jest.fn(), create: jest.fn(), update: jest.fn(), delete: jest.fn() },
   faqItem: { findMany: jest.fn(), findFirst: jest.fn(), findUnique: jest.fn(), update: jest.fn(), create: jest.fn(), delete: jest.fn() },
+};
+
+// Cache Redis di-mock mati — service harus fall through ke DB (pola public.service.ts).
+const mockRedis = {
+  get: jest.fn().mockResolvedValue(null),
+  setex: jest.fn().mockResolvedValue(undefined),
+  del: jest.fn().mockResolvedValue(undefined),
+  delPattern: jest.fn().mockResolvedValue(undefined),
 };
 
 describe('HelpCenterService', () => {
@@ -13,10 +22,15 @@ describe('HelpCenterService', () => {
 
   beforeEach(async () => {
     jest.resetAllMocks();
+    // Redis di-mock mati agar test menempuh jalur DB (fall-through).
+    mockRedis.get.mockResolvedValue(null);
+    mockRedis.setex.mockResolvedValue(undefined);
+    mockRedis.delPattern.mockResolvedValue(undefined);
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         HelpCenterService,
         { provide: PrismaService, useValue: mockPrisma },
+        { provide: RedisService, useValue: mockRedis },
       ],
     }).compile();
     service = module.get<HelpCenterService>(HelpCenterService);
@@ -55,6 +69,31 @@ describe('HelpCenterService', () => {
       }]);
       const result = await service.getCategories('en');
       expect(result[0].name).toBe('Umum');
+    });
+
+    it('writes result to Redis cache on DB hit', async () => {
+      mockPrisma.faqCategory.findMany.mockResolvedValue([]);
+      await service.getCategories('id');
+      expect(mockRedis.setex).toHaveBeenCalledWith(
+        'help-center:categories:id',
+        300,
+        expect.any(String),
+      );
+    });
+
+    it('cache-hit: returns cached payload without touching DB', async () => {
+      const cached = [{ id: 'c1', slug: 'general', name: 'Umum', items: [] }];
+      mockRedis.get.mockResolvedValueOnce(JSON.stringify(cached));
+      const result = await service.getCategories('id');
+      expect(result).toEqual(cached);
+      expect(mockPrisma.faqCategory.findMany).not.toHaveBeenCalled();
+    });
+
+    it('corrupt cache: falls through to DB', async () => {
+      mockRedis.get.mockResolvedValueOnce('{{{bukan-json');
+      mockPrisma.faqCategory.findMany.mockResolvedValue([]);
+      await service.getCategories('id');
+      expect(mockPrisma.faqCategory.findMany).toHaveBeenCalled();
     });
   });
 

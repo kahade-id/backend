@@ -5590,6 +5590,9 @@ model CourierWebhookLog {
 
   @@index([providerCode, createdAt])
   @@index([idempotencyKey])
+  // Perf 2026-10-10: dedupe webhook kurir per request
+  // (courier.service.ts): WHERE providerCode = $1 AND idempotencyKey = $2.
+  @@index([providerCode, idempotencyKey])
   @@map("courier_webhook_logs")
 }
 
@@ -6121,6 +6124,9 @@ model ReportAssignment {
   createdAt       DateTime       @default(now())
 
   @@index([assigneeAdminId, slaDueAt])
+  // Perf 2026-10-10: lookup assignment per report (admin-showcase-reports):
+  // WHERE reportId IN (...) AND unassignedAt IS NULL.
+  @@index([reportId, unassignedAt])
   @@index([slaDueAt])
   @@map("report_assignments")
 }

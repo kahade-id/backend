@@ -1,18 +1,69 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
+import { RedisService } from '../../redis/redis.service';
 import { CreateFaqCategoryDto, UpdateFaqCategoryDto, CreateFaqItemDto, UpdateFaqItemDto } from './dto';
 import { escapeLikePattern } from '../../common/utils/search.util';
 
+// Perf 2026-10-10: TTL cache daftar FAQ publik (lihat getCategories).
+// viewCount di payload bisa tertinggal maks TTL — angka display-only,
+// trackView tetap menulis ke DB.
+const FAQ_CATEGORIES_CACHE_TTL_SECONDS = 300; // 5 menit
+const faqCategoriesCacheKey = (lang: 'id' | 'en') => `help-center:categories:${lang}`;
+
+/** Bentuk payload getCategories — dipakai juga untuk cast hasil cache JSON. */
+export type FaqCategoryView = {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  icon: string | null;
+  items: Array<{
+    id: string;
+    question: string;
+    answer: string;
+    viewCount: number;
+  }>;
+};
+
 @Injectable()
 export class HelpCenterService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private redis: RedisService,
+  ) {}
 
   private normalizeLanguage(lang: string): 'id' | 'en' {
     return lang.trim().toLowerCase() === 'en' ? 'en' : 'id';
   }
 
-  async getCategories(lang: string = 'id') {
+  private async invalidateFaqCache(): Promise<void> {
+    try {
+      await this.redis.delPattern('help-center:categories:*');
+    } catch {
+      // Kegagalan invalidasi cache tidak boleh menggagalkan mutasi admin;
+      // TTL 5 menit tetap membatasi staleness.
+    }
+  }
+
+  async getCategories(lang: string = 'id'): Promise<FaqCategoryView[]> {
     const language = this.normalizeLanguage(lang);
+    // Perf 2026-10-10: di-cache 5 menit di Redis (pola public.service.ts —
+    // Redis gagal = fall through ke DB). FAQ diubah admin sesekali; mutasi
+    // admin meng-invalidate via invalidateFaqCache di bawah.
+    const cacheKey = faqCategoriesCacheKey(language);
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) {
+        try {
+          return JSON.parse(cached) as FaqCategoryView[];
+        } catch {
+          // Cache korup — hitung ulang dari DB.
+        }
+      }
+    } catch {
+      // Redis hanya optimisasi untuk path baca publik ini; lanjut ke DB.
+    }
+
     const categories = await this.prisma.faqCategory.findMany({
       where: { isActive: true },
       orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
@@ -24,7 +75,7 @@ export class HelpCenterService {
       },
     });
 
-    return categories.map((cat) => ({
+    const result: FaqCategoryView[] = categories.map((cat) => ({
       id: cat.id,
       slug: cat.slug,
       name: language === 'en' && cat.nameEn ? cat.nameEn : cat.name,
@@ -37,6 +88,13 @@ export class HelpCenterService {
         viewCount: item.viewCount,
       })),
     }));
+
+    try {
+      await this.redis.setex(cacheKey, FAQ_CATEGORIES_CACHE_TTL_SECONDS, JSON.stringify(result));
+    } catch {
+      // Kegagalan tulis cache tidak boleh mengubah response publik yang sukses.
+    }
+    return result;
   }
 
   async getCategoryBySlug(slug: string, lang: string = 'id') {
@@ -126,28 +184,38 @@ export class HelpCenterService {
   }
 
   async adminCreateCategory(dto: CreateFaqCategoryDto) {
-    return this.prisma.faqCategory.create({ data: dto });
+    const created = await this.prisma.faqCategory.create({ data: dto });
+    await this.invalidateFaqCache();
+    return created;
   }
 
   async adminUpdateCategory(id: string, dto: UpdateFaqCategoryDto) {
-    return this.prisma.faqCategory.update({ where: { id }, data: dto });
+    const updated = await this.prisma.faqCategory.update({ where: { id }, data: dto });
+    await this.invalidateFaqCache();
+    return updated;
   }
 
   async adminDeleteCategory(id: string) {
     await this.prisma.faqCategory.delete({ where: { id } });
+    await this.invalidateFaqCache();
     return { message: 'Category deleted' };
   }
 
   async adminCreateItem(dto: CreateFaqItemDto) {
-    return this.prisma.faqItem.create({ data: dto });
+    const created = await this.prisma.faqItem.create({ data: dto });
+    await this.invalidateFaqCache();
+    return created;
   }
 
   async adminUpdateItem(id: string, dto: UpdateFaqItemDto) {
-    return this.prisma.faqItem.update({ where: { id }, data: dto });
+    const updated = await this.prisma.faqItem.update({ where: { id }, data: dto });
+    await this.invalidateFaqCache();
+    return updated;
   }
 
   async adminDeleteItem(id: string) {
     await this.prisma.faqItem.delete({ where: { id } });
+    await this.invalidateFaqCache();
     return { message: 'FAQ item deleted' };
   }
 

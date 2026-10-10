@@ -5,6 +5,7 @@ import { PrismaService } from '../../../prisma/prisma.service';
 import { RedisService } from '../../../redis/redis.service';
 import { cronJitter } from '../../../common/utils/cron-jitter.util';
 import { alertMoneyCronSkippedRedisDown, ensureRedisAvailable } from '../../../common/utils/redis-health.util';
+import { isCronJobDisabled } from '../../../common/utils/cron-gate.util';
 import { safeErrorMessage } from '../../../common/utils/background-reliability.util';
 import { toIdr } from '../../../common/utils/currency.util';
 import { alertAdminsOnMoneyAnomaly } from '../common/money-alert.util';
@@ -47,6 +48,7 @@ export class DisputeSettlementSweepService {
   // refund-reconciliation :35, dana-refund-retry :50).
   @Cron('25 * * * *', { name: 'dispute-settlement-sweep' })
   async sweepStaleSettlementIntents(): Promise<void> {
+    if (isCronJobDisabled('dispute-settlement-sweep')) return; // K8 feature-flag
     await cronJitter(20_000);
     if (!(await ensureRedisAvailable(this.redis, 'dispute-settlement-sweep', {
         // Job kritis-uang — skip karena Redis down harus termonitor, bukan senyap.

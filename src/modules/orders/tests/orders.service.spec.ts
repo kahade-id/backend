@@ -1501,20 +1501,42 @@ describe('OrdersService', () => {
       );
     });
 
-    it('should return fee without voucher discount when voucher not found', async () => {
+    // Audit voucher 2026-10-10 (B09): preview tidak lagi mengabaikan voucher
+    // yang tidak ada / kedaluwarsa — kode error sama dengan create order.
+    it('should throw NotFoundException when voucher not found during fee calculation (B09)', async () => {
       mockPrisma.user.findUnique.mockResolvedValue(mockUser);
       mockPrisma.voucher.findFirst.mockResolvedValue(null);
 
-      const result = await service.calculateFee(
-        { orderValue: 100_000, feeResponsibility: FeeResponsibility.BUYER, voucherCode: 'NOTEXIST' },
-        'user-db-1',
-      );
+      await expect(
+        service.calculateFee(
+          { orderValue: 100_000, feeResponsibility: FeeResponsibility.BUYER, voucherCode: 'NOTEXIST' },
+          'user-db-1',
+        ),
+      ).rejects.toThrow(NotFoundException);
+      expect(mockFeeCalculator.calculateFee).not.toHaveBeenCalled();
+    });
 
-      expect(result).toHaveProperty('feeRate');
-      expect(mockFeeCalculator.calculateFee).toHaveBeenCalledWith(
-        expect.objectContaining({ voucherDiscountSen: BigInt(0) }),
-        expect.objectContaining({ kahadeFeeRateBps: expect.any(Number) }),
-      );
+    it('should throw VOUCHER_EXPIRED when voucher is inactive or expired during fee calculation (B09)', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(mockUser);
+      mockPrisma.voucher.findFirst.mockResolvedValue({
+        id: 'voucher-1',
+        isActive: true,
+        voucherType: 'FEE_DISCOUNT_PERCENT',
+        discountPercent: 50,
+        discountAmount: null,
+        maxUsageTotal: null,
+        currentUsage: 0,
+        maxUsagePerUser: null,
+        validFrom: new Date(0),
+        validUntil: new Date(Date.now() - 1000),
+      });
+
+      await expect(
+        service.calculateFee(
+          { orderValue: 100_000, feeResponsibility: FeeResponsibility.BUYER, voucherCode: 'OLD' },
+          'user-db-1',
+        ),
+      ).rejects.toMatchObject({ response: { code: 'VOUCHER_EXPIRED' } });
     });
   });
 

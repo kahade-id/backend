@@ -985,6 +985,8 @@ export class OrderStateService {
     // (900 dtk) harus diinvalidasi setelah commit.
     if (referralRewardCredited) {
       await this.referralService.invalidateLeaderboardCache();
+      // B13: beri tahu penerima reward (post-commit, best-effort).
+      await this.referralService.notifyRewardsForOrder(orderId);
     }
 
     // M4 no-wallet: eksekusi payout cashback DANA post-commit (idempoten,

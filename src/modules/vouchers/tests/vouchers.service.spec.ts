@@ -34,11 +34,14 @@ const mockPrisma = {
     findUnique: jest.fn(),
     findMany: jest.fn(),
     count: jest.fn(),
+    // Field reference Prisma (B02) — nilai apa pun cukup untuk unit test.
+    fields: { maxUsageTotal: 'maxUsageTotal' },
   },
   voucherUsage: {
     count: jest.fn(),
     create: jest.fn(),
     findMany: jest.fn(),
+    groupBy: jest.fn().mockResolvedValue([]),
   },
   user: {
     findUnique: jest.fn(),
@@ -394,6 +397,40 @@ describe('VouchersService regression coverage', () => {
     mockPrisma.voucher.count.mockResolvedValueOnce(1);
     await service.getAvailableVouchers('user-1', 1, 20);
     expect(mockRedis.setex.mock.calls[0]?.[1]).toBeLessThanOrEqual(3);
+  });
+
+  // Audit voucher 2026-10-10 — B01/B02/B03/B05/B06/B07.
+  it('B01/B02/B03: available list excludes seller vouchers, exhausted quota, and single-use vouchers already redeemed by the user', async () => {
+    mockPrisma.voucher.findMany.mockResolvedValueOnce([]);
+    mockPrisma.voucher.count.mockResolvedValueOnce(0);
+    await service.getAvailableVouchers('user-1', 1, 20);
+    const where = mockPrisma.voucher.findMany.mock.calls[0][0].where;
+    expect(where.sellerId).toBeNull();
+    expect(where.AND).toEqual(expect.arrayContaining([
+      { OR: [{ maxUsageTotal: null }, { currentUsage: { lt: 'maxUsageTotal' } }] },
+      { OR: [{ maxUsagePerUser: { gt: 1 } }, { usages: { none: { userId: 'user-1' } } }] },
+    ]));
+  });
+
+  it('B03: available list reports usedCount/remainingUses per user', async () => {
+    mockPrisma.voucher.findMany.mockResolvedValueOnce([makeVoucher({ id: 'v-1', maxUsagePerUser: 3 })]);
+    mockPrisma.voucher.count.mockResolvedValueOnce(1);
+    mockPrisma.voucherUsage.groupBy.mockResolvedValueOnce([{ voucherId: 'v-1', _count: { _all: 2 } }]);
+    const result = await service.getAvailableVouchers('user-1', 1, 20);
+    expect(result.data[0]).toMatchObject({ usedCount: 2, remainingUses: 1 });
+  });
+
+  it('B05: pure preview (no order value, no role) accepts a BUYER_ONLY voucher and reports applicableTo', async () => {
+    mockPrisma.voucher.findUnique.mockResolvedValueOnce(makeVoucher({ applicableTo: VoucherApplicability.BUYER_ONLY }));
+    mockPrisma.voucherUsage.count.mockResolvedValueOnce(0);
+    const result = await service.validateVoucher('user-1', 'SAVE10');
+    expect(result).toMatchObject({ valid: true, applicableTo: VoucherApplicability.BUYER_ONLY });
+    expect(result.validUntil).toBeInstanceOf(Date);
+  });
+
+  it('B06: platform validate rejects a seller voucher', async () => {
+    mockPrisma.voucher.findUnique.mockResolvedValueOnce(makeVoucher({ sellerId: 'seller-1' }));
+    await expect(service.validateVoucher('user-1', 'SAVE10', 100_000)).rejects.toThrow(BadRequestException);
   });
 
   it('normalizes direct-service page and limit values for usage history', async () => {

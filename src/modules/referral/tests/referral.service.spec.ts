@@ -112,6 +112,8 @@ describe('ReferralService', () => {
         const txClient = {
           referralCode: { findUnique: jest.fn(), updateMany: jest.fn() },
           referralRelation: { findUnique: jest.fn(), findFirst: jest.fn(), create: jest.fn() },
+          // B19: pemohon default = akun baru (belum pernah bertransaksi).
+          user: { findUnique: jest.fn().mockResolvedValue({ totalOrdersCompleted: 0 }) },
           ...txOverrides,
         };
         return cb(txClient);
@@ -194,7 +196,9 @@ describe('ReferralService', () => {
         orderBy: [{ totalRewardEarned: 'desc' }, { totalReferrals: 'desc' }, { id: 'asc' }],
         take: 10,
       }));
-      expect(result[0]).toMatchObject({ code: 'KHLEADER1', totalRewardEarned: 150_000, successfulReferrals: 3 });
+      expect(result[0]).toMatchObject({ totalRewardEarned: 150_000, successfulReferrals: 3 });
+      // B15: kode referral user lain tidak diekspos.
+      expect(result[0]).not.toHaveProperty('code');
       expect(mockRedis.setex).toHaveBeenCalledWith(expect.stringContaining('referral'), expect.any(Number), expect.any(String));
     });
   });
@@ -317,6 +321,7 @@ describe('ReferralService', () => {
             findFirst: jest.fn().mockResolvedValue(null),
             create,
           },
+          user: { findUnique: jest.fn().mockResolvedValue({ totalOrdersCompleted: 0 }) },
         }),
       );
 
@@ -336,6 +341,23 @@ describe('ReferralService', () => {
           where: expect.objectContaining({ totalReferrals: { lt: 1000 } }),
         }),
       );
+      expect(create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('applyCode — B19 akun baru saja', () => {
+    it('rejects REFERRAL_NOT_NEW_USER when the applicant already completed an order', async () => {
+      const create = jest.fn();
+      mockPrisma.$transaction.mockImplementation(async (cb: (tx: unknown) => Promise<unknown>) =>
+        cb({
+          referralCode: { findUnique: jest.fn().mockResolvedValue(mockReferralCode), updateMany: jest.fn() },
+          referralRelation: { findUnique: jest.fn().mockResolvedValue(null), findFirst: jest.fn(), create },
+          user: { findUnique: jest.fn().mockResolvedValue({ totalOrdersCompleted: 1 }) },
+        }),
+      );
+      await expect(service.applyCode('user-1', 'REFABC123')).rejects.toMatchObject({
+        response: { code: 'REFERRAL_NOT_NEW_USER' },
+      });
       expect(create).not.toHaveBeenCalled();
     });
   });
@@ -386,6 +408,32 @@ describe('ReferralService', () => {
           code: 'REFERRAL_ALREADY_APPLIED',
         });
       }
+    });
+  });
+
+  describe('createReferralRewardIfEligible — B12 self-dealing guard', () => {
+    it('skips the reward when the order counterpart is the referrer', async () => {
+      const mockTx: MockTransactionClient = {
+        referralRelation: {
+          findUnique: jest.fn().mockResolvedValue({ id: 'rel-1', referrerId: 'user-2', refereeId: 'user-1', isRewardActive: false }),
+          update: jest.fn(),
+        },
+        order: {
+          findUnique: jest.fn().mockResolvedValue({ status: 'COMPLETED', buyerId: 'user-1', sellerId: 'user-2' }),
+          count: jest.fn().mockResolvedValue(1),
+        },
+        user: { findUnique: jest.fn().mockResolvedValue({ kycStatus: 'APPROVED', membershipRank: MembershipRank.BRONZE }) },
+        referralReward: { findFirst: jest.fn().mockResolvedValue(null), create: jest.fn(), update: jest.fn() },
+        wallet: { count: jest.fn().mockResolvedValue(2) },
+        walletTransaction: { create: jest.fn() },
+        referralCode: { updateMany: jest.fn() },
+      };
+
+      const credited = await service.createReferralRewardIfEligible('user-1', BigInt(250_000), 'order-1', mockTx as unknown as Prisma.TransactionClient);
+
+      expect(credited).toBe(false);
+      expect(mockTx.referralReward!.create).not.toHaveBeenCalled();
+      expect(mockTx.referralRelation!.update).not.toHaveBeenCalled();
     });
   });
 

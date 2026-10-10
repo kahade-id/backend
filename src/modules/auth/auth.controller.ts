@@ -897,7 +897,8 @@ export class AuthController {
     @Body() body: RefreshTokenDto,
     @Res({ passthrough: true }) res: Response,
   ): Promise<{ accessToken: string; refreshToken?: string }> {
-    const refreshToken = req.cookies?.kahade_refresh_token || body?.refreshToken;
+    const cookieToken = req.cookies?.kahade_refresh_token as string | undefined;
+    const refreshToken = cookieToken || body?.refreshToken;
     if (!refreshToken) {
       this.clearAuthCookies(res);
       throw new UnauthorizedException({
@@ -910,7 +911,11 @@ export class AuthController {
       // AUT-006: teruskan deviceId peminta (bila dikirim di body) agar
       // binding perangkat refresh token dapat ditegakkan. Alur web-cookie
       // (body kosong) tetap jalan via klaim JWT + baris sesi.
-      result = await this.authService.refreshToken(refreshToken, body?.deviceId);
+      // #BE-02: sumber token diteruskan — token dari body (mobile) dengan
+      // klaim deviceId WAJIB menyertakan deviceId peminta.
+      result = await this.authService.refreshToken(refreshToken, body?.deviceId, {
+        source: cookieToken ? 'cookie' : 'body',
+      });
     } catch (error) {
       // A rejected refresh must not leave a browser repeatedly sending an invalid,
       // expired, or revoked HTTP-only token cookie on each subsequent request.

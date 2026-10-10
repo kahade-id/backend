@@ -91,6 +91,12 @@ void bcryptHash(_cryptoRandomBytes(32).toString('hex'), getBcryptRounds()).then(
 const DUMMY_BCRYPT_HASH_FALLBACK = '$2b$12$K4GH.2PFn0b3bVkYe3klq.ScFT2MXqHWMzIxB/yLc8A7EEpzlJxHy';
 
 const TWO_FA_MAX_ATTEMPTS = 5;
+/**
+ * Audit Auth 2026-10-10 (#BE-01): jendela toleransi replay refresh token
+ * setelah rotasi. Dalam jendela ini token lama ditolak TANPA mencabut semua
+ * sesi (balapan rotasi sah / respons hilang); di luar jendela = reuse → cabut.
+ */
+const REFRESH_ROTATION_GRACE_MS = 30 * 1000;
 
 
 interface LoginUserPayload {
@@ -2822,7 +2828,11 @@ export class AuthService {
     return _timingSafeEqual(a, b);
   }
 
-  async refreshToken(refreshToken: string, requestDeviceId?: string): Promise<{ accessToken: string; refreshToken: string }> {
+  async refreshToken(
+    refreshToken: string,
+    requestDeviceId?: string,
+    opts?: { source?: 'cookie' | 'body' },
+  ): Promise<{ accessToken: string; refreshToken: string }> {
     let payload: RefreshTokenPayload;
     try {
       payload = this.tokenService.verifyRefreshToken(refreshToken);
@@ -2843,6 +2853,42 @@ export class AuthService {
     // token mentah, kirim notifikasi dugaan pencurian ke pemilik akun, dan
     // tetap tolak (fail-closed).
     if (!session) {
+      // Audit Auth 2026-10-10 (#BE-01): rotasi mengganti `jti` pada baris
+      // sesi yang SAMA, sehingga token lama yang di-replay selalu jatuh ke
+      // cabang ini — bukan ke cabang "hash tidak cocok" di bawah. Deteksi
+      // reuse sebelumnya mati: TOKEN_BLACKLIST(oldJti) ditulis saat rotasi
+      // tetapi tidak pernah dibaca. Kini: jti lama yang ada di blacklist =
+      // token yang SUDAH dirotasi dipakai lagi → asumsikan pencurian, cabut
+      // seluruh sesi pemilik + notifikasi reuse. Jendela toleransi singkat
+      // (REFRESH_ROTATION_GRACE_MS) menghindari logout massal pada balapan
+      // rotasi yang sah (respons rotasi hilang di jaringan, klien mengulang
+      // dengan token lama): dalam jendela itu hanya ditolak tanpa cabut.
+      const rotatedAtRaw = await this.redis
+        .get(TOKEN_BLACKLIST(payload.jti))
+        .catch(() => null);
+      if (rotatedAtRaw) {
+        const rotatedAt = Number(rotatedAtRaw);
+        const withinGrace =
+          Number.isFinite(rotatedAt) && Date.now() - rotatedAt < REFRESH_ROTATION_GRACE_MS;
+        if (!withinGrace) {
+          const revoked = await this.revokeAllUserSessions(payload.sub, 'token_reuse_detected');
+          this.logger.warn(
+            `[SECURITY] Refresh token yang sudah dirotasi dipakai ulang (userId=${payload.sub}). ` +
+              `${revoked} sesi dicabut.`,
+          );
+          this.notifyRefreshTokenReuse(payload.sub).catch(err => {
+            this.logger.error('[SECURITY] Failed to notify user about refresh token reuse', err);
+          });
+          throw new UnauthorizedException({
+            code: ErrorCodes.UNAUTHORIZED,
+            message: 'Invalid refresh token. All sessions revoked for security.',
+          });
+        }
+        throw new UnauthorizedException({
+          code: ErrorCodes.SESSION_REVOKED,
+          message: 'Session already refreshed. Please retry.',
+        });
+      }
       this.logger.warn(
         `[SECURITY] Refresh token bersignature valid tetapi jti tidak dikenal di DB ` +
           `(userId=${payload.sub}, jti=${payload.jti}). Dugaan pencurian/penyalahgunaan token — request ditolak.`,
@@ -2899,6 +2945,20 @@ export class AuthService {
           message: 'Invalid refresh token',
         });
       }
+      // Audit Auth 2026-10-10 (#BE-02): jalur "transisi" (tanpa deviceId di
+      // request) bisa dipakai untuk MELEWATI binding — cukup tidak mengirim
+      // deviceId. Bila token dikirim di body (mobile/klien non-cookie) dan
+      // token sudah ber-klaim deviceId (bukan token lama), deviceId request
+      // WAJIB ada. Alur cookie web tetap mengandalkan klaim JWT + baris sesi.
+      if (!requestDeviceId && opts?.source === 'body' && payload.deviceId) {
+        this.logger.warn(
+          `[SECURITY] Refresh ditolak: deviceId peminta tidak disertakan untuk sesi terikat ${session.id}.`,
+        );
+        throw new UnauthorizedException({
+          code: ErrorCodes.UNAUTHORIZED,
+          message: 'Invalid refresh token',
+        });
+      }
     }
 
     const incomingTokenHash = sha256(refreshToken);
@@ -2932,10 +2992,24 @@ export class AuthService {
     }
 
     const user = await this.prisma.user.findUnique({ where: { id: payload.sub } });
-    if (!user || !user.isActive || user.isBanned) {
+    // Audit Auth 2026-10-10 (#BE-08): akun yang sudah dihapus (soft delete)
+    // ikut ditolak — guard JWT menolaknya, refresh sebelumnya tidak.
+    if (!user || !user.isActive || user.isBanned || user.deletedAt) {
       throw new UnauthorizedException({
         code: ErrorCodes.UNAUTHORIZED,
         message: 'Invalid refresh token',
+      });
+    }
+    // Audit Auth 2026-10-10 (#BE-03): suspend ringan (Redis TTL) & lockout
+    // sebelumnya tidak diperiksa di refresh — akun yang ditangguhkan admin
+    // tetap bisa memperpanjang sesi sampai 7 hari. Login & OTP sudah menolak;
+    // refresh harus konsisten.
+    await this.assertNotSuspended(user.id);
+    if (user.lockedUntil && user.lockedUntil > new Date()) {
+      throw new UnauthorizedException({
+        code: ErrorCodes.ACCOUNT_LOCKED,
+        message: 'Account is temporarily locked due to too many failed attempts',
+        lockoutRemainingSeconds: Math.ceil((user.lockedUntil.getTime() - Date.now()) / 1000),
       });
     }
 
@@ -2961,7 +3035,11 @@ export class AuthService {
     const hashedRefreshToken = sha256(newRefreshToken);
 
     const refreshTtlSeconds = this.getRefreshTokenTtlSeconds();
-    await this.redis.setex(TOKEN_BLACKLIST(oldJti), refreshTtlSeconds, '1', { throwOnError: true });
+    // #BE-01: simpan waktu rotasi (bukan '1') — dibaca cabang `!session` di
+    // atas untuk membedakan balapan sah (dalam jendela) dari replay token.
+    await this.redis.setex(TOKEN_BLACKLIST(oldJti), refreshTtlSeconds, String(Date.now()), {
+      throwOnError: true,
+    });
 
     const updated = await this.prisma.userSession.updateMany({
       where: { jti: oldJti, isRevoked: false },
@@ -3012,6 +3090,11 @@ export class AuthService {
     const jwtTtlSeconds = this.getAccessTokenTtlSeconds();
     let revokedSessionIds: string[] = [];
 
+    // Audit Auth 2026-10-10 (#BE-07): logout server juga memutus push token
+    // perangkat yang keluar. Sebelumnya hanya klien yang memanggil
+    // `unregister-device` (best-effort); bila gagal (offline/crash), perangkat
+    // yang sudah logout tetap menerima pratinjau chat/notifikasi akun lama.
+    let pushDetachWhere: Prisma.UserDeviceWhereInput | null = null;
     if (logoutAll) {
       const logoutAllIds = await this.prisma.$transaction(
         async tx => {
@@ -3028,14 +3111,29 @@ export class AuthService {
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
       );
       revokedSessionIds = logoutAllIds;
+      pushDetachWhere = { userId };
     } else {
       if (sessionId) {
+        const current = await this.prisma.userSession.findFirst({
+          where: { id: sessionId, userId },
+          select: { deviceId: true },
+        });
         await this.prisma.userSession.updateMany({
           where: { id: sessionId, userId, isRevoked: false },
           data: { isRevoked: true, revokedAt: new Date(), revokedReason: 'logout' },
         });
         revokedSessionIds = [sessionId];
+        if (current?.deviceId) pushDetachWhere = { userId, deviceId: current.deviceId };
       }
+    }
+    if (pushDetachWhere) {
+      await this.prisma.userDevice
+        .updateMany({ where: { ...pushDetachWhere, pushToken: { not: null } }, data: { pushToken: null } })
+        .catch((err: unknown) => {
+          this.logger.warn(
+            `[AUTH] Logout: gagal memutus push token perangkat: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
     }
 
     // Session revocation in PostgreSQL is the durable security boundary. Redis
@@ -4265,6 +4363,13 @@ export class AuthService {
    * terhapus oleh eviksi/cleanup) — hanya menolak request + memberi tahu user.
    */
   private async notifyUnknownRefreshSession(userId: string): Promise<void> {
+    // Audit Auth 2026-10-10 (#BE-04): tanpa throttle, balapan refresh yang sah
+    // (sesi tereviksi lalu klien mencoba lagi) membanjiri pemilik dengan alert
+    // "mencurigakan" + email untuk app-nya sendiri. Satu alert per user per jam.
+    const deduped = await this.redis
+      .setNx(`unknown_refresh_notified:${userId}`, '1', 3600)
+      .catch(() => true);
+    if (!deduped) return;
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       select: { email: true },
@@ -4415,6 +4520,36 @@ export class AuthService {
   private extractBcryptRounds(hash: string): number {
     const match = hash.match(/^\$2[aby]?\$(\d+)\$/);
     return match ? parseInt(match[1], 10) : 0;
+  }
+
+  /**
+   * Audit Auth 2026-10-10: cabut SEMUA sesi aktif seorang user (DB = batas
+   * durable, Redis = propagasi cepat best-effort). Mengembalikan jumlah sesi.
+   */
+  private async revokeAllUserSessions(userId: string, revokedReason: string): Promise<number> {
+    const ids = await this.prisma.$transaction(
+      async tx => {
+        const sessions = await tx.userSession.findMany({
+          where: { userId, isRevoked: false },
+          select: { id: true },
+        });
+        if (sessions.length === 0) return [] as string[];
+        await tx.userSession.updateMany({
+          where: { userId, isRevoked: false },
+          data: { isRevoked: true, revokedAt: new Date(), revokedReason },
+        });
+        return sessions.map(s => s.id);
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
+    if (ids.length) {
+      await this.revokeSessionsInRedis(ids).catch((err: unknown) => {
+        this.logger.warn(
+          `[SECURITY] Sesi dicabut di DB tetapi propagasi Redis tidak tersedia: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+    return ids.length;
   }
 
   private async revokeSessionsInRedis(sessionIds: string[]): Promise<void> {

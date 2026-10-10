@@ -61,9 +61,18 @@ export class ProductCommerceService {
       }
     }
 
-    let originalPriceSen: bigint | undefined;
-    if (dto.originalPriceIdr !== undefined) {
-      const saleSen = row.priceMin ?? row.priceMax ?? null;
+    let originalPriceSen: bigint | null | undefined;
+    if (dto.originalPriceIdr === null) {
+      // Kontrak DTO: null = hapus harga coret. Dulu jatuh ke toSen(null) →
+      // RangeError 500 (audit etalase 2026-10-10).
+      originalPriceSen = null;
+    } else if (dto.originalPriceIdr !== undefined) {
+      // UserShowcase.priceMin/priceMax disimpan dalam IDR (BigInt), sedangkan
+      // originalPrice dalam SEN — bandingkan dalam satuan yang sama. Dulu
+      // dibandingkan mentah (sen vs IDR) sehingga harga coret Rp2.000 pada
+      // barang Rp150.000 lolos validasi (audit etalase 2026-10-10).
+      const saleIdr = row.priceMin ?? row.priceMax ?? null;
+      const saleSen = saleIdr === null ? null : toSen(Number(saleIdr));
       originalPriceSen = toSen(dto.originalPriceIdr);
       if (saleSen !== null && originalPriceSen <= saleSen) {
         throw new BadRequestException({

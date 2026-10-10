@@ -529,11 +529,22 @@ describe('ShowcaseService.getFeed — discover feed (cursor-based)', () => {
 
     it('derives DISKON from originalPrice without any extra query (D1-001)', async () => {
       mockPrisma.userShowcase.findMany.mockResolvedValue([
-        feedRow(1, { originalPrice: BigInt(200000) }),
+        // originalPrice dalam SEN (Rp200.000) vs priceMin IDR (Rp100.001).
+        feedRow(1, { originalPrice: BigInt(20000000) }),
       ]);
       const result = (await feed(service, undefined, {})) as any;
       expect(result.items[0].badges).toEqual(['DISKON']);
       expect(result.items[0].originalPrice).toBeUndefined();
+    });
+
+    it('satuan: harga coret di BAWAH harga jual tidak pernah jadi DISKON (audit etalase 2026-10-10)', async () => {
+      mockPrisma.userShowcase.findMany.mockResolvedValue([
+        // 200000 sen = Rp2.000 < priceMin Rp100.001 — dulu dibandingkan mentah
+        // (200000n > 100001n) sehingga badge DISKON muncul.
+        feedRow(1, { originalPrice: BigInt(200000) }),
+      ]);
+      const result = (await feed(service, undefined, {})) as any;
+      expect(result.items[0].badges).toEqual([]);
     });
 
     it('never leaks the internal owner id or private visibility flags', async () => {

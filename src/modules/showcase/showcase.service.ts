@@ -10,7 +10,7 @@ import * as ErrorCodes from '../../common/constants/error-codes';
 import { escapeLikePattern } from '../../common/utils/search.util';
 import { sanitizeShowcaseHtml } from '../../common/utils/sanitize-html.util';
 import { isBotUserAgent } from '../../common/utils/bot-detection.util';
-import { formatIdr } from '../../common/utils/currency.util';
+import { formatIdr, toIdr } from '../../common/utils/currency.util';
 import {
   ORDER_MAX_VALUE,
   ORDER_MIN_VALUE,
@@ -561,11 +561,16 @@ export class ShowcaseService {
     // diserialkan langsung di payload feed: TERLARIS dari SATU groupBy per
     // halaman (options.bestsellerIds), DISKON dari originalPriceValid yang
     // sudah dihitung di sini — N+1 badge hilang total.
+    // Satuan: priceMin/priceMax = IDR, originalPrice = SEN (ditulis
+    // ProductCommerceService via toSen). Bandingkan dalam sen — dulu mentah
+    // (sen vs IDR) sehingga badge DISKON muncul untuk harga coret di bawah
+    // harga jual (audit etalase 2026-10-10).
+    const salePriceIdr = row.priceMin ?? row.priceMax;
     const originalPriceValid =
       row.originalPrice != null &&
-      (priceMin ?? priceMax) != null &&
+      salePriceIdr != null &&
       row.originalPrice > BigInt(0) &&
-      row.originalPrice > (row.priceMin ?? row.priceMax)!;
+      row.originalPrice > salePriceIdr * 100n;
     const commerceBadges: string[] = [];
     if (options.bestsellerIds?.has(row.id)) commerceBadges.push('TERLARIS');
     if (originalPriceValid) commerceBadges.push('DISKON');
@@ -624,9 +629,23 @@ export class ShowcaseService {
         ? {}
         : {
             productType: row.productType ?? null,
+            // `originalPrice` dipertahankan apa adanya (SEN — kontrak lama
+            // PATCH /v1/commerce/products/:id). `originalPriceIdr` (BE-1,
+            // audit etalase 2026-10-10) = nilai IDR siap pakai, satuan sama
+            // dengan priceMin/priceMax. Additive-only.
             originalPrice: toNumber(row.originalPrice ?? null),
+            originalPriceIdr: row.originalPrice == null ? null : toIdr(row.originalPrice),
             originalPriceValid,
             serviceDeadlineDays: row.serviceDeadlineDays ?? null,
+            // BE-1: field commerce yang hanya relevan untuk editor pemilik —
+            // dulu cuma bisa dibaca dari respons PATCH, jadi editor Kelola
+            // Etalase memprefill default kosong dan menimpanya saat simpan.
+            ...(options.isOwner
+              ? {
+                  digitalDeliveryInfo: row.digitalDeliveryInfo ?? null,
+                  scheduledAt: row.scheduledAt ?? null,
+                }
+              : {}),
           }),
       likeCount: row.likeCount,
       commentCount: row.commentCount,

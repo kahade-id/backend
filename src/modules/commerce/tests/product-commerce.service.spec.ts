@@ -29,7 +29,9 @@ describe('ProductCommerceService', () => {
     const baseRow = {
       id: 's1',
       userId: 'u1',
-      priceMin: 10000000n, // Rp100.000 dalam sen
+      // UserShowcase.priceMin disimpan dalam IDR (BigInt), BUKAN sen —
+      // lihat ShowcaseService.createShowcaseItem (BigInt(dto.priceMin)).
+      priceMin: 100000n, // Rp100.000
       priceMax: null,
       productType: null,
       serviceDeadlineDays: null,
@@ -67,6 +69,23 @@ describe('ProductCommerceService', () => {
       await service.updateCommerceFields('u1', 's1', { originalPriceIdr: 150000 });
       expect(mockPrisma.userShowcase.update).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ originalPrice: 15000000n }) }),
+      );
+    });
+
+    it('satuan: harga coret Rp2.000 pada barang Rp100.000 DITOLAK (dulu lolos karena sen vs IDR)', async () => {
+      mockPrisma.userShowcase.findFirst.mockResolvedValue(baseRow);
+      await expect(
+        service.updateCommerceFields('u1', 's1', { originalPriceIdr: 2000 }),
+      ).rejects.toThrow('lebih besar dari harga jual');
+      expect(mockPrisma.userShowcase.update).not.toHaveBeenCalled();
+    });
+
+    it('null menghapus harga coret (bukan RangeError 500)', async () => {
+      mockPrisma.userShowcase.findFirst.mockResolvedValue({ ...baseRow, originalPrice: 15000000n });
+      mockPrisma.userShowcase.update.mockResolvedValue({ id: 's1', originalPrice: null });
+      await service.updateCommerceFields('u1', 's1', { originalPriceIdr: null } as any);
+      expect(mockPrisma.userShowcase.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ originalPrice: null }) }),
       );
     });
 

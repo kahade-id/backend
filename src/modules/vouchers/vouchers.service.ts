@@ -57,6 +57,11 @@ export class VouchersService {
       isActive: true,
       validFrom: { lte: now },
       validUntil: { gte: now },
+      // Audit voucher 2026-10-10 (B01): voucher TOKO (sellerId != null) hidup di
+      // tabel yang sama, tetapi hanya berlaku untuk order ke penjual itu dan
+      // divalidasi lewat /v1/seller-vouchers/validate. Tanpa filter ini voucher
+      // semua penjual tampil sebagai voucher platform untuk semua user.
+      sellerId: null,
       OR: [{ assignedToUserId: null }, { assignedToUserId: userId }],
       AND: [
         {
@@ -64,6 +69,20 @@ export class VouchersService {
             { campaignId: null },
             { campaign: { is: { status: { not: CampaignStatus.ENDED } } } },
           ],
+        },
+        // B02: kuota global habis bukan "tersedia" — bandingkan dua kolom lewat
+        // field reference Prisma (GA sejak 5.0).
+        {
+          OR: [
+            { maxUsageTotal: null },
+            { currentUsage: { lt: this.prisma.voucher.fields.maxUsageTotal } },
+          ],
+        },
+        // B03: voucher sekali-pakai (maxUsagePerUser = 1, default) yang sudah
+        // ditebus user ini tidak lagi "tersedia". Untuk batas > 1, sisa
+        // pemakaian dikirim sebagai `remainingUses` (lihat fetchVoucherPage).
+        {
+          OR: [{ maxUsagePerUser: { gt: 1 } }, { usages: { none: { userId } } }],
         },
       ],
     };
@@ -89,6 +108,7 @@ export class VouchersService {
     where: Prisma.VoucherWhereInput,
     page: number,
     limit: number,
+    userId: string,
   ): Promise<PaginatedResponse<Record<string, unknown>>> {
     const [vouchers, total] = await Promise.all([
       this.prisma.voucher.findMany({
@@ -100,9 +120,28 @@ export class VouchersService {
       }),
       this.prisma.voucher.count({ where }),
     ]);
+    // B03: pemakaian user ini per voucher di halaman ini — FE memakai
+    // `remainingUses` untuk badge Terpakai / menonaktifkan tombol Pakai.
+    const voucherIds = vouchers.map(v => v.id);
+    const usageRows = voucherIds.length > 0
+      ? await this.prisma.voucherUsage.groupBy({
+          by: ['voucherId'],
+          where: { userId, voucherId: { in: voucherIds } },
+          _count: { _all: true },
+        })
+      : [];
+    const usedByVoucher = new Map(usageRows.map(row => [row.voucherId, row._count._all]));
     const serialized = this.serializeVouchers(
       vouchers as unknown as Array<Record<string, unknown>>,
-    );
+    ).map(v => {
+      const usedCount = usedByVoucher.get(v.id as string) ?? 0;
+      const perUser = typeof v.maxUsagePerUser === 'number' ? v.maxUsagePerUser : null;
+      return {
+        ...v,
+        usedCount,
+        remainingUses: perUser === null ? null : Math.max(0, perUser - usedCount),
+      };
+    });
     return createPaginatedResponse(serialized, total, page, limit);
   }
 
@@ -131,9 +170,7 @@ export class VouchersService {
     // AUDIT-17: a completed-order user requesting BUYER_ONLY/SELLER_ONLY must keep that
     // filter AND drop NEW_USER-only vouchers. DORMANT_USER is also computed from completed
     // order history rather than trusting the display-only targetAudience field.
-    if (user.totalOrdersCompleted > 0 && applicableTo === VoucherApplicability.NEW_USER) {
-      return createPaginatedResponse([], 0, safePage, safeLimit);
-    }
+    // (B04: early-return NEW_USER sudah ditangani di atas — tidak diulang.)
     if (!isDormant && applicableTo === VoucherApplicability.DORMANT_USER) {
       return createPaginatedResponse([], 0, safePage, safeLimit);
     }
@@ -157,7 +194,7 @@ export class VouchersService {
         }
       }
 
-      const result = await this.fetchVoucherPage(where, safePage, safeLimit);
+      const result = await this.fetchVoucherPage(where, safePage, safeLimit, userId);
       const now = Date.now();
       const earliestExpiry = result.data.reduce<number | null>((earliest, item) => {
         const value =
@@ -175,7 +212,7 @@ export class VouchersService {
       return result;
     }
 
-    return this.fetchVoucherPage(where, safePage, safeLimit);
+    return this.fetchVoucherPage(where, safePage, safeLimit, userId);
   }
 
     async validateVoucher(
@@ -245,6 +282,16 @@ export class VouchersService {
         message: 'This voucher is assigned to a different user',
       });
     }
+    // B06: voucher toko hanya sah untuk order ke penjual pemiliknya — jalur
+    // platform tidak tahu penjualnya, jadi arahkan ke validasi voucher toko
+    // (POST /v1/seller-vouchers/validate) alih-alih menjawab "valid" lalu
+    // ditolak saat create order.
+    if (voucher.sellerId) {
+      throw new BadRequestException({
+        code: ErrorCodes.VOUCHER_NOT_APPLICABLE,
+        message: 'This is a seller voucher — apply it in the seller voucher field',
+      });
+    }
     if (orderValue != null && voucher.voucherType === VoucherType.TOPUP_BONUS) {
       throw new BadRequestException({
         code: ErrorCodes.VOUCHER_NOT_APPLICABLE,
@@ -298,7 +345,13 @@ export class VouchersService {
           });
         }
       } else if (voucher.applicableTo === 'BUYER_ONLY' || voucher.applicableTo === 'SELLER_ONLY') {
-        if (!userRole) {
+        // B05: pratinjau murni (halaman Promo: tanpa nilai order DAN tanpa peran)
+        // tidak punya konteks peran — jangan tolak; `applicableTo` ikut dikirim
+        // agar FE menampilkan syaratnya. Dengan nilai order (checkout) peran wajib.
+        const previewOnly = orderValue == null && !userRole;
+        if (previewOnly) {
+          // lewati cek peran
+        } else if (!userRole) {
           throw new BadRequestException({
             code: ErrorCodes.VOUCHER_NOT_APPLICABLE,
             message: `This voucher is only for ${voucher.applicableTo === 'BUYER_ONLY' ? 'buyers' : 'sellers'}. Please specify your role.`,
@@ -369,6 +422,9 @@ export class VouchersService {
       code: voucher.code,
       name: voucher.name,
       voucherType: voucher.voucherType,
+      // B07: syarat peran & masa berlaku untuk ditampilkan FE.
+      applicableTo: voucher.applicableTo,
+      validUntil: voucher.validUntil,
       discountAmount: feeDiscountAmount != null ? toIdr(feeDiscountAmount) : null,
       cashbackAmount: cashbackAmount != null ? toIdr(cashbackAmount) : null,
       topupBonusAmount: topupBonusAmount != null ? toIdr(topupBonusAmount) : null,

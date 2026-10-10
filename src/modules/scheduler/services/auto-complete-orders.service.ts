@@ -780,6 +780,8 @@ export class AutoCompleteDeliveredOrdersService {
             // leaderboard cache setelah tx commit.
             if (outcome.referralRewardCredited) {
               await this.referralService.invalidateLeaderboardCache();
+              // B13: beri tahu penerima reward (post-commit, best-effort).
+              await this.referralService.notifyRewardsForOrder(order.orderId);
             }
 
             // M4 no-wallet: eksekusi payout cashback DANA post-tx (idempoten).

@@ -157,6 +157,8 @@ export const DISPUTE_NOT_ACTIVE = 'DISPUTE_NOT_ACTIVE';
 export const REFERRAL_SELF = 'REFERRAL_SELF';
 export const REFERRAL_ALREADY_APPLIED = 'REFERRAL_ALREADY_APPLIED';
 export const REFERRAL_CODE_NOT_FOUND = 'REFERRAL_CODE_NOT_FOUND';
+// Audit referral 2026-10-10 (B19): kode referral hanya untuk akun yang belum pernah bertransaksi.
+export const REFERRAL_NOT_NEW_USER = 'REFERRAL_NOT_NEW_USER';
 
 // Subscriptions
 export const SUBSCRIPTION_ALREADY_ACTIVE = 'SUBSCRIPTION_ALREADY_ACTIVE';

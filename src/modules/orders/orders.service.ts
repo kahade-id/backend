@@ -14,6 +14,7 @@ import { ORDER_SERIAL, ORDER_AVG_DURATIONS_CACHE } from '../../common/constants/
 import { NotificationQueueService } from '../queue/notification-queue.service';
 import { SubscriptionsService } from '../subscriptions/subscriptions.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
+import { invalidateUserVoucherListCache } from '../../common/utils/voucher-cache.util';
 import { CONFIRMATION_DEADLINE_DAYS, KYC_THRESHOLD, CONFIRMATION_DEADLINE_DAYS_MAP, ORDER_MIN_VALUE, ORDER_MAX_VALUE, DELIVERY_DEADLINE_DAYS_MIN, DELIVERY_DEADLINE_DAYS_MAX, POST_COMPLETION_DISPUTE_WINDOW_HOURS, RATING_WINDOW_DAYS } from '../../common/constants/app.constants';
 import { DEFAULT_RETURN_WINDOW_DAYS } from '../returns/returns.constants';
 import { escapeLikePattern } from '../../common/utils/search.util';
@@ -1065,6 +1066,11 @@ export class OrdersService {
       const subCacheKey = `subscription_status:${userId}`;
       await this.redis.del(subCacheKey);
     }
+    // Audit voucher 2026-10-10 (B08): voucher baru ditebus → daftar "tersedia"
+    // user ini (cache 300 dtk) harus segera mencerminkannya. Post-commit, best-effort.
+    if (dto.voucherCode) {
+      await invalidateUserVoucherListCache(this.redis, userId, this.logger);
+    }
 
     const counterpartId = dto.role === 'BUYER' ? sellerId : buyerId;
     const creatorName = (user.fullName || user.username || 'User').replace(/[<>\"'&]/g, '');
@@ -1649,15 +1655,22 @@ export class OrdersService {
       if (voucherCode.length > 50) {
         throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Voucher code is too long' });
       }
+      // Audit voucher 2026-10-10 (B09): dulu voucher tidak ada / nonaktif /
+      // kedaluwarsa DIABAIKAN diam-diam (where isActive+masa berlaku → null),
+      // sehingga ringkasan biaya tampil tanpa potongan lalu create order
+      // justru menolak 404/VOUCHER_EXPIRED. Sekarang preview menolak dengan
+      // kode yang sama seperti create order agar FE bisa melepas voucher.
       const voucher = await this.prisma.voucher.findFirst({
-        where: {
-          code: voucherCode,
-          isActive: true,
-          validFrom: { lte: new Date() },
-          validUntil: { gte: new Date() },
-        },
+        where: { code: voucherCode },
       });
-      if (voucher) {
+      if (!voucher) {
+        throw new NotFoundException({ code: ErrorCodes.VOUCHER_NOT_FOUND, message: 'Voucher not found' });
+      }
+      {
+        const previewNow = new Date();
+        if (!voucher.isActive || previewNow < voucher.validFrom || previewNow > voucher.validUntil) {
+          throw new BadRequestException({ code: ErrorCodes.VOUCHER_EXPIRED, message: 'Voucher is expired or inactive' });
+        }
         if (voucher.maxUsageTotal != null && voucher.currentUsage >= voucher.maxUsageTotal) {
           throw new BadRequestException({ code: ErrorCodes.VOUCHER_USAGE_LIMIT_REACHED, message: 'Voucher has reached its maximum usage limit' });
         }

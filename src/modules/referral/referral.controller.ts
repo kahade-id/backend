@@ -1,7 +1,19 @@
 import { Controller, Get, Post, Body, Query, HttpCode, UseGuards, DefaultValuePipe, ParseIntPipe } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
-import { ReferralCode, ReferralRelation } from '@prisma/client';
+import { ReferralRelation } from '@prisma/client';
+
+/**
+ * Audit referral 2026-10-10 (B20): `my-code`/`regenerate` dulu mengembalikan
+ * seluruh row ReferralCode (userId internal, totalRewardEarned dalam sen).
+ * FE hanya membaca `code`; statistik lewat GET /referral/stats (sudah IDR).
+ */
+type PublicReferralCode = { code: string; isActive: boolean; createdAt: Date };
+const toPublicReferralCode = (rc: { code: string; isActive: boolean; createdAt: Date }): PublicReferralCode => ({
+  code: rc.code,
+  isActive: rc.isActive,
+  createdAt: rc.createdAt,
+});
 import { ReferralService } from './referral.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ClampLimitPipe } from '../../common/pipes/clamp-limit.pipe';
@@ -19,8 +31,8 @@ export class ReferralController {
   @Throttle({ default: { ttl: 60000, limit: 30 } })
   @Get('my-code')
   @AllowResponseFields('code')
-  async getMyCode(@CurrentUser('sub') userId: string): Promise<ReferralCode> {
-    return this.referralService.getOrCreateCode(userId);
+  async getMyCode(@CurrentUser('sub') userId: string): Promise<PublicReferralCode> {
+    return toPublicReferralCode(await this.referralService.getOrCreateCode(userId));
   }
 
   @UseGuards(UserThrottleGuard)
@@ -54,8 +66,8 @@ export class ReferralController {
   @Post('regenerate')
   @HttpCode(200)
   @AllowResponseFields('code')
-  async regenerateCode(@CurrentUser('sub') userId: string): Promise<ReferralCode> {
-    return this.referralService.regenerateCode(userId);
+  async regenerateCode(@CurrentUser('sub') userId: string): Promise<PublicReferralCode> {
+    return toPublicReferralCode(await this.referralService.regenerateCode(userId));
   }
 
   @Throttle({ default: { ttl: 60000, limit: 30 } })

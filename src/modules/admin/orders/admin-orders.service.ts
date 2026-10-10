@@ -690,6 +690,8 @@ export class AdminOrdersService {
 
     if (referralRewardCredited) {
       await this.referralService.invalidateLeaderboardCache();
+      // B13: beri tahu penerima reward (post-commit, best-effort).
+      await this.referralService.notifyRewardsForOrder(orderId);
     }
 
     // R2-B (audit): forceComplete consumes the buyer's Plus fee-savings quota; the

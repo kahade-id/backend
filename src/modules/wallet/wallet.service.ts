@@ -78,6 +78,7 @@ import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.se
 import { AuditLogService } from '../../common/services/audit-log.service';
 import { createHasNextPaginatedResponse, PaginatedResponse, sliceLimitPlusOne } from '../../common/dto/pagination.dto';
 import * as ErrorCodes from '../../common/constants/error-codes';
+import { invalidateUserVoucherListCache } from '../../common/utils/voucher-cache.util';
 import { MidtransService } from '../payment/midtrans.service';
 import { OtpService } from '../auth/otp.service';
 import { OtpGatewayService } from '../auth/otp-gateway.service';
@@ -968,6 +969,12 @@ export class WalletService implements OnModuleInit {
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
       );
+
+      // Audit voucher 2026-10-10 (B08): voucher top-up ditebus → daftar voucher
+      // "tersedia" user ini harus segera mencerminkannya (post-commit, best-effort).
+      if (normalizedVoucherCode) {
+        await invalidateUserVoucherListCache(this.redis, userId, this.logger);
+      }
 
       const topupExpiryMs = this.topupExpiryHours * 60 * 60 * 1000;
 

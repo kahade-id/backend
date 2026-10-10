@@ -13,6 +13,7 @@ import { LocalStorageService } from './local-storage.service';
 import { VideoProcessingService } from './video-processing.service';
 import {
   SHOWCASE_IMAGE_THUMBNAIL_WIDTH,
+  STORY_VIDEO_MAX_BYTES,
   SHOWCASE_VIDEO_MAX_BYTES,
   SHOWCASE_VIDEO_MAX_DIMENSION_PX,
   SHOWCASE_VIDEO_MAX_DURATION_SEC,
@@ -47,8 +48,10 @@ export const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
   // Batch 19 TIM A (item 1): video showcase — mp4/mov/webm, magic-byte
   // terverifikasi di MAGIC_BYTES (ftyp brand spesifik / EBML).
   [UploadPurpose.SHOWCASE_VIDEO]: ['video/mp4', 'video/quicktime', 'video/webm'],
-  [UploadPurpose.STORY_MEDIA]: ['image/jpeg', 'image/png', 'image/webp'],
-  [UploadPurpose.STORY_HIGHLIGHT]: ['image/jpeg', 'image/png', 'image/webp'],
+  // Story (2026-10-10): foto ATAU video pendek. Video diproses ffprobe/ffmpeg
+  // di StoriesService (durasi ≤ 60 dtk, poster JPEG); foto di-re-encode di sini.
+  [UploadPurpose.STORY_MEDIA]: ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/quicktime', 'video/webm'],
+  [UploadPurpose.STORY_HIGHLIGHT]: ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/quicktime', 'video/webm'],
   [UploadPurpose.AVATAR]: ['image/jpeg', 'image/png', 'image/webp'],
   [UploadPurpose.CHAT_ATTACHMENT]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm', 'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/mp4'],
   [UploadPurpose.DISPUTE_EVIDENCE]: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf', 'video/mp4', 'video/quicktime', 'video/webm'],
@@ -408,7 +411,7 @@ export function fileTooLargeException(purpose: UploadPurpose | undefined, maxSiz
   if (purpose === UploadPurpose.STORY_MEDIA) {
     return new PayloadTooLargeException({
       code: 'STORY_MEDIA_TOO_LARGE',
-      message: 'Ukuran foto story maksimal 10 MB.',
+      message: `Ukuran media story maksimal ${Math.round(maxSize / 1024 / 1024)} MB.`,
     });
   }
   if (purpose === UploadPurpose.SHOWCASE_VIDEO) {
@@ -1230,7 +1233,7 @@ export class UploadService {
       if (purpose === UploadPurpose.STORY_MEDIA) {
         throw new UnsupportedMediaTypeException({
           code: 'STORY_MEDIA_TYPE',
-          message: 'Format foto story harus JPEG, PNG, atau WEBP.',
+          message: 'Format media story harus JPEG, PNG, WEBP, MP4, MOV, atau WEBM.',
         });
       }
       throw new BadRequestException({
@@ -1246,7 +1249,11 @@ export class UploadService {
       });
     }
 
-    const maxSize = MAX_FILE_SIZE[purpose];
+    // Story video punya batas sendiri (50 MB) — foto story tetap 10 MB.
+    const maxSize =
+      purpose === UploadPurpose.STORY_MEDIA && contentType.startsWith('video/')
+        ? STORY_VIDEO_MAX_BYTES
+        : MAX_FILE_SIZE[purpose];
     if (fileBuffer.length > maxSize) {
       throw fileTooLargeException(purpose, maxSize);
     }
@@ -1257,7 +1264,7 @@ export class UploadService {
       if (purpose === UploadPurpose.STORY_MEDIA) {
         throw new UnsupportedMediaTypeException({
           code: 'STORY_MEDIA_TYPE',
-          message: 'Foto story tidak valid.',
+          message: 'Media story tidak valid.',
         });
       }
       throw new BadRequestException({
@@ -1269,7 +1276,7 @@ export class UploadService {
       if (purpose === UploadPurpose.STORY_MEDIA) {
         throw new UnsupportedMediaTypeException({
           code: 'STORY_MEDIA_TYPE',
-          message: 'Isi file tidak sesuai dengan format foto yang dikirim.',
+          message: 'Isi file tidak sesuai dengan format media yang dikirim.',
         });
       }
       throw new BadRequestException({
@@ -1283,7 +1290,11 @@ export class UploadService {
     // lossless EXIF-stripping pipeline.
     let storedMime = detectedMime;
     let storedBuffer: Buffer;
-    if (purpose === UploadPurpose.STORY_MEDIA) {
+    if (purpose === UploadPurpose.STORY_MEDIA && detectedMime.startsWith('video/')) {
+      // Video story disimpan apa adanya; validasi durasi/dimensi + poster
+      // dibuat StoriesService (fail-closed) setelah file tersimpan.
+      storedBuffer = fileBuffer;
+    } else if (purpose === UploadPurpose.STORY_MEDIA) {
       try {
         storedMime = 'image/jpeg';
         storedBuffer = await sharp(fileBuffer)

@@ -24,7 +24,7 @@ export class StoryMediaTooLargeInterceptor implements NestInterceptor {
               () =>
                 new PayloadTooLargeException({
                   code: 'STORY_MEDIA_TOO_LARGE',
-                  message: 'Ukuran foto story maksimal 10 MB.',
+                  message: 'Ukuran media story melebihi batas (foto maks 10 MB, video maks 50 MB).',
                 }),
             );
           }

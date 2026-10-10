@@ -23,6 +23,11 @@ export enum UploadPurpose {
   // the public upload controller.
   STORY_HIGHLIGHT = 'STORY_HIGHLIGHT',
   AVATAR = 'AVATAR',
+  // BE-5 (audit etalase 2026-10-10): berkas aset digital produk DIGITAL —
+  // PRIVAT; pembeli berbayar mengunduh lewat signed URL
+  // GET /v1/commerce/digital-assets/:id/download (bukan /upload/my-file
+  // yang owner-only).
+  DIGITAL_ASSET = 'DIGITAL_ASSET',
   CHAT_ATTACHMENT = 'CHAT_ATTACHMENT',
   DISPUTE_EVIDENCE = 'DISPUTE_EVIDENCE',
   REPORT_EVIDENCE = 'REPORT_EVIDENCE',

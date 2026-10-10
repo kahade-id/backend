@@ -4,6 +4,7 @@ import { Prisma } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { CreateBannerDto, UpdateBannerDto } from '../dto/commerce.dto';
+import { escapeLikePattern } from '../../../common/utils/search.util';
 
 /**
  * BE-COMMERCE (2026-10-01) — item 15: banner/carousel promo.
@@ -41,7 +42,8 @@ export class BannersService {
     // BAI-013: filter isActive & q yang dikirim admin — sebelumnya diabaikan.
     const where: Record<string, unknown> = {};
     if (filters.isActive !== undefined) where.isActive = filters.isActive;
-    if (filters.q) where.title = { contains: filters.q, mode: 'insensitive' };
+    // BES-15 (audit etalase 2026-10-10): % dan _ dari input admin bukan wildcard.
+    if (filters.q) where.title = { contains: escapeLikePattern(filters.q), mode: 'insensitive' };
     const [rows, total] = await Promise.all([
       this.prisma.banner.findMany({ where, orderBy: [{ sortOrder: 'asc' }, { createdAt: 'desc' }], skip: (page - 1) * limit, take: limit }),
       this.prisma.banner.count({ where }),

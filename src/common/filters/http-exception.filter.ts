@@ -38,6 +38,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
     let message: string;
     let details: string[] | undefined;
     let fields: Array<Record<string, unknown>> | undefined;
+    let data: Record<string, unknown> | undefined;
 
     if (typeof exceptionResponse === 'object' && exceptionResponse !== null) {
       const resp = exceptionResponse as Record<string, unknown>;
@@ -57,6 +58,20 @@ export class HttpExceptionFilter implements ExceptionFilter {
         const sanitized = sanitizeValidationFields(resp.fields);
         if (sanitized.length > 0) fields = sanitized;
       }
+      // BES-01/RK-01 (audit etalase 2026-10-10): state akhir yang disertakan
+      // service pada error (mis. 409 SHOWCASE_ALREADY_LIKED → {liked, likeCount})
+      // diteruskan sebagai `errors.data` — hanya objek datar bernilai
+      // primitif, maks 20 kunci bernama aman.
+      if (resp.data && typeof resp.data === 'object' && !Array.isArray(resp.data)) {
+        const entries = Object.entries(resp.data as Record<string, unknown>)
+          .filter(
+            ([key, value]) =>
+              /^[A-Za-z][A-Za-z0-9_]{0,40}$/.test(key) &&
+              (value === null || ['string', 'number', 'boolean'].includes(typeof value)),
+          )
+          .slice(0, 20);
+        if (entries.length > 0) data = Object.fromEntries(entries);
+      }
     } else if (typeof exceptionResponse === 'string') {
       errorCode = this.getDefaultErrorCode(status);
       message = exceptionResponse;
@@ -74,6 +89,9 @@ export class HttpExceptionFilter implements ExceptionFilter {
     }
     if (fields) {
       errorBody.fields = fields;
+    }
+    if (data) {
+      errorBody.data = data;
     }
     if (requestId) {
       errorBody.requestId = requestId;

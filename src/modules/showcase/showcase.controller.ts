@@ -183,7 +183,7 @@ export class ShowcaseController {
     @CurrentUser('sub') userId: string,
     @Param('commentId', ParseIdPipe) commentId: string,
     @Body() dto?: DeleteCommentDto,
-  ): Promise<{ message: string }> {
+  ): Promise<{ message: string; commentCount?: number | null }> {
     return this.showcaseService.deleteComment(userId, commentId, dto?.reason);
   }
 

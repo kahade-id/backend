@@ -4,6 +4,7 @@ import { PrismaModule } from '../../prisma/prisma.module';
 import { RedisModule } from '../../redis/redis.module';
 import { MilestonesModule } from '../milestones/milestones.module';
 import { OrdersModule } from '../orders/orders.module';
+import { UploadModule } from '../upload/upload.module';
 
 import { ProductCommerceService } from './services/product-commerce.service';
 import { SearchTrendsService } from './services/search-trends.service';
@@ -54,6 +55,8 @@ import { AdminCommerceRefundsController } from './controllers/admin-commerce-ref
     RedisModule,
     MilestonesModule,
     OrdersModule,
+    // BE-5: verifikasi fileKey aset digital + signed URL unduhan.
+    UploadModule,
     // M2: antrean Bull untuk auto-refund REFUND_REQUIRED (repeatable tiap 5 menit).
     BullModule.registerQueue({
       name: COMMERCE_REFUND_QUEUE,

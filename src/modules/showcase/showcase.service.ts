@@ -97,6 +97,16 @@ type CommentRow = Prisma.ShowcaseCommentGetPayload<{
   };
 }>;
 
+/** BEC-01: enforcement moderasi aktif pada satu item (lihat getActiveEnforcementMap). */
+type ModerationEnforcement = {
+  reportId: string;
+  action: 'TAKEDOWN' | 'RESTRICTED';
+  createdAt: Date;
+  note: string | null;
+  /** Batas restrict sementara (ISO) bila ada di metadata event. */
+  until: string | null;
+};
+
 /** Include standar: gambar terurut + ringkasan pemilik. Dipakai di semua jalur baca. */
 const SHOWCASE_INCLUDE = {
   images: { orderBy: [{ sortOrder: 'asc' as const }, { id: 'asc' as const }] },
@@ -478,6 +488,46 @@ export class ShowcaseService {
     return row;
   }
 
+  /**
+   * BEC-01 (audit etalase 2026-10-10): enforcement moderasi yang MASIH AKTIF
+   * per item — event TAKEDOWN/RESTRICTED terakhir yang belum disusul RESTORED
+   * (banding diterima / restrict berakhir / restore admin). Satu query batch
+   * untuk daftar pemilik; best-effort (null bila fragment moderasi belum ada).
+   */
+  private async getActiveEnforcementMap(showcaseIds: string[]): Promise<Map<string, ModerationEnforcement>> {
+    const map = new Map<string, ModerationEnforcement>();
+    if (showcaseIds.length === 0) return map;
+    try {
+      const mod = moderationDb(this.prisma);
+      const events = (await mod.reportModerationEvent.findMany({
+        where: { action: { in: ['TAKEDOWN', 'RESTRICTED', 'RESTORED'] }, report: { showcaseId: { in: showcaseIds } } },
+        orderBy: { createdAt: 'desc' },
+        select: { reportId: true, action: true, createdAt: true, note: true, metadata: true, report: { select: { showcaseId: true } } },
+      })) as unknown as Array<{
+        reportId: string;
+        action: string;
+        createdAt: Date;
+        note: string | null;
+        metadata: unknown;
+        report?: { showcaseId: string } | null;
+      }>;
+      const seen = new Set<string>();
+      for (const ev of events) {
+        const sid = ev.report?.showcaseId;
+        if (!sid || seen.has(sid)) continue;
+        seen.add(sid);
+        // Event terakhir RESTORED = enforcement sudah dicabut.
+        if (ev.action !== 'TAKEDOWN' && ev.action !== 'RESTRICTED') continue;
+        const meta = ev.metadata && typeof ev.metadata === 'object' ? (ev.metadata as Record<string, unknown>) : {};
+        const until = typeof meta.restrictUntil === 'string' ? meta.restrictUntil : null;
+        map.set(sid, { reportId: ev.reportId, action: ev.action, createdAt: ev.createdAt, note: ev.note ?? null, until });
+      }
+    } catch (err) {
+      this.logger.warn(`getActiveEnforcementMap failed (best-effort): ${(err as Error).message}`);
+    }
+    return map;
+  }
+
   // ==================================================================
   // Serializer
   // ==================================================================
@@ -522,7 +572,7 @@ export class ShowcaseService {
    */
   private serializeShowcase(
     row: ShowcaseRow,
-    options: { isLiked?: boolean; isSaved?: boolean; isOwner?: boolean; authorBadges?: Array<{ type: string }>; followedAuthorIds?: Set<string>; excerpt?: boolean; bestsellerIds?: Set<string> } = {},
+    options: { isLiked?: boolean; isSaved?: boolean; isOwner?: boolean; authorBadges?: Array<{ type: string }>; followedAuthorIds?: Set<string>; excerpt?: boolean; bestsellerIds?: Set<string>; moderation?: ModerationEnforcement | null } = {},
   ): Record<string, unknown> {
     // Batch 19 TIM A (item 1 & 2): media etalase bisa image/video/spin360.
     // Field lama (id/imageUrl/sortOrder) tetap — kontrak lama tidak berubah.
@@ -646,6 +696,19 @@ export class ShowcaseService {
                   scheduledAt: row.scheduledAt ?? null,
                 }
               : {}),
+            // BEC-01 (audit etalase 2026-10-10): pemilik tahu itemnya
+            // dinonaktifkan MODERASI (bukan olehnya) — klien menyembunyikan
+            // "Aktifkan etalase" dan menampilkan notice + arah banding.
+            // Nama field mengikuti resolver klien (lib/showcase-moderation.ts).
+            ...(options.isOwner && options.moderation
+              ? {
+                  moderationStatus: options.moderation.action,
+                  moderationReason: options.moderation.note,
+                  moderatedAt: options.moderation.createdAt,
+                  moderationReportId: options.moderation.reportId,
+                  moderationUntil: options.moderation.until,
+                }
+              : {}),
           }),
       likeCount: row.likeCount,
       commentCount: row.commentCount,
@@ -745,8 +808,9 @@ export class ShowcaseService {
       include: SHOWCASE_INCLUDE,
     })) as unknown as ShowcaseRow[];
 
+    const enforcement = await this.getActiveEnforcementMap(items.map((item) => item.id));
     return {
-      items: items.map((item) => this.serializeShowcase(item, { isOwner: true })),
+      items: items.map((item) => this.serializeShowcase(item, { isOwner: true, moderation: enforcement.get(item.id) ?? null })),
       total: items.length,
       limits: {
         maxItems: SHOWCASE_MAX_ITEMS,
@@ -807,12 +871,15 @@ export class ShowcaseService {
         message: 'Gunakan salah satu: media atau imageFileKeys, tidak bisa keduanya',
       });
     }
+    // BES-03 (audit etalase 2026-10-10): validasi key TANPA consume — bila
+    // batas 20 item menolak di bawah, konfirmasi upload tidak hangus (dulu
+    // pengguna harus unggah ulang semua foto setelah ditolak).
     const mediaEntries = dto.media !== undefined
-      ? await this.prepareMediaEntries(userId, dto.media)
+      ? await this.prepareMediaEntries(userId, dto.media, { consume: false })
       : null;
     const imageFileKeys = dto.media !== undefined
       ? []
-      : await this.prepareImageKeys(userId, dto.imageFileKeys);
+      : await this.prepareImageKeys(userId, dto.imageFileKeys, { consume: false });
 
     const limitError = () =>
       new BadRequestException({
@@ -855,6 +922,12 @@ export class ShowcaseService {
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
       )) as unknown as ShowcaseRow;
 
+      // BES-03: consume SETELAH item tersimpan (pola yang sama dengan update).
+      const consumeKeys = dto.media !== undefined
+        ? [...new Set(dto.media.flatMap((m) => [m.fileKey, m.thumbnailFileKey].filter((k): k is string => Boolean(k))))]
+        : (dto.imageFileKeys ?? []);
+      if (consumeKeys.length > 0) await this.uploadService.consumeUploadConfirmations(userId, consumeKeys);
+
       return this.serializeShowcase(item, { isOwner: true });
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2034') {
@@ -870,6 +943,22 @@ export class ShowcaseService {
 
   async updateShowcaseItem(userId: string, itemId: string, dto: UpdateShowcaseItemDto): Promise<object> {
     const existing = await this.findOwnedShowcase(userId, itemId);
+    // BEC-01 (audit etalase 2026-10-10): item yang dinonaktifkan MODERASI
+    // (takedown/restrict) tidak boleh diaktifkan ulang pemilik lewat
+    // isActive:true — dulu menu "Aktifkan etalase" membalikkan takedown.
+    if (dto.isActive === true && !existing.isActive) {
+      const enforcement = await this.findModerationEnforcement(itemId);
+      if (enforcement) {
+        throw new ForbiddenException({
+          code: ErrorCodes.SHOWCASE_MODERATED,
+          message: 'Etalase ini dinonaktifkan oleh moderasi Kahade dan tidak bisa diaktifkan sendiri. Ajukan banding lewat laporan terkait.',
+          reportId: enforcement.reportId,
+        });
+      }
+    }
+    // BES-02: berkas lama dibersihkan SETELAH update DB sukses (dulu
+    // dijadwalkan sebelum update → update gagal = media hilang).
+    let cleanupKeys: string[] = [];
 
     // R-2: pakai hasil normalizeTitle langsung (validasi + trim) supaya tidak
     // ada dua sumber kebenaran untuk nilai title yang disimpan.
@@ -923,9 +1012,7 @@ export class ShowcaseService {
         deleteMany: {},
         create: toImageCreates(mediaEntries),
       };
-      // Bersihkan object lama dari storage SETELAH commit supaya kegagalan
-      // storage tidak membatalkan update yang sudah sukses.
-      this.scheduleImageCleanup(userId, removedKeys);
+      cleanupKeys = removedKeys;
     } else if (dto.imageFileKeys !== undefined) {
       if (dto.imageFileKeys.length === 0) {
         throw new BadRequestException({
@@ -953,9 +1040,7 @@ export class ShowcaseService {
           sortOrder: index,
         })),
       };
-      // Bersihkan object lama dari R2 SETELAH commit supaya kegagalan storage
-      // tidak membatalkan update yang sudah sukses.
-      this.scheduleImageCleanup(userId, removedKeys);
+      cleanupKeys = removedKeys;
     }
 
     const item = (await this.prisma.userShowcase.update({
@@ -976,6 +1061,8 @@ export class ShowcaseService {
     } else if (dto.imageFileKeys !== undefined && dto.imageFileKeys.length > 0) {
       await this.uploadService.consumeUploadConfirmations(userId, dto.imageFileKeys);
     }
+    // BES-02: object lama dibersihkan setelah commit (fire-and-forget).
+    if (cleanupKeys.length > 0) this.scheduleImageCleanup(userId, cleanupKeys);
 
     return this.serializeShowcase(item, { isOwner: true });
   }
@@ -997,7 +1084,15 @@ export class ShowcaseService {
    * Pulihkan item yang di-soft-delete (dalam 30 hari).
    * Setelah 30 hari → 410 GONE (sudah hard delete oleh cron).
    */
-  async restoreShowcaseItem(userId: string, itemId: string): Promise<{ message: string }> {
+  async restoreShowcaseItem(userId: string, itemId: string): Promise<{ message: string; alreadyRestored?: boolean }> {
+    // BE-4 (audit etalase 2026-10-10): restore idempoten — item sudah aktif
+    // (dipulihkan dari perangkat lain / ketuk ganda) → 200, bukan 404 yang
+    // membuat klien menampilkan "Gagal memulihkan" untuk keadaan yang benar.
+    const alreadyLive = await this.prisma.userShowcase.findFirst({
+      where: { id: itemId, userId, deletedAt: null },
+      select: { id: true },
+    });
+    if (alreadyLive) return { message: 'Etalase sudah aktif.', alreadyRestored: true };
     const existing = await this.findDeletedShowcase(userId, itemId);
     const deletedAt = existing.deletedAt as Date;
     const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
@@ -1468,16 +1563,22 @@ export class ShowcaseService {
     // nonaktif (isActive=false) — findVisibleShowcase tidak lagi memfilter
     // isActive untuk cabang owner. Preview semacam itu tidak ikut menaikkan
     // viewCount — angka view hanya untuk item yang tayang.
-    const shouldCountView = !(visible.isOwner && !visible.row.isActive);
+    // BES-17 (audit etalase 2026-10-10): tayangan PEMILIK tidak pernah dihitung
+    // (dulu hanya preview item nonaktif yang dikecualikan → angka view
+    // menggelembung tiap pemilik membuka detailnya sendiri).
+    const shouldCountView = !visible.isOwner;
     const counted = shouldCountView ? await this.recordView(showcaseId, viewerId, options.clientIp) : false;
     const likedIds = await this.getLikedShowcaseIds(viewerId, [showcaseId]);
     const savedIds = await this.getSavedShowcaseIds(viewerId, [showcaseId]);
     const badgeMap = await this.getAuthorBadgeMap([visible.row.user.id]);
+    // BEC-01: notice moderasi hanya untuk pemilik (detail item sendiri).
+    const moderation = visible.isOwner ? (await this.getActiveEnforcementMap([showcaseId])).get(showcaseId) ?? null : null;
 
     return {
       ...this.serializeShowcase(visible.row, {
         isLiked: likedIds.has(showcaseId),
         isSaved: savedIds.has(showcaseId),
+        moderation,
         isOwner: visible.isOwner,
         authorBadges: badgeMap.get(visible.row.user.id) ?? [],
       }),
@@ -2228,6 +2329,9 @@ export class ShowcaseService {
           code: ErrorCodes.SHOWCASE_ALREADY_LIKED,
           message: 'You already liked this showcase item',
           likeCount: current?.likeCount ?? null,
+          // RK-01/BES-01: state akhir → klien menulis lokal tanpa GET detail
+          // (yang menaikkan viewCount). Diteruskan filter sebagai errors.data.
+          data: { liked: true, likeCount: current?.likeCount ?? null },
         });
       }
       throw err;
@@ -2328,6 +2432,7 @@ export class ShowcaseService {
           code: ErrorCodes.SHOWCASE_ALREADY_SAVED,
           message: 'You already saved this showcase item',
           saveCount: current?.saveCount ?? null,
+          data: { saved: true, saveCount: current?.saveCount ?? null },
         });
       }
       throw err;
@@ -2536,15 +2641,25 @@ export class ShowcaseService {
     const showcaseRows = pageRows.map((row) => row.showcase) as unknown as ShowcaseRow[];
     const likedIds = await this.getLikedShowcaseIds(userId, showcaseRows.map((row) => row.id));
     const badgeMap = await this.getAuthorBadgeMap(showcaseRows.map((row) => row.user.id));
-    const items = showcaseRows.map((item, index) => ({
-      ...this.serializeShowcase(item, {
-        isLiked: likedIds.has(item.id),
-        isSaved: true,
-        isOwner: item.user.id === userId,
-        authorBadges: badgeMap.get(item.user.id) ?? [],
-      }),
-      savedAt: pageRows[index].createdAt,
-    }));
+    const items = showcaseRows.map((item, index) => {
+      const isOwner = item.user.id === userId;
+      // BES-05 (audit etalase 2026-10-10): item yang sudah dihapus / privat /
+      // nonaktif (bukan milik sendiri) TIDAK dikirim sebagai kartu penuh —
+      // dulu koleksi "Tersimpan" membocorkan judul/foto item yang pemiliknya
+      // sudah sembunyikan. Klien menampilkan "tidak tersedia" / membersihkan.
+      const unavailable =
+        item.deletedAt != null || (!isOwner && (!item.isActive || item.visibility !== ShowcaseVisibility.PUBLIC));
+      if (unavailable) return { id: item.id, unavailable: true, savedAt: pageRows[index].createdAt };
+      return {
+        ...this.serializeShowcase(item, {
+          isLiked: likedIds.has(item.id),
+          isSaved: true,
+          isOwner,
+          authorBadges: badgeMap.get(item.user.id) ?? [],
+        }),
+        savedAt: pageRows[index].createdAt,
+      };
+    });
     return {
       ...createPaginatedResponse(items, total, safePage, safeLimit),
       hasNext: hasMore,
@@ -2697,6 +2812,8 @@ export class ShowcaseService {
       for (const reply of repliesByParent.get(root.id) ?? []) authorIds.add(reply.user.id);
     }
     const sealTierMap = await this.verificationBadgeService.getSealTierMap(Array.from(authorIds));
+    // BE-8: badge penulis komentar — satu batch (cache Redis per user).
+    const commentBadgeMap = await this.getAuthorBadgeMap(Array.from(authorIds));
 
     // BFE-117/FAL-009: ringkasan reaksi untuk semua komentar yang tampil
     // (roots + replies) dalam 2 query batch.
@@ -2713,13 +2830,14 @@ export class ShowcaseService {
         root as CommentRow,
         sealTierMap,
         this.reactionSummaryFor(root.id, reactionCounts, userVotes),
+        commentBadgeMap,
       );
       if (!serialized) return [];
       return [{
         ...serialized,
         replyCount: replyCountByParent.get(root.id) ?? 0,
         replies: (repliesByParent.get(root.id) ?? []).flatMap((reply) => {
-          const s = this.serializeComment(reply, sealTierMap, this.reactionSummaryFor(reply.id, reactionCounts, userVotes));
+          const s = this.serializeComment(reply, sealTierMap, this.reactionSummaryFor(reply.id, reactionCounts, userVotes), commentBadgeMap);
           return s ? [s] : [];
         }),
       }];
@@ -2753,6 +2871,7 @@ export class ShowcaseService {
     row: CommentRow,
     sealTierMap?: Map<string, string | null>,
     reactions?: { likes: number; dislikes: number; userVote: number },
+    badgeMap?: Map<string, Array<{ type: string }>>,
   ): Record<string, unknown> | null {
     // (2026-10-05: defensif — user yang hilang/rusak tidak boleh meruntuhkan
     // seluruh response; kembalikan null agar pemanggil bisa melewatinya.)
@@ -2782,6 +2901,9 @@ export class ShowcaseService {
         // komentar (konsisten dengan feed & profil).
         sealTier: sealTierMap?.get(row.user.id) ?? null,
         isKycVerified: row.user.kycStatus === 'APPROVED',
+        // BE-8 (audit etalase 2026-10-10): badge verifikasi penulis komentar —
+        // kontrak yang sama dengan author etalase (feed/detail).
+        badges: badgeMap?.get(row.user.id) ?? [],
       },
     };
   }
@@ -2957,7 +3079,7 @@ export class ShowcaseService {
    * balasan yang tampil (lihat listComments). Komentar yang sedang hidden
    * tidak mengubah commentCount (sudah dikurangi saat di-hide).
    */
-  async deleteComment(userId: string, commentId: string, reason?: string): Promise<{ message: string }> {
+  async deleteComment(userId: string, commentId: string, reason?: string): Promise<{ message: string; commentCount?: number | null }> {
     const existing = await this.prisma.showcaseComment.findUnique({
       where: { id: commentId },
       select: { id: true, userId: true, showcaseId: true, parentId: true, isHidden: true, deletedAt: true },
@@ -3003,7 +3125,13 @@ export class ShowcaseService {
       }
     });
 
-    return { message: 'Comment deleted successfully' };
+    // BE-8 (audit etalase 2026-10-10): kembalikan hitungan final supaya klien
+    // tidak perlu menebak (ledger lokal) atau GET detail yang menaikkan view.
+    const after = await this.prisma.userShowcase.findUnique({
+      where: { id: existing.showcaseId },
+      select: { commentCount: true },
+    });
+    return { message: 'Comment deleted successfully', commentCount: after?.commentCount ?? null };
   }
 
   /**
@@ -3100,7 +3228,7 @@ export class ShowcaseService {
     }
     const comment = await this.prisma.showcaseComment.findUnique({
       where: { id: commentId },
-      select: { id: true, isHidden: true, deletedAt: true },
+      select: { id: true, isHidden: true, deletedAt: true, showcaseId: true },
     });
     if (!comment || comment.deletedAt) {
       throw new NotFoundException({
@@ -3114,6 +3242,14 @@ export class ShowcaseService {
         message: 'Hidden comments cannot be liked',
       });
     }
+    // BES-04 (audit etalase 2026-10-10): sama seperti suka/simpan — item
+    // harus terlihat oleh pelaku (privat/nonaktif/takedown → 404) dan tidak
+    // ada relasi blokir dengan pemilik.
+    const visible = await this.findVisibleShowcase(comment.showcaseId, userId);
+    if (!visible) {
+      throw new NotFoundException({ code: ErrorCodes.SHOWCASE_NOT_FOUND, message: 'Showcase item not found' });
+    }
+    await this.assertNoBlockRelation(userId, visible.row.userId);
     if (value === 0) {
       await this.prisma.showcaseCommentReaction.deleteMany({ where: { commentId, userId } });
     } else {
@@ -3180,7 +3316,9 @@ export class ShowcaseService {
         take: safeLimit,
         include: {
           user: { select: { userId: true, username: true, fullName: true, avatarUrl: true } },
-          showcase: { select: { id: true } },
+          // ADM-07 (audit etalase 2026-10-10): judul ikut dikirim — admin web
+          // sebelumnya menampilkan id etalase mentah seolah judul.
+          showcase: { select: { id: true, title: true } },
         },
       }),
       this.prisma.showcaseComment.count({ where }),
@@ -3600,18 +3738,10 @@ export class ShowcaseService {
    * item — dipakai untuk 409-with-appeal-direction saat item takedown dilaporkan.
    * Best-effort: null bila tabel fragment belum tersedia.
    */
-  private async findModerationEnforcement(showcaseId: string): Promise<{ reportId: string } | null> {
+  private async findModerationEnforcement(showcaseId: string): Promise<ModerationEnforcement | null> {
     try {
-      const mod = moderationDb(this.prisma);
-      const ev = await mod.reportModerationEvent.findFirst({
-        where: {
-          action: { in: ['TAKEDOWN', 'RESTRICTED'] },
-          report: { showcaseId },
-        },
-        orderBy: { createdAt: 'desc' },
-        select: { reportId: true },
-      });
-      return ev ? { reportId: ev.reportId } : null;
+      const map = await this.getActiveEnforcementMap([showcaseId]);
+      return map.get(showcaseId) ?? null;
     } catch (err) {
       this.logger.warn(
         `findModerationEnforcement(${showcaseId}) failed (best-effort): ${(err as Error).message}`,

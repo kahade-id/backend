@@ -8,6 +8,13 @@ import { OrdersService } from '../../orders/orders.service';
 import { OrderStateService } from '../../orders/order-state.service';
 import { clampDeadlineDays } from '../commerce-order.util';
 import { CreateServiceSlotDto, BookServiceSlotDto } from '../dto/commerce.dto';
+import { escapeLikePattern } from '../../../common/utils/search.util';
+
+/** Tengah malam WIB hari ini (@db.Date dibandingkan per tanggal, bukan jam). */
+function todayWibStart(now = new Date()): Date {
+  const wib = new Date(now.getTime() + 7 * 3_600_000).toISOString().slice(0, 10);
+  return new Date(`${wib}T00:00:00+07:00`);
+}
 
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
@@ -77,10 +84,17 @@ export class ServiceBookingService {
   }
 
   async listSlots(showcaseId: string, from?: string, page = 1, limit = 20): Promise<PaginatedResponse<Record<string, unknown>>> {
+    // BES-08 (audit etalase 2026-10-10): `from` tak valid → 400 (dulu Invalid
+    // Date → Prisma melempar → 500); default = tengah malam WIB hari ini —
+    // dulu `new Date()` (sekarang) membuat slot HARI INI hilang setelah 07:00
+    // WIB karena @db.Date dibandingkan dengan timestamp.
+    if (from !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'from harus berformat YYYY-MM-DD' });
+    }
     const where: Prisma.ServiceSlotWhereInput = {
       showcaseId,
       isActive: true,
-      slotDate: { gte: from ? new Date(`${from}T00:00:00+07:00`) : new Date() },
+      slotDate: { gte: from ? new Date(`${from}T00:00:00+07:00`) : todayWibStart() },
     };
     const [rows, total] = await Promise.all([
       this.prisma.serviceSlot.findMany({
@@ -276,24 +290,68 @@ export class ServiceBookingService {
     if (slot.sellerId === userId) {
       throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Seller tidak bisa booking slot sendiri' });
     }
+    // BES-10 (audit etalase 2026-10-10): slot yang tanggalnya sudah lewat
+    // tidak bisa di-booking.
+    if (slot.slotDate instanceof Date && slot.slotDate.getTime() < todayWibStart().getTime()) {
+      throw new BadRequestException({ code: ErrorCodes.VALIDATION_ERROR, message: 'Slot sudah lewat' });
+    }
+    // BES-10: etalase jasa harus masih tayang (bukan dihapus/nonaktif/takedown).
+    const showcase = await this.prisma.userShowcase.findFirst({
+      where: { id: slot.showcaseId, deletedAt: null, isActive: true },
+      select: { id: true },
+    });
+    if (!showcase) {
+      throw new NotFoundException({ code: ErrorCodes.SLOT_NOT_FOUND, message: 'Etalase jasa tidak lagi tersedia' });
+    }
     return slot;
   }
 
   /** Klaim kapasitas atomik + upsert booking — isi tx dari bookSlot (dipakai ulang). */
   private async claimSlotTx(tx: Prisma.TransactionClient, slotId: string, userId: string, capacity: number) {
+    // BES-06 (audit etalase 2026-10-10): klaim BARIS BOOKING dulu, baru
+    // kapasitas. Dulu increment lalu upsert — dua request paralel user yang
+    // sama lolos pre-check, keduanya menaikkan bookedCount, upsert kedua
+    // hanya menimpa baris yang sama → kapasitas hangus untuk satu booking.
+    const select = { id: true, slotId: true, status: true, createdAt: true } as const;
+    const existing = await tx.serviceSlotBooking.findUnique({
+      where: { slotId_userId: { slotId, userId } },
+      select: { id: true, status: true },
+    });
+    let booking: { id: string; slotId: string; status: SlotBookingStatus; createdAt: Date };
+    if (existing) {
+      // Hanya baris non-BOOKED yang bisa diklaim ulang — pemenang balapan
+      // ditentukan oleh updateMany bersyarat (count 0 = sudah diklaim).
+      const reclaimed = await tx.serviceSlotBooking.updateMany({
+        where: { id: existing.id, status: { not: SlotBookingStatus.BOOKED } },
+        data: { status: SlotBookingStatus.BOOKED, orderId: null },
+      });
+      if (reclaimed.count === 0) {
+        throw new ConflictException({ code: ErrorCodes.SLOT_ALREADY_BOOKED, message: 'Kamu sudah booking slot ini' });
+      }
+      booking = { id: existing.id, slotId, status: SlotBookingStatus.BOOKED, createdAt: new Date() };
+    } else {
+      try {
+        booking = await tx.serviceSlotBooking.create({
+          data: { slotId, userId, status: SlotBookingStatus.BOOKED },
+          select,
+        });
+      } catch (err) {
+        // Unique (slotId, userId) → request paralel sudah membuat barisnya.
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+          throw new ConflictException({ code: ErrorCodes.SLOT_ALREADY_BOOKED, message: 'Kamu sudah booking slot ini' });
+        }
+        throw err;
+      }
+    }
     const claimed = await tx.serviceSlot.updateMany({
       where: { id: slotId, bookedCount: { lt: capacity }, isActive: true },
       data: { bookedCount: { increment: 1 } },
     });
     if (claimed.count === 0) {
+      // Melempar di dalam transaksi = baris booking di atas ikut dibatalkan.
       throw new ConflictException({ code: ErrorCodes.SLOT_FULL, message: 'Slot sudah penuh' });
     }
-    return tx.serviceSlotBooking.upsert({
-      where: { slotId_userId: { slotId, userId } },
-      create: { slotId, userId, status: SlotBookingStatus.BOOKED },
-      update: { status: SlotBookingStatus.BOOKED },
-      select: { id: true, slotId: true, status: true, createdAt: true },
-    });
+    return booking;
   }
 
   /**
@@ -328,8 +386,19 @@ export class ServiceBookingService {
       }
     }
     await this.prisma.$transaction(async (tx) => {
-      await tx.serviceSlotBooking.update({ where: { id: booking.id }, data: { status: SlotBookingStatus.CANCELLED } });
-      await tx.serviceSlot.update({ where: { id: booking.slotId }, data: { bookedCount: { decrement: 1 } } });
+      // BES-07 (audit etalase 2026-10-10): batal ganda (dua ketukan / dua
+      // perangkat) tidak boleh mengurangi bookedCount dua kali — decrement
+      // hanya bila transisi BOOKED→CANCELLED benar-benar terjadi di sini.
+      const cancelled = await tx.serviceSlotBooking.updateMany({
+        where: { id: booking.id, status: SlotBookingStatus.BOOKED },
+        data: { status: SlotBookingStatus.CANCELLED },
+      });
+      if (cancelled.count === 1) {
+        await tx.serviceSlot.updateMany({
+          where: { id: booking.slotId, bookedCount: { gt: 0 } },
+          data: { bookedCount: { decrement: 1 } },
+        });
+      }
     });
     return { id: booking.id, status: SlotBookingStatus.CANCELLED };
   }
@@ -376,8 +445,9 @@ export class ServiceBookingService {
       const matchedUsers = await this.prisma.user.findMany({
         where: {
           OR: [
-            { username: { contains: term, mode: 'insensitive' } },
-            { fullName: { contains: term, mode: 'insensitive' } },
+            // BES-15: % dan _ dari input admin tidak boleh jadi wildcard LIKE.
+            { username: { contains: escapeLikePattern(term), mode: 'insensitive' } },
+            { fullName: { contains: escapeLikePattern(term), mode: 'insensitive' } },
           ],
         },
         select: { id: true },

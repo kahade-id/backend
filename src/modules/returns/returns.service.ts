@@ -15,16 +15,18 @@ import {
   ConflictException,
   ForbiddenException,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
-import { AuditAction, DisputeStatus, OrderStatus, UserAuditAction } from '@prisma/client';
+import { ActorType, AuditAction, DisputeStatus, OrderStatus, UserAuditAction, WalletTransactionStatus, WalletTransactionType } from '@prisma/client';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { PrismaService } from '../../prisma/prisma.service';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
 import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { DanaDirectRefundService } from '../no-wallet/dana-direct-refund.service';
+import { AdminStepUpService } from '../admin/auth/step-up.service';
 import { UploadService } from '../upload/upload.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
-import { generateDisputeId } from '../../common/utils/id-generator.util';
+import { generateDisputeId, generateWalletTxId } from '../../common/utils/id-generator.util';
 import { DISPUTE_SLA_HOURS } from '../../common/constants/app.constants';
 import { getReturnsDb } from './returns.db';
 import { assertLegalReturnTransition, ACTIVE_RETURN_STATUSES } from './returns-state';
@@ -105,7 +107,14 @@ export class ReturnsService {
     private refundService: ReturnsRefundService,
     private walletMode: WalletModeService,
     private danaDirectRefundService: DanaDirectRefundService,
+    // Audit 2026-10-10: step-up untuk aksi uang admin (StepUpModule @Global).
+    // @Optional agar unit test lama tetap bisa mengonstruksi; fail-closed
+    // bila absen saat aksi uang dipanggil.
+    @Optional() private stepUp?: AdminStepUpService,
   ) {}
+
+  /** Nama aksi step-up untuk SEMUA aksi uang retur (target = id DB retur). */
+  static readonly MONEY_ACTION_STEP_UP = 'return.money-action';
 
   private db() {
     return getReturnsDb(this.prisma);
@@ -743,8 +752,13 @@ export class ReturnsService {
    * - bila ternyata sudah ada sengketa untuk order ini, tautkan saja
    *   (idempoten — tidak membuat duplikat; `Dispute.orderId` unik);
    * - sengketa baru lahir OPEN agar masuk antrean assign normal mediator;
-   * - TIDAK menyentuh status order / wallet — alur uang tetap milik retur;
-   *   sengketa ini memberi kasus yang bisa di-assign ke mediator.
+   * - K4 (audit 2026-10-10): order WAJIB ikut pindah ke DISPUTED di tx yang
+   *   sama (+ orderStatusHistory). Sebelumnya status order dibiarkan
+   *   COMPLETED sehingga resolve admin selalu 409 "Order is no longer
+   *   DISPUTED" — sengketa hasil konversi buntu selamanya. Retur selalu
+   *   pasca-completion: di mode wallet, dana seller dibekukan (pola
+   *   submitDispute) agar putusan bisa dieksekusi; di mode no-wallet tidak
+   *   ada wallet — eksekusi uang mengikuti aturan fail-closed settlement.
    */
   async convertReturnToDispute(
     returnDbId: string,
@@ -776,20 +790,96 @@ export class ReturnsService {
 
     const serial = await this.serial.getNextForPrefix('dispute_serial');
     const now = new Date();
-    const dispute = await this.prisma.dispute.create({
-      data: {
-        disputeId: generateDisputeId(serial),
-        orderId: ret.orderId,
-        // Retur selalu diajukan pembeli — inisiator konversi dicatat sebagai buyer.
-        initiatedBy: 'BUYER',
-        initiatorUserId: ret.buyerId,
-        buyerClaim: `Dikonversi dari retur ${ret.returnId} oleh admin. Alasan retur: ${ret.reasonCode}${ret.reasonDetail ? ` — ${ret.reasonDetail}` : ''}`.slice(0, 2000),
-        buyerClaimedAt: now,
-        status: 'OPEN',
-        slaHours: DISPUTE_SLA_HOURS,
-        slaDeadlineAt: new Date(now.getTime() + DISPUTE_SLA_HOURS * 3_600_000),
-      },
-      select: { id: true, disputeId: true },
+    const walletEnabled = this.walletMode.isWalletEnabled();
+    // Serial ledger Redis tidak ikut rollback — alokasikan sebelum tx.
+    const freezeTxSerial = walletEnabled ? await this.serial.getNext() : null;
+    const dispute = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM orders WHERE id = ${ret.orderId} FOR UPDATE`;
+      const order = await tx.order.findFirst({
+        where: { id: ret.orderId, deletedAt: null },
+        select: { id: true, orderId: true, status: true, sellerId: true, sellerReceiveAmount: true },
+      });
+      if (!order) {
+        throw new NotFoundException({ code: ErrorCodes.ORDER_NOT_FOUND, message: 'Order retur tidak ditemukan.' });
+      }
+      // Dispute.orderId unik — bila balapan dengan konversi/sengketa lain, tautkan saja.
+      const raced = await tx.dispute.findUnique({ where: { orderId: ret.orderId }, select: { id: true, disputeId: true } });
+      if (raced) return raced;
+
+      const created = await tx.dispute.create({
+        data: {
+          disputeId: generateDisputeId(serial),
+          orderId: ret.orderId,
+          // Retur selalu diajukan pembeli — inisiator konversi dicatat sebagai buyer.
+          initiatedBy: 'BUYER',
+          initiatorUserId: ret.buyerId,
+          buyerClaim: `Dikonversi dari retur ${ret.returnId} oleh admin. Alasan retur: ${ret.reasonCode}${ret.reasonDetail ? ` — ${ret.reasonDetail}` : ''}`.slice(0, 2000),
+          buyerClaimedAt: now,
+          status: 'OPEN',
+          slaHours: DISPUTE_SLA_HOURS,
+          slaDeadlineAt: new Date(now.getTime() + DISPUTE_SLA_HOURS * 3_600_000),
+        },
+        select: { id: true, disputeId: true },
+      });
+
+      // K4: order → DISPUTED (dari COMPLETED; retur hanya bisa diajukan untuk
+      // order selesai). Predikat status = guard balapan.
+      const orderUpdated = await tx.order.updateMany({
+        where: { id: order.id, status: { in: [OrderStatus.COMPLETED, OrderStatus.IN_DELIVERY, OrderStatus.PROCESSING] } },
+        data: { status: OrderStatus.DISPUTED, disputedAt: now },
+      });
+      if (orderUpdated.count === 0) {
+        throw new BadRequestException({
+          code: ErrorCodes.INVALID_ORDER_STATUS,
+          message: `Order ${order.orderId} berstatus ${order.status} — tidak dapat dikonversi menjadi sengketa.`,
+        });
+      }
+      await tx.orderStatusHistory.create({
+        data: {
+          orderId: order.id,
+          fromStatus: order.status,
+          toStatus: OrderStatus.DISPUTED,
+          changedBy: adminId,
+          changedByType: ActorType.ADMIN,
+          reason: `Retur ${ret.returnId} dikonversi menjadi sengketa ${created.disputeId}`,
+        },
+      });
+
+      // Mode wallet + pasca-completion: bekukan dana seller (pola submitDispute)
+      // agar resolveDispute pasca-completion bisa mengeksekusi putusan.
+      if (walletEnabled && order.status === OrderStatus.COMPLETED && freezeTxSerial !== null) {
+        const freezeAmount = order.sellerReceiveAmount;
+        const sellerWalletLookup = await tx.wallet.findUnique({ where: { userId: order.sellerId }, select: { id: true } });
+        if (!sellerWalletLookup) {
+          throw new ConflictException({ code: 'POST_COMPLETION_FREEZE_FAILED', message: 'Wallet seller tidak tersedia; sengketa tidak dibuat.' });
+        }
+        await tx.$queryRaw`SELECT id FROM wallets WHERE id = ${sellerWalletLookup.id} FOR UPDATE`;
+        const sellerWallet = await tx.wallet.findUnique({ where: { id: sellerWalletLookup.id } });
+        if (!sellerWallet || sellerWallet.isLocked || sellerWallet.availableBalance < freezeAmount) {
+          throw new ConflictException({ code: 'POST_COMPLETION_FREEZE_FAILED', message: 'Dana seller tidak dapat diamankan untuk sengketa ini; sengketa tidak dibuat.' });
+        }
+        const frozen = await tx.wallet.updateMany({
+          where: { id: sellerWallet.id, version: sellerWallet.version, availableBalance: { gte: freezeAmount }, isLocked: false },
+          data: { availableBalance: { decrement: freezeAmount }, escrowBalance: { increment: freezeAmount }, version: { increment: 1 } },
+        });
+        if (frozen.count === 0) {
+          throw new ConflictException({ code: 'POST_COMPLETION_FREEZE_FAILED', message: 'Dana seller berubah bersamaan; coba lagi.' });
+        }
+        await tx.walletTransaction.create({
+          data: {
+            txId: generateWalletTxId(freezeTxSerial),
+            walletId: sellerWallet.id,
+            type: WalletTransactionType.ORDER_LOCK,
+            status: WalletTransactionStatus.SUCCESS,
+            amount: freezeAmount,
+            balanceBefore: sellerWallet.availableBalance,
+            balanceAfter: sellerWallet.availableBalance - freezeAmount,
+            orderId: order.id,
+            description: `Post-completion dispute freeze (konversi retur ${ret.returnId}) for order ${order.orderId}`,
+          },
+        });
+      }
+      return created;
     });
     await this.db().returnRequest.update({ where: { id: ret.id }, data: { disputeId: dispute.id } });
     await this.logTimeline(ret.id, 'RETURN_CONVERTED_TO_DISPUTE', {
@@ -822,6 +912,8 @@ export class ReturnsService {
     const limit = Math.min(query.limit ?? 20, 100);
     const where: Record<string, unknown> = {};
     if (query.status && query.status !== 'ALL') where.status = query.status;
+    // Audit 2026-10-10: filter tipe transaksi server-side (relasi order).
+    if (query.kind) where.order = { orderKind: query.kind };
     if (query.minAgeHours !== undefined || query.maxAgeHours !== undefined) {
       const now = Date.now();
       const createdAt: Record<string, Date> = {};
@@ -845,12 +937,17 @@ export class ReturnsService {
     ]);
     // BAI-049 (P1): status refund DANA untuk tiap retur — batch agar tidak N+1.
     const refundMap = await this.refundDanaMap(items.map((r) => r.id));
+    // Audit 2026-10-10: ringkasan order (tipe transaksi, judul, nominal) —
+    // admin memakai `orderKind` untuk badge/filter; sebelumnya tidak dikirim.
+    const orderMap = await this.orderSummaryMap(items.map((r) => r.orderId));
     const now = Date.now();
     return {
       items: items.map((r) => ({
         ...this.toListItem(r),
         ageHours: Math.floor((now - r.createdAt.getTime()) / 3_600_000),
         refundDana: refundMap.get(r.id) ?? null,
+        orderKind: orderMap.get(r.orderId)?.orderKind ?? null,
+        order: orderMap.get(r.orderId) ?? null,
       })),
       page, limit, total, totalPages: Math.ceil(total / limit),
     };
@@ -884,6 +981,29 @@ export class ReturnsService {
     return map;
   }
 
+  /** Audit 2026-10-10: ringkasan order per retur (batch, tanpa N+1). */
+  private async orderSummaryMap(orderDbIds: string[]): Promise<
+    Map<string, { id: string; orderId: string; title: string | null; orderKind: string; buyerPayAmount: string }>
+  > {
+    const map = new Map<string, { id: string; orderId: string; title: string | null; orderKind: string; buyerPayAmount: string }>();
+    const ids = Array.from(new Set(orderDbIds.filter((id): id is string => typeof id === 'string' && id.length > 0)));
+    if (ids.length === 0) return map;
+    const orders = (await this.prisma.order.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, orderId: true, title: true, orderKind: true, buyerPayAmount: true },
+    })) ?? [];
+    for (const o of orders) {
+      map.set(o.id, {
+        id: o.id,
+        orderId: o.orderId,
+        title: o.title ?? null,
+        orderKind: String(o.orderKind),
+        buyerPayAmount: o.buyerPayAmount.toString(),
+      });
+    }
+    return map;
+  }
+
   /** BAI-049: versi single-item untuk detail/aksi admin. */
   private async refundDanaFor(returnDbId: string): Promise<RefundDanaInfo> {
     const attempt = await this.prisma.danaRefundAttempt.findUnique({
@@ -906,6 +1026,7 @@ export class ReturnsService {
     returnDbId: string,
     adminId: string,
     dto: AdminReturnActionDto,
+    stepUpToken?: string,
   ): Promise<ReturnRequestRow & { refundDana: RefundDanaInfo; notificationDelivered?: boolean; needsManualConversion?: boolean }> {
     const ret = await this.mustFind(returnDbId);
     // BAI-083: guard method-level kini mencakup CUSTOMER_SUPPORT agar
@@ -920,6 +1041,20 @@ export class ReturnsService {
           message: 'Aksi ini (keuangan) hanya boleh dilakukan SUPER_ADMIN / DISPUTE_ADMIN.',
         });
       }
+      // Audit 2026-10-10: aksi uang wajib step-up server-side (SEC-503) —
+      // token sekali pakai terikat aksi + id retur. Fail-closed bila layanan
+      // step-up tidak tersedia.
+      if (!this.stepUp) {
+        throw new ForbiddenException({
+          code: ErrorCodes.STEP_UP_REQUIRED,
+          message: 'Verifikasi ulang (step-up) wajib untuk aksi keuangan retur, tetapi layanan step-up tidak tersedia.',
+        });
+      }
+      await this.stepUp.consumeStepUpToken(stepUpToken, {
+        adminId,
+        action: ReturnsService.MONEY_ACTION_STEP_UP,
+        targetId: returnDbId,
+      });
     }
     let result: ReturnRequestRow;
     let notificationDelivered: boolean | undefined;

@@ -157,6 +157,55 @@ describe('FeeCalculatorService', () => {
       expect(result.buyerFeeAmount + result.sellerFeeAmount).toBe(result.feeAmount);
     });
 
+    // K5 (audit transaksi 2026-10-10): fee persen atas orderValue sembarang
+    // menghasilkan sen pecahan rupiah → sellerReceiveAmount SELLER/SPLIT tidak
+    // bisa dicairkan DANA (INVALID_AMOUNT_SEN). Semua nominal wajib rupiah utuh.
+    describe('K5 whole-rupiah rounding', () => {
+      const isWholeRupiah = (sen: bigint) => sen % BigInt(100) === BigInt(0);
+
+      it('rounds a fractional-rupiah standard fee (Rp100.001 × 2,5%) to whole rupiah', () => {
+        const result = service.calculateFee({ orderValue: 100_001, feeResponsibility: 'SELLER', isKahadePlus: false });
+        // 100_001 × 2,5% = 2500,025 → Rp2.500 → 250_000 sen
+        expect(result.feeAmount).toBe(BigInt(250_000));
+        expect(isWholeRupiah(result.sellerReceiveAmount)).toBe(true);
+        expect(result.sellerReceiveAmount).toBe(BigInt(100_001) * BigInt(100) - BigInt(250_000));
+      });
+
+      it('keeps buyerPayAmount and sellerReceiveAmount whole rupiah for SPLIT with an odd-rupiah fee', () => {
+        // 100_020 × 2,5% = 2500,5 → Rp2.501 (half-up) → split 1250 / 1251
+        const result = service.calculateFee({ orderValue: 100_020, feeResponsibility: 'SPLIT', isKahadePlus: false });
+        expect(result.feeAmount).toBe(BigInt(250_100));
+        expect(result.buyerFeeAmount).toBe(BigInt(125_000));
+        expect(result.sellerFeeAmount).toBe(BigInt(125_100));
+        expect(isWholeRupiah(result.buyerPayAmount)).toBe(true);
+        expect(isWholeRupiah(result.sellerReceiveAmount)).toBe(true);
+      });
+
+      it('rounds Kahade Plus fee and membership-rank discount to whole rupiah', () => {
+        // 123_457 × 0,5% = 617,285 → Rp617; GOLD 5% of 617 = 30,85 → Rp31
+        const result = service.calculateFee({
+          orderValue: 123_457,
+          feeResponsibility: 'SELLER',
+          isKahadePlus: true,
+          membershipRank: MembershipRank.GOLD,
+        });
+        expect(result.membershipRankDiscount).toBe(BigInt(3_100));
+        expect(result.feeAmount).toBe(BigInt(61_700) - BigInt(3_100));
+        expect(isWholeRupiah(result.sellerReceiveAmount)).toBe(true);
+      });
+
+      it('never produces fractional-rupiah seller amounts across a sweep of order values', () => {
+        for (let v = 1; v < 5_000; v += 7) {
+          for (const resp of ['BUYER', 'SELLER', 'SPLIT'] as const) {
+            const r = service.calculateFee({ orderValue: v, feeResponsibility: resp, isKahadePlus: v % 2 === 0 });
+            expect(isWholeRupiah(r.sellerReceiveAmount)).toBe(true);
+            expect(isWholeRupiah(r.buyerPayAmount)).toBe(true);
+            expect(r.buyerFeeAmount + r.sellerFeeAmount).toBe(r.feeAmount);
+          }
+        }
+      });
+    });
+
     it('should clamp very large order value to MAX fee of Rp 250.000', () => {
       const result = service.calculateFee({ orderValue: 1_000_000_000, feeResponsibility: 'BUYER', isKahadePlus: false });
       // 2.5% of 1B = Rp 25.000.000, clamped DOWN to Rp 250.000 = 25_000_000 sen

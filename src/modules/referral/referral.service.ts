@@ -12,6 +12,7 @@ import {
   OrderStatus,
   MembershipRank,
   EscrowDisbursementScope,
+  NotificationType,
 } from '@prisma/client';
 import { generateWalletTxId, generateReferralCode } from '../../common/utils/id-generator.util';
 import { WalletTxSerialService } from '../../common/services/wallet-tx-serial.service';
@@ -22,6 +23,10 @@ import { REFERRAL_LEADERBOARD_CACHE } from '../../common/constants/redis-keys';
 // M4 no-wallet: payout referral via disbursement DANA bila wallet mati.
 import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { EscrowDisbursementService } from '../no-wallet/escrow-disbursement.service';
+// Audit referral 2026-10-10: B13 notifikasi reward, B18 deteksi lonjakan bersama.
+import { NotificationQueueService } from '../queue/notification-queue.service';
+import { renderNotificationCopy, resolveNotificationLanguage } from '../notifications/notification-copy.service';
+import { flagReferralBurstIfNeeded } from '../../common/utils/referral-burst.util';
 
 const REFERRAL_REWARD_TIERS: Record<MembershipRank, bigint> = {
   BRONZE: BigInt(500_000),
@@ -30,8 +35,6 @@ const REFERRAL_REWARD_TIERS: Record<MembershipRank, bigint> = {
   PLATINUM: BigInt(1_500_000),
   DIAMOND: BigInt(1_500_000),
 };
-const REFERRAL_BURST_THRESHOLD = 5;
-const REFERRAL_BURST_WINDOW_SECONDS = 24 * 60 * 60;
 const REFERRAL_LEADERBOARD_TTL = 900;
 
 @Injectable()
@@ -46,39 +49,21 @@ export class ReferralService {
     // M4 no-wallet: opsional agar modul lama tanpa wiring tetap jalan (fail-closed di pemakaian).
     @Optional() private walletMode: WalletModeService | null,
     @Optional() private disbursement: EscrowDisbursementService | null,
+    // B13: opsional agar konstruksi manual di spec lama tetap jalan.
+    @Optional() private notificationQueue: NotificationQueueService | null,
   ) {}
 
   private getRewardAmountForRank(rank: MembershipRank): bigint {
     return REFERRAL_REWARD_TIERS[rank] ?? REFERRAL_REWARD_TIERS.BRONZE;
   }
 
+  /** B18: logika dipusatkan di util bersama (dipakai juga oleh registrasi). */
   private async flagReferralBurstIfNeeded(referrerId: string, relationId: string): Promise<void> {
-    const key = `referral:relations_24h:${referrerId}`;
-    const redisCount = await this.redis.incrWithTtl(key, REFERRAL_BURST_WINDOW_SECONDS).catch((error: unknown) => {
-      this.logger.warn(`Referral burst Redis counter failed for referrer=${referrerId}: ${error instanceof Error ? error.message : String(error)}`);
-      return null;
-    });
-    const cutoff = new Date(Date.now() - REFERRAL_BURST_WINDOW_SECONDS * 1000);
-    const dbCount = await this.prisma.referralRelation.count({
-      where: { referrerId, appliedAt: { gte: cutoff } },
-    });
-    if ((redisCount ?? 0) < REFERRAL_BURST_THRESHOLD && dbCount < REFERRAL_BURST_THRESHOLD) return;
-    await this.prisma.referralRelation.updateMany({
-      where: { referrerId, appliedAt: { gte: cutoff }, flaggedForReview: false },
-      data: {
-        flaggedForReview: true,
-        flaggedForReviewAt: new Date(),
-        reviewReason: `Referrer received at least ${REFERRAL_BURST_THRESHOLD} new relations in 24 hours`,
-      },
-    });
-    await this.prisma.referralRelation.updateMany({
-      where: { id: relationId },
-      data: {
-        flaggedForReview: true,
-        flaggedForReviewAt: new Date(),
-        reviewReason: `Referrer received at least ${REFERRAL_BURST_THRESHOLD} new relations in 24 hours`,
-      },
-    });
+    await flagReferralBurstIfNeeded(
+      { prisma: this.prisma, redis: this.redis, logger: this.logger },
+      referrerId,
+      relationId,
+    );
   }
 
   async refreshLeaderboard(limit = 50): Promise<Array<Record<string, unknown>>> {
@@ -97,10 +82,11 @@ export class ReferralService {
       _count: { _all: true },
     });
     const successfulByUser = new Map(relationCounts.map(row => [row.referrerId, row._count._all]));
+    // B15: `code` user lain TIDAK diekspos — bisa dipanen untuk membanjiri
+    // relasi (memicu flag review korban). FE tidak memakainya.
     const data = leaders.map((leader, index) => ({
       rank: index + 1,
       user: leader.user,
-      code: leader.code,
       totalReferrals: leader.totalReferrals,
       successfulReferrals: successfulByUser.get(leader.userId) ?? 0,
       totalRewardEarned: toIdr(leader.totalRewardEarned),
@@ -203,6 +189,24 @@ export class ReferralService {
             });
           }
 
+          // B19: program referral = "hadiah saat transaksi PERTAMA referee selesai"
+          // (createReferralRewardIfEligible mensyaratkan tepat 1 order selesai).
+          // Akun yang sudah pernah bertransaksi tidak akan pernah memenuhi syarat —
+          // dulu tetap boleh apply lalu tersangkut "Menunggu syarat" selamanya.
+          const applicant = await tx.user.findUnique({
+            where: { id: userId },
+            select: { totalOrdersCompleted: true },
+          });
+          if (!applicant) {
+            throw new NotFoundException({ code: ErrorCodes.USER_NOT_FOUND, message: 'User not found' });
+          }
+          if (applicant.totalOrdersCompleted > 0) {
+            throw new BadRequestException({
+              code: ErrorCodes.REFERRAL_NOT_NEW_USER,
+              message: 'Referral codes can only be applied by accounts without completed transactions',
+            });
+          }
+
           let currentReferrerId = referralCode.userId;
           const visited = new Set<string>([userId]);
           for (let depth = 0; depth < 10; depth++) {
@@ -270,6 +274,8 @@ export class ReferralService {
       where: { userId },
     });
 
+    // B16: batas kuota dari config, bukan hardcode 100.
+    const maxSlots = this.configService.get<number>('app.maxReferralsPerCode') ?? 100;
     if (!referralCode) {
       return {
         code: null,
@@ -277,12 +283,11 @@ export class ReferralService {
         successfulReferrals: 0,
         totalRewardEarned: 0,
         pendingRewardCount: 0,
-        remainingSlots: 100,
-        maxSlots: 100,
+        remainingSlots: maxSlots,
+        maxSlots,
       };
     }
 
-    const maxSlots = this.configService.get<number>('app.maxReferralsPerCode') ?? 100;
     const [totalReferrals, successfulReferrals, pendingRewardCount] = await Promise.all([
       this.prisma.referralRelation.count({
         where: { referrerId: userId },
@@ -324,12 +329,17 @@ export class ReferralService {
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         skip: (safePage - 1) * safeLimit,
         take: safeLimit,
+        // B23: bedakan reward pengundang vs bonus sambutan referee.
+        include: { relation: { select: { referrerId: true } } },
       }),
       this.prisma.referralReward.count({ where }),
     ]);
 
     const serialized = data.map(r => ({
       id: r.id,
+      // `referrerId` baris = PENERIMA reward (lihat creditReward); dibandingkan
+      // dengan referrer relasi untuk menentukan sisi.
+      kind: r.relation && r.relation.referrerId === r.referrerId ? 'REFERRER' : 'REFEREE',
       feeAmount: toIdr(r.feeAmount),
       rewardAmount: toIdr(r.rewardAmount),
       isCredited: r.isCredited,
@@ -423,9 +433,16 @@ export class ReferralService {
       this.prisma.referralRelation.count({ where }),
     ]);
 
+    // B14: whitelist — dulu `...rel` ikut membocorkan flaggedForReview,
+    // reviewReason, referralCodeId, dan id internal kedua pihak.
     const serialized = data.map(rel => ({
-      ...rel,
+      id: rel.id,
       viewerRole: rel.referrerId === userId ? 'REFERRER' : 'REFEREE',
+      referrer: rel.referrer,
+      referee: rel.referee,
+      isRewardActive: rel.isRewardActive,
+      appliedAt: rel.appliedAt,
+      rewardActivatedAt: rel.rewardActivatedAt,
       rewards: rel.rewards?.map(r => ({
         ...r,
         feeAmount: toIdr(r.feeAmount),
@@ -457,11 +474,23 @@ export class ReferralService {
 
     const order = await tx.order.findUnique({
       where: { id: orderId },
-      select: { status: true },
+      select: { status: true, buyerId: true, sellerId: true },
     });
     if (!order || order.status !== OrderStatus.COMPLETED) {
       this.logger.warn(
         `Referral reward skipped for order ${orderId}: order status is ${order?.status ?? 'NOT_FOUND'}, expected COMPLETED`,
+      );
+      return false;
+    }
+
+    // B12: transaksi antara referee dan pengundangnya sendiri tidak memicu
+    // reward — A mengajak B lalu A↔B bertransaksi fee minimum Rp2.500 akan
+    // membayar 2×Rp5.000 (rugi bersih platform). Transaksi pertama referee
+    // harus dengan pihak ketiga.
+    const counterpartId = order.buyerId === userId ? order.sellerId : order.buyerId;
+    if (counterpartId && counterpartId === relation.referrerId) {
+      this.logger.warn(
+        `Referral reward skipped for order ${orderId}: counterpart is the referrer ${relation.referrerId} (self-dealing)`,
       );
       return false;
     }
@@ -671,6 +700,40 @@ export class ReferralService {
     });
 
     return true;
+  }
+
+  /**
+   * B13: notifikasi REFERRAL_REWARD_RECEIVED untuk semua penerima reward yang
+   * dipicu order ini. Dipanggil POST-COMMIT oleh ketiga jalur completion
+   * (buyer confirm, auto-complete, admin force-complete) — template sudah ada
+   * di notification-copy.service.ts tetapi tidak pernah di-enqueue. Best-effort.
+   */
+  async notifyRewardsForOrder(orderPublicId: string): Promise<void> {
+    if (!this.notificationQueue) return;
+    try {
+      const rewards = await this.prisma.referralReward.findMany({
+        where: { triggeredByOrder: { orderId: orderPublicId } },
+        select: { referrerId: true, rewardAmount: true },
+      });
+      for (const reward of rewards) {
+        const copy = renderNotificationCopy(
+          NotificationType.REFERRAL_REWARD_RECEIVED,
+          await resolveNotificationLanguage(this.prisma, reward.referrerId),
+          { amount: formatSen(reward.rewardAmount) },
+        );
+        await this.notificationQueue.enqueue({
+          userId: reward.referrerId,
+          type: NotificationType.REFERRAL_REWARD_RECEIVED,
+          title: copy.title,
+          body: copy.body,
+          pushData: { type: 'REFERRAL_REWARD_RECEIVED', orderId: orderPublicId },
+        });
+      }
+    } catch (error: unknown) {
+      this.logger.warn(
+        `silent-catch: referral reward notification failed for order ${orderPublicId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   /**

@@ -3,9 +3,10 @@
  */
 import {
   IsString, IsNotEmpty, IsOptional, IsIn, IsInt, Min, Max, MaxLength,
-  IsArray, ArrayMaxSize, IsBoolean, Matches,
+  IsArray, ArrayMaxSize, IsBoolean, Matches, IsEnum,
 } from 'class-validator';
 import { Type } from 'class-transformer';
+import { OrderKind } from '@prisma/client';
 import type {
   ReturnReasonCode,
   ReturnRejectReasonCode,
@@ -180,6 +181,15 @@ export class ReturnQueueQueryDto {
   @IsOptional()
   @IsString()
   status?: string;
+
+  /**
+   * Filter tipe transaksi order (OrderKind) — server-side. Sebelumnya admin
+   * memfilter client-side dari field `orderKind` yang TIDAK dikirim backend
+   * sehingga memilih tipe apa pun mengosongkan tabel.
+   */
+  @IsOptional()
+  @IsEnum(OrderKind)
+  kind?: OrderKind;
 
   /** Filter umur kasus (jam). */
   @IsOptional()

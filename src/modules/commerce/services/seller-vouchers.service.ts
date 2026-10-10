@@ -2,7 +2,8 @@ import { Injectable, NotFoundException, BadRequestException, ConflictException }
 import { PrismaService } from '../../../prisma/prisma.service';
 import { Prisma, VoucherType } from '@prisma/client';
 import * as ErrorCodes from '../../../common/constants/error-codes';
-import { toIdr, toSen, formatSen } from '../../../common/utils/currency.util';
+import { toIdr, toSen, formatSen, percentToBpsBigInt } from '../../../common/utils/currency.util';
+import { FeeCalculatorService } from '../../orders/fee-calculator.service';
 import { createPaginatedResponse, PaginatedResponse } from '../../../common/dto/pagination.dto';
 import { CreateSellerVoucherDto, ValidateSellerVoucherDto } from '../dto/commerce.dto';
 
@@ -15,7 +16,12 @@ import { CreateSellerVoucherDto, ValidateSellerVoucherDto } from '../dto/commerc
  */
 @Injectable()
 export class SellerVouchersService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    // Audit voucher 2026-10-10 (B11): estimasi diskon harus memakai basis yang
+    // sama dengan create order (fee platform), bukan nilai order.
+    private feeCalculator: FeeCalculatorService,
+  ) {}
 
   private serialize(row: Record<string, unknown>) {
     return {
@@ -241,15 +247,25 @@ export class SellerVouchersService {
       throw new BadRequestException({ code: ErrorCodes.VOUCHER_USAGE_LIMIT_REACHED, message: 'Batas pemakaian per user tercapai' });
     }
     // Hitung estimasi diskon (tidak mengubah fee — hanya info untuk UI).
-    let discountIdr = 0;
+    // B11: voucher toko bertipe FEE_DISCOUNT_* memotong FEE PLATFORM, bukan
+    // nilai order — saat create order `calculateOrderVoucherBenefitSen`
+    // (orders.service) memakai basis fee standar. Dulu preview memakai nilai
+    // order: "Diskon Rp50.000" tampil, realisasinya Rp2.500. Cerminan rumus
+    // yang sama (basis poin, cap maxDiscountAmount, cap ke basis).
+    const feeConfig = await this.feeCalculator.getFeeConfig();
+    const feeBaseSen = this.feeCalculator.getStandardFeeSen(orderValueSen, feeConfig);
+    let discountSen = BigInt(0);
     if (voucher.voucherType === VoucherType.FEE_DISCOUNT_PERCENT && voucher.discountPercent !== null) {
-      const raw = (dto.orderValueIdr * Number(voucher.discountPercent)) / 100;
-      const capped =
-        voucher.maxDiscountAmount !== null ? Math.min(raw, toIdr(voucher.maxDiscountAmount)) : raw;
-      discountIdr = Math.floor(capped);
+      const percentBps = percentToBpsBigInt(voucher.discountPercent);
+      discountSen = (feeBaseSen * percentBps) / BigInt(10_000);
+      if (voucher.maxDiscountAmount !== null && discountSen > voucher.maxDiscountAmount) {
+        discountSen = voucher.maxDiscountAmount;
+      }
     } else if (voucher.discountAmount !== null) {
-      discountIdr = Math.min(toIdr(voucher.discountAmount), dto.orderValueIdr);
+      discountSen = voucher.discountAmount;
     }
+    if (discountSen > feeBaseSen) discountSen = feeBaseSen;
+    const discountIdr = toIdr(discountSen);
     return { valid: true, code: voucher.code, name: voucher.name, discountIdr };
   }
 }

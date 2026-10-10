@@ -71,6 +71,11 @@ describe('CourierService — admin Wave 2 (integritas-139)', () => {
         updateMany: jest.fn().mockResolvedValue({ count: 2 }),
       },
       shippingCostRefund: { create: jest.fn(), update: jest.fn() },
+      // A05: resolusi orderId publik (cuid internal → ORD-…).
+      order: {
+        findUnique: jest.fn().mockResolvedValue({ orderId: 'ORD-20261010-001' }),
+        findMany: jest.fn().mockResolvedValue([{ id: 'order-db-1', orderId: 'ORD-20261010-001' }]),
+      },
       $transaction: jest.fn(),
     };
 
@@ -198,14 +203,19 @@ describe('CourierService — admin Wave 2 (integritas-139)', () => {
       });
     };
 
-    it('menghitung diffSen di SQL + filter onlyMismatch + pagination DB', async () => {
+    it('menghitung diff (RUPIAH) di SQL + filter onlyMismatch + pagination DB', async () => {
       const rows = [
-        { shipmentId: 's1', orderId: 'o1', providerCode: 'jne', estimatedCostSen: '15000', actualCostSen: '16000', diffSen: '1000' },
+        { shipmentId: 's1', orderId: 'ORD-20261010-001', providerCode: 'jne', estimatedCost: '15000', actualCost: '16000', diff: '1000' },
       ];
       setupRecon(rows, 1);
       const res: any = await service.getShippingReconciliation({ page: 1, limit: 20 });
       expect(res.total).toBe(1);
-      expect(res.data[0]).toMatchObject({ shipmentId: 's1', diffSen: '1000' });
+      // A06: nama field rupiah (bukan *Sen) — admin tidak lagi membagi 100.
+      expect(res.data[0]).toMatchObject({ shipmentId: 's1', diff: '1000', estimatedCost: '15000' });
+      expect(res.data[0]).not.toHaveProperty('diffSen');
+      // A05: orderId publik di-join dari tabel orders.
+      const pageSqlJoin = String((prisma.$queryRaw.mock.calls[1][0] as { sql: string }).sql);
+      expect(pageSqlJoin).toMatch(/LEFT JOIN "orders"/);
       expect(res.totalPages).toBe(1);
       // COUNT + page query dijalankan paralel.
       expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
@@ -236,7 +246,7 @@ describe('CourierService — admin Wave 2 (integritas-139)', () => {
     it('nominal melebihi sisa biaya → 400, tanpa tulis refund', async () => {
       prisma.shipment.findUnique.mockResolvedValue(makeShipment({ actualCost: 16000n, refundedAmount: 12000n }));
       await expect(
-        service.approveShippingRefund('ship-1', { amountSen: 5000, reason: 'kelebihan ongkir' }, 'admin-1'),
+        service.approveShippingRefund('ship-1', { amount: 5000, reason: 'kelebihan ongkir' }, 'admin-1'),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(prisma.$transaction).not.toHaveBeenCalled();
     });
@@ -244,7 +254,7 @@ describe('CourierService — admin Wave 2 (integritas-139)', () => {
     it('valid → REQUESTED lalu APPROVED dalam satu transaksi, wallet tidak disentuh', async () => {
       prisma.shipment.findUnique.mockResolvedValue(makeShipment({ actualCost: 16000n, refundedAmount: 2000n }));
       const inner = setupTx();
-      const res: any = await service.approveShippingRefund('ship-1', { amountSen: 5000, reason: 'kelebihan ongkir' }, 'admin-1');
+      const res: any = await service.approveShippingRefund('ship-1', { amount: 5000, reason: 'kelebihan ongkir' }, 'admin-1');
       expect(inner.shippingCostRefund.create).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ status: ShippingRefundStatus.REQUESTED, amount: 5000n }) }),
       );
@@ -259,7 +269,7 @@ describe('CourierService — admin Wave 2 (integritas-139)', () => {
     it('shipment hilang → 404', async () => {
       prisma.shipment.findUnique.mockResolvedValue(null);
       await expect(
-        service.approveShippingRefund('nope', { amountSen: 1000, reason: 'alasan cukup panjang' }, 'admin-1'),
+        service.approveShippingRefund('nope', { amount: 1000, reason: 'alasan cukup panjang' }, 'admin-1'),
       ).rejects.toMatchObject({ status: 404 });
     });
   });

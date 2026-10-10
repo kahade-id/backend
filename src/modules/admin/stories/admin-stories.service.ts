@@ -15,7 +15,7 @@ import {
 import { PrismaService } from '../../../prisma/prisma.service';
 import { AuditLogService } from '../../../common/services/audit-log.service';
 import { UploadService } from '../../upload/upload.service';
-import { StoriesService } from '../../stories/stories.service';
+import { StoriesService, apiStoryKind } from '../../stories/stories.service';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 import { generateNotifId } from '../../../common/utils/id-generator.util';
 import { AdminStoryListQueryDto, AdminStoryReportListQueryDto } from './dto/admin-story-query.dto';
@@ -95,7 +95,14 @@ export class AdminStoriesService {
       }
       where.authorId = author.id;
     }
-    if (query.kind) where.kind = query.kind === 'image' ? StoryKind.IMAGE : StoryKind.TEXT;
+    if (query.kind) {
+      where.kind =
+        query.kind === 'image'
+          ? StoryKind.IMAGE
+          : query.kind === 'video'
+            ? StoryKind.VIDEO
+            : StoryKind.TEXT;
+    }
     if (query.from && query.to && Date.parse(query.from) > Date.parse(query.to)) {
       throw new BadRequestException({
         code: 'VALIDATION_ERROR',
@@ -180,12 +187,14 @@ export class AdminStoriesService {
         fullName: row.author.fullName,
         avatarUrl: row.author.avatarUrl,
       },
-      kind: row.kind === StoryKind.IMAGE ? 'image' : 'text',
+      kind: apiStoryKind(row.kind),
+      durationMs: row.durationMs,
       createdAt: row.createdAt.toISOString(),
       expiresAt: row.expiresAt.toISOString(),
       deletedAt: row.deletedAt?.toISOString() ?? null,
       hiddenAt: row.hiddenAt?.toISOString() ?? null,
       hiddenUntil: row.hiddenUntil?.toISOString() ?? null,
+      hiddenReason: row.hiddenReason,
       featureBanned:
         !!row.author.storyFeatureBan?.isActive &&
         (!row.author.storyFeatureBan.bannedUntil || row.author.storyFeatureBan.bannedUntil > now),
@@ -614,10 +623,20 @@ export class AdminStoriesService {
   }): Promise<object> {
     const snapshot = jsonRecord(report.storySnapshot) ?? {};
     const mediaKey = typeof snapshot.mediaKey === 'string' ? snapshot.mediaKey : null;
+    const thumbnailKey = typeof snapshot.thumbnailKey === 'string' ? snapshot.thumbnailKey : null;
     const mediaUrl = mediaKey
       ? await this.upload.generateDownloadUrl(mediaKey, 900).catch(() => null)
       : null;
-    const cleanSnapshot = { ...snapshot, mediaKey: undefined, mediaUrl };
+    const thumbnailUrl = thumbnailKey
+      ? await this.upload.generateDownloadUrl(thumbnailKey, 900).catch(() => null)
+      : null;
+    const cleanSnapshot = {
+      ...snapshot,
+      mediaKey: undefined,
+      thumbnailKey: undefined,
+      mediaUrl,
+      thumbnailUrl,
+    };
     return {
       id: report.id,
       storyId: report.storyId,

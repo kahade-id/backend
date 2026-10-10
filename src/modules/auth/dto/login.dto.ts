@@ -1,6 +1,7 @@
-import { IsString, IsNotEmpty, IsOptional, IsNumber, IsUUID, MaxLength, Min, Max } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsNumber, IsUUID, MaxLength, Min, Max, Matches, ValidateNested } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform, Type } from 'class-transformer';
+import { DEVICE_ID_MESSAGE, DEVICE_ID_PATTERN, normalizeDeviceId } from './device-id.validation';
 import { LocationDto } from './location.dto';
 
 export class LoginDto {
@@ -21,6 +22,9 @@ export class LoginDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(255)
+  // Audit Auth 2026-10-10 (#BE-22): pola & panjang deviceId disamakan dengan DTO OTP.
+  @Matches(DEVICE_ID_PATTERN, { message: DEVICE_ID_MESSAGE })
+  @Transform(({ value }: { value: unknown }) => normalizeDeviceId(value))
   deviceId!: string;
 
   @ApiPropertyOptional({ description: 'Device information (User-Agent)', maxLength: 512 })
@@ -43,6 +47,8 @@ export class LoginDto {
 
   @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional)', type: LocationDto })
   @IsOptional()
+  // Audit Auth 2026-10-10 (#BE-23): tanpa @ValidateNested, @Min/@Max LocationDto tidak dijalankan.
+  @ValidateNested()
   @Type(() => LocationDto)
   location?: LocationDto;
 }

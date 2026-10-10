@@ -2,7 +2,7 @@ import { Injectable, NotFoundException, BadRequestException, ConflictException, 
 import { randomInt } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { bcryptCompare } from '../../../common/utils/crypto.util';
-import { OrderStatus, AuditAction, Prisma, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType, DisputeStatus, PaymentProvider } from '@prisma/client';
+import { OrderStatus, AuditAction, Prisma, ActorType, WalletTransactionType, WalletTransactionStatus, NotificationType, DisputeStatus, PaymentProvider, PaymentPurpose, PaymentStatus, EscrowDisbursementScope, EscrowDisbursementStatus } from '@prisma/client';
 import { getCategoryForType } from '../../notifications/notification-category.map';
 // SYS-C-105: copy notifikasi mengikuti bahasa preferensi penerima.
 import { renderNotificationCopy, resolveNotificationLanguage } from '../../notifications/notification-copy.service';
@@ -466,19 +466,53 @@ export class AdminOrdersService {
     const buyerWallet = orderWithRelations.buyer?.wallet;
     const sellerWallet = orderWithRelations.seller?.wallet;
 
-    if (!buyerWallet || !sellerWallet) {
+    // Audit transaksi 2026-10-10 (force-complete no-wallet): di produksi
+    // (WALLET_ENABLED=false) order dibayar DANA-direct — tidak ada wallet
+    // maupun ledger ORDER_LOCK, sehingga force-complete selalu gagal
+    // (NOT_FOUND / ESCROW_LOCK_MISSING). Jalur no-wallet: selesaikan order +
+    // buat baris EscrowDisbursement PENDING di dalam tx (durable, pola
+    // completeOrder E1), cairkan ke bank seller post-commit (idempoten
+    // ORDER:<id>; cron retryDue menjemput bila gagal).
+    const walletEnabledForComplete = this.walletMode?.isWalletEnabled() ?? true;
+    const danaEscrowPayment = walletEnabledForComplete
+      ? null
+      : await this.prisma.paymentTransaction.findFirst({
+          where: {
+            orderId: order.id,
+            purpose: PaymentPurpose.ORDER_ESCROW,
+            provider: PaymentProvider.DANA,
+            status: PaymentStatus.SUCCESS,
+            danaPayKind: { not: null },
+          },
+          select: { id: true },
+        });
+    const noWalletPath = !walletEnabledForComplete && danaEscrowPayment !== null;
+    if (noWalletPath && !this.disbursement) {
+      throw new BadRequestException({
+        code: 'DISBURSEMENT_UNAVAILABLE',
+        message: 'Layanan disbursement DANA tidak tersedia — force-complete ditahan (fail-closed).',
+      });
+    }
+    if (!noWalletPath && (!buyerWallet || !sellerWallet)) {
       throw new BadRequestException({ code: ErrorCodes.NOT_FOUND, message: 'Buyer or seller wallet not found' });
     }
 
-    const releaseTxSerial = order.buyerPayAmount > BigInt(0)
+    const releaseTxSerial = !noWalletPath && order.buyerPayAmount > BigInt(0)
       ? await this.walletTxSerialService.getNext()
       : 0;
-    const receiveTxSerial = order.buyerPayAmount > BigInt(0)
+    const receiveTxSerial = !noWalletPath && order.buyerPayAmount > BigInt(0)
       ? await this.walletTxSerialService.getNext()
       : 0;
-    const feeTxSerial = order.feeAmount > BigInt(0)
+    const feeTxSerial = !noWalletPath && order.feeAmount > BigInt(0)
       ? await this.walletTxSerialService.getNext()
       : null;
+    type ForceCompleteCashbackPlan = {
+      cashbackResult: Awaited<ReturnType<typeof creditCashbackIfEligible>> | null;
+      danaCashback: {
+        params: { orderDbId: string; orderPublicId: string; source: string };
+        intent: NonNullable<Awaited<ReturnType<typeof planDanaCashback>>>;
+      } | null;
+    };
 
     // SP-047: tandai bila referral reward dikreditkan agar cache leaderboard
     // diinvalidasi setelah tx commit.
@@ -492,23 +526,29 @@ export class AdminOrdersService {
         throw new ConflictException({ code: ErrorCodes.INVALID_ORDER_STATUS, message: 'Order status changed concurrently' });
       }
 
-      const escrowLock = await tx.walletTransaction.findFirst({
-        where: { orderId: order.id, type: WalletTransactionType.ORDER_LOCK, status: WalletTransactionStatus.SUCCESS },
-        select: { amount: true },
-      });
-      if (!escrowLock || escrowLock.amount !== order.buyerPayAmount) {
-        throw new ConflictException({ code: ErrorCodes.ESCROW_LOCK_MISSING, message: 'Escrow lock ledger is missing or does not match this order' });
-      }
+      let freshBuyerWallet!: NonNullable<Awaited<ReturnType<typeof tx.wallet.findUnique>>>;
+      let freshSellerWallet!: NonNullable<Awaited<ReturnType<typeof tx.wallet.findUnique>>>;
+      if (!noWalletPath) {
+        const escrowLock = await tx.walletTransaction.findFirst({
+          where: { orderId: order.id, type: WalletTransactionType.ORDER_LOCK, status: WalletTransactionStatus.SUCCESS },
+          select: { amount: true },
+        });
+        if (!escrowLock || escrowLock.amount !== order.buyerPayAmount) {
+          throw new ConflictException({ code: ErrorCodes.ESCROW_LOCK_MISSING, message: 'Escrow lock ledger is missing or does not match this order' });
+        }
 
-      const [firstWalletId, secondWalletId] = [buyerWallet.id, sellerWallet.id].sort();
-      await tx.$queryRaw`SELECT id FROM wallets WHERE id IN (${firstWalletId}, ${secondWalletId}) ORDER BY id FOR UPDATE`;
-      const freshBuyerWallet = await tx.wallet.findUnique({ where: { id: buyerWallet.id } });
-      const freshSellerWallet = await tx.wallet.findUnique({ where: { id: sellerWallet.id } });
-      if (!freshBuyerWallet || !freshSellerWallet) {
-        throw new BadRequestException({ code: ErrorCodes.NOT_FOUND, message: 'Buyer or seller wallet not found during force-complete' });
-      }
-      if (freshBuyerWallet.isLocked || freshSellerWallet.isLocked) {
-        throw new ForbiddenException({ code: 'WALLET_LOCKED', message: 'A participant wallet is locked; force-complete is deferred.' });
+        const [firstWalletId, secondWalletId] = [buyerWallet!.id, sellerWallet!.id].sort();
+        await tx.$queryRaw`SELECT id FROM wallets WHERE id IN (${firstWalletId}, ${secondWalletId}) ORDER BY id FOR UPDATE`;
+        const lockedBuyerWallet = await tx.wallet.findUnique({ where: { id: buyerWallet!.id } });
+        const lockedSellerWallet = await tx.wallet.findUnique({ where: { id: sellerWallet!.id } });
+        if (!lockedBuyerWallet || !lockedSellerWallet) {
+          throw new BadRequestException({ code: ErrorCodes.NOT_FOUND, message: 'Buyer or seller wallet not found during force-complete' });
+        }
+        if (lockedBuyerWallet.isLocked || lockedSellerWallet.isLocked) {
+          throw new ForbiddenException({ code: 'WALLET_LOCKED', message: 'A participant wallet is locked; force-complete is deferred.' });
+        }
+        freshBuyerWallet = lockedBuyerWallet;
+        freshSellerWallet = lockedSellerWallet;
       }
 
       await tx.orderStatusHistory.create({
@@ -535,7 +575,35 @@ export class AdminOrdersService {
         data: { status: 'ACCEPTED', reviewedAt: new Date() },
       });
 
-      if (order.buyerPayAmount > BigInt(0)) {
+      let cashbackPlan: ForceCompleteCashbackPlan = { cashbackResult: null, danaCashback: null };
+      if (noWalletPath) {
+        // Fail-closed: tanpa sellerReceiveAmount valid, jangan cairkan apa pun.
+        if (order.sellerReceiveAmount == null || order.sellerReceiveAmount <= BigInt(0)) {
+          throw new BadRequestException({
+            code: 'ORDER_NOT_RELEASE_ELIGIBLE',
+            message: 'Nominal pencairan escrow tidak valid — force-complete ditahan (fail-closed).',
+          });
+        }
+        // K6: jejak durable pergerakan dana dibuat DI DALAM tx status — tidak
+        // ada jalan uang bergerak (atau gagal bergerak) tanpa baris ledger.
+        const disbKey = `ORDER:${order.id}`;
+        const existingDisb = await tx.escrowDisbursement.findUnique({ where: { idempotencyKey: disbKey }, select: { id: true } });
+        if (!existingDisb) {
+          await tx.escrowDisbursement.create({
+            data: {
+              idempotencyKey: disbKey,
+              scope: EscrowDisbursementScope.ORDER_ESCROW,
+              orderId: order.id,
+              sellerId: order.sellerId,
+              amountSen: order.sellerReceiveAmount,
+              status: EscrowDisbursementStatus.PENDING,
+            },
+          });
+        }
+        const params = { orderDbId: order.id, orderPublicId: order.orderId, source: 'force-complete' };
+        const intent = await planDanaCashback(tx, params);
+        cashbackPlan = { cashbackResult: null, danaCashback: intent ? { params, intent } : null };
+      } else if (order.buyerPayAmount > BigInt(0)) {
         const buyerUpdated = await tx.wallet.updateMany({
           where: { id: freshBuyerWallet.id, version: freshBuyerWallet.version, escrowBalance: { gte: order.buyerPayAmount } },
           data: {
@@ -605,6 +673,9 @@ export class AdminOrdersService {
         // Batch 1-money (EO-005): cashback voucher juga dikredit pada force-complete —
         // sebelumnya hangus diam-diam.
         // M4 no-wallet: wallet mati -> rencanakan payout DANA (eksekusi post-tx).
+        // Audit 2026-10-10: blok ini dulu `return` lebih awal dari callback tx
+        // sehingga ledger FEE_DEDUCT, statistik user, kuota Plus, reward
+        // referral, dan rank TIDAK PERNAH ditulis pada force-complete.
         const walletEnabled = this.walletMode?.isWalletEnabled() ?? true;
         if (walletEnabled) {
           const cashbackResult = await creditCashbackIfEligible(tx, () => this.walletTxSerialService.getNext(), {
@@ -612,20 +683,21 @@ export class AdminOrdersService {
             orderPublicId: order.orderId,
             source: 'force-complete',
           });
-          return { cashbackResult, danaCashback: null };
+          cashbackPlan = { cashbackResult, danaCashback: null };
+        } else {
+          const params = { orderDbId: order.id, orderPublicId: order.orderId, source: 'force-complete' };
+          const intent = await planDanaCashback(tx, params);
+          cashbackPlan = { cashbackResult: null, danaCashback: intent ? { params, intent } : null };
         }
-        const params = { orderDbId: order.id, orderPublicId: order.orderId, source: 'force-complete' };
-        const intent = await planDanaCashback(tx, params);
-        return { cashbackResult: null, danaCashback: intent ? { params, intent } : null };
       }
 
-      if (order.feeAmount > BigInt(0) && feeTxSerial !== null) {
+      if (!noWalletPath && order.feeAmount > BigInt(0) && feeTxSerial !== null) {
         const feeBalanceBefore = freshBuyerWallet.totalBalance;
         const feeTxId = generateWalletTxId(feeTxSerial);
         await tx.walletTransaction.create({
           data: {
             txId: feeTxId,
-            walletId: buyerWallet.id,
+            walletId: freshBuyerWallet.id,
             type: WalletTransactionType.FEE_DEDUCT,
             status: WalletTransactionStatus.SUCCESS,
             amount: order.feeAmount,
@@ -686,10 +758,26 @@ export class AdminOrdersService {
 
       await this.membershipRankService.checkAndUpdateMembershipRank(tx, order.buyerId);
       await this.membershipRankService.checkAndUpdateMembershipRank(tx, order.sellerId);
+      return cashbackPlan;
     }), 'ADMIN_FORCE_COMPLETE_TX');
+
+    // Force-complete no-wallet: cairkan escrow ke bank seller post-commit.
+    // Baris PENDING sudah durable; kegagalan di sini dijemput cron retryDue.
+    if (noWalletPath && this.disbursement) {
+      try {
+        const release = await this.disbursement.releaseForOrder(order.id);
+        this.logger.log(`Admin force-complete no-wallet: release order ${order.orderId} → ${release.outcome}`);
+      } catch (err: unknown) {
+        this.logger.error(
+          `FORCE_COMPLETE_NO_WALLET_RELEASE_FAILED order=${order.orderId}: ${err instanceof Error ? err.message : String(err)} — retry via cron retryDue`,
+        );
+      }
+    }
 
     if (referralRewardCredited) {
       await this.referralService.invalidateLeaderboardCache();
+      // B13: beri tahu penerima reward (post-commit, best-effort).
+      await this.referralService.notifyRewardsForOrder(orderId);
     }
 
     // R2-B (audit): forceComplete consumes the buyer's Plus fee-savings quota; the

@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException } from '@nestjs/common';
+import { HttpException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { OtpTriggerService } from '../otp-trigger.service';
 import { OtpTriggerPurpose } from '../dto/otp-trigger.dto';
@@ -11,7 +11,12 @@ import { OtpService } from '../otp.service';
 import { OtpGatewayService } from '../otp-gateway.service';
 import { TokenService } from '../token.service';
 import { AuthLocationService } from '../auth-location.service';
-import { OTP_TRIGGER } from '../../../common/constants/redis-keys';
+import {
+  OTP_TRIGGER,
+  OTP_TRIGGER_COOLDOWN,
+  OTP_TRIGGER_PHONE_IP_RATE,
+  OTP_TRIGGER_PHONE_RATE,
+} from '../../../common/constants/redis-keys';
 import { OtpType } from '@prisma/client';
 
 describe('OtpTriggerService', () => {
@@ -31,6 +36,8 @@ describe('OtpTriggerService', () => {
   const mockOtpGateway = {
     sendOtp: jest.fn(),
   };
+  const mockPrisma = { user: { findFirst: jest.fn() } };
+  const mockLocation = { logEvent: jest.fn() };
   const mockConfig = {
     get: jest.fn((key: string) => (key === 'FONNTE_WEBHOOK_SECRET' ? 'test-secret' : undefined)),
   };
@@ -56,12 +63,12 @@ describe('OtpTriggerService', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         OtpTriggerService,
-        { provide: PrismaService, useValue: { user: { findFirst: jest.fn() } } },
+        { provide: PrismaService, useValue: mockPrisma },
         { provide: RedisService, useValue: mockRedis },
         { provide: OtpService, useValue: mockOtpService },
         { provide: OtpGatewayService, useValue: mockOtpGateway },
         { provide: TokenService, useValue: {} },
-        { provide: AuthLocationService, useValue: { logEvent: jest.fn() } },
+        { provide: AuthLocationService, useValue: mockLocation },
         { provide: ConfigService, useValue: mockConfig },
         { provide: OpsSettingsService, useValue: mockOpsSettings },
       ],
@@ -92,13 +99,65 @@ describe('OtpTriggerService', () => {
       expect(result.expiresInSeconds).toBe(600);
     });
 
-    it('menolak bila cooldown nomor masih aktif', async () => {
+    it('menolak bila cooldown nomor masih aktif (429 + retryAfter, BE-20)', async () => {
       mockRedis.setNx.mockResolvedValue(false); // cooldown key sudah ada
 
-      await expect(service.createTrigger(baseDto, '127.0.0.1')).rejects.toThrow(
-        BadRequestException,
-      );
+      const err = (await service.createTrigger(baseDto, '127.0.0.1').catch(e => e)) as HttpException;
+      expect(err).toBeInstanceOf(HttpException);
+      expect(err.getStatus()).toBe(429);
+      expect((err.getResponse() as { retryAfter?: number }).retryAfter).toBe(60);
       expect(mockRedis.incrWithTtl).not.toHaveBeenCalled();
+    });
+
+    it('kuota pembuatan dikunci per nomor+IP, bukan per nomor murni (BE-18)', async () => {
+      mockRedis.setNx.mockResolvedValue(true);
+      mockRedis.incrWithTtl.mockResolvedValue(1);
+
+      await service.createTrigger(baseDto, '203.0.113.9');
+
+      const keys = mockRedis.incrWithTtl.mock.calls.map(([k]: string[]) => k);
+      expect(keys).toContain(OTP_TRIGGER_PHONE_IP_RATE('+6281234567890', '203.0.113.9'));
+      expect(keys).not.toContain(OTP_TRIGGER_PHONE_RATE('+6281234567890'));
+    });
+
+    it('kuota nomor+IP terlampaui → 429 dan cooldown TIDAK dilepas (BE-20)', async () => {
+      mockRedis.setNx.mockResolvedValue(true);
+      mockRedis.incrWithTtl.mockResolvedValueOnce(11);
+
+      const err = (await service.createTrigger(baseDto, '127.0.0.1').catch(e => e)) as HttpException;
+      expect(err).toBeInstanceOf(HttpException);
+      expect(err.getStatus()).toBe(429);
+      expect(mockRedis.del).not.toHaveBeenCalled();
+    });
+
+    it('error infrastruktur → cooldown dilepas agar user bisa coba lagi (BE-20)', async () => {
+      mockRedis.setNx.mockResolvedValue(true);
+      mockRedis.incrWithTtl.mockRejectedValueOnce(new Error('redis down'));
+
+      await expect(service.createTrigger(baseDto, '127.0.0.1')).rejects.toThrow('redis down');
+      expect(mockRedis.del).toHaveBeenCalledWith(
+        OTP_TRIGGER_COOLDOWN('+6281234567890', OtpTriggerPurpose.REGISTER),
+      );
+    });
+
+    it('forgot_password: lokasi trigger TIDAK diikat ke userId korban (BE-19)', async () => {
+      mockRedis.setNx.mockResolvedValue(true);
+      mockRedis.incrWithTtl.mockResolvedValue(1);
+      mockPrisma.user.findFirst.mockResolvedValue({
+        id: 'victim-1',
+        isActive: true,
+        isBanned: false,
+        lockedUntil: null,
+      });
+
+      await service.createTrigger(
+        { ...baseDto, purpose: OtpTriggerPurpose.FORGOT_PASSWORD, location: { latitude: -6.2, longitude: 106.8 } },
+        '127.0.0.1',
+      );
+
+      expect(mockLocation.logEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ event: 'otp_trigger', userId: null }),
+      );
     });
 
     it('menolak nomor non-Indonesia', async () => {
@@ -158,6 +217,24 @@ describe('OtpTriggerService', () => {
 
     beforeEach(() => {
       mockRedis.setNx.mockResolvedValue(true);
+      mockRedis.incrWithTtl.mockResolvedValue(1);
+    });
+
+    it('kuota per nomor murni dihitung di webhook; terlampaui → FAILED tanpa OTP (BE-18)', async () => {
+      mockRedis.get.mockResolvedValue(JSON.stringify(waitingRecord()));
+      mockRedis.incrWithTtl.mockResolvedValue(11);
+
+      await service.handleFonnteWebhook({
+        sender: '6281234567890',
+        message: 'KAHADE ABCDEF123456',
+        inboxid: 'inbox-quota',
+      });
+
+      expect(mockRedis.incrWithTtl).toHaveBeenCalledWith(OTP_TRIGGER_PHONE_RATE('+6281234567890'), 3600);
+      expect(mockOtpService.generatePhoneOtp).not.toHaveBeenCalled();
+      const setCalls = mockRedis.set.mock.calls.filter(([k]: string[]) => k === OTP_TRIGGER('ABCDEF123456'));
+      expect(setCalls).toHaveLength(1);
+      expect(JSON.parse(setCalls[0][1]).status).toBe('FAILED');
     });
 
     it('mengabaikan pesan tanpa kode trigger', async () => {

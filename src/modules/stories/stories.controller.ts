@@ -37,7 +37,7 @@ import { StoryViewersQueryDto } from './dto/story-query.dto';
 import { StoriesService } from './stories.service';
 import { StoryMediaTooLargeInterceptor } from './story-media-too-large.interceptor';
 import { StoryThrottle, StoryThrottleGuard } from './story-throttle.guard';
-import { STORY_MEDIA_MAX_BYTES } from './stories.constants';
+import { STORY_MEDIA_MULTER_MAX_BYTES } from './stories.constants';
 
 interface StoryMulterFile {
   originalname: string;
@@ -79,7 +79,7 @@ export class StoriesController {
   @StoryThrottle('media', 20, 60 * 60 * 1000)
   @UseInterceptors(
     StoryMediaTooLargeInterceptor,
-    FileInterceptor('file', { limits: { fileSize: STORY_MEDIA_MAX_BYTES } }),
+    FileInterceptor('file', { limits: { fileSize: STORY_MEDIA_MULTER_MAX_BYTES } }),
   )
   @ApiConsumes('multipart/form-data')
   @ApiBody({
@@ -89,22 +89,34 @@ export class StoriesController {
       properties: { file: { type: 'string', format: 'binary' } },
     },
   })
-  @ApiOperation({ summary: 'Unggah foto story ke penyimpanan disk privat' })
+  @ApiOperation({ summary: 'Unggah foto/video story ke penyimpanan disk privat' })
   @ApiCreatedResponse({
     schema: {
       type: 'object',
-      required: ['mediaId', 'url'],
-      properties: { mediaId: { type: 'string' }, url: { type: 'string', format: 'uri' } },
+      required: ['mediaId', 'url', 'kind'],
+      properties: {
+        mediaId: { type: 'string' },
+        url: { type: 'string', format: 'uri' },
+        kind: { type: 'string', enum: ['image', 'video'] },
+        thumbnailUrl: { type: 'string', format: 'uri', nullable: true },
+        durationMs: { type: 'integer', nullable: true },
+      },
     },
   })
   uploadMedia(
     @CurrentUser('sub') userId: string,
     @UploadedFile() file?: StoryMulterFile,
-  ): Promise<{ mediaId: string; url: string }> {
+  ): Promise<{
+    mediaId: string;
+    url: string;
+    kind: 'image' | 'video';
+    thumbnailUrl: string | null;
+    durationMs: number | null;
+  }> {
     if (!file)
       throw new BadRequestException({
         code: 'STORY_MEDIA_REQUIRED',
-        message: 'Foto story wajib diunggah.',
+        message: 'Media story wajib diunggah.',
       });
     return this.stories.uploadStoryMedia(userId, file.originalname, file.mimetype, file.buffer);
   }
@@ -113,7 +125,7 @@ export class StoriesController {
   @HttpCode(201)
   @UseGuards(StoryThrottleGuard)
   @StoryThrottle('create', 30, 60 * 60 * 1000)
-  @ApiOperation({ summary: 'Buat story foto atau teks dengan privasi per-story' })
+  @ApiOperation({ summary: 'Buat story foto, video, atau teks dengan privasi per-story' })
   createStory(@CurrentUser('sub') userId: string, @Body() dto: CreateStoryDto): Promise<object> {
     return this.stories.createStory(userId, dto);
   }

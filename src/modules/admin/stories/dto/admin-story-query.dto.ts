@@ -2,7 +2,7 @@ import { IsIn, IsOptional, IsString, MaxLength, IsDateString } from 'class-valid
 import { Transform } from 'class-transformer';
 import { PaginationDto } from '../../../../common/dto/pagination.dto';
 
-const STORY_KINDS = ['image', 'text'];
+const STORY_KINDS = ['image', 'video', 'text'];
 const STORY_STATUSES = ['all', 'active', 'expired', 'deleted', 'hidden', 'banned'];
 const REPORT_STATUSES = ['open', 'in_review', 'resolved_action', 'resolved_dismissed'];
 
@@ -14,7 +14,7 @@ export class AdminStoryListQueryDto extends PaginationDto {
 
   @IsOptional()
   @IsIn(STORY_KINDS)
-  kind?: 'image' | 'text';
+  kind?: 'image' | 'video' | 'text';
 
   @IsOptional()
   @IsIn(STORY_STATUSES)

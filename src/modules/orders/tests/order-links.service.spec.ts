@@ -587,7 +587,28 @@ describe('OrderLinksService — TRX-009 shipping address on order links', () => 
     );
   });
 
-  it('acceptLink: rejects when the link address no longer belongs to the buyer', async () => {
+  it('B03: link address deleted → falls back to the buyer\'s current default address', async () => {
+    mockPrisma.orderLink.findUnique.mockResolvedValue({
+      ...PHYSICAL_LINK,
+      creatorRole: 'BUYER',
+      shippingAddressId: 'addr-1',
+    });
+    mockPrisma.address.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ ...MOCK_ADDRESS, id: 'addr-default' });
+
+    await service.acceptLink('tok-1', 'acceptor', {});
+
+    expect(mockPrisma.address.findFirst).toHaveBeenNthCalledWith(2, {
+      where: { userId: 'creator', deletedAt: null },
+      orderBy: [{ isDefault: 'desc' }, { updatedAt: 'desc' }],
+    });
+    expect(mockPrisma.order.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ shippingAddressId: 'addr-default' }) }),
+    );
+  });
+
+  it('B03: rejects when the link address is gone and the buyer has no address left (fail-closed)', async () => {
     mockPrisma.orderLink.findUnique.mockResolvedValue({
       ...PHYSICAL_LINK,
       creatorRole: 'BUYER',
@@ -598,5 +619,14 @@ describe('OrderLinksService — TRX-009 shipping address on order links', () => 
     await expect(service.acceptLink('tok-1', 'acceptor', {})).rejects.toMatchObject({
       response: { code: 'SHIPPING_ADDRESS_REQUIRED' },
     });
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('B03: acceptor-as-buyer with a deleted address is still rejected (no silent fallback)', async () => {
+    mockPrisma.address.findFirst.mockResolvedValue(null);
+    await expect(service.acceptLink('tok-1', 'acceptor', { shippingAddressId: 'addr-gone' })).rejects.toMatchObject({
+      response: { code: 'SHIPPING_ADDRESS_REQUIRED' },
+    });
+    expect(mockPrisma.address.findFirst).toHaveBeenCalledTimes(1);
   });
 });

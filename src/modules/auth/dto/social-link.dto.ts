@@ -1,5 +1,7 @@
-import { IsString, IsNotEmpty, IsOptional, IsEnum } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsEnum, Matches, MaxLength } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Transform } from 'class-transformer';
+import { DEVICE_ID_MESSAGE, DEVICE_ID_PATTERN, normalizeDeviceId } from './device-id.validation';
 
 /**
  * GAP-A G013: tautkan Google/Apple dari akun yang sedang login.
@@ -73,10 +75,14 @@ export class ConfirmSocialLinkDto {
   @IsString()
   reauthToken?: string;
 
-  @ApiPropertyOptional({ description: 'Device ID untuk pelacakan sesi' })
-  @IsOptional()
+  // Audit Auth 2026-10-10 (#BE-30): deviceId WAJIB (lihat SocialLoginDto).
+  @ApiProperty({ description: 'Device ID untuk pelacakan sesi', maxLength: 255 })
   @IsString()
-  deviceId?: string;
+  @IsNotEmpty()
+  @Transform(({ value }: { value: unknown }) => normalizeDeviceId(value))
+  @Matches(DEVICE_ID_PATTERN, { message: DEVICE_ID_MESSAGE })
+  @MaxLength(255)
+  deviceId!: string;
 
   @ApiPropertyOptional({ description: 'Info perangkat (user-agent)' })
   @IsOptional()

@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
-import { EscrowDisbursementScope, PaymentProvider, PaymentPurpose, PaymentStatus } from '@prisma/client';
+import { EscrowDisbursementScope, EscrowDisbursementStatus, PaymentProvider, PaymentPurpose, PaymentStatus } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { sanitizeProviderError } from '../../common/utils/sanitize-provider-error';
 import { DanaDirectRefundService } from './dana-direct-refund.service';
@@ -21,6 +21,11 @@ export interface DisputeNoWalletSettlementResult {
   buyerRefundAlready: boolean;
   /** null bila porsi seller = 0 (tidak ada disbursement). */
   sellerDisbursement: ReleaseResult | null;
+  /**
+   * K2: true bila escrow order sudah pernah dicairkan ke seller (ORDER_ESCROW)
+   * sebelum putusan — porsi seller TIDAK dicairkan lagi (sudah di tangan seller).
+   */
+  sellerAlreadyPaid: boolean;
 }
 
 export interface ClaimAndSettleIntentInput {
@@ -68,14 +73,40 @@ export class DisputeDanaSettlementService {
     if (!order) {
       throw new BadRequestException({ code: 'ORDER_NOT_FOUND', message: 'Order not found' });
     }
-    if (order.completedAt !== null) {
-      // Fail-closed: dana sudah cair ke seller. Keputusan operasional/finance
+    // K2 (audit 2026-10-10): "pasca-completion" TIDAK boleh dibaca dari
+    // order.completedAt — tx putusan FULL_SELLER/SPLIT & mutual resolution
+    // menulis completedAt SEBELUM settlement dijalankan, sehingga semua
+    // putusan itu ditolak di sini dan uang tidak pernah bergerak. Bukti yang
+    // benar bahwa dana sudah cair ke seller = baris EscrowDisbursement
+    // ORDER_ESCROW untuk order ini (dibuat di tx completeOrder/auto-complete,
+    // status apa pun selain CANCELLED — PENDING/HELD pun bisa di-retry cron
+    // dan akan membayar seller).
+    const priorRelease = await this.prisma.escrowDisbursement.findFirst({
+      where: {
+        orderId: input.orderDbId,
+        scope: EscrowDisbursementScope.ORDER_ESCROW,
+        status: { not: EscrowDisbursementStatus.CANCELLED },
+      },
+      select: { id: true, status: true },
+    });
+    const sellerAlreadyPaid = priorRelease !== null;
+    if (sellerAlreadyPaid && input.buyerAmountSen > BigInt(0)) {
+      // Fail-closed: dana sudah cair ke seller. Refund provider akan membayar
+      // dari kas platform tanpa clawback — keputusan operasional/finance
       // diperlukan sebelum platform menalangi dari kas sendiri.
       throw new BadRequestException({
         code: 'DISPUTE_POST_COMPLETION_MANUAL_REVIEW',
         message:
           'Post-completion dispute in no-wallet mode requires manual review — funds already disbursed to seller',
       });
+    }
+    if (sellerAlreadyPaid) {
+      // Porsi buyer 0 (FULL_SELLER pasca-completion): seller sudah menerima
+      // dana lewat ORDER_ESCROW — tidak ada yang perlu digerakkan.
+      this.logger.log(
+        `Dispute ${input.disputeDbId}: pasca-completion, buyer=0 — seller sudah dibayar via disbursement ${priorRelease!.id} (${priorRelease!.status}); tidak ada pergerakan dana`,
+      );
+      return { buyerRefunded: false, buyerRefundAlready: false, sellerDisbursement: null, sellerAlreadyPaid: true };
     }
 
     const payment = await this.prisma.paymentTransaction.findFirst({
@@ -137,7 +168,7 @@ export class DisputeDanaSettlementService {
       );
     }
 
-    return { buyerRefunded, buyerRefundAlready, sellerDisbursement };
+    return { buyerRefunded, buyerRefundAlready, sellerDisbursement, sellerAlreadyPaid: false };
   }
 
   /**

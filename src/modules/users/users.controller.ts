@@ -806,8 +806,9 @@ export class UsersController {
     @CurrentUser('sub') viewerId: string | null,
     @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
     @Query('limit', new DefaultValuePipe(20), ParseIntPipe, new ClampLimitPipe()) limit: number,
+    @Query('search', new ParseQueryStringPipe('search', 100)) search?: string,
   ): Promise<object> {
-    return this.usersService.getFollowing(username, page, limit, viewerId);
+    return this.usersService.getFollowing(username, page, limit, viewerId, search);
   }
 
   @Public()

@@ -12,6 +12,29 @@ const FEE_CONFIG_TTL = 300;
 const FEE_CONFIG_LOCK_TTL = 5;
 const MEMBERSHIP_RANK_FEE_DISCOUNT_CONFIG_KEY = 'membership_rank_fee_discount_bps';
 
+const SEN_PER_RUPIAH = BigInt(100);
+
+/**
+ * K5 (audit transaksi 2026-10-10): bulatkan nominal sen ke RUPIAH UTUH
+ * (kelipatan 100 sen), half-up. Fee persen (2,5% / 0,5% / diskon rank bps)
+ * atas orderValue sembarang menghasilkan sen pecahan rupiah (mis. Rp100.001
+ * × 2,5% = 2500,025 → 250002 sen = Rp2.500,02). Untuk feeResponsibility
+ * SELLER/SPLIT nilai itu masuk ke sellerReceiveAmount → disbursement DANA
+ * (transfer bank, rupiah utuh) menolak INVALID_AMOUNT_SEN dan seller TIDAK
+ * PERNAH dibayar. Semua komponen fee dibulatkan ke rupiah agar
+ * buyerPayAmount / sellerReceiveAmount selalu rupiah utuh.
+ */
+export function roundSenToRupiah(sen: bigint): bigint {
+  if (sen <= BigInt(0)) return BigInt(0);
+  return ((sen + BigInt(50)) / SEN_PER_RUPIAH) * SEN_PER_RUPIAH;
+}
+
+/** K5: bulatkan ke bawah ke rupiah utuh (untuk pembagian SPLIT). */
+export function floorSenToRupiah(sen: bigint): bigint {
+  if (sen <= BigInt(0)) return BigInt(0);
+  return (sen / SEN_PER_RUPIAH) * SEN_PER_RUPIAH;
+}
+
 const DEFAULT_MEMBERSHIP_RANK_FEE_DISCOUNT_BPS: Record<MembershipRank, number> = {
   [MembershipRank.BRONZE]: 0,
   [MembershipRank.SILVER]: 0,
@@ -236,7 +259,7 @@ export class FeeCalculatorService {
   getStandardFeeSen(orderValueSen: bigint, feeConfig?: FeeConfig): bigint {
     if (orderValueSen <= BigInt(0)) return BigInt(0);
     const rateBps = this.getFeeRateBps(false, feeConfig);
-    let fee = (orderValueSen * rateBps) / BigInt(10_000);
+    let fee = roundSenToRupiah((orderValueSen * rateBps) / BigInt(10_000));
     const MIN_FEE = BigInt(FEE_MIN_SEN);
     const MAX_FEE = BigInt(FEE_MAX_SEN);
     if (fee < MIN_FEE) fee = MIN_FEE;
@@ -257,7 +280,7 @@ export class FeeCalculatorService {
     if (orderValueSen <= BigInt(0)) return BigInt(0);
     const standardFee = this.getStandardFeeSen(orderValueSen, feeConfig);
     const plusRateBps = this.getFeeRateBps(true, feeConfig);
-    const plusFeeRaw = (orderValueSen * plusRateBps) / BigInt(10_000);
+    const plusFeeRaw = roundSenToRupiah((orderValueSen * plusRateBps) / BigInt(10_000));
     const effectivePlusFee = plusFeeRaw < standardFee ? plusFeeRaw : standardFee;
     return standardFee > effectivePlusFee ? standardFee - effectivePlusFee : BigInt(0);
   }
@@ -273,7 +296,7 @@ export class FeeCalculatorService {
     const standardFee = this.getStandardFeeSen(orderValueSen, feeConfig);
     if (!isKahadePlus) return standardFee;
     const plusRateBps = this.getFeeRateBps(true, feeConfig);
-    const plusFeeRaw = (orderValueSen * plusRateBps) / BigInt(10_000);
+    const plusFeeRaw = roundSenToRupiah((orderValueSen * plusRateBps) / BigInt(10_000));
     return plusFeeRaw < standardFee ? plusFeeRaw : standardFee;
   }
 
@@ -296,7 +319,8 @@ export class FeeCalculatorService {
     const standardRateBps = this.getFeeRateBps(false, feeConfig);
     const MIN_FEE = BigInt(FEE_MIN_SEN);
     const MAX_FEE = BigInt(FEE_MAX_SEN);
-    let standardFee = (orderValueSen * standardRateBps) / BigInt(10_000);
+    // K5: setiap komponen fee dibulatkan ke rupiah utuh (lihat roundSenToRupiah).
+    let standardFee = roundSenToRupiah((orderValueSen * standardRateBps) / BigInt(10_000));
     if (orderValueSen > BigInt(0)) {
       if (standardFee < MIN_FEE) standardFee = MIN_FEE;
       if (standardFee > MAX_FEE) standardFee = MAX_FEE;
@@ -309,12 +333,14 @@ export class FeeCalculatorService {
     let feeAmount = standardFee;
     if (isKahadePlus) {
       const plusRateBps = this.getFeeRateBps(true, feeConfig);
-      const plusFee = (orderValueSen * plusRateBps) / BigInt(10_000);
+      const plusFee = roundSenToRupiah((orderValueSen * plusRateBps) / BigInt(10_000));
       feeAmount = plusFee < standardFee ? plusFee : standardFee;
     }
 
     // ── 3. Voucher reduction (capped at the current fee, floor at 0).
-    const cappedVoucherDiscountSen = voucherDiscountSen > feeAmount ? feeAmount : voucherDiscountSen;
+    //       K5: nominal voucher dibulatkan ke rupiah agar sisa fee tetap rupiah utuh.
+    const roundedVoucherDiscountSen = roundSenToRupiah(voucherDiscountSen);
+    const cappedVoucherDiscountSen = roundedVoucherDiscountSen > feeAmount ? feeAmount : roundedVoucherDiscountSen;
     if (cappedVoucherDiscountSen > BigInt(0)) {
       feeAmount = feeAmount - cappedVoucherDiscountSen;
     }
@@ -322,7 +348,7 @@ export class FeeCalculatorService {
     // ── 4. Membership-rank reduction from SystemConfig (GOLD+ by default),
     //       capped to the remaining fee after Kahade+ and voucher.
     const rankDiscountBps = this.getMembershipRankDiscountBps(membershipRank, feeConfig);
-    let membershipRankDiscount = (feeAmount * rankDiscountBps) / BigInt(10_000);
+    let membershipRankDiscount = roundSenToRupiah((feeAmount * rankDiscountBps) / BigInt(10_000));
     if (membershipRankDiscount > feeAmount) membershipRankDiscount = feeAmount;
     if (membershipRankDiscount > BigInt(0)) {
       feeAmount = feeAmount - membershipRankDiscount;
@@ -342,8 +368,9 @@ export class FeeCalculatorService {
         sellerFeeAmount = feeAmount;
         break;
       case 'SPLIT':
-        // BigInt division truncates; odd-sen remainder is absorbed by seller
-        buyerFeeAmount = feeAmount / BigInt(2);
+        // K5: porsi buyer dibulatkan ke bawah ke rupiah utuh; sisa rupiah
+        // ganjil ditanggung seller — keduanya rupiah utuh.
+        buyerFeeAmount = floorSenToRupiah(feeAmount / BigInt(2));
         sellerFeeAmount = feeAmount - buyerFeeAmount;
         break;
       default:
@@ -386,6 +413,13 @@ export class FeeCalculatorService {
     }
     if (sellerReceiveAmount !== orderValueSen - sellerFeeAmount) {
       throw new InternalServerErrorException({ code: 'FEE_INVARIANT_VIOLATED', message: 'Seller receive amount invariant violated' });
+    }
+    // K5: nominal yang dibayar/diterima harus rupiah utuh (DANA transfer bank
+    // menolak sen pecahan → disbursement seller FAILED permanen).
+    if (orderValueSen % SEN_PER_RUPIAH === BigInt(0)) {
+      if (buyerPayAmount % SEN_PER_RUPIAH !== BigInt(0) || sellerReceiveAmount % SEN_PER_RUPIAH !== BigInt(0)) {
+        throw new InternalServerErrorException({ code: 'FEE_INVARIANT_VIOLATED', message: 'Fee amounts must be whole rupiah' });
+      }
     }
   }
 }

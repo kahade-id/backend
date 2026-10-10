@@ -33,11 +33,15 @@ export interface VerifiedAppleIdentity {
 const APPLE_JWKS_URL = 'https://appleid.apple.com/auth/keys';
 const APPLE_ISSUER = 'https://appleid.apple.com';
 const JWKS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+// Audit Auth 2026-10-10 (#BE-47): jarak minimum antar refetch paksa — token
+// dengan `kid` palsu tidak boleh memicu fetch JWKS Apple tanpa batas.
+const JWKS_MIN_REFETCH_INTERVAL_MS = 60 * 1000;
 
 @Injectable()
 export class AppleAuthService {
   private readonly logger = new Logger(AppleAuthService.name);
   private jwksCache: { fetchedAt: number; keys: AppleJwk[] } | null = null;
+  private lastForcedRefetchAt = 0;
 
   constructor(private readonly configService: ConfigService) {}
 
@@ -54,11 +58,20 @@ export class AppleAuthService {
     );
   }
 
-  private async getJwks(): Promise<AppleJwk[]> {
+  private async getJwks(forceRefresh = false): Promise<AppleJwk[]> {
     const now = Date.now();
-    if (this.jwksCache && now - this.jwksCache.fetchedAt < JWKS_CACHE_TTL_MS) {
-      return this.jwksCache.keys;
+    // Audit Auth 2026-10-10 (#BE-47): `forceRefresh` melewati cache saat `kid`
+    // token tidak dikenal (rotasi kunci Apple) — tanpa ini login Apple mati
+    // sampai cache 24 jam kedaluwarsa.
+    if (this.jwksCache) {
+      if (!forceRefresh && now - this.jwksCache.fetchedAt < JWKS_CACHE_TTL_MS) {
+        return this.jwksCache.keys;
+      }
+      if (forceRefresh && now - this.lastForcedRefetchAt < JWKS_MIN_REFETCH_INTERVAL_MS) {
+        return this.jwksCache.keys;
+      }
     }
+    if (forceRefresh) this.lastForcedRefetchAt = now;
     // G010: pemuatan + cache JWKS Apple.
     const res = await fetch(APPLE_JWKS_URL, { signal: AbortSignal.timeout(10000) });
     if (!res.ok) {
@@ -104,7 +117,16 @@ export class AppleAuthService {
       this.logger.warn(`Apple JWKS fetch failed: ${(e as Error).message}`);
       throw new Error('Unable to verify Apple token at this time');
     });
-    const jwk = keys.find((k) => k.kid === header.kid);
+    let jwk = keys.find((k) => k.kid === header.kid);
+    if (!jwk) {
+      // Audit Auth 2026-10-10 (#BE-47): kid tak dikenal → refetch JWKS SEKALI
+      // (rotasi kunci Apple), baru tolak bila tetap tidak ada.
+      const refreshed = await this.getJwks(true).catch((e) => {
+        this.logger.warn(`Apple JWKS refetch failed: ${(e as Error).message}`);
+        return keys;
+      });
+      jwk = refreshed.find((k) => k.kid === header.kid);
+    }
     if (!jwk) throw new Error('Apple signing key not found');
 
     let publicKey: KeyObject;

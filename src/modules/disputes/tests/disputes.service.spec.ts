@@ -493,6 +493,7 @@ describe('DisputesService', () => {
         disputeEvidence: { create: jest.fn() },
         orderStatusHistory: { create: jest.fn() },
         walletTransaction: { findFirst: jest.fn().mockResolvedValue(null) },
+        paymentTransaction: { findFirst: jest.fn().mockResolvedValue(null) },
         user: { update: jest.fn() },
         $queryRaw: jest.fn().mockResolvedValue([]),
       }));
@@ -500,6 +501,72 @@ describe('DisputesService', () => {
       await expect(service.submitDispute('O1', 'buyer', dto)).rejects.toMatchObject({
         response: { code: 'ESCROW_LOCK_MISSING' },
       });
+    });
+
+    // K1 (audit transaksi 2026-10-10): produksi = no-wallet. Escrow dibuktikan
+    // lewat PaymentTransaction DANA-direct, bukan ledger ORDER_LOCK.
+    it('K1: accepts a DANA-direct ORDER_ESCROW payment as escrow evidence when there is no wallet lock', async () => {
+      const activeOrder = { ...order, buyerPayAmount: 10000n, sellerReceiveAmount: 9000n, completedAt: null };
+      mockPrisma.order.findUnique.mockResolvedValue(activeOrder);
+      const paymentFindFirst = jest.fn().mockResolvedValue({ id: 'pay-1', amount: 10000n });
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: any) => Promise<unknown>) => fn({
+        dispute: { findUnique: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue(createdDispute) },
+        order: { findUnique: jest.fn().mockResolvedValue(activeOrder), findFirst: jest.fn().mockResolvedValue(activeOrder), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        disputeEvidence: { create: jest.fn() },
+        orderStatusHistory: { create: jest.fn() },
+        walletTransaction: { findFirst: jest.fn().mockResolvedValue(null) },
+        paymentTransaction: { findFirst: paymentFindFirst },
+        user: { update: jest.fn() },
+        $queryRaw: jest.fn().mockResolvedValue([]),
+      }));
+
+      await expect(service.submitDispute('O1', 'buyer', dto)).resolves.toEqual({ disputeId: 'DSP-0001', status: 'OPEN' });
+      expect(paymentFindFirst).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ orderId: 'ord-1', purpose: 'ORDER_ESCROW', provider: 'DANA', status: 'SUCCESS' }),
+      }));
+    });
+
+    it('K1: still fails closed when the DANA payment amount does not match buyerPayAmount', async () => {
+      const activeOrder = { ...order, buyerPayAmount: 10000n, sellerReceiveAmount: 9000n, completedAt: null };
+      mockPrisma.order.findUnique.mockResolvedValue(activeOrder);
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: any) => Promise<unknown>) => fn({
+        dispute: { findUnique: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue(createdDispute) },
+        order: { findUnique: jest.fn().mockResolvedValue(activeOrder), findFirst: jest.fn().mockResolvedValue(activeOrder), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        disputeEvidence: { create: jest.fn() },
+        orderStatusHistory: { create: jest.fn() },
+        walletTransaction: { findFirst: jest.fn().mockResolvedValue(null) },
+        paymentTransaction: { findFirst: jest.fn().mockResolvedValue({ id: 'pay-1', amount: 9999n }) },
+        user: { update: jest.fn() },
+        $queryRaw: jest.fn().mockResolvedValue([]),
+      }));
+
+      await expect(service.submitDispute('O1', 'buyer', dto)).rejects.toMatchObject({
+        response: { code: 'ESCROW_LOCK_MISSING' },
+      });
+    });
+
+    it('K1: post-completion dispute in no-wallet mode opens without touching any wallet', async () => {
+      const completedOrder = { ...order, status: 'COMPLETED', completedAt: new Date(), buyerPayAmount: 10000n, sellerReceiveAmount: 9000n };
+      mockPrisma.order.findUnique.mockResolvedValue(completedOrder);
+      (service as unknown as { walletMode: { isWalletEnabled: () => boolean } }).walletMode = { isWalletEnabled: () => false };
+      const walletFindUnique = jest.fn();
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: any) => Promise<unknown>) => fn({
+        dispute: { findUnique: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue(createdDispute) },
+        order: { findUnique: jest.fn().mockResolvedValue(completedOrder), findFirst: jest.fn().mockResolvedValue(completedOrder), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        disputeEvidence: { create: jest.fn() },
+        orderStatusHistory: { create: jest.fn() },
+        wallet: { findUnique: walletFindUnique },
+        walletTransaction: { create: jest.fn() },
+        user: { update: jest.fn() },
+        $queryRaw: jest.fn().mockResolvedValue([]),
+      }));
+
+      try {
+        await expect(service.submitDispute('O1', 'buyer', dto)).resolves.toEqual({ disputeId: 'DSP-0001', status: 'OPEN' });
+        expect(walletFindUnique).not.toHaveBeenCalled();
+      } finally {
+        (service as unknown as { walletMode?: unknown }).walletMode = undefined;
+      }
     });
 
     it('rolls back a post-completion dispute when seller funds cannot be frozen', async () => {

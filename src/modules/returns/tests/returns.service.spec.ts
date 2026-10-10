@@ -91,6 +91,7 @@ describe('ReturnsService (GAP-D retur)', () => {
   let refundService: ReturnsRefundService;
   let walletMode: { isWalletEnabled: MockFn };
   let danaDirectRefundService: { refundAmount: MockFn };
+  let stepUp: { consumeStepUpToken: MockFn };
   let service: ReturnsService;
 
   beforeEach(() => {
@@ -137,6 +138,7 @@ describe('ReturnsService (GAP-D retur)', () => {
     // Default wallet ENABLED agar test jalur ledger wallet lama tetap valid.
     walletMode = { isWalletEnabled: jest.fn().mockReturnValue(true) };
     danaDirectRefundService = { refundAmount: jest.fn() };
+    stepUp = { consumeStepUpToken: jest.fn().mockResolvedValue(undefined) };
     service = new ReturnsService(
       prisma as unknown as PrismaService,
       serial as unknown as WalletTxSerialService,
@@ -146,8 +148,11 @@ describe('ReturnsService (GAP-D retur)', () => {
       refundService,
       walletMode as unknown as WalletModeService,
       danaDirectRefundService as unknown as DanaDirectRefundService,
+      // Audit 2026-10-10: aksi uang admin wajib step-up — mock menerima token apa pun.
+      stepUp as never,
     );
     jest.clearAllMocks();
+    stepUp.consumeStepUpToken.mockResolvedValue(undefined);
     // jest.clearAllMocks menghapus implementasi mockResolvedValue di atas —
     // setel ulang default yang dibutuhkan semua test.
     serial.getNextForPrefix.mockResolvedValue(7);
@@ -439,6 +444,29 @@ describe('ReturnsService (GAP-D retur)', () => {
       );
     });
 
+    it('audit 2026-10-10: aksi uang mengonsumsi step-up token terikat return.money-action + id retur', async () => {
+      await service.adminAct('ret-db-1', 'admin-1', { action: 'EXTEND_DEADLINE' }, 'tok-123');
+      expect(stepUp.consumeStepUpToken).toHaveBeenCalledWith('tok-123', {
+        adminId: 'admin-1',
+        action: 'return.money-action',
+        targetId: 'ret-db-1',
+      });
+    });
+
+    it('audit 2026-10-10: step-up ditolak → aksi uang tidak dieksekusi (fail-closed)', async () => {
+      stepUp.consumeStepUpToken.mockRejectedValueOnce(new Error('STEP_UP_REQUIRED'));
+      await expect(service.adminAct('ret-db-1', 'admin-1', { action: 'EXTEND_DEADLINE' })).rejects.toThrow('STEP_UP_REQUIRED');
+      expect(delegates.returnRequest.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('audit 2026-10-10: aksi non-uang (REJECT/ESCALATE) tidak butuh step-up', async () => {
+      delegates.returnRequest.findUnique.mockResolvedValue(baseReturn({ status: 'REQUESTED' }));
+      (prisma.dispute as Delegate).findFirst.mockResolvedValue(null);
+      delegates.returnRequest.updateMany.mockResolvedValue({ count: 1 });
+      await service.adminAct('ret-db-1', 'admin-1', { action: 'ESCALATE' }).catch(() => undefined);
+      expect(stepUp.consumeStepUpToken).not.toHaveBeenCalled();
+    });
+
     it('menolak bila status terminal (INVALID_STATUS) — fail closed', async () => {
       delegates.returnRequest.findUnique.mockResolvedValue(
         baseReturn({ status: 'RESOLVED_REFUND', sellerRespondBy: base }),
@@ -502,6 +530,85 @@ describe('ReturnsService (GAP-D retur)', () => {
 
       const detail = await service.getDetail('ret-db-1', 'admin-1', { isAdmin: true });
       expect(detail.order).toBeNull();
+    });
+  });
+
+  // K4 (audit transaksi 2026-10-10): konversi retur → sengketa harus memindahkan
+  // order ke DISPUTED di tx yang sama, kalau tidak resolve admin 409 selamanya.
+  describe('convertReturnToDispute memindahkan order ke DISPUTED (K4)', () => {
+    function mockTx(orderStatus: string) {
+      const tx = {
+        $queryRaw: jest.fn().mockResolvedValue([]),
+        order: {
+          findFirst: jest.fn().mockResolvedValue({ id: 'order-db-1', orderId: 'ORD-1', status: orderStatus, sellerId: 'seller-1', sellerReceiveAmount: BigInt(97_500_00) }),
+          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
+        dispute: {
+          findUnique: jest.fn().mockResolvedValue(null),
+          create: jest.fn().mockResolvedValue({ id: 'disp-db-1', disputeId: 'DSP-20261010-0007' }),
+        },
+        orderStatusHistory: { create: jest.fn().mockResolvedValue({}) },
+        wallet: { findUnique: jest.fn(), updateMany: jest.fn() },
+        walletTransaction: { create: jest.fn() },
+      };
+      (prisma.$transaction as MockFn).mockImplementation(async (cb: (t: unknown) => Promise<unknown>) => cb(tx));
+      return tx;
+    }
+
+    beforeEach(() => {
+      delegates.returnRequest.findUnique.mockResolvedValue(baseReturn({ status: 'ESCALATED', disputeId: null }));
+      delegates.returnRequest.update.mockResolvedValue({});
+      (prisma.dispute as Delegate).findFirst.mockResolvedValue(null);
+      notify.notifyBoth.mockResolvedValue(undefined);
+    });
+
+    it('no-wallet: buat sengketa OPEN + order COMPLETED → DISPUTED + history, tanpa menyentuh wallet', async () => {
+      walletMode.isWalletEnabled.mockReturnValue(false);
+      const tx = mockTx('COMPLETED');
+
+      const res = await service.convertReturnToDispute('ret-db-1', 'admin-1');
+
+      expect(res).toMatchObject({ disputeId: 'DSP-20261010-0007', created: true, linked: true });
+      expect(tx.order.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: 'order-db-1', status: { in: expect.arrayContaining(['COMPLETED']) } }),
+        data: expect.objectContaining({ status: 'DISPUTED' }),
+      }));
+      expect(tx.orderStatusHistory.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ fromStatus: 'COMPLETED', toStatus: 'DISPUTED', changedByType: 'ADMIN' }),
+      }));
+      expect(tx.wallet.updateMany).not.toHaveBeenCalled();
+      expect(delegates.returnRequest.update).toHaveBeenCalledWith(expect.objectContaining({ data: { disputeId: 'disp-db-1' } }));
+    });
+
+    it('mode wallet: bekukan dana seller (ORDER_LOCK) agar putusan pasca-completion bisa dieksekusi', async () => {
+      walletMode.isWalletEnabled.mockReturnValue(true);
+      (serial as unknown as { getNext: MockFn }).getNext = jest.fn().mockResolvedValue(42);
+      const tx = mockTx('COMPLETED');
+      tx.wallet.findUnique
+        .mockResolvedValueOnce({ id: 'sw-1' })
+        .mockResolvedValueOnce({ id: 'sw-1', isLocked: false, availableBalance: BigInt(200_000_00), version: 3 });
+      tx.wallet.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.convertReturnToDispute('ret-db-1', 'admin-1');
+
+      expect(tx.wallet.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: 'sw-1', version: 3 }),
+        data: expect.objectContaining({ availableBalance: { decrement: BigInt(97_500_00) }, escrowBalance: { increment: BigInt(97_500_00) } }),
+      }));
+      expect(tx.walletTransaction.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ type: 'ORDER_LOCK', amount: BigInt(97_500_00), orderId: 'order-db-1' }),
+      }));
+    });
+
+    it('order sudah berstatus lain (updateMany 0) → INVALID_ORDER_STATUS, tx dibatalkan', async () => {
+      walletMode.isWalletEnabled.mockReturnValue(false);
+      const tx = mockTx('CANCELLED');
+      tx.order.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(service.convertReturnToDispute('ret-db-1', 'admin-1')).rejects.toMatchObject({
+        response: { code: 'INVALID_ORDER_STATUS' },
+      });
+      expect(delegates.returnRequest.update).not.toHaveBeenCalled();
     });
   });
 });

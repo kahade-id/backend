@@ -186,13 +186,33 @@ export class SessionsService {
       orderBy: { lastLoginAt: 'desc' },
       select: { id: true, deviceId: true, deviceName: true, deviceType: true, ipAddress: true, lastLoginAt: true, createdAt: true },
     });
-    return { devices };
+    // Audit Auth 2026-10-10 (#BE-S2): IP dimasker seperti GET /sessions —
+    // endpoint deprecated ini sebelumnya mengembalikan IP penuh tiap perangkat.
+    return {
+      devices: devices.map((device) => ({ ...device, ipAddress: this.maskIpAddress(device.ipAddress) })),
+    };
   }
 
+  /**
+   * DELETE /v1/sessions — cabut semua sesi LAIN dan putus push perangkat lain.
+   *
+   * Audit Auth 2026-10-10 (#BE-S1): sebelumnya `pushToken` SEMUA perangkat
+   * di-null-kan, termasuk perangkat yang sedang dipakai — padahal sesinya
+   * sengaja dipertahankan. Akibatnya perangkat ini diam-diam berhenti
+   * menerima notifikasi (chat, transaksi, keamanan) sampai token didaftar
+   * ulang. Kini perangkat milik sesi saat ini dikecualikan.
+   */
   async revokeAllSessionsAndDevices(userId: string, currentSessionId: string): Promise<{ sessionsRevoked: number; devicesRevoked: number }> {
     const sessionsResult = await this.revokeAllOtherSessions(userId, currentSessionId);
-    const devices = await this.prisma.userDevice.findMany({ where: { userId }, select: { id: true } });
-    await this.prisma.userDevice.updateMany({ where: { userId }, data: { pushToken: null } });
+    const currentSession = currentSessionId
+      ? await this.prisma.userSession.findUnique({ where: { id: currentSessionId }, select: { deviceId: true } })
+      : null;
+    const otherDevicesWhere = {
+      userId,
+      ...(currentSession?.deviceId ? { deviceId: { not: currentSession.deviceId } } : {}),
+    };
+    const devices = await this.prisma.userDevice.findMany({ where: otherDevicesWhere, select: { id: true } });
+    await this.prisma.userDevice.updateMany({ where: otherDevicesWhere, data: { pushToken: null } });
     return { sessionsRevoked: sessionsResult.count, devicesRevoked: devices.length };
   }
 }

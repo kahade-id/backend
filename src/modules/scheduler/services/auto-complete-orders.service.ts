@@ -29,6 +29,7 @@ import { WalletModeService } from '../../wallet-mode/wallet-mode.service';
 import { EscrowDisbursementService } from '../../no-wallet/escrow-disbursement.service';
 import { deriveDanaRefundNo } from '../../no-wallet/dana-direct-refund.service';
 import { alertMoneyCronSkippedRedisDown, ensureRedisAvailable } from '../../../common/utils/redis-health.util';
+import { isCronJobDisabled } from '../../../common/utils/cron-gate.util';
 import { toIdr, formatSen } from '../../../common/utils/currency.util';
 import { AUTO_COMPLETE_GRACE_PERIOD_HOURS, DELIVERY_REVIEW_WINDOW_DAYS } from '../../../common/constants/app.constants';
 
@@ -46,6 +47,14 @@ const DEFER_PREFIX = 'DEFER_AUTO_COMPLETE:';
  * terkunci selamanya.
  */
 const SELLER_ABANDONED_MULTIPLIER = 2;
+
+/** K8: ukuran batch kandidat per iterasi. */
+const AUTO_COMPLETE_BATCH_SIZE = 50;
+/**
+ * K8: batas iterasi batch per run cron. Run berikutnya (tiap jam) melanjutkan.
+ * Bersama kursor id, ini menjamin loop selalu berhenti.
+ */
+const AUTO_COMPLETE_MAX_BATCHES = 20;
 
 @Injectable()
 export class AutoCompleteDeliveredOrdersService {
@@ -81,6 +90,12 @@ export class AutoCompleteDeliveredOrdersService {
   // SCH-017: Runs every hour to auto-complete delivered orders past deadline
   @Cron('0 * * * *', { name: 'auto-complete-orders' })
   async autoComplete(): Promise<void> {
+    // K8: feature-flag — CRON_DISABLED_JOBS=auto-complete-orders mematikan
+    // job ini tanpa deploy (kill-switch bila loop/anomali terdeteksi).
+    if (isCronJobDisabled('auto-complete-orders')) {
+      this.logger.warn('auto-complete-orders dinonaktifkan via CRON_DISABLED_JOBS — dilewati');
+      return;
+    }
     if (!(await ensureRedisAvailable(this.redis, 'auto-complete-orders', {
         // CW-014: job kritis-uang — skip karena Redis down harus termonitor,
         // bukan senyap.
@@ -113,6 +128,12 @@ export class AutoCompleteDeliveredOrdersService {
     const now = new Date();
     try {
       let hasMore = true;
+      // K8 (audit 2026-10-10): kursor id + batas batch. Sebelumnya query batch
+      // tanpa kursor: bila ≥50 order di-skip/defer (status tidak berubah),
+      // iterasi berikutnya mengambil 50 baris yang SAMA → hot loop tanpa akhir
+      // (lock diperpanjang terus, CPU/DB terbakar sampai proses di-restart).
+      let cursorId: string | null = null;
+      let batches = 0;
       while (hasMore) {
         if (lockLost || (await this.redis.get(lockKey)) !== lockToken) {
           this.logger.warn(
@@ -120,6 +141,13 @@ export class AutoCompleteDeliveredOrdersService {
           );
           return;
         }
+        if (batches >= AUTO_COMPLETE_MAX_BATCHES) {
+          this.logger.warn(
+            `Auto-complete: batas ${AUTO_COMPLETE_MAX_BATCHES} batch tercapai — sisa kandidat diproses run berikutnya.`,
+          );
+          break;
+        }
+        batches++;
         const orders = await this.prisma.order.findMany({
           where: {
             status: OrderStatus.IN_DELIVERY,
@@ -132,15 +160,19 @@ export class AutoCompleteDeliveredOrdersService {
                 reviewWindowEnd: { gt: now },
               },
             },
+            ...(cursorId ? { id: { gt: cursorId } } : {}),
           },
-          take: 50,
+          orderBy: { id: 'asc' },
+          take: AUTO_COMPLETE_BATCH_SIZE,
         });
 
         if (orders.length === 0) {
           hasMore = false;
           break;
         }
-        hasMore = orders.length === 50;
+        hasMore = orders.length === AUTO_COMPLETE_BATCH_SIZE;
+        const lastBatchId: string = orders[orders.length - 1].id;
+        cursorId = lastBatchId;
 
         this.logger.log(`Found ${orders.length} orders past delivery deadline — auto-completing.`);
 
@@ -780,6 +812,8 @@ export class AutoCompleteDeliveredOrdersService {
             // leaderboard cache setelah tx commit.
             if (outcome.referralRewardCredited) {
               await this.referralService.invalidateLeaderboardCache();
+              // B13: beri tahu penerima reward (post-commit, best-effort).
+              await this.referralService.notifyRewardsForOrder(order.orderId);
             }
 
             // M4 no-wallet: eksekusi payout cashback DANA post-tx (idempoten).

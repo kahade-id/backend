@@ -412,13 +412,29 @@ export class OrderLinksService {
             : 'Link ini tidak memiliki alamat pengiriman yang valid. Minta pembuat link membuat ulang tautannya.',
         });
       }
-      const address = await this.prisma.address.findFirst({
+      let address = await this.prisma.address.findFirst({
         where: { id: rawAddressId, userId: buyerId, deletedAt: null },
       });
+      // Audit alamat & kurir B03 (2026-10-10): link buatan PEMBELI yang
+      // alamatnya sudah dihapus dari buku alamat — penerima (penjual) tidak
+      // bisa memperbaikinya. Jatuhkan ke alamat utama pembeli saat ini; bila
+      // itu pun tidak ada, baru tolak (fail-closed). Pembeli yang menerima
+      // link (buyerIsAcceptor) tetap harus memilih alamat yang valid.
+      if (!address && !buyerIsAcceptor) {
+        address = await this.prisma.address.findFirst({
+          where: { userId: buyerId, deletedAt: null },
+          orderBy: [{ isDefault: 'desc' }, { updatedAt: 'desc' }],
+        });
+        if (address) {
+          this.logger.warn(`acceptLink: alamat link ${rawAddressId} sudah tidak ada — memakai alamat utama pembeli ${address.id}`);
+        }
+      }
       if (!address) {
         throw new BadRequestException({
           code: ErrorCodes.SHIPPING_ADDRESS_REQUIRED,
-          message: 'Alamat pengiriman tidak ditemukan di buku alamat pembeli.',
+          message: buyerIsAcceptor
+            ? 'Alamat pengiriman tidak ditemukan di buku alamat Anda.'
+            : 'Alamat pengiriman pembeli sudah dihapus dan tidak ada alamat lain. Minta pembeli menambah alamat lalu membuat ulang tautannya.',
         });
       }
       shippingSnapshot = {
@@ -604,7 +620,11 @@ export class OrderLinksService {
       title: 'Order Link Accepted',
       body: `Your order link "${link.title}" has been accepted. A new order has been created.`,
       pushData: { type: 'ORDER_NEW', orderId: result.order.orderId },
-      actionUrl: `/o/${result.order.orderId}`,
+      // K10 (audit 2026-10-10): `/o/<x>` = deeplink TOKEN tautan order
+      // (kahade.id/o/<token>, FE app/o/[token].tsx) — bukan detail order.
+      // Notifikasi ini merujuk order yang sudah lahir → pakai `/order/<orderId>`
+      // (konvensi push.service deriveActionUrl).
+      actionUrl: `/order/${result.order.orderId}`,
     }).catch((error: unknown) => this.logger.warn(`ACCEPT_LINK notification failed: ${error instanceof Error ? error.message : String(error)}`));
 
     return {

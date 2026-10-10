@@ -6,6 +6,7 @@ import { NotificationChannel, NotificationType, Prisma } from '@prisma/client';
 import { createHash } from 'crypto';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { getCategoryForType } from '../../notifications/notification-category.map';
+import { derivePushActionUrl } from '../../notifications/push-action-url';
 import { DEAD_LETTER_QUEUE, deadLetterJobId } from '../queue.constants';
 import { safeErrorMessage } from '../../../common/utils/background-reliability.util';
 
@@ -64,7 +65,8 @@ export class NotificationProcessor {
     }
 
     const category = getCategoryForType(type);
-    const resolvedActionUrl = actionUrl ?? this.deriveActionUrl(pushData);
+    // Audit 2026-10-10 (BE-09): helper bersama dengan push.service.
+    const resolvedActionUrl = actionUrl ?? derivePushActionUrl(pushData);
 
     let notification;
     try {
@@ -116,16 +118,6 @@ export class NotificationProcessor {
     });
 
     this.logger.debug(`Notification job ${job.id} processed (lang=${language ?? 'default'})`);
-  }
-
-  private deriveActionUrl(data?: Record<string, string>): string | undefined {
-    if (data?.actionUrl) return data.actionUrl;
-    if (data?.orderId) return `/order/${encodeURIComponent(data.orderId)}`;
-    if (data?.orderLinkToken) return `/link/${encodeURIComponent(data.orderLinkToken)}`;
-    if (data?.roomId ?? data?.chatRoomId) return `/chat/${encodeURIComponent(data.roomId ?? data.chatRoomId ?? '')}`;
-    if (data?.transactionId ?? data?.txId) return `/wallet/transaction?id=${encodeURIComponent(data.transactionId ?? data.txId ?? '')}`;
-    if (data?.disputeId) return `/dispute/${encodeURIComponent(data.disputeId)}`;
-    return undefined;
   }
 
   @OnQueueFailed()

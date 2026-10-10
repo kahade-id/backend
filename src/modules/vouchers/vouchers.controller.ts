@@ -31,7 +31,10 @@ export class VouchersController {
   }
 
   @UseGuards(UserThrottleGuard)
-  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  // Audit voucher 2026-10-10 (B10): 5/menit terlalu ketat — halaman Promo dan
+  // checkout berbagi kuota; salah ketik 5× mengunci user 1 menit. Kode voucher
+  // dibagikan publik (bukan rahasia), 10/menit masih aman dari brute force.
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
   @Post('validate')
   @HttpCode(200)
   @AllowResponseFields('code')

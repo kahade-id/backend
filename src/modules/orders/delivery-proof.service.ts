@@ -453,14 +453,14 @@ export class DeliveryProofService {
         await this.notificationQueue.enqueue({
           userId: completedOrder.buyerId,
           type: NotificationType.WALLET_FUNDS_RELEASED,
-          title: 'Escrow Released',
-          body: `Escrow funds for order "${completedOrder.title}" have been released to the seller.`,
+          title: 'Funds Released',
+          body: `Funds for order "${completedOrder.title}" have been released to the seller.`,
           pushData: { type: 'WALLET_FUNDS_RELEASED', orderId },
         });
       }, 'CONFIRM_DELIVERY_NOTIFICATION');
     }
 
-    return { message: 'Delivery confirmed and order completed. Escrow funds have been released.' };
+    return { message: 'Delivery confirmed and order completed. Funds have been released to the seller.' };
   }
 
   private static readonly MAX_REJECTION_COUNT = 5;

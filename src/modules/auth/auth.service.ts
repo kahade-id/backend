@@ -50,6 +50,8 @@ import {
   USER_SUSPENDED_KEY,
 } from '../../common/constants/redis-keys';
 import * as ErrorCodes from '../../common/constants/error-codes';
+// Audit referral 2026-10-10 (B18): deteksi lonjakan relasi juga untuk jalur registrasi.
+import { flagReferralBurstIfNeeded } from '../../common/utils/referral-burst.util';
 import {
   RESERVED_USERNAMES,
   ACCOUNT_LOCK_MAX_ATTEMPTS,
@@ -254,7 +256,7 @@ export class AuthService {
     } | null = null;
     if (dto.referralCode) {
       referralCodeRecord = await this.prisma.referralCode.findUnique({
-        where: { code: dto.referralCode.toUpperCase() },
+        where: { code: dto.referralCode.trim().toUpperCase() },
         select: { id: true, userId: true, isActive: true, totalReferrals: true },
       });
       if (
@@ -339,6 +341,16 @@ export class AuthService {
         }
       }
       throw err;
+    }
+
+    // B18: relasi referral dari registrasi ikut deteksi lonjakan (≥5/24 jam).
+    if (referralCodeRecord) {
+      await flagReferralBurstIfNeeded(
+        { prisma: this.prisma, redis: this.redis, logger: this.logger },
+        referralCodeRecord.userId,
+      ).catch((flagErr: unknown) =>
+        this.logger.warn(`silent-catch: referral burst flag failed: ${flagErr instanceof Error ? flagErr.message : String(flagErr)}`),
+      );
     }
 
     if (user.email) {
@@ -1225,7 +1237,7 @@ export class AuthService {
     } | null = null;
     if (dto.referralCode) {
       referralCodeRecord = await this.prisma.referralCode.findUnique({
-        where: { code: dto.referralCode.toUpperCase() },
+        where: { code: dto.referralCode.trim().toUpperCase() },
         select: { id: true, userId: true, isActive: true, totalReferrals: true },
       });
       if (
@@ -1343,6 +1355,16 @@ export class AuthService {
         }
       }
       throw err;
+    }
+
+    // B18: relasi referral dari registrasi ikut deteksi lonjakan (≥5/24 jam).
+    if (referralCodeRecord) {
+      await flagReferralBurstIfNeeded(
+        { prisma: this.prisma, redis: this.redis, logger: this.logger },
+        referralCodeRecord.userId,
+      ).catch((flagErr: unknown) =>
+        this.logger.warn(`silent-catch: referral burst flag failed: ${flagErr instanceof Error ? flagErr.message : String(flagErr)}`),
+      );
     }
 
     const refreshToken = this.tokenService.signRefreshToken({ sub: user.id, deviceId: dto.deviceId }); // AUT-006

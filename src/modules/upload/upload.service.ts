@@ -13,6 +13,7 @@ import { LocalStorageService } from './local-storage.service';
 import { VideoProcessingService } from './video-processing.service';
 import {
   SHOWCASE_IMAGE_THUMBNAIL_WIDTH,
+  STORY_VIDEO_MAX_BYTES,
   SHOWCASE_VIDEO_MAX_BYTES,
   SHOWCASE_VIDEO_MAX_DIMENSION_PX,
   SHOWCASE_VIDEO_MAX_DURATION_SEC,
@@ -47,8 +48,10 @@ export const ALLOWED_CONTENT_TYPES: Record<UploadPurpose, string[]> = {
   // Batch 19 TIM A (item 1): video showcase — mp4/mov/webm, magic-byte
   // terverifikasi di MAGIC_BYTES (ftyp brand spesifik / EBML).
   [UploadPurpose.SHOWCASE_VIDEO]: ['video/mp4', 'video/quicktime', 'video/webm'],
-  [UploadPurpose.STORY_MEDIA]: ['image/jpeg', 'image/png', 'image/webp'],
-  [UploadPurpose.STORY_HIGHLIGHT]: ['image/jpeg', 'image/png', 'image/webp'],
+  // Story (2026-10-10): foto ATAU video pendek. Video diproses ffprobe/ffmpeg
+  // di StoriesService (durasi ≤ 60 dtk, poster JPEG); foto di-re-encode di sini.
+  [UploadPurpose.STORY_MEDIA]: ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/quicktime', 'video/webm'],
+  [UploadPurpose.STORY_HIGHLIGHT]: ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/quicktime', 'video/webm'],
   [UploadPurpose.AVATAR]: ['image/jpeg', 'image/png', 'image/webp'],
   // BE-5: aset digital — PDF, gambar, video mp4 (tipe yang magic-byte-nya dikenal).
   [UploadPurpose.DIGITAL_ASSET]: ['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'video/mp4'],
@@ -240,6 +243,36 @@ function detectMimeFromBytes(header: Buffer): string | null {
 /** Diekspor untuk test kontrak magic-byte (UPFV-01/UPFV-04). */
 export { detectMimeFromBytes };
 
+/**
+ * Audit Pesan 2026-10-10 (bug #4, voice note "bahkan kirim saja gagal"):
+ * kecocokan MIME yang DIDEKLARASIKAN klien vs MIME TERDETEKSI magic-byte.
+ *
+ * Aturan dasar tetap ketat: deklarasi harus sama dengan deteksi. SATU
+ * pengecualian yang disengaja: `audio/mp4` (m4a) vs `video/mp4`. Keduanya
+ * kontainer ISO-BMFF yang sama; yang membedakan hanya brand di box `ftyp`.
+ * Rekaman AVAudioRecorder (iOS) menulis brand `M4A ` sehingga terdeteksi
+ * `audio/mp4`, tetapi MediaRecorder Android (OutputFormat.MPEG_4, encoder
+ * AAC — preset HIGH_QUALITY expo-audio) menulis brand `mp42`/`isom` untuk
+ * berkas audio-only. Deteksi di sini mengatakan `video/mp4`, klien jujur
+ * mendeklarasikan `audio/mp4`, dan pembandingan ketat menolaknya dengan
+ * MIME_TYPE_MISMATCH — voice note dari SEMUA perangkat Android gagal
+ * terunggah 100%.
+ *
+ * Yang disimpan adalah MIME yang dideklarasikan (`audio/mp4` → `.m4a`):
+ * konsumen (validateVoiceNote, pemutar di klien) memerlukan `audio/*`, dan
+ * tidak ada vektor XSS — kedua MIME diserve dengan `nosniff` sebagai media
+ * biner, bukan teks. Arah sebaliknya (deklarasi `video/mp4`, deteksi
+ * `audio/mp4`) TIDAK dilonggarkan: tidak ada encoder nyata yang
+ * menghasilkannya, jadi lebih mungkin salah label.
+ *
+ * Mengembalikan MIME yang harus DISIMPAN, atau null bila tidak kompatibel.
+ */
+export function resolveStoredMime(declared: string, detected: string): string | null {
+  if (declared === detected) return detected;
+  if (declared === 'audio/mp4' && detected === 'video/mp4') return declared;
+  return null;
+}
+
 // B-37 (audit-fix): centralised filename sanitiser used by every code path
 // that builds an R2 object-key from a user-supplied filename. Rules:
 //   - allow only [a-zA-Z0-9._-]
@@ -414,7 +447,7 @@ export function fileTooLargeException(purpose: UploadPurpose | undefined, maxSiz
   if (purpose === UploadPurpose.STORY_MEDIA) {
     return new PayloadTooLargeException({
       code: 'STORY_MEDIA_TOO_LARGE',
-      message: 'Ukuran foto story maksimal 10 MB.',
+      message: `Ukuran media story maksimal ${Math.round(maxSize / 1024 / 1024)} MB.`,
     });
   }
   if (purpose === UploadPurpose.SHOWCASE_VIDEO) {
@@ -1135,14 +1168,18 @@ export class UploadService {
         message: 'Unable to identify file type from content. The file may be corrupted or unsupported.',
       });
     }
-    if (detectedMime !== contentType) {
+    // Bug #4 (2026-10-10): `audio/mp4` yang terdeteksi `video/mp4` (brand
+    // ftyp Android) tetap diterima dan disimpan sebagai audio — lihat
+    // `resolveStoredMime`.
+    const storedMime = resolveStoredMime(contentType, detectedMime);
+    if (!storedMime) {
       throw new BadRequestException({
         code: ErrorCodes.MIME_TYPE_MISMATCH,
         message: `File content (${detectedMime}) does not match declared type (${contentType})`,
       });
     }
 
-    const fileKey = this.buildStoredFileKey(userId, purpose, fileName, detectedMime);
+    const fileKey = this.buildStoredFileKey(userId, purpose, fileName, storedMime);
 
     let imageBuffer: Buffer | undefined;
     if (detectedMime.startsWith('image/')) {
@@ -1179,7 +1216,7 @@ export class UploadService {
     return withSpan(
       'upload.direct_from_path',
       async (span) => {
-        const result = await this.finalizeDirectUpload(userId, purpose, fileKey, detectedMime, imageBuffer);
+        const result = await this.finalizeDirectUpload(userId, purpose, fileKey, storedMime, imageBuffer);
         span.setAttribute(
           'fileKeyHash',
           createHash('sha256').update(result.fileKey).digest('hex'),
@@ -1236,7 +1273,7 @@ export class UploadService {
       if (purpose === UploadPurpose.STORY_MEDIA) {
         throw new UnsupportedMediaTypeException({
           code: 'STORY_MEDIA_TYPE',
-          message: 'Format foto story harus JPEG, PNG, atau WEBP.',
+          message: 'Format media story harus JPEG, PNG, WEBP, MP4, MOV, atau WEBM.',
         });
       }
       throw new BadRequestException({
@@ -1252,7 +1289,11 @@ export class UploadService {
       });
     }
 
-    const maxSize = MAX_FILE_SIZE[purpose];
+    // Story video punya batas sendiri (50 MB) — foto story tetap 10 MB.
+    const maxSize =
+      purpose === UploadPurpose.STORY_MEDIA && contentType.startsWith('video/')
+        ? STORY_VIDEO_MAX_BYTES
+        : MAX_FILE_SIZE[purpose];
     if (fileBuffer.length > maxSize) {
       throw fileTooLargeException(purpose, maxSize);
     }
@@ -1263,7 +1304,7 @@ export class UploadService {
       if (purpose === UploadPurpose.STORY_MEDIA) {
         throw new UnsupportedMediaTypeException({
           code: 'STORY_MEDIA_TYPE',
-          message: 'Foto story tidak valid.',
+          message: 'Media story tidak valid.',
         });
       }
       throw new BadRequestException({
@@ -1271,11 +1312,15 @@ export class UploadService {
         message: 'Unable to identify file type from content. The file may be corrupted or unsupported.',
       });
     }
-    if (detectedMime !== contentType) {
+    // Bug #4 (2026-10-10): voice note Android — deklarasi `audio/mp4`,
+    // deteksi `video/mp4` (brand ftyp mp42/isom). Kompatibel; disimpan
+    // sebagai audio. Lihat `resolveStoredMime`.
+    const compatibleMime = resolveStoredMime(contentType, detectedMime);
+    if (!compatibleMime) {
       if (purpose === UploadPurpose.STORY_MEDIA) {
         throw new UnsupportedMediaTypeException({
           code: 'STORY_MEDIA_TYPE',
-          message: 'Isi file tidak sesuai dengan format foto yang dikirim.',
+          message: 'Isi file tidak sesuai dengan format media yang dikirim.',
         });
       }
       throw new BadRequestException({
@@ -1287,9 +1332,13 @@ export class UploadService {
     // Story photos are re-encoded to metadata-free JPEG and resized server-side
     // to a 1600px longest edge. Other upload purposes keep their existing
     // lossless EXIF-stripping pipeline.
-    let storedMime = detectedMime;
+    let storedMime = compatibleMime;
     let storedBuffer: Buffer;
-    if (purpose === UploadPurpose.STORY_MEDIA) {
+    if (purpose === UploadPurpose.STORY_MEDIA && detectedMime.startsWith('video/')) {
+      // Video story disimpan apa adanya; validasi durasi/dimensi + poster
+      // dibuat StoriesService (fail-closed) setelah file tersimpan.
+      storedBuffer = fileBuffer;
+    } else if (purpose === UploadPurpose.STORY_MEDIA) {
       try {
         storedMime = 'image/jpeg';
         storedBuffer = await sharp(fileBuffer)

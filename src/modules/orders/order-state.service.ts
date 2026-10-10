@@ -7,7 +7,7 @@ import { WalletModeService } from '../wallet-mode/wallet-mode.service';
 import { ReferralService } from '../referral/referral.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { MembershipRankService } from './membership-rank.service';
-import { OrderStatus, OrderCancelReason, ActorType, WalletTransactionType, WalletTransactionStatus, SubscriptionStatus, NotificationType, Prisma, VoucherType, EscrowDisbursementScope, EscrowDisbursementStatus } from '@prisma/client';
+import { OrderStatus, OrderType, OrderCancelReason, ActorType, WalletTransactionType, WalletTransactionStatus, SubscriptionStatus, NotificationType, Prisma, VoucherType, EscrowDisbursementScope, EscrowDisbursementStatus } from '@prisma/client';
 import { addDays, resolveDeliveryDeadlineAt, resolveProcessingDeadlineAt } from '../../common/utils/date.util';
 import { rollbackOrderVoucherUsage } from '../../common/utils/voucher-rollback.util';
 import { generateWalletTxId } from '../../common/utils/id-generator.util';
@@ -153,9 +153,10 @@ export class OrderStateService {
     userId: string,
     action: 'ACCEPT' | 'REJECT',
     reason?: string,
+    shippingAddressId?: string,
   ): Promise<ConfirmOrderResult> {
     if (action === 'ACCEPT') {
-      await this.confirmOrder(orderId, userId);
+      await this.confirmOrder(orderId, userId, shippingAddressId);
     } else {
       await this.rejectOrder(orderId, userId, reason);
     }
@@ -339,7 +340,15 @@ export class OrderStateService {
     return { orderId, status: 'CANCELLED' };
   }
 
-  async confirmOrder(orderId: string, userId: string): Promise<void> {
+  /**
+   * Audit alamat & kurir B02 (2026-10-10): order barang fisik yang DIBUAT
+   * PENJUAL — pembeli adalah pihak yang mengonfirmasi, dan alamat tujuan
+   * baru bisa diketahui di sini. `shippingAddressId` WAJIB (fail-closed)
+   * untuk kasus itu; snapshot ciphertext disalin apa adanya dari buku alamat
+   * pembeli (pola sama dengan createOrder/acceptLink). Untuk order buatan
+   * pembeli (penjual yang konfirmasi) field ini diabaikan.
+   */
+  async confirmOrder(orderId: string, userId: string, shippingAddressId?: string): Promise<void> {
     await this.withSerializableRetry(() => this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       // AUDIT-16: exclude soft-deleted orders — every other surface (list views, WS
       // rooms, scheduler crons) filters `deletedAt: null`; without it a deleted order
@@ -363,12 +372,41 @@ export class OrderStateService {
       }
       this.validateTransition(order.status, OrderStatus.WAITING_PAYMENT);
 
+      // B02: pembeli mengonfirmasi order fisik buatan penjual → alamat wajib.
+      let shippingData: Prisma.OrderUpdateManyMutationInput = {};
+      if (!order.createdByBuyer && order.orderType === OrderType.PHYSICAL_GOODS) {
+        const addressId = typeof shippingAddressId === 'string' ? shippingAddressId.trim() : '';
+        if (!addressId) {
+          throw new BadRequestException({
+            code: ErrorCodes.SHIPPING_ADDRESS_REQUIRED,
+            message: 'Pilih alamat pengiriman dari buku alamat Anda untuk menerima order barang fisik ini.',
+          });
+        }
+        const address = await tx.address.findFirst({ where: { id: addressId, userId, deletedAt: null } });
+        if (!address) {
+          throw new BadRequestException({
+            code: ErrorCodes.SHIPPING_ADDRESS_REQUIRED,
+            message: 'Alamat pengiriman tidak ditemukan di buku alamat Anda.',
+          });
+        }
+        shippingData = {
+          shippingAddressId: address.id,
+          shippingRecipientName: address.recipientName,
+          shippingPhone: address.phone,
+          shippingAddressLine: address.addressLine,
+          shippingCity: address.city,
+          shippingProvince: address.province,
+          shippingPostalCode: address.postalCode,
+        };
+      }
+
       const updated = await tx.order.updateMany({
         where: { id: order.id, status: OrderStatus.WAITING_CONFIRMATION, deletedAt: null, OR: [{ confirmationDeadlineAt: null }, { confirmationDeadlineAt: { gt: new Date() } }] },
         data: {
           status: OrderStatus.WAITING_PAYMENT,
           confirmedAt: new Date(),
           paymentDeadlineAt: addDays(new Date(), PAYMENT_DEADLINE_DAYS),
+          ...shippingData,
         },
       });
 
@@ -985,6 +1023,8 @@ export class OrderStateService {
     // (900 dtk) harus diinvalidasi setelah commit.
     if (referralRewardCredited) {
       await this.referralService.invalidateLeaderboardCache();
+      // B13: beri tahu penerima reward (post-commit, best-effort).
+      await this.referralService.notifyRewardsForOrder(orderId);
     }
 
     // M4 no-wallet: eksekusi payout cashback DANA post-commit (idempoten,

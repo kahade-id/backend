@@ -11,6 +11,8 @@ import {
 } from '@nestjs/common';
 import { Highlight, Prisma, StoryKind, StoryReportCategory, UserAuditAction } from '@prisma/client';
 import { createId } from '@paralleldrive/cuid2';
+import * as fs from 'fs';
+import * as path from 'path';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../redis/redis.service';
 import { RealtimeService } from '../realtime/realtime.service';
@@ -18,6 +20,7 @@ import { ChatService } from '../chat/chat.service';
 import { UploadPurpose } from '../upload/dto/presigned-url.dto';
 import { UploadService, isSafeFileKey } from '../upload/upload.service';
 import { LocalStorageService } from '../upload/local-storage.service';
+import { VideoProcessingService } from '../upload/video-processing.service';
 import { AuditLogService } from '../../common/services/audit-log.service';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { CreateStoryDto } from './dto/create-story.dto';
@@ -28,11 +31,21 @@ import {
   UpdateStoryHighlightDto,
 } from './dto/story-mutations.dto';
 import { isStoryUnexpired, storyAudienceAllows } from './story-visibility.util';
+import {
+  STORY_MEDIA_MAX_BYTES,
+  STORY_VIDEO_MAX_BYTES,
+  STORY_VIDEO_MAX_DURATION_SEC,
+  STORY_VIDEO_MIN_DURATION_SEC,
+  STORY_VIDEO_THUMBNAIL_WIDTH,
+  isStoryImageContentType,
+  isStoryVideoContentType,
+} from './stories.constants';
 
 const STORY_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const STORY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const STORY_MEDIA_TICKET_MS = 30 * 60 * 1000;
-const STORY_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
+/** Dimensi video story maks (sisi terpanjang) — 4K; sama dengan etalase. */
+const STORY_VIDEO_MAX_DIMENSION_PX = 3840;
 const STORY_TEXT_MAX = 200;
 const STORY_TAGS_MAX = 5;
 const STORY_HIGHLIGHT_ITEMS_MAX = 30;
@@ -55,6 +68,10 @@ type StoryRecord = {
   authorId: string;
   kind: StoryKind;
   mediaKey: string | null;
+  /** VIDEO: poster JPEG privat; null untuk IMAGE/TEXT. */
+  thumbnailKey: string | null;
+  /** VIDEO: durasi ms; null untuk IMAGE/TEXT. */
+  durationMs: number | null;
   textContent: string | null;
   backgroundColor: string | null;
   audience: Prisma.JsonValue;
@@ -82,11 +99,17 @@ type PublicProduct = {
   images: { imageUrl: string; fileKey: string | null }[];
 };
 
+export type StoryApiKind = 'image' | 'video' | 'text';
+
 type StoryApi = {
   id: string;
   author: { userId: string; username: string; fullName: string | null; avatarUrl: string | null };
-  kind: 'image' | 'text';
+  kind: StoryApiKind;
   mediaUrl: string | null;
+  /** VIDEO: signed URL poster JPEG (tray/viewer menampilkannya sebelum stream siap). */
+  thumbnailUrl: string | null;
+  /** VIDEO: durasi ms — progress bar viewer mengikuti ini, bukan 5 dtk tetap. */
+  durationMs: number | null;
   text: string | null;
   backgroundColor: string | null;
   productTags: Array<{
@@ -116,6 +139,26 @@ function storyNotVisible(): ForbiddenException {
     code: 'STORY_NOT_VISIBLE',
     message: 'Story ini tidak dapat dilihat.',
   });
+}
+
+/** Enum Prisma → kontrak API (`image` | `video` | `text`). */
+export function apiStoryKind(kind: StoryKind): StoryApiKind {
+  if (kind === StoryKind.VIDEO) return 'video';
+  if (kind === StoryKind.TEXT) return 'text';
+  return 'image';
+}
+
+/** Kontrak API → enum Prisma. */
+function storedStoryKind(kind: StoryApiKind): StoryKind {
+  if (kind === 'video') return StoryKind.VIDEO;
+  if (kind === 'text') return StoryKind.TEXT;
+  return StoryKind.IMAGE;
+}
+
+/** Ekstensi simpan untuk salinan highlight — mengikuti ekstensi key asli (video .mp4/.mov/.webm). */
+function fileExtensionOf(fileKey: string, fallback: string): string {
+  const match = /\.([a-z0-9]{2,5})$/i.exec(fileKey);
+  return match ? `.${match[1].toLowerCase()}` : fallback;
 }
 
 function activeStoryWhere(now: Date): Prisma.StoryWhereInput {
@@ -192,31 +235,49 @@ export class StoriesService {
     private readonly redis: RedisService,
     private readonly chat: ChatService,
     private readonly auditLog: AuditLogService,
+    private readonly videoProcessing: VideoProcessingService,
   ) {}
 
+  /**
+   * Unggah foto ATAU video story. Foto: ≤ 10 MB, di-re-encode JPEG 1600 px oleh
+   * UploadService. Video: ≤ 50 MB, ≤ 60 dtk, sisi terpanjang ≤ 3840 px;
+   * diprobe ffprobe dan diberi poster JPEG (ffmpeg) — FAIL-CLOSED: video yang
+   * tidak lolos dihapus dari storage, tidak ada tiket setengah jadi.
+   */
   async uploadStoryMedia(
     userId: string,
     fileName: string,
     contentType: string,
     fileBuffer: Buffer,
-  ): Promise<{ mediaId: string; url: string }> {
+  ): Promise<{
+    mediaId: string;
+    url: string;
+    kind: 'image' | 'video';
+    thumbnailUrl: string | null;
+    durationMs: number | null;
+  }> {
     await this.assertStoryFeatureAllowed(userId);
     if (!fileBuffer || fileBuffer.length === 0) {
       throw new BadRequestException({
         code: 'STORY_MEDIA_REQUIRED',
-        message: 'Foto story wajib diunggah.',
+        message: 'Media story wajib diunggah.',
       });
     }
-    if (fileBuffer.length > STORY_MEDIA_MAX_BYTES) {
-      throw new PayloadTooLargeException({
-        code: 'STORY_MEDIA_TOO_LARGE',
-        message: 'Ukuran foto story maksimal 10 MB.',
-      });
-    }
-    if (!['image/jpeg', 'image/png', 'image/webp'].includes(contentType.toLowerCase())) {
+    const mime = contentType.toLowerCase();
+    const isVideo = isStoryVideoContentType(mime);
+    if (!isVideo && !isStoryImageContentType(mime)) {
       throw new UnsupportedMediaTypeException({
         code: 'STORY_MEDIA_TYPE',
-        message: 'Format foto story harus JPEG, PNG, atau WEBP.',
+        message: 'Format media story harus JPEG, PNG, WEBP, MP4, MOV, atau WEBM.',
+      });
+    }
+    const maxBytes = isVideo ? STORY_VIDEO_MAX_BYTES : STORY_MEDIA_MAX_BYTES;
+    if (fileBuffer.length > maxBytes) {
+      throw new PayloadTooLargeException({
+        code: 'STORY_MEDIA_TOO_LARGE',
+        message: isVideo
+          ? `Ukuran video story maksimal ${Math.round(STORY_VIDEO_MAX_BYTES / 1024 / 1024)} MB.`
+          : `Ukuran foto story maksimal ${Math.round(STORY_MEDIA_MAX_BYTES / 1024 / 1024)} MB.`,
       });
     }
 
@@ -224,9 +285,30 @@ export class StoriesService {
       userId,
       UploadPurpose.STORY_MEDIA,
       fileName,
-      contentType.toLowerCase(),
+      mime,
       fileBuffer,
     );
+    const ownedKeys = [uploaded.fileKey];
+    const discard = async (): Promise<void> => {
+      await this.uploadService.cleanupFileKeys(userId, ownedKeys).catch(() => undefined);
+    };
+
+    let videoMeta: {
+      thumbnailKey: string;
+      durationMs: number;
+      width: number;
+      height: number;
+    } | null = null;
+    if (isVideo) {
+      try {
+        videoMeta = await this.processStoryVideo(userId, uploaded.fileKey);
+        ownedKeys.push(videoMeta.thumbnailKey);
+      } catch (error) {
+        await discard();
+        throw error;
+      }
+    }
+
     const now = new Date();
     const mediaId = createId();
     try {
@@ -235,22 +317,103 @@ export class StoriesService {
           id: mediaId,
           authorId: userId,
           fileKey: uploaded.fileKey,
+          kind: isVideo ? StoryKind.VIDEO : StoryKind.IMAGE,
+          thumbnailKey: videoMeta?.thumbnailKey ?? null,
+          durationMs: videoMeta?.durationMs ?? null,
+          width: videoMeta?.width ?? null,
+          height: videoMeta?.height ?? null,
           createdAt: now,
           expiresAt: new Date(now.getTime() + STORY_MEDIA_TICKET_MS),
         },
       });
     } catch (error) {
-      await this.uploadService.cleanupFileKeys(userId, [uploaded.fileKey]).catch(() => undefined);
+      await discard();
       throw error;
     }
 
+    // Covers the pending ticket and the full 24-hour Story lifetime.
+    const ttl = STORY_LIFETIME_MS / 1000 + 60 * 60;
     return {
       mediaId,
-      // Covers the pending ticket and the full 24-hour Story lifetime.
-      url: await this.uploadService.generateDownloadUrl(
-        uploaded.fileKey,
-        STORY_LIFETIME_MS / 1000 + 60 * 60,
-      ),
+      url: await this.uploadService.generateDownloadUrl(uploaded.fileKey, ttl),
+      kind: isVideo ? 'video' : 'image',
+      thumbnailUrl: videoMeta
+        ? await this.uploadService.generateDownloadUrl(videoMeta.thumbnailKey, ttl)
+        : null,
+      durationMs: videoMeta?.durationMs ?? null,
+    };
+  }
+
+  /**
+   * Probe + poster video story. Semua galat = video dibuang oleh pemanggil.
+   * Poster disimpan di folder privat `story-media/{userId}` yang sama agar
+   * `cleanupFileKeys` (cek kepemilikan segmen ke-3) dan signed URL berlaku.
+   */
+  private async processStoryVideo(
+    userId: string,
+    fileKey: string,
+  ): Promise<{ thumbnailKey: string; durationMs: number; width: number; height: number }> {
+    if (!this.videoProcessing.isAvailable()) {
+      this.logger.error(
+        `[story-video] ffmpeg/ffprobe tidak tersedia — unggahan ${fileKey} ditolak`,
+      );
+      throw new ServiceUnavailableException({
+        code: ErrorCodes.UPLOAD_FAILED,
+        message: 'Pemrosesan video sementara tidak tersedia. Coba lagi nanti.',
+      });
+    }
+    const sourcePath = this.localStorage.resolvePath(fileKey);
+    let probe: { durationSec: number; width: number; height: number };
+    try {
+      probe = await this.videoProcessing.probeVideo(sourcePath);
+    } catch (error) {
+      this.logger.warn(`[story-video] probe gagal ${fileKey}: ${String(error)}`);
+      throw new BadRequestException({
+        code: ErrorCodes.VIDEO_UNPROCESSABLE,
+        message: 'Video tidak dapat diproses. Coba dengan video lain.',
+      });
+    }
+    if (probe.durationSec > STORY_VIDEO_MAX_DURATION_SEC) {
+      throw new BadRequestException({
+        code: ErrorCodes.VIDEO_TOO_LONG,
+        message: `Durasi video story maksimal ${STORY_VIDEO_MAX_DURATION_SEC} detik.`,
+      });
+    }
+    if (probe.durationSec < STORY_VIDEO_MIN_DURATION_SEC) {
+      throw new BadRequestException({
+        code: ErrorCodes.VIDEO_UNPROCESSABLE,
+        message: 'Video terlalu pendek atau rusak.',
+      });
+    }
+    if (Math.max(probe.width, probe.height) > STORY_VIDEO_MAX_DIMENSION_PX) {
+      throw new BadRequestException({
+        code: ErrorCodes.VIDEO_RESOLUTION_TOO_HIGH,
+        message: `Resolusi video story maksimal ${STORY_VIDEO_MAX_DIMENSION_PX}p.`,
+      });
+    }
+    const thumbnailKey = `uploads/story-media/${userId}/${Date.now()}-thumb-${createId()}.jpg`;
+    const destPath = this.localStorage.resolvePath(thumbnailKey);
+    try {
+      await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+      await this.videoProcessing.generateThumbnail(
+        sourcePath,
+        destPath,
+        Math.min(1, probe.durationSec / 2),
+        STORY_VIDEO_THUMBNAIL_WIDTH,
+      );
+    } catch (error) {
+      await this.localStorage.deleteFile(thumbnailKey).catch(() => undefined);
+      this.logger.error(`[story-video] poster gagal ${fileKey}: ${String(error)}`);
+      throw new ServiceUnavailableException({
+        code: ErrorCodes.UPLOAD_FAILED,
+        message: 'Poster video belum bisa dibuat. Coba lagi.',
+      });
+    }
+    return {
+      thumbnailKey,
+      durationMs: Math.max(1, Math.round(probe.durationSec * 1000)),
+      width: probe.width,
+      height: probe.height,
     };
   }
 
@@ -269,30 +432,51 @@ export class StoriesService {
     }
 
     let mediaKey: string | null = null;
-    if (dto.kind === 'image') {
+    let thumbnailKey: string | null = null;
+    let durationMs: number | null = null;
+    const isMedia = dto.kind === 'image' || dto.kind === 'video';
+    if (isMedia) {
+      const mediaLabel = dto.kind === 'video' ? 'Video' : 'Foto';
       if (!dto.mediaId) {
         throw new BadRequestException({
           code: 'STORY_MEDIA_REQUIRED',
-          message: 'Foto story wajib diunggah.',
+          message: `${mediaLabel} story wajib diunggah.`,
         });
       }
       const ticket = await this.prisma.storyMediaUpload.findFirst({
         where: { id: dto.mediaId, authorId: userId, expiresAt: { gt: now } },
-        select: { id: true, fileKey: true },
+        select: { id: true, fileKey: true, kind: true, thumbnailKey: true, durationMs: true },
       });
       if (!ticket || !isSafeFileKey(ticket.fileKey)) {
         throw new BadRequestException({
           code: 'STORY_MEDIA_REQUIRED',
-          message: 'Foto story tidak tersedia atau masa unggahnya habis.',
+          message: `${mediaLabel} story tidak tersedia atau masa unggahnya habis.`,
+        });
+      }
+      // Tiket foto tidak boleh dipakai untuk story video (dan sebaliknya):
+      // viewer memutar berdasarkan `kind`, jadi ketidaksesuaian = media rusak.
+      if (ticket.kind !== storedStoryKind(dto.kind)) {
+        throw new BadRequestException({
+          code: 'STORY_MEDIA_REQUIRED',
+          message: 'Jenis media tidak sesuai dengan jenis story.',
         });
       }
       if ((await this.uploadService.getFileSize(ticket.fileKey)) < 1) {
         throw new BadRequestException({
           code: 'STORY_MEDIA_REQUIRED',
-          message: 'Foto story tidak tersedia.',
+          message: `${mediaLabel} story tidak tersedia.`,
+        });
+      }
+      if (dto.kind === 'video' && (!ticket.durationMs || ticket.durationMs <= 0)) {
+        throw new BadRequestException({
+          code: 'STORY_MEDIA_REQUIRED',
+          message: 'Video story belum selesai diproses.',
         });
       }
       mediaKey = ticket.fileKey;
+      thumbnailKey =
+        ticket.thumbnailKey && isSafeFileKey(ticket.thumbnailKey) ? ticket.thumbnailKey : null;
+      durationMs = dto.kind === 'video' ? ticket.durationMs : null;
     } else if (dto.mediaId) {
       throw new BadRequestException({
         code: 'VALIDATION_ERROR',
@@ -301,22 +485,24 @@ export class StoriesService {
     }
 
     const story = await this.prisma.$transaction(async tx => {
-      if (dto.kind === 'image') {
+      if (isMedia) {
         const consumed = await tx.storyMediaUpload.deleteMany({
           where: { id: dto.mediaId, authorId: userId, expiresAt: { gt: now } },
         });
         if (consumed.count !== 1) {
           throw new BadRequestException({
             code: 'STORY_MEDIA_REQUIRED',
-            message: 'Foto story sudah dipakai atau masa unggahnya habis.',
+            message: 'Media story sudah dipakai atau masa unggahnya habis.',
           });
         }
       }
       return tx.story.create({
         data: {
           authorId: userId,
-          kind: dto.kind === 'image' ? StoryKind.IMAGE : StoryKind.TEXT,
+          kind: storedStoryKind(dto.kind),
           mediaKey,
+          thumbnailKey,
+          durationMs,
           textContent: text,
           backgroundColor: dto.kind === 'text' ? dto.backgroundColor! : null,
           audience: audience as Prisma.InputJsonValue,
@@ -640,8 +826,10 @@ export class StoriesService {
     const snapshot = {
       id: story.id,
       author: publicAuthor(story.author),
-      kind: story.kind === StoryKind.IMAGE ? 'image' : 'text',
+      kind: apiStoryKind(story.kind),
       mediaKey: story.mediaKey,
+      thumbnailKey: story.thumbnailKey,
+      durationMs: story.durationMs,
       text: story.textContent,
       backgroundColor: story.backgroundColor,
       audience: audiencePayload(story.audience),
@@ -911,11 +1099,14 @@ export class StoriesService {
     const pendingTickets = await this.prisma.storyMediaUpload.findMany({
       where: { expiresAt: { lte: now } },
       take: batchSize,
-      select: { id: true, authorId: true, fileKey: true },
+      select: { id: true, authorId: true, fileKey: true, thumbnailKey: true },
     });
     let mediaTickets = 0;
     for (const row of pendingTickets) {
-      const cleanup = await this.uploadService.cleanupFileKeys(row.authorId, [row.fileKey]);
+      const cleanup = await this.uploadService.cleanupFileKeys(
+        row.authorId,
+        this.storyStorageKeys(row),
+      );
       if (cleanup.errors.length > 0) {
         // Keep the expired ticket as a retry record. It can no longer be used
         // to create a Story because its expiresAt has passed.
@@ -937,16 +1128,19 @@ export class StoriesService {
       },
       take: batchSize,
       orderBy: { expiresAt: 'asc' },
-      select: { id: true, authorId: true, mediaKey: true },
+      select: { id: true, authorId: true, mediaKey: true, thumbnailKey: true },
     });
     let deleted = 0;
     for (const row of retainedRows) {
-      if (row.mediaKey) {
-        const cleanup = await this.uploadService.cleanupFileKeys(row.authorId, [row.mediaKey]);
+      const keys = this.storyStorageKeys({ fileKey: row.mediaKey, thumbnailKey: row.thumbnailKey });
+      if (keys.length) {
+        const cleanup = await this.uploadService.cleanupFileKeys(row.authorId, keys);
         if (cleanup.errors.length > 0) {
           // Keep the row hidden but intact so the next retention run can retry
           // media deletion instead of orphaning a private file on disk.
-          this.logger.warn(`Expired Story hard-delete will retry media cleanup for story=${row.id}`);
+          this.logger.warn(
+            `Expired Story hard-delete will retry media cleanup for story=${row.id}`,
+          );
           continue;
         }
       }
@@ -973,8 +1167,12 @@ export class StoriesService {
     if (!story.deletedAt) {
       await this.prisma.story.update({ where: { id: storyId }, data: { deletedAt: new Date() } });
     }
-    if (story.mediaKey) {
-      const cleanup = await this.uploadService.cleanupFileKeys(story.authorId, [story.mediaKey]);
+    const storageKeys = this.storyStorageKeys({
+      fileKey: story.mediaKey,
+      thumbnailKey: story.thumbnailKey,
+    });
+    if (storageKeys.length) {
+      const cleanup = await this.uploadService.cleanupFileKeys(story.authorId, storageKeys);
       if (cleanup.errors.length > 0) {
         throw new ServiceUnavailableException({
           code: ErrorCodes.UPLOAD_STORAGE_UNAVAILABLE,
@@ -1083,11 +1281,16 @@ export class StoriesService {
     const mediaUrl = story.mediaKey
       ? await this.uploadService.generateDownloadUrl(story.mediaKey, 300)
       : null;
+    const thumbnailUrl = story.thumbnailKey
+      ? await this.uploadService.generateDownloadUrl(story.thumbnailKey, 300).catch(() => null)
+      : null;
     return {
       id: story.id,
       author: publicAuthor(story.author),
-      kind: story.kind === StoryKind.IMAGE ? 'image' : 'text',
+      kind: apiStoryKind(story.kind),
       mediaUrl,
+      thumbnailUrl,
+      durationMs: story.durationMs,
       text: story.textContent,
       backgroundColor: story.backgroundColor,
       productTags: await this.serializeProductTags(
@@ -1225,7 +1428,7 @@ export class StoriesService {
     }
   }
 
-  private validateStoryText(kind: 'image' | 'text', input?: string): string | null {
+  private validateStoryText(kind: StoryApiKind, input?: string): string | null {
     const text = input?.trim() ?? '';
     if (text.length > STORY_TEXT_MAX) {
       throw new BadRequestException({
@@ -1419,6 +1622,12 @@ export class StoriesService {
     const mediaUrl = row.mediaKey
       ? await this.uploadService.generateDownloadUrl(row.mediaKey, STORY_LIFETIME_MS / 1000)
       : null;
+    const thumbnailUrl =
+      row.kind === StoryKind.VIDEO && row.thumbnailKey
+        ? await this.uploadService
+            .generateDownloadUrl(row.thumbnailKey, STORY_LIFETIME_MS / 1000)
+            .catch(() => null)
+        : null;
     const priceSticker = this.serializePriceSticker(row.priceSticker);
     const askStock = this.serializeAskStock(row.askStock);
     const productTags = await Promise.all(
@@ -1438,8 +1647,10 @@ export class StoriesService {
     return {
       id: row.id,
       author: publicAuthor(row.author)!,
-      kind: row.kind === StoryKind.IMAGE ? 'image' : 'text',
+      kind: apiStoryKind(row.kind),
       mediaUrl,
+      thumbnailUrl,
+      durationMs: row.kind === StoryKind.VIDEO ? row.durationMs : null,
       text: row.textContent,
       backgroundColor: row.backgroundColor,
       productTags: productTags.filter((tag): tag is NonNullable<typeof tag> => tag !== null),
@@ -1633,15 +1844,23 @@ export class StoriesService {
       const row = rows[index];
       const serializedStory = serialized[index];
       let archivedMediaKey: string | null = null;
+      let archivedThumbnailKey: string | null = null;
       if (row.mediaKey) {
-        archivedMediaKey = this.newHighlightFileKey(userId);
+        archivedMediaKey = this.newHighlightFileKey(userId, fileExtensionOf(row.mediaKey, '.jpg'));
         copiedKeys.push(archivedMediaKey);
         await this.localStorage.copyFile(row.mediaKey, archivedMediaKey);
+      }
+      if (row.kind === StoryKind.VIDEO && row.thumbnailKey) {
+        archivedThumbnailKey = this.newHighlightFileKey(userId, '.jpg');
+        copiedKeys.push(archivedThumbnailKey);
+        await this.localStorage.copyFile(row.thumbnailKey, archivedThumbnailKey);
       }
       snapshots.push({
         ...serializedStory,
         mediaUrl: null,
         mediaKey: archivedMediaKey,
+        thumbnailUrl: null,
+        thumbnailKey: archivedThumbnailKey,
         audience: null,
         viewed: false,
         viewCount: 0,
@@ -1651,16 +1870,26 @@ export class StoriesService {
     return snapshots;
   }
 
-  private newHighlightFileKey(userId: string): string {
-    return `uploads/story-highlights/${userId}/${Date.now()}-${createId()}.jpg`;
+  private newHighlightFileKey(userId: string, extension = '.jpg'): string {
+    return `uploads/story-highlights/${userId}/${Date.now()}-${createId()}${extension}`;
+  }
+
+  /** Semua key storage milik satu story/tiket (media + poster video), tanpa null. */
+  private storyStorageKeys(row: { fileKey: string | null; thumbnailKey: string | null }): string[] {
+    return [row.fileKey, row.thumbnailKey].filter(
+      (key): key is string => typeof key === 'string' && key.length > 0,
+    );
   }
 
   private highlightMediaKeys(snapshots: unknown[]): string[] {
     return snapshots.flatMap(raw => {
       const item = jsonObject(raw as Prisma.JsonValue);
-      return typeof item?.mediaKey === 'string' && isSafeFileKey(item.mediaKey)
-        ? [item.mediaKey]
-        : [];
+      const keys: string[] = [];
+      if (typeof item?.mediaKey === 'string' && isSafeFileKey(item.mediaKey))
+        keys.push(item.mediaKey);
+      if (typeof item?.thumbnailKey === 'string' && isSafeFileKey(item.thumbnailKey))
+        keys.push(item.thumbnailKey);
+      return keys;
     });
   }
 
@@ -1715,18 +1944,32 @@ export class StoriesService {
         );
         const mediaKey =
           typeof item.mediaKey === 'string' && isSafeFileKey(item.mediaKey) ? item.mediaKey : null;
+        const thumbnailKey =
+          typeof item.thumbnailKey === 'string' && isSafeFileKey(item.thumbnailKey)
+            ? item.thumbnailKey
+            : null;
+        const kind: StoryApiKind =
+          item.kind === 'text' ? 'text' : item.kind === 'video' ? 'video' : 'image';
         const price = jsonObject(item.priceSticker as Prisma.JsonValue);
         const ask = jsonObject(item.askStock as Prisma.JsonValue);
+        const highlightTtl = (STORY_LIFETIME_MS / 1000) * 365;
         return {
           id: item.id,
           author: item.author as StoryApi['author'],
-          kind: item.kind === 'text' ? 'text' : 'image',
+          kind,
           mediaUrl: mediaKey
-            ? await this.uploadService.generateDownloadUrl(
-                mediaKey,
-                (STORY_LIFETIME_MS / 1000) * 365,
-              )
+            ? await this.uploadService.generateDownloadUrl(mediaKey, highlightTtl)
             : null,
+          thumbnailUrl:
+            kind === 'video' && thumbnailKey
+              ? await this.uploadService
+                  .generateDownloadUrl(thumbnailKey, highlightTtl)
+                  .catch(() => null)
+              : null,
+          durationMs:
+            kind === 'video' && typeof item.durationMs === 'number' && item.durationMs > 0
+              ? item.durationMs
+              : null,
           text: typeof item.text === 'string' ? item.text : null,
           backgroundColor: typeof item.backgroundColor === 'string' ? item.backgroundColor : null,
           productTags: productTags.filter((tag): tag is NonNullable<typeof tag> => tag !== null),
@@ -1752,7 +1995,8 @@ export class StoriesService {
     return {
       id: highlight.id,
       title: highlight.title,
-      coverUrl: cover?.mediaUrl ?? null,
+      // Sampul video = poster JPEG (bukan URL berkas video, yang tidak bisa dirender <Image>).
+      coverUrl: cover ? (cover.kind === 'video' ? cover.thumbnailUrl : cover.mediaUrl) : null,
       storyCount: cleanStories.length,
       stories: cleanStories,
       createdAt: highlight.createdAt.toISOString(),
@@ -1772,6 +2016,22 @@ export class StoriesService {
       select: { id: true },
     });
     return !!block;
+  }
+
+  /** Penyimpan yang memblokir / diblokir penulis (dua arah) — kebalikan `blockedAuthorIds`. */
+  private async blockedViewerIds(authorId: string, viewerIds: string[]): Promise<Set<string>> {
+    const candidates = [...new Set(viewerIds)].filter(id => id !== authorId);
+    if (!candidates.length) return new Set();
+    const rows = await this.prisma.blockList.findMany({
+      where: {
+        OR: [
+          { blockerId: authorId, blockedId: { in: candidates } },
+          { blockedId: authorId, blockerId: { in: candidates } },
+        ],
+      },
+      select: { blockerId: true, blockedId: true },
+    });
+    return new Set(rows.map(row => (row.blockerId === authorId ? row.blockedId : row.blockerId)));
   }
 
   private async blockedAuthorIds(viewerId: string, authorIds: string[]): Promise<Set<string>> {
@@ -1838,10 +2098,16 @@ export class StoriesService {
         })
       : [];
     const mutedIds = new Set(mutedProfiles.map(row => row.viewerId));
+    // Satu query blokir untuk semua penyimpan (dulu satu query per penyimpan —
+    // 500 penyimpan = 500 round-trip saat setiap story dibuat).
+    const blockedIds = await this.blockedViewerIds(
+      story.authorId,
+      savedProfiles.map(row => row.userId),
+    );
     for (const saved of savedProfiles) {
       if (!storyAudienceAllows(story.audience, saved.user.userId)) continue;
       if (mutedIds.has(saved.userId)) continue;
-      if (await this.isBlocked(saved.userId, story.authorId)) continue;
+      if (blockedIds.has(saved.userId)) continue;
       this.realtime.emitToUser(saved.userId, 'story.created', {
         authorUserId: story.author.userId,
         storyId: story.id,

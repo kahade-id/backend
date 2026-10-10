@@ -20,9 +20,6 @@ export class CsrfGuard implements CanActivate {
       context.getHandler(),
       context.getClass(),
     ]);
-    if (isPublic) {
-      return true;
-    }
 
     if (!STATE_CHANGING_METHODS.has(request.method)) {
       return true;
@@ -37,6 +34,14 @@ export class CsrfGuard implements CanActivate {
     // https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html
     const hasBearerHeader = request.headers.authorization?.startsWith('Bearer ') && user?.sub;
     if (hasBearerHeader) {
+      return true;
+    }
+
+    // Audit Auth 2026-10-10 (#BE-51): rute @Public() hanya bebas CSRF bila
+    // request benar-benar anonim. Bila JwtAuthGuard mengisi request.user dari
+    // COOKIE (auth opsional, mis. POST /feedback), aksi itu berjalan atas nama
+    // user dan browser melampirkan cookie otomatis — CSRF tetap wajib.
+    if (isPublic && !user?.sub) {
       return true;
     }
 

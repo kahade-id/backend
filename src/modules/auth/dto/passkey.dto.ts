@@ -1,5 +1,7 @@
-import { IsString, IsNotEmpty, IsOptional, MaxLength, MinLength, IsIn, IsObject } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, MaxLength, MinLength, IsIn, IsObject, Matches } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Transform } from 'class-transformer';
+import { DEVICE_ID_MESSAGE, DEVICE_ID_PATTERN, normalizeDeviceId } from './device-id.validation';
 
 /**
  * DTO re-auth untuk operasi sensitif passkey (G027, G036, G037).
@@ -58,7 +60,9 @@ export class PasskeyRegisterVerifyDto {
 }
 
 export class PasskeyAuthOptionsDto {
-  @ApiPropertyOptional({ description: 'Username/email/nomor HP (opsional; bila diisi allowCredentials dibatasi ke akun itu)' })
+  // Audit Auth 2026-10-10 (#BE-41): identifier hanya mengikat challenge ke akun
+  // (dicocokkan saat verify) — respons TIDAK lagi memuat allowCredentials.
+  @ApiPropertyOptional({ description: 'Username/email/nomor HP (opsional; mengikat tantangan ke akun itu, respons tetap seragam)' })
   @IsOptional()
   @IsString()
   @MaxLength(100)
@@ -75,10 +79,13 @@ export class PasskeyAuthVerifyDto {
   @IsObject()
   assertion!: Record<string, unknown>;
 
-  @ApiPropertyOptional({ description: 'ID perangkat (diisi otomatis dari session klien bila tersedia)' })
+  @ApiPropertyOptional({ description: 'ID perangkat (diisi otomatis dari session klien bila tersedia)', maxLength: 255 })
   @IsOptional()
   @IsString()
-  @MaxLength(100)
+  // Audit Auth 2026-10-10 (#BE-22): pola & panjang deviceId disamakan dengan DTO auth lain.
+  @MaxLength(255)
+  @Matches(DEVICE_ID_PATTERN, { message: DEVICE_ID_MESSAGE })
+  @Transform(({ value }: { value: unknown }) => normalizeDeviceId(value))
   deviceId?: string;
 
   @ApiPropertyOptional({ description: 'Info perangkat' })
@@ -112,9 +119,12 @@ export class PasskeyRecoverDto {
   @MaxLength(10)
   otpCode?: string;
 
-  @ApiPropertyOptional({ description: 'ID perangkat pemohon (untuk deteksi perangkat baru)' })
+  @ApiPropertyOptional({ description: 'ID perangkat pemohon (untuk deteksi perangkat baru)', maxLength: 255 })
   @IsOptional()
   @IsString()
-  @MaxLength(100)
+  // Audit Auth 2026-10-10 (#BE-22): pola & panjang deviceId disamakan dengan DTO auth lain.
+  @MaxLength(255)
+  @Matches(DEVICE_ID_PATTERN, { message: DEVICE_ID_MESSAGE })
+  @Transform(({ value }: { value: unknown }) => normalizeDeviceId(value))
   deviceId?: string;
 }

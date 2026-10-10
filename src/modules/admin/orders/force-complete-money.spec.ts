@@ -126,3 +126,89 @@ describe('Batch 8 money — EO-008 force-complete ORDER_RELEASE balance basis', 
     expect(sellerRelease.balanceAfter - sellerRelease.balanceBefore).toBe(SELLER_RECV_SEN);
   });
 });
+
+/**
+ * Audit transaksi 2026-10-10 — force-complete di mode no-wallet (produksi):
+ * order dibayar DANA-direct, tidak ada wallet/ORDER_LOCK. Harus selesai +
+ * membuat baris EscrowDisbursement PENDING di dalam tx, lalu cair post-commit.
+ */
+describe('Force-complete no-wallet (audit 2026-10-10)', () => {
+  function buildNoWallet() {
+    const disbursementCreates: any[] = [];
+    const ptx = {
+      order: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+      walletTransaction: { findFirst: jest.fn().mockResolvedValue(null), create: jest.fn() },
+      wallet: { findUnique: jest.fn(), updateMany: jest.fn() },
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      escrowDisbursement: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        create: jest.fn(async (args: any) => { disbursementCreates.push(args.data); return { id: 'disb-1' }; }),
+      },
+      orderStatusHistory: { create: jest.fn().mockResolvedValue({}) },
+      orderExtensionRequest: { updateMany: jest.fn().mockResolvedValue({}) },
+      deliveryProof: { updateMany: jest.fn().mockResolvedValue({}) },
+      user: { update: jest.fn().mockResolvedValue({}) },
+      subscription: { findFirst: jest.fn().mockResolvedValue(null) },
+      voucherUsage: { findFirst: jest.fn().mockResolvedValue(null) },
+    };
+    const orderNoWallet = { ...orderRow, buyer: { wallet: null }, seller: { wallet: null } };
+    const prisma = {
+      order: { findFirst: jest.fn().mockResolvedValue(orderNoWallet) },
+      paymentTransaction: { findFirst: jest.fn().mockResolvedValue({ id: 'pay-1' }) },
+      adminUser: {
+        findUnique: jest.fn().mockResolvedValue({ id: 'admin-1', password: ADMIN_PASSWORD_HASH, isActive: true, deletedAt: null }),
+      },
+      $transaction: jest.fn(async (cb: any) => cb(ptx)),
+      notification: { create: jest.fn().mockResolvedValue({}) },
+      emitNotificationCreated: jest.fn(),
+    };
+    const walletTxSerialService = { getNext: jest.fn(async () => 1) };
+    const disbursement = { releaseForOrder: jest.fn().mockResolvedValue({ outcome: 'RELEASED', disbursementId: 'disb-1', danaReferenceNo: 'ref' }) };
+    const service = new AdminOrdersService(
+      prisma as never,
+      { logAdminAction: jest.fn() } as never,
+      { del: jest.fn().mockResolvedValue(1) } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      walletTxSerialService as never,
+      { createReferralRewardIfEligible: jest.fn().mockResolvedValue(false), invalidateLeaderboardCache: jest.fn() } as never,
+      { checkAndUpdateMembershipRank: jest.fn().mockResolvedValue(undefined) } as never,
+      { invalidateSummaryCache: jest.fn().mockResolvedValue(undefined) } as never,
+      { isWalletEnabled: () => false } as never,
+      disbursement as never,
+    );
+    return { service, ptx, prisma, disbursement, disbursementCreates, walletTxSerialService };
+  }
+
+  it('wallet mati + payment DANA → COMPLETED, baris ORDER_ESCROW PENDING di tx, release post-commit, ledger wallet tak disentuh', async () => {
+    const { service, ptx, disbursement, disbursementCreates, walletTxSerialService } = buildNoWallet();
+
+    const result = await service.forceComplete('ORD-2026-1', 'admin-1', { reason: 'Buyer tidak merespons', password: ADMIN_PASSWORD } as never);
+
+    expect(result.status).toBe('COMPLETED');
+    expect(disbursementCreates).toHaveLength(1);
+    expect(disbursementCreates[0]).toMatchObject({
+      idempotencyKey: 'ORDER:order-db-1',
+      scope: 'ORDER_ESCROW',
+      sellerId: 'seller-1',
+      amountSen: SELLER_RECV_SEN,
+      status: 'PENDING',
+    });
+    expect(disbursement.releaseForOrder).toHaveBeenCalledWith('order-db-1');
+    expect(ptx.walletTransaction.create).not.toHaveBeenCalled();
+    expect(ptx.wallet.updateMany).not.toHaveBeenCalled();
+    expect(walletTxSerialService.getNext).not.toHaveBeenCalled();
+    // Statistik user tetap ditulis (sebelumnya terlewat oleh early-return).
+    expect(ptx.user.update).toHaveBeenCalledTimes(2);
+  });
+
+  it('wallet mati TANPA payment DANA dan tanpa wallet → NOT_FOUND (fail-closed, tidak menebak)', async () => {
+    const { service, prisma } = buildNoWallet();
+    prisma.paymentTransaction.findFirst.mockResolvedValue(null);
+
+    await expect(
+      service.forceComplete('ORD-2026-1', 'admin-1', { reason: 'x', password: ADMIN_PASSWORD } as never),
+    ).rejects.toMatchObject({ response: { code: 'NOT_FOUND' } });
+  });
+});

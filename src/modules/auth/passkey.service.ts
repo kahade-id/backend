@@ -5,6 +5,8 @@ import {
   NotFoundException,
   ConflictException,
   ServiceUnavailableException,
+  HttpException,
+  HttpStatus,
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -18,6 +20,8 @@ import { AuditLogService } from '../../common/services/audit-log.service';
 import { OtpType, NotificationType, UserAuditAction } from '@prisma/client';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import { generateNotifId } from '../../common/utils/id-generator.util';
+import { decryptPiiSafe, hashPhoneNumber, normalizePhoneNumber } from '../../common/utils/pii.util';
+import { PASSKEY_RECOVER_COOLDOWN, PASSKEY_RECOVER_RATE } from '../../common/constants/redis-keys';
 import {
   generateRegistrationOptions,
   verifyRegistrationResponse,
@@ -61,6 +65,24 @@ interface StoredChallenge {
   challenge: string;
   type: 'registration' | 'authentication';
   userId: string | null;
+}
+
+// Audit Auth 2026-10-10 (#BE-44): OTP pemulihan passkey — cooldown 60 d per
+// user + maks 3 permintaan/jam (Redis). Sebelumnya hanya throttle rute 5/menit.
+const RECOVER_COOLDOWN_SECONDS = 60;
+const RECOVER_RATE_LIMIT = 3;
+const RECOVER_RATE_WINDOW_SECONDS = 3600;
+
+function tooManyRequests(message: string, retryAfterSeconds: number): HttpException {
+  return new HttpException(
+    {
+      statusCode: HttpStatus.TOO_MANY_REQUESTS,
+      code: 'TOO_MANY_REQUESTS',
+      message,
+      retryAfter: retryAfterSeconds,
+    },
+    HttpStatus.TOO_MANY_REQUESTS,
+  );
 }
 
 /**
@@ -176,10 +198,14 @@ export class PasskeyService {
     userId: string | null,
     type: StoredChallenge['type'],
     challenge: string,
+    // Audit Auth 2026-10-10 (#BE-42): userId yang DIIKAT ke payload boleh
+    // berbeda dari namespace key (auth memakai namespace anon tetapi tetap
+    // mengikat challenge ke akun yang di-resolve dari identifier).
+    boundUserId: string | null = userId,
   ): Promise<string> {
     for (let attempt = 0; attempt < 3; attempt++) {
       const challengeId = randomUUID();
-      const payload: StoredChallenge = { challenge, type, userId };
+      const payload: StoredChallenge = { challenge, type, userId: boundUserId };
       const stored = await this.redis.setNx(
         this.challengeKey(userId, challengeId),
         JSON.stringify(payload),
@@ -420,33 +446,29 @@ export class PasskeyService {
   ): Promise<{ challengeId: string; options: unknown }> {
     this.assertWebauthnEnabled();
 
+    // Audit Auth 2026-10-10 (#BE-41): endpoint ini publik. Sebelumnya respons
+    // berbeda untuk identifier tak dikenal / ada tanpa passkey / ada dengan
+    // passkey (+ bocor credentialId) → orakel eksistensi akun. Sekarang
+    // respons SELALU seragam tanpa allowCredentials (resident key
+    // 'preferred' saat registrasi → browser memakai discoverable credential).
+    // Identifier hanya dipakai untuk mengikat challenge ke akun (#BE-42).
     let userId: string | null = null;
-    let allowCredentials: { id: string }[] | undefined;
     if (dto.username?.trim()) {
       const user = await this.findUserByIdentifier(dto.username.trim());
-      if (user) {
-        userId = user.id;
-        const creds = await this.prisma.passkeyCredential.findMany({
-          where: { userId: user.id, revokedAt: null },
-          select: { credentialId: true },
-        });
-        allowCredentials = creds.map(c => ({ id: c.credentialId }));
-      }
-      // Sengaja tidak membedakan user ada/tidak (anti-enumerasi): bila user
-      // tidak ditemukan, kembalikan options tanpa allowCredentials sehingga
-      // browser memakai discoverable credential.
+      if (user) userId = user.id;
     }
 
     const options = await generateAuthenticationOptions({
       rpID: this.rpId(),
-      allowCredentials,
       userVerification: 'preferred',
     });
 
-    // Challenge auth SELALU di namespace anon (userId tersimpan di payload)
-    // agar alur discoverable credential (tanpa username) tetap bisa
-    // diverifikasi — challengeId acak tidak bisa ditebak pihak lain.
-    const challengeId = await this.storeChallenge(null, 'authentication', options.challenge);
+    // Challenge auth SELALU di namespace anon agar alur discoverable
+    // credential (tanpa username) tetap bisa diverifikasi — challengeId acak
+    // tidak bisa ditebak pihak lain. Audit Auth 2026-10-10 (#BE-42): userId
+    // hasil resolve DISIMPAN di payload dan dicocokkan saat verify (sebelumnya
+    // selalu null sehingga pengecekan di verifyAuthentication mati).
+    const challengeId = await this.storeChallenge(null, 'authentication', options.challenge, userId);
     return { challengeId, options };
   }
 
@@ -572,10 +594,29 @@ export class PasskeyService {
       });
     }
 
-    await this.prisma.passkeyCredential.update({
-      where: { id: credential.id },
+    // Audit Auth 2026-10-10 (#BE-43): update counter ATOMIK — hanya berhasil
+    // bila counter tersimpan masih sama dengan yang dibaca di atas. Dua
+    // assertion paralel dari authenticator kloning tidak bisa sama-sama lolos
+    // pemeriksaan non-atomik di atas lalu saling menimpa.
+    const counterUpdate = await this.prisma.passkeyCredential.updateMany({
+      where: { id: credential.id, counter: storedCounter, revokedAt: null },
       data: { counter: newCounter, lastUsedAt: new Date() },
     });
+    if (counterUpdate.count === 0) {
+      this.auditLog.logUserAction({
+        userId: credential.userId,
+        action: UserAuditAction.PASSKEY_FAILED,
+        entityType: 'PasskeyCredential',
+        entityId: credential.id,
+        description: `Anomali counter passkey (race): stored=${storedCounter} new=${newCounter}`,
+        ipAddress,
+      });
+      throw new UnauthorizedException({
+        code: 'PASSKEY_COUNTER_ANOMALY',
+        message:
+          'Terdeteksi anomali keamanan pada passkey Anda. Silakan masuk dengan kata sandi atau OTP WhatsApp.',
+      });
+    }
 
     this.auditLog.logUserAction({
       userId: credential.userId,
@@ -735,6 +776,16 @@ export class PasskeyService {
     if (!user || !user.isActive || user.isBanned) {
       throw new UnauthorizedException({ code: 'INVALID_CREDENTIALS', message: 'Kredensial tidak valid.' });
     }
+    // Audit Auth 2026-10-10 (#BE-27): `user.phoneNumber` tersimpan TERENKRIPSI
+    // (encryptPii) — sebelumnya ciphertext dipakai langsung sebagai tujuan OTP
+    // sehingga OTP terkirim ke string acak dan verifikasi selalu gagal.
+    const phoneNumber = await decryptPiiSafe(user.phoneNumber);
+    if (!phoneNumber) {
+      throw new BadRequestException({
+        code: 'PHONE_NOT_SET',
+        message: 'Nomor HP terdaftar tidak tersedia. Hubungi dukungan Kahade.',
+      });
+    }
 
     if (dto.step === 'request') {
       const newDevice = await this.isNewDevice(userId, dto.deviceId);
@@ -744,30 +795,56 @@ export class PasskeyService {
           message: 'Pengiriman OTP sedang tidak tersedia. Coba lagi nanti.',
         });
       }
-      const otp = await this.otpService.generatePhoneOtp(
-        user.phoneNumber,
-        OtpType.SENSITIVE_ACTION,
-        'WHATSAPP',
-        userId,
-        { purpose: 'passkey_recover', userId },
-        ipAddress,
-      );
-      let delivery: { success: boolean; error?: string };
-      try {
-        delivery = await this.otpGateway.sendOtp(user.phoneNumber, otp, 'WHATSAPP');
-      } catch {
-        await this.otpService.invalidatePhoneOtps(user.phoneNumber, OtpType.SENSITIVE_ACTION).catch(() => undefined);
-        throw new ServiceUnavailableException({
-          code: 'OTP_DELIVERY_FAILED',
-          message: 'Pengiriman OTP sedang tidak tersedia. Coba lagi nanti.',
-        });
+      // Audit Auth 2026-10-10 (#BE-44): cooldown 60 d per user + maks 3/jam.
+      const cooldownKey = PASSKEY_RECOVER_COOLDOWN(userId);
+      const cooldownClaimed = await this.redis.setNx(cooldownKey, '1', RECOVER_COOLDOWN_SECONDS);
+      if (!cooldownClaimed) {
+        throw tooManyRequests(
+          `Tunggu ${RECOVER_COOLDOWN_SECONDS} detik sebelum meminta kode pemulihan baru.`,
+          RECOVER_COOLDOWN_SECONDS,
+        );
       }
-      if (!delivery.success) {
-        await this.otpService.invalidatePhoneOtps(user.phoneNumber, OtpType.SENSITIVE_ACTION).catch(() => undefined);
-        throw new ServiceUnavailableException({
-          code: 'OTP_DELIVERY_FAILED',
-          message: 'Pengiriman OTP gagal. Coba lagi nanti.',
-        });
+      try {
+        const hourly = await this.redis.incrWithTtl(PASSKEY_RECOVER_RATE(userId), RECOVER_RATE_WINDOW_SECONDS);
+        if (hourly > RECOVER_RATE_LIMIT) {
+          throw tooManyRequests(
+            'Terlalu banyak permintaan kode pemulihan. Coba lagi dalam satu jam.',
+            RECOVER_RATE_WINDOW_SECONDS,
+          );
+        }
+        const otp = await this.otpService.generatePhoneOtp(
+          phoneNumber,
+          OtpType.SENSITIVE_ACTION,
+          'WHATSAPP',
+          userId,
+          { purpose: 'passkey_recover', userId },
+          ipAddress,
+        );
+        let delivery: { success: boolean; error?: string };
+        try {
+          delivery = await this.otpGateway.sendOtp(phoneNumber, otp, 'WHATSAPP');
+        } catch {
+          await this.otpService.invalidatePhoneOtps(phoneNumber, OtpType.SENSITIVE_ACTION).catch(() => undefined);
+          throw new ServiceUnavailableException({
+            code: 'OTP_DELIVERY_FAILED',
+            message: 'Pengiriman OTP sedang tidak tersedia. Coba lagi nanti.',
+          });
+        }
+        if (!delivery.success) {
+          await this.otpService.invalidatePhoneOtps(phoneNumber, OtpType.SENSITIVE_ACTION).catch(() => undefined);
+          throw new ServiceUnavailableException({
+            code: 'OTP_DELIVERY_FAILED',
+            message: 'Pengiriman OTP gagal. Coba lagi nanti.',
+          });
+        }
+      } catch (error) {
+        // Cooldown dilepas hanya bila OTP gagal dibuat/dikirim (bukan karena
+        // batas kuota) agar user sah bisa langsung mencoba lagi.
+        const status = error instanceof HttpException ? error.getStatus() : undefined;
+        if (status !== HttpStatus.TOO_MANY_REQUESTS) {
+          await this.redis.del(cooldownKey).catch(() => undefined);
+        }
+        throw error;
       }
       this.auditLog.logUserAction({
         userId,
@@ -787,8 +864,17 @@ export class PasskeyService {
     if (!dto.otpCode) {
       throw new BadRequestException({ code: 'OTP_REQUIRED', message: 'Kode OTP wajib diisi.' });
     }
-    const valid = await this.otpService.verifyPhoneOtp(user.phoneNumber, OtpType.SENSITIVE_ACTION, dto.otpCode);
-    if (!valid) {
+    // Audit Auth 2026-10-10 (#BE-27): verifikasi memakai nomor terdekripsi DAN
+    // wajib metadata.purpose === 'passkey_recover' + userId cocok — OTP
+    // SENSITIVE_ACTION lain (hapus akun, ganti nomor) tidak bisa dipakai
+    // sebagai re-auth passkey.
+    const otpResult = await this.otpService.verifyPhoneOtpWithMetadata(
+      phoneNumber,
+      OtpType.SENSITIVE_ACTION,
+      dto.otpCode,
+    );
+    const otpMeta = (otpResult.metadata ?? {}) as { purpose?: unknown; userId?: unknown };
+    if (!otpResult.valid || otpMeta.purpose !== 'passkey_recover' || otpMeta.userId !== userId) {
       throw new BadRequestException({
         code: 'INVALID_OTP',
         message: 'Kode OTP salah atau kedaluwarsa.',
@@ -857,12 +943,19 @@ export class PasskeyService {
   private async findUserByIdentifier(identifier: string) {
     // Cerminkan pencarian login: username / email / nomor HP.
     const normalized = identifier.trim();
+    // Audit Auth 2026-10-10 (#BE-42): nomor HP tersimpan terenkripsi — cocokkan
+    // via phoneNumberHash (dinormalkan ke +62 dulu) agar binding challenge ke
+    // akun juga bekerja untuk identifier berupa nomor HP.
+    const phoneHash = /^[+\d][\d\s\-.]{6,}$/.test(normalized)
+      ? hashPhoneNumber(normalizePhoneNumber(normalized))
+      : null;
     return this.prisma.user.findFirst({
       where: {
         OR: [
           { username: normalized },
           { email: normalized.toLowerCase() },
           { phoneNumber: normalized },
+          ...(phoneHash ? [{ phoneNumberHash: phoneHash }] : []),
         ],
       },
       select: { id: true },

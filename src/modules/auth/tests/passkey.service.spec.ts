@@ -9,8 +9,10 @@
  *  - anomali counter (G046) vs pasangan 0/0 passkey sync yang diizinkan
  *  - revoke kredensial terakhir tanpa metode lain ditolak (G038)
  */
-import { BadRequestException, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, HttpException, ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
 import { PasskeyService } from '../passkey.service';
+import { encryptAES, initializeCrypto } from '../../../common/utils/crypto.util';
+import { PASSKEY_RECOVER_COOLDOWN } from '../../../common/constants/redis-keys';
 
 jest.mock('@simplewebauthn/server', () => ({
   generateRegistrationOptions: jest.fn(),
@@ -22,10 +24,12 @@ jest.mock('@simplewebauthn/server', () => ({
 import {
   verifyRegistrationResponse,
   verifyAuthenticationResponse,
+  generateAuthenticationOptions,
 } from '@simplewebauthn/server';
 
 const mockVerifyRegistration = verifyRegistrationResponse as jest.Mock;
 const mockVerifyAuthentication = verifyAuthenticationResponse as jest.Mock;
+const mockGenerateAuthOptions = generateAuthenticationOptions as jest.Mock;
 
 function makePrisma() {
   return {
@@ -35,6 +39,7 @@ function makePrisma() {
       findMany: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       count: jest.fn(),
     },
     user: { findUnique: jest.fn(), findFirst: jest.fn() },
@@ -48,6 +53,8 @@ function makeRedis() {
   return {
     setNx: jest.fn().mockResolvedValue(true),
     getAndDelete: jest.fn(),
+    incrWithTtl: jest.fn().mockResolvedValue(1),
+    del: jest.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -76,6 +83,7 @@ function makeService(deps: {
   const otpService = {
     generatePhoneOtp: jest.fn(),
     verifyPhoneOtp: jest.fn(),
+    verifyPhoneOtpWithMetadata: jest.fn(),
     invalidatePhoneOtps: jest.fn(),
   };
   const otpGateway = { supportsMethod: jest.fn().mockReturnValue(true), sendOtp: jest.fn() };
@@ -136,8 +144,9 @@ describe('PasskeyService.verifyAuthentication (G030/G031/G046)', () => {
     );
 
     expect(result).toEqual({ accessToken: 'a', refreshToken: 'r' });
-    expect(prisma.passkeyCredential.update).toHaveBeenCalledWith({
-      where: { id: 'cred-row-1' },
+    // BE-43: update counter kondisional (atomik) pada counter yang dibaca.
+    expect(prisma.passkeyCredential.updateMany).toHaveBeenCalledWith({
+      where: { id: 'cred-row-1', counter: BigInt(5), revokedAt: null },
       data: { counter: BigInt(6), lastUsedAt: expect.any(Date) },
     });
     expect(authService.loginWithPasskey).toHaveBeenCalledWith('user-1', '127.0.0.1', expect.anything());
@@ -200,7 +209,7 @@ describe('PasskeyService.verifyAuthentication (G030/G031/G046)', () => {
       .catch(e => e)) as { response?: { code?: string } };
     expect(err).toBeInstanceOf(UnauthorizedException);
     expect(err.response?.code).toBe('PASSKEY_COUNTER_ANOMALY');
-    expect(prisma.passkeyCredential.update).not.toHaveBeenCalled();
+    expect(prisma.passkeyCredential.updateMany).not.toHaveBeenCalled();
     expect(authService.loginWithPasskey).not.toHaveBeenCalled();
     expect(prisma.notification.create).toHaveBeenCalled();
     expect(auditLog.logUserAction).toHaveBeenCalledWith(
@@ -219,6 +228,182 @@ describe('PasskeyService.verifyAuthentication (G030/G031/G046)', () => {
 
     await service.verifyAuthentication({ challengeId: 'cid', assertion: { id: 'credential-id-abc' } }, '127.0.0.1');
     expect(authService.loginWithPasskey).toHaveBeenCalled();
+  });
+
+  test('BE-43: updateMany kondisional gagal (race/kloning) → 401 PASSKEY_COUNTER_ANOMALY, sesi tidak terbit', async () => {
+    const { service, prisma, redis, authService, auditLog } = makeService();
+    redis.getAndDelete.mockResolvedValue(storedChallenge);
+    prisma.passkeyCredential.findUnique.mockResolvedValue(baseCredential);
+    prisma.passkeyCredential.updateMany.mockResolvedValue({ count: 0 });
+    mockVerifyAuthentication.mockResolvedValue({
+      verified: true,
+      authenticationInfo: { newCounter: 6 },
+    });
+
+    const err = (await service
+      .verifyAuthentication({ challengeId: 'cid', assertion: { id: 'credential-id-abc' } }, '127.0.0.1')
+      .catch(e => e)) as { response?: { code?: string } };
+    expect(err).toBeInstanceOf(UnauthorizedException);
+    expect(err.response?.code).toBe('PASSKEY_COUNTER_ANOMALY');
+    expect(authService.loginWithPasskey).not.toHaveBeenCalled();
+    expect(auditLog.logUserAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'PASSKEY_FAILED', description: expect.stringContaining('race') }),
+    );
+  });
+
+  test('BE-42: challenge terikat ke user lain → 401 INVALID_CREDENTIALS', async () => {
+    const { service, prisma, redis, authService } = makeService();
+    redis.getAndDelete.mockResolvedValue(
+      JSON.stringify({ challenge: 'test-challenge-base64url', type: 'authentication', userId: 'user-2' }),
+    );
+    prisma.passkeyCredential.findUnique.mockResolvedValue(baseCredential);
+
+    const err = (await service
+      .verifyAuthentication({ challengeId: 'cid', assertion: { id: 'credential-id-abc' } }, '127.0.0.1')
+      .catch(e => e)) as { response?: { code?: string } };
+    expect(err).toBeInstanceOf(UnauthorizedException);
+    expect(err.response?.code).toBe('INVALID_CREDENTIALS');
+    expect(mockVerifyAuthentication).not.toHaveBeenCalled();
+    expect(authService.loginWithPasskey).not.toHaveBeenCalled();
+  });
+});
+
+describe('PasskeyService.getAuthenticationOptions (BE-41/BE-42)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    delete process.env.WEBAUTHN_ENABLED;
+    mockGenerateAuthOptions.mockResolvedValue({ challenge: 'chal-1', rpId: 'localhost' });
+  });
+
+  test('respons seragam tanpa allowCredentials untuk identifier dikenal maupun tidak', async () => {
+    const { service, prisma } = makeService();
+
+    prisma.user.findFirst.mockResolvedValueOnce({ id: 'user-1' });
+    const known = await service.getAuthenticationOptions({ username: 'alice' });
+    prisma.user.findFirst.mockResolvedValueOnce(null);
+    const unknown = await service.getAuthenticationOptions({ username: 'nobody' });
+
+    expect(prisma.passkeyCredential.findMany).not.toHaveBeenCalled();
+    for (const call of mockGenerateAuthOptions.mock.calls) {
+      expect(call[0]).not.toHaveProperty('allowCredentials');
+    }
+    expect(Object.keys(known).sort()).toEqual(Object.keys(unknown).sort());
+    expect(known.options).toEqual(unknown.options);
+  });
+
+  test('userId hasil resolve disimpan di payload challenge (namespace anon)', async () => {
+    const { service, prisma, redis } = makeService();
+    prisma.user.findFirst.mockResolvedValue({ id: 'user-1' });
+
+    await service.getAuthenticationOptions({ username: 'alice' });
+
+    const [key, payload] = redis.setNx.mock.calls[0];
+    expect(key).toMatch(/^passkey:challenge:anon:/);
+    expect(JSON.parse(payload)).toEqual({ challenge: 'chal-1', type: 'authentication', userId: 'user-1' });
+  });
+});
+
+describe('PasskeyService.recover (BE-27/BE-44)', () => {
+  const PLAIN_PHONE = '+6281234567890';
+  let cipherPhone: string;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    initializeCrypto({ aesSecretKey: 'test-aes-secret', hmacSecretKey: 'test-hmac-secret' });
+    cipherPhone = await encryptAES(PLAIN_PHONE);
+  });
+
+  function recoverDeps() {
+    const deps = makeService();
+    deps.prisma.user.findUnique.mockResolvedValue({
+      id: 'user-1',
+      phoneNumber: cipherPhone,
+      isActive: true,
+      isBanned: false,
+    });
+    deps.prisma.userDevice.findFirst.mockResolvedValue(null);
+    deps.otpService.generatePhoneOtp.mockResolvedValue('123456');
+    deps.otpGateway.sendOtp.mockResolvedValue({ success: true });
+    return deps;
+  }
+
+  test('request: OTP dikirim ke nomor TERDEKRIPSI, bukan ciphertext (BE-27)', async () => {
+    const { service, otpService, otpGateway } = recoverDeps();
+
+    const result = await service.recover('user-1', { step: 'request' }, '127.0.0.1');
+
+    expect(result.message).toContain('OTP');
+    expect(otpService.generatePhoneOtp).toHaveBeenCalledWith(
+      PLAIN_PHONE,
+      'SENSITIVE_ACTION',
+      'WHATSAPP',
+      'user-1',
+      { purpose: 'passkey_recover', userId: 'user-1' },
+      '127.0.0.1',
+    );
+    expect(otpGateway.sendOtp).toHaveBeenCalledWith(PLAIN_PHONE, '123456', 'WHATSAPP');
+  });
+
+  test('request: cooldown 60 d per user → 429 (BE-44)', async () => {
+    const { service, redis, otpService } = recoverDeps();
+    redis.setNx.mockResolvedValue(false);
+
+    const err = (await service.recover('user-1', { step: 'request' }, '127.0.0.1').catch(e => e)) as HttpException;
+    expect(err).toBeInstanceOf(HttpException);
+    expect(err.getStatus()).toBe(429);
+    expect(otpService.generatePhoneOtp).not.toHaveBeenCalled();
+  });
+
+  test('request: maks 3/jam → 429, cooldown tidak dilepas (BE-44)', async () => {
+    const { service, redis, otpService } = recoverDeps();
+    redis.incrWithTtl.mockResolvedValue(4);
+
+    const err = (await service.recover('user-1', { step: 'request' }, '127.0.0.1').catch(e => e)) as HttpException;
+    expect(err.getStatus()).toBe(429);
+    expect(otpService.generatePhoneOtp).not.toHaveBeenCalled();
+    expect(redis.del).not.toHaveBeenCalled();
+  });
+
+  test('request: pengiriman gagal → 503 dan cooldown dilepas', async () => {
+    const { service, redis, otpGateway } = recoverDeps();
+    otpGateway.sendOtp.mockResolvedValue({ success: false, error: 'DOWN' });
+
+    await expect(service.recover('user-1', { step: 'request' }, '127.0.0.1')).rejects.toBeInstanceOf(
+      ServiceUnavailableException,
+    );
+    expect(redis.del).toHaveBeenCalledWith(PASSKEY_RECOVER_COOLDOWN('user-1'));
+  });
+
+  test('verify: OTP SENSITIVE_ACTION dengan purpose lain DITOLAK (BE-27)', async () => {
+    const { service, otpService, tokenService } = recoverDeps();
+    otpService.verifyPhoneOtpWithMetadata.mockResolvedValue({
+      valid: true,
+      metadata: { purpose: 'account_deletion', userId: 'user-1' },
+    });
+
+    const err = (await service
+      .recover('user-1', { step: 'verify', otpCode: '123456' }, '127.0.0.1')
+      .catch(e => e)) as { response?: { code?: string } };
+    expect(err).toBeInstanceOf(BadRequestException);
+    expect(err.response?.code).toBe('INVALID_OTP');
+    expect(tokenService.signTempToken).not.toHaveBeenCalled();
+  });
+
+  test('verify: purpose passkey_recover + userId cocok → reauthToken (BE-27)', async () => {
+    const { service, otpService, tokenService } = recoverDeps();
+    otpService.verifyPhoneOtpWithMetadata.mockResolvedValue({
+      valid: true,
+      metadata: { purpose: 'passkey_recover', userId: 'user-1' },
+    });
+    tokenService.signTempToken.mockReturnValue('reauth-token');
+
+    const result = await service.recover('user-1', { step: 'verify', otpCode: '123456' }, '127.0.0.1');
+
+    expect(otpService.verifyPhoneOtpWithMetadata).toHaveBeenCalledWith(PLAIN_PHONE, 'SENSITIVE_ACTION', '123456');
+    expect(result.reauthToken).toBe('reauth-token');
+    expect(tokenService.signTempToken).toHaveBeenCalledWith(
+      expect.objectContaining({ sub: 'user-1', scope: 'passkey_reauth' }),
+    );
   });
 });
 

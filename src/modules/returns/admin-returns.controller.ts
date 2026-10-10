@@ -2,7 +2,7 @@
  * GAP-D retur — endpoint admin. Prefix global /v1 → /v1/admin/returns.
  * Guard: JwtAdminGuard + AdminRolesGuard (pola admin-disputes).
  */
-import { Controller, Get, Post, Body, Param, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Body, Param, Query, UseGuards, Headers } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { ReturnsService } from './returns.service';
 import { JwtAdminGuard } from '../../common/guards/jwt-admin.guard';
@@ -44,13 +44,18 @@ export class AdminReturnsController {
   // harian), sehingga guard method-level mencakup CS; pembatasan aksi uang
   // ditegakkan di ReturnsService.adminAct (fail-closed bila role berubah).
   @AdminRoles('SUPER_ADMIN', 'DISPUTE_ADMIN', 'CUSTOMER_SUPPORT')
-  @ApiOperation({ summary: 'Aksi admin: approve / reject / escalate / force-resolve' })
+  // Audit 2026-10-10: aksi UANG (APPROVE/FORCE_RESOLVE_*/EXTEND_DEADLINE)
+  // wajib step-up server-side (header X-Step-Up-Token, action
+  // 'return.money-action', targetId = id retur). Dikonsumsi di service karena
+  // satu endpoint melayani aksi uang & non-uang (REJECT/ESCALATE tanpa step-up).
+  @ApiOperation({ summary: 'Aksi admin: approve / reject / escalate / force-resolve (aksi uang wajib X-Step-Up-Token)' })
   async act(
     @Param('id') id: string,
     @CurrentAdmin() admin: AdminJwtPayload,
     @Body() dto: AdminReturnActionDto,
+    @Headers('x-step-up-token') stepUpToken?: string,
   ) {
-    return this.returnsService.adminAct(id, admin.sub, dto);
+    return this.returnsService.adminAct(id, admin.sub, dto, stepUpToken);
   }
 
   @Post(':id/note')

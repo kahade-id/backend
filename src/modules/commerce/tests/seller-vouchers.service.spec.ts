@@ -2,6 +2,13 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { SellerVouchersService } from '../services/seller-vouchers.service';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { VoucherType } from '@prisma/client';
+import { FeeCalculatorService } from '../../orders/fee-calculator.service';
+
+// B11: estimasi diskon memakai basis fee platform — fee standar Rp100.000 = Rp2.500.
+const mockFeeCalculator = {
+  getFeeConfig: jest.fn(),
+  getStandardFeeSen: jest.fn(),
+};
 
 const mockPrisma = {
   voucher: { findUnique: jest.fn(), findUniqueOrThrow: jest.fn(), findFirst: jest.fn(), create: jest.fn(), findMany: jest.fn(), count: jest.fn(), update: jest.fn() },
@@ -33,8 +40,14 @@ describe('SellerVouchersService', () => {
 
   beforeEach(async () => {
     jest.resetAllMocks();
+    mockFeeCalculator.getFeeConfig.mockResolvedValue({ kahadeFeeRateBps: 250 });
+    mockFeeCalculator.getStandardFeeSen.mockReturnValue(BigInt(250_000));
     const module: TestingModule = await Test.createTestingModule({
-      providers: [SellerVouchersService, { provide: PrismaService, useValue: mockPrisma }],
+      providers: [
+        SellerVouchersService,
+        { provide: PrismaService, useValue: mockPrisma },
+        { provide: FeeCalculatorService, useValue: mockFeeCalculator },
+      ],
     }).compile();
     service = module.get<SellerVouchersService>(SellerVouchersService);
   });
@@ -87,12 +100,28 @@ describe('SellerVouchersService', () => {
       maxUsagePerUser: 1,
     };
 
-    it('valid: menghitung estimasi diskon', async () => {
+    it('valid: estimasi diskon FLAT di-cap ke fee platform, bukan nilai order (B11)', async () => {
       mockPrisma.voucher.findUnique.mockResolvedValue(voucherRow);
       mockPrisma.voucherUsage.count.mockResolvedValue(0);
       const res = await service.validateVoucher('buyer-1', { code: 'hemat10', orderValueIdr: 100000, sellerId: 'seller-1' });
       expect(res.valid).toBe(true);
-      expect(res.discountIdr).toBe(10000);
+      // Rp10.000 nominal > fee Rp2.500 → realisasi saat create order = Rp2.500.
+      expect(res.discountIdr).toBe(2500);
+      expect(mockFeeCalculator.getStandardFeeSen).toHaveBeenCalledWith(BigInt(10_000_000), expect.anything());
+    });
+
+    it('valid: estimasi diskon PERSEN dihitung dari fee platform + cap maksimum (B11)', async () => {
+      mockPrisma.voucher.findUnique.mockResolvedValue({
+        ...voucherRow,
+        voucherType: VoucherType.FEE_DISCOUNT_PERCENT,
+        discountAmount: null,
+        discountPercent: 50,
+        maxDiscountAmount: 100000n,
+      });
+      mockPrisma.voucherUsage.count.mockResolvedValue(0);
+      const res = await service.validateVoucher('buyer-1', { code: 'hemat10', orderValueIdr: 100000, sellerId: 'seller-1' });
+      // 50% × fee Rp2.500 = Rp1.250 (bukan 50% × Rp100.000).
+      expect(res.discountIdr).toBe(1250);
     });
 
     it('menolak bila voucher milik seller lain', async () => {

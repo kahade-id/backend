@@ -48,6 +48,18 @@ export class ConfirmOrderDto {
   @IsString()
   @MaxLength(500)
   reason?: string;
+
+  /**
+   * Audit alamat & kurir B02 (2026-10-10): alamat pengiriman pembeli saat
+   * menerima order BARANG FISIK yang dibuat penjual (pembeli = pihak yang
+   * mengonfirmasi). Wajib untuk kasus itu (SHIPPING_ADDRESS_REQUIRED);
+   * diabaikan untuk order buatan pembeli / non-fisik.
+   */
+  @ApiPropertyOptional({ description: 'ID alamat buku alamat pembeli — wajib bila pembeli menerima order fisik buatan penjual', maxLength: 100 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  shippingAddressId?: string;
 }
 
 export class UpdateShippingDto {

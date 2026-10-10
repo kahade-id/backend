@@ -7,8 +7,8 @@
  */
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
-import { ShipmentBookingState, ShipmentStatus } from '@prisma/client';
-import { CourierService, normalizeRawStatus } from '../courier.service';
+import { Prisma, ShipmentBookingState, ShipmentStatus } from '@prisma/client';
+import { CourierService, canApplyStatus, normalizeRawStatus, parseOccurredAt, replayShipmentStatus } from '../courier.service';
 import { CourierRegistry } from '../providers/courier-registry';
 import { CourierConfigService } from '../courier.config';
 import { MockCourierProvider } from '../providers/mock-courier.provider';
@@ -39,12 +39,41 @@ describe('normalisasi event provider (G236)', () => {
   });
 });
 
+describe('aturan transisi status (audit alamat & kurir A01/A02)', () => {
+  it('EXCEPTION boleh diterapkan setelah IN_TRANSIT / OUT_FOR_DELIVERY', () => {
+    expect(canApplyStatus(ShipmentStatus.IN_TRANSIT, ShipmentStatus.EXCEPTION)).toBe(true);
+    expect(canApplyStatus(ShipmentStatus.OUT_FOR_DELIVERY, ShipmentStatus.EXCEPTION)).toBe(true);
+  });
+
+  it('status tidak turun; terminal tidak berubah; dari EXCEPTION/UNKNOWN boleh pulih', () => {
+    expect(canApplyStatus(ShipmentStatus.IN_TRANSIT, ShipmentStatus.PICKED_UP)).toBe(false);
+    expect(canApplyStatus(ShipmentStatus.DELIVERED, ShipmentStatus.EXCEPTION)).toBe(false);
+    expect(canApplyStatus(ShipmentStatus.EXCEPTION, ShipmentStatus.IN_TRANSIT)).toBe(true);
+    expect(canApplyStatus(ShipmentStatus.UNKNOWN, ShipmentStatus.CREATED)).toBe(true);
+    expect(canApplyStatus(ShipmentStatus.CREATED, ShipmentStatus.UNKNOWN)).toBe(false);
+  });
+
+  it('replay event mengabaikan UNKNOWN dan menghasilkan status terakhir yang sah', () => {
+    expect(replayShipmentStatus([
+      ShipmentStatus.CREATED, ShipmentStatus.PICKED_UP, ShipmentStatus.UNKNOWN, ShipmentStatus.IN_TRANSIT,
+    ])).toBe(ShipmentStatus.IN_TRANSIT);
+    expect(replayShipmentStatus([ShipmentStatus.IN_TRANSIT, ShipmentStatus.EXCEPTION])).toBe(ShipmentStatus.EXCEPTION);
+    expect(replayShipmentStatus([])).toBe(ShipmentStatus.UNKNOWN);
+  });
+
+  it('parseOccurredAt: tanggal tak valid tidak menghasilkan Invalid Date (A09)', () => {
+    expect(Number.isFinite(parseOccurredAt('bukan-tanggal').getTime())).toBe(true);
+    expect(parseOccurredAt('2026-10-10T00:00:00Z').toISOString()).toBe('2026-10-10T00:00:00.000Z');
+    expect(Number.isFinite(parseOccurredAt(undefined).getTime())).toBe(true);
+  });
+});
+
 describe('CourierService — refresh tracking & fallback manual', () => {
   let service: CourierService;
   let prisma: {
     shipment: { findFirst: jest.Mock; findUnique: jest.Mock; update: jest.Mock };
-    shipmentEvent: { create: jest.Mock };
-    order: { update: jest.Mock };
+    shipmentEvent: { create: jest.Mock; findMany: jest.Mock };
+    order: { update: jest.Mock; findUnique: jest.Mock };
     courierWebhookLog: { create: jest.Mock; findFirst: jest.Mock };
   };
   let mockProvider: MockCourierProvider;
@@ -89,8 +118,8 @@ describe('CourierService — refresh tracking & fallback manual', () => {
         findUnique: jest.fn().mockResolvedValue(shipment),
         update: jest.fn().mockImplementation(async (args: { data: unknown }) => ({ ...shipment, ...(args.data as object) })),
       },
-      shipmentEvent: { create: jest.fn().mockResolvedValue({ id: 'evt-1' }) },
-      order: { update: jest.fn().mockResolvedValue({}) },
+      shipmentEvent: { create: jest.fn().mockResolvedValue({ id: 'evt-1' }), findMany: jest.fn().mockResolvedValue([]) },
+      order: { update: jest.fn().mockResolvedValue({}), findUnique: jest.fn().mockResolvedValue({ orderId: 'ORD-20261010-001' }) },
       courierWebhookLog: { create: jest.fn(), findFirst: jest.fn() },
     };
 
@@ -129,6 +158,44 @@ describe('CourierService — refresh tracking & fallback manual', () => {
         data: expect.objectContaining({ rawStatus: 'PROVIDER_TIMEOUT', status: ShipmentStatus.UNKNOWN }),
       }),
     );
+  });
+
+  it('A02: setelah UNKNOWN, refresh sukses tanpa event baru memulihkan status dari riwayat', async () => {
+    prisma.shipment.findUnique.mockResolvedValue({ ...shipment, status: ShipmentStatus.UNKNOWN });
+    // Semua event provider sudah tersimpan → P2002 (duplikat) → tidak ada yang diterapkan.
+    prisma.shipmentEvent.create.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('dup', { code: 'P2002', clientVersion: 'test' }),
+    );
+    prisma.shipmentEvent.findMany.mockResolvedValue([
+      { status: ShipmentStatus.CREATED }, { status: ShipmentStatus.PICKED_UP }, { status: ShipmentStatus.IN_TRANSIT },
+    ]);
+    const result = await service.refreshTracking('seller-1', 'ship-1');
+    expect(result.timeout).toBe(false);
+    expect(result.events).toBe(0);
+    expect(result.status).toBe(ShipmentStatus.IN_TRANSIT);
+    expect(prisma.shipment.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { status: ShipmentStatus.IN_TRANSIT } }),
+    );
+  });
+
+  it('A01: event EXCEPTION setelah IN_TRANSIT mengubah status + notifikasi dengan orderId publik', async () => {
+    const applied = await service.applyProviderEvent('ship-1', 'mock', {
+      providerEventId: 'evt-exc', rawStatus: 'EXCEPTION', description: 'Alamat tidak ditemukan',
+    });
+    expect(applied).toBe(true);
+    expect(prisma.shipment.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: ShipmentStatus.EXCEPTION }) }),
+    );
+    const enqueue = (service as unknown as { notificationQueue: { enqueue: jest.Mock } }).notificationQueue.enqueue;
+    expect(enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ body: expect.stringContaining('ORD-20261010-001'), pushData: expect.objectContaining({ orderId: 'ORD-20261010-001' }) }),
+    );
+    expect(enqueue).not.toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining('ord-internal-1') }));
+  });
+
+  it('A12: resi manual tidak bisa di-refresh — pesan jujur', async () => {
+    prisma.shipment.findUnique.mockResolvedValueOnce({ ...shipment, isManual: true, trackingNumber: 'MANUAL1' });
+    await expect(service.refreshTracking('seller-1', 'ship-1')).rejects.toThrow('Resi manual');
   });
 
   it('timeout tidak menimpa status terminal DELIVERED', async () => {

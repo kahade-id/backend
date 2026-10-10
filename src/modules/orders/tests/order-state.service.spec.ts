@@ -69,6 +69,8 @@ const mockPrisma = {
     update: jest.fn(),
     updateMany: jest.fn(),
   },
+  // Audit alamat & kurir B02: buku alamat pembeli saat konfirmasi order buatan penjual.
+  address: { findFirst: jest.fn() },
   wallet: {
     findFirst: jest.fn(),
     findUnique: jest.fn(),
@@ -332,6 +334,61 @@ describe('OrderStateService', () => {
           }),
         }),
       );
+    });
+  });
+
+  // ─── B02 (audit alamat & kurir 2026-10-10): pembeli mengonfirmasi order fisik buatan penjual ──
+
+  describe('confirmOrder — order fisik buatan penjual (pembeli konfirmasi)', () => {
+    const sellerCreated = { ...mockOrder, status: OrderStatus.WAITING_CONFIRMATION, createdByBuyer: false, orderType: OrderType.PHYSICAL_GOODS };
+
+    beforeEach(() => {
+      mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => fn(mockPrisma));
+      mockPrisma.order.findFirst.mockResolvedValue(sellerCreated);
+      mockPrisma.order.updateMany.mockResolvedValue({ count: 1 });
+      mockPrisma.address.findFirst.mockReset();
+    });
+
+    it('menolak tanpa shippingAddressId (fail-closed, SHIPPING_ADDRESS_REQUIRED)', async () => {
+      await expect(service.confirmOrder('ORD-001', 'user-db-1')).rejects.toMatchObject({
+        response: { code: 'SHIPPING_ADDRESS_REQUIRED' },
+      });
+      expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('menolak alamat yang bukan milik pembeli / sudah dihapus', async () => {
+      mockPrisma.address.findFirst.mockResolvedValue(null);
+      await expect(service.confirmOrder('ORD-001', 'user-db-1', 'addr-x')).rejects.toMatchObject({
+        response: { code: 'SHIPPING_ADDRESS_REQUIRED' },
+      });
+      expect(mockPrisma.address.findFirst).toHaveBeenCalledWith({ where: { id: 'addr-x', userId: 'user-db-1', deletedAt: null } });
+    });
+
+    it('menyimpan snapshot alamat (ciphertext apa adanya) bersama transisi ke WAITING_PAYMENT', async () => {
+      mockPrisma.address.findFirst.mockResolvedValue({
+        id: 'addr-1', recipientName: 'enc(nama)', phone: 'enc(hp)', addressLine: 'enc(jalan)',
+        city: 'enc(kota)', province: null, postalCode: 'enc(pos)',
+      });
+      await service.confirmOrder('ORD-001', 'user-db-1', 'addr-1');
+      expect(mockPrisma.order.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: OrderStatus.WAITING_PAYMENT,
+            shippingAddressId: 'addr-1',
+            shippingRecipientName: 'enc(nama)',
+            shippingAddressLine: 'enc(jalan)',
+            shippingPostalCode: 'enc(pos)',
+          }),
+        }),
+      );
+    });
+
+    it('order buatan pembeli: penjual konfirmasi tanpa alamat — field diabaikan', async () => {
+      mockPrisma.order.findFirst.mockResolvedValue({ ...sellerCreated, createdByBuyer: true, sellerId: 'seller-id' });
+      await service.confirmOrder('ORD-001', 'seller-id');
+      expect(mockPrisma.address.findFirst).not.toHaveBeenCalled();
+      const data = mockPrisma.order.updateMany.mock.calls[0][0].data;
+      expect(data).not.toHaveProperty('shippingAddressId');
     });
   });
 

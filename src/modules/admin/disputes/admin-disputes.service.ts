@@ -194,14 +194,25 @@ export class AdminDisputesService implements OnModuleInit {
       include: {
         order: true,
         initiator: { select: { userId: true, fullName: true, email: true } },
-        evidences: { orderBy: { createdAt: 'asc' } },
+        // K8: batasi relasi tanpa limit (evidences bisa ratusan berkas + signed URL per berkas).
+        evidences: { orderBy: { createdAt: 'asc' }, take: 200 },
         calls: { orderBy: { createdAt: 'desc' }, take: 100 },
         mutualProposals: { orderBy: { createdAt: 'desc' }, take: 100, include: { proposer: { select: { userId: true, fullName: true, username: true } } } },
         decision: true,
         assignedAdmin: { select: { adminId: true, fullName: true } },
+        // K6: intent settlement no-wallet — status eksekusi uang putusan.
+        settlementIntent: true,
       },
     });
     if (!dispute) throw new NotFoundException({ code: ErrorCodes.DISPUTE_NOT_FOUND, message: 'Dispute not found' });
+
+    // K6 (audit 2026-10-10): jejak setiap pergerakan dana sengketa dari baris
+    // durable (bukan log): refund buyer (DanaRefundAttempt
+    // DISPUTE:<id>:BUYER), disbursement seller (EscrowDisbursement
+    // DISPUTE:<id>:SELLER), dan pencairan escrow order (ORDER:<orderDbId>)
+    // yang menentukan klasifikasi pasca-completion. Admin melihat di mana
+    // uang berada — tidak ada "hilang tanpa jejak".
+    const moneyTrail = await this.loadDisputeMoneyTrail(dispute.id, dispute.orderId, dispute.settlementIntent);
 
     if (adminId) {
       this.auditLog.logAdminAction({
@@ -266,7 +277,128 @@ export class AdminDisputesService implements OnModuleInit {
           sellerAmount: toIdr(dispute.decision.sellerAmount),
         },
       } : {}),
+      settlementIntent: moneyTrail.settlementIntent,
+      moneyTrail,
     };
+  }
+
+  /** K6: baris-baris durable yang mencatat pergerakan dana sengketa. */
+  private async loadDisputeMoneyTrail(
+    disputeDbId: string,
+    orderDbId: string,
+    intent: { status: string; buyerAmountSen: bigint; sellerAmountSen: bigint; attemptCount: number; lastError: string | null; claimedAt: Date | null; doneAt: Date | null; updatedAt: Date } | null,
+  ): Promise<{
+    settlementIntent: { status: string; buyerAmountSen: string; sellerAmountSen: string; buyerAmount: number; sellerAmount: number; attemptCount: number; lastError: string | null; claimedAt: Date | null; doneAt: Date | null; updatedAt: Date } | null;
+    buyerRefund: { status: string; amountSen: string; amount: number; danaReferenceNo: string | null; partnerRefundNo: string; providerStatus: string | null; settledAt: Date | null; updatedAt: Date } | null;
+    sellerDisbursement: { id: string; status: string; amountSen: string; amount: number; danaReferenceNo: string | null; heldReason: string | null; lastError: string | null; attemptCount: number; releasedAt: Date | null; updatedAt: Date } | null;
+    orderRelease: { id: string; status: string; amountSen: string; amount: number; danaReferenceNo: string | null; releasedAt: Date | null; updatedAt: Date } | null;
+  }> {
+    const disbursementSelect = {
+      id: true, status: true, amountSen: true, danaReferenceNo: true, heldReason: true,
+      lastError: true, attemptCount: true, releasedAt: true, updatedAt: true,
+    } as const;
+    const [buyerRefund, sellerDisbursement, orderRelease] = await Promise.all([
+      this.prisma.danaRefundAttempt.findUnique({
+        where: { idempotencyKey: `DISPUTE:${disputeDbId}:BUYER` },
+        select: { status: true, amountSen: true, danaReferenceNo: true, partnerRefundNo: true, providerStatus: true, settledAt: true, updatedAt: true },
+      }),
+      this.prisma.escrowDisbursement.findUnique({ where: { idempotencyKey: `DISPUTE:${disputeDbId}:SELLER` }, select: disbursementSelect }),
+      this.prisma.escrowDisbursement.findUnique({ where: { idempotencyKey: `ORDER:${orderDbId}` }, select: disbursementSelect }),
+    ]);
+    return {
+      settlementIntent: intent
+        ? {
+            status: intent.status,
+            buyerAmountSen: intent.buyerAmountSen.toString(),
+            sellerAmountSen: intent.sellerAmountSen.toString(),
+            buyerAmount: toIdr(intent.buyerAmountSen),
+            sellerAmount: toIdr(intent.sellerAmountSen),
+            attemptCount: intent.attemptCount,
+            lastError: intent.lastError,
+            claimedAt: intent.claimedAt,
+            doneAt: intent.doneAt,
+            updatedAt: intent.updatedAt,
+          }
+        : null,
+      buyerRefund: buyerRefund
+        ? { ...buyerRefund, amountSen: buyerRefund.amountSen.toString(), amount: toIdr(buyerRefund.amountSen) }
+        : null,
+      sellerDisbursement: sellerDisbursement
+        ? { ...sellerDisbursement, amountSen: sellerDisbursement.amountSen.toString(), amount: toIdr(sellerDisbursement.amountSen) }
+        : null,
+      orderRelease: orderRelease
+        ? {
+            id: orderRelease.id, status: orderRelease.status, amountSen: orderRelease.amountSen.toString(), amount: toIdr(orderRelease.amountSen),
+            danaReferenceNo: orderRelease.danaReferenceNo, releasedAt: orderRelease.releasedAt, updatedAt: orderRelease.updatedAt,
+          }
+        : null,
+    };
+  }
+
+  /**
+   * K6 (audit 2026-10-10): eksekusi ulang settlement sengketa no-wallet yang
+   * FAILED/ESCALATED (attempt habis) — jalur admin yang sebelumnya tidak ada
+   * (alert hanya berkata "tindaklanjuti manual via jalur admin"). SUPER_ADMIN
+   * + step-up di controller. Idempoten: refund DANA & disbursement memakai
+   * key DISPUTE:<id>:BUYER/:SELLER yang sama — tidak ada pembayaran ganda.
+   */
+  async retrySettlement(disputeId: string, adminId: string, ipAddress: string = 'internal'): Promise<object> {
+    const dispute = await this.prisma.dispute.findFirst({
+      where: { OR: [{ id: disputeId }, { disputeId }] },
+      select: {
+        id: true, disputeId: true, orderId: true, status: true,
+        decision: { select: { decisionType: true } },
+        settlementIntent: { select: { id: true, status: true, buyerAmountSen: true, sellerAmountSen: true, attemptCount: true } },
+      },
+    });
+    if (!dispute) throw new NotFoundException({ code: ErrorCodes.DISPUTE_NOT_FOUND, message: 'Dispute not found' });
+    if (!dispute.decision || !dispute.settlementIntent) {
+      throw new BadRequestException({ code: ErrorCodes.INVALID_STATUS, message: 'Sengketa belum punya putusan/intent settlement (bukan jalur no-wallet)' });
+    }
+    const intent = dispute.settlementIntent;
+    if (intent.status === 'DONE') {
+      throw new ConflictException({ code: ErrorCodes.INVALID_STATUS, message: 'Settlement sudah DONE — tidak ada yang perlu diulang' });
+    }
+    if (intent.status === 'CLAIMED') {
+      throw new ConflictException({ code: ErrorCodes.INVALID_STATUS, message: 'Settlement sedang diproses eksekutor lain (CLAIMED) — tunggu sweep berikutnya' });
+    }
+    // ESCALATED/FAILED/PENDING → PENDING (predikat status = guard balapan).
+    const reset = await this.prisma.disputeSettlementIntent.updateMany({
+      where: { id: intent.id, status: { in: ['PENDING', 'FAILED', 'ESCALATED'] } },
+      data: { status: 'PENDING', lastError: `Retry manual oleh admin ${adminId}` },
+    });
+    if (reset.count === 0) {
+      throw new ConflictException({ code: ErrorCodes.INVALID_STATUS, message: 'Status intent berubah; muat ulang' });
+    }
+    this.auditLog.logAdminAction({
+      adminId,
+      action: AuditAction.DISPUTE_DECIDED,
+      targetType: 'DisputeSettlementIntent',
+      targetId: intent.id,
+      description: `Admin memicu ulang settlement sengketa ${dispute.disputeId} (status sebelumnya ${intent.status}, attempt ${intent.attemptCount})`,
+      after: { disputeId: dispute.disputeId, previousStatus: intent.status, attemptCount: intent.attemptCount },
+      ipAddress,
+    });
+    let settlement: Awaited<ReturnType<DisputeDanaSettlementService['claimAndSettleIntent']>> = null;
+    let error: string | null = null;
+    try {
+      settlement = await this.disputeDanaSettlement.claimAndSettleIntent({
+        disputeId: dispute.id,
+        orderDbId: dispute.orderId,
+        decision: dispute.decision.decisionType as 'FULL_BUYER' | 'FULL_SELLER' | 'SPLIT',
+        buyerAmountSen: intent.buyerAmountSen,
+        sellerAmountSen: intent.sellerAmountSen,
+        reason: `Dispute ${dispute.disputeId} settlement retry by admin`,
+      });
+    } catch (err: unknown) {
+      // Intent sudah ditandai FAILED + lastError oleh claimAndSettleIntent.
+      error = err instanceof Error ? err.message : String(err);
+    }
+    const fresh = await this.prisma.disputeSettlementIntent.findUnique({
+      where: { id: intent.id },
+      select: { status: true, attemptCount: true, lastError: true, doneAt: true },
+    });
+    return { disputeId: dispute.disputeId, intent: fresh, settlement, error };
   }
 
   /**

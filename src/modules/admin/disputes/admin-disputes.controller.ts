@@ -85,6 +85,24 @@ export class AdminDisputesController {
     return this.service.getDisputeOrderChat(disputeId, admin.sub, cursor, limit ?? 50, includeDeleted !== false, req?.ip || 'unknown');
   }
 
+  // K6 (audit 2026-10-10): retry settlement sengketa no-wallet yang
+  // FAILED/ESCALATED. Aksi uang → SUPER_ADMIN + step-up + Idempotency-Key.
+  @Post(':disputeId/settlement/retry')
+  @Idempotency()
+  @UseGuards(UserThrottleGuard, StepUpGuard)
+  @AdminRoles('SUPER_ADMIN')
+  @RequireStepUp('dispute.settlement-retry', 'disputeId')
+  @ApiOperation({ summary: 'Retry no-wallet dispute settlement', description: 'Re-runs the DANA refund/disbursement for a resolved dispute whose settlement intent is FAILED or ESCALATED. Idempotent per dispute. SUPER_ADMIN + step-up.' })
+  @ApiResponse({ status: 201, description: 'Retry executed; see intent status.' })
+  @ApiResponse({ status: 409, description: 'Settlement already DONE or currently CLAIMED.' })
+  retrySettlement(
+    @Param('disputeId', ParseIdPipe) disputeId: string,
+    @CurrentAdmin() admin: AdminJwtPayload,
+    @Req() req: Request,
+  ): Promise<object> {
+    return this.service.retrySettlement(disputeId, admin.sub, req.ip || 'unknown');
+  }
+
   @Post(':disputeId/messages')
   @Idempotency()
   @UseGuards(UserThrottleGuard)

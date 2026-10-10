@@ -1,4 +1,4 @@
-import { IsString, IsNotEmpty, IsOptional, MinLength, MaxLength, Matches } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, MinLength, MaxLength, Matches, ValidateNested } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { Match } from '../../../common/decorators/match.decorator';
@@ -35,6 +35,8 @@ export class ChangePasswordDto {
 
   @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional)', type: LocationDto })
   @IsOptional()
+  // Audit Auth 2026-10-10 (#BE-23): tanpa @ValidateNested, @Min/@Max LocationDto tidak dijalankan.
+  @ValidateNested()
   @Type(() => LocationDto)
   location?: LocationDto;
 }

@@ -118,7 +118,22 @@ describe('AuthService.socialLogin (GAP-A G001–G025)', () => {
       providers: [
         AuthService,
         { provide: PrismaService, useValue: mockPrisma },
-        { provide: RedisService, useValue: { setNx: jest.fn().mockResolvedValue(true), setex: jest.fn(), get: jest.fn(), releaseLock: jest.fn(), set: jest.fn(), getAndDelete: jest.fn() } },
+        {
+          provide: RedisService,
+          useValue: {
+            setNx: jest.fn().mockResolvedValue(true),
+            setex: jest.fn(),
+            get: jest.fn(),
+            releaseLock: jest.fn(),
+            set: jest.fn(),
+            getAndDelete: jest.fn(),
+            // BAI-074 assertNotSuspended + Audit Auth 2026-10-10 (#BE-11/#BE-31) counters.
+            exists: jest.fn().mockResolvedValue(0),
+            incrWithTtl: jest.fn().mockResolvedValue(1),
+            del: jest.fn().mockResolvedValue(1),
+            decr: jest.fn().mockResolvedValue(0),
+          },
+        },
         { provide: TokenService, useValue: mockTokenService },
         { provide: OtpService, useValue: {} },
         { provide: OtpGatewayService, useValue: {} },
@@ -302,9 +317,11 @@ describe('AuthService.socialLogin (GAP-A G001–G025)', () => {
         '127.0.0.1',
       );
       // Re-auth diverifikasi terhadap akun pemilik email.
+      // #BE-25: ipAddress diteruskan agar tebakan sandi dihitung (lockout).
       expect(service['assertPasskeyReauthenticated']).toHaveBeenCalledWith(
         'db-user-1',
         { password: 'secret123' },
+        '127.0.0.1',
       );
       expect(result.accessToken).toBe('access-xyz');
       expect(mockPrisma.socialAccount.create).toHaveBeenCalledWith({

@@ -182,12 +182,14 @@ export class TokenService {
     if (!tempSecret) {
       throw new Error('JWT_TEMP_SECRET is not configured. Cannot issue temp tokens.');
     }
+    // Audit Auth 2026-10-10 (#BE-09): `extra` di-spread SEBELUM klaim inti
+    // agar pemanggil tidak bisa (sengaja/tidak) menimpa sub/scope/deviceId.
     return this.jwtService.sign(
       {
+        ...(payload.extra ?? {}),
         sub: payload.sub,
         scope: payload.scope,
         deviceId: payload.deviceId,
-        ...(payload.extra ?? {}),
         jti,
         iss: TOKEN_ISSUER,
         aud: TEMP_TOKEN_AUDIENCE,

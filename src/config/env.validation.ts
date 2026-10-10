@@ -116,6 +116,21 @@ export function collectEnvWarnings(env: Env): string[] {
 }
 
 /**
+ * Audit Auth 2026-10-10 (#BE-50): nilai TRUSTED_PROXY_CIDR yang berarti
+ * "percaya semua proxy" — Express akan mempercayai X-Forwarded-For dari
+ * SIAPA PUN, sehingga IP klien (rate limit, lockout, audit) bisa dipalsukan.
+ */
+const TRUST_ALL_PROXY_VALUES = new Set(['0.0.0.0/0', '::/0', 'true', '*', 'all'])
+
+export function isTrustAllProxyValue(raw: string | undefined): boolean {
+  if (!raw) return false
+  return raw
+    .split(',')
+    .map((part) => part.trim().toLowerCase())
+    .some((part) => TRUST_ALL_PROXY_VALUES.has(part))
+}
+
+/**
  * Validate function passed to ConfigModule.forRoot({ validate }).
  * Receives the raw process.env and returns a typed config object.
  * Throws if any critical variable is missing or invalid.
@@ -322,6 +337,19 @@ export function validateEnv(env: Env): Env {
   optionalInt(env, 'REFERRAL_REWARD_RATE_BPS', 1000, 0, 5000, errors)
   optionalInt(env, 'MAX_REFERRALS_PER_CODE', 100, 1, 100_000, errors)
   optionalInt(env, 'FEE_SAVINGS_LIMIT', 5_000_000, 0, 100_000_000_000, errors)
+
+  // ── TRUSTED PROXY (anti X-Forwarded-For spoofing) ────────────────────────────
+  // Audit Auth 2026-10-10 (#BE-50): main.ts hanya mengecek ada/tidaknya nilai;
+  // "0.0.0.0/0", "::/0", "true", "*" lolos dan membuat Express mempercayai
+  // X-Forwarded-For dari klien mana pun. Tolak eksplisit di semua lingkungan.
+  if (isTrustAllProxyValue(env['TRUSTED_PROXY_CIDR'])) {
+    errors.push({
+      key: 'TRUSTED_PROXY_CIDR',
+      message:
+        `TRUSTED_PROXY_CIDR="${env['TRUSTED_PROXY_CIDR']}" trusts every proxy — X-Forwarded-For could be spoofed by any client. ` +
+        'Set it to the CIDR/IP of your reverse proxy only (e.g. 127.0.0.1/32 or 10.0.0.0/8).',
+    })
+  }
 
   // ── REDIS FAIL-OPEN POLICY ───────────────────────────────────────────────────
   // Auth blacklist/session checks and idempotency are security and escrow

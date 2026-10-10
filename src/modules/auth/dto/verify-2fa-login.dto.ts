@@ -1,5 +1,7 @@
 import { IsString, IsNotEmpty, MaxLength, Length, IsOptional, Matches } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Transform } from 'class-transformer';
+import { DEVICE_ID_MESSAGE, DEVICE_ID_PATTERN, normalizeDeviceId } from './device-id.validation';
 
 export class Verify2faLoginDto {
   @ApiProperty({ description: 'Temporary token from login', maxLength: 512 })
@@ -19,6 +21,9 @@ export class Verify2faLoginDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(255)
+  // Audit Auth 2026-10-10 (#BE-22): pola & panjang deviceId disamakan dengan DTO OTP.
+  @Matches(DEVICE_ID_PATTERN, { message: DEVICE_ID_MESSAGE })
+  @Transform(({ value }: { value: unknown }) => normalizeDeviceId(value))
   deviceId!: string;
 
   @ApiPropertyOptional({ description: 'Device information', maxLength: 512 })

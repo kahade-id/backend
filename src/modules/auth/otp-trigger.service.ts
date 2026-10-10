@@ -1,8 +1,11 @@
 import {
   BadRequestException,
   ConflictException,
+  HttpException,
+  HttpStatus,
   Injectable,
   Logger,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -25,6 +28,7 @@ import {
   OTP_TRIGGER_COOLDOWN,
   OTP_TRIGGER_INBOX,
   OTP_TRIGGER_IP_RATE,
+  OTP_TRIGGER_PHONE_IP_RATE,
   OTP_TRIGGER_PHONE_RATE,
 } from '../../common/constants/redis-keys';
 import * as ErrorCodes from '../../common/constants/error-codes';
@@ -42,6 +46,23 @@ const TRIGGER_PHONE_RATE_LIMIT = 10;
 const TRIGGER_IP_RATE_LIMIT = 20;
 const TRIGGER_RATE_WINDOW_SECONDS = 3600;
 const REFCODE_BYTES = 6; // 12 hex chars — jauh lebih kuat dari 4 hex
+
+/**
+ * Audit Auth 2026-10-10 (#BE-20): penolakan rate limit memakai 429 (bukan 400)
+ * + `retryAfter` (detik) mengikuti pola guard throttle di repo, sehingga
+ * HttpExceptionFilter mengisi countdown untuk klien.
+ */
+function tooManyRequests(message: string, retryAfterSeconds: number): HttpException {
+  return new HttpException(
+    {
+      statusCode: HttpStatus.TOO_MANY_REQUESTS,
+      code: ErrorCodes.TOO_MANY_REQUESTS,
+      message,
+      retryAfter: retryAfterSeconds,
+    },
+    HttpStatus.TOO_MANY_REQUESTS,
+  );
+}
 
 interface TriggerRecord {
   phoneNumber: string; // +62...
@@ -105,35 +126,39 @@ export class OtpTriggerService {
     const phoneNumber = normalizeIndonesianPhone(dto.phoneNumber);
     const phoneHash = hashPhoneNumber(phoneNumber);
 
-    // Rate limit: cooldown per nomor+purpose, lalu rate per nomor & per IP.
+    // Rate limit: cooldown per nomor+purpose, lalu rate per nomor+IP & per IP.
     const cooldownKey = OTP_TRIGGER_COOLDOWN(phoneNumber, dto.purpose);
     const cooldownClaimed = await this.redis.setNx(cooldownKey, '1', TRIGGER_COOLDOWN_SECONDS);
     if (!cooldownClaimed) {
-      throw new BadRequestException({
-        code: ErrorCodes.TOO_MANY_REQUESTS,
-        message: `Tunggu ${TRIGGER_COOLDOWN_SECONDS} detik sebelum meminta kode baru`,
-      });
+      throw tooManyRequests(
+        `Tunggu ${TRIGGER_COOLDOWN_SECONDS} detik sebelum meminta kode baru`,
+        TRIGGER_COOLDOWN_SECONDS,
+      );
     }
     try {
-      const phoneCount = await this.redis.incrWithTtl(
-        OTP_TRIGGER_PHONE_RATE(phoneNumber),
+      // Audit Auth 2026-10-10 (#BE-18): saat PEMBUATAN trigger belum ada bukti
+      // kepemilikan nomor, jadi kuota dikunci per nomor+IP — penyerang tidak
+      // bisa menghabiskan kuota nomor korban (login/daftar/reset) dari IP-nya.
+      // Kuota per nomor murni dihitung di webhook setelah pengirim cocok.
+      const phoneIpCount = await this.redis.incrWithTtl(
+        OTP_TRIGGER_PHONE_IP_RATE(phoneNumber, ipAddress),
         TRIGGER_RATE_WINDOW_SECONDS,
       );
-      if (phoneCount > TRIGGER_PHONE_RATE_LIMIT) {
-        throw new BadRequestException({
-          code: ErrorCodes.TOO_MANY_REQUESTS,
-          message: 'Terlalu banyak permintaan untuk nomor ini. Coba lagi nanti.',
-        });
+      if (phoneIpCount > TRIGGER_PHONE_RATE_LIMIT) {
+        throw tooManyRequests(
+          'Terlalu banyak permintaan untuk nomor ini. Coba lagi nanti.',
+          TRIGGER_RATE_WINDOW_SECONDS,
+        );
       }
       const ipCount = await this.redis.incrWithTtl(
         OTP_TRIGGER_IP_RATE(ipAddress),
         TRIGGER_RATE_WINDOW_SECONDS,
       );
       if (ipCount > TRIGGER_IP_RATE_LIMIT) {
-        throw new BadRequestException({
-          code: ErrorCodes.TOO_MANY_REQUESTS,
-          message: 'Terlalu banyak permintaan dari jaringan ini. Coba lagi nanti.',
-        });
+        throw tooManyRequests(
+          'Terlalu banyak permintaan dari jaringan ini. Coba lagi nanti.',
+          TRIGGER_RATE_WINDOW_SECONDS,
+        );
       }
 
       // Prekondisi per purpose.
@@ -222,8 +247,14 @@ export class OtpTriggerService {
       // menimpa record trigger — pola check-then-set sebelumnya punya race.
       const refCode = await this.claimUniqueRefCode(record);
 
+      // Audit Auth 2026-10-10 (#BE-19): lokasi trigger TIDAK diikat ke userId
+      // korban untuk forgot_password — pemohon belum membuktikan kepemilikan
+      // nomor, sehingga lokasi penyerang bisa menyemai heuristik impossible-
+      // travel akun korban. Binding ke user terjadi di verify-otp (event
+      // 'otp_verify'/'password_reset'). migrate_phone tetap terikat karena
+      // userId berasal dari token sesi pemohon sendiri.
       await this.locationService.logEvent({
-        userId: boundUserId ?? null,
+        userId: dto.purpose === OtpTriggerPurpose.MIGRATE_PHONE ? boundUserId ?? null : null,
         event: 'otp_trigger',
         location: dto.location ?? null,
         ipAddress,
@@ -239,7 +270,13 @@ export class OtpTriggerService {
         expiresAt: expiresAt.toISOString(),
       };
     } catch (error) {
-      await this.redis.del(cooldownKey).catch(() => undefined);
+      // Audit Auth 2026-10-10 (#BE-20): cooldown HANYA dilepas pada error
+      // infrastruktur (Redis/DB/bug) — bukan pada penolakan rate limit /
+      // validasi / otorisasi (HttpException). Sebelumnya setiap penolakan
+      // menghapus cooldown sehingga pembatasan bisa ditembak tanpa jeda.
+      if (!(error instanceof HttpException)) {
+        await this.redis.del(cooldownKey).catch(() => undefined);
+      }
       throw error;
     }
   }
@@ -388,6 +425,20 @@ export class OtpTriggerService {
         return;
       }
 
+      // Audit Auth 2026-10-10 (#BE-18): kuota per nomor murni (10/jam) dihitung
+      // DI SINI — pengirim sudah terbukti memegang nomor (sender cocok).
+      // Melebihi kuota → trigger ditandai FAILED tanpa mengirim OTP.
+      const phoneCount = await this.redis.incrWithTtl(
+        OTP_TRIGGER_PHONE_RATE(record.phoneNumber),
+        TRIGGER_RATE_WINDOW_SECONDS,
+      );
+      if (phoneCount > TRIGGER_PHONE_RATE_LIMIT) {
+        this.logger.warn(`[OTP-TRIGGER] kuota per nomor terlampaui refCode=${refCode}`);
+        record.status = 'FAILED';
+        await this.redis.set(OTP_TRIGGER(refCode), JSON.stringify(record), TRIGGER_TTL_SECONDS);
+        return;
+      }
+
       let otp: string;
       try {
         otp = await this.otpService.generatePhoneOtp(
@@ -494,8 +545,10 @@ export class OtpTriggerService {
       );
       if (claimed) return code;
     }
-    throw new BadRequestException({
-      code: ErrorCodes.TOO_MANY_REQUESTS,
+    // Audit Auth 2026-10-10 (#BE-20): kegagalan klaim refCode = kondisi
+    // infrastruktur (bukan rate limit) — 503 agar cooldown dilepas di catch.
+    throw new ServiceUnavailableException({
+      code: ErrorCodes.SERVICE_UNAVAILABLE,
       message: 'Gagal membuat kode referensi. Coba lagi.',
     });
   }

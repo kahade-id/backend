@@ -114,6 +114,18 @@ describe('validateEnv', () => {
     expect(() => validateEnv(minimalEnv)).not.toThrow();
   });
 
+  // Audit Auth 2026-10-10 (#BE-50)
+  it.each(['0.0.0.0/0', '::/0', 'true', '*', '127.0.0.1/32, 0.0.0.0/0'])(
+    'rejects TRUSTED_PROXY_CIDR=%p because it trusts every proxy (X-Forwarded-For spoofing)',
+    (value) => {
+      expect(() => validateEnv({ ...baseEnv, TRUSTED_PROXY_CIDR: value })).toThrow('TRUSTED_PROXY_CIDR');
+    },
+  );
+
+  it('accepts a specific TRUSTED_PROXY_CIDR', () => {
+    expect(() => validateEnv({ ...baseEnv, TRUSTED_PROXY_CIDR: '127.0.0.1/32, 10.0.0.0/8' })).not.toThrow();
+  });
+
   it('throws when CORS_ORIGINS is missing in production', () => {
     const env: Record<string, string> = { ...baseEnv, NODE_ENV: 'production' };
     delete env['CORS_ORIGINS'];

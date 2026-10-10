@@ -24,6 +24,10 @@ function defaultRpId(): string {
   // api.kahade.id — RP ID harus sama dengan host origin atau domain
   // induknya; subdomain tidak valid untuk origin https://kahade.id.
   if (nodeEnv === 'production') return 'kahade.id';
+  // Audit Auth 2026-10-10 (#BE-48): default staging harus konsisten dengan
+  // origin default staging (https://staging.kahade.id) — sebelumnya 'localhost'
+  // sehingga semua upacara passkey di staging gagal verifikasi RP ID.
+  if (nodeEnv === 'staging') return 'staging.kahade.id';
   return 'localhost';
 }
 

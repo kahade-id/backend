@@ -809,6 +809,57 @@ describe('WalletService', () => {
 
       await expect(service.setPin('user-nonexistent', '481723')).rejects.toThrow(NotFoundException);
     });
+
+    // Audit Auth 2026-10-10 (#BE-52)
+    async function existingPinSetup(currentPin: string) {
+      const bcrypt = require('bcrypt');
+      const { hmacPinDigest } = require('../../../common/utils/crypto.util');
+      const digest = hmacPinDigest('test-pepper-12345678901234567890', currentPin);
+      const hashedPin = await bcrypt.hash(digest, 4);
+      mockPrisma.wallet.findUnique.mockResolvedValue({ ...mockWallet, walletPinHash: hashedPin });
+      mockPrisma.wallet.update.mockResolvedValue({ ...mockWallet, walletPinHash: 'new-hash' });
+      mockPrisma.user.findUnique.mockResolvedValue({ password: await bcryptHash('Password123!', 4) });
+      mockRedis.get.mockResolvedValue('0');
+      mockRedis.incr.mockResolvedValue(1);
+      mockRedis.del.mockResolvedValue(1);
+    }
+
+    it('rejects a new PIN identical to the current PIN (BE-52)', async () => {
+      await existingPinSetup('481723');
+
+      await expect(service.setPin('user-1', '481723', '481723', 'Password123!')).rejects.toThrow(
+        BadRequestException,
+      );
+      expect(mockPrisma.wallet.update).not.toHaveBeenCalled();
+      expect(mockPrisma.notification.create).not.toHaveBeenCalled();
+    });
+
+    it('creates a SECURITY notification when an existing PIN is changed (BE-52)', async () => {
+      await existingPinSetup('481723');
+
+      const result = await service.setPin('user-1', '907154', '481723', 'Password123!');
+
+      expect(result).toEqual({ message: 'Wallet PIN has been changed successfully' });
+      expect(mockPrisma.wallet.update).toHaveBeenCalled();
+      expect(mockPrisma.notification.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ userId: 'user-1', type: 'SECURITY_NEW_LOGIN' }),
+        }),
+      );
+      expect(mockPrisma.emitNotificationCreated).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'user-1' }),
+      );
+    });
+
+    it('does not send a change notification when the PIN is set for the first time (BE-52)', async () => {
+      mockPrisma.wallet.findUnique.mockResolvedValue(mockWallet);
+      mockPrisma.wallet.update.mockResolvedValue({ ...mockWallet, walletPinHash: 'hashed' });
+      mockPrisma.user.findUnique.mockResolvedValue({ password: await bcryptHash('Password123!', 4) });
+
+      await service.setPin('user-1', '481723', undefined, 'Password123!');
+
+      expect(mockPrisma.notification.create).not.toHaveBeenCalled();
+    });
   });
 
   // ─── verifyPin ───────────────────────────────────────────────────

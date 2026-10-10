@@ -25,10 +25,10 @@ export class EmailVerifiedGuard implements CanActivate {
       });
     }
 
-    if (user.emailVerified === true) {
-      return true;
-    }
-
+    // Audit Auth 2026-10-10 (#BE-46): klaim JWT `emailVerified` TIDAK dipercaya —
+    // klaim bisa basi hingga masa hidup access token (mis. email diganti/
+    // dicabut verifikasinya setelah token terbit). Sumber kebenaran: Redis
+    // (TTL 5 menit) lalu DB.
     const cacheKey = EMAIL_CACHE_KEY(userId);
     const cached = await this.redis.get(cacheKey);
     if (cached === '1') {

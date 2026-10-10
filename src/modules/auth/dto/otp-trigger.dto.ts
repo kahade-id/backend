@@ -1,4 +1,4 @@
-import { IsEnum, IsNotEmpty, IsOptional, IsString, Matches, MaxLength } from 'class-validator';
+import { IsEnum, IsNotEmpty, IsOptional, IsString, Matches, MaxLength, ValidateNested } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform, Type } from 'class-transformer';
 import { DEVICE_ID_MESSAGE, DEVICE_ID_PATTERN, normalizeDeviceId } from './device-id.validation';
@@ -42,6 +42,8 @@ export class RequestOtpTriggerDto {
 
   @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional)', type: LocationDto })
   @IsOptional()
+  // Audit Auth 2026-10-10 (#BE-23): tanpa @ValidateNested, @Min/@Max LocationDto tidak dijalankan.
+  @ValidateNested()
   @Type(() => LocationDto)
   location?: LocationDto;
 }
@@ -62,6 +64,8 @@ export class ConfirmPhoneMigrationDto {
 
   @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional)', type: LocationDto })
   @IsOptional()
+  // Audit Auth 2026-10-10 (#BE-23): tanpa @ValidateNested, @Min/@Max LocationDto tidak dijalankan.
+  @ValidateNested()
   @Type(() => LocationDto)
   location?: LocationDto;
 }

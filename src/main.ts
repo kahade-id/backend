@@ -30,6 +30,7 @@ import { OpsSettingsService } from './modules/ops-settings/ops-settings.service'
 import { MaintenanceMiddleware } from './modules/ops-settings/maintenance.middleware';
 import { withTimeout } from './common/utils/background-reliability.util';
 import { validationExceptionFactory } from './common/pipes/validation-exception.factory';
+import { isTrustAllProxyValue } from './config/env.validation';
 
 const PLACEHOLDER_PATTERNS = ['change_me', 'EXAMPLE', '0123456789abcdef'];
 
@@ -158,6 +159,11 @@ async function bootstrap(): Promise<void> {
   const trustedProxyCidr = process.env.TRUSTED_PROXY_CIDR;
   if ((nodeEnv === 'production' || nodeEnv === 'staging') && !trustedProxyCidr) {
     throw new Error('TRUSTED_PROXY_CIDR must be set in production/staging to prevent IP spoofing via X-Forwarded-For');
+  }
+  // Audit Auth 2026-10-10 (#BE-50): pertahanan berlapis — validateEnv sudah
+  // menolak nilai "percaya semua", tetapi bootstrap tidak boleh bergantung padanya.
+  if (isTrustAllProxyValue(trustedProxyCidr)) {
+    throw new Error('TRUSTED_PROXY_CIDR must not trust every proxy (0.0.0.0/0, ::/0, true, *) — X-Forwarded-For could be spoofed');
   }
   app.getHttpAdapter().getInstance().set('trust proxy', trustedProxyCidr ?? 1);
 

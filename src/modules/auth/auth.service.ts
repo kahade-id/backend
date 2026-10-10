@@ -2844,7 +2844,7 @@ export class AuthService {
     return _timingSafeEqual(a, b);
   }
 
-  async refreshToken(refreshToken: string, requestDeviceId?: string): Promise<{ accessToken: string; refreshToken: string }> {
+  async refreshToken(refreshToken: string, requestDeviceId?: string, options?: { source?: 'cookie' | 'body' }): Promise<{ accessToken: string; refreshToken: string }> {
     let payload: RefreshTokenPayload;
     try {
       payload = this.tokenService.verifyRefreshToken(refreshToken);
@@ -4502,7 +4502,7 @@ export class AuthService {
     deviceInfo: string | undefined,
     ipAddress: string,
     nonce?: string,
-  ): Promise<SocialLoginResult | SocialLoginPendingLink> {
+  ): Promise<SocialLoginResult | SocialLoginPendingLink | SocialPhoneMigrationRequired> {
     if (provider === 'google') {
       const identity = await this.verifyGoogleIdentity(idToken);
       return this.loginWithSocialIdentity('GOOGLE', identity, deviceId, deviceInfo, ipAddress);
@@ -4679,7 +4679,7 @@ export class AuthService {
     deviceId: string | undefined,
     deviceInfo: string | undefined,
     ipAddress: string,
-  ): Promise<SocialLoginResult | SocialLoginPendingLink> {
+  ): Promise<SocialLoginResult | SocialLoginPendingLink | SocialPhoneMigrationRequired> {
     const providerSlug = provider === 'GOOGLE' ? 'google' : 'apple';
     const providerLabel = provider === 'GOOGLE' ? 'Google' : 'Apple';
 
@@ -5240,6 +5240,13 @@ export interface SocialLoginPendingLink {
    * nomor HP terverifikasi — bukan untuk membuat akun diam-diam.
    */
   isNewIdentity?: boolean;
+}
+
+/** Audit Auth 2026-10-10: login sosial butuh migrasi nomor HP wajib. */
+export interface SocialPhoneMigrationRequired {
+  requiresPhoneMigration: true;
+  migrationToken: string;
+  provider: 'google' | 'apple';
 }
 
 /** G018: ringkasan provider tertaut (tanpa token). */

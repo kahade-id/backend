@@ -3812,6 +3812,14 @@ export class WalletService implements OnModuleInit {
         });
       }
       await this.verifyWalletPin(wallet, currentPin, userId, ip);
+      // Audit Auth 2026-10-10 (#BE-52): PIN baru tidak boleh sama dengan PIN
+      // lama (currentPin baru saja terverifikasi == PIN tersimpan).
+      if (pin === currentPin) {
+        throw new BadRequestException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'New PIN must be different from the current PIN',
+        });
+      }
     }
 
     const pinDigest = hmacPinDigest(this.walletPinPepper, pin);
@@ -3820,6 +3828,38 @@ export class WalletService implements OnModuleInit {
       where: { userId },
       data: { walletPinHash: hashedPin },
     });
+
+    // Audit Auth 2026-10-10 (#BE-52): notifikasi keamanan saat PIN diubah —
+    // pola sama dengan createSecurityNotification di auth.service (best-effort).
+    if (hasExistingPin) {
+      const title = 'PIN Dompet Diubah';
+      const body =
+        'PIN dompet Kahade Anda baru saja diubah. Jika ini bukan Anda, segera ubah kata sandi dan hubungi dukungan.';
+      const type = NotificationType.SECURITY_NEW_LOGIN;
+      try {
+        await this.prisma.notification.create({
+          data: {
+            notifId: generateNotifId(),
+            userId,
+            type,
+            category: getCategoryForType(type),
+            title,
+            body,
+            isRead: false,
+          },
+        });
+        this.prisma.emitNotificationCreated({
+          userId,
+          title,
+          body,
+          data: { type: 'SECURITY_ALERT', notificationType: type },
+        });
+      } catch (error) {
+        this.logger.warn(
+          `Wallet PIN change notification failed for ${userId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
 
     // Lokasi presisi tiap aksi sensitif — best-effort, tidak pernah throw.
     // Mencakup set PIN pertama DAN change PIN (kontrak WALLET_PIN_CHANGE).

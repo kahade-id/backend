@@ -18,7 +18,12 @@ import { ApiTags } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { Throttle } from '@nestjs/throttler';
 import { Request, Response } from 'express';
-import { AuthService, type SocialLoginResult, type SocialLoginPendingLink } from './auth.service';
+import {
+  AuthService,
+  type SocialLoginResult,
+  type SocialLoginPendingLink,
+  type SocialPhoneMigrationRequired,
+} from './auth.service';
 import { CaptchaService } from './captcha.service';
 import { AccountDeletionService } from '../users/account-deletion.service';
 import { OtpGatewayService, OtpDeliveryMethod } from './otp-gateway.service';
@@ -68,9 +73,16 @@ import { type OtpTriggerPurpose } from './dto/otp-trigger.dto';
 
 /** Type guard G014: hasil social-login berupa permintaan konfirmasi taut. */
 function isSocialLoginPendingLink(
-  r: SocialLoginResult | SocialLoginPendingLink,
+  r: SocialLoginResult | SocialLoginPendingLink | SocialPhoneMigrationRequired,
 ): r is SocialLoginPendingLink {
   return (r as SocialLoginPendingLink).requiresLink === true;
+}
+
+/** Audit Auth 2026-10-10 (#BE-29): login sosial juga tunduk migrasi nomor HP wajib. */
+function isSocialPhoneMigration(
+  r: SocialLoginResult | SocialPhoneMigrationRequired,
+): r is SocialPhoneMigrationRequired {
+  return (r as SocialPhoneMigrationRequired).requiresPhoneMigration === true;
 }
 
 @ApiTags('auth')
@@ -288,6 +300,10 @@ export class AuthController {
    * Selalu 200 — Fonnte me-retry bila respons non-2xx.
    */
   @Public()
+  // Audit Auth 2026-10-10 (#BE-49): rute webhook sebelumnya tanpa throttle
+  // rute — pembanjiran payload palsu memukul verifikasi secret + handler
+  // tanpa batas. 60/menit per IP (Fonnte mengirim jauh di bawah itu).
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Post('webhooks/fonnte')
   @HttpCode(HttpStatus.OK)
   async fonnteWebhook(@Body() body: Record<string, unknown>, @Req() req: Request): Promise<{ ok: true }> {
@@ -423,6 +439,11 @@ export class AuthController {
         // nomor HP; linkToken (scope social_signup) ditautkan di phone-register.
         return result as unknown as Record<string, unknown>;
       }
+      // Audit Auth 2026-10-10 (#BE-29): akun lama tanpa nomor HP terverifikasi
+      // → migrasi wajib, sama seperti login password (tanpa cookie sesi).
+      if (isSocialPhoneMigration(result)) {
+        return result as unknown as Record<string, unknown>;
+      }
       this.setRefreshTokenCookie(res, result.refreshToken);
       this.setAccessTokenCookie(res, result.accessToken);
       return result as unknown as Record<string, unknown>;
@@ -527,6 +548,11 @@ export class AuthController {
         deviceInfo,
         ipAddress,
       );
+      // Audit Auth 2026-10-10 (#BE-29): migrasi nomor HP wajib juga di jalur
+      // konfirmasi taut (sesi tidak diterbitkan sebelum nomor terverifikasi).
+      if (isSocialPhoneMigration(result)) {
+        return result as unknown as Record<string, unknown>;
+      }
       this.setRefreshTokenCookie(res, result.refreshToken);
       this.setAccessTokenCookie(res, result.accessToken);
       return result as unknown as Record<string, unknown>;
@@ -849,9 +875,13 @@ export class AuthController {
       }
       throw error;
     }
-    await this.captchaService.clearLoginFailures(ipAddress);
-
+    // Audit Auth 2026-10-10 (#BE-11/#BE-12): hitungan captcha HANYA dihapus
+    // setelah sesi penuh terbit. Pada cabang requires2FA / migrasi nomor HP
+    // sandi memang benar, tetapi login belum selesai — menghapus hitungan di
+    // sini membuat pemegang sandi curian bisa mereset captcha tanpa batas
+    // (lalu menebak TOTP). Hitungan dihapus di handler verify2faLogin.
     if ('refreshToken' in result) {
+      await this.captchaService.clearLoginFailures(ipAddress);
       this.setRefreshTokenCookie(res, result.refreshToken);
       if ('accessToken' in result) {
         this.setAccessTokenCookie(res, result.accessToken);
@@ -882,6 +912,9 @@ export class AuthController {
       ipAddress,
     );
 
+    // Audit Auth 2026-10-10 (#BE-11/#BE-12): sesi penuh terbit → baru
+    // hitungan captcha IP dibersihkan (lihat handler login).
+    await this.captchaService.clearLoginFailures(ipAddress);
     this.setRefreshTokenCookie(res, result.refreshToken);
     this.setAccessTokenCookie(res, result.accessToken);
     return result;

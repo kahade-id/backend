@@ -131,6 +131,27 @@ describe('AppleAuthService (GAP-A G009–G011)', () => {
     await expect(service.verifyIdentityToken(token, 'nonce-abc-123')).rejects.toThrow('algorithm');
   });
 
+  it('kid tak dikenal → refetch JWKS sekali, lalu verifikasi dengan kunci baru (BE-47)', async () => {
+    // Isi cache dengan kunci lama.
+    await service.verifyIdentityToken(signToken(validPayload()), 'nonce-abc-123');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Apple merotasi kunci: JWKS kini memuat kid baru.
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ keys: [{ ...jwk, kid: 'rotated-kid', alg: 'RS256', use: 'sig' }] }),
+    });
+    const rotated = await service.verifyIdentityToken(signToken(validPayload(), 'rotated-kid'), 'nonce-abc-123');
+    expect(rotated.sub).toBeDefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // kid palsu berikutnya dalam 60 d TIDAK memicu fetch lagi (anti-DoS JWKS).
+    await expect(service.verifyIdentityToken(signToken(validPayload(), 'bogus-kid'), 'nonce-abc-123')).rejects.toThrow(
+      'signing key not found',
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('cache JWKS: fetch hanya sekali untuk dua verifikasi (G010)', async () => {
     const token = signToken(validPayload());
     await service.verifyIdentityToken(token, 'nonce-abc-123');

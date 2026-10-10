@@ -1,4 +1,9 @@
 import { validate } from 'class-validator';
+import { plainToInstance } from 'class-transformer';
+import { LoginDto } from '../dto/login.dto';
+import { RequestOtpTriggerDto } from '../dto/otp-trigger.dto';
+import { PasskeyRecoverDto } from '../dto/passkey.dto';
+import { AppleNonceDto } from '../dto/apple-nonce.dto';
 import { ResetPasswordDto } from '../dto/reset-password.dto';
 import { VerifyEmailDto } from '../dto/verify-email.dto';
 import { Disable2faDto } from '../dto/disable-2fa.dto';
@@ -85,6 +90,35 @@ describe('authentication OTP DTO validation', () => {
     const errors = await validate(dto);
 
     expect(errors).toHaveLength(0);
+  });
+
+  // Audit Auth 2026-10-10 (#BE-22): pola deviceId seragam di login/verify-2fa/reset-password/passkey.
+  it.each([
+    [LoginDto, { identifier: 'alice', password: 'Password123!@', deviceId: 'bad device id' }],
+    [Verify2faLoginDto, { tempToken: 'temp-token', code: '123456', deviceId: 'bad device id' }],
+    [ResetPasswordDto, { tempToken: 'temp-token', deviceId: 'x'.repeat(300), newPassword: 'Password123!@' }],
+    [PasskeyRecoverDto, { step: 'request', deviceId: 'bad device id' }],
+    [AppleNonceDto, { deviceId: 'bad device id' }],
+  ])('rejects unsafe device identifiers for %p (BE-22)', async (Dto, value) => {
+    const errors = await validate(Object.assign(new Dto(), value));
+    expect(errors.some((error) => error.property === 'deviceId')).toBe(true);
+  });
+
+  // Audit Auth 2026-10-10 (#BE-23): location bersarang harus benar-benar divalidasi.
+  it.each([
+    [LoginDto, { identifier: 'alice', password: 'Password123!@', deviceId: 'Android-123e4567-e89b' }],
+    [RequestOtpTriggerDto, { phoneNumber: '+628123456789', purpose: 'login' }],
+    [ResetPasswordDto, { tempToken: 'temp-token', deviceId: 'Android-123e4567-e89b', newPassword: 'Password123!@' }],
+    [ChangePasswordDto, { currentPassword: 'OldPassword1!', newPassword: 'Password123!@', confirmPassword: 'Password123!@' }],
+    [PhoneRegisterDto, { tempToken: 'temp-token', fullName: 'Nama Pengguna', password: 'Password123!@', deviceId: 'Android-123e4567-e89b' }],
+  ])('rejects out-of-range nested location for %p (BE-23)', async (Dto, value) => {
+    const dto = plainToInstance(Dto, { ...value, location: { latitude: 'abc', longitude: 200 } });
+    const errors = await validate(dto as object);
+    expect(errors.some((error) => error.property === 'location')).toBe(true);
+
+    const okDto = plainToInstance(Dto, { ...value, location: { latitude: -6.2, longitude: 106.8 } });
+    const okErrors = await validate(okDto as object);
+    expect(okErrors.some((error) => error.property === 'location')).toBe(false);
   });
 
   it('rejects an empty device identifier before a 2FA login can create an unbound session', async () => {

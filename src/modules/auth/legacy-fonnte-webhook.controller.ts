@@ -8,6 +8,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import type { Request } from 'express';
+import { Throttle } from '@nestjs/throttler';
 import { Public } from '../../common/decorators/public.decorator';
 import * as ErrorCodes from '../../common/constants/error-codes';
 import { OtpTriggerService } from './otp-trigger.service';
@@ -25,6 +26,9 @@ export class LegacyFonnteWebhookController {
   constructor(private readonly otpTriggerService: OtpTriggerService) {}
 
   @Public()
+  // Audit Auth 2026-10-10 (#BE-49): throttle rute webhook 60/menit — tanpa ini
+  // rute publik hanya dilindungi throttle global.
+  @Throttle({ default: { ttl: 60000, limit: 60 } })
   @Post('whatsapp')
   @HttpCode(HttpStatus.OK)
   async whatsappWebhook(

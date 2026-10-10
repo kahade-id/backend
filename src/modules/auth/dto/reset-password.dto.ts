@@ -1,7 +1,8 @@
-import { IsString, IsNotEmpty, IsOptional, MinLength, MaxLength } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, MinLength, MaxLength, Matches, ValidateNested } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { Match } from '../../../common/decorators/match.decorator';
+import { DEVICE_ID_MESSAGE, DEVICE_ID_PATTERN, normalizeDeviceId } from './device-id.validation';
 import { LocationDto } from './location.dto';
 
 /**
@@ -15,9 +16,13 @@ export class ResetPasswordDto {
   @IsNotEmpty()
   tempToken!: string;
 
-  @ApiProperty({ description: 'Device ID — wajib cocok dengan deviceId saat OTP diverifikasi (binding perangkat)' })
+  @ApiProperty({ description: 'Device ID — wajib cocok dengan deviceId saat OTP diverifikasi (binding perangkat)', maxLength: 255 })
   @IsString()
   @IsNotEmpty()
+  // Audit Auth 2026-10-10 (#BE-22): sebelumnya tanpa batas panjang/pola sama sekali.
+  @MaxLength(255)
+  @Matches(DEVICE_ID_PATTERN, { message: DEVICE_ID_MESSAGE })
+  @Transform(({ value }: { value: unknown }) => normalizeDeviceId(value))
   deviceId!: string;
 
   @ApiProperty({ description: 'New password (min 8 karakter)', minLength: 8, maxLength: 72 })
@@ -36,6 +41,8 @@ export class ResetPasswordDto {
 
   @ApiPropertyOptional({ description: 'Lokasi presisi perangkat (opsional)', type: LocationDto })
   @IsOptional()
+  // Audit Auth 2026-10-10 (#BE-23): tanpa @ValidateNested, @Min/@Max LocationDto tidak dijalankan.
+  @ValidateNested()
   @Type(() => LocationDto)
   location?: LocationDto;
 }

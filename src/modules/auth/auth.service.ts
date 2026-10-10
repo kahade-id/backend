@@ -20,7 +20,7 @@ import { OtpTriggerPurpose } from './dto/otp-trigger.dto';
 import { AuthLocationService } from './auth-location.service';
 import { AppleAuthService } from './apple-auth.service';
 import type { LocationDto } from './dto/location.dto';
-import { OtpType, NotificationType, UserAuditAction, Gender, Prisma, User, SocialProvider } from '@prisma/client';
+import { OtpType, NotificationType, UserAuditAction, Prisma, User, SocialProvider } from '@prisma/client';
 import { getCategoryForType } from '../notifications/notification-category.map';
 import {
   generateUserId,
@@ -91,6 +91,26 @@ void bcryptHash(_cryptoRandomBytes(32).toString('hex'), getBcryptRounds()).then(
 const DUMMY_BCRYPT_HASH_FALLBACK = '$2b$12$K4GH.2PFn0b3bVkYe3klq.ScFT2MXqHWMzIxB/yLc8A7EEpzlJxHy';
 
 const TWO_FA_MAX_ATTEMPTS = 5;
+/**
+ * Audit Auth 2026-10-10 (#BE-11): batas percobaan TOTP juga PER AKUN —
+ * counter per tempToken saja bisa di-reset tanpa batas oleh pemegang sandi
+ * (login ulang → tempToken baru → 5 tebakan lagi). 10 kegagalan / 15 menit
+ * → `lockedUntil` 30 menit + notifikasi keamanan.
+ */
+const TWO_FA_USER_FAIL_KEY = (userId: string): string => `2fa_fail:${userId}`;
+const TWO_FA_USER_FAIL_MAX = 10;
+const TWO_FA_USER_FAIL_WINDOW_SECONDS = 15 * 60;
+const TWO_FA_USER_LOCK_MINUTES = 30;
+/** Audit Auth 2026-10-10 (#BE-31): counter TOTP untuk verifySensitiveMfa (5/15 menit → 429). */
+const SENSITIVE_MFA_ATTEMPT_KEY = (userId: string): string => `sensitive_mfa_attempts:${userId}`;
+const SENSITIVE_MFA_MAX_ATTEMPTS = 5;
+const SENSITIVE_MFA_WINDOW_SECONDS = 15 * 60;
+/**
+ * Audit Auth 2026-10-10 (#BE-15): siklus lockout ke-N tidak lagi
+ * menonaktifkan akun permanen (`isActive=false` dari input tanpa autentikasi
+ * = DoS terhadap pemilik). Diganti kunci sementara 24 jam + cabut sesi.
+ */
+const ACCOUNT_LOCK_MAX_CYCLE_MINUTES = 24 * 60;
 /**
  * Audit Auth 2026-10-10 (#BE-01): jendela toleransi replay refresh token
  * setelah rotasi. Dalam jendela ini token lama ditolak TANPA mencabut semua
@@ -173,185 +193,9 @@ export class AuthService {
     return Math.max(0, exp - Math.floor(Date.now() / 1000));
   }
 
-  // ─────────────────────────────────────────────────────────────────
-  // REGISTER
-  // ─────────────────────────────────────────────────────────────────
-  /** @deprecated Use phoneRegister() for new phone-based registration */
-  async register(
-    dto: Record<string, any> & { fullName: string },
-    ipAddress?: string,
-  ): Promise<{ message: string }> {
-    if (dto.password && dto.confirmPassword !== dto.password) {
-      throw new BadRequestException({
-        code: ErrorCodes.PASSWORDS_DO_NOT_MATCH,
-        message: 'Password and confirmation do not match',
-      });
-    }
-    if (dto.password) {
-      validatePasswordPolicy(dto.password);
-    }
-
-    if (dto.dateOfBirth) {
-      const dob = new Date(dto.dateOfBirth + 'T00:00:00Z');
-      if (isNaN(dob.getTime())) {
-        throw new BadRequestException({
-          code: ErrorCodes.VALIDATION_ERROR,
-          message: 'Invalid date of birth format. Use ISO 8601 (YYYY-MM-DD)',
-        });
-      }
-      const age = (Date.now() - dob.getTime()) / (365.25 * 24 * 60 * 60 * 1000);
-      if (age < 13 || age > 120) {
-        throw new BadRequestException({
-          code: ErrorCodes.VALIDATION_ERROR,
-          message: 'Date of birth must represent an age between 13 and 120 years',
-        });
-      }
-    }
-
-    if (dto.phoneNumber) {
-      const cleaned = dto.phoneNumber.replace(/[\s\-.]/g, '');
-      const STRICT_INDONESIAN_PHONE = /^(\+62|62|0)8[1-9][0-9]{7,10}$/;
-      if (!STRICT_INDONESIAN_PHONE.test(cleaned)) {
-        throw new BadRequestException({
-          code: ErrorCodes.VALIDATION_ERROR,
-          message: 'Only valid Indonesian mobile numbers are accepted (e.g. 08xx or +628xx)',
-        });
-      }
-    }
-
-    const normalizedEmail = (dto.email ?? '').toLowerCase();
-
-    // Email enumeration protection — always return the same message regardless
-    const existingUser = await this.prisma.user.findUnique({
-      where: { email: normalizedEmail },
-    });
-    if (existingUser) {
-      return { message: 'If this is a new email, a verification link has been sent.' };
-    }
-
-    // Validate username uniqueness up-front (before transaction) for better UX.
-    // The DB unique constraint is the authoritative guard inside the transaction.
-    if (dto.username) {
-      const normalizedUsername = dto.username.toLowerCase();
-      if (RESERVED_USERNAMES.includes(normalizedUsername)) {
-        throw new BadRequestException({
-          code: ErrorCodes.USERNAME_RESERVED,
-          message: 'Username is already taken',
-        });
-      }
-    }
-
-    if (dto.phoneNumber) {
-      const normalizedPhone = this.normalizePhoneNumber(dto.phoneNumber);
-      const phoneHash = hashPhoneNumber(normalizedPhone);
-      const existingPhone = await this.prisma.user.findFirst({
-        where: { OR: [{ phoneNumberHash: phoneHash }, { phoneNumber: normalizedPhone }] },
-      });
-      if (existingPhone) {
-        return { message: 'If this is a new email, a verification link has been sent.' };
-      }
-    }
-
-    let referralCodeRecord: {
-      id: string;
-      userId: string;
-      isActive: boolean;
-      totalReferrals: number;
-    } | null = null;
-    if (dto.referralCode) {
-      referralCodeRecord = await this.prisma.referralCode.findUnique({
-        where: { code: dto.referralCode.toUpperCase() },
-        select: { id: true, userId: true, isActive: true, totalReferrals: true },
-      });
-      if (
-        !referralCodeRecord ||
-        !referralCodeRecord.isActive ||
-        referralCodeRecord.totalReferrals >= MAX_REFERRALS
-      ) {
-        referralCodeRecord = null;
-      }
-    }
-
-    const hashedPassword = dto.password ? await bcryptHash(dto.password, getBcryptRounds()) : null;
-    const userId = generateUserId();
-    const myReferralCode = generateReferralCode();
-
-    let user: { id: string; userId: string; email: string | null };
-    try {
-      user = await this.prisma.$transaction(
-        async (tx: Prisma.TransactionClient) => {
-          const normalizedPhone = dto.phoneNumber ? this.normalizePhoneNumber(dto.phoneNumber) : '';
-          const normalizedUsername = dto.username ? dto.username.toLowerCase() : undefined;
-          const encryptedPhone = normalizedPhone ? await encryptPii(normalizedPhone) : '';
-          const phoneHash = normalizedPhone ? hashPhoneNumber(normalizedPhone) : undefined;
-
-          const newUser = await tx.user.create({
-            data: {
-              userId,
-              email: normalizedEmail || null,
-              password: hashedPassword,
-              fullName: dto.fullName,
-              phoneNumber: encryptedPhone,
-              phoneNumberHash: phoneHash,
-              ...(normalizedUsername ? { username: normalizedUsername } : {}),
-              ...(dto.dateOfBirth ? { dateOfBirth: new Date(dto.dateOfBirth + 'T00:00:00Z') } : {}),
-              ...(dto.gender ? { gender: dto.gender as Gender } : {}),
-            },
-          });
-
-          await tx.wallet.create({ data: { userId: newUser.id } });
-          await tx.notificationPreference.create({ data: { userId: newUser.id } });
-          await tx.referralCode.create({ data: { userId: newUser.id, code: myReferralCode } });
-
-          if (referralCodeRecord) {
-            const codeUpdated = await tx.referralCode.updateMany({
-              where: {
-                id: referralCodeRecord.id,
-                isActive: true,
-                totalReferrals: { lt: MAX_REFERRALS },
-              },
-              data: { totalReferrals: { increment: 1 } },
-            });
-            if (codeUpdated.count > 0) {
-              await tx.referralRelation.create({
-                data: {
-                  referralCodeId: referralCodeRecord.id,
-                  referrerId: referralCodeRecord.userId,
-                  refereeId: newUser.id,
-                },
-              });
-            }
-          }
-
-          return newUser;
-        },
-        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-      );
-    } catch (err: unknown) {
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-        const target = (err.meta?.target as string[]) ?? [];
-        if (target.includes('userId')) {
-          throw new InternalServerErrorException({
-            code: 'TRANSIENT_CONFLICT',
-            message: 'Registration failed due to a transient conflict. Please try again.',
-          });
-        }
-        if (
-          target.includes('username') ||
-          target.includes('email') ||
-          target.includes('phoneNumber')
-        ) {
-          return { message: 'If this is a new email, a verification link has been sent.' };
-        }
-      }
-      throw err;
-    }
-
-    if (user.email) {
-      await this.sendVerificationEmail(user.id, user.email, ipAddress);
-    }
-    return { message: 'If this is a new email, a verification link has been sent.' };
-  }
+  // Audit Auth 2026-10-10 (#BE-39): register() lama (registrasi email +
+  // sandi, jalur lemah tanpa OTP) dihapus — controller sudah 410 GONE dan
+  // tidak ada pemanggil lain. Registrasi hanya via phoneRegister().
 
   /** Normalize phone to E.164 Indonesia format: 08xx → +628xx
    *  Delegates to shared util (also used by OtpTriggerService).
@@ -380,17 +224,8 @@ export class AuthService {
     return this.prisma.user.findUnique({ where: { username: trimmed.toLowerCase() } });
   }
 
-
-  private shouldExposeDebugOtp(): boolean {
-    const nodeEnv = (
-      this.configService.get<string>('app.nodeEnv') ??
-      process.env.NODE_ENV ??
-      'development'
-    ).toLowerCase();
-    if (!['development', 'test'].includes(nodeEnv)) return false;
-    const flag = (process.env.OTP_DEBUG_RETURN_CODE ?? '').toLowerCase();
-    return flag === 'true' || flag === '1' || flag === 'yes';
-  }
+  // Audit Auth 2026-10-10 (#BE-39): shouldExposeDebugOtp() dihapus (kode mati,
+  // tidak ada pemanggil di src/ maupun test).
 
   // ─────────────────────────────────────────────────────────────────
   // VERIFY PHONE OTP (e-wallet style login/register check)
@@ -425,35 +260,12 @@ export class AuthService {
       where: { OR: [{ phoneNumberHash: phoneHash }, { phoneNumber: normalizedPhone }] },
     });
 
-    // Do not consume a one-time login code for an account that cannot complete
-    // login. The state is checked again after verification to cover a concurrent
-    // administrative change between this preflight and OTP consumption.
-    if (existingUser) {
-      if (!existingUser.isActive) {
-        throw new ForbiddenException({
-          code: ErrorCodes.ACCOUNT_INACTIVE,
-          message: 'Account is inactive',
-        });
-      }
-      if (existingUser.isBanned) {
-        throw new ForbiddenException({
-          code: ErrorCodes.ACCOUNT_BANNED,
-          message: 'Account has been banned',
-        });
-      }
-      // BAI-074: suspend ringan ikut diblokir di jalur OTP.
-      await this.assertNotSuspended(existingUser.id);
-      if (existingUser.lockedUntil && existingUser.lockedUntil > new Date()) {
-        const remainingMs = existingUser.lockedUntil.getTime() - Date.now();
-        const remainingSeconds = Math.ceil(remainingMs / 1000);
-        throw new UnauthorizedException({
-          code: ErrorCodes.ACCOUNT_LOCKED,
-          message: 'Account is temporarily locked due to too many failed attempts',
-          lockoutRemainingSeconds: remainingSeconds,
-        });
-      }
-    }
-
+    // Audit Auth 2026-10-10 (#BE-13): preflight status akun (inactive/banned/
+    // suspended/locked + sisa detik) SEBELUM OTP dicek DIHAPUS — itu oracle
+    // status nomor HP tanpa kredensial apa pun. Status dicek SETELAH OTP valid
+    // (di tiap cabang di bawah); OTP diverifikasi tanpa konsumsi dan baru
+    // dikonsumsi (`consumeOtp`) tepat sebelum token/sesi diterbitkan, sehingga
+    // akun yang tidak bisa login tidak membakar kode milik pemiliknya.
     const verification = await this.otpService.verifyPhoneOtpWithMetadata(
       normalizedPhone,
       OtpType.PHONE_LOGIN,
@@ -472,12 +284,15 @@ export class AuthService {
         message: 'Invalid or expired OTP',
       });
     }
-    if (!(await this.otpService.consumeVerifiedOtp(verification.otpId))) {
-      throw new BadRequestException({
-        code: ErrorCodes.OTP_INVALID,
-        message: 'Invalid or expired OTP',
-      });
-    }
+    const verifiedOtpId = verification.otpId;
+    const consumeOtp = async (): Promise<void> => {
+      if (!(await this.otpService.consumeVerifiedOtp(verifiedOtpId))) {
+        throw new BadRequestException({
+          code: ErrorCodes.OTP_INVALID,
+          message: 'Invalid or expired OTP',
+        });
+      }
+    };
 
     // Percabangan berdasarkan purpose trigger WhatsApp (disimpan di metadata
     // OTP oleh webhook). Tanpa triggerPurpose → perilaku lama (login/register).
@@ -490,6 +305,7 @@ export class AuthService {
           message: 'Nomor HP tidak terdaftar di Kahade.',
         });
       }
+      await consumeOtp();
       const tempToken = this.tokenService.signTempToken({
         sub: existingUser.id,
         scope: 'password_reset',
@@ -528,6 +344,7 @@ export class AuthService {
           message: 'Account is temporarily locked due to too many failed attempts',
         });
       }
+      await consumeOtp();
       const tempToken = this.tokenService.signTempToken({
         sub: migratingUser.id,
         scope: 'phone_migration',
@@ -538,6 +355,7 @@ export class AuthService {
     }
 
     if (!existingUser) {
+      await consumeOtp();
       const tempToken = this.tokenService.signTempToken({
         sub: normalizedPhone,
         scope: 'phone_register',
@@ -558,7 +376,7 @@ export class AuthService {
         message: 'Account has been banned',
       });
     }
-    // BAI-074: cek ulang suspend pasca-verifikasi (perubahan admin konkuren).
+    // BAI-074: cek suspend SETELAH OTP valid (#BE-13: satu-satunya titik cek).
     await this.assertNotSuspended(existingUser.id);
     if (existingUser.lockedUntil && existingUser.lockedUntil > new Date()) {
       const remainingMs = existingUser.lockedUntil.getTime() - Date.now();
@@ -569,6 +387,8 @@ export class AuthService {
         lockoutRemainingSeconds: remainingSeconds,
       });
     }
+    // #BE-13: status lolos → baru OTP dikonsumsi.
+    await consumeOtp();
 
     await this.prisma.user.update({
       where: { id: existingUser.id },
@@ -706,6 +526,10 @@ export class AuthService {
         message: 'Unable to process phone number change',
       });
     }
+    // Audit Auth 2026-10-10 (#BE-33): MFA diverifikasi SEBELUM cek "nomor
+    // sudah dipakai akun lain" — sebelumnya pemegang sandi tanpa TOTP bisa
+    // memakai endpoint ini sebagai oracle nomor HP terdaftar.
+    await this.verifySensitiveMfa(userId, mfaCode);
 
     const normalizedPhone = this.normalizePhoneNumber(newPhoneNumber);
     const phoneHash = hashPhoneNumber(normalizedPhone);
@@ -725,7 +549,6 @@ export class AuthService {
         message: 'This phone number cannot be used',
       });
     }
-    await this.verifySensitiveMfa(userId, mfaCode);
     // OTP hanya via WhatsApp (kebijakan produk) — Fonnte tidak mendukung SMS.
     if (!this.otpGateway.supportsMethod('WHATSAPP')) {
       throw new ServiceUnavailableException({
@@ -904,6 +727,24 @@ export class AuthService {
     }
 
     const normalizedCode = code.trim().toUpperCase();
+    // Audit Auth 2026-10-10 (#BE-31): TOTP di jalur aksi sensitif sebelumnya
+    // tanpa counter percobaan (hanya backup code yang dibatasi) → brute force
+    // 6 digit dari sesi curian. 5 percobaan / 15 menit per user → 429.
+    const sensitiveAttemptKey = SENSITIVE_MFA_ATTEMPT_KEY(userId);
+    const sensitiveAttempts = await this.redis.incrWithTtl(
+      sensitiveAttemptKey,
+      SENSITIVE_MFA_WINDOW_SECONDS,
+    );
+    if (sensitiveAttempts > SENSITIVE_MFA_MAX_ATTEMPTS) {
+      throw new HttpException(
+        {
+          code: ErrorCodes.TOO_MANY_REQUESTS,
+          message: 'Terlalu banyak percobaan kode 2FA. Coba lagi dalam 15 menit.',
+          retryAfter: SENSITIVE_MFA_WINDOW_SECONDS,
+        },
+        429,
+      );
+    }
     let totpVerified = false;
     if (twoFactorAuth.secret) {
       try {
@@ -933,6 +774,7 @@ export class AuthService {
           message: 'Invalid 2FA code',
         });
       }
+      await this.redis.del(sensitiveAttemptKey).catch(() => undefined);
       this.notifyBackupCodeUsed(userId).catch(() => undefined);
       return;
     }
@@ -954,6 +796,82 @@ export class AuthService {
       });
     }
     await client.expire(`${this.redis.getPrefix()}${totpUsedKey}`, 90);
+    await this.redis.del(sensitiveAttemptKey).catch(() => undefined);
+  }
+
+  /**
+   * Audit Auth 2026-10-10 (#BE-15, #BE-25): satu-satunya tempat yang
+   * menaikkan `failedLoginAttempts` & memutuskan lockout — dipakai login()
+   * dan jalur sandi assertPasskeyReauthenticated() (confirmSocialLink,
+   * link/unlink provider, passkey) agar semua oracle sandi memiliki
+   * lockout yang sama.
+   *
+   * #BE-15: siklus ke-N tidak lagi `isActive=false` (deaktivasi permanen
+   * dari input tanpa autentikasi = DoS terhadap pemilik akun). Diganti
+   * `lockedUntil` 24 jam + cabut semua sesi + notifikasi. Admin tetap bisa
+   * menonaktifkan manual.
+   *
+   * Melempar ACCOUNT_LOCKED hanya pada siklus maksimum; selain itu kembali
+   * (pemanggil melempar INVALID_CREDENTIALS generik).
+   */
+  private async recordFailedPasswordAttempt(
+    user: { id: string; email: string | null },
+    ipAddress: string,
+  ): Promise<void> {
+    const updated = await this.prisma.user.update({
+      where: { id: user.id },
+      data: { failedLoginAttempts: { increment: 1 } },
+      select: { failedLoginAttempts: true },
+    });
+    if (!(updated.failedLoginAttempts >= ACCOUNT_LOCK_MAX_ATTEMPTS)) return;
+
+    let cycleCount = 1;
+    try {
+      const lockoutCycleKey = `lockout_cycles:${user.id}`;
+      cycleCount = await this.redis.incrWithTtl(lockoutCycleKey, 7 * 24 * 3600);
+    } catch (redisErr) {
+      this.logger.warn(
+        `[AUTH] Redis unavailable for lockout cycle tracking (user: ${user.id}), falling back to base lockout`,
+        redisErr,
+      );
+      cycleCount = 1;
+    }
+    const maxCycles = this.configService.get<number>('app.accountLockMaxCycles') ?? 5;
+    if (cycleCount >= maxCycles) {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          failedLoginAttempts: 0,
+          lockedUntil: addMinutes(new Date(), ACCOUNT_LOCK_MAX_CYCLE_MINUTES),
+        },
+      });
+      await this.revokeAllUserSessions(user.id, 'account_locked_repeated_failures').catch(
+        (err: unknown) => {
+          this.logger.error(
+            `[AUTH] Failed to revoke sessions after max lockout cycles for user ${user.id}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        },
+      );
+      this.notifyAccountLocked(user.id, user.email ?? '', ipAddress).catch(err => {
+        this.logger.error('[AUTH] Failed to send max-cycle lockout notification', err);
+      });
+      throw new UnauthorizedException({
+        code: ErrorCodes.ACCOUNT_LOCKED,
+        message:
+          'Account has been locked for 24 hours due to repeated failed attempts. All sessions were signed out.',
+      });
+    }
+    const progressiveDuration = ACCOUNT_LOCK_DURATION_MINUTES * Math.pow(2, cycleCount - 1);
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        failedLoginAttempts: 0,
+        lockedUntil: addMinutes(new Date(), progressiveDuration),
+      },
+    });
+    this.notifyAccountLocked(user.id, user.email ?? '', ipAddress).catch(err => {
+      this.logger.error('[AUTH] Failed to send account lockout notification', err);
+    });
   }
 
   // ─────────────────────────────────────────────────────────────────
@@ -964,16 +882,29 @@ export class AuthService {
    *
    * Kebijakan berlapis:
    *  1. `reauthToken` (scope `passkey_reauth`, sekali pakai, dari alur
-   *     recover/verify) → langsung lolos.
+   *     recover/verify) menggantikan password/OTP — TETAPI bila 2FA aktif,
+   *     `mfaCode` tetap WAJIB (#BE-26).
    *  2. Bila user punya password: password WAJIB benar; bila 2FA aktif,
    *     `mfaCode` (TOTP/backup) juga WAJIB via verifySensitiveMfa.
    *  3. Bila tanpa password (akun social-only): `otpCode` WhatsApp
-   *     (OtpType.SENSITIVE_ACTION) WAJIB; bila 2FA aktif, `mfaCode` juga WAJIB.
+   *     (OtpType.SENSITIVE_ACTION, purpose `passkey_recover`) WAJIB; bila
+   *     2FA aktif, `mfaCode` juga WAJIB.
+   *
+   * Audit Auth 2026-10-10 (#BE-25): jalur sandi menaikkan
+   * failedLoginAttempts/lockout seperti login() (sebelumnya oracle sandi
+   * publik tanpa batas via confirmSocialLink) + dummy bcrypt untuk akun
+   * tanpa sandi / tidak ditemukan agar timing seragam.
    */
   async assertPasskeyReauthenticated(
     userId: string,
     dto: { password?: string; mfaCode?: string; otpCode?: string; reauthToken?: string },
+    ipAddress = 'unknown',
   ): Promise<void> {
+    // OTP WhatsApp (akun social-only) diverifikasi tanpa konsumsi dan baru
+    // dikonsumsi setelah seluruh faktor lolos — salah ketik TOTP tidak
+    // membakar OTP (pola sama dengan disable2fa, #BE-34).
+    let pendingOtpId: string | undefined;
+
     if (dto.reauthToken) {
       let payload: TempTokenPayload;
       try {
@@ -996,39 +927,107 @@ export class AuthService {
         'REAUTH_TOKEN_USED',
         'Token re-autentikasi sudah dipakai. Minta kode OTP baru.',
       );
-      return;
-    }
-
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { id: true, password: true, isActive: true, isBanned: true, phoneNumber: true },
-    });
-    if (!user || !user.isActive || user.isBanned) {
-      throw new UnauthorizedException({
-        code: ErrorCodes.INVALID_CREDENTIALS,
-        message: 'Kredensial tidak valid.',
+      // Audit Auth 2026-10-10 (#BE-26): reauthToken hanya berasal dari OTP
+      // WhatsApp — TIDAK boleh melewati faktor kedua. Lanjut ke
+      // verifySensitiveMfa di bawah (no-op bila 2FA nonaktif).
+    } else {
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          id: true,
+          email: true,
+          password: true,
+          isActive: true,
+          isBanned: true,
+          phoneNumber: true,
+          lockedUntil: true,
+        },
       });
-    }
-    if (user.password) {
-      if (!dto.password || !(await bcryptCompare(dto.password, user.password))) {
+      if (!user || !user.isActive || user.isBanned) {
+        // #BE-25: dummy bcrypt agar waktu respons sama dengan sandi salah.
+        await bcryptCompare(dto.password ?? '', _dummyHash || DUMMY_BCRYPT_HASH_FALLBACK);
         throw new UnauthorizedException({
           code: ErrorCodes.INVALID_CREDENTIALS,
-          message: 'Kata sandi salah. Masukkan kata sandi Anda untuk melanjutkan.',
+          message: 'Kredensial tidak valid.',
         });
       }
-    } else {
-      // Akun tanpa password (social-only): re-auth via OTP WhatsApp.
-      const otpOk =
-        !!dto.otpCode &&
-        (await this.otpService.verifyPhoneOtp(user.phoneNumber, OtpType.SENSITIVE_ACTION, dto.otpCode));
-      if (!otpOk) {
-        throw new UnauthorizedException({
-          code: 'INVALID_OTP',
-          message: 'Kode OTP WhatsApp salah atau kedaluwarsa.',
-        });
+      if (user.password) {
+        const passwordValid =
+          !!dto.password && (await bcryptCompare(dto.password, user.password));
+        if (!dto.password) {
+          await bcryptCompare('', _dummyHash || DUMMY_BCRYPT_HASH_FALLBACK);
+        }
+        if (user.lockedUntil && user.lockedUntil > new Date()) {
+          // #BE-14 (pola sama): sisa detik hanya bila sandi benar.
+          throw new UnauthorizedException({
+            code: ErrorCodes.ACCOUNT_LOCKED,
+            message: 'Akun dikunci sementara karena terlalu banyak percobaan gagal.',
+            ...(passwordValid
+              ? { lockoutRemainingSeconds: Math.ceil((user.lockedUntil.getTime() - Date.now()) / 1000) }
+              : {}),
+          });
+        }
+        if (!passwordValid) {
+          if (dto.password) {
+            // #BE-25: tebakan sandi dihitung seperti login().
+            await this.recordFailedPasswordAttempt(user, ipAddress);
+          }
+          throw new UnauthorizedException({
+            code: ErrorCodes.INVALID_CREDENTIALS,
+            message: 'Kata sandi salah. Masukkan kata sandi Anda untuk melanjutkan.',
+          });
+        }
+      } else {
+        // Akun tanpa password (social-only): re-auth via OTP WhatsApp.
+        if (!dto.otpCode) {
+          // #BE-25: akun tanpa sandi tetap menjalani dummy bcrypt (anti-enumerasi).
+          await bcryptCompare(dto.password ?? '', _dummyHash || DUMMY_BCRYPT_HASH_FALLBACK);
+          throw new UnauthorizedException({
+            code: 'INVALID_OTP',
+            message: 'Kode OTP WhatsApp salah atau kedaluwarsa.',
+          });
+        }
+        // Audit Auth 2026-10-10 (#BE-27): `user.phoneNumber` adalah ciphertext
+        // PII — sebelumnya dipakai mentah sehingga verifikasi selalu gagal.
+        // Decrypt dulu; OTP wajib purpose `passkey_recover` & userId cocok
+        // (OTP phone_change / deletion tidak boleh dipakai sebagai re-auth).
+        const phone = await decryptPiiSafe(user.phoneNumber);
+        if (!phone) {
+          throw new UnauthorizedException({
+            code: 'INVALID_OTP',
+            message: 'Kode OTP WhatsApp salah atau kedaluwarsa.',
+          });
+        }
+        const verification = await this.otpService.verifyPhoneOtpWithMetadata(
+          phone,
+          OtpType.SENSITIVE_ACTION,
+          dto.otpCode,
+          { consume: false },
+        );
+        const metadata = verification.metadata;
+        if (
+          !verification.valid ||
+          !verification.otpId ||
+          metadata?.purpose !== 'passkey_recover' ||
+          metadata.userId !== userId
+        ) {
+          throw new UnauthorizedException({
+            code: 'INVALID_OTP',
+            message: 'Kode OTP WhatsApp salah atau kedaluwarsa.',
+          });
+        }
+        pendingOtpId = verification.otpId;
       }
     }
+
     await this.verifySensitiveMfa(userId, dto.mfaCode);
+
+    if (pendingOtpId && !(await this.otpService.consumeVerifiedOtp(pendingOtpId))) {
+      throw new UnauthorizedException({
+        code: 'INVALID_OTP',
+        message: 'Kode OTP WhatsApp salah atau kedaluwarsa.',
+      });
+    }
   }
 
   /**
@@ -1357,7 +1356,13 @@ export class AuthService {
     // Nomor HP sudah terverifikasi di titik ini — penautan aman dilakukan.
     let socialLinked = false;
     if (dto.socialLinkToken) {
-      socialLinked = await this.linkSocialSignupToken(dto.socialLinkToken, user.id, ipAddress).catch(
+      // #BE-36: token social_signup dicocokkan ke deviceId pendaftar.
+      socialLinked = await this.linkSocialSignupToken(
+        dto.socialLinkToken,
+        user.id,
+        ipAddress,
+        dto.deviceId,
+      ).catch(
         (err) => {
           this.logger.warn(
             `social signup link failed for user ${user.id}: ${err instanceof Error ? err.message : String(err)}`,
@@ -1376,9 +1381,10 @@ export class AuthService {
     );
 
     if (dto.deviceId) {
-      await this.trackDevice(user.id, dto.deviceId, dto.deviceInfo, ipAddress).catch(err =>
-        this.logger.error('trackDevice failed in phoneRegister()', err),
-      );
+      // #BE-54: perangkat pertama saat registrasi — tanpa notifikasi "perangkat baru".
+      await this.trackDevice(user.id, dto.deviceId, dto.deviceInfo, ipAddress, {
+        notifyNewDevice: false,
+      }).catch(err => this.logger.error('trackDevice failed in phoneRegister()', err));
     }
 
     const accessToken = this.tokenService.signAccessToken({
@@ -1448,12 +1454,19 @@ export class AuthService {
     socialLinkToken: string,
     userId: string,
     ipAddress: string,
+    deviceId: string,
   ): Promise<boolean> {
     let payload: TempTokenPayload;
     try {
       payload = this.tokenService.verifyTempToken(socialLinkToken);
     } catch {
       throw new Error('Token penautan sosial kedaluwarsa. Tautkan dari Pengaturan → Keamanan.');
+    }
+    // Audit Auth 2026-10-10 (#BE-36): token social_signup terikat ke perangkat
+    // yang melakukan login sosial — tolak bila dipakai dari perangkat lain.
+    // (Klaim sekali-pakai sudah dilakukan SETELAH SocialAccount dibuat.)
+    if (!payload.deviceId || payload.deviceId !== deviceId) {
+      throw new Error('Token penautan sosial tidak berlaku untuk perangkat ini.');
     }
     const extra = payload as TempTokenPayload & {
       provider?: SocialProvider;
@@ -1931,18 +1944,10 @@ export class AuthService {
       });
     }
 
-    // Temp token sekali pakai: klaim atomik (SET NX) SEBELUM mutasi.
-    // 03-#4: pola check-then-set sebelumnya punya race TOCTOU — dua request
-    // konkuren bisa sama-sama lolos cek awal. Bila transaksi di bawah gagal
-    // setelah klaim, token tetap dianggap terpakai (fail-closed, konsisten
-    // dengan phoneRegister).
-    await this.claimTempTokenOnce(
-      payload.jti,
-      this.getTempTokenTtlFromPayload(payload),
-      ErrorCodes.TEMP_TOKEN_EXPIRED,
-      'Reset token has already been used. Please request a new OTP.',
-    );
-
+    // Audit Auth 2026-10-10 (#BE-32): klaim token sekali-pakai DIPINDAH ke
+    // tepat sebelum transaksi — pemeriksaan read-only (status akun, sandi
+    // sama, riwayat sandi) dilakukan dulu agar salah pilih sandi tidak
+    // membakar token dan memaksa ulang seluruh alur OTP.
     const user = await this.prisma.user.findUnique({ where: { id: payload.sub } });
     if (!user || !user.isActive || user.isBanned) {
       throw new BadRequestException({
@@ -1950,6 +1955,8 @@ export class AuthService {
         message: 'Invalid or expired reset token',
       });
     }
+    // Audit Auth 2026-10-10 (#BE-55): suspend setelah tempToken terbit tetap diblokir.
+    await this.assertNotSuspended(user.id);
     if (user.lockedUntil && user.lockedUntil > new Date()) {
       throw new UnauthorizedException({
         code: ErrorCodes.ACCOUNT_LOCKED,
@@ -1983,6 +1990,18 @@ export class AuthService {
     }
 
     const hashedPassword = await bcryptHash(dto.newPassword, getBcryptRounds());
+
+    // Temp token sekali pakai: klaim atomik (SET NX) SEBELUM mutasi.
+    // 03-#4: pola check-then-set sebelumnya punya race TOCTOU — dua request
+    // konkuren bisa sama-sama lolos cek awal. Bila transaksi di bawah gagal
+    // setelah klaim, token tetap dianggap terpakai (fail-closed, konsisten
+    // dengan phoneRegister). #BE-32: klaim di sini, setelah cek read-only.
+    await this.claimTempTokenOnce(
+      payload.jti,
+      this.getTempTokenTtlFromPayload(payload),
+      ErrorCodes.TEMP_TOKEN_EXPIRED,
+      'Reset token has already been used. Please request a new OTP.',
+    );
 
     const resetSessionIds = await this.prisma.$transaction(
       async (tx: Prisma.TransactionClient) => {
@@ -2139,6 +2158,8 @@ export class AuthService {
         message: 'Akun tidak valid',
       });
     }
+    // Audit Auth 2026-10-10 (#BE-55): suspend setelah token terbit tetap diblokir.
+    await this.assertNotSuspended(user.id);
     if (user.lockedUntil && user.lockedUntil > new Date()) {
       throw new UnauthorizedException({
         code: ErrorCodes.ACCOUNT_LOCKED,
@@ -2160,28 +2181,26 @@ export class AuthService {
       });
     }
 
-    const encryptedPhone = await encryptPii(phoneNumber);
-    const updatedUser = await this.prisma.user.update({
-      where: { id: user.id },
-      data: {
-        phoneNumber: encryptedPhone,
-        phoneNumberHash: phoneHash,
-        phoneVerified: true,
-        phoneVerifiedAt: new Date(),
-      },
+    const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({
+      where: { userId: user.id },
     });
+    // Audit Auth 2026-10-10 (#BE-28): 2FA dicek SEBELUM nomor HP ditulis.
+    // Sebelumnya nomor sudah terikat di sini lalu baru diminta TOTP —
+    // pemegang sandi akun 2FA legacy bisa mengikat nomornya sendiri (lalu
+    // reset sandi via OTP). Kini nomor yang sudah diverifikasi dibawa di
+    // tempToken 2FA (klaim `phone`) dan baru diikat di verify2faLogin
+    // setelah TOTP valid. AUT-005: bypass "trusted device" tetap DIHAPUS.
+    if (twoFactorAuth?.isEnabled) {
+      const tempToken = this.tokenService.signTempToken({
+        sub: user.id,
+        scope: '2fa_verify',
+        deviceId: dto.deviceId,
+        extra: { phone: phoneNumber },
+      });
+      return { requires2FA: true, tempToken };
+    }
 
-    // 03-#4: token sudah diklaim atomik sebelum mutasi — tidak perlu tulis
-    // best-effort setelah commit.
-
-    this.auditLog.logUserAction({
-      userId: user.id,
-      action: UserAuditAction.PROFILE_UPDATED,
-      entityType: 'User',
-      entityId: user.id,
-      description: `Phone migration completed from ${ipAddress}`,
-      ipAddress,
-    });
+    const updatedUser = await this.bindMigratedPhone(user.id, phoneNumber, ipAddress);
 
     await this.locationService.logEvent({
       userId: user.id,
@@ -2191,25 +2210,123 @@ export class AuthService {
       deviceId: dto.deviceId,
     });
 
-    const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({
-      where: { userId: user.id },
-    });
-    // AUT-005 (fail-closed): bypass "trusted device" DIHAPUS — bila 2FA aktif,
-    // TOTP selalu diminta, termasuk di jalur penyelesaian migrasi nomor HP ini.
-    if (twoFactorAuth?.isEnabled) {
-      const tempToken = this.tokenService.signTempToken({
-        sub: user.id,
-        scope: '2fa_verify',
-        deviceId: dto.deviceId,
-      });
-      return { requires2FA: true, tempToken };
-    }
-
     return this.issueLoginSession(updatedUser, ipAddress, {
       deviceId: dto.deviceId,
       deviceInfo: dto.deviceInfo,
-      isMfaEnabled: twoFactorAuth?.isEnabled ?? false,
+      isMfaEnabled: false,
       location: dto.location,
+    });
+  }
+
+  /**
+   * Audit Auth 2026-10-10 (#BE-28): ikat nomor HP hasil migrasi (sudah
+   * diverifikasi OTP WhatsApp) ke akun — dipanggil HANYA setelah semua
+   * faktor lolos (sandi/passkey + TOTP bila 2FA aktif). Cek ulang pemilik
+   * nomor (balapan), lalu audit + notifikasi keamanan.
+   */
+  private async bindMigratedPhone(
+    userId: string,
+    phoneNumber: string,
+    ipAddress: string,
+  ): Promise<User> {
+    const phoneHash = hashPhoneNumber(phoneNumber);
+    const owner = await this.prisma.user.findFirst({
+      where: {
+        OR: [{ phoneNumberHash: phoneHash }, { phoneNumber }],
+        NOT: { id: userId },
+      },
+      select: { id: true },
+    });
+    if (owner) {
+      throw new ConflictException({
+        code: ErrorCodes.VALIDATION_ERROR,
+        message: 'Nomor HP sudah dipakai akun lain.',
+      });
+    }
+    const encryptedPhone = await encryptPii(phoneNumber);
+    let updatedUser: User;
+    try {
+      updatedUser = await this.prisma.user.update({
+        where: { id: userId },
+        data: {
+          phoneNumber: encryptedPhone,
+          phoneNumberHash: phoneHash,
+          phoneVerified: true,
+          phoneVerifiedAt: new Date(),
+        },
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException({
+          code: ErrorCodes.VALIDATION_ERROR,
+          message: 'Nomor HP sudah dipakai akun lain.',
+        });
+      }
+      throw error;
+    }
+    await this.redis.del(PHONE_VERIFIED_GUARD(userId)).catch(() => undefined);
+
+    this.auditLog.logUserAction({
+      userId,
+      action: UserAuditAction.PROFILE_UPDATED,
+      entityType: 'User',
+      entityId: userId,
+      description: `Phone migration completed from ${ipAddress}`,
+      ipAddress,
+    });
+    // #BE-28: notifikasi keamanan saat nomor terikat (pemilik sah tahu bila
+    // ada yang mengikat nomor lain ke akunnya).
+    this.createSecurityNotification(
+      userId,
+      'Nomor HP ditautkan ke akun Anda',
+      'Nomor HP baru saja diverifikasi dan ditautkan sebagai metode masuk akun Anda. Jika ini bukan Anda, segera ganti kata sandi dan hubungi support.',
+    ).catch(() => undefined);
+    return updatedUser;
+  }
+
+  /**
+   * Audit Auth 2026-10-10 (#BE-11/#BE-12): refund SATU slot kuota IP login
+   * (AUDIT-6: pengguna sah di balik NAT operator) — HANYA setelah sesi penuh
+   * terbit. Sebelumnya refund terjadi begitu sandi benar (termasuk cabang
+   * requires2FA/migrasi) sehingga pemegang sandi curian bisa mereset kuota
+   * IP tanpa batas lalu menebak TOTP.
+   */
+  private async refundLoginIpAttempt(ipAddress: string): Promise<void> {
+    const key = `login_ip_rate:${ipAddress}`;
+    const remaining = await this.redis.decr(key).catch(() => undefined);
+    if (typeof remaining === 'number' && remaining < 0) {
+      await this.redis.del(key).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Audit Auth 2026-10-10 (#BE-11): kegagalan TOTP dihitung PER AKUN
+   * (`2fa_fail:<userId>`, 10 / 15 menit) — counter per tempToken saja bisa
+   * di-reset oleh pemegang sandi dengan login ulang. Pada ambang: kunci
+   * akun 30 menit + notifikasi keamanan.
+   */
+  private async recordTwoFaFailure(
+    user: { id: string; email: string | null },
+    ipAddress: string,
+  ): Promise<void> {
+    const key = TWO_FA_USER_FAIL_KEY(user.id);
+    const failures = await this.redis.incrWithTtl(key, TWO_FA_USER_FAIL_WINDOW_SECONDS);
+    if (failures < TWO_FA_USER_FAIL_MAX) return;
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        failedLoginAttempts: 0,
+        lockedUntil: addMinutes(new Date(), TWO_FA_USER_LOCK_MINUTES),
+      },
+    });
+    await this.redis.del(key).catch(() => undefined);
+    this.notifyAccountLocked(user.id, user.email ?? '', ipAddress).catch(err => {
+      this.logger.error('[2FA] Failed to send 2FA lockout notification', err);
+    });
+    throw new UnauthorizedException({
+      code: ErrorCodes.ACCOUNT_LOCKED,
+      message: 'Account is temporarily locked due to too many failed 2FA attempts',
+      lockoutRemainingSeconds: TWO_FA_USER_LOCK_MINUTES * 60,
     });
   }
 
@@ -2273,118 +2390,52 @@ export class AuthService {
         message: 'Invalid credentials',
       });
     }
-    // BAI-074: suspend ringan ikut diblokir di jalur login password.
-    await this.assertNotSuspended(user.id);
 
     if (user.lockedUntil && user.lockedUntil > new Date()) {
-      const remainingMs = user.lockedUntil!.getTime() - Date.now();
+      // Audit Auth 2026-10-10 (#BE-14): ACCOUNT_LOCKED tetap dilempar
+      // (dibutuhkan UI countdown; sudah butuh ≥5 kegagalan) tetapi sisa detik
+      // HANYA diberikan bila sandi benar — sandi apa pun tidak boleh membaca
+      // status akun.
+      const remainingMs = user.lockedUntil.getTime() - Date.now();
       const remainingSeconds = Math.ceil(remainingMs / 1000);
       throw new UnauthorizedException({
         code: ErrorCodes.ACCOUNT_LOCKED,
         message: 'Account is temporarily locked due to too many failed attempts',
-        lockoutRemainingSeconds: remainingSeconds,
+        ...(isPasswordValid ? { lockoutRemainingSeconds: remainingSeconds } : {}),
       });
     }
 
     if (!isPasswordValid) {
       // SEC (round-2): akun TANPA password tidak boleh menaikkan
-      // failedLoginAttempts / lockout permanen — tidak ada password yang bisa
-      // di-brute-force, dan lockout permanen (isActive=false) akan menjadi DoS
-      // terhadap pemilik akun yang sah. Tetap tolak dengan error generik.
+      // failedLoginAttempts / lockout — tidak ada password yang bisa
+      // di-brute-force, dan lockout akan menjadi DoS terhadap pemilik akun
+      // yang sah. Tetap tolak dengan error generik.
       if (!user.password) {
         throw new UnauthorizedException({
           code: ErrorCodes.INVALID_CREDENTIALS,
           message: 'Invalid credentials',
         });
       }
-      const updated = await this.prisma.user.update({
-        where: { id: user.id },
-        data: { failedLoginAttempts: { increment: 1 } },
-        select: { failedLoginAttempts: true },
-      });
-      if (updated.failedLoginAttempts >= ACCOUNT_LOCK_MAX_ATTEMPTS) {
-        let cycleCount = 1;
-        try {
-          const lockoutCycleKey = `lockout_cycles:${user.id}`;
-          cycleCount = await this.redis.incrWithTtl(lockoutCycleKey, 7 * 24 * 3600);
-        } catch (redisErr) {
-          this.logger.warn(
-            `[AUTH] Redis unavailable for lockout cycle tracking (user: ${user.id}), falling back to base lockout`,
-            redisErr,
-          );
-          cycleCount = 1;
-        }
-        const maxCycles = this.configService.get<number>('app.accountLockMaxCycles') ?? 5;
-        if (cycleCount >= maxCycles) {
-          await this.prisma.user.update({
-            where: { id: user.id },
-            data: { isActive: false, failedLoginAttempts: 0 },
-          });
-          const lockedSessionIds = await this.prisma.$transaction(
-            async tx => {
-              const sessions = await tx.userSession.findMany({
-                where: { userId: user.id, isRevoked: false },
-                select: { id: true },
-              });
-              await tx.userSession.updateMany({
-                where: { userId: user.id, isRevoked: false },
-                data: {
-                  isRevoked: true,
-                  revokedAt: new Date(),
-                  revokedReason: 'account_permanently_locked',
-                },
-              });
-              return sessions.map(session => session.id);
-            },
-            { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-          );
-          await this.revokeSessionsInRedis(lockedSessionIds).catch(err => {
-            this.logger.error(
-              `[AUTH] Failed to blacklist sessions after permanent lockout for user ${user.id}: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          });
-          this.notifyAccountLocked(user.id, user.email ?? '', ipAddress).catch(err => {
-            this.logger.error('[AUTH] Failed to send permanent lockout notification', err);
-          });
-          throw new UnauthorizedException({
-            code: ErrorCodes.ACCOUNT_LOCKED,
-            message:
-              'Account has been permanently locked due to repeated failed attempts. Contact support.',
-          });
-        }
-        const baseDuration = ACCOUNT_LOCK_DURATION_MINUTES;
-        const progressiveDuration = baseDuration * Math.pow(2, cycleCount - 1);
-        await this.prisma.user.update({
-          where: { id: user.id },
-          data: {
-            failedLoginAttempts: 0,
-            lockedUntil: addMinutes(new Date(), progressiveDuration),
-          },
-        });
-        this.notifyAccountLocked(user.id, user.email ?? '', ipAddress).catch(err => {
-          this.logger.error('[AUTH] Failed to send account lockout notification', err);
-        });
-      }
+      // #BE-15: siklus ke-N → lockedUntil 24 jam + cabut sesi (bukan isActive=false).
+      await this.recordFailedPasswordAttempt(user, ipAddress);
       throw new UnauthorizedException({
         code: ErrorCodes.INVALID_CREDENTIALS,
         message: 'Invalid credentials',
       });
     }
 
-    // AUDIT-6: a successful password check refunds *this* attempt to the shared per-IP
-    // budget — legitimate users on carrier-grade NAT IPs (several households per address)
-    // must not exhaust the 20/15min allowance with successes alone. Failure counts from
-    // other actors on the same IP are untouched because we decrement by one.
-    if (isPasswordValid) {
-      const remaining = await this.redis.decr(LOGIN_IP_KEY).catch(() => undefined);
-      if (typeof remaining === 'number' && remaining < 0) {
-        await this.redis.del(LOGIN_IP_KEY).catch(() => undefined);
-      }
-    }
+    // Audit Auth 2026-10-10 (#BE-14): ACCOUNT_SUSPENDED hanya setelah sandi
+    // benar — sebelumnya dilempar untuk sandi apa pun (oracle status akun).
+    // BAI-074: suspend ringan ikut diblokir di jalur login password.
+    await this.assertNotSuspended(user.id);
+
+    // Audit Auth 2026-10-10 (#BE-11/#BE-12): refund kuota IP DIPINDAH ke
+    // setelah sesi penuh terbit (lihat refundLoginIpAttempt di bawah dan di
+    // verify2faLogin) — bukan di sini, sebelum cabang 2FA/migrasi.
 
     // Migrasi wajib: akun lama yang nomor HP-nya belum terverifikasi harus
     // verifikasi via WhatsApp dulu sebelum sesi diterbitkan.
-    if (isPasswordValid && !user.phoneVerified) {
+    if (!user.phoneVerified) {
       const migrationToken = this.tokenService.signTempToken({
         sub: user.id,
         scope: 'phone_migration',
@@ -2416,6 +2467,9 @@ export class AuthService {
       });
       return { requires2FA: true, tempToken };
     }
+
+    // #BE-11/#BE-12: sesi penuh terbit tanpa 2FA → refund slot kuota IP.
+    await this.refundLoginIpAttempt(ipAddress);
 
     return this.issueLoginSession(user, ipAddress, {
       deviceId: dto.deviceId,
@@ -2639,6 +2693,8 @@ export class AuthService {
         message: 'Account has been banned',
       });
     }
+    // Audit Auth 2026-10-10 (#BE-55): suspend setelah tempToken terbit tetap diblokir.
+    await this.assertNotSuspended(user.id);
 
     const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({ where: { userId } });
 
@@ -2694,6 +2750,8 @@ export class AuthService {
     if (!totpVerified) {
       const backupCodeMatch = await this.checkAndConsumeBackupCode(twoFactorAuth, code);
       if (!backupCodeMatch) {
+        // #BE-11: hitung kegagalan per akun (lockout 30 menit pada ambang).
+        await this.recordTwoFaFailure(user, ipAddress);
         throw new BadRequestException({
           code: ErrorCodes.INVALID_2FA_CODE,
           message: 'Invalid 2FA code',
@@ -2735,8 +2793,17 @@ export class AuthService {
       'Temp token has already been used. Please log in again.',
     );
 
-    // Clear the attempt counter on successful login
+    // Clear the attempt counters on successful login (#BE-11: juga per akun)
     await this.redis.del(attemptKey);
+    await this.redis.del(TWO_FA_USER_FAIL_KEY(user.id)).catch(() => undefined);
+
+    // Audit Auth 2026-10-10 (#BE-28): nomor HP migrasi (klaim `phone` dari
+    // confirmPhoneMigration) baru diikat SEKARANG — setelah TOTP valid dan
+    // token diklaim. Dilewati bila nomor sudah terverifikasi (balapan).
+    const sessionUser: User =
+      payload.phone && !user.phoneVerified
+        ? await this.bindMigratedPhone(user.id, normalizeIndonesianPhone(payload.phone), ipAddress)
+        : user;
 
     const lockoutCycleKey2fa = `lockout_cycles:${user.id}`;
     await this.redis
@@ -2777,6 +2844,9 @@ export class AuthService {
       emailVerified: user.emailVerified,
     });
 
+    // #BE-11/#BE-12: sesi penuh terbit → refund slot kuota IP login.
+    await this.refundLoginIpAttempt(ipAddress);
+
     return {
       accessToken,
       refreshToken,
@@ -2797,8 +2867,8 @@ export class AuthService {
           : null,
         membershipRank: user.membershipRank,
         isMfaEnabled: true,
-        phoneNumber: await decryptPiiSafe(user.phoneNumber),
-        phoneVerified: user.phoneVerified ?? false,
+        phoneNumber: await decryptPiiSafe(sessionUser.phoneNumber),
+        phoneVerified: sessionUser.phoneVerified ?? false,
         dateOfBirth: user.dateOfBirth ? user.dateOfBirth.toISOString() : null,
         gender: user.gender ?? null,
         createdAt: user.createdAt.toISOString(),
@@ -3639,12 +3709,16 @@ export class AuthService {
       });
     }
 
-    const isOtpValid = await this.otpService.verifyOtp(
+    // Audit Auth 2026-10-10 (#BE-34): OTP email diverifikasi TANPA konsumsi,
+    // lalu TOTP/backup divalidasi, baru OTP dikonsumsi — salah ketik TOTP
+    // tidak lagi membakar OTP email (yang dibatasi 3 / 5 menit).
+    const emailOtp = await this.otpService.verifyOtpWithMetadata(
       user.email,
       OtpType.TWO_FA_DISABLE,
       emailOtpCode,
+      { consume: false },
     );
-    if (!isOtpValid) {
+    if (!emailOtp.valid || !emailOtp.otpId) {
       throw new BadRequestException({ code: ErrorCodes.OTP_INVALID, message: 'Invalid email OTP' });
     }
 
@@ -3696,6 +3770,11 @@ export class AuthService {
         });
       }
       await client.expire(redisKey, 90);
+    }
+
+    // #BE-34: semua faktor lolos → konsumsi OTP email (sekali pakai).
+    if (!(await this.otpService.consumeVerifiedOtp(emailOtp.otpId))) {
+      throw new BadRequestException({ code: ErrorCodes.OTP_INVALID, message: 'Invalid email OTP' });
     }
 
     const disable2faSessionIds = await this.prisma.$transaction(
@@ -3932,6 +4011,17 @@ export class AuthService {
         code: 'EMAIL_NOT_CONFIGURED',
         message:
           'Your account has no email address. Please add and verify an email before disabling 2FA, or contact support.',
+      });
+    }
+    // Audit Auth 2026-10-10 (#BE-35): OTP pelepasan 2FA hanya ke email yang
+    // sudah TERVERIFIKASI — email belum terverifikasi bisa saja milik orang
+    // lain / salah ketik, dan menjadikannya faktor pelepasan 2FA melemahkan
+    // faktor kedua.
+    if (!user.emailVerified) {
+      throw new BadRequestException({
+        code: ErrorCodes.EMAIL_NOT_VERIFIED,
+        message:
+          'Your email address is not verified yet. Verify it first before disabling 2FA, or contact support.',
       });
     }
 
@@ -4184,6 +4274,9 @@ export class AuthService {
     deviceId: string,
     deviceInfo: string | undefined,
     ipAddress: string,
+    // Audit Auth 2026-10-10 (#BE-54): registrasi = perangkat pertama, bukan
+    // "perangkat baru" — notifikasi dilewati (notifyNewDevice: false).
+    opts: { notifyNewDevice?: boolean } = {},
   ): Promise<void> {
     const existingDevice = await this.prisma.userDevice.findUnique({
       where: { userId_deviceId: { userId, deviceId } },
@@ -4198,6 +4291,7 @@ export class AuthService {
       await this.prisma.userDevice.create({
         data: { userId, deviceId, deviceName: deviceInfo ?? 'Unknown Device', ipAddress },
       });
+      if (opts.notifyNewDevice === false) return;
       // Full async notification via queue is the production path; the inline
       // implementation below covers the case when the queue module is not yet live.
       await this.notifyNewDeviceLogin(userId, deviceInfo ?? 'Unknown Device', ipAddress).catch(
@@ -4295,11 +4389,13 @@ export class AuthService {
       data: { type: 'SECURITY_ACCOUNT_LOCKED' },
     });
 
+    // Audit Auth 2026-10-10 (#BE-38): email juga memakai IP termasker,
+    // sama dengan body in-app (email bisa diteruskan / tersimpan di pihak ketiga).
     await this.dispatchEmail({
       to: email,
       subject: 'Kahade — Your Account Has Been Locked',
       templateName: 'account-locked',
-      templateContext: { ipAddress },
+      templateContext: { ipAddress: maskedIp },
     }).catch(err => {
       this.logger.error(
         `[AUTH] Failed to queue account lockout email for user ${userId}: ${(err as Error).message}`,
@@ -4312,8 +4408,10 @@ export class AuthService {
     deviceInfo: string,
     ipAddress: string,
   ): Promise<void> {
-    const loginTitle = 'New Device Login';
-    const loginBody = `Your account was accessed from a new device: ${deviceInfo} (IP: ${ipAddress}). If this was not you, change your password immediately.`;
+    // Audit Auth 2026-10-10 (#BE-54): teks Indonesia (konsisten dengan
+    // notifikasi keamanan lain yang tampil di aplikasi).
+    const loginTitle = 'Masuk dari perangkat baru';
+    const loginBody = `Akun Anda baru saja diakses dari perangkat baru: ${deviceInfo} (IP: ${ipAddress}). Jika ini bukan Anda, segera ganti kata sandi dan periksa perangkat tertaut.`;
     await this.prisma.notification.create({
       data: {
         notifId: generateNotifId(),
@@ -4611,11 +4709,11 @@ export class AuthService {
   async socialLogin(
     provider: 'google' | 'apple',
     idToken: string,
-    deviceId: string | undefined,
+    deviceId: string,
     deviceInfo: string | undefined,
     ipAddress: string,
     nonce?: string,
-  ): Promise<SocialLoginResult | SocialLoginPendingLink> {
+  ): Promise<SocialLoginResult | SocialLoginPendingLink | SocialPhoneMigrationRequired> {
     if (provider === 'google') {
       const identity = await this.verifyGoogleIdentity(idToken);
       return this.loginWithSocialIdentity('GOOGLE', identity, deviceId, deviceInfo, ipAddress);
@@ -4789,10 +4887,10 @@ export class AuthService {
   private async loginWithSocialIdentity(
     provider: SocialProvider,
     identity: SocialIdentity,
-    deviceId: string | undefined,
+    deviceId: string,
     deviceInfo: string | undefined,
     ipAddress: string,
-  ): Promise<SocialLoginResult | SocialLoginPendingLink> {
+  ): Promise<SocialLoginResult | SocialLoginPendingLink | SocialPhoneMigrationRequired> {
     const providerSlug = provider === 'GOOGLE' ? 'google' : 'apple';
     const providerLabel = provider === 'GOOGLE' ? 'Google' : 'Apple';
 
@@ -4818,7 +4916,13 @@ export class AuthService {
     // email } (sub='pending'). Frontend meminta user membuktikan kepemilikan
     // akun Kahade lama (password/2FA/OTP WhatsApp) di /social/link/confirm
     // SEBELUM penautan terjadi. Tanpa re-auth, token ini tidak berguna.
-    const normalizedEmail = identity.email?.trim().toLowerCase();
+    // Audit Auth 2026-10-10 (#BE-25): email provider HANYA dipercaya bila
+    // `emailVerified === true`. Email Google/Apple yang belum terverifikasi
+    // bisa diklaim siapa saja → sebelumnya menjadi oracle sandi + maskedEmail
+    // (oracle eksistensi email) untuk akun korban. Tanpa verifikasi provider,
+    // identitas diperlakukan sebagai identitas baru tanpa email.
+    const normalizedEmail =
+      identity.emailVerified === true ? identity.email?.trim().toLowerCase() : undefined;
     if (normalizedEmail) {
       const existing = await this.prisma.user.findUnique({ where: { email: normalizedEmail } });
       if (existing) {
@@ -4917,18 +5021,34 @@ export class AuthService {
       phoneNumber: string; phoneVerified: boolean; dateOfBirth: Date | null;
       gender: string | null; createdAt: Date;
     },
-    deviceId: string | undefined,
+    deviceId: string,
     deviceInfo: string | undefined,
     ipAddress: string,
     isNewUser: boolean,
     providerLabel: string,
-  ): Promise<SocialLoginResult> {
+  ): Promise<SocialLoginResult | SocialPhoneMigrationRequired> {
+    // Audit Auth 2026-10-10 (#BE-29): login sosial tunduk migrasi nomor HP
+    // wajib, sama seperti login() — akun lama tanpa nomor terverifikasi tidak
+    // mendapat sesi sebelum verifikasi WhatsApp (2FA, bila aktif, dicek di
+    // confirmPhoneMigration → verify2faLogin sebelum nomor diikat, #BE-28).
+    if (!user.phoneVerified) {
+      const migrationToken = this.tokenService.signTempToken({
+        sub: user.id,
+        scope: 'phone_migration',
+        deviceId,
+      });
+      this.logger.log(`social_login_step provider=${providerLabel.toLowerCase()} step=phone_migration_required`);
+      return { requiresPhoneMigration: true as const, migrationToken };
+    }
+
     const twoFactorAuth = await this.prisma.twoFactorAuth.findUnique({ where: { userId: user.id } });
     if (twoFactorAuth?.isEnabled) {
+      // Audit Auth 2026-10-10 (#BE-30): deviceId wajib (DTO) — fallback
+      // literal 'social' dihapus; sesi terikat ke perangkat sebenarnya.
       const tempToken = this.tokenService.signTempToken({
         sub: user.id,
         scope: '2fa_verify',
-        deviceId: deviceId || 'social',
+        deviceId,
       });
       throw new BadRequestException({
         code: 'TWO_FA_REQUIRED',
@@ -5007,10 +5127,10 @@ export class AuthService {
   async confirmSocialLink(
     linkToken: string,
     reauth: { password?: string; mfaCode?: string; otpCode?: string; reauthToken?: string },
-    deviceId: string | undefined,
+    deviceId: string,
     deviceInfo: string | undefined,
     ipAddress: string,
-  ): Promise<SocialLoginResult> {
+  ): Promise<SocialLoginResult | SocialPhoneMigrationRequired> {
     let payload: TempTokenPayload;
     try {
       payload = this.tokenService.verifyTempToken(linkToken);
@@ -5051,7 +5171,8 @@ export class AuthService {
     await this.assertSocialAccountUsable(user, providerLabel);
 
     // Re-auth akun lama WAJIB sebelum penautan (anti take-over).
-    await this.assertPasskeyReauthenticated(user.id, reauth);
+    // #BE-25: ipAddress diteruskan agar tebakan sandi dihitung/lockout + notifikasi.
+    await this.assertPasskeyReauthenticated(user.id, reauth, ipAddress);
 
     // Klaim token sekali-pakai SETELAH re-auth lolos — percobaan gagal tidak
     // membakar token (user bisa memperbaiki password/OTP).
@@ -5121,7 +5242,7 @@ export class AuthService {
     reauth: { password?: string; mfaCode?: string; otpCode?: string },
     ipAddress: string,
   ): Promise<{ message: string; linked: LinkedSocialProvider[] }> {
-    await this.assertPasskeyReauthenticated(userId, reauth);
+    await this.assertPasskeyReauthenticated(userId, reauth, ipAddress);
 
     const identity =
       provider === 'google'
@@ -5202,7 +5323,7 @@ export class AuthService {
     reauth: { password?: string; mfaCode?: string; otpCode?: string },
     ipAddress: string,
   ): Promise<{ message: string; linked: LinkedSocialProvider[] }> {
-    await this.assertPasskeyReauthenticated(userId, reauth);
+    await this.assertPasskeyReauthenticated(userId, reauth, ipAddress);
 
     const providerEnum: SocialProvider = provider === 'google' ? 'GOOGLE' : 'APPLE';
     const providerLabel = provider === 'google' ? 'Google' : 'Apple';
@@ -5337,6 +5458,12 @@ export interface SocialLoginResult {
   refreshToken: string;
   user: LoginUserPayload;
   isNewUser: boolean;
+}
+
+/** Audit Auth 2026-10-10 (#BE-29): login sosial juga wajib migrasi nomor HP. */
+export interface SocialPhoneMigrationRequired {
+  requiresPhoneMigration: true;
+  migrationToken: string;
 }
 
 /** G014: email provider bentrok dengan akun lain — butuh konfirmasi taut. */

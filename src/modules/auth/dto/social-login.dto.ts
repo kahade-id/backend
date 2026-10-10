@@ -1,7 +1,8 @@
-import { IsString, IsNotEmpty, IsOptional, IsEnum, IsIn, ValidateNested } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsEnum, ValidateNested, Matches, MaxLength } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { LocationDto } from './location.dto';
+import { DEVICE_ID_MESSAGE, DEVICE_ID_PATTERN, normalizeDeviceId } from './device-id.validation';
 
 export class SocialLoginDto {
   @ApiProperty({ description: 'Social provider', enum: ['google', 'apple'] })
@@ -13,10 +14,16 @@ export class SocialLoginDto {
   @IsNotEmpty()
   idToken!: string;
 
-  @ApiPropertyOptional({ description: 'Device ID for session tracking' })
-  @IsOptional()
+  // Audit Auth 2026-10-10 (#BE-30): deviceId WAJIB — tempToken 2FA & sesi
+  // sosial sebelumnya memakai fallback literal 'social' sehingga sesi antar
+  // perangkat saling mengusir dan binding perangkat tidak berarti.
+  @ApiProperty({ description: 'Device ID for session tracking', maxLength: 255 })
   @IsString()
-  deviceId?: string;
+  @IsNotEmpty()
+  @Transform(({ value }: { value: unknown }) => normalizeDeviceId(value))
+  @Matches(DEVICE_ID_PATTERN, { message: DEVICE_ID_MESSAGE })
+  @MaxLength(255)
+  deviceId!: string;
 
   @ApiPropertyOptional({ description: 'Device info (user-agent)' })
   @IsOptional()

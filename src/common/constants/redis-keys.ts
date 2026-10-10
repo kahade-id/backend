@@ -126,6 +126,14 @@ export const OTP_TRIGGER_COOLDOWN = (phone: string, purpose: string): string =>
 export const OTP_TRIGGER_PHONE_RATE = (phone: string): string =>
   `otp_trigger_phone_rate:${hmacIdentifier('otp_trigger_phone_rate', phone)}`;
 export const OTP_TRIGGER_IP_RATE = (ip: string): string => `otp_trigger_ip_rate:${ip}`;
+// Audit Auth 2026-10-10 (#BE-18): kuota pembuatan trigger dikunci per nomor+IP
+// (tanpa bukti kepemilikan nomor, kuota per nomor murni bisa dipakai DoS).
+export const OTP_TRIGGER_PHONE_IP_RATE = (phone: string, ip: string): string =>
+  `otp_trigger_phone_ip_rate:${hmacIdentifier('otp_trigger_phone_ip_rate', phone)}:${ip}`;
+// Audit Auth 2026-10-10 (#BE-44): cooldown & kuota OTP pemulihan passkey per user.
+export const PASSKEY_RECOVER_COOLDOWN = (userId: string): string =>
+  `passkey_recover_cooldown:${userId}`;
+export const PASSKEY_RECOVER_RATE = (userId: string): string => `passkey_recover_rate:${userId}`;
 
 /** GAP-A: kunci purge penghapusan akun per-user (G056) — satu worker per user. */
 export const DELETION_PURGE_LOCK = (userId: string): string => `deletion_purge:${userId}`;

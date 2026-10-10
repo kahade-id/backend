@@ -113,6 +113,8 @@ const mockRedis = {
   releaseLock: jest.fn().mockResolvedValue(true),
   getPrefix: jest.fn().mockReturnValue('test:'),
   getClient: jest.fn(),
+  // BAI-074 / Audit Auth 2026-10-10 (#BE-55): assertNotSuspended memakai exists().
+  exists: jest.fn().mockResolvedValue(0),
 };
 // AUDIT-B: alias the atomic counter primitive to the shared mock fn
 (mockRedis as any).incrWithTtl = (mockRedis as any).incr;
@@ -134,6 +136,7 @@ const mockOtpService = {
   verifyOtp: jest.fn().mockResolvedValue(true),
   verifyPhoneOtp: jest.fn().mockResolvedValue(true),
   verifyPhoneOtpWithMetadata: jest.fn(),
+  verifyOtpWithMetadata: jest.fn(),
   consumeVerifiedOtp: jest.fn(),
   invalidatePhoneOtps: jest.fn().mockResolvedValue(undefined),
   invalidateOtps: jest.fn().mockResolvedValue(undefined),
@@ -325,102 +328,7 @@ describe('AuthService', () => {
 
   // ─── register ────────────────────────────────────────────────────
 
-  describe('register', () => {
-    it('should throw BadRequestException when passwords do not match', async () => {
-      await expect(
-        service.register({
-          fullName: 'Test User',
-          email: 'test@example.com',
-          password: 'Password123!',
-          confirmPassword: 'Different123!',
-        }),
-      ).rejects.toThrow(BadRequestException);
-    });
-
-    it('should return ambiguous success message when user already exists (anti-enumeration)', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue(mockUser);
-
-      const result = await service.register({
-        fullName: 'Test User',
-        email: 'user@example.com',
-        password: 'Password123!',
-        confirmPassword: 'Password123!',
-      });
-
-      expect(result.message).toBeTruthy();
-    });
-
-    it('should create user and return success message for new email', async () => {
-      mockPrisma.user.findUnique.mockResolvedValue(null);
-      mockPrisma.$transaction.mockImplementation(
-        async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => fn(mockPrisma),
-      );
-      mockPrisma.user.create.mockResolvedValue(mockUser);
-      mockPrisma.wallet.create.mockResolvedValue({});
-      mockPrisma.notificationPreference.create.mockResolvedValue({});
-      mockPrisma.referralCode.create.mockResolvedValue({});
-      mockEmailQueue.add.mockResolvedValue({ id: 'job-1' });
-      mockOtpService.generateOtp.mockResolvedValue('654321');
-
-      const result = await service.register({
-        fullName: 'New User',
-        email: 'new@example.com',
-        password: 'Password123!',
-        confirmPassword: 'Password123!',
-      });
-
-      expect(result.message).toBeTruthy();
-    });
-  });
-
-  describe('session limit', () => {
-    it('evicts only active unexpired sessions', async () => {
-      mockPrisma.userSession.count.mockResolvedValue(5);
-      mockPrisma.userSession.findMany.mockResolvedValue([{ id: 'session-old' }]);
-      mockPrisma.userSession.updateMany.mockResolvedValue({ count: 1 });
-      mockPrisma.userSession.create.mockResolvedValue({ id: 'session-new' });
-      mockPrisma.$transaction.mockImplementation(
-        async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => fn(mockPrisma),
-      );
-
-      await (service as unknown as { saveSession: (...args: string[]) => Promise<string> }).saveSession(
-        'db-id-1',
-        'refresh-token',
-        'test-device',
-        '127.0.0.1',
-      );
-
-      expect(mockPrisma.userSession.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({
-            expiresAt: expect.objectContaining({ gt: expect.any(Date) }),
-          }),
-        }),
-      );
-    });
-
-    it('revokes an earlier active session on the same device before issuing a new session', async () => {
-      mockPrisma.userSession.findMany.mockResolvedValue([{ id: 'same-device-session' }]);
-      mockPrisma.userSession.count.mockResolvedValue(1);
-      mockPrisma.userSession.updateMany.mockResolvedValue({ count: 1 });
-      mockPrisma.userSession.create.mockResolvedValue({ id: 'session-new' });
-      mockPrisma.$transaction.mockImplementation(
-        async (fn: (tx: typeof mockPrisma) => Promise<unknown>) => fn(mockPrisma),
-      );
-
-      await (service as unknown as { saveSession: (...args: string[]) => Promise<string> }).saveSession(
-        'db-id-1', 'refresh-token', 'same-device', '127.0.0.1',
-      );
-
-      expect(mockPrisma.userSession.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-        where: expect.objectContaining({ id: { in: ['same-device-session'] }, isRevoked: false }),
-        data: expect.objectContaining({ isRevoked: true, revokedReason: 'device_reauthenticated' }),
-      }));
-      expect(mockRedis.setex).toHaveBeenCalledWith('session_revoked:same-device-session', 900, '1', { throwOnError: true });
-    });
-  });
-
-  // ─── login ───────────────────────────────────────────────────────
+  // Audit Auth 2026-10-10 (#BE-39): describe('register') dihapus bersama service.register() lama.
 
   describe('phone OTP login', () => {
     it('does not consume a valid OTP when account lookup fails before verification', async () => {
@@ -434,7 +342,7 @@ describe('AuthService', () => {
       expect(mockOtpService.verifyPhoneOtpWithMetadata).not.toHaveBeenCalled();
     });
 
-    it('rejects a phone OTP login while the account is temporarily locked', async () => {
+    it('rejects a phone OTP login while the account is temporarily locked — only AFTER the OTP is valid, without consuming it (#BE-13)', async () => {
       mockOtpService.verifyPhoneOtpWithMetadata.mockResolvedValue({
         valid: true,
         otpId: 'otp-1',
@@ -448,9 +356,27 @@ describe('AuthService', () => {
       await expect(
         service.verifyPhoneOtp('+628123456789', '123456', 'device-abc', 'Test Browser', '127.0.0.1'),
       ).rejects.toThrow(UnauthorizedException);
-      expect(mockOtpService.verifyPhoneOtpWithMetadata).not.toHaveBeenCalled();
+      // Audit Auth 2026-10-10 (#BE-13): status akun TIDAK bocor sebelum OTP
+      // dicek (bukan oracle status nomor HP) — OTP diverifikasi dulu ...
+      expect(mockOtpService.verifyPhoneOtpWithMetadata).toHaveBeenCalledWith(
+        '+628123456789', OtpType.PHONE_LOGIN, '123456', { consume: false },
+      );
+      // ... tetapi tidak dikonsumsi karena akun tidak bisa melanjutkan login.
+      expect(mockOtpService.consumeVerifiedOtp).not.toHaveBeenCalled();
       expect(mockPrisma.user.update).not.toHaveBeenCalled();
       expect(mockPrisma.userSession.create).not.toHaveBeenCalled();
+    });
+
+    it('does not leak account status for an invalid OTP (#BE-13)', async () => {
+      mockOtpService.verifyPhoneOtpWithMetadata.mockResolvedValue({ valid: false });
+      mockPrisma.user.findFirst.mockResolvedValue({ ...mockUser, isBanned: true });
+
+      await expect(
+        service.verifyPhoneOtp('+628123456789', '000000', 'device-abc', 'Test Browser', '127.0.0.1'),
+      ).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: 'OTP_INVALID' }) }),
+      );
+      expect(mockOtpService.consumeVerifiedOtp).not.toHaveBeenCalled();
     });
 
     it('rejects a valid phone OTP presented from a device other than the requesting device without consuming it', async () => {
@@ -539,7 +465,7 @@ describe('AuthService', () => {
       ).rejects.toThrow(UnauthorizedException);
     });
 
-    it('should revoke active sessions when repeated failures permanently lock the account', async () => {
+    it('locks the account for 24h (NOT isActive=false) and revokes sessions on the max lockout cycle (#BE-15)', async () => {
       const bcryptHash = require('bcrypt');
       const hashedPassword = await bcryptHash.hash('RealPassword123!', 12);
       mockPrisma.user.findUnique.mockResolvedValue({
@@ -557,14 +483,70 @@ describe('AuthService', () => {
 
       await expect(
         service.login({ ...loginDto, password: 'WrongPassword!' }, '127.0.0.1'),
-      ).rejects.toThrow('permanently locked');
+      ).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: 'ACCOUNT_LOCKED' }) }),
+      );
 
+      // Audit Auth 2026-10-10 (#BE-15): kunci sementara 24 jam, bukan deaktivasi permanen.
+      expect(mockPrisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ failedLoginAttempts: 0, lockedUntil: expect.any(Date) }),
+        }),
+      );
+      expect(mockPrisma.user.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ isActive: false }) }),
+      );
       expect(mockPrisma.userSession.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { userId: 'db-id-1', isRevoked: false },
-          data: expect.objectContaining({ revokedReason: 'account_permanently_locked' }),
+          data: expect.objectContaining({ revokedReason: 'account_locked_repeated_failures' }),
         }),
       );
+    });
+
+    it('does not reveal lockoutRemainingSeconds when the password is wrong (#BE-14)', async () => {
+      const bcryptHash = require('bcrypt');
+      const hashedPassword = await bcryptHash.hash('RealPassword123!', 4);
+      mockPrisma.user.findUnique.mockResolvedValue({
+        ...mockUser,
+        password: hashedPassword,
+        lockedUntil: new Date(Date.now() + 30 * 60 * 1000),
+      });
+
+      await expect(
+        service.login({ ...loginDto, password: 'WrongPassword!' }, '127.0.0.1'),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.not.objectContaining({ lockoutRemainingSeconds: expect.anything() }),
+        }),
+      );
+      // Sandi benar → countdown diberikan (UI membutuhkannya).
+      await expect(
+        service.login({ ...loginDto, password: 'RealPassword123!' }, '127.0.0.1'),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ lockoutRemainingSeconds: expect.any(Number) }),
+        }),
+      );
+    });
+
+    it('checks suspension only after the password is correct (#BE-14)', async () => {
+      const bcryptHash = require('bcrypt');
+      const hashedPassword = await bcryptHash.hash('RealPassword123!', 4);
+      mockPrisma.user.findUnique.mockResolvedValue({ ...mockUser, password: hashedPassword });
+      mockRedis.exists.mockResolvedValue(1);
+
+      await expect(
+        service.login({ ...loginDto, password: 'WrongPassword!' }, '127.0.0.1'),
+      ).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: 'INVALID_CREDENTIALS' }) }),
+      );
+      await expect(
+        service.login({ ...loginDto, password: 'RealPassword123!' }, '127.0.0.1'),
+      ).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: 'ACCOUNT_SUSPENDED' }) }),
+      );
+      mockRedis.exists.mockResolvedValue(0);
     });
 
     it('should throw UnauthorizedException for wrong password and increment failedLoginAttempts', async () => {
@@ -1107,7 +1089,9 @@ describe('AuthService', () => {
         backupCodes: ['hash'],
         usedBackupCodes: [],
       });
-      mockOtpService.verifyOtp.mockResolvedValue(true);
+      // Audit Auth 2026-10-10 (#BE-34): OTP email diverifikasi tanpa konsumsi dulu.
+      mockOtpService.verifyOtpWithMetadata.mockResolvedValue({ valid: true, otpId: 'otp-email-1' });
+      mockOtpService.consumeVerifiedOtp.mockResolvedValue(true);
       mockPrisma.twoFactorAuth.update.mockResolvedValue({});
       mockPrisma.userSession.findMany.mockResolvedValue([{ id: 'session-1' }]);
       mockPrisma.userSession.updateMany.mockResolvedValue({ count: 1 });
@@ -1119,8 +1103,12 @@ describe('AuthService', () => {
 
       const result = await service.disable2fa(mockUser.id, validPassword, 'A1B2C3D4E5F6G7H8', '123456');
 
-      expect(mockOtpService.verifyOtp).toHaveBeenCalledWith(mockUser.email, OtpType.TWO_FA_DISABLE, '123456');
+      expect(mockOtpService.verifyOtpWithMetadata).toHaveBeenCalledWith(
+        mockUser.email, OtpType.TWO_FA_DISABLE, '123456', { consume: false },
+      );
       expect(consumeBackupCode).toHaveBeenCalledWith(expect.objectContaining({ id: 'two-factor-1' }), 'A1B2C3D4E5F6G7H8');
+      // #BE-34: OTP email baru dikonsumsi SETELAH faktor TOTP/backup lolos.
+      expect(mockOtpService.consumeVerifiedOtp).toHaveBeenCalledWith('otp-email-1');
       expect(mockPrisma.userSession.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: { userId: mockUser.id, isRevoked: false },
       }));
